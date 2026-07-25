@@ -1,6 +1,17 @@
 #![forbid(unsafe_code)]
 
+mod policy;
+mod sas;
+
 use serde::{Deserialize, Serialize};
+
+pub use crate::{
+    policy::{
+        PermissionSet, PolicyError, ResourceScope, ResourceScopeError, SharedAccessKey,
+        SharedAccessPolicy, SharedAccessRule,
+    },
+    sas::{AccessGrant, SasError},
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
