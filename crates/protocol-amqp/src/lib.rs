@@ -9,6 +9,7 @@
 mod address;
 mod broker;
 mod condition;
+mod listener;
 mod message;
 
 use thiserror::Error;
@@ -24,6 +25,7 @@ pub use crate::{
         NOT_ALLOWED, NOT_FOUND, PRECONDITION_FAILED, RESOURCE_LOCKED, SESSION_CANNOT_BE_LOCKED,
         SESSION_LOCK_LOST, condition_for, is_retryable,
     },
+    listener::AmqpListener,
     message::{IncomingMessage, read_incoming, write_delivery},
 };
 

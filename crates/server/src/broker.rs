@@ -216,6 +216,28 @@ impl Drop for Broker {
     }
 }
 
+/// The broker as the protocol edge sees it.
+///
+/// Separating a refusal from an unreachable broker is what lets the edge report
+/// a condition the client can act on instead of a generic failure.
+impl protocol_amqp::Broker for BrokerHandle {
+    async fn submit(
+        &self,
+        namespace: NamespaceName,
+        entity: EntityPath,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, protocol_amqp::BrokerRejection> {
+        BrokerHandle::submit(self, namespace, entity, kind)
+            .await
+            .map_err(|error| match error {
+                SubmitError::Propose(ProposeError::Broker(refused)) => {
+                    protocol_amqp::BrokerRejection::Refused(refused)
+                }
+                other => protocol_amqp::BrokerRejection::Unavailable(other.to_string()),
+            })
+    }
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum SubmitError {
     #[error("the broker is not running")]

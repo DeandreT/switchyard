@@ -74,6 +74,12 @@ pub enum StartupError {
     MemoryStorageInProduction,
     #[error("the durable backend needs a data directory")]
     MissingDataDirectory,
+    #[error("could not listen on {address}: {detail}")]
+    Listen { address: String, detail: String },
+    #[error("the runtime could not be started: {0}")]
+    Runtime(String),
+    #[error(transparent)]
+    Protocol(#[from] protocol_amqp::ProtocolError),
     #[error(transparent)]
     Cluster(#[from] cluster::ClusterConfigError),
     #[error(transparent)]

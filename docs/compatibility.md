@@ -84,7 +84,17 @@ a rejection or a bound rather than a silent difference:
 
 Expiry is not merely expressible: the `server` crate's timer worker proposes the
 lock, time-to-live, and session-lock sweeps on an interval, so a running node
-actually releases what has elapsed. Everything else waits on the protocol edge.
+actually releases what has elapsed.
+
+An AMQP 1.0 client can reach a queue. The node accepts plain-TCP AMQP
+connections, resolves a link's address to an entity, turns transfers into send
+commands and dispositions into settlements, and answers a rejection with the
+condition an SDK keys its behaviour off. A transfer is accepted only after its
+command committed, so the acknowledgement means durable. What this is not yet:
+there is no TLS, no SASL or CBS authentication, one node serves one namespace,
+session-aware links and dead-letter receive are not exposed, and a receiving
+link polls the queue instead of waiting on a signal. The end-to-end coverage is
+a Rust AMQP 1.0 client, not the official SDKs the client gates require.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch
 before reporting it applied, and the same semantics suite runs against both

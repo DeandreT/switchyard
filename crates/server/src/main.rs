@@ -1,9 +1,10 @@
 #![forbid(unsafe_code)]
 
-use std::{path::PathBuf, process::ExitCode, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, process::ExitCode, sync::Arc, thread, time::Duration};
 
 use clap::{Parser, ValueEnum};
 use cluster::{ClusterConfig, DeploymentMode};
+use protocol_amqp::{AmqpListener, namespace_from_hostname};
 use server::{
     Broker, DEFAULT_SWEEP_INTERVAL, LocalProposer, NodeState, Shutdown, StartupError,
     StorageChoice, SystemClock, TimerWorker,
@@ -33,6 +34,16 @@ struct Arguments {
 
     #[arg(long, default_value_t = DEFAULT_SWEEP_INTERVAL.as_millis() as u64)]
     sweep_interval_millis: u64,
+
+    /// Where to accept AMQP connections. TLS is not implemented, so this is
+    /// plain TCP and is not fit for anything but a trusted network.
+    #[arg(long, default_value = "127.0.0.1:5672")]
+    listen: SocketAddr,
+
+    /// The namespace this node serves. A hostname is accepted and its first
+    /// label taken, so a deployment can name namespaces in DNS.
+    #[arg(long, default_value = "development")]
+    namespace: String,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -99,20 +110,45 @@ fn run() -> Result<(), StartupError> {
         storage = ?arguments.storage,
         "configuration is valid"
     );
-    println!(
-        "Switchyard pre-alpha: expiry timers are running; protocol listeners are not implemented \
-         yet, so nothing can connect. Interrupt to stop."
-    );
-
-    // Nothing here settles a message before its batch is fsynced, so an
-    // interrupt at any point loses no acknowledged state. That is why there is
-    // no signal handler yet: an abrupt stop is already safe.
-    let shutdown = Shutdown::default();
-    let interval = Duration::from_millis(arguments.sweep_interval_millis);
+    let namespace = namespace_from_hostname(&arguments.namespace)?;
     let broker = match state {
         NodeState::Memory(machine) => Broker::spawn(LocalProposer::new(machine, SystemClock)),
         NodeState::Durable(machine) => Broker::spawn(LocalProposer::new(machine, SystemClock)),
     };
-    TimerWorker::new(&broker.handle()).run(interval, &shutdown);
-    Ok(())
+
+    // Nothing settles a message before its batch is fsynced, so an interrupt at
+    // any point loses no acknowledged state. That is why there is no signal
+    // handler yet: an abrupt stop is already safe.
+    let shutdown = Arc::new(Shutdown::default());
+    let interval = Duration::from_millis(arguments.sweep_interval_millis);
+    let sweeper = {
+        let handle = broker.handle();
+        let shutdown = Arc::clone(&shutdown);
+        thread::Builder::new()
+            .name(String::from("switchyard-timer"))
+            .spawn(move || TimerWorker::new(&handle).run(interval, &shutdown))
+            .map_err(|error| StartupError::Runtime(error.to_string()))?
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| StartupError::Runtime(error.to_string()))?;
+    let served = runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind(arguments.listen)
+            .await
+            .map_err(|error| StartupError::Listen {
+                address: arguments.listen.to_string(),
+                detail: error.to_string(),
+            })?;
+        info!(address = %arguments.listen, namespace = %namespace, "accepting AMQP connections");
+        AmqpListener::new(broker.handle(), namespace)
+            .serve(listener)
+            .await
+            .map_err(|error| StartupError::Runtime(error.to_string()))
+    });
+
+    shutdown.signal();
+    let _ = sweeper.join();
+    served
 }
