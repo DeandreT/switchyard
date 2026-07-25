@@ -5,9 +5,11 @@
 This document is the implementation contract for Switchyard. The repository is
 currently pre-alpha. The workspace boundaries, the domain contracts, and the
 deterministic queue state machine described under
-[Message Semantics](#message-semantics) exist over the memory backend, while
-the network protocol, Fjall, Raft, and compliance implementations remain to be
-built.
+[Message Semantics](#message-semantics) exist, and run over either the Fjall
+backend or the memory backend, so a single node survives a restart. The network
+protocol, Raft, and compliance implementations remain to be built, and the
+storage keyspace layout described under [Storage](#storage) is still a single
+record keyspace rather than the split listed there.
 
 Compatibility means observable protocol and SDK behavior backed by automated
 tests. It does not mean byte-for-byte implementation similarity, Microsoft
@@ -161,8 +163,18 @@ The state machine uses explicit big-endian keys and versioned value envelopes.
 Schema upgrades are online and resumable. A new format is activated only after
 all voters advertise support, allowing one-minor-version rolling upgrades.
 
-The memory backend implements the same atomic batch and snapshot contract. It
-is reserved for unit tests, deterministic simulations, Sift demos, and local
+What exists today is one `records` keyspace holding every state-machine key, and
+a `meta` keyspace holding the on-disk layout version. Splitting `records` into
+the keyspaces listed above is a layout change, which is what the layout version
+exists to gate: an open refuses any version other than the one the build reads
+and writes, in both directions, so a rollback fails rather than misreading a
+newer store. A command's batch is journalled and fsynced before the store
+reports it applied, and a store directory has a single owner — a second open of a
+live directory is refused rather than shared.
+
+The memory backend implements the same atomic batch and snapshot contract, and
+one conformance suite runs against both backends so they cannot drift. It is
+reserved for unit tests, deterministic simulations, Sift demos, and local
 development and never satisfies production readiness.
 
 ## Message Semantics

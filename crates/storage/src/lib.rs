@@ -1,11 +1,21 @@
+//! The atomic storage contract and its backends.
+//!
+//! Everything above this crate sees only [`StateStore`]: read one key, walk an
+//! ordered prefix, commit a batch. Both backends implement that contract and
+//! the same conformance suite runs against both, so a queue behaves identically
+//! whether its state lives in memory or on disk.
+
 #![forbid(unsafe_code)]
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, RwLock},
-};
+mod durable;
+mod memory;
 
 use thiserror::Error;
+
+pub use crate::{
+    durable::{ACTIVE_STORE_FORMAT, FjallStore, STORE_FORMAT_V1},
+    memory::MemoryStore,
+};
 
 pub type Key = Vec<u8>;
 pub type Value = Vec<u8>;
@@ -47,6 +57,12 @@ impl WriteBatch {
         &self.mutations
     }
 
+    /// Takes the mutations in the order they were recorded. A backend applies
+    /// them in that order, so the last mutation naming a key decides its fate.
+    pub fn into_mutations(self) -> Vec<Mutation> {
+        self.mutations
+    }
+
     pub fn is_empty(&self) -> bool {
         self.mutations.is_empty()
     }
@@ -65,7 +81,16 @@ impl StoreSnapshot {
 
 pub trait StateStore: Clone + Send + Sync + 'static {
     fn get(&self, key: &[u8]) -> Result<Option<Value>, StorageError>;
+
+    /// Commits every mutation in `batch` as one unit. A later reader observes
+    /// all of the batch or none of it, including a reader that opens the store
+    /// again after the process died mid-commit. A durable backend has persisted
+    /// the batch before this returns, so nothing is acknowledged that a power
+    /// failure could take back.
     fn apply(&self, batch: WriteBatch) -> Result<(), StorageError>;
+
+    /// Returns every entry in the store, in ascending key order, read at a
+    /// single point in time.
     fn snapshot(&self) -> Result<StoreSnapshot, StorageError>;
 
     /// Returns up to `limit` entries whose key starts with `prefix`, in ascending
@@ -75,112 +100,34 @@ pub trait StateStore: Clone + Send + Sync + 'static {
     fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Key, Value)>, StorageError>;
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct MemoryStore {
-    entries: Arc<RwLock<BTreeMap<Key, Value>>>,
-}
-
-impl StateStore for MemoryStore {
-    fn get(&self, key: &[u8]) -> Result<Option<Value>, StorageError> {
-        let entries = self
-            .entries
-            .read()
-            .map_err(|_| StorageError::LockPoisoned)?;
-        Ok(entries.get(key).cloned())
-    }
-
-    fn apply(&self, batch: WriteBatch) -> Result<(), StorageError> {
-        let mut entries = self
-            .entries
-            .write()
-            .map_err(|_| StorageError::LockPoisoned)?;
-        for mutation in batch.mutations {
-            match mutation {
-                Mutation::Put { key, value } => {
-                    entries.insert(key, value);
-                }
-                Mutation::Delete { key } => {
-                    entries.remove(&key);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn snapshot(&self) -> Result<StoreSnapshot, StorageError> {
-        let entries = self
-            .entries
-            .read()
-            .map_err(|_| StorageError::LockPoisoned)?;
-        Ok(StoreSnapshot {
-            entries: entries
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        })
-    }
-
-    fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Key, Value)>, StorageError> {
-        let entries = self
-            .entries
-            .read()
-            .map_err(|_| StorageError::LockPoisoned)?;
-        Ok(entries
-            .range(prefix.to_vec()..)
-            .take_while(|(key, _)| key.starts_with(prefix))
-            .take(limit)
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect())
-    }
-}
-
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum StorageError {
     #[error("storage lock was poisoned")]
     LockPoisoned,
+    /// A durable backend refused an operation.
+    ///
+    /// The backend's own error is rendered to a string rather than carried,
+    /// because `StorageError` has to stay comparable: the domain crate's error
+    /// enum derives `PartialEq` so that a test can assert the exact rejection a
+    /// command produced.
+    #[error("durable storage failed to {operation}: {detail}")]
+    Backend {
+        operation: &'static str,
+        detail: String,
+    },
+    #[error(
+        "store directory holds format version {found}, but this build reads and writes version {expected}"
+    )]
+    UnsupportedStoreFormat { found: u32, expected: u32 },
+    #[error("store metadata is unreadable: {detail}")]
+    CorruptMetadata { detail: String },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn applies_a_batch_atomically_to_the_memory_view() -> Result<(), StorageError> {
-        let store = MemoryStore::default();
-        store.apply(
-            WriteBatch::default()
-                .put(b"message:1".to_vec(), b"first".to_vec())
-                .put(b"message:2".to_vec(), b"second".to_vec())
-                .delete(b"message:1".to_vec()),
-        )?;
-
-        assert_eq!(store.get(b"message:1")?, None);
-        assert_eq!(store.get(b"message:2")?, Some(b"second".to_vec()));
-        assert_eq!(store.snapshot()?.entries().len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn scans_a_prefix_in_key_order_within_its_limit() -> Result<(), StorageError> {
-        let store = MemoryStore::default();
-        store.apply(
-            WriteBatch::default()
-                .put(b"ready:\x00\x02".to_vec(), Vec::new())
-                .put(b"ready:\x00\x01".to_vec(), Vec::new())
-                .put(b"ready:\x00\x03".to_vec(), Vec::new())
-                .put(b"locks:\x00\x01".to_vec(), Vec::new()),
-        )?;
-
-        let scanned = store.scan_prefix(b"ready:", 2)?;
-        assert_eq!(
-            scanned
-                .iter()
-                .map(|(key, _)| key.clone())
-                .collect::<Vec<_>>(),
-            vec![b"ready:\x00\x01".to_vec(), b"ready:\x00\x02".to_vec()]
-        );
-        assert_eq!(store.scan_prefix(b"ready:", 16)?.len(), 3);
-        assert_eq!(store.scan_prefix(b"absent:", 16)?.len(), 0);
-        Ok(())
+impl StorageError {
+    pub(crate) fn backend(operation: &'static str, error: &dyn std::error::Error) -> Self {
+        Self::Backend {
+            operation,
+            detail: error.to_string(),
+        }
     }
 }

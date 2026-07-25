@@ -34,7 +34,7 @@ tracked in [docs/compatibility.md](docs/compatibility.md).
 | Crate | Responsibility |
 | --- | --- |
 | `domain` | Broker identifiers, commands, state-machine rules, and errors |
-| `storage` | Atomic storage contract, memory backend, and planned Fjall backend |
+| `storage` | Atomic storage contract with a Fjall backend and a memory backend |
 | `cluster` | Cluster invariants, placement, Raft integration, and routing |
 | `protocol-amqp` | AMQP 1.0 and Azure Service Bus protocol adaptation |
 | `auth` | SAS, OIDC, mTLS, RBAC, encryption, and audit policy |

@@ -63,7 +63,11 @@ behavior it currently enforces:
   both by the timer sweep and by any receive that reaches one first.
 - Rejected commands write nothing, so every replica rejects at the same point.
 
-Storage remains the memory backend, so none of this survives a restart yet.
+All of it now runs on either backend. The Fjall backend fsyncs a command's batch
+before reporting it applied, and the same semantics suite runs against both
+backends, so a single node keeps its messages, locks, delivery counts, and
+sequence numbers across a restart. Preserving them across the loss of a node
+still needs replication.
 
 Switchyard intentionally does not reproduce Azure subscription, namespace
 capacity, or operations-per-second commercial quotas. It defaults to compatible

@@ -1,15 +1,23 @@
 //! Queue delivery semantics, driven entirely by injected timestamps.
+//!
+//! Every case is generic over the backend its state lives on and is run twice,
+//! once in memory and once on a real store directory. Delivery semantics are a
+//! property of the state machine, not of where its records are kept, so a case
+//! that passes on one backend and fails on the other is a storage bug.
+
+use std::error::Error;
 
 use domain::{
     BrokerError, CommandKind, CommandOutcome, DeadLetterReason, Delivery, DeliveryLock, LockToken,
     MessageState, QueueConfig, ReceiveMode, SequenceNumber, Timestamp,
 };
-use testkit::{FixtureError, QueueFixture};
+use testkit::{QueueFixture, StoreProvider};
 
 const LOCK_MILLIS: u64 = 30_000;
 
-fn queue() -> Result<QueueFixture, FixtureError> {
-    QueueFixture::new(
+fn queue<P: StoreProvider>(provider: P) -> Result<QueueFixture<P>, Box<dyn Error>> {
+    Ok(QueueFixture::new(
+        provider,
         "tenant",
         "orders",
         QueueConfig {
@@ -17,10 +25,14 @@ fn queue() -> Result<QueueFixture, FixtureError> {
             max_delivery_count: 2,
             ..QueueConfig::default()
         },
-    )
+    )?)
 }
 
-fn send(fixture: &QueueFixture, millis: u64, id: &str) -> Result<SequenceNumber, BrokerError> {
+fn send<P: StoreProvider>(
+    fixture: &QueueFixture<P>,
+    millis: u64,
+    id: &str,
+) -> Result<SequenceNumber, BrokerError> {
     match fixture.at(
         millis,
         CommandKind::Send {
@@ -34,7 +46,10 @@ fn send(fixture: &QueueFixture, millis: u64, id: &str) -> Result<SequenceNumber,
     }
 }
 
-fn receive(fixture: &QueueFixture, millis: u64) -> Result<Option<Delivery>, BrokerError> {
+fn receive<P: StoreProvider>(
+    fixture: &QueueFixture<P>,
+    millis: u64,
+) -> Result<Option<Delivery>, BrokerError> {
     match fixture.at(
         millis,
         CommandKind::Receive {
@@ -51,10 +66,12 @@ fn locked(delivery: &Delivery) -> DeliveryLock {
     delivery.lock.expect("peek-lock delivery carries a lock")
 }
 
-#[test]
-fn a_peek_lock_delivery_hides_the_message_from_other_receivers()
--> Result<(), Box<dyn std::error::Error>> {
-    let fixture = queue()?;
+// ---- the suite -------------------------------------------------------------
+
+fn a_peek_lock_delivery_hides_the_message_from_other_receivers<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     send(&fixture, 10, "first")?;
 
     let delivery = receive(&fixture, 20)?.expect("the queue holds one message");
@@ -77,9 +94,10 @@ fn a_peek_lock_delivery_hides_the_message_from_other_receivers()
     Ok(())
 }
 
-#[test]
-fn messages_are_delivered_in_send_order() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = queue()?;
+fn messages_are_delivered_in_send_order<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     for (index, id) in ["first", "second", "third"].iter().enumerate() {
         let sequence = send(&fixture, 10 + index as u64, id)?;
         assert_eq!(sequence, SequenceNumber::new(index as u64 + 1));
@@ -94,9 +112,10 @@ fn messages_are_delivered_in_send_order() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
-#[test]
-fn completing_a_lock_removes_the_message() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = queue()?;
+fn completing_a_lock_removes_the_message<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     send(&fixture, 10, "first")?;
     let delivery = receive(&fixture, 20)?.expect("the queue holds one message");
 
@@ -122,9 +141,10 @@ fn completing_a_lock_removes_the_message() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-#[test]
-fn a_foreign_lock_token_cannot_settle_a_message() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = queue()?;
+fn a_foreign_lock_token_cannot_settle_a_message<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     send(&fixture, 10, "first")?;
     let delivery = receive(&fixture, 20)?.expect("the queue holds one message");
 
@@ -154,9 +174,10 @@ fn a_foreign_lock_token_cannot_settle_a_message() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-#[test]
-fn settling_after_the_lock_elapsed_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = queue()?;
+fn settling_after_the_lock_elapsed_is_rejected<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     send(&fixture, 10, "first")?;
     let delivery = receive(&fixture, 20)?.expect("the queue holds one message");
     let lock = locked(&delivery);
@@ -177,10 +198,10 @@ fn settling_after_the_lock_elapsed_is_rejected() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-#[test]
-fn abandoning_returns_the_message_and_keeps_its_delivery_count()
--> Result<(), Box<dyn std::error::Error>> {
-    let fixture = queue()?;
+fn abandoning_returns_the_message_and_keeps_its_delivery_count<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     send(&fixture, 10, "first")?;
     let first = receive(&fixture, 20)?.expect("the queue holds one message");
 
@@ -203,10 +224,10 @@ fn abandoning_returns_the_message_and_keeps_its_delivery_count()
     Ok(())
 }
 
-#[test]
-fn abandoning_at_the_delivery_limit_dead_letters_the_message()
--> Result<(), Box<dyn std::error::Error>> {
-    let fixture = queue()?;
+fn abandoning_at_the_delivery_limit_dead_letters_the_message<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     let sequence = send(&fixture, 10, "first")?;
 
     let first = receive(&fixture, 20)?.expect("the queue holds one message");
@@ -250,9 +271,10 @@ fn abandoning_at_the_delivery_limit_dead_letters_the_message()
     Ok(())
 }
 
-#[test]
-fn an_elapsed_lock_returns_the_message_to_the_queue() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = queue()?;
+fn an_elapsed_lock_returns_the_message_to_the_queue<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     let sequence = send(&fixture, 10, "first")?;
     let delivery = receive(&fixture, 20)?.expect("the queue holds one message");
     let locked_until = locked(&delivery).locked_until;
@@ -281,9 +303,10 @@ fn an_elapsed_lock_returns_the_message_to_the_queue() -> Result<(), Box<dyn std:
     Ok(())
 }
 
-#[test]
-fn an_elapsed_lock_dead_letters_at_the_delivery_limit() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = queue()?;
+fn an_elapsed_lock_dead_letters_at_the_delivery_limit<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     let sequence = send(&fixture, 10, "first")?;
 
     let first = receive(&fixture, 20)?.expect("the queue holds one message");
@@ -310,10 +333,10 @@ fn an_elapsed_lock_dead_letters_at_the_delivery_limit() -> Result<(), Box<dyn st
     Ok(())
 }
 
-#[test]
-fn receive_and_delete_removes_the_message_before_returning_it()
--> Result<(), Box<dyn std::error::Error>> {
-    let fixture = queue()?;
+fn receive_and_delete_removes_the_message_before_returning_it<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     let sequence = send(&fixture, 10, "first")?;
 
     let outcome = fixture.at(
@@ -341,10 +364,10 @@ fn receive_and_delete_removes_the_message_before_returning_it()
     Ok(())
 }
 
-#[test]
-fn the_time_to_live_sweep_dead_letters_expired_messages() -> Result<(), Box<dyn std::error::Error>>
-{
-    let fixture = queue()?;
+fn the_time_to_live_sweep_dead_letters_expired_messages<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     let sequence = fixture.at(
         10,
         CommandKind::Send {
@@ -378,9 +401,10 @@ fn the_time_to_live_sweep_dead_letters_expired_messages() -> Result<(), Box<dyn 
     Ok(())
 }
 
-#[test]
-fn a_receive_never_hands_out_an_expired_message() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = queue()?;
+fn a_receive_never_hands_out_an_expired_message<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     fixture.at(
         10,
         CommandKind::Send {
@@ -404,9 +428,10 @@ fn a_receive_never_hands_out_an_expired_message() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-#[test]
-fn an_application_can_dead_letter_a_locked_message() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = queue()?;
+fn an_application_can_dead_letter_a_locked_message<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     let sequence = send(&fixture, 10, "first")?;
     let delivery = receive(&fixture, 20)?.expect("the queue holds one message");
 
@@ -437,9 +462,10 @@ fn an_application_can_dead_letter_a_locked_message() -> Result<(), Box<dyn std::
     Ok(())
 }
 
-#[test]
-fn a_command_that_moves_time_backward_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = queue()?;
+fn a_command_that_moves_time_backward_is_rejected<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     send(&fixture, 100, "first")?;
 
     assert_eq!(
@@ -466,9 +492,11 @@ fn a_command_that_moves_time_backward_is_rejected() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-#[test]
-fn a_send_larger_than_the_queue_limit_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+fn a_send_larger_than_the_queue_limit_is_rejected<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
     let fixture = QueueFixture::new(
+        provider,
         "tenant",
         "orders",
         QueueConfig {
@@ -507,9 +535,10 @@ fn a_send_larger_than_the_queue_limit_is_rejected() -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-#[test]
-fn commands_against_a_missing_queue_are_rejected() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = queue()?;
+fn commands_against_a_missing_queue_are_rejected<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     let elsewhere = domain::EntityPath::new("invoices")?;
     let command = domain::Command::new(
         fixture.namespace.clone(),
@@ -529,9 +558,8 @@ fn commands_against_a_missing_queue_are_rejected() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-#[test]
-fn creating_a_queue_twice_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = queue()?;
+fn creating_a_queue_twice_is_rejected<P: StoreProvider>(provider: P) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
     assert_eq!(
         fixture.at(
             10,
@@ -544,29 +572,34 @@ fn creating_a_queue_twice_is_rejected() -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-#[test]
-fn an_invalid_queue_configuration_is_rejected() {
-    let error = QueueFixture::new(
+fn an_invalid_queue_configuration_is_rejected<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let Err(error) = QueueFixture::new(
+        provider,
         "tenant",
         "orders",
         QueueConfig {
             max_delivery_count: 0,
             ..QueueConfig::default()
         },
-    )
-    .expect_err("a queue that can never deliver is invalid");
+    ) else {
+        panic!("a queue that can never deliver is invalid");
+    };
 
     assert_eq!(
         error,
-        FixtureError::Broker(BrokerError::QueueConfig(
+        testkit::FixtureError::Broker(BrokerError::QueueConfig(
             domain::QueueConfigError::MaxDeliveryCountTooSmall
         ))
     );
+    Ok(())
 }
 
-#[test]
-fn two_queues_in_one_namespace_do_not_share_messages() -> Result<(), Box<dyn std::error::Error>> {
-    let orders = queue()?;
+fn two_queues_in_one_namespace_do_not_share_messages<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let orders = queue(provider)?;
     send(&orders, 10, "for-orders")?;
 
     let invoices = domain::EntityPath::new("invoices")?;
@@ -592,4 +625,87 @@ fn two_queues_in_one_namespace_do_not_share_messages() -> Result<(), Box<dyn std
         vec![SequenceNumber::new(1)]
     );
     Ok(())
+}
+
+fn a_restart_preserves_locks_counters_and_queue_order<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
+    send(&fixture, 10, "first")?;
+    send(&fixture, 11, "second")?;
+    let delivery = receive(&fixture, 20)?.expect("the queue holds two messages");
+
+    let fixture = fixture.restart()?;
+
+    // A lock token issued before the restart still settles the message it names,
+    // so the lock itself was replicated state rather than something the running
+    // process held.
+    assert_eq!(
+        fixture.at(
+            30,
+            CommandKind::Complete {
+                sequence: delivery.sequence,
+                lock_token: locked(&delivery).token,
+            }
+        )?,
+        CommandOutcome::Completed
+    );
+    // The applied clock, the ready index, and the sequence counter all came back
+    // where the machine left them.
+    assert_eq!(
+        fixture.machine.last_applied_time()?,
+        Timestamp::from_millis(30)
+    );
+    let next = receive(&fixture, 40)?.expect("the second message is still ready");
+    assert_eq!(next.message_id, "second");
+    assert_eq!(send(&fixture, 50, "third")?, SequenceNumber::new(3));
+    Ok(())
+}
+
+// ---- instantiation ---------------------------------------------------------
+
+/// Runs every named case against both backends, so the two suites cannot drift.
+macro_rules! for_each_backend {
+    ($($case:ident,)+) => {
+        mod memory {
+            $(
+                #[test]
+                fn $case() -> Result<(), Box<dyn std::error::Error>> {
+                    super::$case(::testkit::MemoryProvider::new())
+                }
+            )+
+        }
+
+        mod durable {
+            $(
+                #[test]
+                fn $case() -> Result<(), Box<dyn std::error::Error>> {
+                    super::$case(::testkit::DurableProvider::temporary()?)
+                }
+            )+
+        }
+    };
+}
+
+for_each_backend! {
+    a_peek_lock_delivery_hides_the_message_from_other_receivers,
+    messages_are_delivered_in_send_order,
+    completing_a_lock_removes_the_message,
+    a_foreign_lock_token_cannot_settle_a_message,
+    settling_after_the_lock_elapsed_is_rejected,
+    abandoning_returns_the_message_and_keeps_its_delivery_count,
+    abandoning_at_the_delivery_limit_dead_letters_the_message,
+    an_elapsed_lock_returns_the_message_to_the_queue,
+    an_elapsed_lock_dead_letters_at_the_delivery_limit,
+    receive_and_delete_removes_the_message_before_returning_it,
+    the_time_to_live_sweep_dead_letters_expired_messages,
+    a_receive_never_hands_out_an_expired_message,
+    an_application_can_dead_letter_a_locked_message,
+    a_command_that_moves_time_backward_is_rejected,
+    a_send_larger_than_the_queue_limit_is_rejected,
+    commands_against_a_missing_queue_are_rejected,
+    creating_a_queue_twice_is_rejected,
+    an_invalid_queue_configuration_is_rejected,
+    two_queues_in_one_namespace_do_not_share_messages,
+    a_restart_preserves_locks_counters_and_queue_order,
 }

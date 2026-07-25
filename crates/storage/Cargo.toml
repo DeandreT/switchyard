@@ -7,5 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+fjall.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
