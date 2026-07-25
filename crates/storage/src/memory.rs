@@ -60,13 +60,18 @@ impl StateStore for MemoryStore {
         })
     }
 
-    fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Key, Value)>, StorageError> {
+    fn scan_from(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Key, Value)>, StorageError> {
         let entries = self
             .entries
             .read()
             .map_err(|_| StorageError::LockPoisoned)?;
         Ok(entries
-            .range(prefix.to_vec()..)
+            .range(crate::scan_start(prefix, start).to_vec()..)
             .take_while(|(key, _)| key.starts_with(prefix))
             .take(limit)
             .map(|(key, value)| (key.clone(), value.clone()))

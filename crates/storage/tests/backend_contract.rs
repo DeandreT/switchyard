@@ -221,6 +221,32 @@ fn state_is_visible_after_reopening_the_store<B: Backend>() -> Result<(), Storag
     Ok(())
 }
 
+fn a_scan_resumes_from_its_start_key<B: Backend>() -> Result<(), StorageError> {
+    let store = B::create().open()?;
+    store.apply(
+        WriteBatch::default()
+            .put(b"ready:a\x00\x01".to_vec(), Vec::new())
+            .put(b"ready:a\x00\x02".to_vec(), Vec::new())
+            .put(b"ready:b\x00\x01".to_vec(), Vec::new())
+            .put(b"locks:c\x00\x01".to_vec(), Vec::new()),
+    )?;
+
+    // Skipping every entry of `a` without reading them is how a receive walks
+    // past a session it cannot use.
+    assert_eq!(
+        keys(&store.scan_from(b"ready:", b"ready:a\x01", 16)?),
+        vec![b"ready:b\x00\x01".to_vec()]
+    );
+    // A start below the prefix is the same as starting at the prefix, and a
+    // start past it ends the walk rather than escaping into the next prefix.
+    assert_eq!(
+        keys(&store.scan_from(b"ready:", b"aaaa", 16)?),
+        keys(&store.scan_prefix(b"ready:", 16)?)
+    );
+    assert_eq!(store.scan_from(b"ready:", b"ready;", 16)?, Vec::new());
+    Ok(())
+}
+
 // ---- instantiation ---------------------------------------------------------
 
 /// Runs every named case against both backends, so the two suites cannot drift.
@@ -255,5 +281,6 @@ for_each_backend! {
     a_prefix_scan_stops_at_the_end_of_its_prefix,
     a_snapshot_holds_every_entry_in_key_order,
     a_deleted_key_leaves_no_trace_behind,
+    a_scan_resumes_from_its_start_key,
     state_is_visible_after_reopening_the_store,
 }

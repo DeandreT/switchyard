@@ -1,7 +1,7 @@
 use storage::StorageError;
 use thiserror::Error;
 
-use crate::{CodecError, QueueConfigError, SequenceNumber, Timestamp};
+use crate::{CodecError, IdentifierError, QueueConfigError, SequenceNumber, SessionId, Timestamp};
 
 /// Every rejection the state machine can produce.
 ///
@@ -36,12 +36,29 @@ pub enum BrokerError {
     },
     #[error("invalid queue configuration: {0}")]
     QueueConfig(#[from] QueueConfigError),
+    #[error("queue requires a session and the command named none")]
+    SessionRequired,
+    #[error("queue does not use sessions")]
+    SessionNotSupported,
+    #[error("session {session_id} is held by another receiver")]
+    SessionAlreadyLocked { session_id: SessionId },
+    #[error("no live lock on session {session_id} matches the token presented")]
+    SessionLockNotHeld { session_id: SessionId },
+    #[error("the lock on session {session_id} expired at {locked_until}")]
+    SessionLockExpired {
+        session_id: SessionId,
+        locked_until: Timestamp,
+    },
     #[error("index entry references missing message {sequence}")]
     DanglingIndexEntry { sequence: SequenceNumber },
     #[error("index key is malformed")]
     MalformedIndexKey,
     #[error(transparent)]
     Codec(#[from] CodecError),
+    /// An identifier read back out of an index key failed to validate, which
+    /// means the key was not one this build wrote.
+    #[error(transparent)]
+    Identifier(#[from] IdentifierError),
     #[error(transparent)]
     Storage(#[from] StorageError),
 }

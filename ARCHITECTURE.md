@@ -3,13 +3,19 @@
 ## Status
 
 This document is the implementation contract for Switchyard. The repository is
-currently pre-alpha. The workspace boundaries, the domain contracts, and the
-deterministic queue state machine described under
-[Message Semantics](#message-semantics) exist, and run over either the Fjall
-backend or the memory backend, so a single node survives a restart. The network
-protocol, Raft, and compliance implementations remain to be built, and the
-storage keyspace layout described under [Storage](#storage) is still a single
-record keyspace rather than the split listed there.
+currently pre-alpha. What exists is the workspace boundaries, the domain
+contracts, and a deterministic state machine covering queue send and receive,
+both settlement modes, lock expiry, time-to-live expiry, dead-lettering, and the
+session ownership and session state described under
+[Message Semantics](#message-semantics). It runs over either the Fjall backend
+or the memory backend, so a single node survives a restart.
+
+The network protocol, Raft, and compliance implementations remain to be built.
+Within the semantics below, scheduling, deferral, duplicate detection, topics,
+and dead-letter receive are not implemented, the timer workers are commands
+without a worker to propose them, and the storage keyspace layout under
+[Storage](#storage) is still a single record keyspace rather than the split
+listed there.
 
 Compatibility means observable protocol and SDK behavior backed by automated
 tests. It does not mean byte-for-byte implementation similarity, Microsoft

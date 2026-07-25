@@ -142,10 +142,22 @@ impl StateStore for FjallStore {
         Ok(StoreSnapshot { entries })
     }
 
-    fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Key, Value)>, StorageError> {
+    fn scan_from(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Key, Value)>, StorageError> {
         let mut entries = Vec::new();
-        for guard in self.records.prefix(prefix).take(limit) {
-            entries.push(read_entry(guard)?);
+        let start = crate::scan_start(prefix, start).to_vec();
+        for guard in self.records.range(start..).take(limit) {
+            let (key, value) = read_entry(guard)?;
+            // The range is open-ended, so the walk ends at the first key that
+            // has left the prefix.
+            if !key.starts_with(prefix) {
+                break;
+            }
+            entries.push((key, value));
         }
         Ok(entries)
     }

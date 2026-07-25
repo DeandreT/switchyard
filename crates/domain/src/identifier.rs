@@ -6,6 +6,8 @@ use thiserror::Error;
 pub const MAX_NAMESPACE_NAME_BYTES: usize = 50;
 pub const MAX_ENTITY_PATH_BYTES: usize = 260;
 pub const MAX_PLACEMENT_GROUP_ID_BYTES: usize = 128;
+/// The Service Bus session identifier limit.
+pub const MAX_SESSION_ID_BYTES: usize = 128;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -46,6 +48,33 @@ impl EntityPath {
 }
 
 impl fmt::Display for EntityPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Names the ordered subset of a queue a session receiver owns.
+///
+/// Ordering within a session is the only FIFO guarantee the broker makes, and a
+/// session identifier is part of the key of every message in it, so the same
+/// control-character rule applies here as to the entity scope.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub fn new(value: impl Into<String>) -> Result<Self, IdentifierError> {
+        let value = value.into();
+        validate_identifier("session id", &value, MAX_SESSION_ID_BYTES)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SessionId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
@@ -129,6 +158,31 @@ mod tests {
             Err(IdentifierError::ControlCharacter {
                 kind: "entity path"
             })
+        );
+        assert_eq!(
+            SessionId::new("cart-1\0forged"),
+            Err(IdentifierError::ControlCharacter { kind: "session id" })
+        );
+    }
+
+    #[test]
+    fn session_ids_are_bounded_and_non_empty() {
+        assert_eq!(
+            SessionId::new(""),
+            Err(IdentifierError::Empty { kind: "session id" })
+        );
+        assert_eq!(
+            SessionId::new("s".repeat(MAX_SESSION_ID_BYTES + 1)),
+            Err(IdentifierError::TooLong {
+                kind: "session id",
+                maximum: MAX_SESSION_ID_BYTES
+            })
+        );
+        assert_eq!(
+            SessionId::new("s".repeat(MAX_SESSION_ID_BYTES))
+                .as_ref()
+                .map(SessionId::as_str),
+            Ok("s".repeat(MAX_SESSION_ID_BYTES).as_str())
         );
     }
 }

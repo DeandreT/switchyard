@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Timestamp;
+use crate::{CodecError, SessionId, Timestamp, codec};
 
 /// Position of a message in its entity's total order. Allocated from a
 /// replicated counter, never from a local generator.
@@ -126,9 +126,56 @@ pub struct MessageRecord {
     pub expires_at: Option<Timestamp>,
     pub delivery_count: u32,
     pub state: MessageState,
+    /// Set exactly when the queue requires sessions. `session_id` is last in the
+    /// record so that a version 1 payload is a strict prefix of a version 2 one,
+    /// which makes decoding a version 1 record as version 2 run off the end of
+    /// the buffer instead of silently producing a different message.
+    pub session_id: Option<SessionId>,
+}
+
+/// The version 1 shape of [`MessageRecord`], from before queues had sessions.
+///
+/// Kept so that a store written by an earlier build still reads. Version 1
+/// predates sessions entirely, so every message it holds belongs to no session.
+#[derive(Deserialize)]
+struct MessageRecordV1 {
+    sequence: SequenceNumber,
+    message_id: String,
+    body: Vec<u8>,
+    enqueued_at: Timestamp,
+    expires_at: Option<Timestamp>,
+    delivery_count: u32,
+    state: MessageState,
+}
+
+impl From<MessageRecordV1> for MessageRecord {
+    fn from(record: MessageRecordV1) -> Self {
+        Self {
+            sequence: record.sequence,
+            message_id: record.message_id,
+            body: record.body,
+            enqueued_at: record.enqueued_at,
+            expires_at: record.expires_at,
+            delivery_count: record.delivery_count,
+            state: record.state,
+            session_id: None,
+        }
+    }
 }
 
 impl MessageRecord {
+    /// Decodes a stored message, migrating a version 1 record on the way.
+    ///
+    /// Messages are the one record whose shape changed, so they decode through
+    /// here rather than through the shape-stable [`codec::decode`].
+    pub fn decode(envelope: &[u8]) -> Result<Self, CodecError> {
+        let (version, payload) = codec::split(envelope)?;
+        match version {
+            codec::VALUE_FORMAT_V1 => Ok(codec::decode_payload::<MessageRecordV1>(payload)?.into()),
+            _ => codec::decode_payload(payload),
+        }
+    }
+
     /// A message with no configured lifetime never expires, which is the
     /// Service Bus default.
     pub fn is_expired_at(&self, now: Timestamp) -> bool {
@@ -153,6 +200,8 @@ pub struct Delivery {
     pub delivery_count: u32,
     /// Absent in receive-and-delete, where the message is already gone.
     pub lock: Option<DeliveryLock>,
+    /// The session this message was delivered from, on a session queue.
+    pub session_id: Option<SessionId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,33 +214,77 @@ pub struct DeliveryLock {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_message_without_a_lifetime_never_expires() {
-        let record = MessageRecord {
+    fn record(expires_at: Option<Timestamp>) -> MessageRecord {
+        MessageRecord {
             sequence: SequenceNumber::new(1),
             message_id: String::from("m-1"),
             body: Vec::new(),
             enqueued_at: Timestamp::from_millis(0),
-            expires_at: None,
+            expires_at,
             delivery_count: 0,
             state: MessageState::Ready,
-        };
-        assert!(!record.is_expired_at(Timestamp::from_millis(u64::MAX)));
+            session_id: None,
+        }
+    }
+
+    /// The version 1 payload of [`record`], which is every field except the
+    /// session identifier version 2 appended.
+    fn version_1_payload() -> Vec<u8> {
+        postcard::to_stdvec(&(
+            SequenceNumber::new(1),
+            String::from("m-1"),
+            Vec::<u8>::new(),
+            Timestamp::from_millis(0),
+            Option::<Timestamp>::None,
+            0_u32,
+            MessageState::Ready,
+        ))
+        .expect("a message encodes")
+    }
+
+    #[test]
+    fn a_message_without_a_lifetime_never_expires() {
+        assert!(!record(None).is_expired_at(Timestamp::from_millis(u64::MAX)));
     }
 
     #[test]
     fn expiry_is_inclusive_of_the_deadline() {
-        let record = MessageRecord {
-            sequence: SequenceNumber::new(1),
-            message_id: String::from("m-1"),
-            body: Vec::new(),
-            enqueued_at: Timestamp::from_millis(0),
-            expires_at: Some(Timestamp::from_millis(100)),
-            delivery_count: 0,
-            state: MessageState::Ready,
-        };
+        let record = record(Some(Timestamp::from_millis(100)));
         assert!(!record.is_expired_at(Timestamp::from_millis(99)));
         assert!(record.is_expired_at(Timestamp::from_millis(100)));
+    }
+
+    #[test]
+    fn a_message_round_trips_through_the_active_format() -> Result<(), CodecError> {
+        let original = MessageRecord {
+            session_id: Some(SessionId::new("cart-1").expect("a valid session id")),
+            ..record(None)
+        };
+        let envelope = codec::encode(&original)?;
+        assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V2));
+        assert_eq!(MessageRecord::decode(&envelope)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn a_version_1_message_reads_as_belonging_to_no_session() -> Result<(), CodecError> {
+        let mut envelope = vec![codec::VALUE_FORMAT_V1];
+        envelope.extend_from_slice(&version_1_payload());
+
+        // Version 1 predates sessions, so every message it holds is session-less.
+        assert_eq!(MessageRecord::decode(&envelope)?, record(None));
+        Ok(())
+    }
+
+    #[test]
+    fn version_1_bytes_cannot_be_misread_as_the_active_format() {
+        // The rollback direction. `session_id` is the last field, so a version 1
+        // payload runs off the end of the buffer when it is read as version 2
+        // rather than decoding into some other message.
+        assert_eq!(
+            codec::decode_payload::<MessageRecord>(&version_1_payload()),
+            Err(CodecError::Decode)
+        );
     }
 
     #[test]

@@ -6,14 +6,19 @@
 //! - the ready index sorts by sequence number, which is queue FIFO order;
 //! - the lock index sorts by lock deadline, so the expiry sweep stops at the
 //!   first entry that has not elapsed;
-//! - the expiry index sorts by message deadline for the same reason.
+//! - the expiry index sorts by message deadline for the same reason;
+//! - the session ready index sorts by session first and sequence second, so one
+//!   session's messages are contiguous and in order within the group, and a
+//!   receiver looking for a session to accept walks the groups in turn;
+//! - the session lock index sorts by lock deadline, like the message one.
 //!
-//! Every entity-scoped key is `tag || namespace || 0x00 || path || 0x00 || ..`.
-//! The terminator is safe because [`crate::NamespaceName`] and
-//! [`crate::EntityPath`] reject control characters, so no name can contain a
-//! zero byte and forge another entity's prefix.
+//! Every entity-scoped key is `tag || namespace || 0x00 || path || 0x00 || ..`,
+//! and a session-scoped key appends `session || 0x00` to that. The terminators
+//! are safe because [`crate::NamespaceName`], [`crate::EntityPath`], and
+//! [`crate::SessionId`] reject control characters, so no name can contain a zero
+//! byte and forge another scope's prefix.
 
-use crate::{EntityPath, NamespaceName, SequenceNumber, Timestamp};
+use crate::{EntityPath, NamespaceName, SequenceNumber, SessionId, Timestamp};
 
 const TAG_CLOCK: u8 = 0x00;
 const TAG_QUEUE_CONFIG: u8 = 0x01;
@@ -23,6 +28,9 @@ const TAG_READY: u8 = 0x04;
 const TAG_LOCK: u8 = 0x05;
 const TAG_EXPIRY: u8 = 0x06;
 const TAG_DEAD_LETTER: u8 = 0x07;
+const TAG_SESSION: u8 = 0x08;
+const TAG_SESSION_READY: u8 = 0x09;
+const TAG_SESSION_LOCK: u8 = 0x0A;
 
 const SEPARATOR: u8 = 0x00;
 
@@ -34,6 +42,18 @@ fn entity_scope(tag: u8, namespace: &NamespaceName, entity: &EntityPath) -> Vec<
     key.extend_from_slice(namespace);
     key.push(SEPARATOR);
     key.extend_from_slice(entity);
+    key.push(SEPARATOR);
+    key
+}
+
+fn session_scope(
+    tag: u8,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    session_id: &SessionId,
+) -> Vec<u8> {
+    let mut key = entity_scope(tag, namespace, entity);
+    key.extend_from_slice(session_id.as_str().as_bytes());
     key.push(SEPARATOR);
     key
 }
@@ -115,6 +135,95 @@ pub fn dead_letter(
     with_u64(dead_letter_prefix(namespace, entity), sequence.as_u64())
 }
 
+/// The record holding one session's lock and state.
+pub fn session(namespace: &NamespaceName, entity: &EntityPath, session_id: &SessionId) -> Vec<u8> {
+    session_scope(TAG_SESSION, namespace, entity, session_id)
+}
+
+/// Ready messages of one session, ordered by sequence — the FIFO order a
+/// session guarantees.
+pub fn session_ready_prefix(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    session_id: &SessionId,
+) -> Vec<u8> {
+    session_scope(TAG_SESSION_READY, namespace, entity, session_id)
+}
+
+pub fn session_ready(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    session_id: &SessionId,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
+    with_u64(
+        session_ready_prefix(namespace, entity, session_id),
+        sequence.as_u64(),
+    )
+}
+
+/// Every ready message in the entity, grouped by session and ordered by session
+/// identifier. Walking it is how a receiver finds a session to accept.
+pub fn entity_session_ready_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_SESSION_READY, namespace, entity)
+}
+
+/// The key sorting immediately after every ready entry of `session_id`, which is
+/// where a walk resumes once it has rejected that session.
+///
+/// Session identifiers cannot contain a control character, so replacing the
+/// terminator with `0x01` sorts past every key in the session and before the
+/// first key of any later one.
+pub fn after_session_ready(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    session_id: &SessionId,
+) -> Vec<u8> {
+    let mut key = entity_scope(TAG_SESSION_READY, namespace, entity);
+    key.extend_from_slice(session_id.as_str().as_bytes());
+    key.push(SEPARATOR + 1);
+    key
+}
+
+/// Session locks ordered by deadline, so a sweep stops at the first lock that is
+/// still held.
+pub fn session_lock_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_SESSION_LOCK, namespace, entity)
+}
+
+pub fn session_lock(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    locked_until: Timestamp,
+    session_id: &SessionId,
+) -> Vec<u8> {
+    let mut key = with_u64(
+        session_lock_prefix(namespace, entity),
+        locked_until.as_millis(),
+    );
+    key.extend_from_slice(session_id.as_str().as_bytes());
+    key
+}
+
+/// Reads the session identifier from a key built on `prefix`, which must be the
+/// entity-scoped prefix that key was built from.
+pub fn session_id_after<'a>(prefix: &[u8], key: &'a [u8]) -> Option<&'a str> {
+    let rest = key.get(prefix.len()..)?;
+    let end = rest.iter().position(|byte| *byte == SEPARATOR)?;
+    std::str::from_utf8(rest.get(..end)?).ok()
+}
+
+/// Reads the deadline and session identifier from a session lock index key.
+pub fn session_lock_parts<'a>(prefix: &[u8], key: &'a [u8]) -> Option<(Timestamp, &'a str)> {
+    let rest = key.get(prefix.len()..)?;
+    let bytes: [u8; 8] = rest.get(..8)?.try_into().ok()?;
+    let session_id = std::str::from_utf8(rest.get(8..)?).ok()?;
+    Some((
+        Timestamp::from_millis(u64::from_be_bytes(bytes)),
+        session_id,
+    ))
+}
+
 /// Reads the sequence number from a ready or dead-letter index key.
 pub fn trailing_sequence(key: &[u8]) -> Option<SequenceNumber> {
     let bytes: [u8; 8] = key.get(key.len().checked_sub(8)?..)?.try_into().ok()?;
@@ -189,6 +298,106 @@ mod tests {
         let short_prefix = ready_prefix(&namespace(), &short);
         let long_prefix = ready_prefix(&namespace(), &long);
         assert!(!long_prefix.starts_with(&short_prefix));
+    }
+
+    fn session_id(value: &str) -> SessionId {
+        SessionId::new(value).expect("valid session id")
+    }
+
+    #[test]
+    fn session_ready_keys_sort_by_session_then_sequence() {
+        let mut keys = [
+            session_ready(
+                &namespace(),
+                &entity(),
+                &session_id("b"),
+                SequenceNumber::new(1),
+            ),
+            session_ready(
+                &namespace(),
+                &entity(),
+                &session_id("a"),
+                SequenceNumber::new(10),
+            ),
+            session_ready(
+                &namespace(),
+                &entity(),
+                &session_id("a"),
+                SequenceNumber::new(2),
+            ),
+        ];
+        keys.sort();
+
+        let prefix = entity_session_ready_prefix(&namespace(), &entity());
+        assert_eq!(
+            keys.iter()
+                .filter_map(|key| Some((
+                    session_id_after(&prefix, key)?,
+                    trailing_sequence(key)?.as_u64()
+                )))
+                .collect::<Vec<_>>(),
+            vec![("a", 2), ("a", 10), ("b", 1)]
+        );
+    }
+
+    #[test]
+    fn a_walk_resumes_past_every_entry_of_a_session() {
+        let prefix = entity_session_ready_prefix(&namespace(), &entity());
+        let resume = after_session_ready(&namespace(), &entity(), &session_id("a"));
+
+        // Past every key of session "a", including its highest sequence...
+        assert!(
+            session_ready(
+                &namespace(),
+                &entity(),
+                &session_id("a"),
+                SequenceNumber::new(u64::MAX)
+            ) < resume
+        );
+        // ...and before the first key of any session that sorts after it, even
+        // one that has "a" as a prefix.
+        for later in ["ab", "b"] {
+            assert!(
+                resume
+                    < session_ready(
+                        &namespace(),
+                        &entity(),
+                        &session_id(later),
+                        SequenceNumber::new(0)
+                    )
+            );
+        }
+        assert!(resume.starts_with(&prefix));
+    }
+
+    #[test]
+    fn session_lock_keys_sort_by_deadline_and_carry_their_session() {
+        let prefix = session_lock_prefix(&namespace(), &entity());
+        let early = session_lock(
+            &namespace(),
+            &entity(),
+            Timestamp::from_millis(100),
+            &session_id("late-session"),
+        );
+        let late = session_lock(
+            &namespace(),
+            &entity(),
+            Timestamp::from_millis(200),
+            &session_id("early-session"),
+        );
+
+        assert!(early < late);
+        assert_eq!(
+            session_lock_parts(&prefix, &early),
+            Some((Timestamp::from_millis(100), "late-session"))
+        );
+    }
+
+    #[test]
+    fn sessions_do_not_collide_across_similar_names() {
+        let short = session_ready_prefix(&namespace(), &entity(), &session_id("cart"));
+        let long = session_ready_prefix(&namespace(), &entity(), &session_id("cart-2"));
+        assert!(!long.starts_with(&short));
     }
 
     #[test]

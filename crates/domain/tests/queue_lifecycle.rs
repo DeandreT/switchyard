@@ -39,6 +39,7 @@ fn send<P: StoreProvider>(
             message_id: id.to_owned(),
             body: id.as_bytes().to_vec(),
             time_to_live_millis: None,
+            session_id: None,
         },
     )? {
         CommandOutcome::Sent { sequence } => Ok(sequence),
@@ -55,6 +56,7 @@ fn receive<P: StoreProvider>(
         CommandKind::Receive {
             mode: ReceiveMode::PeekLock,
             lock_duration_millis: None,
+            session: None,
         },
     )? {
         CommandOutcome::Received(delivery) => Ok(delivery),
@@ -344,6 +346,7 @@ fn receive_and_delete_removes_the_message_before_returning_it<P: StoreProvider>(
         CommandKind::Receive {
             mode: ReceiveMode::ReceiveAndDelete,
             lock_duration_millis: None,
+            session: None,
         },
     )?;
     let CommandOutcome::Received(Some(delivery)) = outcome else {
@@ -374,6 +377,7 @@ fn the_time_to_live_sweep_dead_letters_expired_messages<P: StoreProvider>(
             message_id: String::from("perishable"),
             body: b"perishable".to_vec(),
             time_to_live_millis: Some(100),
+            session_id: None,
         },
     )?;
     let CommandOutcome::Sent { sequence } = sequence else {
@@ -411,6 +415,7 @@ fn a_receive_never_hands_out_an_expired_message<P: StoreProvider>(
             message_id: String::from("perishable"),
             body: b"perishable".to_vec(),
             time_to_live_millis: Some(100),
+            session_id: None,
         },
     )?;
     send(&fixture, 11, "durable")?;
@@ -475,6 +480,7 @@ fn a_command_that_moves_time_backward_is_rejected<P: StoreProvider>(
                 message_id: String::from("second"),
                 body: Vec::new(),
                 time_to_live_millis: None,
+                session_id: None,
             }
         ),
         Err(BrokerError::ClockRegression {
@@ -512,6 +518,7 @@ fn a_send_larger_than_the_queue_limit_is_rejected<P: StoreProvider>(
                 message_id: String::from("oversized"),
                 body: vec![0; 9],
                 time_to_live_millis: None,
+                session_id: None,
             }
         ),
         Err(BrokerError::MessageTooLarge {
@@ -526,6 +533,7 @@ fn a_send_larger_than_the_queue_limit_is_rejected<P: StoreProvider>(
                 message_id: String::from("exact"),
                 body: vec![0; 8],
                 time_to_live_millis: None,
+                session_id: None,
             }
         )?,
         CommandOutcome::Sent {
@@ -548,6 +556,7 @@ fn commands_against_a_missing_queue_are_rejected<P: StoreProvider>(
             message_id: String::from("first"),
             body: Vec::new(),
             time_to_live_millis: None,
+            session_id: None,
         },
     );
 

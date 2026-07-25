@@ -34,7 +34,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Deferral and deferred receive | Pre-1.0 | Not implemented |
 | Dead-letter | Pre-1.0 | State machine |
 | Dead-letter receive and resubmit | Pre-1.0 | Not implemented |
-| Sessions and session state | Pre-1.0 | Not implemented |
+| Sessions and session state | Pre-1.0 | State machine |
 | Duplicate detection | Pre-1.0 | Not implemented |
 | Same-placement-group transactions | Pre-1.0 | Not implemented |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
@@ -62,6 +62,25 @@ behavior it currently enforces:
 - Messages past their time to live are dead-lettered as `TTLExpiredException`,
   both by the timer sweep and by any receive that reaches one first.
 - Rejected commands write nothing, so every replica rejects at the same point.
+- On a queue that requires sessions, a message carries a session identifier and
+  is only delivered to a receiver holding that session's lock. Ordering is
+  guaranteed within a session, which is the only FIFO guarantee made. A session
+  lock is exclusive and expires on its own deadline; session state outlives the
+  receiver that set it.
+
+Three session behaviors deliberately differ from Azure Service Bus, and each is
+a rejection or a bound rather than a silent difference:
+
+- A session identifier on a queue that does not require sessions is refused
+  rather than carried, because it would promise an ordering that queue cannot
+  keep. Azure accepts and ignores it.
+- Settling a message inside a session needs the message's own lock token, not a
+  live session lock. Azure fails settlement once the session lock is lost. The
+  message lock is treated as the authority over that message, so a receiver that
+  did the work can still settle it.
+- Accepting the next available session examines a bounded number of sessions and
+  reports none available if they are all held, rather than walking the entity.
+  The receiver retries.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch
 before reporting it applied, and the same semantics suite runs against both

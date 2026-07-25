@@ -16,7 +16,9 @@ pub struct QueueConfig {
     /// an effectively unbounded time to live.
     pub default_time_to_live_millis: Option<u64>,
     pub max_message_bytes: usize,
-    /// Accepted and stored, but session ordering is not yet enforced.
+    /// When set, every message carries a session identifier and is only
+    /// delivered to a receiver holding that session's lock. Ordering within a
+    /// session is the only FIFO guarantee the broker makes.
     pub requires_session: bool,
 }
 

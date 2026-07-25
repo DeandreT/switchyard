@@ -93,11 +93,27 @@ pub trait StateStore: Clone + Send + Sync + 'static {
     /// single point in time.
     fn snapshot(&self) -> Result<StoreSnapshot, StorageError>;
 
+    /// Returns up to `limit` entries whose key starts with `prefix` and sorts at
+    /// or after `start`, in ascending key order.
+    ///
+    /// `start` lets a caller resume a walk past entries it has already decided
+    /// about — skipping every entry of one session, say — without paying to read
+    /// them again. A `start` below `prefix` yields the same entries as starting
+    /// at `prefix`, since nothing outside the prefix is returned either way.
+    fn scan_from(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Key, Value)>, StorageError>;
+
     /// Returns up to `limit` entries whose key starts with `prefix`, in ascending
     /// key order. Callers encode index keys so that lexicographic order is the
     /// order they need to walk, and rely on `limit` to bound the work a single
     /// state-machine command performs.
-    fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Key, Value)>, StorageError>;
+    fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Key, Value)>, StorageError> {
+        self.scan_from(prefix, prefix, limit)
+    }
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -121,6 +137,15 @@ pub enum StorageError {
     UnsupportedStoreFormat { found: u32, expected: u32 },
     #[error("store metadata is unreadable: {detail}")]
     CorruptMetadata { detail: String },
+}
+
+/// Where a prefix scan actually begins.
+///
+/// A scan never leaves its prefix, so a `start` that sorts below the prefix
+/// begins at the prefix rather than at unrelated keys in between — otherwise the
+/// walk would end on the first of those instead of returning the prefix.
+pub(crate) fn scan_start<'a>(prefix: &'a [u8], start: &'a [u8]) -> &'a [u8] {
+    if start < prefix { prefix } else { start }
 }
 
 impl StorageError {

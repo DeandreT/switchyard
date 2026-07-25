@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Delivery, EntityPath, LockToken, NamespaceName, QueueConfig, ReceiveMode, SequenceNumber,
-    Timestamp,
+    AcceptedSession, Delivery, EntityPath, LockToken, NamespaceName, QueueConfig, ReceiveMode,
+    SequenceNumber, SessionHold, SessionId, Timestamp,
 };
 
 /// One replicated instruction for the broker state machine.
@@ -45,11 +45,17 @@ pub enum CommandKind {
         body: Vec<u8>,
         /// Overrides the queue default when set.
         time_to_live_millis: Option<u64>,
+        /// Required on a queue that requires sessions, and refused on one that
+        /// does not.
+        session_id: Option<SessionId>,
     },
     Receive {
         mode: ReceiveMode,
         /// Overrides the queue default when set.
         lock_duration_millis: Option<u64>,
+        /// The session lock this receive draws from. Required on a queue that
+        /// requires sessions, and refused on one that does not.
+        session: Option<SessionHold>,
     },
     Complete {
         sequence: SequenceNumber,
@@ -65,12 +71,39 @@ pub enum CommandKind {
         reason: String,
         description: String,
     },
+    /// Takes exclusive ownership of a session.
+    AcceptSession {
+        /// `None` accepts the next session that has a ready message and is not
+        /// already held.
+        session_id: Option<SessionId>,
+        /// Overrides the queue default when set.
+        lock_duration_millis: Option<u64>,
+    },
+    /// Gives up a session so another receiver can take it. Messages already
+    /// locked inside the session keep their own locks.
+    ReleaseSession {
+        session: SessionHold,
+    },
+    /// Extends a session lock without changing its token.
+    RenewSessionLock {
+        session: SessionHold,
+        /// Overrides the queue default when set.
+        lock_duration_millis: Option<u64>,
+    },
+    /// Replaces the opaque state stored alongside a session.
+    SetSessionState {
+        session: SessionHold,
+        state: Vec<u8>,
+    },
     /// Proposed by the leader's timer worker. Returns messages whose lock has
     /// elapsed, or dead-letters them once they reach the delivery limit.
     ExpireLocks,
     /// Proposed by the leader's timer worker. Dead-letters messages whose time
     /// to live has elapsed.
     ExpireMessages,
+    /// Proposed by the leader's timer worker. Releases sessions whose lock has
+    /// elapsed.
+    ExpireSessionLocks,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,5 +125,15 @@ pub enum CommandOutcome {
     },
     MessagesExpired {
         dead_lettered: u32,
+    },
+    /// `None` when no session was available to accept.
+    SessionAccepted(Option<AcceptedSession>),
+    SessionReleased,
+    SessionLockRenewed {
+        locked_until: Timestamp,
+    },
+    SessionStateSet,
+    SessionLocksExpired {
+        released: u32,
     },
 }

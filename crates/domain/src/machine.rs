@@ -13,9 +13,10 @@ use serde::de::DeserializeOwned;
 use storage::{StateStore, WriteBatch};
 
 use crate::{
-    BrokerError, Command, CommandKind, CommandOutcome, DeadLetterInfo, DeadLetterReason, Delivery,
-    DeliveryLock, EntityPath, LockToken, MessageRecord, MessageState, NamespaceName, QueueConfig,
-    QueueCounters, ReceiveMode, SequenceNumber, Timestamp, codec, keys,
+    AcceptedSession, BrokerError, Command, CommandKind, CommandOutcome, DeadLetterInfo,
+    DeadLetterReason, Delivery, DeliveryLock, EntityPath, LockToken, MessageRecord, MessageState,
+    NamespaceName, QueueConfig, QueueCounters, ReceiveMode, SequenceNumber, SessionHold, SessionId,
+    SessionLock, SessionRecord, Timestamp, codec, keys,
 };
 
 /// Ready entries a single receive may walk past while discarding expired
@@ -26,6 +27,11 @@ const MAX_RECEIVE_SCAN: usize = 32;
 /// Index entries a single timer sweep may process. The worker proposes another
 /// command when it reaches this limit.
 const MAX_TIMER_SCAN: usize = 256;
+
+/// Sessions one acceptance may examine before giving up. A queue whose first
+/// `MAX_SESSION_SCAN` sessions are all held reports none available rather than
+/// walking an unbounded number of them, and the receiver retries.
+const MAX_SESSION_SCAN: usize = 32;
 
 #[derive(Clone, Debug)]
 pub struct StateMachine<S> {
@@ -63,11 +69,26 @@ impl<S: StateStore> StateMachine<S> {
                 message_id,
                 body,
                 time_to_live_millis,
-            } => self.send(command, message_id, body, *time_to_live_millis, &mut batch)?,
+                session_id,
+            } => self.send(
+                command,
+                message_id,
+                body,
+                *time_to_live_millis,
+                session_id.as_ref(),
+                &mut batch,
+            )?,
             CommandKind::Receive {
                 mode,
                 lock_duration_millis,
-            } => self.receive(command, *mode, *lock_duration_millis, &mut batch)?,
+                session,
+            } => self.receive(
+                command,
+                *mode,
+                *lock_duration_millis,
+                session.as_ref(),
+                &mut batch,
+            )?,
             CommandKind::Complete {
                 sequence,
                 lock_token,
@@ -89,8 +110,28 @@ impl<S: StateStore> StateMachine<S> {
                 description,
                 &mut batch,
             )?,
+            CommandKind::AcceptSession {
+                session_id,
+                lock_duration_millis,
+            } => self.accept_session(
+                command,
+                session_id.as_ref(),
+                *lock_duration_millis,
+                &mut batch,
+            )?,
+            CommandKind::ReleaseSession { session } => {
+                self.release_session(command, session, &mut batch)?
+            }
+            CommandKind::RenewSessionLock {
+                session,
+                lock_duration_millis,
+            } => self.renew_session_lock(command, session, *lock_duration_millis, &mut batch)?,
+            CommandKind::SetSessionState { session, state } => {
+                self.set_session_state(command, session, state, &mut batch)?
+            }
             CommandKind::ExpireLocks => self.expire_locks(command, &mut batch)?,
             CommandKind::ExpireMessages => self.expire_messages(command, &mut batch)?,
+            CommandKind::ExpireSessionLocks => self.expire_session_locks(command, &mut batch)?,
         };
 
         // Advancing the clock in the same batch keeps the applied timestamp and
@@ -120,7 +161,7 @@ impl<S: StateStore> StateMachine<S> {
         entity: &EntityPath,
         sequence: SequenceNumber,
     ) -> Result<Option<MessageRecord>, BrokerError> {
-        self.read(&keys::message(namespace, entity, sequence))
+        self.read_message(&keys::message(namespace, entity, sequence))
     }
 
     pub fn dead_lettered_message(
@@ -129,7 +170,44 @@ impl<S: StateStore> StateMachine<S> {
         entity: &EntityPath,
         sequence: SequenceNumber,
     ) -> Result<Option<MessageRecord>, BrokerError> {
-        self.read(&keys::dead_letter(namespace, entity, sequence))
+        self.read_message(&keys::dead_letter(namespace, entity, sequence))
+    }
+
+    /// The stored state of one session. `None` means the session has never been
+    /// locked or given state, which is indistinguishable from one that was.
+    pub fn session(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionRecord>, BrokerError> {
+        self.read(&keys::session(namespace, entity, session_id))
+    }
+
+    /// The opaque state stored alongside a session, empty when it has none.
+    pub fn session_state(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+        session_id: &SessionId,
+    ) -> Result<Vec<u8>, BrokerError> {
+        Ok(self
+            .session(namespace, entity, session_id)?
+            .map(|record| record.state)
+            .unwrap_or_default())
+    }
+
+    pub fn session_ready_sequences(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+        session_id: &SessionId,
+        limit: usize,
+    ) -> Result<Vec<SequenceNumber>, BrokerError> {
+        self.index_sequences(
+            &keys::session_ready_prefix(namespace, entity, session_id),
+            limit,
+        )
     }
 
     pub fn ready_sequences(
@@ -166,6 +244,36 @@ impl<S: StateStore> StateMachine<S> {
         match self.store.get(key)? {
             Some(bytes) => Ok(Some(codec::decode(&bytes)?)),
             None => Ok(None),
+        }
+    }
+
+    /// Messages are the one record whose stored shape has changed, so they read
+    /// through their own version-aware decode rather than through [`Self::read`].
+    fn read_message(&self, key: &[u8]) -> Result<Option<MessageRecord>, BrokerError> {
+        match self.store.get(key)? {
+            Some(bytes) => Ok(Some(MessageRecord::decode(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn load_session(
+        &self,
+        command: &Command,
+        session_id: &SessionId,
+    ) -> Result<SessionRecord, BrokerError> {
+        Ok(self
+            .session(&command.namespace, &command.entity, session_id)?
+            .unwrap_or_default())
+    }
+
+    /// The index a ready message sits in: its own session's on a session queue,
+    /// and the entity-wide ready index otherwise.
+    fn ready_key(&self, command: &Command, record: &MessageRecord) -> Vec<u8> {
+        let namespace = &command.namespace;
+        let entity = &command.entity;
+        match &record.session_id {
+            Some(session_id) => keys::session_ready(namespace, entity, session_id, record.sequence),
+            None => keys::ready(namespace, entity, record.sequence),
         }
     }
 
@@ -212,9 +320,11 @@ impl<S: StateStore> StateMachine<S> {
         message_id: &str,
         body: &[u8],
         time_to_live_millis: Option<u64>,
+        session_id: Option<&SessionId>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
         let config = self.load_config(command)?;
+        require_session_agreement(&config, session_id.is_some())?;
         if body.len() > config.max_message_bytes {
             return Err(BrokerError::MessageTooLarge {
                 body_bytes: body.len(),
@@ -238,6 +348,7 @@ impl<S: StateStore> StateMachine<S> {
             expires_at,
             delivery_count: 0,
             state: MessageState::Ready,
+            session_id: session_id.cloned(),
         };
 
         let namespace = &command.namespace;
@@ -246,7 +357,7 @@ impl<S: StateStore> StateMachine<S> {
             keys::message(namespace, entity, sequence),
             codec::encode(&record)?,
         );
-        batch.push_put(keys::ready(namespace, entity, sequence), Vec::new());
+        batch.push_put(self.ready_key(command, &record), Vec::new());
         if let Some(expires_at) = expires_at {
             batch.push_put(
                 keys::expiry(namespace, entity, expires_at, sequence),
@@ -265,14 +376,24 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         mode: ReceiveMode,
         lock_duration_millis: Option<u64>,
+        session: Option<&SessionHold>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
         let config = self.load_config(command)?;
+        require_session_agreement(&config, session.is_some())?;
         let namespace = &command.namespace;
         let entity = &command.entity;
-        let ready = self
-            .store
-            .scan_prefix(&keys::ready_prefix(namespace, entity), MAX_RECEIVE_SCAN)?;
+
+        // A session receiver only ever sees its own session's messages, and only
+        // for as long as it holds the session.
+        let ready_prefix = match session {
+            Some(hold) => {
+                self.held_session(command, hold)?;
+                keys::session_ready_prefix(namespace, entity, &hold.session_id)
+            }
+            None => keys::ready_prefix(namespace, entity),
+        };
+        let ready = self.store.scan_prefix(&ready_prefix, MAX_RECEIVE_SCAN)?;
 
         for (key, _) in ready {
             let sequence = keys::trailing_sequence(&key).ok_or(BrokerError::MalformedIndexKey)?;
@@ -295,6 +416,7 @@ impl<S: StateStore> StateMachine<S> {
 
             record.delivery_count = record.delivery_count.saturating_add(1);
             let delivery_count = record.delivery_count;
+            let ready_key = self.ready_key(command, &record);
 
             let lock = match mode {
                 ReceiveMode::PeekLock => {
@@ -310,7 +432,7 @@ impl<S: StateStore> StateMachine<S> {
                         locked_until,
                     };
 
-                    batch.push_delete(keys::ready(namespace, entity, sequence));
+                    batch.push_delete(ready_key.clone());
                     batch.push_put(
                         keys::message(namespace, entity, sequence),
                         codec::encode(&record)?,
@@ -331,7 +453,7 @@ impl<S: StateStore> StateMachine<S> {
                 // At-most-once: the deletion commits before the transfer, so a
                 // client that never receives the reply loses this delivery.
                 ReceiveMode::ReceiveAndDelete => {
-                    batch.push_delete(keys::ready(namespace, entity, sequence));
+                    batch.push_delete(ready_key.clone());
                     batch.push_delete(keys::message(namespace, entity, sequence));
                     if let Some(expires_at) = record.expires_at {
                         batch.push_delete(keys::expiry(namespace, entity, expires_at, sequence));
@@ -347,6 +469,7 @@ impl<S: StateStore> StateMachine<S> {
                 enqueued_at: record.enqueued_at,
                 delivery_count,
                 lock,
+                session_id: record.session_id,
             })));
         }
 
@@ -403,7 +526,9 @@ impl<S: StateStore> StateMachine<S> {
             keys::message(namespace, entity, sequence),
             codec::encode(&record)?,
         );
-        batch.push_put(keys::ready(namespace, entity, sequence), Vec::new());
+        // Back into its own session's order on a session queue, so an abandon
+        // does not move a message ahead of its siblings.
+        batch.push_put(self.ready_key(command, &record), Vec::new());
         Ok(CommandOutcome::Abandoned {
             dead_lettered: false,
         })
@@ -472,7 +597,7 @@ impl<S: StateStore> StateMachine<S> {
                     keys::message(namespace, entity, sequence),
                     codec::encode(&record)?,
                 );
-                batch.push_put(keys::ready(namespace, entity, sequence), Vec::new());
+                batch.push_put(self.ready_key(command, &record), Vec::new());
                 returned_to_ready += 1;
             }
         }
@@ -516,6 +641,273 @@ impl<S: StateStore> StateMachine<S> {
         }
 
         Ok(CommandOutcome::MessagesExpired { dead_lettered })
+    }
+
+    // ---- sessions ----------------------------------------------------------
+
+    fn accept_session(
+        &self,
+        command: &Command,
+        session_id: Option<&SessionId>,
+        lock_duration_millis: Option<u64>,
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        let config = self.load_config(command)?;
+        if !config.requires_session {
+            return Err(BrokerError::SessionNotSupported);
+        }
+        let locked_until = command
+            .issued_at
+            .saturating_add_millis(lock_duration_millis.unwrap_or(config.lock_duration_millis));
+
+        let Some(session_id) = session_id else {
+            return self.accept_next_session(command, locked_until, batch);
+        };
+
+        // A named session can be accepted even when it holds nothing, which is
+        // how a receiver waits on a session it knows is coming.
+        let record = self.load_session(command, session_id)?;
+        if record.live_lock_at(command.issued_at).is_some() {
+            return Err(BrokerError::SessionAlreadyLocked {
+                session_id: session_id.clone(),
+            });
+        }
+        let accepted = self.lock_session(command, session_id, record, locked_until, batch)?;
+        Ok(CommandOutcome::SessionAccepted(Some(accepted)))
+    }
+
+    /// Walks the entity's ready messages grouped by session, taking the first
+    /// session nobody holds.
+    fn accept_next_session(
+        &self,
+        command: &Command,
+        locked_until: Timestamp,
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        let namespace = &command.namespace;
+        let entity = &command.entity;
+        let prefix = keys::entity_session_ready_prefix(namespace, entity);
+        let mut start = prefix.clone();
+
+        for _ in 0..MAX_SESSION_SCAN {
+            let Some((key, _)) = self.store.scan_from(&prefix, &start, 1)?.into_iter().next()
+            else {
+                return Ok(CommandOutcome::SessionAccepted(None));
+            };
+
+            let session_id = SessionId::new(
+                keys::session_id_after(&prefix, &key).ok_or(BrokerError::MalformedIndexKey)?,
+            )?;
+            let record = self.load_session(command, &session_id)?;
+            if record.live_lock_at(command.issued_at).is_none() {
+                let accepted =
+                    self.lock_session(command, &session_id, record, locked_until, batch)?;
+                return Ok(CommandOutcome::SessionAccepted(Some(accepted)));
+            }
+
+            // Held by someone else: resume past every message of this session
+            // rather than reading them only to reject them again.
+            start = keys::after_session_ready(namespace, entity, &session_id);
+        }
+
+        Ok(CommandOutcome::SessionAccepted(None))
+    }
+
+    fn lock_session(
+        &self,
+        command: &Command,
+        session_id: &SessionId,
+        mut record: SessionRecord,
+        locked_until: Timestamp,
+        batch: &mut WriteBatch,
+    ) -> Result<AcceptedSession, BrokerError> {
+        let namespace = &command.namespace;
+        let entity = &command.entity;
+        let mut counters = self.load_counters(command)?;
+        let token = LockToken::new(counters.next_lock_token);
+        counters.next_lock_token = counters.next_lock_token.saturating_add(1);
+
+        // An elapsed lock still owns an index entry, which the sweep may not
+        // have reached yet.
+        if let Some(previous) = record.lock {
+            batch.push_delete(keys::session_lock(
+                namespace,
+                entity,
+                previous.locked_until,
+                session_id,
+            ));
+        }
+
+        let lock = SessionLock {
+            token,
+            locked_until,
+        };
+        record.lock = Some(lock);
+        batch.push_put(
+            keys::session(namespace, entity, session_id),
+            codec::encode(&record)?,
+        );
+        batch.push_put(
+            keys::session_lock(namespace, entity, locked_until, session_id),
+            Vec::new(),
+        );
+        batch.push_put(
+            keys::queue_counters(namespace, entity),
+            codec::encode(&counters)?,
+        );
+
+        Ok(AcceptedSession {
+            session_id: session_id.clone(),
+            lock,
+            state: record.state,
+        })
+    }
+
+    fn release_session(
+        &self,
+        command: &Command,
+        session: &SessionHold,
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        let record = self.held_session(command, session)?;
+        self.clear_session_lock(command, &session.session_id, record, batch)?;
+        Ok(CommandOutcome::SessionReleased)
+    }
+
+    fn renew_session_lock(
+        &self,
+        command: &Command,
+        session: &SessionHold,
+        lock_duration_millis: Option<u64>,
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        let config = self.load_config(command)?;
+        let mut record = self.held_session(command, session)?;
+        let namespace = &command.namespace;
+        let entity = &command.entity;
+
+        let previous = record.lock.ok_or(BrokerError::SessionLockNotHeld {
+            session_id: session.session_id.clone(),
+        })?;
+        let locked_until = command
+            .issued_at
+            .saturating_add_millis(lock_duration_millis.unwrap_or(config.lock_duration_millis));
+
+        // The token is unchanged, so a receiver mid-renewal keeps working.
+        record.lock = Some(SessionLock {
+            token: previous.token,
+            locked_until,
+        });
+        batch.push_delete(keys::session_lock(
+            namespace,
+            entity,
+            previous.locked_until,
+            &session.session_id,
+        ));
+        batch.push_put(
+            keys::session_lock(namespace, entity, locked_until, &session.session_id),
+            Vec::new(),
+        );
+        batch.push_put(
+            keys::session(namespace, entity, &session.session_id),
+            codec::encode(&record)?,
+        );
+        Ok(CommandOutcome::SessionLockRenewed { locked_until })
+    }
+
+    fn set_session_state(
+        &self,
+        command: &Command,
+        session: &SessionHold,
+        state: &[u8],
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        let mut record = self.held_session(command, session)?;
+        record.state = state.to_vec();
+        batch.push_put(
+            keys::session(&command.namespace, &command.entity, &session.session_id),
+            codec::encode(&record)?,
+        );
+        Ok(CommandOutcome::SessionStateSet)
+    }
+
+    fn expire_session_locks(
+        &self,
+        command: &Command,
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        let namespace = &command.namespace;
+        let entity = &command.entity;
+        let prefix = keys::session_lock_prefix(namespace, entity);
+        let locks = self.store.scan_prefix(&prefix, MAX_TIMER_SCAN)?;
+
+        let mut released = 0;
+        for (key, _) in locks {
+            let (locked_until, session_id) =
+                keys::session_lock_parts(&prefix, &key).ok_or(BrokerError::MalformedIndexKey)?;
+            // Ordered by deadline, so the first lock still held ends the sweep.
+            if locked_until > command.issued_at {
+                break;
+            }
+
+            let session_id = SessionId::new(session_id)?;
+            let record = self.load_session(command, &session_id)?;
+            self.clear_session_lock(command, &session_id, record, batch)?;
+            released += 1;
+        }
+
+        Ok(CommandOutcome::SessionLocksExpired { released })
+    }
+
+    /// Drops a session's lock while keeping its state, which outlives any one
+    /// receiver. Messages locked inside the session keep their own locks.
+    fn clear_session_lock(
+        &self,
+        command: &Command,
+        session_id: &SessionId,
+        mut record: SessionRecord,
+        batch: &mut WriteBatch,
+    ) -> Result<(), BrokerError> {
+        let namespace = &command.namespace;
+        let entity = &command.entity;
+        if let Some(lock) = record.lock.take() {
+            batch.push_delete(keys::session_lock(
+                namespace,
+                entity,
+                lock.locked_until,
+                session_id,
+            ));
+        }
+        batch.push_put(
+            keys::session(namespace, entity, session_id),
+            codec::encode(&record)?,
+        );
+        Ok(())
+    }
+
+    /// Resolves a command's session hold, rejecting a token that does not match
+    /// a lock that is still live.
+    fn held_session(
+        &self,
+        command: &Command,
+        session: &SessionHold,
+    ) -> Result<SessionRecord, BrokerError> {
+        let record = self.load_session(command, &session.session_id)?;
+        let lock = record.lock.ok_or_else(|| BrokerError::SessionLockNotHeld {
+            session_id: session.session_id.clone(),
+        })?;
+        if lock.token != session.token {
+            return Err(BrokerError::SessionLockNotHeld {
+                session_id: session.session_id.clone(),
+            });
+        }
+        if lock.locked_until <= command.issued_at {
+            return Err(BrokerError::SessionLockExpired {
+                session_id: session.session_id.clone(),
+                locked_until: lock.locked_until,
+            });
+        }
+        Ok(record)
     }
 
     // ---- shared transitions ------------------------------------------------
@@ -565,7 +957,7 @@ impl<S: StateStore> StateMachine<S> {
 
         match record.state {
             MessageState::Ready => {
-                batch.push_delete(keys::ready(namespace, entity, sequence));
+                batch.push_delete(self.ready_key(command, &record));
             }
             MessageState::Locked { locked_until, .. } => {
                 batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
@@ -587,5 +979,17 @@ impl<S: StateStore> StateMachine<S> {
             codec::encode(&record)?,
         );
         Ok(())
+    }
+}
+
+/// Rejects a command whose session argument disagrees with the queue.
+///
+/// A session identifier on a queue that does not use sessions is refused rather
+/// than ignored: accepting it would promise an ordering the queue cannot keep.
+fn require_session_agreement(config: &QueueConfig, names_session: bool) -> Result<(), BrokerError> {
+    match (config.requires_session, names_session) {
+        (true, false) => Err(BrokerError::SessionRequired),
+        (false, true) => Err(BrokerError::SessionNotSupported),
+        _ => Ok(()),
     }
 }
