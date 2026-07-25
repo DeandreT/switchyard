@@ -1,0 +1,16 @@
+[package]
+name = "switchyardctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "switchyardctl"
+path = "src/main.rs"
+
+[dependencies]
+admin-api.workspace = true
+clap.workspace = true
+

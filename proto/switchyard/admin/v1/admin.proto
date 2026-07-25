@@ -1,0 +1,165 @@
+syntax = "proto3";
+
+package switchyard.admin.v1;
+
+service ClusterService {
+  rpc GetCluster(GetClusterRequest) returns (Cluster);
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+}
+
+service NamespaceService {
+  rpc CreateNamespace(CreateNamespaceRequest) returns (Namespace);
+  rpc GetNamespace(GetNamespaceRequest) returns (Namespace);
+  rpc ListNamespaces(ListNamespacesRequest) returns (ListNamespacesResponse);
+  rpc DeleteNamespace(DeleteNamespaceRequest) returns (Operation);
+}
+
+service EntityService {
+  rpc CreateEntity(CreateEntityRequest) returns (Entity);
+  rpc GetEntity(GetEntityRequest) returns (Entity);
+  rpc ListEntities(ListEntitiesRequest) returns (ListEntitiesResponse);
+  rpc DeleteEntity(DeleteEntityRequest) returns (Operation);
+}
+
+service BackupService {
+  rpc StartBackup(StartBackupRequest) returns (Operation);
+  rpc GetOperation(GetOperationRequest) returns (Operation);
+}
+
+service AuditService {
+  rpc StreamAudit(StreamAuditRequest) returns (stream AuditRecord);
+}
+
+message GetClusterRequest {}
+
+message ListNodesRequest {}
+
+message Cluster {
+  string cluster_id = 1;
+  string version = 2;
+  uint32 voters = 3;
+}
+
+message Node {
+  string node_id = 1;
+  string address = 2;
+  string availability_zone = 3;
+  string state = 4;
+}
+
+message ListNodesResponse {
+  repeated Node nodes = 1;
+}
+
+message CreateNamespaceRequest {
+  string name = 1;
+  uint64 storage_quota_bytes = 2;
+  string key_provider = 3;
+  string key_reference = 4;
+}
+
+message GetNamespaceRequest {
+  string name = 1;
+}
+
+message ListNamespacesRequest {
+  string page_token = 1;
+  uint32 page_size = 2;
+}
+
+message DeleteNamespaceRequest {
+  string name = 1;
+}
+
+message Namespace {
+  string name = 1;
+  uint64 storage_quota_bytes = 2;
+  uint64 used_logical_bytes = 3;
+  string key_provider = 4;
+}
+
+message ListNamespacesResponse {
+  repeated Namespace namespaces = 1;
+  string next_page_token = 2;
+}
+
+enum EntityKind {
+  ENTITY_KIND_UNSPECIFIED = 0;
+  ENTITY_KIND_QUEUE = 1;
+  ENTITY_KIND_TOPIC = 2;
+  ENTITY_KIND_SUBSCRIPTION = 3;
+}
+
+message CreateEntityRequest {
+  string namespace = 1;
+  string path = 2;
+  EntityKind kind = 3;
+  string placement_group_id = 4;
+  uint64 max_size_bytes = 5;
+  uint64 default_ttl_millis = 6;
+  uint64 lock_duration_millis = 7;
+  uint32 max_delivery_count = 8;
+  bool requires_session = 9;
+}
+
+message GetEntityRequest {
+  string namespace = 1;
+  string path = 2;
+}
+
+message ListEntitiesRequest {
+  string namespace = 1;
+  string page_token = 2;
+  uint32 page_size = 3;
+}
+
+message DeleteEntityRequest {
+  string namespace = 1;
+  string path = 2;
+}
+
+message Entity {
+  string namespace = 1;
+  string path = 2;
+  EntityKind kind = 3;
+  string placement_group_id = 4;
+  uint64 max_size_bytes = 5;
+  uint64 used_logical_bytes = 6;
+}
+
+message ListEntitiesResponse {
+  repeated Entity entities = 1;
+  string next_page_token = 2;
+}
+
+message StartBackupRequest {
+  string destination = 1;
+}
+
+message GetOperationRequest {
+  string operation_id = 1;
+}
+
+message Operation {
+  string operation_id = 1;
+  string state = 2;
+  string error = 3;
+}
+
+message StreamAuditRequest {
+  string namespace = 1;
+  uint64 after_sequence = 2;
+}
+
+message AuditRecord {
+  uint64 sequence = 1;
+  uint64 unix_millis = 2;
+  string actor = 3;
+  string namespace = 4;
+  string entity = 5;
+  string operation = 6;
+  string result = 7;
+  bytes previous_hash = 8;
+  bytes record_hash = 9;
+}
+

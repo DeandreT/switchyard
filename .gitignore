@@ -1,0 +1,15 @@
+/target/
+/.idea/
+/.vscode/
+*.log
+*.pid
+*.profraw
+*.swp
+.DS_Store
+
+# Local runtime state and credentials
+/data/
+/backups/
+/.env
+/*.local.toml
+

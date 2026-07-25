@@ -1,0 +1,18 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "switchyard"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+cluster.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+

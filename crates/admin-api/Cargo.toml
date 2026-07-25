@@ -1,0 +1,12 @@
+[package]
+name = "admin-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+domain.workspace = true
+serde.workspace = true
+
