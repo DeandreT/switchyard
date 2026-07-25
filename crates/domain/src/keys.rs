@@ -27,7 +27,8 @@ const TAG_MESSAGE: u8 = 0x03;
 const TAG_READY: u8 = 0x04;
 const TAG_LOCK: u8 = 0x05;
 const TAG_EXPIRY: u8 = 0x06;
-const TAG_DEAD_LETTER: u8 = 0x07;
+// 0x07 held the dead-letter keyspace before dead-letter queues became queues;
+// retired with store format 2 and not to be reused.
 const TAG_SESSION: u8 = 0x08;
 const TAG_SESSION_READY: u8 = 0x09;
 const TAG_SESSION_LOCK: u8 = 0x0A;
@@ -139,18 +140,6 @@ pub fn expiry(
 ) -> Vec<u8> {
     let key = with_u64(expiry_prefix(namespace, entity), expires_at.as_millis());
     with_u64(key, sequence.as_u64())
-}
-
-pub fn dead_letter_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
-    entity_scope(TAG_DEAD_LETTER, namespace, entity)
-}
-
-pub fn dead_letter(
-    namespace: &NamespaceName,
-    entity: &EntityPath,
-    sequence: SequenceNumber,
-) -> Vec<u8> {
-    with_u64(dead_letter_prefix(namespace, entity), sequence.as_u64())
 }
 
 /// The record holding one session's lock and state.

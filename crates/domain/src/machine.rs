@@ -192,7 +192,7 @@ impl<S: StateStore> StateMachine<S> {
         entity: &EntityPath,
         sequence: SequenceNumber,
     ) -> Result<Option<MessageRecord>, BrokerError> {
-        self.read_message(&keys::dead_letter(namespace, entity, sequence))
+        self.message(namespace, &entity.dead_letter_queue()?, sequence)
     }
 
     /// The stored state of one session. `None` means the session has never been
@@ -241,13 +241,14 @@ impl<S: StateStore> StateMachine<S> {
         self.index_sequences(&keys::ready_prefix(namespace, entity), limit)
     }
 
+    /// Sequences ready in the entity's dead-letter queue, in order.
     pub fn dead_lettered_sequences(
         &self,
         namespace: &NamespaceName,
         entity: &EntityPath,
         limit: usize,
     ) -> Result<Vec<SequenceNumber>, BrokerError> {
-        self.index_sequences(&keys::dead_letter_prefix(namespace, entity), limit)
+        self.ready_sequences(namespace, &entity.dead_letter_queue()?, limit)
     }
 
     fn index_sequences(
@@ -327,12 +328,31 @@ impl<S: StateStore> StateMachine<S> {
         config: QueueConfig,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
+        if command.entity.is_dead_letter_queue() {
+            return Err(BrokerError::DeadLetterQueueIsReserved);
+        }
         let key = keys::queue_config(&command.namespace, &command.entity);
         if self.store.get(&key)?.is_some() {
             return Err(BrokerError::QueueAlreadyExists);
         }
         let config = config.validate()?;
+
+        // Every queue casts a dead-letter shadow: a queue with the same limits
+        // that ignores lifetimes and sessions and never dead-letters again.
+        // Failing here, rather than at the first dead-lettering, is why a
+        // parent whose shadow path would be too long cannot be created.
+        let dead_letter_queue = command.entity.dead_letter_queue()?;
+        let shadow = QueueConfig {
+            max_delivery_count: u32::MAX,
+            default_time_to_live_millis: None,
+            requires_session: false,
+            ..config
+        };
         batch.push_put(key, codec::encode(&config)?);
+        batch.push_put(
+            keys::queue_config(&command.namespace, &dead_letter_queue),
+            codec::encode(&shadow)?,
+        );
         Ok(CommandOutcome::QueueCreated)
     }
 
@@ -345,6 +365,9 @@ impl<S: StateStore> StateMachine<S> {
         session_id: Option<&SessionId>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
+        if command.entity.is_dead_letter_queue() {
+            return Err(BrokerError::DeadLetterQueueIsReserved);
+        }
         let config = self.load_config(command)?;
         require_session_agreement(&config, session_id.is_some())?;
         if body.len() > config.max_message_bytes {
@@ -371,6 +394,7 @@ impl<S: StateStore> StateMachine<S> {
             delivery_count: 0,
             state: MessageState::Ready,
             session_id: session_id.cloned(),
+            dead_letter: None,
         };
 
         let namespace = &command.namespace;
@@ -527,7 +551,7 @@ impl<S: StateStore> StateMachine<S> {
         let config = self.load_config(command)?;
         let (mut record, locked_until) = self.held_lock(command, sequence, lock_token)?;
 
-        if record.delivery_count >= config.max_delivery_count {
+        if exceeded_delivery_limit(command, &config, &record) {
             self.move_to_dead_letter(
                 command,
                 record,
@@ -603,7 +627,7 @@ impl<S: StateStore> StateMachine<S> {
                 .message(namespace, entity, sequence)?
                 .ok_or(BrokerError::DanglingIndexEntry { sequence })?;
 
-            if record.delivery_count >= config.max_delivery_count {
+            if exceeded_delivery_limit(command, &config, &record) {
                 self.move_to_dead_letter(
                     command,
                     record,
@@ -984,24 +1008,49 @@ impl<S: StateStore> StateMachine<S> {
             MessageState::Locked { locked_until, .. } => {
                 batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
             }
-            MessageState::DeadLettered(_) => {}
         }
         batch.push_delete(keys::message(namespace, entity, sequence));
         if let Some(expires_at) = record.expires_at {
             batch.push_delete(keys::expiry(namespace, entity, expires_at, sequence));
         }
 
-        record.state = MessageState::DeadLettered(DeadLetterInfo {
+        // Into the shadow queue as an ordinary ready message under its original
+        // sequence — the same receive and settlement machinery drains it.
+        // Lifetime and session are stripped: time to live does not apply in a
+        // dead-letter queue, and its receivers hold no session.
+        let dead_letter_queue = entity.dead_letter_queue()?;
+        record.state = MessageState::Ready;
+        record.expires_at = None;
+        record.session_id = None;
+        record.dead_letter = Some(DeadLetterInfo {
             reason,
             description,
             dead_lettered_at: command.issued_at,
         });
         batch.push_put(
-            keys::dead_letter(namespace, entity, sequence),
+            keys::message(namespace, &dead_letter_queue, sequence),
             codec::encode(&record)?,
+        );
+        batch.push_put(
+            keys::ready(namespace, &dead_letter_queue, sequence),
+            Vec::new(),
         );
         Ok(())
     }
+}
+
+/// Whether abandoning or lock expiry should dead-letter rather than return the
+/// message.
+///
+/// Never true inside a dead-letter queue: its shadow config carries an
+/// unreachable delivery limit, and this guard keeps even a saturated delivery
+/// count from cascading a message into a shadow of a shadow.
+fn exceeded_delivery_limit(
+    command: &Command,
+    config: &QueueConfig,
+    record: &MessageRecord,
+) -> bool {
+    !command.entity.is_dead_letter_queue() && record.delivery_count >= config.max_delivery_count
 }
 
 /// Rejects a command whose session argument disagrees with the queue.

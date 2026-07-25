@@ -107,7 +107,7 @@ fn a_sweep_returns_a_message_whose_lock_elapsed<P: StoreProvider>(
     assert_eq!(
         runtime.sweep()?,
         SweepReport {
-            queues_swept: 1,
+            queues_swept: 2, // the queue and its dead-letter shadow
             locks_returned_to_ready: 1,
             ..SweepReport::default()
         }
@@ -132,7 +132,7 @@ fn a_sweep_dead_letters_a_message_past_its_time_to_live<P: StoreProvider>(
     assert_eq!(
         runtime.sweep()?,
         SweepReport {
-            queues_swept: 1,
+            queues_swept: 2, // the queue and its dead-letter shadow
             messages_dead_lettered: 1,
             ..SweepReport::default()
         }
@@ -173,7 +173,7 @@ fn a_sweep_releases_a_session_whose_lock_elapsed<P: StoreProvider>(
     assert_eq!(
         runtime.sweep()?,
         SweepReport {
-            queues_swept: 1,
+            queues_swept: 2, // the queue and its dead-letter shadow
             sessions_released: 1,
             ..SweepReport::default()
         }
@@ -210,7 +210,7 @@ fn one_sweep_drains_a_backlog_larger_than_a_single_command<P: StoreProvider>(
     assert_eq!(
         runtime.sweep()?,
         SweepReport {
-            queues_swept: 1,
+            queues_swept: 2, // the queue and its dead-letter shadow
             locks_returned_to_ready: backlog as u32,
             ..SweepReport::default()
         }

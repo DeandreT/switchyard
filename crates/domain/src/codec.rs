@@ -13,7 +13,12 @@ pub const VALUE_FORMAT_V1: u8 = 1;
 /// same shape it had in version 1.
 pub const VALUE_FORMAT_V2: u8 = 2;
 
-pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V2;
+/// Moves a message's dead-letter information out of its state enum: a
+/// dead-lettered message now lives in a dead-letter queue as an ordinary ready
+/// or locked record. Every other record keeps its version 2 shape.
+pub const VALUE_FORMAT_V3: u8 = 3;
+
+pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V3;
 
 /// Encodes a value into a versioned envelope.
 ///
@@ -41,7 +46,7 @@ pub fn decode<T: DeserializeOwned>(envelope: &[u8]) -> Result<T, CodecError> {
 /// a version this build does not know.
 pub fn split(envelope: &[u8]) -> Result<(u8, &[u8]), CodecError> {
     let (version, payload) = envelope.split_first().ok_or(CodecError::EmptyEnvelope)?;
-    if *version != VALUE_FORMAT_V1 && *version != VALUE_FORMAT_V2 {
+    if !(VALUE_FORMAT_V1..=ACTIVE_VALUE_FORMAT).contains(version) {
         return Err(CodecError::UnsupportedVersion { version: *version });
     }
     Ok((*version, payload))
@@ -87,7 +92,7 @@ mod tests {
     #[test]
     fn a_record_that_never_changed_shape_reads_under_either_version() -> Result<(), CodecError> {
         let payload = postcard::to_stdvec(&(7_u64, String::from("orders"))).expect("encodes");
-        for version in [VALUE_FORMAT_V1, VALUE_FORMAT_V2] {
+        for version in [VALUE_FORMAT_V1, VALUE_FORMAT_V2, VALUE_FORMAT_V3] {
             let mut envelope = vec![version];
             envelope.extend_from_slice(&payload);
             assert_eq!(

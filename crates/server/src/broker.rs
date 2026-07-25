@@ -400,7 +400,18 @@ mod tests {
     #[test]
     fn listing_queues_reaches_the_same_owner() -> Result<(), SubmitError> {
         let broker = broker();
-        assert_eq!(broker.handle().queues_blocking(16)?, vec![names()]);
+        let (namespace, entity) = names();
+        // A queue and the dead-letter shadow it casts, in key order.
+        assert_eq!(
+            broker.handle().queues_blocking(16)?,
+            vec![
+                (namespace.clone(), entity.clone()),
+                (
+                    namespace,
+                    entity.dead_letter_queue().expect("a valid shadow")
+                ),
+            ]
+        );
         Ok(())
     }
 

@@ -405,6 +405,63 @@ async fn a_held_session_is_refused_until_its_link_closes() -> Result<(), Box<dyn
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_message_is_drained_from_the_dead_letter_queue() -> Result<(), Box<dyn Error>> {
+    let node = Node::start("orders", QueueConfig::default()).await?;
+
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
+    sender
+        .send(Message::builder().body(body("poison")).build())
+        .await?;
+
+    // Rejecting a delivery dead-letters it rather than redelivering it.
+    let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
+    let delivery = receiver.recv::<Body<Binary>>().await?;
+    receiver.reject(&delivery, None).await?;
+
+    // The dead-letter queue is addressed as a sub-queue and drained like one.
+    let mut dead_letter_receiver =
+        Receiver::attach(&mut session, "dlq-receiver", "orders/$deadletterqueue").await?;
+    let poisoned = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        dead_letter_receiver.recv::<Body<Binary>>(),
+    )
+    .await??;
+    assert_eq!(text_of(poisoned.message()), "poison");
+    dead_letter_receiver.accept(&poisoned).await?;
+
+    // Completing in the dead-letter queue removes the message permanently.
+    let drained = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        dead_letter_receiver.recv::<Body<Binary>>(),
+    )
+    .await;
+    assert!(drained.is_err(), "the dead-letter queue still held it");
+
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sender_cannot_attach_to_a_dead_letter_queue() -> Result<(), Box<dyn Error>> {
+    let node = Node::start("orders", QueueConfig::default()).await?;
+
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut smuggler = Sender::attach(&mut session, "smuggler", "orders/$deadletterqueue").await?;
+
+    // The attach completes and the link is then refused; the send never lands.
+    let outcome = smuggler
+        .send(Message::builder().body(body("smuggled")).build())
+        .await;
+    assert!(outcome.is_err(), "a send into the dead-letter queue landed");
+
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn attaching_to_a_queue_that_does_not_exist_is_refused() -> Result<(), Box<dyn Error>> {
     let node = Node::start("orders", QueueConfig::default()).await?;
 

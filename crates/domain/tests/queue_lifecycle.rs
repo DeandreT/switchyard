@@ -463,7 +463,8 @@ fn an_application_can_dead_letter_a_locked_message<P: StoreProvider>(
     assert_eq!(info.reason.as_str(), "SchemaMismatch");
     assert_eq!(info.description, "order payload failed validation");
     assert_eq!(info.dead_lettered_at, Timestamp::from_millis(30));
-    assert!(matches!(dead.state, MessageState::DeadLettered(_)));
+    // Dead-lettered is a queue, not a state: the record waits there ready.
+    assert!(matches!(dead.state, MessageState::Ready));
     Ok(())
 }
 

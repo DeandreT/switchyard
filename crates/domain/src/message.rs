@@ -114,7 +114,6 @@ pub enum MessageState {
         token: LockToken,
         locked_until: Timestamp,
     },
-    DeadLettered(DeadLetterInfo),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -126,17 +125,54 @@ pub struct MessageRecord {
     pub expires_at: Option<Timestamp>,
     pub delivery_count: u32,
     pub state: MessageState,
-    /// Set exactly when the queue requires sessions. `session_id` is last in the
-    /// record so that a version 1 payload is a strict prefix of a version 2 one,
-    /// which makes decoding a version 1 record as version 2 run off the end of
-    /// the buffer instead of silently producing a different message.
+    /// Set exactly when the queue requires sessions.
+    ///
+    /// Fields are appended in the order the record grew — `session_id` in
+    /// version 2, `dead_letter` in version 3 — so an older payload is a strict
+    /// prefix of a newer one, and reading it as the newer version runs off the
+    /// end of the buffer instead of silently producing a different message.
     pub session_id: Option<SessionId>,
+    /// Why the message was dead-lettered, once it lives in a dead-letter queue.
+    ///
+    /// Dead-lettered is not a state of its own: a message in a dead-letter
+    /// queue is ready or locked like any other, which is what lets the same
+    /// receive and settlement machinery drain it. This field is what remembers
+    /// how it got there.
+    pub dead_letter: Option<DeadLetterInfo>,
+}
+
+/// The state enum as versions 1 and 2 stored it, when dead-lettered was a
+/// state rather than a queue.
+#[derive(Deserialize)]
+enum MessageStateV2 {
+    Ready,
+    Locked {
+        token: LockToken,
+        locked_until: Timestamp,
+    },
+    DeadLettered(DeadLetterInfo),
+}
+
+impl From<MessageStateV2> for (MessageState, Option<DeadLetterInfo>) {
+    fn from(state: MessageStateV2) -> Self {
+        match state {
+            MessageStateV2::Ready => (MessageState::Ready, None),
+            MessageStateV2::Locked {
+                token,
+                locked_until,
+            } => (
+                MessageState::Locked {
+                    token,
+                    locked_until,
+                },
+                None,
+            ),
+            MessageStateV2::DeadLettered(info) => (MessageState::Ready, Some(info)),
+        }
+    }
 }
 
 /// The version 1 shape of [`MessageRecord`], from before queues had sessions.
-///
-/// Kept so that a store written by an earlier build still reads. Version 1
-/// predates sessions entirely, so every message it holds belongs to no session.
 #[derive(Deserialize)]
 struct MessageRecordV1 {
     sequence: SequenceNumber,
@@ -145,12 +181,42 @@ struct MessageRecordV1 {
     enqueued_at: Timestamp,
     expires_at: Option<Timestamp>,
     delivery_count: u32,
-    state: MessageState,
+    state: MessageStateV2,
+}
+
+/// The version 2 shape, from before the dead-letter queue was a queue.
+#[derive(Deserialize)]
+struct MessageRecordV2 {
+    sequence: SequenceNumber,
+    message_id: String,
+    body: Vec<u8>,
+    enqueued_at: Timestamp,
+    expires_at: Option<Timestamp>,
+    delivery_count: u32,
+    state: MessageStateV2,
+    session_id: Option<SessionId>,
+}
+
+impl From<MessageRecordV2> for MessageRecord {
+    fn from(record: MessageRecordV2) -> Self {
+        let (state, dead_letter) = record.state.into();
+        Self {
+            sequence: record.sequence,
+            message_id: record.message_id,
+            body: record.body,
+            enqueued_at: record.enqueued_at,
+            expires_at: record.expires_at,
+            delivery_count: record.delivery_count,
+            state,
+            session_id: record.session_id,
+            dead_letter,
+        }
+    }
 }
 
 impl From<MessageRecordV1> for MessageRecord {
     fn from(record: MessageRecordV1) -> Self {
-        Self {
+        MessageRecordV2 {
             sequence: record.sequence,
             message_id: record.message_id,
             body: record.body,
@@ -160,18 +226,20 @@ impl From<MessageRecordV1> for MessageRecord {
             state: record.state,
             session_id: None,
         }
+        .into()
     }
 }
 
 impl MessageRecord {
-    /// Decodes a stored message, migrating a version 1 record on the way.
+    /// Decodes a stored message, migrating an older record on the way.
     ///
-    /// Messages are the one record whose shape changed, so they decode through
-    /// here rather than through the shape-stable [`codec::decode`].
+    /// Messages are the one record whose shape has changed, so they decode
+    /// through here rather than through the shape-stable [`codec::decode`].
     pub fn decode(envelope: &[u8]) -> Result<Self, CodecError> {
         let (version, payload) = codec::split(envelope)?;
         match version {
             codec::VALUE_FORMAT_V1 => Ok(codec::decode_payload::<MessageRecordV1>(payload)?.into()),
+            codec::VALUE_FORMAT_V2 => Ok(codec::decode_payload::<MessageRecordV2>(payload)?.into()),
             _ => codec::decode_payload(payload),
         }
     }
@@ -183,10 +251,7 @@ impl MessageRecord {
     }
 
     pub fn dead_letter_info(&self) -> Option<&DeadLetterInfo> {
-        match &self.state {
-            MessageState::DeadLettered(info) => Some(info),
-            _ => None,
-        }
+        self.dead_letter.as_ref()
     }
 }
 
@@ -224,12 +289,25 @@ mod tests {
             delivery_count: 0,
             state: MessageState::Ready,
             session_id: None,
+            dead_letter: None,
         }
     }
 
-    /// The version 1 payload of [`record`], which is every field except the
-    /// session identifier version 2 appended.
-    fn version_1_payload() -> Vec<u8> {
+    /// The state enum as versions 1 and 2 wrote it, for building old payloads.
+    #[derive(Serialize)]
+    enum StoredStateV2 {
+        Ready,
+        #[expect(dead_code)]
+        Locked {
+            token: LockToken,
+            locked_until: Timestamp,
+        },
+        DeadLettered(DeadLetterInfo),
+    }
+
+    /// The version 1 payload of [`record`]: every field up to the session
+    /// identifier version 2 appended.
+    fn version_1_payload(state: StoredStateV2) -> Vec<u8> {
         postcard::to_stdvec(&(
             SequenceNumber::new(1),
             String::from("m-1"),
@@ -237,7 +315,7 @@ mod tests {
             Timestamp::from_millis(0),
             Option::<Timestamp>::None,
             0_u32,
-            MessageState::Ready,
+            state,
         ))
         .expect("a message encodes")
     }
@@ -261,7 +339,7 @@ mod tests {
             ..record(None)
         };
         let envelope = codec::encode(&original)?;
-        assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V2));
+        assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V3));
         assert_eq!(MessageRecord::decode(&envelope)?, original);
         Ok(())
     }
@@ -269,7 +347,7 @@ mod tests {
     #[test]
     fn a_version_1_message_reads_as_belonging_to_no_session() -> Result<(), CodecError> {
         let mut envelope = vec![codec::VALUE_FORMAT_V1];
-        envelope.extend_from_slice(&version_1_payload());
+        envelope.extend_from_slice(&version_1_payload(StoredStateV2::Ready));
 
         // Version 1 predates sessions, so every message it holds is session-less.
         assert_eq!(MessageRecord::decode(&envelope)?, record(None));
@@ -277,12 +355,33 @@ mod tests {
     }
 
     #[test]
-    fn version_1_bytes_cannot_be_misread_as_the_active_format() {
-        // The rollback direction. `session_id` is the last field, so a version 1
-        // payload runs off the end of the buffer when it is read as version 2
-        // rather than decoding into some other message.
+    fn an_old_dead_lettered_state_reads_as_a_ready_dead_letter() -> Result<(), CodecError> {
+        // Versions 1 and 2 stored dead-lettered as a state. It reads back as a
+        // ready message that remembers why it was dead-lettered, which is the
+        // shape a dead-letter queue drains.
+        let info = DeadLetterInfo {
+            reason: DeadLetterReason::TimeToLiveExpired,
+            description: String::from("expired"),
+            dead_lettered_at: Timestamp::from_millis(9),
+        };
+        let mut envelope = vec![codec::VALUE_FORMAT_V1];
+        envelope.extend_from_slice(&version_1_payload(StoredStateV2::DeadLettered(
+            info.clone(),
+        )));
+
+        let decoded = MessageRecord::decode(&envelope)?;
+        assert_eq!(decoded.state, MessageState::Ready);
+        assert_eq!(decoded.dead_letter, Some(info));
+        Ok(())
+    }
+
+    #[test]
+    fn old_bytes_cannot_be_misread_as_the_active_format() {
+        // The rollback direction. Fields are appended in version order, so an
+        // older payload runs off the end of the buffer when read as the active
+        // version rather than decoding into some other message.
         assert_eq!(
-            codec::decode_payload::<MessageRecord>(&version_1_payload()),
+            codec::decode_payload::<MessageRecord>(&version_1_payload(StoredStateV2::Ready)),
             Err(CodecError::Decode)
         );
     }

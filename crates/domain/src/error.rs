@@ -36,6 +36,8 @@ pub enum BrokerError {
     },
     #[error("invalid queue configuration: {0}")]
     QueueConfig(#[from] QueueConfigError),
+    #[error("a dead-letter queue exists only as the shadow of its parent")]
+    DeadLetterQueueIsReserved,
     #[error("queue requires a session and the command named none")]
     SessionRequired,
     #[error("queue does not use sessions")]

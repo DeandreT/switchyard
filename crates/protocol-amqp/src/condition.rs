@@ -43,7 +43,9 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
 
         // The client used the entity in a way its configuration forbids, which
         // no retry fixes.
-        BrokerError::SessionRequired | BrokerError::SessionNotSupported => NOT_ALLOWED,
+        BrokerError::SessionRequired
+        | BrokerError::SessionNotSupported
+        | BrokerError::DeadLetterQueueIsReserved => NOT_ALLOWED,
 
         BrokerError::MessageTooLarge { .. } => MESSAGE_SIZE_EXCEEDED,
         BrokerError::QueueConfig(_) => PRECONDITION_FAILED,

@@ -315,11 +315,12 @@ mod tests {
             )?;
         }
 
+        // Each queue casts a dead-letter shadow, and the sweep visits both.
         assert_eq!(
             TimerWorker::new(&broker.handle())
                 .sweep_once()?
                 .queues_swept,
-            3
+            6
         );
         Ok(())
     }

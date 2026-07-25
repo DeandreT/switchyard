@@ -32,8 +32,8 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
 | Scheduling and cancellation | Pre-1.0 | Not implemented |
 | Deferral and deferred receive | Pre-1.0 | Not implemented |
-| Dead-letter | Pre-1.0 | State machine |
-| Dead-letter receive and resubmit | Pre-1.0 | Not implemented |
+| Dead-letter | Pre-1.0 | State machine, AMQP mapping |
+| Dead-letter receive and resubmit | Pre-1.0 | Receive: state machine, AMQP mapping. Resubmit: not implemented |
 | Sessions and session state | Pre-1.0 | State machine, AMQP mapping |
 | Duplicate detection | Pre-1.0 | Not implemented |
 | Same-placement-group transactions | Pre-1.0 | Not implemented |
@@ -61,6 +61,12 @@ behavior it currently enforces:
   dead-lettered as `MaxDeliveryCountExceeded`.
 - Messages past their time to live are dead-lettered as `TTLExpiredException`,
   both by the timer sweep and by any receive that reaches one first.
+- The dead-letter queue is a queue: `entity/$deadletterqueue` is drained with
+  the same receive and settlement machinery as its parent. Messages arrive
+  there stripped of lifetime and session, keep their sequence numbers and the
+  reason they were dead-lettered, and never dead-letter again — abandoning in
+  a dead-letter queue always returns the message to it. The path is reserved:
+  it cannot be created or sent to directly.
 - Rejected commands write nothing, so every replica rejects at the same point.
 - On a queue that requires sessions, a message carries a session identifier and
   is only delivered to a receiver holding that session's lock. Ordering is
@@ -98,9 +104,9 @@ open and releases it when the link closes, because the management operations
 the SDKs renew through are not implemented. A transfer is accepted only after its
 command committed, so the acknowledgement means durable. What this is not yet:
 there is no TLS, no SASL or CBS authentication, one node serves one namespace,
-and session-aware links and dead-letter receive are not exposed. The end-to-end
-coverage is a Rust AMQP 1.0 client, not the official SDKs the client gates
-require.
+and dead-letter reason and description are not yet surfaced as message
+annotations. The end-to-end coverage is a Rust AMQP 1.0 client, not the
+official SDKs the client gates require.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch
 before reporting it applied, and the same semantics suite runs against both

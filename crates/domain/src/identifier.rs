@@ -8,6 +8,8 @@ pub const MAX_ENTITY_PATH_BYTES: usize = 260;
 pub const MAX_PLACEMENT_GROUP_ID_BYTES: usize = 128;
 /// The Service Bus session identifier limit.
 pub const MAX_SESSION_ID_BYTES: usize = 128;
+/// Suffix naming an entity's dead-letter queue, per the Service Bus path model.
+pub const DEAD_LETTER_QUEUE_SUFFIX: &str = "/$deadletterqueue";
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -44,6 +46,24 @@ impl EntityPath {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The dead-letter queue that shadows this entity.
+    ///
+    /// Fails only when the suffixed path would exceed the entity length limit,
+    /// which is why creating a queue validates this up front rather than
+    /// discovering it at the first dead-lettering.
+    pub fn dead_letter_queue(&self) -> Result<Self, IdentifierError> {
+        Self::new(format!("{}{DEAD_LETTER_QUEUE_SUFFIX}", self.0))
+    }
+
+    /// Whether this path names a dead-letter queue. Such paths are reserved:
+    /// they exist as shadows of their parent, never created or sent to
+    /// directly.
+    pub fn is_dead_letter_queue(&self) -> bool {
+        self.0
+            .to_ascii_lowercase()
+            .ends_with(DEAD_LETTER_QUEUE_SUFFIX)
     }
 }
 

@@ -23,8 +23,9 @@ pub use codec::CodecError;
 pub use command::{Command, CommandKind, CommandOutcome};
 pub use error::BrokerError;
 pub use identifier::{
-    EntityPath, IdentifierError, MAX_ENTITY_PATH_BYTES, MAX_NAMESPACE_NAME_BYTES,
-    MAX_PLACEMENT_GROUP_ID_BYTES, MAX_SESSION_ID_BYTES, NamespaceName, PlacementGroupId, SessionId,
+    DEAD_LETTER_QUEUE_SUFFIX, EntityPath, IdentifierError, MAX_ENTITY_PATH_BYTES,
+    MAX_NAMESPACE_NAME_BYTES, MAX_PLACEMENT_GROUP_ID_BYTES, MAX_SESSION_ID_BYTES, NamespaceName,
+    PlacementGroupId, SessionId,
 };
 pub use machine::{StateMachine, TIMER_SCAN_LIMIT};
 pub use message::{

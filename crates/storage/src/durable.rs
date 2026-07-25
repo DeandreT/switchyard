@@ -19,13 +19,18 @@ use crate::{Key, Mutation, StateStore, StorageError, StoreSnapshot, Value, Write
 /// big-endian format version in `meta`.
 pub const STORE_FORMAT_V1: u32 = 1;
 
+/// Version 2: the broker's keyspace moved dead-lettered messages out of their
+/// own tag and into shadow dead-letter queues. Same physical layout as
+/// version 1; the caller's keys mean different things.
+pub const STORE_FORMAT_V2: u32 = 2;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V1;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V2;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";

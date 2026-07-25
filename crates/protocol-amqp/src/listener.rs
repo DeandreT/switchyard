@@ -208,7 +208,7 @@ async fn plan_link<B: Broker>(
     address: &str,
     attach: &Attach,
 ) -> Result<(EntityPath, Option<AcceptedSession>), definitions::Error> {
-    let entity = resolve_entity(address)
+    let entity = resolve_entity(address, attach.role.clone())
         .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?;
 
     // Only a receiving link takes a session lock; a sender names a session per
@@ -252,12 +252,21 @@ async fn plan_link<B: Broker>(
 }
 
 /// The entity a link may attach to, or why it may not.
-fn resolve_entity(address: &str) -> Result<EntityPath, ProtocolError> {
+///
+/// A dead-letter address resolves to the shadow queue for a receiver and is
+/// refused for a sender: the only way in is dead-lettering.
+fn resolve_entity(address: &str, role: Role) -> Result<EntityPath, ProtocolError> {
     match parse_attachment(address)? {
         Attachment::Queue(entity) => Ok(entity),
+        Attachment::DeadLetter(entity) if role == Role::Receiver => entity
+            .dead_letter_queue()
+            .map_err(|error| ProtocolError::InvalidAddress {
+                address: address.to_owned(),
+                detail: error.to_string(),
+            }),
         Attachment::DeadLetter(entity) => Err(ProtocolError::InvalidAddress {
             address: address.to_owned(),
-            detail: format!("receiving from the dead-letter queue of {entity} is not implemented"),
+            detail: format!("the dead-letter queue of {entity} cannot be sent to"),
         }),
         Attachment::Subscription { topic, .. } => Err(ProtocolError::InvalidAddress {
             address: address.to_owned(),
@@ -538,21 +547,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_plain_queue_address_attaches() {
+    fn addresses_resolve_by_role() {
         assert_eq!(
-            resolve_entity("orders").expect("a queue attaches").as_str(),
+            resolve_entity("orders", Role::Sender)
+                .expect("a queue accepts senders")
+                .as_str(),
             "orders"
         );
-        // Recognised and refused, rather than treated as a queue of that name.
-        for address in [
-            "orders/$deadletterqueue",
-            "billing/Subscriptions/accounting",
-        ] {
-            assert!(
-                resolve_entity(address).is_err(),
-                "{address} should not attach yet"
-            );
-        }
+        // The dead-letter address is a real queue for a receiver and a refusal
+        // for a sender: the only way in is dead-lettering.
+        assert_eq!(
+            resolve_entity("orders/$deadletterqueue", Role::Receiver)
+                .expect("the shadow queue accepts receivers")
+                .as_str(),
+            "orders/$deadletterqueue"
+        );
+        assert!(resolve_entity("orders/$deadletterqueue", Role::Sender).is_err());
+        assert!(resolve_entity("billing/Subscriptions/accounting", Role::Receiver).is_err());
     }
 
     #[test]
