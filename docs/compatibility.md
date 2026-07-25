@@ -92,9 +92,9 @@ commands and dispositions into settlements, and answers a rejection with the
 condition an SDK keys its behaviour off. A transfer is accepted only after its
 command committed, so the acknowledgement means durable. What this is not yet:
 there is no TLS, no SASL or CBS authentication, one node serves one namespace,
-session-aware links and dead-letter receive are not exposed, and a receiving
-link polls the queue instead of waiting on a signal. The end-to-end coverage is
-a Rust AMQP 1.0 client, not the official SDKs the client gates require.
+and session-aware links and dead-letter receive are not exposed. The end-to-end
+coverage is a Rust AMQP 1.0 client, not the official SDKs the client gates
+require.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch
 before reporting it applied, and the same semantics suite runs against both

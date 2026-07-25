@@ -173,6 +173,51 @@ async fn a_released_message_comes_round_again() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_receiver_waiting_on_an_empty_queue_is_woken_by_a_send() -> Result<(), Box<dyn Error>> {
+    let node = Node::start("orders", QueueConfig::default()).await?;
+
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+
+    // The receiver goes first and the queue is empty, so it is parked on the
+    // broker's wakeup rather than a poll.
+    let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
+    let waiting = tokio::spawn(async move {
+        let delivery = receiver
+            .recv::<Body<Binary>>()
+            .await
+            .map_err(|error| error.to_string())?;
+        receiver
+            .accept(&delivery)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok::<_, String>(text_of(delivery.message()))
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let started = std::time::Instant::now();
+    let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
+    sender
+        .send(Message::builder().body(body("wake-up")).build())
+        .await?;
+
+    let received = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await??
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    assert_eq!(received, "wake-up");
+    // Under the 3-second fallback: the delivery came from the wakeup, not from
+    // the safety-net re-poll.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "delivery took {:?}, which is the fallback, not the wakeup",
+        started.elapsed()
+    );
+
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn attaching_to_a_queue_that_does_not_exist_is_refused() -> Result<(), Box<dyn Error>> {
     let node = Node::start("orders", QueueConfig::default()).await?;
 

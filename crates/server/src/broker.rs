@@ -15,11 +15,16 @@
 //! happens on the owner thread, because a timestamp chosen before queueing could
 //! reach the machine out of order and be refused.
 
-use std::thread::{self, JoinHandle};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    thread::{self, JoinHandle},
+};
 
 use domain::{CommandKind, CommandOutcome, EntityPath, NamespaceName, Timestamp};
 use storage::StateStore;
 use thiserror::Error;
+use tokio::sync::Notify;
 use tracing::debug;
 
 use crate::{Clock, LocalProposer, ProposeError};
@@ -54,6 +59,58 @@ enum Request {
     Stop,
 }
 
+/// Wakes the links waiting on an entity when a command makes it worth asking
+/// again.
+///
+/// One notify per entity, permit-style: a notification with nobody waiting is
+/// kept and satisfies the next waiter immediately, which is what closes the gap
+/// between a receive that found nothing and the wait that follows it.
+#[derive(Debug, Default)]
+struct Watchers {
+    entities: Mutex<HashMap<(NamespaceName, EntityPath), Arc<Notify>>>,
+}
+
+impl Watchers {
+    fn watch(&self, namespace: &NamespaceName, entity: &EntityPath) -> Arc<Notify> {
+        let mut entities = self
+            .entities
+            .lock()
+            .expect("the watcher lock is not poisoned");
+        Arc::clone(
+            entities
+                .entry((namespace.clone(), entity.clone()))
+                .or_default(),
+        )
+    }
+
+    fn notify(&self, namespace: &NamespaceName, entity: &EntityPath) {
+        let entities = self
+            .entities
+            .lock()
+            .expect("the watcher lock is not poisoned");
+        // Nothing is created here: an entity nobody has ever waited on needs no
+        // notification.
+        if let Some(notify) = entities.get(&(namespace.clone(), entity.clone())) {
+            notify.notify_one();
+        }
+    }
+}
+
+/// Whether applying this outcome may have made something deliverable, which is
+/// what a waiting link wants to be woken for.
+fn makes_deliverable(outcome: &CommandOutcome) -> bool {
+    match outcome {
+        CommandOutcome::Sent { .. } => true,
+        CommandOutcome::Abandoned { dead_lettered } => !dead_lettered,
+        CommandOutcome::LocksExpired {
+            returned_to_ready, ..
+        } => *returned_to_ready > 0,
+        CommandOutcome::SessionReleased => true,
+        CommandOutcome::SessionLocksExpired { released } => *released > 0,
+        _ => false,
+    }
+}
+
 /// A cheap, shared way to reach the broker.
 ///
 /// Cloning is how every connection, link, and timer gets one; they all queue
@@ -61,6 +118,7 @@ enum Request {
 #[derive(Clone, Debug)]
 pub struct BrokerHandle {
     requests: flume::Sender<Request>,
+    watchers: Arc<Watchers>,
 }
 
 impl BrokerHandle {
@@ -153,6 +211,8 @@ impl Broker {
     /// Starts the owner thread for `proposer`.
     pub fn spawn<S: StateStore, C: Clock>(proposer: LocalProposer<S, C>) -> Self {
         let (requests, incoming) = flume::bounded::<Request>(COMMAND_QUEUE_DEPTH);
+        let watchers = Arc::new(Watchers::default());
+        let watching = Arc::clone(&watchers);
         let owner = thread::Builder::new()
             .name(String::from("switchyard-broker"))
             .spawn(move || {
@@ -165,6 +225,9 @@ impl Broker {
                             reply,
                         } => {
                             let outcome = proposer.propose(&namespace, &entity, kind);
+                            if outcome.as_ref().is_ok_and(makes_deliverable) {
+                                watching.notify(&namespace, &entity);
+                            }
                             // A caller that stopped waiting is not an error: the
                             // command still applied, and it gave up, not us.
                             let _ = reply.send(outcome);
@@ -189,7 +252,7 @@ impl Broker {
             .expect("the broker owner thread can be spawned");
 
         Self {
-            handle: BrokerHandle { requests },
+            handle: BrokerHandle { requests, watchers },
             owner: Some(owner),
         }
     }
@@ -221,6 +284,15 @@ impl Drop for Broker {
 /// Separating a refusal from an unreachable broker is what lets the edge report
 /// a condition the client can act on instead of a generic failure.
 impl protocol_amqp::Broker for BrokerHandle {
+    fn deliverable(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        let notify = self.watchers.watch(namespace, entity);
+        async move { notify.notified().await }
+    }
+
     async fn submit(
         &self,
         namespace: NamespaceName,

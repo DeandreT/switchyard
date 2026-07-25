@@ -56,6 +56,18 @@ pub trait Broker: Clone + Send + Sync + 'static {
         entity: EntityPath,
         kind: CommandKind,
     ) -> impl Future<Output = Result<CommandOutcome, BrokerRejection>> + Send;
+
+    /// Resolves once something on the entity may have become deliverable.
+    ///
+    /// "May have": a wakeup is a hint to ask again, not a claim. Spurious
+    /// wakeups are allowed, a wakeup for a message another link wins is
+    /// expected, and a caller must pair this with its own timeout because a
+    /// wakeup can be lost when several waiters share one entity.
+    fn deliverable(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+    ) -> impl Future<Output = ()> + Send;
 }
 
 #[cfg(test)]

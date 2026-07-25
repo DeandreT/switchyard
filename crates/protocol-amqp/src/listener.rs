@@ -24,12 +24,12 @@ use tracing::{debug, info, warn};
 
 use crate::{Attachment, Broker, BrokerRejection, ProtocolError, parse_attachment, read_incoming};
 
-/// How long a receiving link waits before asking again once a queue came back
-/// empty.
+/// How long a receiving link waits on a wakeup before asking the broker anyway.
 ///
-/// Polling is crude. It is here because the state machine has no way to say "a
-/// message arrived" yet; when it does, this becomes a wait on that signal.
-const EMPTY_QUEUE_BACKOFF: Duration = Duration::from_millis(50);
+/// The wakeup is the mechanism; this is the net under it. A notification can be
+/// lost when several links wait on one entity, so a waiter re-asks on a coarse
+/// interval rather than trusting the signal absolutely.
+const EMPTY_QUEUE_FALLBACK: Duration = Duration::from_secs(3);
 
 pub struct AmqpListener<B> {
     broker: B,
@@ -283,6 +283,10 @@ async fn next_delivery<B: Broker>(
     entity: &EntityPath,
 ) -> Result<Delivery, BrokerRejection> {
     loop {
+        // Armed before the receive: a message that lands between the empty
+        // answer below and the wait leaves a stored notification, so the wait
+        // returns at once instead of sleeping on a queue that is not empty.
+        let wakeup = broker.deliverable(namespace, entity);
         let outcome = broker
             .submit(
                 namespace.clone(),
@@ -297,7 +301,12 @@ async fn next_delivery<B: Broker>(
 
         match outcome {
             CommandOutcome::Received(Some(delivery)) => return Ok(delivery),
-            CommandOutcome::Received(None) => tokio::time::sleep(EMPTY_QUEUE_BACKOFF).await,
+            CommandOutcome::Received(None) => {
+                tokio::select! {
+                    () = wakeup => {}
+                    () = tokio::time::sleep(EMPTY_QUEUE_FALLBACK) => {}
+                }
+            }
             other => {
                 // A receive that produced anything else means the broker and the
                 // edge disagree about the command, which is not a client problem.
