@@ -7,7 +7,9 @@
 #![forbid(unsafe_code)]
 
 mod address;
+mod broker;
 mod condition;
+mod message;
 
 use thiserror::Error;
 
@@ -16,11 +18,13 @@ pub use crate::{
         Attachment, DEAD_LETTER_SUFFIX, SUBSCRIPTION_SEGMENT, namespace_from_hostname,
         parse_attachment, parse_session_id,
     },
+    broker::{Broker, BrokerRejection},
     condition::{
         ENTITY_ALREADY_EXISTS, INTERNAL_ERROR, MESSAGE_LOCK_LOST, MESSAGE_SIZE_EXCEEDED,
         NOT_ALLOWED, NOT_FOUND, PRECONDITION_FAILED, RESOURCE_LOCKED, SESSION_CANNOT_BE_LOCKED,
         SESSION_LOCK_LOST, condition_for, is_retryable,
     },
+    message::{IncomingMessage, read_incoming, write_delivery},
 };
 
 /// Settlement modes are broker semantics, not wire syntax, so they live in the
