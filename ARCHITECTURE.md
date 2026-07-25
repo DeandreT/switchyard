@@ -3,9 +3,11 @@
 ## Status
 
 This document is the implementation contract for Switchyard. The repository is
-currently pre-alpha: the workspace boundaries and initial domain contracts
-exist, while the network protocol, Fjall, Raft, and compliance implementations
-remain to be built.
+currently pre-alpha. The workspace boundaries, the domain contracts, and the
+deterministic queue state machine described under
+[Message Semantics](#message-semantics) exist over the memory backend, while
+the network protocol, Fjall, Raft, and compliance implementations remain to be
+built.
 
 Compatibility means observable protocol and SDK behavior backed by automated
 tests. It does not mean byte-for-byte implementation similarity, Microsoft

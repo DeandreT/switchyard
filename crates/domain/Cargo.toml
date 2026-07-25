@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+postcard.workspace = true
 serde.workspace = true
+storage.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+testkit.workspace = true
 

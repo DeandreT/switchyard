@@ -23,20 +23,32 @@ pub struct WriteBatch {
 
 impl WriteBatch {
     pub fn put(mut self, key: impl Into<Key>, value: impl Into<Value>) -> Self {
-        self.mutations.push(Mutation::Put {
-            key: key.into(),
-            value: value.into(),
-        });
+        self.push_put(key, value);
         self
     }
 
     pub fn delete(mut self, key: impl Into<Key>) -> Self {
-        self.mutations.push(Mutation::Delete { key: key.into() });
+        self.push_delete(key);
         self
+    }
+
+    pub fn push_put(&mut self, key: impl Into<Key>, value: impl Into<Value>) {
+        self.mutations.push(Mutation::Put {
+            key: key.into(),
+            value: value.into(),
+        });
+    }
+
+    pub fn push_delete(&mut self, key: impl Into<Key>) {
+        self.mutations.push(Mutation::Delete { key: key.into() });
     }
 
     pub fn mutations(&self) -> &[Mutation] {
         &self.mutations
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mutations.is_empty()
     }
 }
 
@@ -55,6 +67,12 @@ pub trait StateStore: Clone + Send + Sync + 'static {
     fn get(&self, key: &[u8]) -> Result<Option<Value>, StorageError>;
     fn apply(&self, batch: WriteBatch) -> Result<(), StorageError>;
     fn snapshot(&self) -> Result<StoreSnapshot, StorageError>;
+
+    /// Returns up to `limit` entries whose key starts with `prefix`, in ascending
+    /// key order. Callers encode index keys so that lexicographic order is the
+    /// order they need to walk, and rely on `limit` to bound the work a single
+    /// state-machine command performs.
+    fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Key, Value)>, StorageError>;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -101,6 +119,19 @@ impl StateStore for MemoryStore {
                 .collect(),
         })
     }
+
+    fn scan_prefix(&self, prefix: &[u8], limit: usize) -> Result<Vec<(Key, Value)>, StorageError> {
+        let entries = self
+            .entries
+            .read()
+            .map_err(|_| StorageError::LockPoisoned)?;
+        Ok(entries
+            .range(prefix.to_vec()..)
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .take(limit)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
+    }
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -126,6 +157,30 @@ mod tests {
         assert_eq!(store.get(b"message:1")?, None);
         assert_eq!(store.get(b"message:2")?, Some(b"second".to_vec()));
         assert_eq!(store.snapshot()?.entries().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn scans_a_prefix_in_key_order_within_its_limit() -> Result<(), StorageError> {
+        let store = MemoryStore::default();
+        store.apply(
+            WriteBatch::default()
+                .put(b"ready:\x00\x02".to_vec(), Vec::new())
+                .put(b"ready:\x00\x01".to_vec(), Vec::new())
+                .put(b"ready:\x00\x03".to_vec(), Vec::new())
+                .put(b"locks:\x00\x01".to_vec(), Vec::new()),
+        )?;
+
+        let scanned = store.scan_prefix(b"ready:", 2)?;
+        assert_eq!(
+            scanned
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>(),
+            vec![b"ready:\x00\x01".to_vec(), b"ready:\x00\x02".to_vec()]
+        );
+        assert_eq!(store.scan_prefix(b"ready:", 16)?.len(), 3);
+        assert_eq!(store.scan_prefix(b"absent:", 16)?.len(), 0);
         Ok(())
     }
 }

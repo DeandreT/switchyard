@@ -14,18 +14,26 @@ coverage with the relevant client.
 
 ## Capability Matrix
 
+A capability reaches **State machine** once the deterministic broker core
+implements it with tests. That is a prerequisite for compatibility, not a form
+of it: nothing below is reachable by a client until the protocol edge exists.
+
 | Capability | Target release | Status |
 | --- | --- | --- |
 | AMQP 1.0 over TLS | Pre-1.0 | Not implemented |
 | AMQP over WebSockets | Pre-1.0 | Not implemented |
 | SASL PLAIN and CBS SAS/JWT | Pre-1.0 | Not implemented |
-| Queue send, receive, peek, and settlement | Pre-1.0 | Not implemented |
-| Receive-delete | Pre-1.0 | Not implemented |
+| Queue send, receive, and settlement | Pre-1.0 | State machine |
+| Peek without lock acquisition | Pre-1.0 | Not implemented |
+| Receive-delete | Pre-1.0 | State machine |
+| Lock expiry and redelivery | Pre-1.0 | State machine |
+| Time-to-live expiry | Pre-1.0 | State machine |
 | Topics and subscriptions | Pre-1.0 | Not implemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
 | Scheduling and cancellation | Pre-1.0 | Not implemented |
 | Deferral and deferred receive | Pre-1.0 | Not implemented |
-| Dead-letter and resubmit | Pre-1.0 | Not implemented |
+| Dead-letter | Pre-1.0 | State machine |
+| Dead-letter receive and resubmit | Pre-1.0 | Not implemented |
 | Sessions and session state | Pre-1.0 | Not implemented |
 | Duplicate detection | Pre-1.0 | Not implemented |
 | Same-placement-group transactions | Pre-1.0 | Not implemented |
@@ -35,6 +43,27 @@ coverage with the relevant client.
 | Cross-placement-group transactions | Later | Out of initial scope |
 | Geo-replication | Later | Out of initial scope |
 | Premium-tier features | Uncommitted | Out of scope |
+
+## Broker Core
+
+The `domain` crate applies each replicated command as one atomic storage batch
+and derives every deadline from the timestamp carried on that command, so a
+follower replaying the log reaches the same state as the leader. Delivery
+behavior it currently enforces:
+
+- Peek-lock delivery is at-least-once: the lock commits before the message is
+  handed out, and completion removes it only after settlement commits.
+- Receive-delete is at-most-once: the deletion commits before the transfer.
+- A settlement is rejected unless it presents the live lock token, and rejected
+  again once the lock deadline has passed.
+- Abandoning a message, or letting its lock elapse, returns it to the queue
+  until it reaches the queue's maximum delivery count, after which it is
+  dead-lettered as `MaxDeliveryCountExceeded`.
+- Messages past their time to live are dead-lettered as `TTLExpiredException`,
+  both by the timer sweep and by any receive that reaches one first.
+- Rejected commands write nothing, so every replica rejects at the same point.
+
+Storage remains the memory backend, so none of this survives a restart yet.
 
 Switchyard intentionally does not reproduce Azure subscription, namespace
 capacity, or operations-per-second commercial quotas. It defaults to compatible
