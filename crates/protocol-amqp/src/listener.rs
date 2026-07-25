@@ -14,7 +14,7 @@ use amqp_runtime::{
     },
     link::{LinkStateError, Receiver, RecvError, Sender},
     types::{
-        definitions::{self, AmqpError},
+        definitions::{self, AmqpError, SenderSettleMode},
         messaging::{Body, Outcome, TargetArchetype},
         primitives::Binary,
     },
@@ -123,6 +123,14 @@ async fn serve_session<B: Broker>(
             })
             .unwrap_or_default();
 
+        // A receiver that asks for pre-settled transfers is asking for
+        // at-most-once: the broker deletes before sending and a lost transfer
+        // stays lost. Anything else gets peek-lock.
+        let mode = match attach.snd_settle_mode {
+            SenderSettleMode::Settled => ReceiveMode::ReceiveAndDelete,
+            SenderSettleMode::Unsettled | SenderSettleMode::Mixed => ReceiveMode::PeekLock,
+        };
+
         let endpoint = acceptor
             .accept_incoming_attach(attach, &mut session)
             .await?;
@@ -155,7 +163,7 @@ async fn serve_session<B: Broker>(
             LinkEndpoint::Sender(sender) => {
                 tokio::spawn(async move {
                     if let Err(error) =
-                        serve_receiving_client(sender, namespace, entity, broker).await
+                        serve_receiving_client(sender, namespace, entity, broker, mode).await
                     {
                         warn!(%error, "receiving link ended");
                     }
@@ -252,6 +260,7 @@ async fn serve_receiving_client<B: Broker>(
     namespace: NamespaceName,
     entity: EntityPath,
     broker: B,
+    mode: ReceiveMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         // The link is watched the whole time a message is being waited for. A
@@ -263,7 +272,7 @@ async fn serve_receiving_client<B: Broker>(
                 let _ = sender.close().await;
                 return Ok(());
             }
-            fetched = next_delivery(&broker, &namespace, &entity) => fetched,
+            fetched = next_delivery(&broker, &namespace, &entity, mode) => fetched,
         };
 
         match fetched {
@@ -281,6 +290,7 @@ async fn next_delivery<B: Broker>(
     broker: &B,
     namespace: &NamespaceName,
     entity: &EntityPath,
+    mode: ReceiveMode,
 ) -> Result<Delivery, BrokerRejection> {
     loop {
         // Armed before the receive: a message that lands between the empty
@@ -292,7 +302,7 @@ async fn next_delivery<B: Broker>(
                 namespace.clone(),
                 entity.clone(),
                 CommandKind::Receive {
-                    mode: ReceiveMode::PeekLock,
+                    mode,
                     lock_duration_millis: None,
                     session: None,
                 },

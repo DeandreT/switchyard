@@ -25,7 +25,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | SASL PLAIN and CBS SAS/JWT | Pre-1.0 | Not implemented |
 | Queue send, receive, and settlement | Pre-1.0 | State machine |
 | Peek without lock acquisition | Pre-1.0 | Not implemented |
-| Receive-delete | Pre-1.0 | State machine |
+| Receive-delete | Pre-1.0 | State machine, AMQP mapping |
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Time-to-live expiry | Pre-1.0 | State machine |
 | Topics and subscriptions | Pre-1.0 | Not implemented |
@@ -89,7 +89,8 @@ actually releases what has elapsed.
 An AMQP 1.0 client can reach a queue. The node accepts plain-TCP AMQP
 connections, resolves a link's address to an entity, turns transfers into send
 commands and dispositions into settlements, and answers a rejection with the
-condition an SDK keys its behaviour off. A transfer is accepted only after its
+condition an SDK keys its behaviour off. A receiving link's settle mode selects
+the delivery guarantee: unsettled is peek-lock, pre-settled is receive-delete. A transfer is accepted only after its
 command committed, so the acknowledgement means durable. What this is not yet:
 there is no TLS, no SASL or CBS authentication, one node serves one namespace,
 and session-aware links and dead-letter receive are not exposed. The end-to-end

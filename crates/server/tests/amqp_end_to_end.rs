@@ -173,6 +173,41 @@ async fn a_released_message_comes_round_again() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_pre_settled_receiver_gets_at_most_once() -> Result<(), Box<dyn Error>> {
+    let node = Node::start("orders", QueueConfig::default()).await?;
+
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
+    sender
+        .send(Message::builder().body(body("fire-and-forget")).build())
+        .await?;
+
+    // Asking for pre-settled transfers is asking for receive-and-delete: the
+    // broker deletes before the transfer, so nothing is ever redelivered.
+    let mut receiver = Receiver::builder()
+        .name("test-receiver")
+        .source("orders")
+        .sender_settle_mode(amqp_runtime::types::definitions::SenderSettleMode::Settled)
+        .attach(&mut session)
+        .await?;
+    let delivery = receiver.recv::<Body<Binary>>().await?;
+    assert_eq!(text_of(delivery.message()), "fire-and-forget");
+
+    // Never settled by the client, and still gone: at-most-once means the
+    // deletion committed before the transfer.
+    let starved = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        receiver.recv::<Body<Binary>>(),
+    )
+    .await;
+    assert!(starved.is_err(), "the message survived receive-and-delete");
+
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_receiver_waiting_on_an_empty_queue_is_woken_by_a_send() -> Result<(), Box<dyn Error>> {
     let node = Node::start("orders", QueueConfig::default()).await?;
 
