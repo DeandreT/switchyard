@@ -20,7 +20,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 
 | Capability | Target release | Status |
 | --- | --- | --- |
-| AMQP 1.0 over TLS | Pre-1.0 | Not implemented |
+| AMQP 1.0 over TLS | Pre-1.0 | Protocol edge, Rust client end to end |
 | AMQP over WebSockets | Pre-1.0 | Not implemented |
 | SASL PLAIN and CBS SAS/JWT | Pre-1.0 | Not implemented |
 | Queue send, receive, and settlement | Pre-1.0 | State machine |
@@ -92,19 +92,21 @@ Expiry is not merely expressible: the `server` crate's timer worker proposes the
 lock, time-to-live, and session-lock sweeps on an interval, so a running node
 actually releases what has elapsed.
 
-An AMQP 1.0 client can reach a queue. The node accepts plain-TCP AMQP
-connections, resolves a link's address to an entity, turns transfers into send
-commands and dispositions into settlements, and answers a rejection with the
-condition an SDK keys its behaviour off. A receiving link's settle mode selects
-the delivery guarantee: unsettled is peek-lock, pre-settled is receive-delete.
+An AMQP 1.0 client can reach a queue. The node accepts AMQP over TLS with the
+socket secured before the protocol handshake, as Service Bus port 5671
+requires. Plain TCP remains available only in development mode. The edge
+resolves a link's address to an entity, turns transfers into send commands and
+dispositions into settlements, and answers a rejection with the condition an
+SDK keys its behaviour off. A receiving link's settle mode selects the delivery
+guarantee: unsettled is peek-lock, pre-settled is receive-delete.
 A receiving link's `com.microsoft:session-filter` names a session or, with a
 null value, asks for the next available one; the attach response echoes the
 granted identifier. The node renews a link's session lock while the link is
 open and releases it when the link closes, because the management operations
 the SDKs renew through are not implemented. A transfer is accepted only after its
 command committed, so the acknowledgement means durable. What this is not yet:
-there is no TLS, no SASL or CBS authentication, one node serves one namespace,
-and a message drained from a dead-letter queue carries its reason and
+there is no SASL or CBS authentication, one node serves one namespace, and a
+message drained from a dead-letter queue carries its reason and
 description in the DeadLetterReason and DeadLetterErrorDescription application
 properties. The end-to-end coverage is a Rust AMQP 1.0 client, not the official
 SDKs the client gates require.
@@ -119,4 +121,3 @@ Switchyard intentionally does not reproduce Azure subscription, namespace
 capacity, or operations-per-second commercial quotas. It defaults to compatible
 wire validation, including the Standard 256 KiB message-size limit, while
 allowing operators to configure larger namespace storage quotas.
-

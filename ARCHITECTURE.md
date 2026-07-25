@@ -3,21 +3,21 @@
 ## Status
 
 This document is the implementation contract for Switchyard. The repository is
-currently pre-alpha. What exists is the workspace boundaries, the domain
-contracts, and a deterministic state machine covering queue send and receive,
-both settlement modes, lock expiry, time-to-live expiry, dead-lettering, and the
-session ownership and session state described under
-[Message Semantics](#message-semantics). It runs over either the Fjall backend
-or the memory backend, so a single node survives a restart.
+currently pre-alpha. A deterministic state machine covers queue send and
+receive, both settlement modes, lock expiry, time-to-live expiry,
+dead-lettering and dead-letter receive, and the session ownership and session
+state described under [Message Semantics](#message-semantics). It runs over
+either the Fjall backend or the memory backend, so a single node survives a
+restart.
 
-A single node runs: the `switchyard` binary opens the configured backend and
-sweeps lock expiry, time-to-live expiry, and session lock expiry on an interval.
-Nothing can connect to it, because the network protocol, Raft, and compliance
+The `switchyard` binary accepts AMQP connections over development plaintext or
+TLS, carries messages and sessions across that edge, and sweeps lock,
+time-to-live, and session-lock expiry. Authentication, Raft, and compliance
 implementations remain to be built. Within the semantics below, scheduling,
-deferral, duplicate detection, topics, and dead-letter receive are not
-implemented, the timer worker covers only the three expiry indexes that exist,
-and the storage keyspace layout under [Storage](#storage) is still a single
-record keyspace rather than the split listed there.
+deferral, duplicate detection, and topics are not implemented, the timer worker
+covers only the three expiry indexes that exist, and the storage keyspace
+layout under [Storage](#storage) is still a single record keyspace rather than
+the split listed there.
 
 Compatibility means observable protocol and SDK behavior backed by automated
 tests. It does not mean byte-for-byte implementation similarity, Microsoft
@@ -33,8 +33,8 @@ certification, or support for undocumented Azure internals.
 - Isolate mutually untrusted namespaces through authentication, authorization,
   quotas, fair scheduling, encryption keys, and audit scopes.
 - Supply controls and evidence hooks for SOC 2 and HIPAA-oriented deployments.
-- Keep the server runtime in Rust without RocksDB, OpenSSL, or other C/C++
-  storage and TLS dependencies.
+- Keep the server runtime in Rust without RocksDB, OpenSSL, or system TLS
+  dependencies.
 
 ## Initial Non-Goals
 
@@ -336,4 +336,3 @@ The test program includes:
 
 Version `1.0` is reserved until the compatibility, durability, security,
 recovery, and performance gates pass.
-

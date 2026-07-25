@@ -23,7 +23,10 @@ use amqp_runtime::{
         primitives::Binary,
     },
 };
-use tokio::net::{TcpListener, TcpStream};
+use rustls::ServerConfig;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -49,6 +52,7 @@ pub struct AmqpListener<B> {
     broker: B,
     namespace: NamespaceName,
     container_id: String,
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
 impl<B: Broker> AmqpListener<B> {
@@ -57,7 +61,14 @@ impl<B: Broker> AmqpListener<B> {
             broker,
             namespace,
             container_id: String::from("switchyard"),
+            tls_acceptor: None,
         }
+    }
+
+    /// Secures accepted sockets before AMQP and SASL negotiation begin.
+    pub fn with_tls(mut self, config: ServerConfig) -> Self {
+        self.tls_acceptor = Some(TlsAcceptor::from(std::sync::Arc::new(config)));
+        self
     }
 
     /// Accepts connections until the listener fails.
@@ -72,9 +83,19 @@ impl<B: Broker> AmqpListener<B> {
             let broker = self.broker.clone();
             let namespace = self.namespace.clone();
             let container_id = self.container_id.clone();
+            let tls_acceptor = self.tls_acceptor.clone();
             tokio::spawn(async move {
-                if let Err(error) = serve_connection(stream, container_id, namespace, broker).await
-                {
+                let result = match tls_acceptor {
+                    Some(acceptor) => match acceptor.accept(stream).await {
+                        Ok(stream) => {
+                            debug!(%peer, "TLS established");
+                            serve_connection(stream, container_id, namespace, broker).await
+                        }
+                        Err(error) => Err(error.into()),
+                    },
+                    None => serve_connection(stream, container_id, namespace, broker).await,
+                };
+                if let Err(error) = result {
                     warn!(%peer, %error, "connection ended");
                 }
             });
@@ -82,12 +103,16 @@ impl<B: Broker> AmqpListener<B> {
     }
 }
 
-async fn serve_connection<B: Broker>(
-    stream: TcpStream,
+async fn serve_connection<Io, B>(
+    stream: Io,
     container_id: String,
     namespace: NamespaceName,
     broker: B,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    Io: AsyncRead + AsyncWrite + std::fmt::Debug + Send + Unpin + 'static,
+    B: Broker,
+{
     let mut connection = ConnectionAcceptor::new(container_id).accept(stream).await?;
 
     while let Some(incoming) = connection.next_incoming_session().await {

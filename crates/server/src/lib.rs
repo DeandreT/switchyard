@@ -76,6 +76,14 @@ pub enum StartupError {
     MissingDataDirectory,
     #[error("could not listen on {address}: {detail}")]
     Listen { address: String, detail: String },
+    #[error("production mode requires a TLS certificate and private key")]
+    TlsRequiredInProduction,
+    #[error("TLS configuration requires both --tls-certificate and --tls-private-key")]
+    IncompleteTlsConfiguration,
+    #[error("could not read TLS credentials from {path}: {detail}")]
+    ReadTlsCredentials { path: PathBuf, detail: String },
+    #[error(transparent)]
+    TlsConfiguration(#[from] protocol_amqp::TlsConfigurationError),
     #[error("the runtime could not be started: {0}")]
     Runtime(String),
     #[error(transparent)]

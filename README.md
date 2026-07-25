@@ -10,17 +10,18 @@ and transactions. A separate single-node memory mode is intended for local
 development, conformance tests, and applications such as the Sift demo.
 
 > [!IMPORTANT]
-> Switchyard is currently a pre-alpha architecture and workspace scaffold. It
-> does not yet accept AMQP connections or persist messages. Do not use it for
-> production workloads until the published conformance and durability gates
-> are complete.
+> Switchyard is pre-alpha. A single node accepts AMQP connections over
+> development plaintext or TLS and persists queue state, but authentication,
+> replication, administration, and the official client gates are incomplete.
+> Do not use it for production workloads.
 
 ## Design Targets
 
 - Azure Service Bus-compatible AMQP 1.0 over TLS and WebSockets
 - Official .NET SDK data-plane and administration compatibility
 - Sift data-plane and Atom/XML management compatibility
-- Pure-Rust storage and TLS dependencies
+- Rust-native storage and TLS stacks without RocksDB, OpenSSL, or system TLS
+  dependencies
 - Hard namespace isolation, quotas, RBAC, OIDC, SAS, and mTLS
 - Per-namespace envelope encryption and external KMS integration
 - Tamper-evident audit records and encrypted incremental backups
@@ -77,8 +78,9 @@ Inspect the compatibility status exposed by the CLI scaffold:
 cargo run -p switchyardctl -- compatibility
 ```
 
-The development command currently validates and prints configuration; network
-listeners will be added with the first AMQP vertical slice.
+Development defaults to plaintext AMQP on `127.0.0.1:5672`. Supplying
+`--tls-certificate` and `--tls-private-key` secures the listener and changes its
+default port to 5671. Production mode refuses to start without both files.
 
 ## Production Contract
 

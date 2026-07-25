@@ -9,7 +9,9 @@ repository.workspace = true
 [dependencies]
 domain.workspace = true
 amqp-runtime.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
-

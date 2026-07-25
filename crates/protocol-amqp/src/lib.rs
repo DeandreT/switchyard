@@ -12,6 +12,7 @@ mod condition;
 mod listener;
 mod message;
 mod session_filter;
+mod tls;
 
 use thiserror::Error;
 
@@ -32,6 +33,7 @@ pub use crate::{
         read_incoming, write_delivery,
     },
     session_filter::{SESSION_FILTER, SessionRequest, read_session_filter, stamp_session_filter},
+    tls::{TlsConfigurationError, tls_server_config},
 };
 
 /// Settlement modes are broker semantics, not wire syntax, so they live in the
