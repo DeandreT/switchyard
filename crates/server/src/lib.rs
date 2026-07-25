@@ -84,6 +84,20 @@ pub enum StartupError {
     ReadTlsCredentials { path: PathBuf, detail: String },
     #[error(transparent)]
     TlsConfiguration(#[from] protocol_amqp::TlsConfigurationError),
+    #[error("production mode requires a shared-access policy")]
+    AuthenticationRequiredInProduction,
+    #[error(
+        "shared-access authentication requires both --shared-access-key-name and --shared-access-key-file"
+    )]
+    IncompleteSharedAccessPolicy,
+    #[error("shared-access authentication cannot be enabled on a plaintext listener")]
+    AuthenticationRequiresTls,
+    #[error("could not read the shared-access key from {path}: {detail}")]
+    ReadSharedAccessKey { path: PathBuf, detail: String },
+    #[error(transparent)]
+    AuthPolicy(#[from] auth::PolicyError),
+    #[error(transparent)]
+    AuthScope(#[from] auth::ResourceScopeError),
     #[error("the runtime could not be started: {0}")]
     Runtime(String),
     #[error(transparent)]

@@ -11,7 +11,7 @@ development, conformance tests, and applications such as the Sift demo.
 
 > [!IMPORTANT]
 > Switchyard is pre-alpha. A single node accepts AMQP connections over
-> development plaintext or TLS and persists queue state, but authentication,
+> development plaintext or authenticated TLS and persists queue state, but
 > replication, administration, and the official client gates are incomplete.
 > Do not use it for production workloads.
 
@@ -80,7 +80,10 @@ cargo run -p switchyardctl -- compatibility
 
 Development defaults to plaintext AMQP on `127.0.0.1:5672`. Supplying
 `--tls-certificate` and `--tls-private-key` secures the listener and changes its
-default port to 5671. Production mode refuses to start without both files.
+default port to 5671. A shared-access policy is configured with
+`--shared-access-key-name` and `--shared-access-key-file`; it enables SASL PLAIN
+and CBS SAS authorization. Production mode refuses to start without both TLS
+and a shared-access policy.
 
 ## Production Contract
 

@@ -12,7 +12,9 @@ use std::{
 
 use clap::{Parser, ValueEnum};
 use cluster::{ClusterConfig, DeploymentMode};
-use protocol_amqp::{AmqpListener, namespace_from_hostname, tls_server_config};
+use protocol_amqp::{
+    AmqpListener, SharedAccessAuthentication, namespace_from_hostname, tls_server_config,
+};
 use rustls::ServerConfig;
 use server::{
     Broker, DEFAULT_SWEEP_INTERVAL, LocalProposer, NodeState, Shutdown, StartupError,
@@ -56,6 +58,15 @@ struct Arguments {
     /// PEM private key corresponding to --tls-certificate.
     #[arg(long, value_name = "PATH")]
     tls_private_key: Option<PathBuf>,
+
+    /// Name of the namespace-wide shared-access rule.
+    #[arg(long)]
+    shared_access_key_name: Option<String>,
+
+    /// File containing the shared-access key. The key is never accepted as a
+    /// command-line value because process arguments are commonly observable.
+    #[arg(long, value_name = "PATH")]
+    shared_access_key_file: Option<PathBuf>,
 
     /// The namespace this node serves. A hostname is accepted and its first
     /// label taken, so a deployment can name namespaces in DNS.
@@ -134,6 +145,48 @@ fn listen_address(configured: Option<SocketAddr>, tls: bool) -> SocketAddr {
     })
 }
 
+fn load_shared_access_authentication(
+    mode: DeploymentMode,
+    tls: bool,
+    namespace: &str,
+    key_name: Option<&str>,
+    key_path: Option<&Path>,
+) -> Result<Option<SharedAccessAuthentication>, StartupError> {
+    let (key_name, key_path) = match (key_name, key_path) {
+        (None, None) if mode == DeploymentMode::Production => {
+            return Err(StartupError::AuthenticationRequiredInProduction);
+        }
+        (None, None) => return Ok(None),
+        (Some(key_name), Some(key_path)) => (key_name, key_path),
+        _ => return Err(StartupError::IncompleteSharedAccessPolicy),
+    };
+    if !tls {
+        return Err(StartupError::AuthenticationRequiresTls);
+    }
+
+    let key = fs::read_to_string(key_path).map_err(|error| StartupError::ReadSharedAccessKey {
+        path: key_path.to_path_buf(),
+        detail: error.to_string(),
+    })?;
+    let key = key.trim_end_matches(['\r', '\n']);
+    let host = if namespace.contains('.') {
+        namespace.to_ascii_lowercase()
+    } else {
+        format!("{namespace}.servicebus.windows.net")
+    };
+    let rule = auth::SharedAccessRule::new(
+        key_name,
+        auth::ResourceScope::namespace(&host)?,
+        auth::SharedAccessKey::new(key)?,
+        None,
+        auth::PermissionSet::MANAGE,
+    )?;
+    Ok(Some(SharedAccessAuthentication::new(
+        auth::SharedAccessPolicy::new([rule])?,
+        host,
+    )?))
+}
+
 /// Reports why startup failed in the words the error was written in, rather
 /// than in the derived debug form `Termination` would print.
 fn main() -> ExitCode {
@@ -163,6 +216,13 @@ fn run() -> Result<(), StartupError> {
         mode,
         arguments.tls_certificate.as_deref(),
         arguments.tls_private_key.as_deref(),
+    )?;
+    let shared_access_authentication = load_shared_access_authentication(
+        mode,
+        tls.is_some(),
+        &arguments.namespace,
+        arguments.shared_access_key_name.as_deref(),
+        arguments.shared_access_key_file.as_deref(),
     )?;
     let listen = listen_address(arguments.listen, tls.is_some());
     let state = server::open(cluster, storage_choice(&arguments)?)?;
@@ -210,6 +270,10 @@ fn run() -> Result<(), StartupError> {
             Some(config) => amqp.with_tls(config),
             None => amqp,
         };
+        let amqp = match shared_access_authentication {
+            Some(authentication) => amqp.with_shared_access_authentication(authentication),
+            None => amqp,
+        };
         amqp.serve(listener)
             .await
             .map_err(|error| StartupError::Runtime(error.to_string()))
@@ -251,5 +315,33 @@ mod tests {
             listen_address(None, true).port(),
             protocol_amqp::AMQP_TLS_PORT
         );
+    }
+
+    #[test]
+    fn production_requires_authentication_after_tls_is_configured() {
+        assert!(matches!(
+            load_shared_access_authentication(
+                DeploymentMode::Production,
+                true,
+                "tenant.servicebus.windows.net",
+                None,
+                None,
+            ),
+            Err(StartupError::AuthenticationRequiredInProduction)
+        ));
+    }
+
+    #[test]
+    fn authentication_is_never_sent_over_plaintext() {
+        assert!(matches!(
+            load_shared_access_authentication(
+                DeploymentMode::Development,
+                false,
+                "tenant.servicebus.windows.net",
+                Some("rule"),
+                Some(Path::new("key")),
+            ),
+            Err(StartupError::AuthenticationRequiresTls)
+        ));
     }
 }

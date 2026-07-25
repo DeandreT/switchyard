@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Planned | Planned | Not implemented |
+| Official .NET SDK, current stable | Send, receive, complete | Planned | Experimental gate on 7.20.2 |
 | Official .NET SDK, previous stable | Planned | Planned | Not implemented |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -22,7 +22,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | --- | --- | --- |
 | AMQP 1.0 over TLS | Pre-1.0 | Protocol edge, Rust client end to end |
 | AMQP over WebSockets | Pre-1.0 | Not implemented |
-| SASL PLAIN and CBS SAS/JWT | Pre-1.0 | Not implemented |
+| SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. JWT: not implemented |
 | Queue send, receive, and settlement | Pre-1.0 | State machine |
 | Peek without lock acquisition | Pre-1.0 | Not implemented |
 | Receive-delete | Pre-1.0 | State machine, AMQP mapping |
@@ -94,22 +94,29 @@ actually releases what has elapsed.
 
 An AMQP 1.0 client can reach a queue. The node accepts AMQP over TLS with the
 socket secured before the protocol handshake, as Service Bus port 5671
-requires. Plain TCP remains available only in development mode. The edge
-resolves a link's address to an entity, turns transfers into send commands and
-dispositions into settlements, and answers a rejection with the condition an
-SDK keys its behaviour off. A receiving link's settle mode selects the delivery
-guarantee: unsettled is peek-lock, pre-settled is receive-delete.
+requires. Plain TCP remains available only in development mode. A configured
+shared-access policy accepts either SASL PLAIN credentials or SASL ANONYMOUS
+or Microsoft's equivalent `MSSBCBS` mechanism followed by a CBS SAS token. CBS
+grants are scoped to a namespace or entity and to Send, Listen, or Manage; they
+authorize links connection-wide and close an open link when its token expires.
+A connection without a valid grant gets 20 seconds to complete CBS
+authorization. JWT, OIDC, and mTLS are not implemented.
+The edge resolves a link's address to an entity, turns transfers into send
+commands and dispositions into settlements, and answers a rejection with the
+condition an SDK keys its behaviour off. A receiving link's settle mode selects
+the delivery guarantee: unsettled is peek-lock, pre-settled is receive-delete.
 A receiving link's `com.microsoft:session-filter` names a session or, with a
 null value, asks for the next available one; the attach response echoes the
 granted identifier. The node renews a link's session lock while the link is
 open and releases it when the link closes, because the management operations
-the SDKs renew through are not implemented. A transfer is accepted only after its
-command committed, so the acknowledgement means durable. What this is not yet:
-there is no SASL or CBS authentication, one node serves one namespace, and a
-message drained from a dead-letter queue carries its reason and
-description in the DeadLetterReason and DeadLetterErrorDescription application
-properties. The end-to-end coverage is a Rust AMQP 1.0 client, not the official
-SDKs the client gates require.
+the SDKs renew through are not implemented. A transfer is accepted only after
+its command committed, so the acknowledgement means durable. One node still
+serves one namespace. A message drained from a dead-letter queue carries its
+reason and description in the `DeadLetterReason` and
+`DeadLetterErrorDescription` application properties. The complete protocol
+coverage uses a Rust AMQP 1.0 client. The current stable official .NET SDK also
+has an opt-in gate for send, receive, and completion; the rest of that client
+gate remains incomplete.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch
 before reporting it applied, and the same semantics suite runs against both

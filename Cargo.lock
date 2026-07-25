@@ -1083,10 +1083,12 @@ dependencies = [
 name = "protocol-amqp"
 version = "0.1.0"
 dependencies = [
+ "auth",
  "domain",
  "amqp-runtime",
  "rustls",
  "rustls-pemfile",
+ "serde_amqp",
  "thiserror",
  "tokio",
  "tokio-rustls",
@@ -1368,14 +1370,18 @@ dependencies = [
 name = "server"
 version = "0.1.0"
 dependencies = [
+ "auth",
+ "base64",
  "clap",
  "cluster",
  "domain",
  "amqp-runtime",
  "flume",
+ "hmac",
  "protocol-amqp",
  "rcgen",
  "rustls",
+ "sha2",
  "storage",
  "tempfile",
  "testkit",
@@ -1384,6 +1390,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

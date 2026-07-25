@@ -7,8 +7,11 @@
 #![forbid(unsafe_code)]
 
 mod address;
+mod authorization;
 mod broker;
+mod cbs;
 mod condition;
+mod frame_adapter;
 mod listener;
 mod message;
 mod session_filter;
@@ -21,6 +24,7 @@ pub use crate::{
         Attachment, DEAD_LETTER_SUFFIX, SUBSCRIPTION_SEGMENT, namespace_from_hostname,
         parse_attachment, parse_session_id,
     },
+    authorization::SharedAccessAuthentication,
     broker::{Broker, BrokerRejection},
     condition::{
         ENTITY_ALREADY_EXISTS, INTERNAL_ERROR, MESSAGE_LOCK_LOST, MESSAGE_SIZE_EXCEEDED,

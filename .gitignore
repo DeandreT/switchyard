@@ -6,10 +6,11 @@
 *.profraw
 *.swp
 .DS_Store
+/crates/conformance/dotnet-current/bin/
+/crates/conformance/dotnet-current/obj/
 
 # Local runtime state and credentials
 /data/
 /backups/
 /.env
 /*.local.toml
-

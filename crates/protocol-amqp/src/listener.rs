@@ -5,19 +5,21 @@
 //! holding one, the lock simply expires and the message is redelivered. That is
 //! what makes an abrupt disconnect safe.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
+use auth::{Permission, ResourceScope};
 use domain::{
-    AcceptedSession, CommandKind, CommandOutcome, Delivery, EntityPath, NamespaceName, ReceiveMode,
-    SessionHold,
+    AcceptedSession, CommandKind, CommandOutcome, Delivery, EntityPath, LockToken, NamespaceName,
+    ReceiveMode, SessionHold,
 };
 use amqp_runtime::{
     acceptor::{
-        ConnectionAcceptor, LinkAcceptor, LinkEndpoint, ListenerSessionHandle, SessionAcceptor,
+        ConnectionAcceptor, LinkAcceptor, LinkEndpoint, ListenerConnectionHandle,
+        ListenerSessionHandle, SessionAcceptor,
     },
     link::{LinkStateError, Receiver, RecvError, Sender},
     types::{
-        definitions::{self, AmqpError, Role, SenderSettleMode},
+        definitions::{self, AmqpError, DeliveryTag, Role, SenderSettleMode},
         messaging::{Body, Outcome, TargetArchetype},
         performatives::Attach,
         primitives::Binary,
@@ -30,8 +32,11 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::{
-    Attachment, Broker, BrokerRejection, ProtocolError, SessionRequest, parse_attachment,
-    read_incoming, read_session_filter, stamp_session_filter,
+    Attachment, Broker, BrokerRejection, ProtocolError, SessionRequest, SharedAccessAuthentication,
+    authorization::{ConnectionAuthorization, SharedAccessSaslAcceptor},
+    cbs::{serve_cbs_replies, serve_cbs_requests},
+    frame_adapter::{DeliveryTagRegistry, adapt_connection},
+    parse_attachment, read_incoming, read_session_filter, stamp_session_filter,
 };
 
 /// How long a receiving link waits on a wakeup before asking the broker anyway.
@@ -53,6 +58,7 @@ pub struct AmqpListener<B> {
     namespace: NamespaceName,
     container_id: String,
     tls_acceptor: Option<TlsAcceptor>,
+    shared_access_authentication: Option<SharedAccessAuthentication>,
 }
 
 impl<B: Broker> AmqpListener<B> {
@@ -62,12 +68,23 @@ impl<B: Broker> AmqpListener<B> {
             namespace,
             container_id: String::from("switchyard"),
             tls_acceptor: None,
+            shared_access_authentication: None,
         }
     }
 
     /// Secures accepted sockets before AMQP and SASL negotiation begin.
     pub fn with_tls(mut self, config: ServerConfig) -> Self {
         self.tls_acceptor = Some(TlsAcceptor::from(std::sync::Arc::new(config)));
+        self
+    }
+
+    /// Requires SASL MSSBCBS/ANONYMOUS plus CBS, or valid SASL PLAIN
+    /// credentials, before entity links are accepted.
+    pub fn with_shared_access_authentication(
+        mut self,
+        authentication: SharedAccessAuthentication,
+    ) -> Self {
+        self.shared_access_authentication = Some(authentication);
         self
     }
 
@@ -84,16 +101,33 @@ impl<B: Broker> AmqpListener<B> {
             let namespace = self.namespace.clone();
             let container_id = self.container_id.clone();
             let tls_acceptor = self.tls_acceptor.clone();
+            let shared_access_authentication = self.shared_access_authentication.clone();
             tokio::spawn(async move {
                 let result = match tls_acceptor {
                     Some(acceptor) => match acceptor.accept(stream).await {
                         Ok(stream) => {
                             debug!(%peer, "TLS established");
-                            serve_connection(stream, container_id, namespace, broker).await
+                            serve_connection(
+                                stream,
+                                container_id,
+                                namespace,
+                                broker,
+                                shared_access_authentication,
+                            )
+                            .await
                         }
                         Err(error) => Err(error.into()),
                     },
-                    None => serve_connection(stream, container_id, namespace, broker).await,
+                    None => {
+                        serve_connection(
+                            stream,
+                            container_id,
+                            namespace,
+                            broker,
+                            shared_access_authentication,
+                        )
+                        .await
+                    }
                 };
                 if let Err(error) = result {
                     warn!(%peer, %error, "connection ended");
@@ -108,22 +142,89 @@ async fn serve_connection<Io, B>(
     container_id: String,
     namespace: NamespaceName,
     broker: B,
+    shared_access_authentication: Option<SharedAccessAuthentication>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     Io: AsyncRead + AsyncWrite + std::fmt::Debug + Send + Unpin + 'static,
     B: Broker,
 {
-    let mut connection = ConnectionAcceptor::new(container_id).accept(stream).await?;
+    let (stream, delivery_tags) = adapt_connection(stream);
+    let (connection, authorization) = match shared_access_authentication {
+        Some(config) => {
+            let sasl_acceptor = SharedAccessSaslAcceptor::new(&config);
+            let connection = ConnectionAcceptor::builder()
+                .container_id(container_id)
+                .sasl_acceptor(sasl_acceptor.clone())
+                .build()
+                .accept(stream)
+                .await?;
+            let authorization = ConnectionAuthorization::new(config, sasl_acceptor.grant());
+            (connection, Some(authorization))
+        }
+        None => (
+            ConnectionAcceptor::new(container_id).accept(stream).await?,
+            None,
+        ),
+    };
+    serve_open_connection(connection, namespace, broker, authorization, delivery_tags).await
+}
 
-    while let Some(incoming) = connection.next_incoming_session().await {
+async fn serve_open_connection<B: Broker>(
+    mut connection: ListenerConnectionHandle,
+    namespace: NamespaceName,
+    broker: B,
+    authorization: Option<Arc<ConnectionAuthorization>>,
+    delivery_tags: DeliveryTagRegistry,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut awaiting_authorization = authorization.is_some();
+    let timeout = authorization
+        .as_ref()
+        .map(|authorization| tokio::time::sleep(authorization.authorization_timeout()));
+    tokio::pin!(timeout);
+
+    loop {
+        let incoming = if awaiting_authorization {
+            let authorization = authorization
+                .as_ref()
+                .expect("authorization is present while it is awaited");
+            tokio::select! {
+                biased;
+                () = authorization.wait_for_grant() => {
+                    awaiting_authorization = false;
+                    continue;
+                }
+                () = async {
+                    match timeout.as_mut().as_pin_mut() {
+                        Some(timeout) => timeout.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    connection
+                        .close_with_error(unauthorized_error(
+                            "no CBS token was supplied before the authorization deadline",
+                        ))
+                        .await?;
+                    return Ok(());
+                }
+                incoming = connection.next_incoming_session() => incoming,
+            }
+        } else {
+            connection.next_incoming_session().await
+        };
+        let Some(incoming) = incoming else { break };
+
         let session = SessionAcceptor::default()
             .accept_incoming_session(incoming, &mut connection)
             .await?;
         let broker = broker.clone();
         let namespace = namespace.clone();
+        let authorization = authorization.clone();
+        let delivery_tags = delivery_tags.clone();
         tokio::spawn(async move {
-            if let Err(error) = serve_session(session, namespace, broker).await {
-                warn!(%error, "session ended");
+            if let Err(error) =
+                serve_session(session, namespace, broker, authorization, delivery_tags).await
+            {
+                warn!(%error, ?error, "session ended");
             }
         });
     }
@@ -141,26 +242,84 @@ async fn serve_session<B: Broker>(
     mut session: ListenerSessionHandle,
     namespace: NamespaceName,
     broker: B,
+    authorization: Option<Arc<ConnectionAuthorization>>,
+    delivery_tags: DeliveryTagRegistry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let acceptor = LinkAcceptor::default();
+    let acceptor = LinkAcceptor::builder()
+        .max_message_size(crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64)
+        .build();
 
     while let Some(mut attach) = session.next_incoming_attach().await {
-        // The address has to be read before the attach is consumed. A client
-        // sending names its entity in the target; one receiving names it in the
-        // source.
-        let address = attach
+        let source_address = attach
+            .source
+            .as_ref()
+            .and_then(|source| source.address.clone())
+            .unwrap_or_default();
+        let target_address = attach
             .target
             .as_ref()
             .and_then(|target| match target.as_ref() {
                 TargetArchetype::Target(target) => target.address.clone(),
             })
-            .or_else(|| {
-                attach
-                    .source
-                    .as_ref()
-                    .and_then(|source| source.address.clone())
-            })
             .unwrap_or_default();
+
+        if let Some(authorization) = authorization.as_ref()
+            && (target_address == crate::CBS_NODE || source_address == crate::CBS_NODE)
+        {
+            // The Microsoft duplex CBS link omits this sender field. Azure
+            // accepts it as zero, while the AMQP engine enforces the MUST.
+            if attach.role == Role::Sender && attach.initial_delivery_count.is_none() {
+                attach.initial_delivery_count = Some(0);
+            }
+            debug!(?attach, "accepting CBS link");
+            let endpoint = acceptor
+                .accept_incoming_attach(attach, &mut session)
+                .await?;
+            let authorization = Arc::clone(authorization);
+            match (target_address.as_str(), source_address.as_str(), endpoint) {
+                (crate::CBS_NODE, _, LinkEndpoint::Receiver(receiver)) => {
+                    tokio::spawn(async move {
+                        if let Err(error) = serve_cbs_requests(receiver, authorization).await {
+                            warn!(%error, "CBS request link ended");
+                        }
+                    });
+                }
+                (_, crate::CBS_NODE, LinkEndpoint::Sender(sender))
+                    if !target_address.is_empty() =>
+                {
+                    let (route, responses) = authorization
+                        .register_reply_route(target_address.clone())
+                        .await;
+                    tokio::spawn(async move {
+                        if let Err(error) = serve_cbs_replies(
+                            sender,
+                            target_address,
+                            route,
+                            responses,
+                            authorization,
+                        )
+                        .await
+                        {
+                            warn!(%error, "CBS response link ended");
+                        }
+                    });
+                }
+                (_, _, endpoint) => {
+                    detach_with(
+                        endpoint,
+                        error_for(AmqpError::InvalidField, "invalid CBS link".into()),
+                    )
+                    .await;
+                }
+            }
+            continue;
+        }
+
+        // The address has to be read before the attach is consumed. A client
+        // sending names its entity in the target; one receiving names it in the
+        // source. The other terminus may carry a generated link address.
+        let address = address_for_role(&attach.role, &source_address, &target_address);
+        debug!(%address, ?attach, "accepting entity link");
 
         // A receiver that asks for pre-settled transfers is asking for
         // at-most-once: the broker deletes before sending and a lost transfer
@@ -174,8 +333,15 @@ async fn serve_session<B: Broker>(
         // accepted, so a granted session can be stamped into the source the
         // acceptor echoes — the echo is how a next-available receiver learns
         // which session it got.
-        let plan = plan_link(&broker, &namespace, &address, &attach).await;
-        if let Ok((_, Some(accepted))) = &plan
+        let plan = plan_link(
+            &broker,
+            &namespace,
+            address,
+            &attach,
+            authorization.as_ref(),
+        )
+        .await;
+        if let Ok((_, Some(accepted), _)) = &plan
             && let Some(source) = attach.source.as_deref_mut()
         {
             stamp_session_filter(source, &accepted.session_id);
@@ -184,7 +350,7 @@ async fn serve_session<B: Broker>(
         let endpoint = acceptor
             .accept_incoming_attach(attach, &mut session)
             .await?;
-        let (entity, accepted) = match plan {
+        let (entity, accepted, link_authorization) = match plan {
             Ok(plan) => plan,
             Err(error) => {
                 // Refusing the link rather than the connection: another link on
@@ -202,8 +368,14 @@ async fn serve_session<B: Broker>(
             // The client sends; this end receives.
             LinkEndpoint::Receiver(receiver) => {
                 tokio::spawn(async move {
-                    if let Err(error) =
-                        serve_sending_client(receiver, namespace, entity, broker).await
+                    if let Err(error) = serve_sending_client(
+                        receiver,
+                        namespace,
+                        entity,
+                        broker,
+                        link_authorization,
+                    )
+                    .await
                     {
                         warn!(%error, "sending link ended");
                     }
@@ -212,9 +384,21 @@ async fn serve_session<B: Broker>(
             // The client receives; this end sends.
             LinkEndpoint::Sender(sender) => {
                 let hold = accepted.map(|accepted| accepted.hold());
+                let delivery_tags = delivery_tags.clone();
                 tokio::spawn(async move {
-                    if let Err(error) =
-                        serve_receiving_client(sender, namespace, entity, broker, mode, hold).await
+                    if let Err(error) = serve_receiving_client(
+                        sender,
+                        namespace,
+                        entity,
+                        broker,
+                        mode,
+                        hold,
+                        ReceivingLinkProtocol {
+                            authorization: link_authorization,
+                            delivery_tags,
+                        },
+                    )
+                    .await
                     {
                         warn!(%error, "receiving link ended");
                     }
@@ -225,6 +409,33 @@ async fn serve_session<B: Broker>(
     Ok(())
 }
 
+#[derive(Clone)]
+struct LinkAuthorization {
+    connection: Arc<ConnectionAuthorization>,
+    resource: ResourceScope,
+    permission: Permission,
+}
+
+struct ReceivingLinkProtocol {
+    authorization: Option<LinkAuthorization>,
+    delivery_tags: DeliveryTagRegistry,
+}
+
+impl LinkAuthorization {
+    async fn ensure(&self) -> Result<(), definitions::Error> {
+        self.connection
+            .authorize_resource(&self.resource, self.permission)
+            .await
+            .map_err(|_| unauthorized_error("the link's authorization has expired"))
+    }
+
+    async fn wait_until_unauthorized(&self) {
+        self.connection
+            .wait_until_unauthorized(&self.resource, self.permission)
+            .await;
+    }
+}
+
 /// Everything an attach needs decided before it is answered: the entity it
 /// reaches, and the session lock it holds if its source asked for one.
 async fn plan_link<B: Broker>(
@@ -232,19 +443,47 @@ async fn plan_link<B: Broker>(
     namespace: &NamespaceName,
     address: &str,
     attach: &Attach,
-) -> Result<(EntityPath, Option<AcceptedSession>), definitions::Error> {
+    authorization: Option<&Arc<ConnectionAuthorization>>,
+) -> Result<
+    (
+        EntityPath,
+        Option<AcceptedSession>,
+        Option<LinkAuthorization>,
+    ),
+    definitions::Error,
+> {
     let entity = resolve_entity(address, attach.role.clone())
         .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?;
+    let link_authorization = match authorization {
+        Some(authorization) => {
+            let permission = match attach.role {
+                Role::Sender => Permission::Send,
+                Role::Receiver => Permission::Listen,
+            };
+            let resource = authorization
+                .authorize_entity(entity.as_str(), permission)
+                .await
+                .map_err(|_| {
+                    unauthorized_error(format!("{permission:?} is not authorized for {entity}"))
+                })?;
+            Some(LinkAuthorization {
+                connection: Arc::clone(authorization),
+                resource,
+                permission,
+            })
+        }
+        None => None,
+    };
 
     // Only a receiving link takes a session lock; a sender names a session per
     // message instead.
     if attach.role != Role::Receiver {
-        return Ok((entity, None));
+        return Ok((entity, None, link_authorization));
     }
     let session_id = match read_session_filter(attach.source.as_deref())
         .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?
     {
-        SessionRequest::None => return Ok((entity, None)),
+        SessionRequest::None => return Ok((entity, None, link_authorization)),
         SessionRequest::NextAvailable => None,
         SessionRequest::Named(session_id) => Some(session_id),
     };
@@ -260,7 +499,9 @@ async fn plan_link<B: Broker>(
         )
         .await
     {
-        Ok(CommandOutcome::SessionAccepted(Some(accepted))) => Ok((entity, Some(accepted))),
+        Ok(CommandOutcome::SessionAccepted(Some(accepted))) => {
+            Ok((entity, Some(accepted), link_authorization))
+        }
         // Nothing to grant is what Service Bus reports as a timeout: the client
         // did nothing wrong and simply asks again.
         Ok(CommandOutcome::SessionAccepted(None)) => Err(definitions::Error::new(
@@ -300,15 +541,41 @@ fn resolve_entity(address: &str, role: Role) -> Result<EntityPath, ProtocolError
     }
 }
 
+fn address_for_role<'a>(role: &Role, source: &'a str, target: &'a str) -> &'a str {
+    match role {
+        Role::Sender => target,
+        Role::Receiver => source,
+    }
+}
+
 /// Drives a link the client sends on: every transfer becomes one send command.
 async fn serve_sending_client<B: Broker>(
     mut receiver: Receiver,
     namespace: NamespaceName,
     entity: EntityPath,
     broker: B,
+    authorization: Option<LinkAuthorization>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
-        let delivery = match receiver.recv::<Body<Binary>>().await {
+        let received = async {
+            match authorization.as_ref() {
+                Some(authorization) => {
+                    tokio::select! {
+                        result = receiver.recv::<Body<Binary>>() => Some(result),
+                        () = authorization.wait_until_unauthorized() => None,
+                    }
+                }
+                None => Some(receiver.recv::<Body<Binary>>().await),
+            }
+        }
+        .await;
+        let Some(received) = received else {
+            receiver
+                .close_with_error(unauthorized_error("the link's authorization has expired"))
+                .await?;
+            return Ok(());
+        };
+        let delivery = match received {
             Ok(delivery) => delivery,
             // The client hung up. Its detach is waiting for an answer, and a
             // dropped handle would leave it waiting; closing sends it.
@@ -316,13 +583,20 @@ async fn serve_sending_client<B: Broker>(
                 LinkStateError::RemoteClosed
                 | LinkStateError::RemoteDetached
                 | LinkStateError::RemoteClosedWithError(_)
-                | LinkStateError::RemoteDetachedWithError(_),
+                | LinkStateError::RemoteDetachedWithError(_)
+                | LinkStateError::IllegalSessionState,
             )) => {
                 let _ = receiver.close().await;
                 return Ok(());
             }
             Err(error) => return Err(error.into()),
         };
+        if let Some(authorization) = authorization.as_ref()
+            && let Err(error) = authorization.ensure().await
+        {
+            receiver.close_with_error(error).await?;
+            return Ok(());
+        }
         let incoming = match read_incoming(delivery.message()) {
             Ok(incoming) => incoming,
             Err(error) => {
@@ -373,7 +647,12 @@ async fn serve_receiving_client<B: Broker>(
     broker: B,
     mode: ReceiveMode,
     session: Option<SessionHold>,
+    protocol: ReceivingLinkProtocol,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ReceivingLinkProtocol {
+        authorization,
+        delivery_tags,
+    } = protocol;
     let mut renew = tokio::time::interval(SESSION_RENEW_INTERVAL);
     renew.tick().await; // the first tick is immediate, and the lock is fresh
 
@@ -386,6 +665,13 @@ async fn serve_receiving_client<B: Broker>(
             _ = sender.on_detach() => {
                 release_session(&broker, &namespace, &entity, session.as_ref()).await;
                 let _ = sender.close().await;
+                return Ok(());
+            }
+            () = wait_until_link_unauthorized(authorization.as_ref()), if authorization.is_some() => {
+                release_session(&broker, &namespace, &entity, session.as_ref()).await;
+                sender
+                    .close_with_error(unauthorized_error("the link's authorization has expired"))
+                    .await?;
                 return Ok(());
             }
             _ = renew.tick(), if session.is_some() => {
@@ -409,17 +695,58 @@ async fn serve_receiving_client<B: Broker>(
                     }
                 }
             }
-            fetched = next_delivery(&broker, &namespace, &entity, mode, session.as_ref()) => fetched,
+            fetched = next_delivery(
+                &broker,
+                &namespace,
+                &entity,
+                mode,
+                session.as_ref(),
+                authorization.as_ref(),
+            ) => fetched,
         };
 
         match fetched {
-            Ok(delivery) => settle(&mut sender, &namespace, &entity, &broker, delivery).await?,
-            Err(rejection) => {
+            Ok(delivery) => {
+                if !settle(
+                    &mut sender,
+                    &namespace,
+                    &entity,
+                    &broker,
+                    delivery,
+                    authorization.as_ref(),
+                    &delivery_tags,
+                )
+                .await?
+                {
+                    release_session(&broker, &namespace, &entity, session.as_ref()).await;
+                    sender
+                        .close_with_error(unauthorized_error(
+                            "the link's authorization expired before settlement",
+                        ))
+                        .await?;
+                    return Ok(());
+                }
+            }
+            Err(NextDeliveryError::Broker(rejection)) => {
                 release_session(&broker, &namespace, &entity, session.as_ref()).await;
                 sender.close_with_error(rejection_error(&rejection)).await?;
                 return Ok(());
             }
+            Err(NextDeliveryError::Unauthorized) => {
+                release_session(&broker, &namespace, &entity, session.as_ref()).await;
+                sender
+                    .close_with_error(unauthorized_error("the link's authorization has expired"))
+                    .await?;
+                return Ok(());
+            }
         }
+    }
+}
+
+async fn wait_until_link_unauthorized(authorization: Option<&LinkAuthorization>) {
+    match authorization {
+        Some(authorization) => authorization.wait_until_unauthorized().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -453,8 +780,14 @@ async fn next_delivery<B: Broker>(
     entity: &EntityPath,
     mode: ReceiveMode,
     session: Option<&SessionHold>,
-) -> Result<Delivery, BrokerRejection> {
+    authorization: Option<&LinkAuthorization>,
+) -> Result<Delivery, NextDeliveryError> {
     loop {
+        if let Some(authorization) = authorization
+            && authorization.ensure().await.is_err()
+        {
+            return Err(NextDeliveryError::Unauthorized);
+        }
         // Armed before the receive: a message that lands between the empty
         // answer below and the wait leaves a stored notification, so the wait
         // returns at once instead of sleeping on a queue that is not empty.
@@ -469,7 +802,8 @@ async fn next_delivery<B: Broker>(
                     session: session.cloned(),
                 },
             )
-            .await?;
+            .await
+            .map_err(NextDeliveryError::Broker)?;
 
         match outcome {
             CommandOutcome::Received(Some(delivery)) => return Ok(delivery),
@@ -482,12 +816,17 @@ async fn next_delivery<B: Broker>(
             other => {
                 // A receive that produced anything else means the broker and the
                 // edge disagree about the command, which is not a client problem.
-                return Err(BrokerRejection::Unavailable(format!(
-                    "receive produced an unexpected outcome: {other:?}"
+                return Err(NextDeliveryError::Broker(BrokerRejection::Unavailable(
+                    format!("receive produced an unexpected outcome: {other:?}"),
                 )));
             }
         }
     }
+}
+
+enum NextDeliveryError {
+    Broker(BrokerRejection),
+    Unauthorized,
 }
 
 /// Hands one message to the client and applies whatever it said about it.
@@ -500,15 +839,46 @@ async fn settle<B: Broker>(
     entity: &EntityPath,
     broker: &B,
     delivery: Delivery,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    authorization: Option<&LinkAuthorization>,
+    delivery_tags: &DeliveryTagRegistry,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let Some(lock) = delivery.lock else {
         // Receive-and-delete: the message is already gone, so there is nothing
         // to settle after the transfer.
-        sender.send(crate::write_delivery(&delivery)).await?;
-        return Ok(());
+        let sent = match authorization {
+            Some(authorization) => {
+                tokio::select! {
+                    outcome = sender.send(crate::write_delivery(&delivery)) => {
+                        outcome?;
+                        true
+                    }
+                    () = authorization.wait_until_unauthorized() => false,
+                }
+            }
+            None => {
+                sender.send(crate::write_delivery(&delivery)).await?;
+                true
+            }
+        };
+        return Ok(sent);
     };
     let sequence = delivery.sequence;
-    let outcome = sender.send(crate::write_delivery(&delivery)).await?;
+    let delivery_tag = lock_delivery_tag(lock.token);
+    delivery_tags.register(sender.name(), delivery_tag);
+    let outcome = match authorization {
+        Some(authorization) => {
+            tokio::select! {
+                outcome = sender.send(crate::write_delivery(&delivery)) => outcome?,
+                () = authorization.wait_until_unauthorized() => return Ok(false),
+            }
+        }
+        None => sender.send(crate::write_delivery(&delivery)).await?,
+    };
+    if let Some(authorization) = authorization
+        && authorization.ensure().await.is_err()
+    {
+        return Ok(false);
+    }
 
     let kind = match outcome {
         Outcome::Accepted(_) => CommandKind::Complete {
@@ -539,7 +909,13 @@ async fn settle<B: Broker>(
         // the message comes round again.
         warn!(%sequence, %rejection, "settlement failed, leaving the lock to expire");
     }
-    Ok(())
+    Ok(true)
+}
+
+fn lock_delivery_tag(token: LockToken) -> DeliveryTag {
+    let mut tag = [0_u8; 16];
+    tag[8..].copy_from_slice(&token.as_u64().to_be_bytes());
+    tag.to_vec().into()
 }
 
 async fn detach_with(endpoint: LinkEndpoint, error: definitions::Error) {
@@ -555,6 +931,10 @@ async fn detach_with(endpoint: LinkEndpoint, error: definitions::Error) {
 
 fn error_for(condition: AmqpError, description: String) -> definitions::Error {
     definitions::Error::new(condition, description, None)
+}
+
+fn unauthorized_error(description: impl Into<String>) -> definitions::Error {
+    error_for(AmqpError::UnauthorizedAccess, description.into())
 }
 
 /// The wire error a broker rejection becomes, carrying the condition an SDK
@@ -589,6 +969,25 @@ mod tests {
         );
         assert!(resolve_entity("orders/$deadletterqueue", Role::Sender).is_err());
         assert!(resolve_entity("billing/Subscriptions/accounting", Role::Receiver).is_err());
+    }
+
+    #[test]
+    fn entity_addresses_come_from_the_authoritative_terminus() {
+        assert_eq!(
+            address_for_role(&Role::Sender, "generated-source", "orders"),
+            "orders"
+        );
+        assert_eq!(
+            address_for_role(&Role::Receiver, "orders", "generated-target"),
+            "orders"
+        );
+    }
+
+    #[test]
+    fn a_lock_token_is_a_guid_sized_delivery_tag() {
+        let tag = lock_delivery_tag(LockToken::new(42));
+        assert_eq!(tag.len(), 16);
+        assert_eq!(&tag[8..], &42_u64.to_be_bytes());
     }
 
     #[test]

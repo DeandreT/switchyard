@@ -7,10 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+auth.workspace = true
 domain.workspace = true
 amqp-runtime.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
+serde_amqp.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true

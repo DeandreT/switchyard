@@ -49,6 +49,27 @@ impl AccessGrant {
 }
 
 impl SharedAccessPolicy {
+    pub fn authenticate_plain(
+        &self,
+        key_name: &str,
+        presented_key: &str,
+    ) -> Result<AccessGrant, SasError> {
+        let rule = self.rule(key_name).ok_or(SasError::InvalidCredential)?;
+        let valid = rule
+            .keys()
+            .map(|key| credential_matches(key.expose(), presented_key.as_bytes()))
+            .fold(false, |either, matches| either | matches);
+        if !valid {
+            return Err(SasError::InvalidCredential);
+        }
+        Ok(AccessGrant {
+            subject: key_name.to_owned(),
+            scope: rule.scope().clone(),
+            expires_at_epoch_seconds: u64::MAX,
+            permissions: rule.permissions(),
+        })
+    }
+
     /// Validates one Service Bus shared-access token for the CBS audience.
     ///
     /// The HMAC input deliberately retains the token's encoded `sr` field.
@@ -105,6 +126,21 @@ fn signature_matches(key: &[u8], input: &[u8], signature: &[u8]) -> bool {
     };
     hmac.update(input);
     hmac.verify_slice(signature).is_ok()
+}
+
+fn credential_matches(expected: &[u8], presented: &[u8]) -> bool {
+    const PROOF: &[u8] = b"switchyard-sasl-plain-credential";
+    let (Ok(mut expected_hmac), Ok(mut presented_hmac)) = (
+        Hmac::<Sha256>::new_from_slice(expected),
+        Hmac::<Sha256>::new_from_slice(presented),
+    ) else {
+        return false;
+    };
+    expected_hmac.update(PROOF);
+    presented_hmac.update(PROOF);
+    expected_hmac
+        .verify_slice(&presented_hmac.finalize().into_bytes())
+        .is_ok()
 }
 
 struct ParsedToken<'a> {
@@ -195,6 +231,8 @@ pub enum SasError {
     UnknownRule,
     #[error("the shared-access token signature is invalid")]
     InvalidSignature,
+    #[error("the shared-access credential is invalid")]
+    InvalidCredential,
 }
 
 impl From<ResourceScopeError> for SasError {
@@ -269,6 +307,26 @@ mod tests {
         let signed = token(ENCODED_ORDERS, "send", EXPIRY, "new-key");
 
         assert!(policy.validate_sas(&signed, ORDERS, EXPIRY - 1).is_ok());
+    }
+
+    #[test]
+    fn plain_accepts_either_key_without_disclosing_which_part_failed() {
+        let policy = policy(
+            ResourceScope::namespace(HOST).unwrap(),
+            "old-key",
+            Some("new-key"),
+        );
+
+        assert!(policy.authenticate_plain("send", "old-key").is_ok());
+        assert!(policy.authenticate_plain("send", "new-key").is_ok());
+        assert_eq!(
+            policy.authenticate_plain("send", "wrong"),
+            Err(SasError::InvalidCredential)
+        );
+        assert_eq!(
+            policy.authenticate_plain("unknown", "old-key"),
+            Err(SasError::InvalidCredential)
+        );
     }
 
     #[test]

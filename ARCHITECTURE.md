@@ -11,13 +11,14 @@ either the Fjall backend or the memory backend, so a single node survives a
 restart.
 
 The `switchyard` binary accepts AMQP connections over development plaintext or
-TLS, carries messages and sessions across that edge, and sweeps lock,
-time-to-live, and session-lock expiry. Authentication, Raft, and compliance
-implementations remain to be built. Within the semantics below, scheduling,
-deferral, duplicate detection, and topics are not implemented, the timer worker
-covers only the three expiry indexes that exist, and the storage keyspace
-layout under [Storage](#storage) is still a single record keyspace rather than
-the split listed there.
+TLS, authenticates a configured shared-access policy through SASL PLAIN or CBS
+SAS, carries messages and sessions across that edge, and sweeps lock,
+time-to-live, and session-lock expiry. JWT/OIDC, mTLS, policy administration,
+Raft, and compliance implementations remain to be built. Within the semantics
+below, scheduling, deferral, duplicate detection, and topics are not
+implemented, the timer worker covers only the three expiry indexes that exist,
+and the storage keyspace layout under [Storage](#storage) is still a single
+record keyspace rather than the split listed there.
 
 Compatibility means observable protocol and SDK behavior backed by automated
 tests. It does not mean byte-for-byte implementation similarity, Microsoft
