@@ -267,6 +267,9 @@ pub struct Delivery {
     pub lock: Option<DeliveryLock>,
     /// The session this message was delivered from, on a session queue.
     pub session_id: Option<SessionId>,
+    /// Why the message was dead-lettered, when it came from a dead-letter
+    /// queue.
+    pub dead_letter: Option<DeadLetterInfo>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

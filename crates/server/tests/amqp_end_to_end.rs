@@ -429,6 +429,19 @@ async fn a_rejected_message_is_drained_from_the_dead_letter_queue() -> Result<()
     )
     .await??;
     assert_eq!(text_of(poisoned.message()), "poison");
+    // The drained message says why it is there, in the properties the SDKs read.
+    let reason = poisoned
+        .message()
+        .application_properties
+        .as_ref()
+        .and_then(|properties| properties.0.get("DeadLetterReason"))
+        .cloned();
+    assert_eq!(
+        reason,
+        Some(amqp_runtime::types::primitives::SimpleValue::String(
+            String::from("RejectedByReceiver")
+        ))
+    );
     dead_letter_receiver.accept(&poisoned).await?;
 
     // Completing in the dead-letter queue removes the message permanently.

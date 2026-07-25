@@ -516,6 +516,7 @@ impl<S: StateStore> StateMachine<S> {
                 delivery_count,
                 lock,
                 session_id: record.session_id,
+                dead_letter: record.dead_letter,
             })));
         }
 

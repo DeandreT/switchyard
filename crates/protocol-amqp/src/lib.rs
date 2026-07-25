@@ -27,7 +27,10 @@ pub use crate::{
         SESSION_LOCK_LOST, TIMEOUT, condition_for, is_retryable,
     },
     listener::AmqpListener,
-    message::{IncomingMessage, read_incoming, write_delivery},
+    message::{
+        DEAD_LETTER_DESCRIPTION_PROPERTY, DEAD_LETTER_REASON_PROPERTY, IncomingMessage,
+        read_incoming, write_delivery,
+    },
     session_filter::{SESSION_FILTER, SessionRequest, read_session_filter, stamp_session_filter},
 };
 

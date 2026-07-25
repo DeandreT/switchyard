@@ -8,7 +8,7 @@
 
 use domain::{Delivery, SessionId};
 use amqp_runtime::types::{
-    messaging::{Batch, Body, Data, Message, Properties},
+    messaging::{ApplicationProperties, Batch, Body, Data, Message, Properties},
     primitives::Binary,
 };
 
@@ -51,6 +51,11 @@ pub fn read_incoming(message: &Message<Body<Binary>>) -> Result<IncomingMessage,
     })
 }
 
+/// The application property Service Bus clients read a dead-letter reason from.
+pub const DEAD_LETTER_REASON_PROPERTY: &str = "DeadLetterReason";
+/// The application property carrying the dead-letter description.
+pub const DEAD_LETTER_DESCRIPTION_PROPERTY: &str = "DeadLetterErrorDescription";
+
 /// Builds the message handed back to a receiving client.
 pub fn write_delivery(delivery: &Delivery) -> Message<Body<Binary>> {
     let properties = Properties {
@@ -62,12 +67,30 @@ pub fn write_delivery(delivery: &Delivery) -> Message<Body<Binary>> {
         ..Properties::default()
     };
 
-    Message::builder()
+    let mut message = Message::builder()
         .properties(properties)
         .body(Body::Data(Batch::new(vec![Data(Binary::from(
             delivery.body.clone(),
         ))])))
-        .build()
+        .build();
+
+    // A message drained from a dead-letter queue says why it is there, in the
+    // properties the Service Bus SDKs read.
+    if let Some(dead_letter) = &delivery.dead_letter {
+        message.application_properties = Some(
+            ApplicationProperties::builder()
+                .insert(
+                    DEAD_LETTER_REASON_PROPERTY,
+                    dead_letter.reason.as_str().to_owned(),
+                )
+                .insert(
+                    DEAD_LETTER_DESCRIPTION_PROPERTY,
+                    dead_letter.description.clone(),
+                )
+                .build(),
+        );
+    }
+    message
 }
 
 /// The bytes a body carries, whatever shape it arrived in.
@@ -174,6 +197,7 @@ mod tests {
                 locked_until: Timestamp::from_millis(100),
             }),
             session_id: Some(SessionId::new("cart-1").expect("a valid session id")),
+            dead_letter: None,
         };
 
         // A round trip through the wire shape keeps what the broker recorded, so

@@ -104,9 +104,10 @@ open and releases it when the link closes, because the management operations
 the SDKs renew through are not implemented. A transfer is accepted only after its
 command committed, so the acknowledgement means durable. What this is not yet:
 there is no TLS, no SASL or CBS authentication, one node serves one namespace,
-and dead-letter reason and description are not yet surfaced as message
-annotations. The end-to-end coverage is a Rust AMQP 1.0 client, not the
-official SDKs the client gates require.
+and a message drained from a dead-letter queue carries its reason and
+description in the DeadLetterReason and DeadLetterErrorDescription application
+properties. The end-to-end coverage is a Rust AMQP 1.0 client, not the official
+SDKs the client gates require.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch
 before reporting it applied, and the same semantics suite runs against both
