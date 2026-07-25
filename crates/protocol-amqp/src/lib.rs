@@ -1,6 +1,27 @@
+//! AMQP 1.0 and Azure Service Bus protocol adaptation.
+//!
+//! Wire concerns only: what a client attached to, what a rejection is called on
+//! the wire, and what a message may weigh. Delivery semantics belong to the
+//! domain crate and are re-exported rather than restated.
+
 #![forbid(unsafe_code)]
 
+mod address;
+mod condition;
+
 use thiserror::Error;
+
+pub use crate::{
+    address::{
+        Attachment, DEAD_LETTER_SUFFIX, SUBSCRIPTION_SEGMENT, namespace_from_hostname,
+        parse_attachment, parse_session_id,
+    },
+    condition::{
+        ENTITY_ALREADY_EXISTS, INTERNAL_ERROR, MESSAGE_LOCK_LOST, MESSAGE_SIZE_EXCEEDED,
+        NOT_ALLOWED, NOT_FOUND, PRECONDITION_FAILED, RESOURCE_LOCKED, SESSION_CANNOT_BE_LOCKED,
+        SESSION_LOCK_LOST, condition_for, is_retryable,
+    },
+};
 
 /// Settlement modes are broker semantics, not wire syntax, so they live in the
 /// domain crate. The protocol edge maps AMQP receiver settle modes onto them.
@@ -33,6 +54,12 @@ pub enum ProtocolError {
         encoded_bytes: usize,
         maximum_bytes: usize,
     },
+    #[error("the connection named no namespace")]
+    MissingNamespace,
+    #[error("address {address:?} does not name an entity: {detail}")]
+    InvalidAddress { address: String, detail: String },
+    #[error("session id {session_id:?} is not usable: {detail}")]
+    InvalidSessionId { session_id: String, detail: String },
 }
 
 #[cfg(test)]
