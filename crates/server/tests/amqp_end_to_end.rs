@@ -252,6 +252,158 @@ async fn a_receiver_waiting_on_an_empty_queue_is_woken_by_a_send() -> Result<(),
     Ok(())
 }
 
+fn session_source(queue: &str, session: Option<&str>) -> amqp_runtime::types::messaging::Source {
+    use amqp_runtime::types::{
+        messaging::FilterSet,
+        primitives::{Symbol, Value},
+    };
+    let mut filter = FilterSet::default();
+    filter.insert(
+        Symbol::from(protocol_amqp::SESSION_FILTER),
+        session.map_or(Value::Null, |id| Value::String(id.to_owned())),
+    );
+    amqp_runtime::types::messaging::Source::builder()
+        .address(queue)
+        .filter(filter)
+        .build()
+}
+
+fn session_of(source: &Option<amqp_runtime::types::messaging::Source>) -> Option<String> {
+    use amqp_runtime::types::primitives::{Symbol, Value};
+    source
+        .as_ref()?
+        .filter
+        .as_ref()?
+        .get(&Symbol::from(protocol_amqp::SESSION_FILTER))
+        .and_then(|value| match value {
+            Value::String(id) => Some(id.clone()),
+            _ => None,
+        })
+}
+
+fn with_session(text: &str, session: &str) -> Message<Body<Binary>> {
+    let mut message = Message::builder().body(body(text)).build();
+    message.properties = Some(Properties {
+        group_id: Some(session.to_owned()),
+        ..Properties::default()
+    });
+    message
+}
+
+fn session_queue_config() -> QueueConfig {
+    QueueConfig {
+        requires_session: true,
+        ..QueueConfig::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_receiver_gets_only_its_session_in_order() -> Result<(), Box<dyn Error>> {
+    let node = Node::start("orders", session_queue_config()).await?;
+
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
+    sender.send(with_session("other", "cart-2")).await?;
+    sender.send(with_session("first", "cart-1")).await?;
+    sender.send(with_session("second", "cart-1")).await?;
+
+    let mut receiver = Receiver::builder()
+        .name("test-receiver")
+        .source(session_source("orders", Some("cart-1")))
+        .attach(&mut session)
+        .await?;
+
+    // FIFO within the session, and nothing from any other session.
+    for expected in ["first", "second"] {
+        let delivery = receiver.recv::<Body<Binary>>().await?;
+        assert_eq!(text_of(delivery.message()), expected);
+        receiver.accept(&delivery).await?;
+    }
+    let starved = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        receiver.recv::<Body<Binary>>(),
+    )
+    .await;
+    assert!(starved.is_err(), "another session's message leaked through");
+
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_next_available_receiver_learns_which_session_it_got() -> Result<(), Box<dyn Error>> {
+    let node = Node::start("orders", session_queue_config()).await?;
+
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
+    sender.send(with_session("payload", "cart-9")).await?;
+
+    // A null filter asks for whichever session the broker grants; the echoed
+    // attach carries the granted identifier.
+    let mut receiver = Receiver::builder()
+        .name("test-receiver")
+        .source(session_source("orders", None))
+        .attach(&mut session)
+        .await?;
+    assert_eq!(session_of(receiver.source()), Some(String::from("cart-9")));
+
+    let delivery = receiver.recv::<Body<Binary>>().await?;
+    assert_eq!(text_of(delivery.message()), "payload");
+    receiver.accept(&delivery).await?;
+
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_session_is_refused_until_its_link_closes() -> Result<(), Box<dyn Error>> {
+    let node = Node::start("orders", session_queue_config()).await?;
+
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let holder = Receiver::builder()
+        .name("holder")
+        .source(session_source("orders", Some("cart-1")))
+        .attach(&mut session)
+        .await?;
+
+    // The second claimant's attach completes, then the link is refused: its
+    // first receive reports the session as held.
+    let mut rival = Receiver::builder()
+        .name("rival")
+        .source(session_source("orders", Some("cart-1")))
+        .attach(&mut session)
+        .await?;
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        rival.recv::<Body<Binary>>(),
+    )
+    .await?;
+    assert!(refused.is_err(), "a held session was granted twice");
+
+    // Closing the holder releases the session rather than waiting out its lock.
+    holder.close().await?;
+    let mut next = Receiver::builder()
+        .name("next")
+        .source(session_source("orders", Some("cart-1")))
+        .attach(&mut session)
+        .await?;
+    let waiting = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        next.recv::<Body<Binary>>(),
+    )
+    .await;
+    assert!(
+        waiting.is_err(),
+        "a healthy link waits on an empty session instead of erroring"
+    );
+
+    connection.close().await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn attaching_to_a_queue_that_does_not_exist_is_refused() -> Result<(), Box<dyn Error>> {
     let node = Node::start("orders", QueueConfig::default()).await?;

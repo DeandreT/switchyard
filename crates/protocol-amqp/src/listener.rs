@@ -7,22 +7,29 @@
 
 use std::time::Duration;
 
-use domain::{CommandKind, CommandOutcome, Delivery, EntityPath, NamespaceName, ReceiveMode};
+use domain::{
+    AcceptedSession, CommandKind, CommandOutcome, Delivery, EntityPath, NamespaceName, ReceiveMode,
+    SessionHold,
+};
 use amqp_runtime::{
     acceptor::{
         ConnectionAcceptor, LinkAcceptor, LinkEndpoint, ListenerSessionHandle, SessionAcceptor,
     },
     link::{LinkStateError, Receiver, RecvError, Sender},
     types::{
-        definitions::{self, AmqpError, SenderSettleMode},
+        definitions::{self, AmqpError, Role, SenderSettleMode},
         messaging::{Body, Outcome, TargetArchetype},
+        performatives::Attach,
         primitives::Binary,
     },
 };
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
-use crate::{Attachment, Broker, BrokerRejection, ProtocolError, parse_attachment, read_incoming};
+use crate::{
+    Attachment, Broker, BrokerRejection, ProtocolError, SessionRequest, parse_attachment,
+    read_incoming, read_session_filter, stamp_session_filter,
+};
 
 /// How long a receiving link waits on a wakeup before asking the broker anyway.
 ///
@@ -30,6 +37,13 @@ use crate::{Attachment, Broker, BrokerRejection, ProtocolError, parse_attachment
 /// lost when several links wait on one entity, so a waiter re-asks on a coarse
 /// interval rather than trusting the signal absolutely.
 const EMPTY_QUEUE_FALLBACK: Duration = Duration::from_secs(3);
+
+/// How often a link that holds a session renews its lock.
+///
+/// The broker renews on the receiver's behalf while the link is open, because
+/// the management operations the SDKs renew through do not exist yet. Well
+/// under the shortest configurable lock a client is likely to use.
+const SESSION_RENEW_INTERVAL: Duration = Duration::from_secs(15);
 
 pub struct AmqpListener<B> {
     broker: B,
@@ -105,7 +119,7 @@ async fn serve_session<B: Broker>(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let acceptor = LinkAcceptor::default();
 
-    while let Some(attach) = session.next_incoming_attach().await {
+    while let Some(mut attach) = session.next_incoming_attach().await {
         // The address has to be read before the attach is consumed. A client
         // sending names its entity in the target; one receiving names it in the
         // source.
@@ -131,21 +145,32 @@ async fn serve_session<B: Broker>(
             SenderSettleMode::Unsettled | SenderSettleMode::Mixed => ReceiveMode::PeekLock,
         };
 
+        // Everything that can refuse the link is decided before the attach is
+        // accepted, so a granted session can be stamped into the source the
+        // acceptor echoes — the echo is how a next-available receiver learns
+        // which session it got.
+        let plan = plan_link(&broker, &namespace, &address, &attach).await;
+        if let Ok((_, Some(accepted))) = &plan
+            && let Some(source) = attach.source.as_deref_mut()
+        {
+            stamp_session_filter(source, &accepted.session_id);
+        }
+
         let endpoint = acceptor
             .accept_incoming_attach(attach, &mut session)
             .await?;
-        let entity = match resolve_entity(&address) {
-            Ok(entity) => entity,
+        let (entity, accepted) = match plan {
+            Ok(plan) => plan,
             Err(error) => {
                 // Refusing the link rather than the connection: another link on
                 // the same session may be perfectly valid.
-                warn!(%address, %error, "refusing link");
-                detach_with(endpoint, AmqpError::InvalidField, error.to_string()).await;
+                warn!(%address, condition = ?error.condition, "refusing link");
+                detach_with(endpoint, error).await;
                 continue;
             }
         };
 
-        info!(%address, entity = %entity, "link attached");
+        info!(%address, entity = %entity, session = accepted.as_ref().map(|accepted| accepted.session_id.as_str()), "link attached");
         let broker = broker.clone();
         let namespace = namespace.clone();
         match endpoint {
@@ -161,9 +186,10 @@ async fn serve_session<B: Broker>(
             }
             // The client receives; this end sends.
             LinkEndpoint::Sender(sender) => {
+                let hold = accepted.map(|accepted| accepted.hold());
                 tokio::spawn(async move {
                     if let Err(error) =
-                        serve_receiving_client(sender, namespace, entity, broker, mode).await
+                        serve_receiving_client(sender, namespace, entity, broker, mode, hold).await
                     {
                         warn!(%error, "receiving link ended");
                     }
@@ -172,6 +198,57 @@ async fn serve_session<B: Broker>(
         }
     }
     Ok(())
+}
+
+/// Everything an attach needs decided before it is answered: the entity it
+/// reaches, and the session lock it holds if its source asked for one.
+async fn plan_link<B: Broker>(
+    broker: &B,
+    namespace: &NamespaceName,
+    address: &str,
+    attach: &Attach,
+) -> Result<(EntityPath, Option<AcceptedSession>), definitions::Error> {
+    let entity = resolve_entity(address)
+        .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?;
+
+    // Only a receiving link takes a session lock; a sender names a session per
+    // message instead.
+    if attach.role != Role::Receiver {
+        return Ok((entity, None));
+    }
+    let session_id = match read_session_filter(attach.source.as_deref())
+        .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?
+    {
+        SessionRequest::None => return Ok((entity, None)),
+        SessionRequest::NextAvailable => None,
+        SessionRequest::Named(session_id) => Some(session_id),
+    };
+
+    match broker
+        .submit(
+            namespace.clone(),
+            entity.clone(),
+            CommandKind::AcceptSession {
+                session_id,
+                lock_duration_millis: None,
+            },
+        )
+        .await
+    {
+        Ok(CommandOutcome::SessionAccepted(Some(accepted))) => Ok((entity, Some(accepted))),
+        // Nothing to grant is what Service Bus reports as a timeout: the client
+        // did nothing wrong and simply asks again.
+        Ok(CommandOutcome::SessionAccepted(None)) => Err(definitions::Error::new(
+            definitions::ErrorCondition::Custom(crate::TIMEOUT.into()),
+            String::from("no session is available to accept"),
+            None,
+        )),
+        Ok(other) => Err(error_for(
+            AmqpError::InternalError,
+            format!("accepting a session produced an unexpected outcome: {other:?}"),
+        )),
+        Err(rejection) => Err(rejection_error(&rejection)),
+    }
 }
 
 /// The entity a link may attach to, or why it may not.
@@ -261,7 +338,11 @@ async fn serve_receiving_client<B: Broker>(
     entity: EntityPath,
     broker: B,
     mode: ReceiveMode,
+    session: Option<SessionHold>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut renew = tokio::time::interval(SESSION_RENEW_INTERVAL);
+    renew.tick().await; // the first tick is immediate, and the lock is fresh
+
     loop {
         // The link is watched the whole time a message is being waited for. A
         // client that detaches while the queue is empty is waiting for an
@@ -269,19 +350,65 @@ async fn serve_receiving_client<B: Broker>(
         let fetched = tokio::select! {
             biased;
             _ = sender.on_detach() => {
+                release_session(&broker, &namespace, &entity, session.as_ref()).await;
                 let _ = sender.close().await;
                 return Ok(());
             }
-            fetched = next_delivery(&broker, &namespace, &entity, mode) => fetched,
+            _ = renew.tick(), if session.is_some() => {
+                let Some(hold) = session.as_ref() else { continue };
+                match broker
+                    .submit(
+                        namespace.clone(),
+                        entity.clone(),
+                        CommandKind::RenewSessionLock {
+                            session: hold.clone(),
+                            lock_duration_millis: None,
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => continue,
+                    // The lock is already gone, so there is nothing to release.
+                    Err(rejection) => {
+                        sender.close_with_error(rejection_error(&rejection)).await?;
+                        return Ok(());
+                    }
+                }
+            }
+            fetched = next_delivery(&broker, &namespace, &entity, mode, session.as_ref()) => fetched,
         };
 
         match fetched {
             Ok(delivery) => settle(&mut sender, &namespace, &entity, &broker, delivery).await?,
             Err(rejection) => {
+                release_session(&broker, &namespace, &entity, session.as_ref()).await;
                 sender.close_with_error(rejection_error(&rejection)).await?;
                 return Ok(());
             }
         }
+    }
+}
+
+/// Frees the session a link held, so the next receiver need not wait out the
+/// lock. Failure is survivable: expiry frees it anyway.
+async fn release_session<B: Broker>(
+    broker: &B,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    session: Option<&SessionHold>,
+) {
+    let Some(hold) = session else { return };
+    if let Err(rejection) = broker
+        .submit(
+            namespace.clone(),
+            entity.clone(),
+            CommandKind::ReleaseSession {
+                session: hold.clone(),
+            },
+        )
+        .await
+    {
+        debug!(session = %hold.session_id, %rejection, "session not released, leaving it to expire");
     }
 }
 
@@ -291,6 +418,7 @@ async fn next_delivery<B: Broker>(
     namespace: &NamespaceName,
     entity: &EntityPath,
     mode: ReceiveMode,
+    session: Option<&SessionHold>,
 ) -> Result<Delivery, BrokerRejection> {
     loop {
         // Armed before the receive: a message that lands between the empty
@@ -304,7 +432,7 @@ async fn next_delivery<B: Broker>(
                 CommandKind::Receive {
                     mode,
                     lock_duration_millis: None,
-                    session: None,
+                    session: session.cloned(),
                 },
             )
             .await?;
@@ -380,8 +508,7 @@ async fn settle<B: Broker>(
     Ok(())
 }
 
-async fn detach_with(endpoint: LinkEndpoint, condition: AmqpError, description: String) {
-    let error = error_for(condition, description);
+async fn detach_with(endpoint: LinkEndpoint, error: definitions::Error) {
     match endpoint {
         LinkEndpoint::Sender(sender) => {
             let _ = sender.close_with_error(error).await;

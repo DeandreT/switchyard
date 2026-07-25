@@ -19,6 +19,8 @@ pub const MESSAGE_LOCK_LOST: &str = "com.microsoft:message-lock-lost";
 pub const SESSION_LOCK_LOST: &str = "com.microsoft:session-lock-lost";
 pub const SESSION_CANNOT_BE_LOCKED: &str = "com.microsoft:session-cannot-be-locked";
 pub const ENTITY_ALREADY_EXISTS: &str = "com.microsoft:entity-already-exists";
+/// What Service Bus reports when no session could be granted in time.
+pub const TIMEOUT: &str = "com.microsoft:timeout";
 
 /// The condition symbol to report `error` as.
 pub fn condition_for(error: &BrokerError) -> &'static str {

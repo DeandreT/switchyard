@@ -11,6 +11,7 @@ mod broker;
 mod condition;
 mod listener;
 mod message;
+mod session_filter;
 
 use thiserror::Error;
 
@@ -23,10 +24,11 @@ pub use crate::{
     condition::{
         ENTITY_ALREADY_EXISTS, INTERNAL_ERROR, MESSAGE_LOCK_LOST, MESSAGE_SIZE_EXCEEDED,
         NOT_ALLOWED, NOT_FOUND, PRECONDITION_FAILED, RESOURCE_LOCKED, SESSION_CANNOT_BE_LOCKED,
-        SESSION_LOCK_LOST, condition_for, is_retryable,
+        SESSION_LOCK_LOST, TIMEOUT, condition_for, is_retryable,
     },
     listener::AmqpListener,
     message::{IncomingMessage, read_incoming, write_delivery},
+    session_filter::{SESSION_FILTER, SessionRequest, read_session_filter, stamp_session_filter},
 };
 
 /// Settlement modes are broker semantics, not wire syntax, so they live in the

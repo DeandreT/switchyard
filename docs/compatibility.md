@@ -34,7 +34,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Deferral and deferred receive | Pre-1.0 | Not implemented |
 | Dead-letter | Pre-1.0 | State machine |
 | Dead-letter receive and resubmit | Pre-1.0 | Not implemented |
-| Sessions and session state | Pre-1.0 | State machine |
+| Sessions and session state | Pre-1.0 | State machine, AMQP mapping |
 | Duplicate detection | Pre-1.0 | Not implemented |
 | Same-placement-group transactions | Pre-1.0 | Not implemented |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
@@ -90,7 +90,12 @@ An AMQP 1.0 client can reach a queue. The node accepts plain-TCP AMQP
 connections, resolves a link's address to an entity, turns transfers into send
 commands and dispositions into settlements, and answers a rejection with the
 condition an SDK keys its behaviour off. A receiving link's settle mode selects
-the delivery guarantee: unsettled is peek-lock, pre-settled is receive-delete. A transfer is accepted only after its
+the delivery guarantee: unsettled is peek-lock, pre-settled is receive-delete.
+A receiving link's `com.microsoft:session-filter` names a session or, with a
+null value, asks for the next available one; the attach response echoes the
+granted identifier. The node renews a link's session lock while the link is
+open and releases it when the link closes, because the management operations
+the SDKs renew through are not implemented. A transfer is accepted only after its
 command committed, so the acknowledgement means durable. What this is not yet:
 there is no TLS, no SASL or CBS authentication, one node serves one namespace,
 and session-aware links and dead-letter receive are not exposed. The end-to-end
