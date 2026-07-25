@@ -39,7 +39,7 @@ tracked in [docs/compatibility.md](docs/compatibility.md).
 | `protocol-amqp` | AMQP 1.0 and Azure Service Bus protocol adaptation |
 | `auth` | SAS, OIDC, mTLS, RBAC, encryption, and audit policy |
 | `admin-api` | Versioned native gRPC administration contract |
-| `server` | Broker process and deployment configuration |
+| `server` | Broker process: backend selection, command proposal, and timers |
 | `switchyardctl` | Native administration CLI |
 | `testkit` | Deterministic fixtures and cluster test support |
 | `conformance` | SDK and behavioral compatibility suites |

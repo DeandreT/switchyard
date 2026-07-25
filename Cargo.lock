@@ -668,6 +668,11 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "cluster",
+ "domain",
+ "storage",
+ "tempfile",
+ "testkit",
+ "thiserror",
  "tracing",
  "tracing-subscriber",
 ]

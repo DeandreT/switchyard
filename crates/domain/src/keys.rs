@@ -72,6 +72,24 @@ pub fn queue_config(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
     entity_scope(TAG_QUEUE_CONFIG, namespace, entity)
 }
 
+/// Every queue configuration in the store, across every namespace. Walking it is
+/// how the timer worker learns what there is to sweep.
+pub fn queue_config_prefix() -> Vec<u8> {
+    vec![TAG_QUEUE_CONFIG]
+}
+
+/// Reads the namespace and entity path back out of an entity-scoped key.
+pub fn entity_scope_parts(key: &[u8]) -> Option<(&str, &str)> {
+    let rest = key.get(1..)?;
+    let namespace_end = rest.iter().position(|byte| *byte == SEPARATOR)?;
+    let namespace = std::str::from_utf8(rest.get(..namespace_end)?).ok()?;
+
+    let tail = rest.get(namespace_end + 1..)?;
+    let entity_end = tail.iter().position(|byte| *byte == SEPARATOR)?;
+    let entity = std::str::from_utf8(tail.get(..entity_end)?).ok()?;
+    Some((namespace, entity))
+}
+
 pub fn queue_counters(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
     entity_scope(TAG_QUEUE_COUNTERS, namespace, entity)
 }
@@ -398,6 +416,18 @@ mod tests {
         let short = session_ready_prefix(&namespace(), &entity(), &session_id("cart"));
         let long = session_ready_prefix(&namespace(), &entity(), &session_id("cart-2"));
         assert!(!long.starts_with(&short));
+    }
+
+    #[test]
+    fn an_entity_scope_reads_back_out_of_its_key() {
+        let key = queue_config(&namespace(), &entity());
+        assert!(key.starts_with(&queue_config_prefix()));
+        assert_eq!(entity_scope_parts(&key), Some(("tenant", "orders")));
+
+        // Index keys carry a payload after the scope, which must not confuse it.
+        let ready = ready(&namespace(), &entity(), SequenceNumber::new(7));
+        assert_eq!(entity_scope_parts(&ready), Some(("tenant", "orders")));
+        assert_eq!(entity_scope_parts(&clock()), None);
     }
 
     #[test]

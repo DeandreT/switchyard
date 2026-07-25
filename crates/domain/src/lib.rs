@@ -26,7 +26,7 @@ pub use identifier::{
     EntityPath, IdentifierError, MAX_ENTITY_PATH_BYTES, MAX_NAMESPACE_NAME_BYTES,
     MAX_PLACEMENT_GROUP_ID_BYTES, MAX_SESSION_ID_BYTES, NamespaceName, PlacementGroupId, SessionId,
 };
-pub use machine::StateMachine;
+pub use machine::{StateMachine, TIMER_SCAN_LIMIT};
 pub use message::{
     DeadLetterInfo, DeadLetterReason, Delivery, DeliveryGuarantee, DeliveryLock, LockToken,
     MessageRecord, MessageState, ReceiveMode, SequenceNumber,

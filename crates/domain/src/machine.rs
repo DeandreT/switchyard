@@ -24,9 +24,9 @@ use crate::{
 /// expired messages cannot stall the group.
 const MAX_RECEIVE_SCAN: usize = 32;
 
-/// Index entries a single timer sweep may process. The worker proposes another
-/// command when it reaches this limit.
-const MAX_TIMER_SCAN: usize = 256;
+/// Index entries a single timer sweep may process. A sweep that reports this
+/// many may have more waiting, so the worker proposes another command.
+pub const TIMER_SCAN_LIMIT: usize = 256;
 
 /// Sessions one acceptance may examine before giving up. A queue whose first
 /// `MAX_SESSION_SCAN` sessions are all held reports none available rather than
@@ -153,6 +153,20 @@ impl<S: StateStore> StateMachine<S> {
         entity: &EntityPath,
     ) -> Result<Option<QueueConfig>, BrokerError> {
         self.read(&keys::queue_config(namespace, entity))
+    }
+
+    /// Every queue in the store, in key order, across every namespace. The timer
+    /// worker walks this to learn what there is to sweep.
+    pub fn queues(&self, limit: usize) -> Result<Vec<(NamespaceName, EntityPath)>, BrokerError> {
+        self.store
+            .scan_prefix(&keys::queue_config_prefix(), limit)?
+            .iter()
+            .map(|(key, _)| {
+                let (namespace, entity) =
+                    keys::entity_scope_parts(key).ok_or(BrokerError::MalformedIndexKey)?;
+                Ok((NamespaceName::new(namespace)?, EntityPath::new(entity)?))
+            })
+            .collect()
     }
 
     pub fn message(
@@ -564,7 +578,7 @@ impl<S: StateStore> StateMachine<S> {
         let entity = &command.entity;
         let locks = self
             .store
-            .scan_prefix(&keys::lock_prefix(namespace, entity), MAX_TIMER_SCAN)?;
+            .scan_prefix(&keys::lock_prefix(namespace, entity), TIMER_SCAN_LIMIT)?;
 
         let mut returned_to_ready = 0;
         let mut dead_lettered = 0;
@@ -617,7 +631,7 @@ impl<S: StateStore> StateMachine<S> {
         let entity = &command.entity;
         let expiring = self
             .store
-            .scan_prefix(&keys::expiry_prefix(namespace, entity), MAX_TIMER_SCAN)?;
+            .scan_prefix(&keys::expiry_prefix(namespace, entity), TIMER_SCAN_LIMIT)?;
 
         let mut dead_lettered = 0;
         for (key, _) in expiring {
@@ -839,7 +853,7 @@ impl<S: StateStore> StateMachine<S> {
         let namespace = &command.namespace;
         let entity = &command.entity;
         let prefix = keys::session_lock_prefix(namespace, entity);
-        let locks = self.store.scan_prefix(&prefix, MAX_TIMER_SCAN)?;
+        let locks = self.store.scan_prefix(&prefix, TIMER_SCAN_LIMIT)?;
 
         let mut released = 0;
         for (key, _) in locks {

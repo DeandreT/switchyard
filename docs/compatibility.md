@@ -82,6 +82,10 @@ a rejection or a bound rather than a silent difference:
   reports none available if they are all held, rather than walking the entity.
   The receiver retries.
 
+Expiry is not merely expressible: the `server` crate's timer worker proposes the
+lock, time-to-live, and session-lock sweeps on an interval, so a running node
+actually releases what has elapsed. Everything else waits on the protocol edge.
+
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch
 before reporting it applied, and the same semantics suite runs against both
 backends, so a single node keeps its messages, locks, delivery counts, and

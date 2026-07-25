@@ -1,9 +1,13 @@
 #![forbid(unsafe_code)]
 
-use std::{error::Error, fmt};
+use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 use clap::{Parser, ValueEnum};
 use cluster::{ClusterConfig, DeploymentMode};
+use server::{
+    DEFAULT_SWEEP_INTERVAL, LocalProposer, NodeState, Shutdown, StartupError, StorageChoice,
+    SystemClock, TimerWorker,
+};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -20,8 +24,15 @@ struct Arguments {
     #[arg(long, value_enum, default_value_t = StorageArgument::Memory)]
     storage: StorageArgument,
 
+    /// Where the durable backend keeps its state. Required with `--storage fjall`.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+
     #[arg(long, default_value_t = 1)]
     voters: u16,
+
+    #[arg(long, default_value_t = DEFAULT_SWEEP_INTERVAL.as_millis() as u64)]
+    sweep_interval_millis: u64,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -45,18 +56,30 @@ enum StorageArgument {
     Fjall,
 }
 
-#[derive(Debug)]
-struct StartupError(&'static str);
-
-impl fmt::Display for StartupError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.0)
+fn storage_choice(arguments: &Arguments) -> Result<StorageChoice, StartupError> {
+    match arguments.storage {
+        StorageArgument::Memory => Ok(StorageChoice::Memory),
+        StorageArgument::Fjall => arguments
+            .data_dir
+            .clone()
+            .map(|directory| StorageChoice::Durable { directory })
+            .ok_or(StartupError::MissingDataDirectory),
     }
 }
 
-impl Error for StartupError {}
+/// Reports why startup failed in the words the error was written in, rather
+/// than in the derived debug form `Termination` would print.
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("switchyard: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn run() -> Result<(), StartupError> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
@@ -64,22 +87,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let arguments = Arguments::parse();
     let mode = DeploymentMode::from(arguments.mode);
-    ClusterConfig {
+    let cluster = ClusterConfig {
         mode,
         voters: arguments.voters,
-    }
-    .validate()?;
-
-    if mode == DeploymentMode::Production && arguments.storage == StorageArgument::Memory {
-        return Err(Box::new(StartupError(
-            "production mode cannot use in-memory storage",
-        )));
-    }
-    if arguments.storage == StorageArgument::Fjall {
-        return Err(Box::new(StartupError(
-            "the Fjall backend has not been implemented yet",
-        )));
-    }
+    };
+    let state = server::open(cluster, storage_choice(&arguments)?)?;
 
     info!(
         ?mode,
@@ -88,7 +100,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         "configuration is valid"
     );
     println!(
-        "Switchyard pre-alpha configuration validated; protocol listeners are not implemented yet"
+        "Switchyard pre-alpha: expiry timers are running; protocol listeners are not implemented \
+         yet, so nothing can connect. Interrupt to stop."
     );
+
+    // Nothing here settles a message before its batch is fsynced, so an
+    // interrupt at any point loses no acknowledged state. That is why there is
+    // no signal handler yet: an abrupt stop is already safe.
+    let shutdown = Shutdown::default();
+    let interval = Duration::from_millis(arguments.sweep_interval_millis);
+    match state {
+        NodeState::Memory(machine) => {
+            let proposer = LocalProposer::new(machine, SystemClock);
+            TimerWorker::new(&proposer).run(interval, &shutdown);
+        }
+        NodeState::Durable(machine) => {
+            let proposer = LocalProposer::new(machine, SystemClock);
+            TimerWorker::new(&proposer).run(interval, &shutdown);
+        }
+    }
     Ok(())
 }
