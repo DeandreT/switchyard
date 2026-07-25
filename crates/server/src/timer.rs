@@ -14,10 +14,9 @@ use std::{
 };
 
 use domain::{CommandKind, CommandOutcome, EntityPath, NamespaceName, TIMER_SCAN_LIMIT};
-use storage::StateStore;
 use tracing::{debug, warn};
 
-use crate::{Clock, LocalProposer, ProposeError};
+use crate::{BrokerHandle, ProposeError, SubmitError};
 
 /// Queues one sweep will visit. A store with more than this is swept in the
 /// order its keys sort, and the rest wait for the next tick.
@@ -50,21 +49,21 @@ impl SweepReport {
     }
 }
 
-pub struct TimerWorker<'a, S, C> {
-    proposer: &'a LocalProposer<S, C>,
+pub struct TimerWorker<'a> {
+    broker: &'a BrokerHandle,
 }
 
-impl<'a, S: StateStore, C: Clock> TimerWorker<'a, S, C> {
-    pub fn new(proposer: &'a LocalProposer<S, C>) -> Self {
-        Self { proposer }
+impl<'a> TimerWorker<'a> {
+    pub fn new(broker: &'a BrokerHandle) -> Self {
+        Self { broker }
     }
 
     /// Proposes one round of expiry commands for every queue in the store.
     ///
     /// An error abandons the rest of the sweep. Each command was atomic, so what
     /// already applied stands and the next tick resumes from there.
-    pub fn sweep_once(&self) -> Result<SweepReport, ProposeError> {
-        let queues = self.proposer.machine().queues(MAX_QUEUES_PER_SWEEP)?;
+    pub fn sweep_once(&self) -> Result<SweepReport, SubmitError> {
+        let queues = self.broker.queues_blocking(MAX_QUEUES_PER_SWEEP)?;
         let mut report = SweepReport {
             queues_swept: queues.len(),
             ..SweepReport::default()
@@ -83,11 +82,13 @@ impl<'a, S: StateStore, C: Clock> TimerWorker<'a, S, C> {
         namespace: &NamespaceName,
         entity: &EntityPath,
         report: &mut SweepReport,
-    ) -> Result<(), ProposeError> {
+    ) -> Result<(), SubmitError> {
         for _ in 0..MAX_ROUNDS_PER_INDEX {
-            let outcome = self
-                .proposer
-                .propose(namespace, entity, CommandKind::ExpireLocks)?;
+            let outcome = self.broker.submit_blocking(
+                namespace.clone(),
+                entity.clone(),
+                CommandKind::ExpireLocks,
+            )?;
             let CommandOutcome::LocksExpired {
                 returned_to_ready,
                 dead_lettered,
@@ -110,11 +111,13 @@ impl<'a, S: StateStore, C: Clock> TimerWorker<'a, S, C> {
         namespace: &NamespaceName,
         entity: &EntityPath,
         report: &mut SweepReport,
-    ) -> Result<(), ProposeError> {
+    ) -> Result<(), SubmitError> {
         for _ in 0..MAX_ROUNDS_PER_INDEX {
-            let outcome = self
-                .proposer
-                .propose(namespace, entity, CommandKind::ExpireMessages)?;
+            let outcome = self.broker.submit_blocking(
+                namespace.clone(),
+                entity.clone(),
+                CommandKind::ExpireMessages,
+            )?;
             let CommandOutcome::MessagesExpired { dead_lettered } = outcome else {
                 return Err(unexpected(outcome));
             };
@@ -132,11 +135,13 @@ impl<'a, S: StateStore, C: Clock> TimerWorker<'a, S, C> {
         namespace: &NamespaceName,
         entity: &EntityPath,
         report: &mut SweepReport,
-    ) -> Result<(), ProposeError> {
+    ) -> Result<(), SubmitError> {
         for _ in 0..MAX_ROUNDS_PER_INDEX {
-            let outcome =
-                self.proposer
-                    .propose(namespace, entity, CommandKind::ExpireSessionLocks)?;
+            let outcome = self.broker.submit_blocking(
+                namespace.clone(),
+                entity.clone(),
+                CommandKind::ExpireSessionLocks,
+            )?;
             let CommandOutcome::SessionLocksExpired { released } = outcome else {
                 return Err(unexpected(outcome));
             };
@@ -178,10 +183,10 @@ impl<'a, S: StateStore, C: Clock> TimerWorker<'a, S, C> {
     }
 }
 
-fn unexpected(outcome: CommandOutcome) -> ProposeError {
-    ProposeError::UnexpectedOutcome {
+fn unexpected(outcome: CommandOutcome) -> SubmitError {
+    SubmitError::Propose(ProposeError::UnexpectedOutcome {
         outcome: format!("{outcome:?}"),
-    }
+    })
 }
 
 /// A latch the timer loop waits on, so shutdown does not wait out a full tick.
@@ -233,7 +238,7 @@ mod tests {
     use storage::MemoryStore;
 
     use super::*;
-    use crate::ManualClock;
+    use crate::{Broker, LocalProposer, ManualClock};
 
     /// Long enough that waiting it out is unmistakable in the elapsed time, so
     /// these cannot pass by timing out and reading a flag that turned true in
@@ -278,12 +283,12 @@ mod tests {
     }
 
     #[test]
-    fn a_sweep_of_an_empty_store_visits_nothing() -> Result<(), ProposeError> {
-        let proposer = LocalProposer::new(
+    fn a_sweep_of_an_empty_store_visits_nothing() -> Result<(), SubmitError> {
+        let broker = Broker::spawn(LocalProposer::new(
             StateMachine::new(MemoryStore::default()),
             ManualClock::at(1_000),
-        );
-        let report = TimerWorker::new(&proposer).sweep_once()?;
+        ));
+        let report = TimerWorker::new(&broker.handle()).sweep_once()?;
 
         assert_eq!(report, SweepReport::default());
         assert!(report.is_idle());
@@ -291,26 +296,31 @@ mod tests {
     }
 
     #[test]
-    fn a_sweep_visits_every_queue_in_every_namespace() -> Result<(), ProposeError> {
-        let proposer = LocalProposer::new(
+    fn a_sweep_visits_every_queue_in_every_namespace() -> Result<(), SubmitError> {
+        let broker = Broker::spawn(LocalProposer::new(
             StateMachine::new(MemoryStore::default()),
             ManualClock::at(1_000),
-        );
+        ));
         for (namespace, entity) in [
             ("tenant-a", "orders"),
             ("tenant-a", "invoices"),
             ("tenant-b", "orders"),
         ] {
-            proposer.propose(
-                &NamespaceName::new(namespace).expect("a valid namespace"),
-                &EntityPath::new(entity).expect("a valid entity path"),
+            broker.handle().submit_blocking(
+                NamespaceName::new(namespace).expect("a valid namespace"),
+                EntityPath::new(entity).expect("a valid entity path"),
                 CommandKind::CreateQueue {
                     config: QueueConfig::default(),
                 },
             )?;
         }
 
-        assert_eq!(TimerWorker::new(&proposer).sweep_once()?.queues_swept, 3);
+        assert_eq!(
+            TimerWorker::new(&broker.handle())
+                .sweep_once()?
+                .queues_swept,
+            3
+        );
         Ok(())
     }
 }

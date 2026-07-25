@@ -26,15 +26,18 @@ auth = { path = "crates/auth" }
 cluster = { path = "crates/cluster" }
 domain = { path = "crates/domain" }
 protocol-amqp = { path = "crates/protocol-amqp" }
+server = { path = "crates/server" }
 storage = { path = "crates/storage" }
 testkit = { path = "crates/testkit" }
 
 clap = { version = "4.5", features = ["derive"] }
 fjall = "3.1.8"
+flume = "0.12"
 postcard = { version = "1.1", features = ["use-std"] }
 serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.27"
 thiserror = "2.0"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

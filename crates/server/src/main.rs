@@ -5,8 +5,8 @@ use std::{path::PathBuf, process::ExitCode, time::Duration};
 use clap::{Parser, ValueEnum};
 use cluster::{ClusterConfig, DeploymentMode};
 use server::{
-    DEFAULT_SWEEP_INTERVAL, LocalProposer, NodeState, Shutdown, StartupError, StorageChoice,
-    SystemClock, TimerWorker,
+    Broker, DEFAULT_SWEEP_INTERVAL, LocalProposer, NodeState, Shutdown, StartupError,
+    StorageChoice, SystemClock, TimerWorker,
 };
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -109,15 +109,10 @@ fn run() -> Result<(), StartupError> {
     // no signal handler yet: an abrupt stop is already safe.
     let shutdown = Shutdown::default();
     let interval = Duration::from_millis(arguments.sweep_interval_millis);
-    match state {
-        NodeState::Memory(machine) => {
-            let proposer = LocalProposer::new(machine, SystemClock);
-            TimerWorker::new(&proposer).run(interval, &shutdown);
-        }
-        NodeState::Durable(machine) => {
-            let proposer = LocalProposer::new(machine, SystemClock);
-            TimerWorker::new(&proposer).run(interval, &shutdown);
-        }
-    }
+    let broker = match state {
+        NodeState::Memory(machine) => Broker::spawn(LocalProposer::new(machine, SystemClock)),
+        NodeState::Durable(machine) => Broker::spawn(LocalProposer::new(machine, SystemClock)),
+    };
+    TimerWorker::new(&broker.handle()).run(interval, &shutdown);
     Ok(())
 }

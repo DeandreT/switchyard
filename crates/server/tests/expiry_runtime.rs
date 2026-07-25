@@ -11,14 +11,18 @@ use domain::{
     CommandKind, CommandOutcome, Delivery, EntityPath, NamespaceName, QueueConfig, ReceiveMode,
     SessionId, StateMachine, TIMER_SCAN_LIMIT,
 };
-use server::{LocalProposer, ManualClock, ProposeError, SweepReport, TimerWorker};
+use server::{
+    Broker, BrokerHandle, LocalProposer, ManualClock, SubmitError, SweepReport, TimerWorker,
+};
 use testkit::StoreProvider;
 
 const LOCK_MILLIS: u64 = 30_000;
 
 struct Runtime<P: StoreProvider> {
     _provider: P,
-    proposer: LocalProposer<P::Store, ManualClock>,
+    /// Held only to keep the owner thread alive; dropping it stops the broker.
+    _broker: Broker,
+    handle: BrokerHandle,
     clock: ManualClock,
     namespace: NamespaceName,
     entity: EntityPath,
@@ -27,8 +31,13 @@ struct Runtime<P: StoreProvider> {
 impl<P: StoreProvider> Runtime<P> {
     fn new(provider: P, config: QueueConfig) -> Result<Self, Box<dyn Error>> {
         let clock = ManualClock::at(1_000);
+        let broker = Broker::spawn(LocalProposer::new(
+            StateMachine::new(provider.open()?),
+            clock.clone(),
+        ));
         let runtime = Self {
-            proposer: LocalProposer::new(StateMachine::new(provider.open()?), clock.clone()),
+            handle: broker.handle(),
+            _broker: broker,
             _provider: provider,
             clock,
             namespace: NamespaceName::new("tenant")?,
@@ -38,11 +47,12 @@ impl<P: StoreProvider> Runtime<P> {
         Ok(runtime)
     }
 
-    fn propose(&self, kind: CommandKind) -> Result<CommandOutcome, ProposeError> {
-        self.proposer.propose(&self.namespace, &self.entity, kind)
+    fn propose(&self, kind: CommandKind) -> Result<CommandOutcome, SubmitError> {
+        self.handle
+            .submit_blocking(self.namespace.clone(), self.entity.clone(), kind)
     }
 
-    fn send(&self, message_id: &str, time_to_live_millis: Option<u64>) -> Result<(), ProposeError> {
+    fn send(&self, message_id: &str, time_to_live_millis: Option<u64>) -> Result<(), SubmitError> {
         self.propose(CommandKind::Send {
             message_id: message_id.to_owned(),
             body: message_id.as_bytes().to_vec(),
@@ -52,7 +62,7 @@ impl<P: StoreProvider> Runtime<P> {
         Ok(())
     }
 
-    fn receive(&self) -> Result<Option<Delivery>, ProposeError> {
+    fn receive(&self) -> Result<Option<Delivery>, SubmitError> {
         match self.propose(CommandKind::Receive {
             mode: ReceiveMode::PeekLock,
             lock_duration_millis: None,
@@ -63,8 +73,8 @@ impl<P: StoreProvider> Runtime<P> {
         }
     }
 
-    fn sweep(&self) -> Result<SweepReport, ProposeError> {
-        TimerWorker::new(&self.proposer).sweep_once()
+    fn sweep(&self) -> Result<SweepReport, SubmitError> {
+        TimerWorker::new(&self.handle).sweep_once()
     }
 }
 
@@ -214,13 +224,13 @@ fn a_sweep_never_moves_the_applied_clock_backward<P: StoreProvider>(
 ) -> Result<(), Box<dyn Error>> {
     let runtime = Runtime::new(provider, queue_config())?;
     runtime.send("first", None)?;
-    let applied = runtime.proposer.machine().last_applied_time()?;
+    let applied = runtime.handle.last_applied_blocking()?;
 
     // A host clock that steps back a little must not stall the timer: the
     // state machine refuses a command that precedes what it applied.
     runtime.clock.set(applied.as_millis() - 1);
     assert!(runtime.sweep().is_ok());
-    assert_eq!(runtime.proposer.machine().last_applied_time()?, applied);
+    assert_eq!(runtime.handle.last_applied_blocking()?, applied);
     Ok(())
 }
 
