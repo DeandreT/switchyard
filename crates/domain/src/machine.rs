@@ -134,10 +134,18 @@ impl<S: StateStore> StateMachine<S> {
             CommandKind::ExpireSessionLocks => self.expire_session_locks(command, &mut batch)?,
         };
 
-        // Advancing the clock in the same batch keeps the applied timestamp and
-        // the state it produced consistent under a crash.
-        batch.push_put(keys::clock(), codec::encode(&command.issued_at)?);
-        self.store.apply(batch)?;
+        // A command that changed nothing commits nothing. The clock advance is
+        // bookkeeping for the mutations alongside it, and committing it alone
+        // would turn every empty receive and every idle timer sweep into a
+        // durable write — an fsync apiece on the durable backend. Skipping is
+        // deterministic: every replica computes the same empty batch, so every
+        // replica skips the same commands.
+        if !batch.is_empty() {
+            // Advancing the clock in the same batch keeps the applied timestamp
+            // and the state it produced consistent under a crash.
+            batch.push_put(keys::clock(), codec::encode(&command.issued_at)?);
+            self.store.apply(batch)?;
+        }
         Ok(outcome)
     }
 

@@ -636,6 +636,32 @@ fn two_queues_in_one_namespace_do_not_share_messages<P: StoreProvider>(
     Ok(())
 }
 
+fn a_command_that_changes_nothing_commits_nothing<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
+
+    // An empty receive and an idle sweep decide nothing from their timestamps,
+    // so they leave no trace — not even the clock. On the durable backend each
+    // of these would otherwise be an fsync.
+    assert_eq!(receive(&fixture, 50)?, None);
+    fixture.at(60, CommandKind::ExpireLocks)?;
+    fixture.at(70, CommandKind::ExpireMessages)?;
+    assert_eq!(
+        fixture.machine.last_applied_time()?,
+        Timestamp::from_millis(0)
+    );
+
+    // Time not having advanced is observable: a send stamped before the empty
+    // receive is still accepted, because nothing was decided at the later time.
+    send(&fixture, 10, "first")?;
+    assert_eq!(
+        fixture.machine.last_applied_time()?,
+        Timestamp::from_millis(10)
+    );
+    Ok(())
+}
+
 fn a_restart_preserves_locks_counters_and_queue_order<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
@@ -716,5 +742,6 @@ for_each_backend! {
     creating_a_queue_twice_is_rejected,
     an_invalid_queue_configuration_is_rejected,
     two_queues_in_one_namespace_do_not_share_messages,
+    a_command_that_changes_nothing_commits_nothing,
     a_restart_preserves_locks_counters_and_queue_order,
 }
