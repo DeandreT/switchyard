@@ -25,8 +25,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+amqp = { workspace = true, features = ["test-client"] }
 base64.workspace = true
-amqp-runtime.workspace = true
 hmac.workspace = true
 rcgen.workspace = true
 rustls.workspace = true

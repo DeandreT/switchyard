@@ -10,7 +10,7 @@ use thiserror::Error;
 /// Builds the server side of an AMQPS listener from PEM-encoded credentials.
 ///
 /// Service Bus port 5671 wraps the TCP stream in TLS before any AMQP protocol
-/// header is exchanged. The listener uses this configuration outside fe2o3 so
+/// header is exchanged. The listener applies this configuration before
 /// it follows that ordering rather than AMQP's in-band TLS upgrade.
 pub fn tls_server_config(
     certificate_chain_pem: &[u8],

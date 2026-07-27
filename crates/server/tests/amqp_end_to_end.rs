@@ -6,15 +6,12 @@
 
 use std::error::Error;
 
-use domain::{CommandKind, QueueConfig, StateMachine};
-use amqp_runtime::{
-    Connection, Receiver, Sender, Session,
-    connection::ConnectionHandle,
-    types::{
-        messaging::{Body, Message, Outcome, Properties},
-        primitives::Binary,
-    },
+use amqp::{
+    Body, ClientConnection as Connection, ClientReceiver as Receiver, ClientSender as Sender,
+    ClientSession as Session, FilterSet, Message, Outcome, Properties, SenderSettleMode, Source,
+    Symbol, Value,
 };
+use domain::{CommandKind, QueueConfig, StateMachine};
 use server::{Broker, LocalProposer, ManualClock};
 use storage::MemoryStore;
 use tokio::net::TcpListener;
@@ -53,7 +50,7 @@ impl Node {
         })
     }
 
-    async fn connect(&self) -> Result<ConnectionHandle<()>, Box<dyn Error>> {
+    async fn connect(&self) -> Result<Connection, Box<dyn Error>> {
         Ok(Connection::builder()
             .container_id("test-client")
             .open(format!("amqp://{}", self.address).as_str())
@@ -61,17 +58,15 @@ impl Node {
     }
 }
 
-fn body(text: &str) -> Body<Binary> {
-    Body::Data(amqp_runtime::types::messaging::Batch::new(vec![
-        amqp_runtime::types::messaging::Data(Binary::from(text.as_bytes().to_vec())),
-    ]))
+fn body(text: &str) -> Body {
+    Body::Data(vec![text.as_bytes().to_vec().into()])
 }
 
-fn text_of(message: &Message<Body<Binary>>) -> String {
+fn text_of(message: &Message) -> String {
     match &message.body {
         Body::Data(sections) => sections
             .iter()
-            .flat_map(|section| section.0.iter().copied())
+            .flat_map(|section| section.iter().copied())
             .map(char::from)
             .collect(),
         _ => String::new(),
@@ -96,7 +91,7 @@ async fn a_client_sends_a_message_and_another_receives_it() -> Result<(), Box<dy
     assert!(matches!(sender.send(message).await?, Outcome::Accepted(_)));
 
     let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
-    let delivery = receiver.recv::<Body<Binary>>().await?;
+    let delivery = receiver.recv().await?;
     assert_eq!(text_of(delivery.message()), "payload");
     assert_eq!(
         delivery
@@ -127,16 +122,13 @@ async fn a_completed_message_is_not_delivered_again() -> Result<(), Box<dyn Erro
         .await?;
 
     let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
-    let delivery = receiver.recv::<Body<Binary>>().await?;
+    let delivery = receiver.recv().await?;
     receiver.accept(&delivery).await?;
 
     // Accepting settles the message, so nothing is left to hand out. The
     // receiver would otherwise sit here until the test timed out.
-    let starved = tokio::time::timeout(
-        std::time::Duration::from_millis(300),
-        receiver.recv::<Body<Binary>>(),
-    )
-    .await;
+    let starved =
+        tokio::time::timeout(std::time::Duration::from_millis(300), receiver.recv()).await;
     assert!(starved.is_err(), "a settled message came back");
 
     connection.close().await?;
@@ -155,16 +147,12 @@ async fn a_released_message_comes_round_again() -> Result<(), Box<dyn Error>> {
         .await?;
 
     let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
-    let first = receiver.recv::<Body<Binary>>().await?;
+    let first = receiver.recv().await?;
     receiver.release(&first).await?;
 
     // Releasing abandons the lock, so the message returns to the queue with its
     // delivery count already counted against it.
-    let second = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        receiver.recv::<Body<Binary>>(),
-    )
-    .await??;
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv()).await??;
     assert_eq!(text_of(second.message()), "retry-me");
     receiver.accept(&second).await?;
 
@@ -188,19 +176,16 @@ async fn a_pre_settled_receiver_gets_at_most_once() -> Result<(), Box<dyn Error>
     let mut receiver = Receiver::builder()
         .name("test-receiver")
         .source("orders")
-        .sender_settle_mode(amqp_runtime::types::definitions::SenderSettleMode::Settled)
+        .sender_settle_mode(SenderSettleMode::Settled)
         .attach(&mut session)
         .await?;
-    let delivery = receiver.recv::<Body<Binary>>().await?;
+    let delivery = receiver.recv().await?;
     assert_eq!(text_of(delivery.message()), "fire-and-forget");
 
     // Never settled by the client, and still gone: at-most-once means the
     // deletion committed before the transfer.
-    let starved = tokio::time::timeout(
-        std::time::Duration::from_millis(300),
-        receiver.recv::<Body<Binary>>(),
-    )
-    .await;
+    let starved =
+        tokio::time::timeout(std::time::Duration::from_millis(300), receiver.recv()).await;
     assert!(starved.is_err(), "the message survived receive-and-delete");
 
     connection.close().await?;
@@ -218,10 +203,7 @@ async fn a_receiver_waiting_on_an_empty_queue_is_woken_by_a_send() -> Result<(),
     // broker's wakeup rather than a poll.
     let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
     let waiting = tokio::spawn(async move {
-        let delivery = receiver
-            .recv::<Body<Binary>>()
-            .await
-            .map_err(|error| error.to_string())?;
+        let delivery = receiver.recv().await.map_err(|error| error.to_string())?;
         receiver
             .accept(&delivery)
             .await
@@ -252,24 +234,16 @@ async fn a_receiver_waiting_on_an_empty_queue_is_woken_by_a_send() -> Result<(),
     Ok(())
 }
 
-fn session_source(queue: &str, session: Option<&str>) -> amqp_runtime::types::messaging::Source {
-    use amqp_runtime::types::{
-        messaging::FilterSet,
-        primitives::{Symbol, Value},
-    };
+fn session_source(queue: &str, session: Option<&str>) -> Source {
     let mut filter = FilterSet::default();
     filter.insert(
         Symbol::from(protocol_amqp::SESSION_FILTER),
         session.map_or(Value::Null, |id| Value::String(id.to_owned())),
     );
-    amqp_runtime::types::messaging::Source::builder()
-        .address(queue)
-        .filter(filter)
-        .build()
+    Source::builder().address(queue).filter(filter).build()
 }
 
-fn session_of(source: &Option<amqp_runtime::types::messaging::Source>) -> Option<String> {
-    use amqp_runtime::types::primitives::{Symbol, Value};
+fn session_of(source: &Option<Source>) -> Option<String> {
     source
         .as_ref()?
         .filter
@@ -281,7 +255,7 @@ fn session_of(source: &Option<amqp_runtime::types::messaging::Source>) -> Option
         })
 }
 
-fn with_session(text: &str, session: &str) -> Message<Body<Binary>> {
+fn with_session(text: &str, session: &str) -> Message {
     let mut message = Message::builder().body(body(text)).build();
     message.properties = Some(Properties {
         group_id: Some(session.to_owned()),
@@ -316,15 +290,12 @@ async fn a_session_receiver_gets_only_its_session_in_order() -> Result<(), Box<d
 
     // FIFO within the session, and nothing from any other session.
     for expected in ["first", "second"] {
-        let delivery = receiver.recv::<Body<Binary>>().await?;
+        let delivery = receiver.recv().await?;
         assert_eq!(text_of(delivery.message()), expected);
         receiver.accept(&delivery).await?;
     }
-    let starved = tokio::time::timeout(
-        std::time::Duration::from_millis(300),
-        receiver.recv::<Body<Binary>>(),
-    )
-    .await;
+    let starved =
+        tokio::time::timeout(std::time::Duration::from_millis(300), receiver.recv()).await;
     assert!(starved.is_err(), "another session's message leaked through");
 
     connection.close().await?;
@@ -349,7 +320,7 @@ async fn a_next_available_receiver_learns_which_session_it_got() -> Result<(), B
         .await?;
     assert_eq!(session_of(receiver.source()), Some(String::from("cart-9")));
 
-    let delivery = receiver.recv::<Body<Binary>>().await?;
+    let delivery = receiver.recv().await?;
     assert_eq!(text_of(delivery.message()), "payload");
     receiver.accept(&delivery).await?;
 
@@ -376,11 +347,7 @@ async fn a_held_session_is_refused_until_its_link_closes() -> Result<(), Box<dyn
         .source(session_source("orders", Some("cart-1")))
         .attach(&mut session)
         .await?;
-    let refused = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        rival.recv::<Body<Binary>>(),
-    )
-    .await?;
+    let refused = tokio::time::timeout(std::time::Duration::from_secs(2), rival.recv()).await?;
     assert!(refused.is_err(), "a held session was granted twice");
 
     // Closing the holder releases the session rather than waiting out its lock.
@@ -390,11 +357,7 @@ async fn a_held_session_is_refused_until_its_link_closes() -> Result<(), Box<dyn
         .source(session_source("orders", Some("cart-1")))
         .attach(&mut session)
         .await?;
-    let waiting = tokio::time::timeout(
-        std::time::Duration::from_millis(300),
-        next.recv::<Body<Binary>>(),
-    )
-    .await;
+    let waiting = tokio::time::timeout(std::time::Duration::from_millis(300), next.recv()).await;
     assert!(
         waiting.is_err(),
         "a healthy link waits on an empty session instead of erroring"
@@ -417,7 +380,7 @@ async fn a_rejected_message_is_drained_from_the_dead_letter_queue() -> Result<()
 
     // Rejecting a delivery dead-letters it rather than redelivering it.
     let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
-    let delivery = receiver.recv::<Body<Binary>>().await?;
+    let delivery = receiver.recv().await?;
     receiver.reject(&delivery, None).await?;
 
     // The dead-letter queue is addressed as a sub-queue and drained like one.
@@ -425,7 +388,7 @@ async fn a_rejected_message_is_drained_from_the_dead_letter_queue() -> Result<()
         Receiver::attach(&mut session, "dlq-receiver", "orders/$deadletterqueue").await?;
     let poisoned = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        dead_letter_receiver.recv::<Body<Binary>>(),
+        dead_letter_receiver.recv(),
     )
     .await??;
     assert_eq!(text_of(poisoned.message()), "poison");
@@ -438,16 +401,14 @@ async fn a_rejected_message_is_drained_from_the_dead_letter_queue() -> Result<()
         .cloned();
     assert_eq!(
         reason,
-        Some(amqp_runtime::types::primitives::SimpleValue::String(
-            String::from("RejectedByReceiver")
-        ))
+        Some(Value::String(String::from("RejectedByReceiver")))
     );
     dead_letter_receiver.accept(&poisoned).await?;
 
     // Completing in the dead-letter queue removes the message permanently.
     let drained = tokio::time::timeout(
         std::time::Duration::from_millis(300),
-        dead_letter_receiver.recv::<Body<Binary>>(),
+        dead_letter_receiver.recv(),
     )
     .await;
     assert!(drained.is_err(), "the dead-letter queue still held it");

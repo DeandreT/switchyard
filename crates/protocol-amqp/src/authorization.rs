@@ -4,14 +4,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use amqp::{SaslAuthenticator, SaslCode, SaslInit};
 use auth::{AccessGrant, Permission, ResourceScope, ResourceScopeError, SharedAccessPolicy};
-use amqp_runtime::{
-    acceptor::{SaslAcceptor, sasl_acceptor::SaslServerFrame},
-    types::{
-        primitives::{Array, Symbol},
-        sasl::{SaslCode, SaslInit, SaslOutcome, SaslResponse},
-    },
-};
+use serde_amqp::primitives::Symbol;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 
 use crate::cbs::CbsResponse;
@@ -248,34 +243,23 @@ impl SharedAccessSaslAcceptor {
     }
 }
 
-impl SaslAcceptor for SharedAccessSaslAcceptor {
-    fn mechanisms(&self) -> Array<Symbol> {
-        Array::from(vec![
+impl SaslAuthenticator for SharedAccessSaslAcceptor {
+    fn mechanisms(&self) -> Vec<Symbol> {
+        vec![
             Symbol::from(MICROSOFT_CBS_SASL_MECHANISM),
             Symbol::from("ANONYMOUS"),
             Symbol::from("PLAIN"),
-        ])
+        ]
     }
 
-    fn on_init(&mut self, init: SaslInit) -> SaslServerFrame {
-        let code = match init.mechanism.as_str() {
+    fn authenticate(&self, init: &SaslInit) -> SaslCode {
+        match init.mechanism.as_str() {
             MICROSOFT_CBS_SASL_MECHANISM | "ANONYMOUS" => SaslCode::Ok,
             "PLAIN" => {
                 self.validate_plain(init.initial_response.as_ref().map(|value| value.as_slice()))
             }
             _ => SaslCode::Auth,
-        };
-        SaslServerFrame::Outcome(SaslOutcome {
-            code,
-            additional_data: None,
-        })
-    }
-
-    fn on_response(&mut self, _response: SaslResponse) -> SaslServerFrame {
-        SaslServerFrame::Outcome(SaslOutcome {
-            code: SaslCode::Sys,
-            additional_data: None,
-        })
+        }
     }
 }
 

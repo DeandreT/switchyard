@@ -1,19 +1,18 @@
 [package]
-name = "protocol-amqp"
+name = "amqp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+test-client = ["dep:url"]
+
 [dependencies]
-amqp.workspace = true
-auth.workspace = true
-domain.workspace = true
-rustls.workspace = true
-rustls-pemfile.workspace = true
+serde.workspace = true
 serde_amqp.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tokio-rustls.workspace = true
-tracing.workspace = true
+url = { workspace = true, optional = true }

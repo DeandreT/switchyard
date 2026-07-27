@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/admin-api",
+    "crates/amqp",
     "crates/auth",
     "crates/cluster",
     "crates/conformance",
@@ -22,6 +23,7 @@ repository = "https://github.com/DeandreT/switchyard"
 
 [workspace.dependencies]
 admin-api = { path = "crates/admin-api" }
+amqp = { path = "crates/amqp" }
 auth = { path = "crates/auth" }
 cluster = { path = "crates/cluster" }
 domain = { path = "crates/domain" }
@@ -32,7 +34,6 @@ testkit = { path = "crates/testkit" }
 
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
-amqp-runtime = { version = "0.15.2", features = ["acceptor"] }
 fjall = "3.1.8"
 flume = "0.12"
 hmac = "0.12"

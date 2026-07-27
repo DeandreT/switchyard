@@ -1,12 +1,7 @@
 use std::sync::Arc;
 
-use amqp_runtime::{
-    link::{LinkStateError, Receiver, RecvError, Sender},
-    types::{
-        messaging::{AmqpValue, ApplicationProperties, Body, Message, MessageId, Properties},
-        primitives::{SimpleValue, Value},
-    },
-};
+use amqp::{ApplicationProperties, Body, Message, MessageId, Properties, Receiver, Sender};
+use serde_amqp::{Value, primitives::Binary};
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -53,20 +48,19 @@ impl CbsResponse {
         }
     }
 
-    fn into_message(self) -> Message<Body<Value>> {
-        Message::builder()
-            .properties(Properties {
+    fn into_message(self) -> Message {
+        let mut application_properties = ApplicationProperties::default();
+        application_properties.insert(STATUS_CODE_PROPERTY, self.status_code);
+        application_properties.insert(STATUS_DESCRIPTION_PROPERTY, self.status_description);
+        Message {
+            properties: Some(Properties {
                 correlation_id: Some(self.correlation_id),
                 ..Properties::default()
-            })
-            .application_properties(
-                ApplicationProperties::builder()
-                    .insert(STATUS_CODE_PROPERTY, self.status_code)
-                    .insert(STATUS_DESCRIPTION_PROPERTY, self.status_description)
-                    .build(),
-            )
-            .body(Body::Value(AmqpValue(Value::Null)))
-            .build()
+            }),
+            application_properties: Some(application_properties),
+            body: Body::Value(Value::Null),
+            ..Message::default()
+        }
     }
 }
 
@@ -75,14 +69,9 @@ pub(crate) async fn serve_cbs_requests(
     authorization: Arc<ConnectionAuthorization>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
-        let delivery = match receiver.recv::<Body<String>>().await {
+        let delivery = match receiver.recv().await {
             Ok(delivery) => delivery,
-            Err(RecvError::LinkStateError(
-                LinkStateError::RemoteClosed
-                | LinkStateError::RemoteDetached
-                | LinkStateError::RemoteClosedWithError(_)
-                | LinkStateError::RemoteDetachedWithError(_),
-            )) => {
+            Err(amqp::EngineError::RemoteClosed | amqp::EngineError::RemoteDetached) => {
                 let _ = receiver.close().await;
                 return Ok(());
             }
@@ -115,7 +104,7 @@ pub(crate) async fn serve_cbs_requests(
 }
 
 async fn process_request(
-    message: &Message<Body<String>>,
+    message: &Message,
     message_id: MessageId,
     authorization: &ConnectionAuthorization,
 ) -> CbsResponse {
@@ -130,7 +119,7 @@ async fn process_request(
     let Some(audience) = string_property(properties, AUDIENCE_PROPERTY) else {
         return CbsResponse::bad_request(message_id, "the token audience is required");
     };
-    let Body::Value(AmqpValue(token)) = &message.body else {
+    let Body::Value(Value::String(token)) = &message.body else {
         return CbsResponse::bad_request(message_id, "the SAS token must be an AMQP value string");
     };
 
@@ -142,7 +131,7 @@ async fn process_request(
 
 fn string_property<'a>(properties: &'a ApplicationProperties, name: &str) -> Option<&'a str> {
     match properties.get(name) {
-        Some(SimpleValue::String(value)) => Some(value),
+        Some(Value::String(value)) => Some(value),
         _ => None,
     }
 }
@@ -163,8 +152,13 @@ pub(crate) async fn serve_cbs_replies(
             }
             response = responses.recv() => {
                 let Some(response) = response else { return Ok(()) };
-                sender.send(response.into_message()).await?;
+                let tag = cbs_delivery_tag(&response.correlation_id);
+                sender.send(response.into_message(), tag).await?;
             }
         }
     }
+}
+
+fn cbs_delivery_tag(message_id: &MessageId) -> Binary {
+    Binary::from(format!("{message_id:?}").into_bytes())
 }

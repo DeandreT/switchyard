@@ -11,7 +11,6 @@ mod authorization;
 mod broker;
 mod cbs;
 mod condition;
-mod frame_adapter;
 mod listener;
 mod message;
 mod session_filter;

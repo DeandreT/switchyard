@@ -7,25 +7,18 @@
 
 use std::{sync::Arc, time::Duration};
 
+use amqp::{
+    AmqpError, Attach, DeliveryTag, EngineError, Error as AmqpProtocolError, ErrorCondition,
+    LinkEndpoint, Outcome, Receiver, Role, Sender, SenderSettleMode, ServerConnection,
+    ServerSession,
+};
 use auth::{Permission, ResourceScope};
 use domain::{
     AcceptedSession, CommandKind, CommandOutcome, Delivery, EntityPath, LockToken, NamespaceName,
     ReceiveMode, SessionHold,
 };
-use amqp_runtime::{
-    acceptor::{
-        ConnectionAcceptor, LinkAcceptor, LinkEndpoint, ListenerConnectionHandle,
-        ListenerSessionHandle, SessionAcceptor,
-    },
-    link::{LinkStateError, Receiver, RecvError, Sender},
-    types::{
-        definitions::{self, AmqpError, DeliveryTag, Role, SenderSettleMode},
-        messaging::{Body, Outcome, TargetArchetype},
-        performatives::Attach,
-        primitives::Binary,
-    },
-};
 use rustls::ServerConfig;
+use serde_amqp::primitives::Symbol;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -35,7 +28,6 @@ use crate::{
     Attachment, Broker, BrokerRejection, ProtocolError, SessionRequest, SharedAccessAuthentication,
     authorization::{ConnectionAuthorization, SharedAccessSaslAcceptor},
     cbs::{serve_cbs_replies, serve_cbs_requests},
-    frame_adapter::{DeliveryTagRegistry, adapt_connection},
     parse_attachment, read_incoming, read_session_filter, stamp_session_filter,
 };
 
@@ -145,36 +137,34 @@ async fn serve_connection<Io, B>(
     shared_access_authentication: Option<SharedAccessAuthentication>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
-    Io: AsyncRead + AsyncWrite + std::fmt::Debug + Send + Unpin + 'static,
+    Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     B: Broker,
 {
-    let (stream, delivery_tags) = adapt_connection(stream);
     let (connection, authorization) = match shared_access_authentication {
         Some(config) => {
             let sasl_acceptor = SharedAccessSaslAcceptor::new(&config);
-            let connection = ConnectionAcceptor::builder()
-                .container_id(container_id)
-                .sasl_acceptor(sasl_acceptor.clone())
-                .build()
-                .accept(stream)
-                .await?;
+            let connection = ServerConnection::accept(
+                stream,
+                container_id,
+                Some(Arc::new(sasl_acceptor.clone())),
+            )
+            .await?;
             let authorization = ConnectionAuthorization::new(config, sasl_acceptor.grant());
             (connection, Some(authorization))
         }
         None => (
-            ConnectionAcceptor::new(container_id).accept(stream).await?,
+            ServerConnection::accept(stream, container_id, None).await?,
             None,
         ),
     };
-    serve_open_connection(connection, namespace, broker, authorization, delivery_tags).await
+    serve_open_connection(connection, namespace, broker, authorization).await
 }
 
 async fn serve_open_connection<B: Broker>(
-    mut connection: ListenerConnectionHandle,
+    mut connection: ServerConnection,
     namespace: NamespaceName,
     broker: B,
     authorization: Option<Arc<ConnectionAuthorization>>,
-    delivery_tags: DeliveryTagRegistry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut awaiting_authorization = authorization.is_some();
     let timeout = authorization
@@ -213,17 +203,12 @@ async fn serve_open_connection<B: Broker>(
         };
         let Some(incoming) = incoming else { break };
 
-        let session = SessionAcceptor::default()
-            .accept_incoming_session(incoming, &mut connection)
-            .await?;
+        let session = connection.accept_session(incoming).await?;
         let broker = broker.clone();
         let namespace = namespace.clone();
         let authorization = authorization.clone();
-        let delivery_tags = delivery_tags.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                serve_session(session, namespace, broker, authorization, delivery_tags).await
-            {
+            if let Err(error) = serve_session(session, namespace, broker, authorization).await {
                 warn!(%error, ?error, "session ended");
             }
         });
@@ -233,22 +218,17 @@ async fn serve_open_connection<B: Broker>(
     // still gets the answering close from the engine; reporting its hang-up as
     // this node's error would make every clean disconnect look like a failure.
     match connection.close().await {
-        Ok(()) | Err(amqp_runtime::connection::Error::RemoteClosed) => Ok(()),
+        Ok(()) | Err(EngineError::RemoteClosed | EngineError::Stopped) => Ok(()),
         Err(error) => Err(error.into()),
     }
 }
 
 async fn serve_session<B: Broker>(
-    mut session: ListenerSessionHandle,
+    mut session: ServerSession,
     namespace: NamespaceName,
     broker: B,
     authorization: Option<Arc<ConnectionAuthorization>>,
-    delivery_tags: DeliveryTagRegistry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let acceptor = LinkAcceptor::builder()
-        .max_message_size(crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64)
-        .build();
-
     while let Some(mut attach) = session.next_incoming_attach().await {
         let source_address = attach
             .source
@@ -258,9 +238,7 @@ async fn serve_session<B: Broker>(
         let target_address = attach
             .target
             .as_ref()
-            .and_then(|target| match target.as_ref() {
-                TargetArchetype::Target(target) => target.address.clone(),
-            })
+            .and_then(|target| target.address.clone())
             .unwrap_or_default();
 
         if let Some(authorization) = authorization.as_ref()
@@ -272,8 +250,8 @@ async fn serve_session<B: Broker>(
                 attach.initial_delivery_count = Some(0);
             }
             debug!(?attach, "accepting CBS link");
-            let endpoint = acceptor
-                .accept_incoming_attach(attach, &mut session)
+            let endpoint = session
+                .accept_attach(attach, crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64)
                 .await?;
             let authorization = Arc::clone(authorization);
             match (target_address.as_str(), source_address.as_str(), endpoint) {
@@ -342,13 +320,13 @@ async fn serve_session<B: Broker>(
         )
         .await;
         if let Ok((_, Some(accepted), _)) = &plan
-            && let Some(source) = attach.source.as_deref_mut()
+            && let Some(source) = attach.source.as_mut()
         {
             stamp_session_filter(source, &accepted.session_id);
         }
 
-        let endpoint = acceptor
-            .accept_incoming_attach(attach, &mut session)
+        let endpoint = session
+            .accept_attach(attach, crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64)
             .await?;
         let (entity, accepted, link_authorization) = match plan {
             Ok(plan) => plan,
@@ -384,7 +362,6 @@ async fn serve_session<B: Broker>(
             // The client receives; this end sends.
             LinkEndpoint::Sender(sender) => {
                 let hold = accepted.map(|accepted| accepted.hold());
-                let delivery_tags = delivery_tags.clone();
                 tokio::spawn(async move {
                     if let Err(error) = serve_receiving_client(
                         sender,
@@ -395,7 +372,6 @@ async fn serve_session<B: Broker>(
                         hold,
                         ReceivingLinkProtocol {
                             authorization: link_authorization,
-                            delivery_tags,
                         },
                     )
                     .await
@@ -418,11 +394,10 @@ struct LinkAuthorization {
 
 struct ReceivingLinkProtocol {
     authorization: Option<LinkAuthorization>,
-    delivery_tags: DeliveryTagRegistry,
 }
 
 impl LinkAuthorization {
-    async fn ensure(&self) -> Result<(), definitions::Error> {
+    async fn ensure(&self) -> Result<(), AmqpProtocolError> {
         self.connection
             .authorize_resource(&self.resource, self.permission)
             .await
@@ -450,7 +425,7 @@ async fn plan_link<B: Broker>(
         Option<AcceptedSession>,
         Option<LinkAuthorization>,
     ),
-    definitions::Error,
+    AmqpProtocolError,
 > {
     let entity = resolve_entity(address, attach.role.clone())
         .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?;
@@ -480,7 +455,7 @@ async fn plan_link<B: Broker>(
     if attach.role != Role::Receiver {
         return Ok((entity, None, link_authorization));
     }
-    let session_id = match read_session_filter(attach.source.as_deref())
+    let session_id = match read_session_filter(attach.source.as_ref())
         .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?
     {
         SessionRequest::None => return Ok((entity, None, link_authorization)),
@@ -504,8 +479,8 @@ async fn plan_link<B: Broker>(
         }
         // Nothing to grant is what Service Bus reports as a timeout: the client
         // did nothing wrong and simply asks again.
-        Ok(CommandOutcome::SessionAccepted(None)) => Err(definitions::Error::new(
-            definitions::ErrorCondition::Custom(crate::TIMEOUT.into()),
+        Ok(CommandOutcome::SessionAccepted(None)) => Err(AmqpProtocolError::new(
+            ErrorCondition::Custom(Symbol::from(crate::TIMEOUT)),
             String::from("no session is available to accept"),
             None,
         )),
@@ -561,11 +536,11 @@ async fn serve_sending_client<B: Broker>(
             match authorization.as_ref() {
                 Some(authorization) => {
                     tokio::select! {
-                        result = receiver.recv::<Body<Binary>>() => Some(result),
+                        result = receiver.recv() => Some(result),
                         () = authorization.wait_until_unauthorized() => None,
                     }
                 }
-                None => Some(receiver.recv::<Body<Binary>>().await),
+                None => Some(receiver.recv().await),
             }
         }
         .await;
@@ -579,13 +554,7 @@ async fn serve_sending_client<B: Broker>(
             Ok(delivery) => delivery,
             // The client hung up. Its detach is waiting for an answer, and a
             // dropped handle would leave it waiting; closing sends it.
-            Err(RecvError::LinkStateError(
-                LinkStateError::RemoteClosed
-                | LinkStateError::RemoteDetached
-                | LinkStateError::RemoteClosedWithError(_)
-                | LinkStateError::RemoteDetachedWithError(_)
-                | LinkStateError::IllegalSessionState,
-            )) => {
+            Err(EngineError::RemoteClosed | EngineError::RemoteDetached | EngineError::Stopped) => {
                 let _ = receiver.close().await;
                 return Ok(());
             }
@@ -605,7 +574,7 @@ async fn serve_sending_client<B: Broker>(
                 receiver
                     .reject(
                         &delivery,
-                        error_for(AmqpError::InvalidField, error.to_string()),
+                        Some(error_for(AmqpError::InvalidField, error.to_string())),
                     )
                     .await?;
                 continue;
@@ -631,7 +600,7 @@ async fn serve_sending_client<B: Broker>(
             Ok(_) => receiver.accept(&delivery).await?,
             Err(rejection) => {
                 receiver
-                    .reject(&delivery, rejection_error(&rejection))
+                    .reject(&delivery, Some(rejection_error(&rejection)))
                     .await?
             }
         }
@@ -649,10 +618,7 @@ async fn serve_receiving_client<B: Broker>(
     session: Option<SessionHold>,
     protocol: ReceivingLinkProtocol,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ReceivingLinkProtocol {
-        authorization,
-        delivery_tags,
-    } = protocol;
+    let ReceivingLinkProtocol { authorization } = protocol;
     let mut renew = tokio::time::interval(SESSION_RENEW_INTERVAL);
     renew.tick().await; // the first tick is immediate, and the lock is fresh
 
@@ -714,7 +680,6 @@ async fn serve_receiving_client<B: Broker>(
                     &broker,
                     delivery,
                     authorization.as_ref(),
-                    &delivery_tags,
                 )
                 .await?
                 {
@@ -840,15 +805,15 @@ async fn settle<B: Broker>(
     broker: &B,
     delivery: Delivery,
     authorization: Option<&LinkAuthorization>,
-    delivery_tags: &DeliveryTagRegistry,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let Some(lock) = delivery.lock else {
+        let delivery_tag = sequence_delivery_tag(delivery.sequence);
         // Receive-and-delete: the message is already gone, so there is nothing
         // to settle after the transfer.
         let sent = match authorization {
             Some(authorization) => {
                 tokio::select! {
-                    outcome = sender.send(crate::write_delivery(&delivery)) => {
+                    outcome = sender.send(crate::write_delivery(&delivery), delivery_tag.clone()) => {
                         outcome?;
                         true
                     }
@@ -856,7 +821,9 @@ async fn settle<B: Broker>(
                 }
             }
             None => {
-                sender.send(crate::write_delivery(&delivery)).await?;
+                sender
+                    .send(crate::write_delivery(&delivery), delivery_tag)
+                    .await?;
                 true
             }
         };
@@ -864,15 +831,18 @@ async fn settle<B: Broker>(
     };
     let sequence = delivery.sequence;
     let delivery_tag = lock_delivery_tag(lock.token);
-    delivery_tags.register(sender.name(), delivery_tag);
     let outcome = match authorization {
         Some(authorization) => {
             tokio::select! {
-                outcome = sender.send(crate::write_delivery(&delivery)) => outcome?,
+                outcome = sender.send(crate::write_delivery(&delivery), delivery_tag.clone()) => outcome?,
                 () = authorization.wait_until_unauthorized() => return Ok(false),
             }
         }
-        None => sender.send(crate::write_delivery(&delivery)).await?,
+        None => {
+            sender
+                .send(crate::write_delivery(&delivery), delivery_tag)
+                .await?
+        }
     };
     if let Some(authorization) = authorization
         && authorization.ensure().await.is_err()
@@ -918,7 +888,11 @@ fn lock_delivery_tag(token: LockToken) -> DeliveryTag {
     tag.to_vec().into()
 }
 
-async fn detach_with(endpoint: LinkEndpoint, error: definitions::Error) {
+fn sequence_delivery_tag(sequence: domain::SequenceNumber) -> DeliveryTag {
+    sequence.as_u64().to_be_bytes().to_vec().into()
+}
+
+async fn detach_with(endpoint: LinkEndpoint, error: AmqpProtocolError) {
     match endpoint {
         LinkEndpoint::Sender(sender) => {
             let _ = sender.close_with_error(error).await;
@@ -929,19 +903,19 @@ async fn detach_with(endpoint: LinkEndpoint, error: definitions::Error) {
     }
 }
 
-fn error_for(condition: AmqpError, description: String) -> definitions::Error {
-    definitions::Error::new(condition, description, None)
+fn error_for(condition: AmqpError, description: String) -> AmqpProtocolError {
+    AmqpProtocolError::new(condition, description, None)
 }
 
-fn unauthorized_error(description: impl Into<String>) -> definitions::Error {
+fn unauthorized_error(description: impl Into<String>) -> AmqpProtocolError {
     error_for(AmqpError::UnauthorizedAccess, description.into())
 }
 
 /// The wire error a broker rejection becomes, carrying the condition an SDK
 /// keys its behaviour off.
-fn rejection_error(rejection: &BrokerRejection) -> definitions::Error {
-    definitions::Error::new(
-        definitions::ErrorCondition::Custom(rejection.condition().into()),
+fn rejection_error(rejection: &BrokerRejection) -> AmqpProtocolError {
+    AmqpProtocolError::new(
+        ErrorCondition::Custom(Symbol::from(rejection.condition())),
         rejection.to_string(),
         None,
     )
@@ -996,7 +970,7 @@ mod tests {
         let error = rejection_error(&rejection);
         assert_eq!(
             error.condition,
-            definitions::ErrorCondition::Custom(crate::NOT_FOUND.into())
+            ErrorCondition::Custom(Symbol::from(crate::NOT_FOUND))
         );
     }
 }

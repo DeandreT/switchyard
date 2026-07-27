@@ -6,18 +6,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use amqp::{
+    ApplicationProperties, Body, ClientConnection as Connection, ClientReceiver as Receiver,
+    ClientSender as Sender, ClientSession as Session, Message, Outcome, Properties, SaslInit,
+    Symbol, Value,
+};
 use auth::{PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use domain::{CommandKind, QueueConfig, StateMachine};
-use amqp_runtime::{
-    Connection, Receiver, Sender, Session,
-    connection::ConnectionHandle,
-    sasl_profile::SaslProfile,
-    types::{
-        messaging::{AmqpValue, ApplicationProperties, Body, Message, Outcome, Properties},
-        primitives::{Binary, SimpleValue, Value},
-    },
-};
 use hmac::{Hmac, Mac};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::{
@@ -43,6 +39,11 @@ struct AuthNode {
     _broker: Broker,
     address: String,
     certificate: CertificateDer<'static>,
+}
+
+enum SaslProfile {
+    Anonymous,
+    Plain { username: String, password: String },
 }
 
 impl AuthNode {
@@ -108,14 +109,14 @@ impl AuthNode {
         })
     }
 
-    async fn connect(&self) -> Result<ConnectionHandle<()>, Box<dyn Error>> {
+    async fn connect(&self) -> Result<Connection, Box<dyn Error>> {
         self.connect_with_profile(SaslProfile::Anonymous).await
     }
 
     async fn connect_with_profile(
         &self,
         profile: SaslProfile,
-    ) -> Result<ConnectionHandle<()>, Box<dyn Error>> {
+    ) -> Result<Connection, Box<dyn Error>> {
         let mut roots = RootCertStore::empty();
         roots.add(self.certificate.clone())?;
         let config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
@@ -126,9 +127,30 @@ impl AuthNode {
         let tls = TlsConnector::from(Arc::new(config))
             .connect(ServerName::try_from("localhost")?, tcp)
             .await?;
+        let init = match profile {
+            SaslProfile::Anonymous => SaslInit {
+                mechanism: Symbol::from("ANONYMOUS"),
+                initial_response: None,
+                hostname: Some(String::from(HOST)),
+            },
+            SaslProfile::Plain { username, password } => SaslInit {
+                mechanism: Symbol::from("PLAIN"),
+                initial_response: Some(
+                    [
+                        b"\0".as_slice(),
+                        username.as_bytes(),
+                        b"\0",
+                        password.as_bytes(),
+                    ]
+                    .concat()
+                    .into(),
+                ),
+                hostname: Some(String::from(HOST)),
+            },
+        };
         Ok(Connection::builder()
             .container_id("test-client")
-            .sasl_profile(profile)
+            .sasl(init)
             .open_with_stream(tls)
             .await?)
     }
@@ -154,10 +176,7 @@ fn sas_token(audience: &str, expiry: u64) -> String {
     )
 }
 
-async fn put_token(
-    session: &mut amqp_runtime::session::SessionHandle<()>,
-    token: String,
-) -> Result<i32, Box<dyn Error>> {
+async fn put_token(session: &mut Session, token: String) -> Result<i32, Box<dyn Error>> {
     let mut request_link = Sender::attach(session, "cbs-request", protocol_amqp::CBS_NODE).await?;
     let mut response_link = Receiver::builder()
         .name("cbs-response")
@@ -180,11 +199,11 @@ async fn put_token(
                 .insert("name", String::from(AUDIENCE))
                 .build(),
         )
-        .body(Body::Value(AmqpValue(token)))
+        .body(Body::Value(Value::String(token)))
         .build();
     request_link.send(request).await?;
 
-    let response = response_link.recv::<Body<Value>>().await?;
+    let response = response_link.recv().await?;
     assert_eq!(
         response
             .message()
@@ -199,7 +218,7 @@ async fn put_token(
         .as_ref()
         .and_then(|properties| properties.get("status-code"))
     {
-        Some(SimpleValue::Int(status)) => *status,
+        Some(Value::Int(status)) => *status,
         other => panic!("expected an int CBS status, got {other:?}"),
     };
     assert!(matches!(
@@ -208,7 +227,7 @@ async fn put_token(
             .application_properties
             .as_ref()
             .and_then(|properties| properties.get("status-description")),
-        Some(SimpleValue::String(_))
+        Some(Value::String(_))
     ));
     response_link.accept(&response).await?;
     request_link.close().await?;
@@ -216,10 +235,8 @@ async fn put_token(
     Ok(status)
 }
 
-fn body(text: &str) -> Body<Binary> {
-    Body::Data(amqp_runtime::types::messaging::Batch::new(vec![
-        amqp_runtime::types::messaging::Data(Binary::from(text.as_bytes().to_vec())),
-    ]))
+fn body(text: &str) -> Body {
+    Body::Data(vec![text.as_bytes().to_vec().into()])
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -250,8 +267,7 @@ async fn cbs_grants_send_but_not_listen() -> Result<(), Box<dyn Error>> {
     ));
 
     let mut receiver = Receiver::attach(&mut session, "forbidden-receiver", "orders").await?;
-    let refused =
-        tokio::time::timeout(Duration::from_secs(2), receiver.recv::<Body<Binary>>()).await?;
+    let refused = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await?;
     assert!(refused.is_err(), "a Send grant also granted Listen");
     connection.close().await?;
     Ok(())
@@ -297,7 +313,7 @@ async fn cbs_grants_listen_but_not_send() -> Result<(), Box<dyn Error>> {
     );
 
     let mut receiver = Receiver::attach(&mut session, "authorized-receiver", "orders").await?;
-    let delivery = receiver.recv::<Body<Binary>>().await?;
+    let delivery = receiver.recv().await?;
     receiver.accept(&delivery).await?;
 
     let mut sender = Sender::attach(&mut session, "forbidden-sender", "orders").await?;
@@ -351,6 +367,6 @@ async fn a_connection_without_cbs_is_closed_on_its_deadline() -> Result<(), Box<
     let node = AuthNode::start(PermissionSet::SEND, Duration::from_millis(100)).await?;
     let mut connection = node.connect().await?;
 
-    let _ = tokio::time::timeout(Duration::from_secs(2), connection.on_close()).await?;
+    tokio::time::timeout(Duration::from_secs(2), connection.on_close()).await?;
     Ok(())
 }

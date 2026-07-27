@@ -6,11 +6,9 @@
 //! broker answers by echoing the filter with the granted session's identifier,
 //! which is the only way a next-available receiver learns what it got.
 
+use amqp::Source;
 use domain::SessionId;
-use amqp_runtime::types::{
-    messaging::Source,
-    primitives::{Symbol, Value},
-};
+use serde_amqp::{Value, primitives::Symbol};
 
 use crate::{ProtocolError, parse_session_id};
 
@@ -55,7 +53,7 @@ pub fn stamp_session_filter(source: &mut Source, session_id: &SessionId) {
 
 #[cfg(test)]
 mod tests {
-    use amqp_runtime::types::messaging::FilterSet;
+    use amqp::FilterSet;
 
     use super::*;
 
@@ -64,7 +62,11 @@ mod tests {
         if let Some(value) = value {
             filter.insert(Symbol::from(SESSION_FILTER), value);
         }
-        Source::builder().address("orders").filter(filter).build()
+        Source {
+            address: Some(String::from("orders")),
+            filter: Some(filter),
+            ..Source::default()
+        }
     }
 
     #[test]

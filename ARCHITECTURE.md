@@ -82,9 +82,9 @@ transactions, and settlements are replicated.
 
 ## Protocol Edge
 
-The protocol crate will use `amqp-runtime` acceptors for AMQP framing, sessions,
-links, flow control, SASL, TLS, and WebSocket transport. Switchyard implements
-the Service Bus-specific layer:
+The repository-owned AMQP engine handles framing, sessions, links, flow
+control, settlement, and SASL. The protocol listener establishes TLS before
+that engine starts. Switchyard implements the Service Bus-specific layer:
 
 - SASL PLAIN for shared access policies
 - SASL ANONYMOUS followed by CBS `$cbs` SAS or JWT authorization

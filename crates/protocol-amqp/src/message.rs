@@ -6,11 +6,8 @@
 //! back out is what the broker recorded, so a redelivery looks the same as the
 //! first attempt.
 
+use amqp::{ApplicationProperties, Body, Message, MessageId, Properties};
 use domain::{Delivery, SessionId};
-use amqp_runtime::types::{
-    messaging::{ApplicationProperties, Batch, Body, Data, Message, Properties},
-    primitives::Binary,
-};
 
 use crate::{ProtocolError, parse_session_id};
 
@@ -28,7 +25,7 @@ pub struct IncomingMessage {
 /// A message with no identifier of its own is accepted: Service Bus assigns one
 /// rather than refusing the send, and the broker's own sequence number is what
 /// actually identifies the message afterwards.
-pub fn read_incoming(message: &Message<Body<Binary>>) -> Result<IncomingMessage, ProtocolError> {
+pub fn read_incoming(message: &Message) -> Result<IncomingMessage, ProtocolError> {
     let properties = message.properties.as_ref();
     let session_id = properties
         .and_then(|properties| properties.group_id.as_deref())
@@ -57,7 +54,7 @@ pub const DEAD_LETTER_REASON_PROPERTY: &str = "DeadLetterReason";
 pub const DEAD_LETTER_DESCRIPTION_PROPERTY: &str = "DeadLetterErrorDescription";
 
 /// Builds the message handed back to a receiving client.
-pub fn write_delivery(delivery: &Delivery) -> Message<Body<Binary>> {
+pub fn write_delivery(delivery: &Delivery) -> Message {
     let properties = Properties {
         message_id: Some(delivery.message_id.clone().into()),
         group_id: delivery
@@ -67,28 +64,22 @@ pub fn write_delivery(delivery: &Delivery) -> Message<Body<Binary>> {
         ..Properties::default()
     };
 
-    let mut message = Message::builder()
-        .properties(properties)
-        .body(Body::Data(Batch::new(vec![Data(Binary::from(
-            delivery.body.clone(),
-        ))])))
-        .build();
+    let mut message = Message::data(delivery.body.clone());
+    message.properties = Some(properties);
 
     // A message drained from a dead-letter queue says why it is there, in the
     // properties the Service Bus SDKs read.
     if let Some(dead_letter) = &delivery.dead_letter {
-        message.application_properties = Some(
-            ApplicationProperties::builder()
-                .insert(
-                    DEAD_LETTER_REASON_PROPERTY,
-                    dead_letter.reason.as_str().to_owned(),
-                )
-                .insert(
-                    DEAD_LETTER_DESCRIPTION_PROPERTY,
-                    dead_letter.description.clone(),
-                )
-                .build(),
+        let mut properties = ApplicationProperties::default();
+        properties.insert(
+            DEAD_LETTER_REASON_PROPERTY,
+            dead_letter.reason.as_str().to_owned(),
         );
+        properties.insert(
+            DEAD_LETTER_DESCRIPTION_PROPERTY,
+            dead_letter.description.clone(),
+        );
+        message.application_properties = Some(properties);
     }
     message
 }
@@ -97,20 +88,19 @@ pub fn write_delivery(delivery: &Delivery) -> Message<Body<Binary>> {
 ///
 /// A value or an empty body is not an error: the broker stores bodies opaquely
 /// and a client is entitled to send nothing.
-fn body_bytes(body: &Body<Binary>) -> Vec<u8> {
+fn body_bytes(body: &Body) -> Vec<u8> {
     match body {
         // A body may arrive as several data sections; the broker stores the
         // payload as one opaque run of bytes.
         Body::Data(sections) => sections
             .iter()
-            .flat_map(|section| section.0.iter().copied())
+            .flat_map(|section| section.iter().copied())
             .collect(),
         Body::Sequence(_) | Body::Value(_) | Body::Empty => Vec::new(),
     }
 }
 
-fn message_id_text(message_id: &amqp_runtime::types::messaging::MessageId) -> String {
-    use amqp_runtime::types::messaging::MessageId;
+fn message_id_text(message_id: &MessageId) -> String {
     match message_id {
         MessageId::String(text) => text.to_string(),
         MessageId::Ulong(value) => value.to_string(),
@@ -125,10 +115,8 @@ mod tests {
 
     use super::*;
 
-    fn sent(properties: Option<Properties>, body: Vec<u8>) -> Message<Body<Binary>> {
-        let mut message = Message::builder()
-            .body(Body::Data(Batch::new(vec![Data(Binary::from(body))])))
-            .build();
+    fn sent(properties: Option<Properties>, body: Vec<u8>) -> Message {
+        let mut message = Message::data(body);
         message.properties = properties;
         message
     }

@@ -2,15 +2,11 @@
 
 use std::{error::Error, sync::Arc};
 
-use domain::{CommandKind, QueueConfig, StateMachine};
-use amqp_runtime::{
-    Connection, Receiver, Sender, Session,
-    connection::ConnectionHandle,
-    types::{
-        messaging::{Body, Message, Outcome},
-        primitives::Binary,
-    },
+use amqp::{
+    Body, ClientConnection as Connection, ClientReceiver as Receiver, ClientSender as Sender,
+    ClientSession as Session, Message, Outcome,
 };
+use domain::{CommandKind, QueueConfig, StateMachine};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::{
     ClientConfig, RootCertStore,
@@ -68,16 +64,13 @@ impl TlsNode {
         })
     }
 
-    async fn connect(&self) -> Result<ConnectionHandle<()>, Box<dyn Error>> {
+    async fn connect(&self) -> Result<Connection, Box<dyn Error>> {
         let mut roots = RootCertStore::empty();
         roots.add(self.certificate.clone())?;
         self.connect_with_roots(roots).await
     }
 
-    async fn connect_with_roots(
-        &self,
-        roots: RootCertStore,
-    ) -> Result<ConnectionHandle<()>, Box<dyn Error>> {
+    async fn connect_with_roots(&self, roots: RootCertStore) -> Result<Connection, Box<dyn Error>> {
         let config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
             .with_protocol_versions(&[&TLS13, &TLS12])?
             .with_root_certificates(roots)
@@ -93,10 +86,8 @@ impl TlsNode {
     }
 }
 
-fn body(text: &str) -> Body<Binary> {
-    Body::Data(amqp_runtime::types::messaging::Batch::new(vec![
-        amqp_runtime::types::messaging::Data(Binary::from(text.as_bytes().to_vec())),
-    ]))
+fn body(text: &str) -> Body {
+    Body::Data(vec![text.as_bytes().to_vec().into()])
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -112,7 +103,7 @@ async fn a_trusted_tls_client_sends_and_receives() -> Result<(), Box<dyn Error>>
     assert!(matches!(outcome, Outcome::Accepted(_)));
 
     let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
-    let delivery = receiver.recv::<Body<Binary>>().await?;
+    let delivery = receiver.recv().await?;
     assert_eq!(
         delivery.message().body,
         Message::builder().body(body("secured")).build().body
