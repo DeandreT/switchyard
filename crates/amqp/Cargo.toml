@@ -15,4 +15,5 @@ serde.workspace = true
 serde_amqp.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 url = { workspace = true, optional = true }

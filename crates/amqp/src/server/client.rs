@@ -654,6 +654,7 @@ where
                         sessions.insert(channel, SessionState {
                             attach_tx: Some(unused_attach_tx.clone()),
                             links: HashMap::new(),
+                            pending_flows: HashMap::new(),
                             next_outgoing_id: 0,
                         });
                         next_handles.insert(channel, 0);

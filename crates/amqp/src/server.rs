@@ -9,6 +9,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::{mpsc, oneshot, watch},
 };
+use tracing::trace;
 
 use crate::{
     Accepted, Attach, Begin, Close, DeliveryState, DeliveryTag, Detach, Disposition, End, Error,
@@ -452,6 +453,7 @@ enum Command {
 struct SessionState {
     attach_tx: Option<mpsc::Sender<Attach>>,
     links: HashMap<u32, LinkState>,
+    pending_flows: HashMap<u32, Flow>,
     next_outgoing_id: u32,
 }
 
@@ -688,6 +690,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 SessionState {
                     attach_tx: Some(attach_tx),
                     links: HashMap::new(),
+                    pending_flows: HashMap::new(),
                     next_outgoing_id: 0,
                 },
             );
@@ -762,6 +765,10 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                         }),
                     );
                 }
+            }
+            let pending_flow = session.pending_flows.remove(&handle);
+            if let Some(flow) = pending_flow {
+                apply_flow(channel, flow, writer, sessions, remote_max_frame_size).await?;
             }
             let _ = reply.send(Ok(()));
         }
@@ -917,14 +924,33 @@ async fn apply_flow<W: AsyncWrite + Unpin>(
         return Ok(());
     };
     let Some(session) = sessions.get_mut(&channel) else {
+        trace!(channel, handle, "ignoring flow for an unknown session");
         return Ok(());
     };
-    let Some(LinkState::Sending(link)) = session.links.get_mut(&handle) else {
-        return Ok(());
+    let link = match session.links.get_mut(&handle) {
+        Some(LinkState::Sending(link)) => link,
+        Some(LinkState::Receiving(_)) => {
+            trace!(channel, handle, "ignoring flow for a receiving link");
+            return Ok(());
+        }
+        None => {
+            trace!(channel, handle, "buffering flow for a pending attach");
+            session.pending_flows.insert(handle, flow);
+            return Ok(());
+        }
     };
     if let Some(credit) = flow.link_credit {
         link.credit_limit =
             u64::from(flow.delivery_count.unwrap_or(link.delivery_count)) + u64::from(credit);
+        trace!(
+            channel,
+            handle,
+            delivery_count = link.delivery_count,
+            credit,
+            credit_limit = link.credit_limit,
+            queued = link.queued.len(),
+            "link credit updated"
+        );
     }
     flush_sends(channel, handle, session, writer, remote_max_frame_size).await
 }
@@ -941,6 +967,14 @@ async fn flush_sends<W: AsyncWrite + Unpin>(
             return Ok(());
         };
         if u64::from(link.delivery_count) >= link.credit_limit {
+            trace!(
+                channel,
+                handle,
+                delivery_count = link.delivery_count,
+                credit_limit = link.credit_limit,
+                queued = link.queued.len(),
+                "send is waiting for link credit"
+            );
             return Ok(());
         }
         let Some(queued) = link.queued.pop_front() else {
@@ -1116,7 +1150,7 @@ mod tests {
     use serde_amqp::primitives::Binary;
 
     use super::*;
-    use crate::AmqpError;
+    use crate::{AmqpError, Source, Target};
 
     #[test]
     fn a_link_role_selects_the_local_endpoint() {
@@ -1134,5 +1168,82 @@ mod tests {
     fn delivery_tags_are_binary_and_exact() {
         let tag = Binary::from(vec![0, 1, 2, 3]);
         assert_eq!(tag.as_slice(), &[0, 1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn link_credit_arriving_during_attach_is_applied_when_the_link_is_accepted() {
+        let channel = 3;
+        let handle = 1;
+        let (attach_tx, _attaches) = mpsc::channel(1);
+        let mut sessions = HashMap::from([(
+            channel,
+            SessionState {
+                attach_tx: Some(attach_tx),
+                links: HashMap::new(),
+                pending_flows: HashMap::new(),
+                next_outgoing_id: 0,
+            },
+        )]);
+        let (mut wire, _peer) = tokio::io::duplex(64 * 1024);
+
+        apply_flow(
+            channel,
+            Flow {
+                handle: Some(handle),
+                delivery_count: Some(0),
+                link_credit: Some(50),
+                ..Flow::default()
+            },
+            &mut wire,
+            &mut sessions,
+            u32::MAX,
+        )
+        .await
+        .expect("an early flow is buffered");
+        assert!(sessions[&channel].pending_flows.contains_key(&handle));
+
+        let (deliveries_tx, _deliveries) = mpsc::channel(1);
+        let (detached_tx, _detached) = watch::channel(false);
+        let (reply, response) = oneshot::channel();
+        handle_command(
+            Command::AcceptLink {
+                channel,
+                attach: Box::new(Attach {
+                    name: String::from("response"),
+                    handle,
+                    role: Role::Receiver,
+                    snd_settle_mode: SenderSettleMode::Settled,
+                    rcv_settle_mode: ReceiverSettleMode::First,
+                    source: Some(Source::new("node")),
+                    target: Some(Target::new("reply-to")),
+                    unsettled: None,
+                    incomplete_unsettled: false,
+                    initial_delivery_count: None,
+                    max_message_size: None,
+                    offered_capabilities: None,
+                    desired_capabilities: None,
+                    properties: None,
+                }),
+                max_message_size: 1024,
+                deliveries_tx,
+                detached_tx,
+                reply,
+            },
+            &mut wire,
+            &mut sessions,
+            u32::MAX,
+        )
+        .await
+        .expect("the link is accepted");
+        response
+            .await
+            .expect("the accept reply remains live")
+            .expect("the attach is valid");
+
+        assert!(sessions[&channel].pending_flows.is_empty());
+        let Some(LinkState::Sending(link)) = sessions[&channel].links.get(&handle) else {
+            panic!("the remote receiver created a local sending link");
+        };
+        assert_eq!(link.credit_limit, 50);
     }
 }

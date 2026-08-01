@@ -27,6 +27,7 @@ dependencies = [
  "serde_amqp",
  "thiserror",
  "tokio",
+ "tracing",
  "url",
 ]
 
