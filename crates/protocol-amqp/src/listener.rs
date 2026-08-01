@@ -28,6 +28,10 @@ use crate::{
     Attachment, Broker, BrokerRejection, ProtocolError, SessionRequest, SharedAccessAuthentication,
     authorization::{ConnectionAuthorization, SharedAccessSaslAcceptor},
     cbs::{serve_cbs_replies, serve_cbs_requests},
+    management::{
+        ConnectionManagement, ManagementAuthorization, serve_management_replies,
+        serve_management_requests,
+    },
     parse_attachment, read_incoming, read_session_filter, stamp_session_filter,
 };
 
@@ -41,7 +45,7 @@ const EMPTY_QUEUE_FALLBACK: Duration = Duration::from_secs(3);
 /// How often a link that holds a session renews its lock.
 ///
 /// The broker renews on the receiver's behalf while the link is open, because
-/// the management operations the SDKs renew through do not exist yet. Well
+/// session-lock renewal through the management node does not exist yet. Well
 /// under the shortest configurable lock a client is likely to use.
 const SESSION_RENEW_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -166,6 +170,7 @@ async fn serve_open_connection<B: Broker>(
     broker: B,
     authorization: Option<Arc<ConnectionAuthorization>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let management = ConnectionManagement::new();
     let mut awaiting_authorization = authorization.is_some();
     let timeout = authorization
         .as_ref()
@@ -207,8 +212,11 @@ async fn serve_open_connection<B: Broker>(
         let broker = broker.clone();
         let namespace = namespace.clone();
         let authorization = authorization.clone();
+        let management = Arc::clone(&management);
         tokio::spawn(async move {
-            if let Err(error) = serve_session(session, namespace, broker, authorization).await {
+            if let Err(error) =
+                serve_session(session, namespace, broker, authorization, management).await
+            {
                 warn!(%error, ?error, "session ended");
             }
         });
@@ -228,6 +236,7 @@ async fn serve_session<B: Broker>(
     namespace: NamespaceName,
     broker: B,
     authorization: Option<Arc<ConnectionAuthorization>>,
+    management: Arc<ConnectionManagement>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     while let Some(mut attach) = session.next_incoming_attach().await {
         let source_address = attach
@@ -293,10 +302,113 @@ async fn serve_session<B: Broker>(
             continue;
         }
 
+        let address = address_for_role(&attach.role, &source_address, &target_address);
+        if let Some(entity) = management_entity(address) {
+            if attach.role == Role::Sender && attach.initial_delivery_count.is_none() {
+                attach.initial_delivery_count = Some(0);
+            }
+            let plan = match entity {
+                Ok(entity) => {
+                    let link_authorization = match authorization.as_ref() {
+                        Some(authorization) => match authorization
+                            .authorize_entity(entity.as_str(), Permission::Manage)
+                            .await
+                        {
+                            Ok(resource) => Some(ManagementAuthorization::new(
+                                Arc::clone(authorization),
+                                resource,
+                            )),
+                            Err(_) => {
+                                let endpoint = session
+                                    .accept_attach(
+                                        attach,
+                                        crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64,
+                                    )
+                                    .await?;
+                                detach_with(
+                                    endpoint,
+                                    unauthorized_error(format!(
+                                        "Manage is not authorized for {entity}"
+                                    )),
+                                )
+                                .await;
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
+                    Ok((entity, link_authorization))
+                }
+                Err(error) => Err(error_for(AmqpError::InvalidField, error.to_string())),
+            };
+
+            debug!(%address, ?attach, "accepting management link");
+            let endpoint = session
+                .accept_attach(attach, crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64)
+                .await?;
+            let (entity, link_authorization) = match plan {
+                Ok(plan) => plan,
+                Err(error) => {
+                    detach_with(endpoint, error).await;
+                    continue;
+                }
+            };
+            match (target_address.as_str(), source_address.as_str(), endpoint) {
+                (target, _, LinkEndpoint::Receiver(receiver)) if target == address => {
+                    let namespace = namespace.clone();
+                    let broker = broker.clone();
+                    let management = Arc::clone(&management);
+                    tokio::spawn(async move {
+                        if let Err(error) = serve_management_requests(
+                            receiver,
+                            namespace,
+                            entity,
+                            broker,
+                            management,
+                            link_authorization,
+                        )
+                        .await
+                        {
+                            warn!(%error, "management request link ended");
+                        }
+                    });
+                }
+                (_, source, LinkEndpoint::Sender(sender))
+                    if source == address && !target_address.is_empty() =>
+                {
+                    let (route, responses) = management
+                        .register_reply_route(target_address.clone())
+                        .await;
+                    let management = Arc::clone(&management);
+                    tokio::spawn(async move {
+                        if let Err(error) = serve_management_replies(
+                            sender,
+                            target_address,
+                            route,
+                            responses,
+                            management,
+                            link_authorization,
+                        )
+                        .await
+                        {
+                            warn!(%error, "management response link ended");
+                        }
+                    });
+                }
+                (_, _, endpoint) => {
+                    detach_with(
+                        endpoint,
+                        error_for(AmqpError::InvalidField, "invalid management link".into()),
+                    )
+                    .await;
+                }
+            }
+            continue;
+        }
+
         // The address has to be read before the attach is consumed. A client
         // sending names its entity in the target; one receiving names it in the
         // source. The other terminus may carry a generated link address.
-        let address = address_for_role(&attach.role, &source_address, &target_address);
         debug!(%address, ?attach, "accepting entity link");
 
         // A receiver that asks for pre-settled transfers is asking for
@@ -362,6 +474,7 @@ async fn serve_session<B: Broker>(
             // The client receives; this end sends.
             LinkEndpoint::Sender(sender) => {
                 let hold = accepted.map(|accepted| accepted.hold());
+                let connection_management = Arc::clone(&management);
                 tokio::spawn(async move {
                     if let Err(error) = serve_receiving_client(
                         sender,
@@ -372,6 +485,7 @@ async fn serve_session<B: Broker>(
                         hold,
                         ReceivingLinkProtocol {
                             authorization: link_authorization,
+                            management: connection_management,
                         },
                     )
                     .await
@@ -394,6 +508,7 @@ struct LinkAuthorization {
 
 struct ReceivingLinkProtocol {
     authorization: Option<LinkAuthorization>,
+    management: Arc<ConnectionManagement>,
 }
 
 impl LinkAuthorization {
@@ -523,6 +638,16 @@ fn address_for_role<'a>(role: &Role, source: &'a str, target: &'a str) -> &'a st
     }
 }
 
+fn management_entity(address: &str) -> Option<Result<EntityPath, ProtocolError>> {
+    let entity = address.strip_suffix("/$management")?;
+    Some(
+        EntityPath::new(entity).map_err(|error| ProtocolError::InvalidAddress {
+            address: address.to_owned(),
+            detail: error.to_string(),
+        }),
+    )
+}
+
 /// Drives a link the client sends on: every transfer becomes one send command.
 async fn serve_sending_client<B: Broker>(
     mut receiver: Receiver,
@@ -618,7 +743,10 @@ async fn serve_receiving_client<B: Broker>(
     session: Option<SessionHold>,
     protocol: ReceivingLinkProtocol,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ReceivingLinkProtocol { authorization } = protocol;
+    let ReceivingLinkProtocol {
+        authorization,
+        management,
+    } = protocol;
     let mut renew = tokio::time::interval(SESSION_RENEW_INTERVAL);
     renew.tick().await; // the first tick is immediate, and the lock is fresh
 
@@ -680,6 +808,7 @@ async fn serve_receiving_client<B: Broker>(
                     &broker,
                     delivery,
                     authorization.as_ref(),
+                    &management,
                 )
                 .await?
                 {
@@ -805,6 +934,7 @@ async fn settle<B: Broker>(
     broker: &B,
     delivery: Delivery,
     authorization: Option<&LinkAuthorization>,
+    management: &ConnectionManagement,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let Some(lock) = delivery.lock else {
         let delivery_tag = sequence_delivery_tag(delivery.sequence);
@@ -831,19 +961,28 @@ async fn settle<B: Broker>(
     };
     let sequence = delivery.sequence;
     let delivery_tag = lock_delivery_tag(lock.token);
+    let link_name = sender.name().to_owned();
+    management
+        .register_delivery(&link_name, entity.clone(), sequence, lock.token)
+        .await;
     let outcome = match authorization {
         Some(authorization) => {
             tokio::select! {
-                outcome = sender.send(crate::write_delivery(&delivery), delivery_tag.clone()) => outcome?,
-                () = authorization.wait_until_unauthorized() => return Ok(false),
+                outcome = sender.send(crate::write_delivery(&delivery), delivery_tag.clone()) => Some(outcome),
+                () = authorization.wait_until_unauthorized() => None,
             }
         }
-        None => {
+        None => Some(
             sender
                 .send(crate::write_delivery(&delivery), delivery_tag)
-                .await?
-        }
+                .await,
+        ),
     };
+    management.unregister_delivery(&link_name, lock.token).await;
+    let Some(outcome) = outcome else {
+        return Ok(false);
+    };
+    let outcome = outcome?;
     if let Some(authorization) = authorization
         && authorization.ensure().await.is_err()
     {

@@ -71,6 +71,13 @@ pub enum CommandKind {
         reason: String,
         description: String,
     },
+    /// Extends a message lock without changing its token.
+    RenewLock {
+        sequence: SequenceNumber,
+        lock_token: LockToken,
+        /// Overrides the queue default when set.
+        lock_duration_millis: Option<u64>,
+    },
     /// Takes exclusive ownership of a session.
     AcceptSession {
         /// `None` accepts the next session that has a ready message and is not
@@ -119,6 +126,9 @@ pub enum CommandOutcome {
         dead_lettered: bool,
     },
     DeadLettered,
+    LockRenewed {
+        locked_until: Timestamp,
+    },
     LocksExpired {
         returned_to_ready: u32,
         dead_lettered: u32,

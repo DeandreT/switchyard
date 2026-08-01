@@ -47,6 +47,15 @@ if (received.Body.ToString() != "official-dotnet-current")
     return 4;
 }
 
+DateTimeOffset lockedUntilBeforeRenewal = received.LockedUntil;
+await receiver.RenewMessageLockAsync(received);
+if (received.LockedUntil < lockedUntilBeforeRenewal)
+{
+    Console.Error.WriteLine(
+        $"renewal moved the lock backward: {lockedUntilBeforeRenewal:o} -> {received.LockedUntil:o}");
+    return 5;
+}
+
 await receiver.CompleteMessageAsync(received);
-Console.WriteLine("official .NET Service Bus client send/receive/complete passed");
+Console.WriteLine("official .NET Service Bus client send/receive/renew/complete passed");
 return 0;

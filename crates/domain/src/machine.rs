@@ -110,6 +110,17 @@ impl<S: StateStore> StateMachine<S> {
                 description,
                 &mut batch,
             )?,
+            CommandKind::RenewLock {
+                sequence,
+                lock_token,
+                lock_duration_millis,
+            } => self.renew_lock(
+                command,
+                *sequence,
+                *lock_token,
+                *lock_duration_millis,
+                &mut batch,
+            )?,
             CommandKind::AcceptSession {
                 session_id,
                 lock_duration_millis,
@@ -860,6 +871,41 @@ impl<S: StateStore> StateMachine<S> {
             codec::encode(&record)?,
         );
         Ok(CommandOutcome::SessionLockRenewed { locked_until })
+    }
+
+    fn renew_lock(
+        &self,
+        command: &Command,
+        sequence: SequenceNumber,
+        lock_token: LockToken,
+        lock_duration_millis: Option<u64>,
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        let config = self.load_config(command)?;
+        let (mut record, previous_locked_until) = self.held_lock(command, sequence, lock_token)?;
+        let locked_until = command
+            .issued_at
+            .saturating_add_millis(lock_duration_millis.unwrap_or(config.lock_duration_millis));
+
+        record.state = MessageState::Locked {
+            token: lock_token,
+            locked_until,
+        };
+        batch.push_delete(keys::lock(
+            &command.namespace,
+            &command.entity,
+            previous_locked_until,
+            sequence,
+        ));
+        batch.push_put(
+            keys::lock(&command.namespace, &command.entity, locked_until, sequence),
+            Vec::new(),
+        );
+        batch.push_put(
+            keys::message(&command.namespace, &command.entity, sequence),
+            codec::encode(&record)?,
+        );
+        Ok(CommandOutcome::LockRenewed { locked_until })
     }
 
     fn set_session_state(

@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Send, receive, complete | Planned | Experimental gate on 7.20.2 |
+| Official .NET SDK, current stable | Send, receive, renew lock, complete | Planned | Experimental gate on 7.20.2 |
 | Official .NET SDK, previous stable | Planned | Planned | Not implemented |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -27,6 +27,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Peek without lock acquisition | Pre-1.0 | Not implemented |
 | Receive-delete | Pre-1.0 | State machine, AMQP mapping |
 | Lock expiry and redelivery | Pre-1.0 | State machine |
+| Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine |
 | Topics and subscriptions | Pre-1.0 | Not implemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
@@ -56,6 +57,8 @@ behavior it currently enforces:
 - Receive-delete is at-most-once: the deletion commits before the transfer.
 - A settlement is rejected unless it presents the live lock token, and rejected
   again once the lock deadline has passed.
+- A live message lock can be renewed without changing its token. Renewal moves
+  the replicated deadline record and its expiry index in one storage batch.
 - Abandoning a message, or letting its lock elapse, returns it to the queue
   until it reaches the queue's maximum delivery count, after which it is
   dead-lettered as `MaxDeliveryCountExceeded`.
@@ -108,15 +111,17 @@ the delivery guarantee: unsettled is peek-lock, pre-settled is receive-delete.
 A receiving link's `com.microsoft:session-filter` names a session or, with a
 null value, asks for the next available one; the attach response echoes the
 granted identifier. The node renews a link's session lock while the link is
-open and releases it when the link closes, because the management operations
-the SDKs renew through are not implemented. A transfer is accepted only after
-its command committed, so the acknowledgement means durable. One node still
-serves one namespace. A message drained from a dead-letter queue carries its
-reason and description in the `DeadLetterReason` and
+open and releases it when the link closes, because session-lock renewal through
+the management node is not implemented yet. Message-lock renewal is available
+through an entity's `$management` request/reply links and requires Manage
+authorization when authentication is enabled. A transfer is accepted only
+after its command committed, so the acknowledgement means durable. One node
+still serves one namespace. A message drained from a dead-letter queue carries
+its reason and description in the `DeadLetterReason` and
 `DeadLetterErrorDescription` application properties. The complete protocol
 coverage uses a Rust AMQP 1.0 client. The current stable official .NET SDK also
-has an opt-in gate for send, receive, and completion; the rest of that client
-gate remains incomplete.
+has an opt-in gate for send, receive, message-lock renewal, and completion; the
+rest of that client gate remains incomplete.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch
 before reporting it applied, and the same semantics suite runs against both

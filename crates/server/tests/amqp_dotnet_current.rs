@@ -15,7 +15,8 @@ const KEY: &str = "test-secret";
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires dotnet and a NuGet restore"]
-async fn current_stable_dotnet_client_sends_receives_and_completes() -> Result<(), Box<dyn Error>> {
+async fn current_stable_dotnet_client_sends_receives_renews_and_completes()
+-> Result<(), Box<dyn Error>> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -86,7 +87,7 @@ async fn current_stable_dotnet_client_sends_receives_and_completes() -> Result<(
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("send/receive/complete passed"),
+        String::from_utf8_lossy(&output.stdout).contains("send/receive/renew/complete passed"),
         "the client exited without reporting the completed workflow"
     );
     assert_eq!(

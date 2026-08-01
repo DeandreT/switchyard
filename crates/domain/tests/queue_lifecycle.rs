@@ -176,6 +176,119 @@ fn a_foreign_lock_token_cannot_settle_a_message<P: StoreProvider>(
     Ok(())
 }
 
+fn renewing_a_lock_moves_its_deadline_without_changing_its_token<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
+    send(&fixture, 10, "first")?;
+    let delivery = receive(&fixture, 20)?.expect("the queue holds one message");
+    let lock = locked(&delivery);
+    let renewed_until = Timestamp::from_millis(100 + LOCK_MILLIS);
+
+    assert_eq!(
+        fixture.at(
+            100,
+            CommandKind::RenewLock {
+                sequence: delivery.sequence,
+                lock_token: lock.token,
+                lock_duration_millis: None,
+            }
+        )?,
+        CommandOutcome::LockRenewed {
+            locked_until: renewed_until
+        }
+    );
+    assert_eq!(
+        fixture
+            .machine
+            .message(&fixture.namespace, &fixture.entity, delivery.sequence)?
+            .expect("the renewed message remains stored")
+            .state,
+        MessageState::Locked {
+            token: lock.token,
+            locked_until: renewed_until,
+        }
+    );
+
+    // The stale deadline index was removed, so its sweep cannot release the
+    // renewed delivery.
+    assert_eq!(
+        fixture.at(lock.locked_until.as_millis(), CommandKind::ExpireLocks)?,
+        CommandOutcome::LocksExpired {
+            returned_to_ready: 0,
+            dead_lettered: 0,
+        }
+    );
+    assert_eq!(
+        fixture.at(
+            lock.locked_until.as_millis() + 1,
+            CommandKind::Complete {
+                sequence: delivery.sequence,
+                lock_token: lock.token,
+            }
+        )?,
+        CommandOutcome::Completed
+    );
+    Ok(())
+}
+
+fn a_foreign_lock_token_cannot_renew_a_message<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
+    send(&fixture, 10, "first")?;
+    let delivery = receive(&fixture, 20)?.expect("the queue holds one message");
+    let lock = locked(&delivery);
+
+    assert_eq!(
+        fixture.at(
+            30,
+            CommandKind::RenewLock {
+                sequence: delivery.sequence,
+                lock_token: LockToken::new(lock.token.as_u64() + 1),
+                lock_duration_millis: None,
+            }
+        ),
+        Err(BrokerError::LockTokenMismatch {
+            sequence: delivery.sequence
+        })
+    );
+    assert_eq!(
+        fixture.at(
+            31,
+            CommandKind::Complete {
+                sequence: delivery.sequence,
+                lock_token: lock.token,
+            }
+        )?,
+        CommandOutcome::Completed
+    );
+    Ok(())
+}
+
+fn an_elapsed_lock_cannot_be_renewed<P: StoreProvider>(provider: P) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
+    send(&fixture, 10, "first")?;
+    let delivery = receive(&fixture, 20)?.expect("the queue holds one message");
+    let lock = locked(&delivery);
+
+    assert_eq!(
+        fixture.at(
+            lock.locked_until.as_millis(),
+            CommandKind::RenewLock {
+                sequence: delivery.sequence,
+                lock_token: lock.token,
+                lock_duration_millis: None,
+            }
+        ),
+        Err(BrokerError::LockExpired {
+            sequence: delivery.sequence,
+            locked_until: lock.locked_until,
+        })
+    );
+    Ok(())
+}
+
 fn settling_after_the_lock_elapsed_is_rejected<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
@@ -728,6 +841,9 @@ for_each_backend! {
     messages_are_delivered_in_send_order,
     completing_a_lock_removes_the_message,
     a_foreign_lock_token_cannot_settle_a_message,
+    renewing_a_lock_moves_its_deadline_without_changing_its_token,
+    a_foreign_lock_token_cannot_renew_a_message,
+    an_elapsed_lock_cannot_be_renewed,
     settling_after_the_lock_elapsed_is_rejected,
     abandoning_returns_the_message_and_keeps_its_delivery_count,
     abandoning_at_the_delivery_limit_dead_letters_the_message,

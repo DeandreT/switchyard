@@ -12,6 +12,7 @@ mod broker;
 mod cbs;
 mod condition;
 mod listener;
+mod management;
 mod message;
 mod session_filter;
 mod tls;
@@ -31,6 +32,11 @@ pub use crate::{
         SESSION_LOCK_LOST, TIMEOUT, condition_for, is_retryable,
     },
     listener::AmqpListener,
+    management::{
+        ASSOCIATED_LINK_NAME_PROPERTY, ERROR_CONDITION_PROPERTY, EXPIRATIONS, LOCK_TOKENS,
+        OPERATION_PROPERTY, RENEW_LOCK_OPERATION, STATUS_CODE_PROPERTY,
+        STATUS_DESCRIPTION_PROPERTY, TRACKING_ID_PROPERTY,
+    },
     message::{
         DEAD_LETTER_DESCRIPTION_PROPERTY, DEAD_LETTER_REASON_PROPERTY, IncomingMessage,
         read_incoming, write_delivery,

@@ -7,9 +7,9 @@
 use std::error::Error;
 
 use amqp::{
-    Body, ClientConnection as Connection, ClientReceiver as Receiver, ClientSender as Sender,
-    ClientSession as Session, FilterSet, Message, Outcome, Properties, SenderSettleMode, Source,
-    Symbol, Value,
+    ApplicationProperties, Array, Body, ClientConnection as Connection, ClientReceiver as Receiver,
+    ClientSender as Sender, ClientSession as Session, FilterSet, Message, OrderedMap, Outcome,
+    Properties, SenderSettleMode, Source, Symbol, Uuid, Value,
 };
 use domain::{CommandKind, QueueConfig, StateMachine};
 use server::{Broker, LocalProposer, ManualClock};
@@ -131,6 +131,101 @@ async fn a_completed_message_is_not_delivered_again() -> Result<(), Box<dyn Erro
         tokio::time::timeout(std::time::Duration::from_millis(300), receiver.recv()).await;
     assert!(starved.is_err(), "a settled message came back");
 
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_renews_a_live_message_lock_over_the_management_node() -> Result<(), Box<dyn Error>>
+{
+    let node = Node::start(
+        "orders",
+        QueueConfig {
+            lock_duration_millis: 30_000,
+            ..QueueConfig::default()
+        },
+    )
+    .await?;
+
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
+    sender
+        .send(Message::builder().body(body("renew-me")).build())
+        .await?;
+
+    let mut receiver = Receiver::attach(&mut session, "renewable-receiver", "orders").await?;
+    let delivery = receiver.recv().await?;
+
+    let reply_to = String::from("management-replies");
+    let mut responses = Receiver::builder()
+        .name("management-response")
+        .source("orders/$management")
+        .target(reply_to.clone())
+        .attach(&mut session)
+        .await?;
+    let mut requests =
+        Sender::attach(&mut session, "management-request", "orders/$management").await?;
+
+    // A fresh queue's first peek-lock token is one. On the wire that token is
+    // the same 16-byte UUID carried as the original delivery tag.
+    let mut token = [0_u8; 16];
+    token[8..].copy_from_slice(&1_u64.to_be_bytes());
+    let mut request_body = OrderedMap::new();
+    request_body.insert(
+        Value::String(String::from(protocol_amqp::LOCK_TOKENS)),
+        Value::Array(Array::from(vec![Value::Uuid(Uuid::from(token))])),
+    );
+    let request = Message::builder()
+        .properties(Properties {
+            message_id: Some("renew-1".into()),
+            reply_to: Some(reply_to),
+            ..Properties::default()
+        })
+        .application_properties(
+            ApplicationProperties::builder()
+                .insert(
+                    protocol_amqp::OPERATION_PROPERTY,
+                    protocol_amqp::RENEW_LOCK_OPERATION,
+                )
+                .insert(
+                    protocol_amqp::ASSOCIATED_LINK_NAME_PROPERTY,
+                    "renewable-receiver",
+                )
+                .build(),
+        )
+        .body(Body::Value(Value::Map(request_body)))
+        .build();
+    assert!(matches!(
+        requests.send(request).await?,
+        Outcome::Accepted(_)
+    ));
+
+    let response =
+        tokio::time::timeout(std::time::Duration::from_secs(2), responses.recv()).await??;
+    assert_eq!(
+        response
+            .message()
+            .application_properties
+            .as_ref()
+            .and_then(|properties| properties.get(protocol_amqp::STATUS_CODE_PROPERTY)),
+        Some(&Value::Int(200))
+    );
+    let Body::Value(Value::Map(body)) = &response.message().body else {
+        panic!("the renewal response must carry an AMQP value map");
+    };
+    let expirations = body.iter().find_map(|(key, value)| {
+        (key == &Value::String(String::from(protocol_amqp::EXPIRATIONS))).then_some(value)
+    });
+    assert!(
+        matches!(expirations, Some(Value::Array(values)) if matches!(values.as_slice(), [Value::Timestamp(value)] if value.milliseconds() == 31_000)),
+        "unexpected renewal expirations: {expirations:?}"
+    );
+    responses.accept(&response).await?;
+
+    // Renewal kept the delivery token valid, so ordinary link settlement still
+    // completes it.
+    receiver.accept(&delivery).await?;
     connection.close().await?;
     Ok(())
 }
