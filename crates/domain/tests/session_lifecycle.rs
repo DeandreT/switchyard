@@ -453,8 +453,17 @@ fn session_state_outlives_the_receiver_that_set_it<P: StoreProvider>(
         )?,
         CommandOutcome::SessionStateSet
     );
+    assert_eq!(
+        fixture.at(
+            21,
+            CommandKind::GetSessionState {
+                session: accepted.hold(),
+            }
+        )?,
+        CommandOutcome::SessionState(b"checkout-step-2".to_vec())
+    );
     fixture.at(
-        21,
+        22,
         CommandKind::ReleaseSession {
             session: accepted.hold(),
         },
@@ -467,7 +476,7 @@ fn session_state_outlives_the_receiver_that_set_it<P: StoreProvider>(
             .session_state(&fixture.namespace, &fixture.entity, &id("cart-1"))?,
         b"checkout-step-2".to_vec()
     );
-    let next = accept(&fixture, 22, Some(id("cart-1")))?.expect("the session is available");
+    let next = accept(&fixture, 23, Some(id("cart-1")))?.expect("the session is available");
     assert_eq!(next.state, b"checkout-step-2".to_vec());
     Ok(())
 }

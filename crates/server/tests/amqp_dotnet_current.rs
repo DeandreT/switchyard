@@ -15,7 +15,7 @@ const KEY: &str = "test-secret";
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires dotnet and a NuGet restore"]
-async fn current_stable_dotnet_client_sends_receives_renews_and_completes()
+async fn current_stable_dotnet_client_completes_message_and_session_workflows()
 -> Result<(), Box<dyn Error>> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -31,6 +31,16 @@ async fn current_stable_dotnet_client_sends_receives_renews_and_completes()
         domain::EntityPath::new("orders")?,
         CommandKind::CreateQueue {
             config: QueueConfig::default(),
+        },
+    )?;
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        domain::EntityPath::new("sessions")?,
+        CommandKind::CreateQueue {
+            config: QueueConfig {
+                requires_session: true,
+                ..QueueConfig::default()
+            },
         },
     )?;
 
@@ -64,16 +74,28 @@ async fn current_stable_dotnet_client_sends_receives_renews_and_completes()
     let project = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../conformance/dotnet-current/Switchyard.Conformance.DotNetCurrent.csproj");
     let output = tokio::task::spawn_blocking(move || {
+        let build = Command::new("dotnet")
+            .arg("build")
+            .arg(&project)
+            .arg("--configuration")
+            .arg("Release")
+            .arg("--maxcpucount:2")
+            .output()?;
+        if !build.status.success() {
+            return Ok::<_, std::io::Error>(build);
+        }
         Command::new("dotnet")
             .arg("run")
             .arg("--project")
-            .arg(project)
+            .arg(&project)
             .arg("--configuration")
             .arg("Release")
+            .arg("--no-build")
             .arg("--")
             .arg(HOST)
             .arg(format!("sb://localhost:{}", address.port()))
             .arg("orders")
+            .arg("sessions")
             .arg(RULE)
             .arg(KEY)
             .output()
@@ -87,7 +109,7 @@ async fn current_stable_dotnet_client_sends_receives_renews_and_completes()
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("send/receive/renew/complete passed"),
+        String::from_utf8_lossy(&output.stdout).contains("session renew/state passed"),
         "the client exited without reporting the completed workflow"
     );
     assert_eq!(

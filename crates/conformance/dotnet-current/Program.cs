@@ -1,18 +1,19 @@
 using Azure;
 using Azure.Messaging.ServiceBus;
 
-if (args.Length != 5)
+if (args.Length != 6)
 {
     Console.Error.WriteLine(
-        "usage: <namespace> <custom-endpoint> <queue> <key-name> <key>");
+        "usage: <namespace> <custom-endpoint> <queue> <session-queue> <key-name> <key>");
     return 2;
 }
 
 string fullyQualifiedNamespace = args[0];
 var customEndpoint = new Uri(args[1]);
 string queue = args[2];
-string keyName = args[3];
-string key = args[4];
+string sessionQueue = args[3];
+string keyName = args[4];
+string key = args[5];
 
 var options = new ServiceBusClientOptions
 {
@@ -57,5 +58,41 @@ if (received.LockedUntil < lockedUntilBeforeRenewal)
 }
 
 await receiver.CompleteMessageAsync(received);
-Console.WriteLine("official .NET Service Bus client send/receive/renew/complete passed");
+
+await using ServiceBusSender sessionSender = client.CreateSender(sessionQueue);
+await sessionSender.SendMessageAsync(new ServiceBusMessage("official-session-current")
+{
+    SessionId = "session-1",
+});
+await using ServiceBusSessionReceiver sessionReceiver =
+    await client.AcceptSessionAsync(sessionQueue, "session-1");
+
+await sessionReceiver.SetSessionStateAsync(BinaryData.FromString("checkout-step-2"));
+BinaryData sessionState = await sessionReceiver.GetSessionStateAsync();
+if (sessionState.ToString() != "checkout-step-2")
+{
+    Console.Error.WriteLine($"unexpected session state: {sessionState}");
+    return 6;
+}
+
+DateTimeOffset sessionLockedUntilBeforeRenewal = sessionReceiver.SessionLockedUntil;
+await sessionReceiver.RenewSessionLockAsync();
+if (sessionReceiver.SessionLockedUntil < sessionLockedUntilBeforeRenewal)
+{
+    Console.Error.WriteLine(
+        $"session renewal moved the lock backward: {sessionLockedUntilBeforeRenewal:o} -> {sessionReceiver.SessionLockedUntil:o}");
+    return 7;
+}
+
+ServiceBusReceivedMessage? sessionMessage =
+    await sessionReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (sessionMessage?.Body.ToString() != "official-session-current")
+{
+    Console.Error.WriteLine($"unexpected session message: {sessionMessage?.Body}");
+    return 8;
+}
+await sessionReceiver.CompleteMessageAsync(sessionMessage);
+
+Console.WriteLine(
+    "official .NET Service Bus client send/receive/renew/complete and session renew/state passed");
 return 0;

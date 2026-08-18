@@ -140,6 +140,7 @@ impl<S: StateStore> StateMachine<S> {
             CommandKind::SetSessionState { session, state } => {
                 self.set_session_state(command, session, state, &mut batch)?
             }
+            CommandKind::GetSessionState { session } => self.get_session_state(command, session)?,
             CommandKind::ExpireLocks => self.expire_locks(command, &mut batch)?,
             CommandKind::ExpireMessages => self.expire_messages(command, &mut batch)?,
             CommandKind::ExpireSessionLocks => self.expire_session_locks(command, &mut batch)?,
@@ -922,6 +923,15 @@ impl<S: StateStore> StateMachine<S> {
             codec::encode(&record)?,
         );
         Ok(CommandOutcome::SessionStateSet)
+    }
+
+    fn get_session_state(
+        &self,
+        command: &Command,
+        session: &SessionHold,
+    ) -> Result<CommandOutcome, BrokerError> {
+        let record = self.held_session(command, session)?;
+        Ok(CommandOutcome::SessionState(record.state))
     }
 
     fn expire_session_locks(

@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Send, receive, renew lock, complete | Planned | Experimental gate on 7.20.2 |
+| Official .NET SDK, current stable | Send, receive, renew and complete; session renew/state | Planned | Experimental gate on 7.20.2 |
 | Official .NET SDK, previous stable | Planned | Planned | Not implemented |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -35,7 +35,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Deferral and deferred receive | Pre-1.0 | Not implemented |
 | Dead-letter | Pre-1.0 | State machine, AMQP mapping |
 | Dead-letter receive and resubmit | Pre-1.0 | Receive: state machine, AMQP mapping. Resubmit: not implemented |
-| Sessions and session state | Pre-1.0 | State machine, AMQP mapping |
+| Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Duplicate detection | Pre-1.0 | Not implemented |
 | Same-placement-group transactions | Pre-1.0 | Not implemented |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
@@ -75,7 +75,8 @@ behavior it currently enforces:
   is only delivered to a receiver holding that session's lock. Ordering is
   guaranteed within a session, which is the only FIFO guarantee made. A session
   lock is exclusive and expires on its own deadline; session state outlives the
-  receiver that set it.
+  receiver that set it. A receiver holding the session can renew that lock and
+  read, replace, or clear the opaque state through the management node.
 
 Three session behaviors deliberately differ from Azure Service Bus, and each is
 a rejection or a bound rather than a silent difference:
@@ -110,18 +111,18 @@ condition an SDK keys its behaviour off. A receiving link's settle mode selects
 the delivery guarantee: unsettled is peek-lock, pre-settled is receive-delete.
 A receiving link's `com.microsoft:session-filter` names a session or, with a
 null value, asks for the next available one; the attach response echoes the
-granted identifier. The node renews a link's session lock while the link is
-open and releases it when the link closes, because session-lock renewal through
-the management node is not implemented yet. Message-lock renewal is available
-through an entity's `$management` request/reply links and requires Manage
-authorization when authentication is enabled. A transfer is accepted only
-after its command committed, so the acknowledgement means durable. One node
-still serves one namespace. A message drained from a dead-letter queue carries
-its reason and description in the `DeadLetterReason` and
-`DeadLetterErrorDescription` application properties. The complete protocol
-coverage uses a Rust AMQP 1.0 client. The current stable official .NET SDK also
-has an opt-in gate for send, receive, message-lock renewal, and completion; the
-rest of that client gate remains incomplete.
+granted identifier and the initial session-lock deadline. The session is
+released when that link closes; renewing its lock and reading or writing its
+state use the entity's `$management` request/reply links, as does message-lock
+renewal. Those operations require Manage authorization when authentication is
+enabled. A transfer is accepted only after its command committed, so the
+acknowledgement means durable. One node still serves one namespace. A message
+drained from a dead-letter queue carries its reason and description in the
+`DeadLetterReason` and `DeadLetterErrorDescription` application properties. The
+complete protocol coverage uses a Rust AMQP 1.0 client. The current stable
+official .NET SDK also has an opt-in gate for ordinary send, receive,
+message-lock renewal, and completion plus session state, renewal, receive, and
+completion; the rest of that client gate remains incomplete.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch
 before reporting it applied, and the same semantics suite runs against both

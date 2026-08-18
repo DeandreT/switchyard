@@ -102,6 +102,10 @@ pub enum CommandKind {
         session: SessionHold,
         state: Vec<u8>,
     },
+    /// Reads the opaque state stored alongside a session.
+    GetSessionState {
+        session: SessionHold,
+    },
     /// Proposed by the leader's timer worker. Returns messages whose lock has
     /// elapsed, or dead-letters them once they reach the delivery limit.
     ExpireLocks,
@@ -143,6 +147,7 @@ pub enum CommandOutcome {
         locked_until: Timestamp,
     },
     SessionStateSet,
+    SessionState(Vec<u8>),
     SessionLocksExpired {
         released: u32,
     },

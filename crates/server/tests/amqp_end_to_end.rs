@@ -366,6 +366,49 @@ fn session_queue_config() -> QueueConfig {
     }
 }
 
+async fn session_management_request(
+    requests: &mut Sender,
+    responses: &mut Receiver,
+    reply_to: &str,
+    message_id: &str,
+    operation: &str,
+    link_name: &str,
+    body: OrderedMap<Value, Value>,
+) -> Result<Message, Box<dyn Error>> {
+    let request = Message::builder()
+        .properties(Properties {
+            message_id: Some(message_id.to_owned().into()),
+            reply_to: Some(reply_to.to_owned()),
+            ..Properties::default()
+        })
+        .application_properties(
+            ApplicationProperties::builder()
+                .insert(protocol_amqp::OPERATION_PROPERTY, operation)
+                .insert(protocol_amqp::ASSOCIATED_LINK_NAME_PROPERTY, link_name)
+                .build(),
+        )
+        .body(Body::Value(Value::Map(body)))
+        .build();
+    assert!(matches!(
+        requests.send(request).await?,
+        Outcome::Accepted(_)
+    ));
+
+    let response =
+        tokio::time::timeout(std::time::Duration::from_secs(2), responses.recv()).await??;
+    assert_eq!(
+        response
+            .message()
+            .application_properties
+            .as_ref()
+            .and_then(|properties| properties.get(protocol_amqp::STATUS_CODE_PROPERTY)),
+        Some(&Value::Int(200))
+    );
+    let message = response.message().clone();
+    responses.accept(&response).await?;
+    Ok(message)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_receiver_gets_only_its_session_in_order() -> Result<(), Box<dyn Error>> {
     let node = Node::start("orders", session_queue_config()).await?;
@@ -393,6 +436,111 @@ async fn a_session_receiver_gets_only_its_session_in_order() -> Result<(), Box<d
         tokio::time::timeout(std::time::Duration::from_millis(300), receiver.recv()).await;
     assert!(starved.is_err(), "another session's message leaked through");
 
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_receiver_manages_its_lock_and_state() -> Result<(), Box<dyn Error>> {
+    let node = Node::start(
+        "orders",
+        QueueConfig {
+            lock_duration_millis: 30_000,
+            ..session_queue_config()
+        },
+    )
+    .await?;
+
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
+    sender.send(with_session("payload", "cart-1")).await?;
+
+    let link_name = "managed-session-receiver";
+    let mut receiver = Receiver::builder()
+        .name(link_name)
+        .source(session_source("orders", Some("cart-1")))
+        .attach(&mut session)
+        .await?;
+    let reply_to = "session-management-replies";
+    let mut responses = Receiver::builder()
+        .name("session-management-response")
+        .source("orders/$management")
+        .target(reply_to)
+        .attach(&mut session)
+        .await?;
+    let mut requests = Sender::attach(
+        &mut session,
+        "session-management-request",
+        "orders/$management",
+    )
+    .await?;
+
+    let mut set_body = OrderedMap::new();
+    set_body.insert(
+        Value::String(String::from(protocol_amqp::SESSION_ID)),
+        Value::String(String::from("cart-1")),
+    );
+    set_body.insert(
+        Value::String(String::from(protocol_amqp::SESSION_STATE)),
+        Value::Binary(b"checkout-step-2".to_vec().into()),
+    );
+    let set_response = session_management_request(
+        &mut requests,
+        &mut responses,
+        reply_to,
+        "set-session-state-1",
+        protocol_amqp::SET_SESSION_STATE_OPERATION,
+        link_name,
+        set_body,
+    )
+    .await?;
+    assert_eq!(set_response.body, Body::Value(Value::Null));
+
+    let mut session_body = OrderedMap::new();
+    session_body.insert(
+        Value::String(String::from(protocol_amqp::SESSION_ID)),
+        Value::String(String::from("cart-1")),
+    );
+    let get_response = session_management_request(
+        &mut requests,
+        &mut responses,
+        reply_to,
+        "get-session-state-1",
+        protocol_amqp::GET_SESSION_STATE_OPERATION,
+        link_name,
+        session_body.clone(),
+    )
+    .await?;
+    let Body::Value(Value::Map(get_body)) = get_response.body else {
+        panic!("the state response must carry an AMQP value map");
+    };
+    assert_eq!(
+        get_body.get(&Value::String(String::from(protocol_amqp::SESSION_STATE))),
+        Some(&Value::Binary(b"checkout-step-2".to_vec().into()))
+    );
+
+    let renew_response = session_management_request(
+        &mut requests,
+        &mut responses,
+        reply_to,
+        "renew-session-lock-1",
+        protocol_amqp::RENEW_SESSION_LOCK_OPERATION,
+        link_name,
+        session_body,
+    )
+    .await?;
+    let Body::Value(Value::Map(renew_body)) = renew_response.body else {
+        panic!("the renewal response must carry an AMQP value map");
+    };
+    assert!(matches!(
+        renew_body.get(&Value::String(String::from(protocol_amqp::EXPIRATION))),
+        Some(Value::Timestamp(value)) if value.milliseconds() == 31_000
+    ));
+
+    let delivery = receiver.recv().await?;
+    assert_eq!(text_of(delivery.message()), "payload");
+    receiver.accept(&delivery).await?;
     connection.close().await?;
     Ok(())
 }

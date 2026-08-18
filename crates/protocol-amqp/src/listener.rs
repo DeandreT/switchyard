@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Duration};
 
 use amqp::{
     AmqpError, Attach, DeliveryTag, EngineError, Error as AmqpProtocolError, ErrorCondition,
-    LinkEndpoint, Outcome, Receiver, Role, Sender, SenderSettleMode, ServerConnection,
+    Fields, LinkEndpoint, Outcome, Receiver, Role, Sender, SenderSettleMode, ServerConnection,
     ServerSession,
 };
 use auth::{Permission, ResourceScope};
@@ -18,7 +18,7 @@ use domain::{
     ReceiveMode, SessionHold,
 };
 use rustls::ServerConfig;
-use serde_amqp::primitives::Symbol;
+use serde_amqp::{Value, primitives::Symbol};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -42,12 +42,9 @@ use crate::{
 /// interval rather than trusting the signal absolutely.
 const EMPTY_QUEUE_FALLBACK: Duration = Duration::from_secs(3);
 
-/// How often a link that holds a session renews its lock.
-///
-/// The broker renews on the receiver's behalf while the link is open, because
-/// session-lock renewal through the management node does not exist yet. Well
-/// under the shortest configurable lock a client is likely to use.
-const SESSION_RENEW_INTERVAL: Duration = Duration::from_secs(15);
+const LOCKED_UNTIL_UTC_PROPERTY: &str = "com.microsoft:locked-until-utc";
+const DOTNET_UNIX_EPOCH_TICKS: u64 = 621_355_968_000_000_000;
+const DOTNET_TICKS_PER_MILLISECOND: u64 = 10_000;
 
 pub struct AmqpListener<B> {
     broker: B,
@@ -437,8 +434,17 @@ async fn serve_session<B: Broker>(
             stamp_session_filter(source, &accepted.session_id);
         }
 
+        let response_properties = plan
+            .as_ref()
+            .ok()
+            .and_then(|(_, accepted, _)| accepted.as_ref())
+            .map(session_attach_properties);
         let endpoint = session
-            .accept_attach(attach, crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64)
+            .accept_attach_with_properties(
+                attach,
+                crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64,
+                response_properties,
+            )
             .await?;
         let (entity, accepted, link_authorization) = match plan {
             Ok(plan) => plan,
@@ -474,22 +480,33 @@ async fn serve_session<B: Broker>(
             // The client receives; this end sends.
             LinkEndpoint::Sender(sender) => {
                 let hold = accepted.map(|accepted| accepted.hold());
+                let link_name = sender.name().to_owned();
+                if let Some(hold) = hold.as_ref() {
+                    management
+                        .register_session(&link_name, entity.clone(), hold.clone())
+                        .await;
+                }
                 let connection_management = Arc::clone(&management);
                 tokio::spawn(async move {
-                    if let Err(error) = serve_receiving_client(
+                    let result = serve_receiving_client(
                         sender,
                         namespace,
-                        entity,
+                        entity.clone(),
                         broker,
                         mode,
-                        hold,
+                        hold.clone(),
                         ReceivingLinkProtocol {
                             authorization: link_authorization,
-                            management: connection_management,
+                            management: Arc::clone(&connection_management),
                         },
                     )
-                    .await
-                    {
+                    .await;
+                    if let Some(hold) = hold.as_ref() {
+                        connection_management
+                            .unregister_session(&link_name, hold)
+                            .await;
+                    }
+                    if let Err(error) = result {
                         warn!(%error, "receiving link ended");
                     }
                 });
@@ -509,6 +526,18 @@ struct LinkAuthorization {
 struct ReceivingLinkProtocol {
     authorization: Option<LinkAuthorization>,
     management: Arc<ConnectionManagement>,
+}
+
+fn session_attach_properties(accepted: &AcceptedSession) -> Fields {
+    let millis = accepted.lock.locked_until.as_millis();
+    let ticks =
+        DOTNET_UNIX_EPOCH_TICKS.saturating_add(millis.saturating_mul(DOTNET_TICKS_PER_MILLISECOND));
+    let mut properties = Fields::new();
+    properties.insert(
+        Symbol::from(LOCKED_UNTIL_UTC_PROPERTY),
+        Value::Long(i64::try_from(ticks).unwrap_or(i64::MAX)),
+    );
+    properties
 }
 
 impl LinkAuthorization {
@@ -747,8 +776,6 @@ async fn serve_receiving_client<B: Broker>(
         authorization,
         management,
     } = protocol;
-    let mut renew = tokio::time::interval(SESSION_RENEW_INTERVAL);
-    renew.tick().await; // the first tick is immediate, and the lock is fresh
 
     loop {
         // The link is watched the whole time a message is being waited for. A
@@ -767,27 +794,6 @@ async fn serve_receiving_client<B: Broker>(
                     .close_with_error(unauthorized_error("the link's authorization has expired"))
                     .await?;
                 return Ok(());
-            }
-            _ = renew.tick(), if session.is_some() => {
-                let Some(hold) = session.as_ref() else { continue };
-                match broker
-                    .submit(
-                        namespace.clone(),
-                        entity.clone(),
-                        CommandKind::RenewSessionLock {
-                            session: hold.clone(),
-                            lock_duration_millis: None,
-                        },
-                    )
-                    .await
-                {
-                    Ok(_) => continue,
-                    // The lock is already gone, so there is nothing to release.
-                    Err(rejection) => {
-                        sender.close_with_error(rejection_error(&rejection)).await?;
-                        return Ok(());
-                    }
-                }
             }
             fetched = next_delivery(
                 &broker,

@@ -5,7 +5,9 @@ use amqp::{
     Properties, Receiver, Sender,
 };
 use auth::{Permission, ResourceScope};
-use domain::{CommandKind, CommandOutcome, EntityPath, LockToken, NamespaceName, SequenceNumber};
+use domain::{
+    CommandKind, CommandOutcome, EntityPath, LockToken, NamespaceName, SequenceNumber, SessionHold,
+};
 use serde_amqp::{
     Value,
     primitives::{Array, Binary, OrderedMap, Symbol, Timestamp as AmqpTimestamp, Uuid},
@@ -16,6 +18,9 @@ use tracing::debug;
 use crate::{Broker, BrokerRejection, authorization::ConnectionAuthorization};
 
 pub const RENEW_LOCK_OPERATION: &str = "com.microsoft:renew-lock";
+pub const RENEW_SESSION_LOCK_OPERATION: &str = "com.microsoft:renew-session-lock";
+pub const GET_SESSION_STATE_OPERATION: &str = "com.microsoft:get-session-state";
+pub const SET_SESSION_STATE_OPERATION: &str = "com.microsoft:set-session-state";
 pub const OPERATION_PROPERTY: &str = "operation";
 pub const ASSOCIATED_LINK_NAME_PROPERTY: &str = "associated-link-name";
 pub const STATUS_CODE_PROPERTY: &str = "statusCode";
@@ -24,6 +29,9 @@ pub const ERROR_CONDITION_PROPERTY: &str = "errorCondition";
 pub const TRACKING_ID_PROPERTY: &str = "com.microsoft:tracking-id";
 pub const LOCK_TOKENS: &str = "lock-tokens";
 pub const EXPIRATIONS: &str = "expirations";
+pub const EXPIRATION: &str = "expiration";
+pub const SESSION_ID: &str = "session-id";
+pub const SESSION_STATE: &str = "session-state";
 
 const REPLY_ROUTE_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLY_BUFFER: usize = 16;
@@ -40,6 +48,12 @@ struct ManagedDelivery {
     sequence: SequenceNumber,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedSession {
+    entity: EntityPath,
+    hold: SessionHold,
+}
+
 #[derive(Debug, Default)]
 struct ReplyRoutes {
     senders: HashMap<String, mpsc::Sender<ManagementResponse>>,
@@ -52,6 +66,7 @@ struct ReplyRoutes {
 #[derive(Debug, Default)]
 pub(crate) struct ConnectionManagement {
     deliveries: RwLock<HashMap<DeliveryKey, ManagedDelivery>>,
+    sessions: RwLock<HashMap<String, ManagedSession>>,
     routes: Mutex<ReplyRoutes>,
     route_changed: Notify,
 }
@@ -93,6 +108,32 @@ impl ConnectionManagement {
                 lock_token,
             })
             .cloned()
+    }
+
+    pub(crate) async fn register_session(
+        &self,
+        link_name: &str,
+        entity: EntityPath,
+        hold: SessionHold,
+    ) {
+        self.sessions
+            .write()
+            .await
+            .insert(link_name.to_owned(), ManagedSession { entity, hold });
+    }
+
+    pub(crate) async fn unregister_session(&self, link_name: &str, hold: &SessionHold) {
+        let mut sessions = self.sessions.write().await;
+        if sessions
+            .get(link_name)
+            .is_some_and(|session| &session.hold == hold)
+        {
+            sessions.remove(link_name);
+        }
+    }
+
+    async fn session(&self, link_name: &str) -> Option<ManagedSession> {
+        self.sessions.read().await.get(link_name).cloned()
     }
 
     pub(crate) async fn register_reply_route(
@@ -181,22 +222,18 @@ pub(crate) struct ManagementResponse {
     status_description: String,
     error_condition: Option<&'static str>,
     tracking_id: Option<String>,
-    expirations: Vec<domain::Timestamp>,
+    body: Value,
 }
 
 impl ManagementResponse {
-    fn accepted(
-        correlation_id: MessageId,
-        tracking_id: Option<String>,
-        expirations: Vec<domain::Timestamp>,
-    ) -> Self {
+    fn accepted(correlation_id: MessageId, tracking_id: Option<String>, body: Value) -> Self {
         Self {
             correlation_id,
             status_code: 200,
             status_description: String::from("OK"),
             error_condition: None,
             tracking_id,
-            expirations,
+            body,
         }
     }
 
@@ -211,7 +248,7 @@ impl ManagementResponse {
             status_description: description.into(),
             error_condition: None,
             tracking_id,
-            expirations: Vec::new(),
+            body: Value::Null,
         }
     }
 
@@ -222,7 +259,7 @@ impl ManagementResponse {
     ) -> Self {
         let condition = rejection.condition();
         let status_code = match condition {
-            crate::MESSAGE_LOCK_LOST => 410,
+            crate::MESSAGE_LOCK_LOST | crate::SESSION_LOCK_LOST => 410,
             crate::NOT_FOUND => 404,
             crate::NOT_ALLOWED | crate::PRECONDITION_FAILED => 400,
             crate::RESOURCE_LOCKED => 503,
@@ -234,7 +271,7 @@ impl ManagementResponse {
             status_description: rejection.to_string(),
             error_condition: Some(condition),
             tracking_id,
-            expirations: Vec::new(),
+            body: Value::Null,
         }
     }
 
@@ -249,7 +286,22 @@ impl ManagementResponse {
             status_description: description.into(),
             error_condition: Some(crate::MESSAGE_LOCK_LOST),
             tracking_id,
-            expirations: Vec::new(),
+            body: Value::Null,
+        }
+    }
+
+    fn session_lock_lost(
+        correlation_id: MessageId,
+        tracking_id: Option<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            correlation_id,
+            status_code: 410,
+            status_description: description.into(),
+            error_condition: Some(crate::SESSION_LOCK_LOST),
+            tracking_id,
+            body: Value::Null,
         }
     }
 
@@ -264,7 +316,7 @@ impl ManagementResponse {
             status_description: description.into(),
             error_condition: Some(crate::INTERNAL_ERROR),
             tracking_id,
-            expirations: Vec::new(),
+            body: Value::Null,
         }
     }
 
@@ -279,33 +331,13 @@ impl ManagementResponse {
             application_properties.insert(TRACKING_ID_PROPERTY, tracking_id);
         }
 
-        let body = if self.expirations.is_empty() {
-            Body::Value(Value::Null)
-        } else {
-            let expirations: Vec<Value> = self
-                .expirations
-                .into_iter()
-                .map(|timestamp| {
-                    Value::Timestamp(AmqpTimestamp::from_milliseconds(
-                        i64::try_from(timestamp.as_millis()).unwrap_or(i64::MAX),
-                    ))
-                })
-                .collect();
-            let mut map = OrderedMap::new();
-            map.insert(
-                Value::String(String::from(EXPIRATIONS)),
-                Value::Array(Array::from(expirations)),
-            );
-            Body::Value(Value::Map(map))
-        };
-
         Message {
             properties: Some(Properties {
                 correlation_id: Some(self.correlation_id),
                 ..Properties::default()
             }),
             application_properties: Some(application_properties),
-            body,
+            body: Body::Value(self.body),
             ..Message::default()
         }
     }
@@ -410,13 +442,83 @@ async fn process_request<B: Broker>(
             "application properties are required",
         );
     };
-    if string_property(properties, OPERATION_PROPERTY) != Some(RENEW_LOCK_OPERATION) {
-        return ManagementResponse::bad_request(
+    let Some(operation) = string_property(properties, OPERATION_PROPERTY) else {
+        return ManagementResponse::bad_request(message_id, tracking_id, "operation is required");
+    };
+    match operation {
+        RENEW_LOCK_OPERATION => {
+            renew_message_lock(
+                message,
+                message_id,
+                tracking_id,
+                namespace,
+                entity,
+                broker,
+                management,
+            )
+            .await
+        }
+        RENEW_SESSION_LOCK_OPERATION => {
+            renew_session_lock(
+                message,
+                message_id,
+                tracking_id,
+                namespace,
+                entity,
+                broker,
+                management,
+            )
+            .await
+        }
+        GET_SESSION_STATE_OPERATION => {
+            get_session_state(
+                message,
+                message_id,
+                tracking_id,
+                namespace,
+                entity,
+                broker,
+                management,
+            )
+            .await
+        }
+        SET_SESSION_STATE_OPERATION => {
+            set_session_state(
+                message,
+                message_id,
+                tracking_id,
+                namespace,
+                entity,
+                broker,
+                management,
+            )
+            .await
+        }
+        _ => ManagementResponse::bad_request(
             message_id,
             tracking_id,
             "unsupported management operation",
-        );
+        ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn renew_message_lock<B: Broker>(
+    message: &Message,
+    message_id: MessageId,
+    tracking_id: Option<String>,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    broker: &B,
+    management: &ConnectionManagement,
+) -> ManagementResponse {
+    let Some(properties) = message.application_properties.as_ref() else {
+        return ManagementResponse::bad_request(
+            message_id,
+            tracking_id,
+            "application properties are required",
+        );
+    };
     let Some(link_name) = string_property(properties, ASSOCIATED_LINK_NAME_PROPERTY) else {
         return ManagementResponse::bad_request(
             message_id,
@@ -439,54 +541,230 @@ async fn process_request<B: Broker>(
         );
     }
 
-    let mut deliveries = Vec::with_capacity(tokens.len());
-    for token in tokens {
-        let Some(delivery) = management.delivery(link_name, token).await else {
-            return ManagementResponse::lock_lost(
-                message_id,
-                tracking_id,
-                "the lock token is not active on the associated link",
-            );
-        };
-        if &delivery.entity != entity {
-            return ManagementResponse::lock_lost(
-                message_id,
-                tracking_id,
-                "the lock token belongs to another entity",
-            );
-        }
-        deliveries.push((delivery, token));
+    let lock_token = tokens[0];
+    let Some(delivery) = management.delivery(link_name, lock_token).await else {
+        return ManagementResponse::lock_lost(
+            message_id,
+            tracking_id,
+            "the lock token is not active on the associated link",
+        );
+    };
+    if &delivery.entity != entity {
+        return ManagementResponse::lock_lost(
+            message_id,
+            tracking_id,
+            "the lock token belongs to another entity",
+        );
     }
 
-    let mut expirations = Vec::with_capacity(deliveries.len());
-    for (delivery, lock_token) in deliveries {
-        match broker
-            .submit(
-                namespace.clone(),
-                entity.clone(),
-                CommandKind::RenewLock {
-                    sequence: delivery.sequence,
-                    lock_token,
-                    lock_duration_millis: None,
-                },
-            )
-            .await
-        {
-            Ok(CommandOutcome::LockRenewed { locked_until }) => expirations.push(locked_until),
-            Ok(other) => {
-                return ManagementResponse::internal(
-                    message_id,
-                    tracking_id,
-                    format!("renewing a lock produced an unexpected outcome: {other:?}"),
-                );
-            }
-            Err(rejection) => {
-                return ManagementResponse::from_rejection(message_id, tracking_id, &rejection);
-            }
+    match broker
+        .submit(
+            namespace.clone(),
+            entity.clone(),
+            CommandKind::RenewLock {
+                sequence: delivery.sequence,
+                lock_token,
+                lock_duration_millis: None,
+            },
+        )
+        .await
+    {
+        Ok(CommandOutcome::LockRenewed { locked_until }) => ManagementResponse::accepted(
+            message_id,
+            tracking_id,
+            map_body(
+                EXPIRATIONS,
+                Value::Array(Array::from(vec![timestamp_value(locked_until)])),
+            ),
+        ),
+        Ok(other) => ManagementResponse::internal(
+            message_id,
+            tracking_id,
+            format!("renewing a lock produced an unexpected outcome: {other:?}"),
+        ),
+        Err(rejection) => ManagementResponse::from_rejection(message_id, tracking_id, &rejection),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SessionLookupError {
+    BadRequest(&'static str),
+    LockLost(&'static str),
+}
+
+async fn requested_session(
+    message: &Message,
+    entity: &EntityPath,
+    management: &ConnectionManagement,
+) -> Result<ManagedSession, SessionLookupError> {
+    let properties =
+        message
+            .application_properties
+            .as_ref()
+            .ok_or(SessionLookupError::BadRequest(
+                "application properties are required",
+            ))?;
+    let link_name = string_property(properties, ASSOCIATED_LINK_NAME_PROPERTY).ok_or(
+        SessionLookupError::BadRequest("the associated receive link name is required"),
+    )?;
+    let session_id = string_map_value(&message.body, SESSION_ID).ok_or(
+        SessionLookupError::BadRequest("session-id must be an AMQP value string"),
+    )?;
+    let session = management
+        .session(link_name)
+        .await
+        .ok_or(SessionLookupError::LockLost(
+            "the associated link does not hold a session",
+        ))?;
+    if &session.entity != entity || session.hold.session_id.as_str() != session_id {
+        return Err(SessionLookupError::LockLost(
+            "the associated link does not hold the named session",
+        ));
+    }
+    Ok(session)
+}
+
+fn session_lookup_response(
+    message_id: MessageId,
+    tracking_id: Option<String>,
+    error: SessionLookupError,
+) -> ManagementResponse {
+    match error {
+        SessionLookupError::BadRequest(description) => {
+            ManagementResponse::bad_request(message_id, tracking_id, description)
+        }
+        SessionLookupError::LockLost(description) => {
+            ManagementResponse::session_lock_lost(message_id, tracking_id, description)
         }
     }
+}
 
-    ManagementResponse::accepted(message_id, tracking_id, expirations)
+#[allow(clippy::too_many_arguments)]
+async fn renew_session_lock<B: Broker>(
+    message: &Message,
+    message_id: MessageId,
+    tracking_id: Option<String>,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    broker: &B,
+    management: &ConnectionManagement,
+) -> ManagementResponse {
+    let session = match requested_session(message, entity, management).await {
+        Ok(session) => session,
+        Err(error) => return session_lookup_response(message_id, tracking_id, error),
+    };
+    match broker
+        .submit(
+            namespace.clone(),
+            entity.clone(),
+            CommandKind::RenewSessionLock {
+                session: session.hold,
+                lock_duration_millis: None,
+            },
+        )
+        .await
+    {
+        Ok(CommandOutcome::SessionLockRenewed { locked_until }) => ManagementResponse::accepted(
+            message_id,
+            tracking_id,
+            map_body(EXPIRATION, timestamp_value(locked_until)),
+        ),
+        Ok(other) => ManagementResponse::internal(
+            message_id,
+            tracking_id,
+            format!("renewing a session lock produced an unexpected outcome: {other:?}"),
+        ),
+        Err(rejection) => ManagementResponse::from_rejection(message_id, tracking_id, &rejection),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn get_session_state<B: Broker>(
+    message: &Message,
+    message_id: MessageId,
+    tracking_id: Option<String>,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    broker: &B,
+    management: &ConnectionManagement,
+) -> ManagementResponse {
+    let session = match requested_session(message, entity, management).await {
+        Ok(session) => session,
+        Err(error) => return session_lookup_response(message_id, tracking_id, error),
+    };
+    match broker
+        .submit(
+            namespace.clone(),
+            entity.clone(),
+            CommandKind::GetSessionState {
+                session: session.hold,
+            },
+        )
+        .await
+    {
+        Ok(CommandOutcome::SessionState(state)) => {
+            let state = if state.is_empty() {
+                Value::Null
+            } else {
+                Value::Binary(Binary::from(state))
+            };
+            ManagementResponse::accepted(message_id, tracking_id, map_body(SESSION_STATE, state))
+        }
+        Ok(other) => ManagementResponse::internal(
+            message_id,
+            tracking_id,
+            format!("reading session state produced an unexpected outcome: {other:?}"),
+        ),
+        Err(rejection) => ManagementResponse::from_rejection(message_id, tracking_id, &rejection),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn set_session_state<B: Broker>(
+    message: &Message,
+    message_id: MessageId,
+    tracking_id: Option<String>,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    broker: &B,
+    management: &ConnectionManagement,
+) -> ManagementResponse {
+    let session = match requested_session(message, entity, management).await {
+        Ok(session) => session,
+        Err(error) => return session_lookup_response(message_id, tracking_id, error),
+    };
+    let state = match map_value(&message.body, SESSION_STATE) {
+        Some(Value::Binary(state)) => state.to_vec(),
+        Some(Value::Null) => Vec::new(),
+        _ => {
+            return ManagementResponse::bad_request(
+                message_id,
+                tracking_id,
+                "session-state must be an AMQP binary value or null",
+            );
+        }
+    };
+    match broker
+        .submit(
+            namespace.clone(),
+            entity.clone(),
+            CommandKind::SetSessionState {
+                session: session.hold,
+                state,
+            },
+        )
+        .await
+    {
+        Ok(CommandOutcome::SessionStateSet) => {
+            ManagementResponse::accepted(message_id, tracking_id, Value::Null)
+        }
+        Ok(other) => ManagementResponse::internal(
+            message_id,
+            tracking_id,
+            format!("setting session state produced an unexpected outcome: {other:?}"),
+        ),
+        Err(rejection) => ManagementResponse::from_rejection(message_id, tracking_id, &rejection),
+    }
 }
 
 fn string_property<'a>(properties: &'a ApplicationProperties, name: &str) -> Option<&'a str> {
@@ -496,15 +774,38 @@ fn string_property<'a>(properties: &'a ApplicationProperties, name: &str) -> Opt
     }
 }
 
-fn lock_tokens(body: &Body) -> Option<Vec<LockToken>> {
+fn map_value<'a>(body: &'a Body, name: &str) -> Option<&'a Value> {
     let Body::Value(Value::Map(map)) = body else {
         return None;
     };
-    let value = map.iter().find_map(|(key, value)| match key {
-        Value::String(key) if key == LOCK_TOKENS => Some(value),
-        Value::Symbol(key) if key.as_str() == LOCK_TOKENS => Some(value),
+    map.iter().find_map(|(key, value)| match key {
+        Value::String(key) if key == name => Some(value),
+        Value::Symbol(key) if key.as_str() == name => Some(value),
         _ => None,
-    })?;
+    })
+}
+
+fn string_map_value<'a>(body: &'a Body, name: &str) -> Option<&'a str> {
+    match map_value(body, name) {
+        Some(Value::String(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn map_body(name: &str, value: Value) -> Value {
+    let mut map = OrderedMap::new();
+    map.insert(Value::String(name.to_owned()), value);
+    Value::Map(map)
+}
+
+fn timestamp_value(timestamp: domain::Timestamp) -> Value {
+    Value::Timestamp(AmqpTimestamp::from_milliseconds(
+        i64::try_from(timestamp.as_millis()).unwrap_or(i64::MAX),
+    ))
+}
+
+fn lock_tokens(body: &Body) -> Option<Vec<LockToken>> {
+    let value = map_value(body, LOCK_TOKENS)?;
     let Value::Array(values) = value else {
         return None;
     };
@@ -603,7 +904,12 @@ mod tests {
         let response = ManagementResponse::accepted(
             MessageId::Ulong(7),
             Some(String::from("trace-1")),
-            vec![domain::Timestamp::from_millis(12_345)],
+            map_body(
+                EXPIRATIONS,
+                Value::Array(Array::from(vec![timestamp_value(
+                    domain::Timestamp::from_millis(12_345),
+                )])),
+            ),
         )
         .into_message();
 

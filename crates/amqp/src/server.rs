@@ -13,9 +13,9 @@ use tracing::trace;
 
 use crate::{
     Accepted, Attach, Begin, Close, DeliveryState, DeliveryTag, Detach, Disposition, End, Error,
-    Flow, Frame, Message, Open, Outcome, Performative, ProtocolHeader, ReceiverSettleMode, Role,
-    SaslCode, SaslInit, SaslMechanisms, SaslOutcome, SaslPerformative, SenderSettleMode, Transfer,
-    decode_message, encode_message, read_frame, read_protocol_header, write_frame,
+    Fields, Flow, Frame, Message, Open, Outcome, Performative, ProtocolHeader, ReceiverSettleMode,
+    Role, SaslCode, SaslInit, SaslMechanisms, SaslOutcome, SaslPerformative, SenderSettleMode,
+    Transfer, decode_message, encode_message, read_frame, read_protocol_header, write_frame,
     write_protocol_header,
 };
 
@@ -219,6 +219,16 @@ impl ServerSession {
         attach: Attach,
         max_message_size: u64,
     ) -> Result<LinkEndpoint, EngineError> {
+        self.accept_attach_with_properties(attach, max_message_size, None)
+            .await
+    }
+
+    pub async fn accept_attach_with_properties(
+        &self,
+        attach: Attach,
+        max_message_size: u64,
+        properties: Option<Fields>,
+    ) -> Result<LinkEndpoint, EngineError> {
         let (deliveries_tx, deliveries) = mpsc::channel(32);
         let (detached_tx, detached) = watch::channel(false);
         let role = attach.role.clone();
@@ -228,6 +238,7 @@ impl ServerSession {
             channel: self.channel,
             attach: Box::new(attach),
             max_message_size,
+            properties,
             deliveries_tx,
             detached_tx,
             reply,
@@ -420,6 +431,7 @@ enum Command {
         channel: u16,
         attach: Box<Attach>,
         max_message_size: u64,
+        properties: Option<Fields>,
         deliveries_tx: mpsc::Sender<Delivery>,
         detached_tx: watch::Sender<bool>,
         reply: oneshot::Sender<Result<(), EngineError>>,
@@ -700,6 +712,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             channel,
             attach,
             max_message_size,
+            properties,
             deliveries_tx,
             detached_tx,
             reply,
@@ -716,6 +729,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             let mut response = attach.response(attach.source.clone(), attach.target.clone());
             response.max_message_size =
                 (response.role == Role::Receiver).then_some(max_message_size);
+            response.properties = properties;
             write_amqp(
                 writer,
                 channel,
@@ -1225,6 +1239,7 @@ mod tests {
                     properties: None,
                 }),
                 max_message_size: 1024,
+                properties: None,
                 deliveries_tx,
                 detached_tx,
                 reply,
