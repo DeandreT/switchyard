@@ -78,6 +78,8 @@ pub enum StartupError {
     Listen { address: String, detail: String },
     #[error("production mode requires a TLS certificate and private key")]
     TlsRequiredInProduction,
+    #[error("AMQP over WebSockets requires a TLS certificate and private key")]
+    WebSocketsRequireTls,
     #[error("TLS configuration requires both --tls-certificate and --tls-private-key")]
     IncompleteTlsConfiguration,
     #[error("could not read TLS credentials from {path}: {detail}")]

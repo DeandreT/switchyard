@@ -48,6 +48,7 @@ fn send<P: StoreProvider>(
             body: message_id.as_bytes().to_vec(),
             time_to_live_millis: None,
             session_id,
+            envelope: None,
         },
     )? {
         CommandOutcome::Sent { sequence } => Ok(sequence),
@@ -105,6 +106,7 @@ fn a_session_queue_refuses_a_command_that_names_no_session<P: StoreProvider>(
                 body: Vec::new(),
                 time_to_live_millis: None,
                 session_id: None,
+                envelope: None,
             }
         ),
         Err(BrokerError::SessionRequired)
@@ -138,6 +140,7 @@ fn a_plain_queue_refuses_a_command_that_names_a_session<P: StoreProvider>(
                 body: Vec::new(),
                 time_to_live_millis: None,
                 session_id: Some(id("cart-1")),
+                envelope: None,
             }
         ),
         Err(BrokerError::SessionNotSupported)
@@ -557,6 +560,7 @@ fn an_expired_session_message_is_dead_lettered_out_of_its_session<P: StoreProvid
             body: b"perishable".to_vec(),
             time_to_live_millis: Some(100),
             session_id: Some(id("cart-1")),
+            envelope: None,
         },
     )?;
 

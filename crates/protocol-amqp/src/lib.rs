@@ -16,6 +16,7 @@ mod management;
 mod message;
 mod session_filter;
 mod tls;
+mod websocket;
 
 use thiserror::Error;
 
@@ -44,6 +45,10 @@ pub use crate::{
     },
     session_filter::{SESSION_FILTER, SessionRequest, read_session_filter, stamp_session_filter},
     tls::{TlsConfigurationError, tls_server_config},
+    websocket::{
+        AMQP_WEBSOCKET_STANDARD_SUBPROTOCOL, AMQP_WEBSOCKET_SUBPROTOCOL,
+        SERVICE_BUS_WEBSOCKET_PATH, WebSocketIo, accept_amqp_websocket,
+    },
 };
 
 /// Settlement modes are broker semantics, not wire syntax, so they live in the
@@ -83,6 +88,8 @@ pub enum ProtocolError {
     InvalidAddress { address: String, detail: String },
     #[error("session id {session_id:?} is not usable: {detail}")]
     InvalidSessionId { session_id: String, detail: String },
+    #[error("the stored AMQP message envelope is invalid: {detail}")]
+    InvalidEnvelope { detail: String },
 }
 
 #[cfg(test)]

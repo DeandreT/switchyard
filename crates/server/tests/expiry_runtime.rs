@@ -58,6 +58,7 @@ impl<P: StoreProvider> Runtime<P> {
             body: message_id.as_bytes().to_vec(),
             time_to_live_millis,
             session_id: None,
+            envelope: None,
         })?;
         Ok(())
     }
@@ -157,6 +158,7 @@ fn a_sweep_releases_a_session_whose_lock_elapsed<P: StoreProvider>(
         body: Vec::new(),
         time_to_live_millis: None,
         session_id: Some(session_id.clone()),
+        envelope: None,
     })?;
 
     let CommandOutcome::SessionAccepted(Some(accepted)) =

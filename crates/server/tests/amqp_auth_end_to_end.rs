@@ -71,6 +71,7 @@ impl AuthNode {
                 body: b"seed".to_vec(),
                 time_to_live_millis: None,
                 session_id: None,
+                envelope: None,
             },
         )?;
 

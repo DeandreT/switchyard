@@ -116,6 +116,50 @@ pub enum MessageState {
     },
 }
 
+/// The protocol-native representation of a message.
+///
+/// The broker treats these bytes as opaque durable data. Protocol adapters
+/// retain normalized fields alongside them for routing, expiry, and settlement
+/// decisions, then use the envelope to reconstruct the message without losing
+/// protocol-specific metadata or body forms.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MessageEnvelope(Vec<u8>);
+
+impl MessageEnvelope {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl AsRef<[u8]> for MessageEnvelope {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl From<Vec<u8>> for MessageEnvelope {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::new(bytes)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MessageRecord {
     pub sequence: SequenceNumber,
@@ -126,11 +170,6 @@ pub struct MessageRecord {
     pub delivery_count: u32,
     pub state: MessageState,
     /// Set exactly when the queue requires sessions.
-    ///
-    /// Fields are appended in the order the record grew — `session_id` in
-    /// version 2, `dead_letter` in version 3 — so an older payload is a strict
-    /// prefix of a newer one, and reading it as the newer version runs off the
-    /// end of the buffer instead of silently producing a different message.
     pub session_id: Option<SessionId>,
     /// Why the message was dead-lettered, once it lives in a dead-letter queue.
     ///
@@ -139,109 +178,15 @@ pub struct MessageRecord {
     /// receive and settlement machinery drain it. This field is what remembers
     /// how it got there.
     pub dead_letter: Option<DeadLetterInfo>,
-}
-
-/// The state enum as versions 1 and 2 stored it, when dead-lettered was a
-/// state rather than a queue.
-#[derive(Deserialize)]
-enum MessageStateV2 {
-    Ready,
-    Locked {
-        token: LockToken,
-        locked_until: Timestamp,
-    },
-    DeadLettered(DeadLetterInfo),
-}
-
-impl From<MessageStateV2> for (MessageState, Option<DeadLetterInfo>) {
-    fn from(state: MessageStateV2) -> Self {
-        match state {
-            MessageStateV2::Ready => (MessageState::Ready, None),
-            MessageStateV2::Locked {
-                token,
-                locked_until,
-            } => (
-                MessageState::Locked {
-                    token,
-                    locked_until,
-                },
-                None,
-            ),
-            MessageStateV2::DeadLettered(info) => (MessageState::Ready, Some(info)),
-        }
-    }
-}
-
-/// The version 1 shape of [`MessageRecord`], from before queues had sessions.
-#[derive(Deserialize)]
-struct MessageRecordV1 {
-    sequence: SequenceNumber,
-    message_id: String,
-    body: Vec<u8>,
-    enqueued_at: Timestamp,
-    expires_at: Option<Timestamp>,
-    delivery_count: u32,
-    state: MessageStateV2,
-}
-
-/// The version 2 shape, from before the dead-letter queue was a queue.
-#[derive(Deserialize)]
-struct MessageRecordV2 {
-    sequence: SequenceNumber,
-    message_id: String,
-    body: Vec<u8>,
-    enqueued_at: Timestamp,
-    expires_at: Option<Timestamp>,
-    delivery_count: u32,
-    state: MessageStateV2,
-    session_id: Option<SessionId>,
-}
-
-impl From<MessageRecordV2> for MessageRecord {
-    fn from(record: MessageRecordV2) -> Self {
-        let (state, dead_letter) = record.state.into();
-        Self {
-            sequence: record.sequence,
-            message_id: record.message_id,
-            body: record.body,
-            enqueued_at: record.enqueued_at,
-            expires_at: record.expires_at,
-            delivery_count: record.delivery_count,
-            state,
-            session_id: record.session_id,
-            dead_letter,
-        }
-    }
-}
-
-impl From<MessageRecordV1> for MessageRecord {
-    fn from(record: MessageRecordV1) -> Self {
-        MessageRecordV2 {
-            sequence: record.sequence,
-            message_id: record.message_id,
-            body: record.body,
-            enqueued_at: record.enqueued_at,
-            expires_at: record.expires_at,
-            delivery_count: record.delivery_count,
-            state: record.state,
-            session_id: None,
-        }
-        .into()
-    }
+    /// The lossless protocol-native message, when the ingress adapter supplied
+    /// one. Non-protocol producers have no envelope.
+    pub envelope: Option<MessageEnvelope>,
 }
 
 impl MessageRecord {
-    /// Decodes a stored message, migrating an older record on the way.
-    ///
-    /// Messages are the one record whose shape has changed, so they decode
-    /// through here rather than through the shape-stable [`codec::decode`].
+    /// Decodes a stored message from the V1 value format.
     pub fn decode(envelope: &[u8]) -> Result<Self, CodecError> {
-        let (version, payload) = codec::split(envelope)?;
-        match version {
-            codec::VALUE_FORMAT_V1 => Ok(codec::decode_payload::<MessageRecordV1>(payload)?.into()),
-            codec::VALUE_FORMAT_V2 => Ok(codec::decode_payload::<MessageRecordV2>(payload)?.into()),
-            _ => codec::decode_payload(payload),
-        }
+        codec::decode(envelope)
     }
 
     /// A message with no configured lifetime never expires, which is the
@@ -262,6 +207,7 @@ pub struct Delivery {
     pub message_id: String,
     pub body: Vec<u8>,
     pub enqueued_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
     pub delivery_count: u32,
     /// Absent in receive-and-delete, where the message is already gone.
     pub lock: Option<DeliveryLock>,
@@ -270,6 +216,8 @@ pub struct Delivery {
     /// Why the message was dead-lettered, when it came from a dead-letter
     /// queue.
     pub dead_letter: Option<DeadLetterInfo>,
+    /// The lossless protocol-native message, when one accompanied the send.
+    pub envelope: Option<MessageEnvelope>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -293,34 +241,8 @@ mod tests {
             state: MessageState::Ready,
             session_id: None,
             dead_letter: None,
+            envelope: None,
         }
-    }
-
-    /// The state enum as versions 1 and 2 wrote it, for building old payloads.
-    #[derive(Serialize)]
-    enum StoredStateV2 {
-        Ready,
-        #[expect(dead_code)]
-        Locked {
-            token: LockToken,
-            locked_until: Timestamp,
-        },
-        DeadLettered(DeadLetterInfo),
-    }
-
-    /// The version 1 payload of [`record`]: every field up to the session
-    /// identifier version 2 appended.
-    fn version_1_payload(state: StoredStateV2) -> Vec<u8> {
-        postcard::to_stdvec(&(
-            SequenceNumber::new(1),
-            String::from("m-1"),
-            Vec::<u8>::new(),
-            Timestamp::from_millis(0),
-            Option::<Timestamp>::None,
-            0_u32,
-            state,
-        ))
-        .expect("a message encodes")
     }
 
     #[test]
@@ -336,56 +258,39 @@ mod tests {
     }
 
     #[test]
-    fn a_message_round_trips_through_the_active_format() -> Result<(), CodecError> {
+    fn a_message_round_trips_through_version_one() -> Result<(), CodecError> {
         let original = MessageRecord {
             session_id: Some(SessionId::new("cart-1").expect("a valid session id")),
             ..record(None)
         };
         let envelope = codec::encode(&original)?;
-        assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V3));
+        assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V1));
         assert_eq!(MessageRecord::decode(&envelope)?, original);
         Ok(())
     }
 
     #[test]
-    fn a_version_1_message_reads_as_belonging_to_no_session() -> Result<(), CodecError> {
-        let mut envelope = vec![codec::VALUE_FORMAT_V1];
-        envelope.extend_from_slice(&version_1_payload(StoredStateV2::Ready));
-
-        // Version 1 predates sessions, so every message it holds is session-less.
-        assert_eq!(MessageRecord::decode(&envelope)?, record(None));
-        Ok(())
-    }
-
-    #[test]
-    fn an_old_dead_lettered_state_reads_as_a_ready_dead_letter() -> Result<(), CodecError> {
-        // Versions 1 and 2 stored dead-lettered as a state. It reads back as a
-        // ready message that remembers why it was dead-lettered, which is the
-        // shape a dead-letter queue drains.
-        let info = DeadLetterInfo {
-            reason: DeadLetterReason::TimeToLiveExpired,
-            description: String::from("expired"),
-            dead_lettered_at: Timestamp::from_millis(9),
+    fn a_protocol_envelope_round_trips_through_version_one() -> Result<(), CodecError> {
+        let original = MessageRecord {
+            envelope: Some(MessageEnvelope::new(vec![
+                0, 0x53, 0x77, 0xa1, 3, b'a', b'm', b'q',
+            ])),
+            ..record(None)
         };
-        let mut envelope = vec![codec::VALUE_FORMAT_V1];
-        envelope.extend_from_slice(&version_1_payload(StoredStateV2::DeadLettered(
-            info.clone(),
-        )));
+        let encoded = codec::encode(&original)?;
 
-        let decoded = MessageRecord::decode(&envelope)?;
-        assert_eq!(decoded.state, MessageState::Ready);
-        assert_eq!(decoded.dead_letter, Some(info));
+        assert_eq!(encoded.first(), Some(&codec::VALUE_FORMAT_V1));
+        assert_eq!(MessageRecord::decode(&encoded)?, original);
         Ok(())
     }
 
     #[test]
-    fn old_bytes_cannot_be_misread_as_the_active_format() {
-        // The rollback direction. Fields are appended in version order, so an
-        // older payload runs off the end of the buffer when read as the active
-        // version rather than decoding into some other message.
+    fn a_newer_message_format_is_rejected() {
         assert_eq!(
-            codec::decode_payload::<MessageRecord>(&version_1_payload(StoredStateV2::Ready)),
-            Err(CodecError::Decode)
+            MessageRecord::decode(&[codec::VALUE_FORMAT_V1 + 1, 0]),
+            Err(CodecError::UnsupportedVersion {
+                version: codec::VALUE_FORMAT_V1 + 1,
+            })
         );
     }
 

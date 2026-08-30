@@ -364,6 +364,7 @@ mod tests {
                 body: Vec::new(),
                 time_to_live_millis: None,
                 session_id: None,
+                envelope: None,
             },
         )? {
             CommandOutcome::Sent { sequence } => Ok(sequence),
@@ -477,6 +478,7 @@ mod tests {
                     body: Vec::new(),
                     time_to_live_millis: None,
                     session_id: None,
+                    envelope: None,
                 },
             )
             .await?;

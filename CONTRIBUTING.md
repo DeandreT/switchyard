@@ -1,8 +1,7 @@
 # Contributing to Switchyard
 
-Switchyard is pre-alpha. Design changes should begin with an issue or a short
-architecture decision record when they affect wire compatibility, durable
-formats, consensus, security boundaries, or public APIs.
+Switchyard is pre-alpha. Keep the current design in `ARCHITECTURE.md` and the
+focused documents under `docs/`; do not add decision-history archives.
 
 ## Development
 
@@ -16,8 +15,8 @@ cargo build --workspace
 ```
 
 Changes to protocol or broker behavior must include focused tests and update
-`docs/compatibility.md`. Changes to durable types require an explicit version
-and an upgrade/rollback test.
+`docs/compatibility.md`. Changes to durable types update the V1 format and must
+include focused persistence and restart coverage.
 
 ## Engineering Policy
 

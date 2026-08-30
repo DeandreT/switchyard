@@ -109,7 +109,7 @@ One metadata Raft group owns:
 - Cluster membership and node availability-zone labels
 - Namespace definitions, quotas, RBAC bindings, and KMS references
 - Entity definitions, immutable placement groups, and replica assignments
-- Storage, snapshot, protocol, and Raft command format versions
+- Storage, snapshot, protocol, and Raft command compatibility requirements
 - Backup manifests, feature gates, and cluster-wide audit configuration
 - Namespace storage quota leases allocated to data groups
 
@@ -168,16 +168,14 @@ keyspaces for:
 - Logical quota accounting and audit-chain records
 - Backup checkpoints and exporter cursors
 
-The state machine uses explicit big-endian keys and versioned value envelopes.
-Schema upgrades are online and resumable. A new format is activated only after
-all voters advertise support, allowing one-minor-version rolling upgrades.
+The state machine uses explicit big-endian keys and V1 value envelopes. Until
+the production compatibility boundary is established, schema changes update
+that format directly.
 
 What exists today is one `records` keyspace holding every state-machine key, and
-a `meta` keyspace holding the on-disk layout version. Splitting `records` into
-the keyspaces listed above is a layout change, which is what the layout version
-exists to gate: an open refuses any version other than the one the build reads
-and writes, in both directions, so a rollback fails rather than misreading a
-newer store. A command's batch is journalled and fsynced before the store
+a `meta` keyspace holding the V1 on-disk layout marker. An open refuses any
+other marker rather than guessing at the meaning of stored bytes. A command's
+batch is journalled and fsynced before the store
 reports it applied, and a store directory has a single owner — a second open of a
 live directory is refused rather than shared.
 

@@ -2,23 +2,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 /// Leading byte of every stored value.
-///
-/// A rolling upgrade writes the version its whole voter set advertises, so a
-/// replica must be able to decode the version it is given rather than assume
-/// the current one. Reads accept any known version; writes always use the
-/// active one.
 pub const VALUE_FORMAT_V1: u8 = 1;
-
-/// Adds a session identifier to a stored message. Every other record has the
-/// same shape it had in version 1.
-pub const VALUE_FORMAT_V2: u8 = 2;
-
-/// Moves a message's dead-letter information out of its state enum: a
-/// dead-lettered message now lives in a dead-letter queue as an ordinary ready
-/// or locked record. Every other record keeps its version 2 shape.
-pub const VALUE_FORMAT_V3: u8 = 3;
-
-pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V3;
 
 /// Encodes a value into a versioned envelope.
 ///
@@ -28,31 +12,26 @@ pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V3;
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CodecError> {
     let payload = postcard::to_stdvec(value).map_err(|_| CodecError::Encode)?;
     let mut envelope = Vec::with_capacity(payload.len() + 1);
-    envelope.push(ACTIVE_VALUE_FORMAT);
+    envelope.push(VALUE_FORMAT_V1);
     envelope.extend_from_slice(&payload);
     Ok(envelope)
 }
 
-/// Decodes a record whose shape is the same in every known format version.
-///
-/// A record that gained a field needs to know which version it is reading, and
-/// decodes through [`split`] and [`decode_payload`] instead.
+/// Decodes a record from the V1 storage envelope.
 pub fn decode<T: DeserializeOwned>(envelope: &[u8]) -> Result<T, CodecError> {
-    let (_, payload) = split(envelope)?;
+    let payload = payload(envelope)?;
     decode_payload(payload)
 }
 
-/// Splits a stored envelope into its format version and its payload, rejecting
-/// a version this build does not know.
-pub fn split(envelope: &[u8]) -> Result<(u8, &[u8]), CodecError> {
+fn payload(envelope: &[u8]) -> Result<&[u8], CodecError> {
     let (version, payload) = envelope.split_first().ok_or(CodecError::EmptyEnvelope)?;
-    if !(VALUE_FORMAT_V1..=ACTIVE_VALUE_FORMAT).contains(version) {
+    if *version != VALUE_FORMAT_V1 {
         return Err(CodecError::UnsupportedVersion { version: *version });
     }
-    Ok((*version, payload))
+    Ok(payload)
 }
 
-pub fn decode_payload<T: DeserializeOwned>(payload: &[u8]) -> Result<T, CodecError> {
+fn decode_payload<T: DeserializeOwned>(payload: &[u8]) -> Result<T, CodecError> {
     postcard::from_bytes(payload).map_err(|_| CodecError::Decode)
 }
 
@@ -75,7 +54,7 @@ mod tests {
     #[test]
     fn round_trips_through_a_versioned_envelope() -> Result<(), CodecError> {
         let envelope = encode(&(7_u64, String::from("orders")))?;
-        assert_eq!(envelope.first(), Some(&ACTIVE_VALUE_FORMAT));
+        assert_eq!(envelope.first(), Some(&VALUE_FORMAT_V1));
         assert_eq!(
             decode::<(u64, String)>(&envelope)?,
             (7, String::from("orders"))
@@ -90,17 +69,14 @@ mod tests {
     }
 
     #[test]
-    fn a_record_that_never_changed_shape_reads_under_either_version() -> Result<(), CodecError> {
+    fn reads_version_one_records() -> Result<(), CodecError> {
         let payload = postcard::to_stdvec(&(7_u64, String::from("orders"))).expect("encodes");
-        for version in [VALUE_FORMAT_V1, VALUE_FORMAT_V2, VALUE_FORMAT_V3] {
-            let mut envelope = vec![version];
-            envelope.extend_from_slice(&payload);
-            assert_eq!(
-                decode::<(u64, String)>(&envelope)?,
-                (7, String::from("orders"))
-            );
-            assert_eq!(split(&envelope)?.0, version);
-        }
+        let mut envelope = vec![VALUE_FORMAT_V1];
+        envelope.extend_from_slice(&payload);
+        assert_eq!(
+            decode::<(u64, String)>(&envelope)?,
+            (7, String::from("orders"))
+        );
         Ok(())
     }
 
@@ -111,7 +87,7 @@ mod tests {
             Err(CodecError::UnsupportedVersion { version: 99 })
         );
         assert_eq!(
-            split(&[99, 0]),
+            payload(&[99, 0]),
             Err(CodecError::UnsupportedVersion { version: 99 })
         );
         assert_eq!(decode::<u64>(&[]), Err(CodecError::EmptyEnvelope));

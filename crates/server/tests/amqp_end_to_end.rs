@@ -7,10 +7,11 @@
 use std::error::Error;
 
 use amqp::{
-    ApplicationProperties, Array, Body, ClientConnection as Connection, ClientReceiver as Receiver,
-    ClientSender as Sender, ClientSession as Session, Error as AmqpError, ErrorCondition, Fields,
-    FilterSet, Message, Modified, OrderedMap, Outcome, Properties, SenderSettleMode, Source,
-    Symbol, Uuid, Value,
+    AnnotationKey, ApplicationProperties, Array, Body, ClientConnection as Connection,
+    ClientReceiver as Receiver, ClientSender as Sender, ClientSession as Session,
+    DeliveryAnnotations, Error as AmqpError, ErrorCondition, Fields, FilterSet, Footer, Header,
+    Message, MessageAnnotations, Modified, OrderedMap, Outcome, Properties, SenderSettleMode,
+    Source, Symbol, Uuid, Value,
 };
 use domain::{CommandKind, QueueConfig, StateMachine};
 use server::{Broker, LocalProposer, ManualClock};
@@ -254,6 +255,169 @@ async fn a_released_message_comes_round_again() -> Result<(), Box<dyn Error>> {
 
     connection.close().await?;
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rich_envelope_survives_release_and_broker_overlays() -> Result<(), Box<dyn Error>> {
+    let node = Node::start("orders", QueueConfig::default()).await?;
+
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
+
+    let mut delivery_annotations = DeliveryAnnotations::default();
+    delivery_annotations.insert("x-custom-delivery", "delivery-value");
+    delivery_annotations.insert(700_u64, 701_i32);
+    delivery_annotations.insert("x-opt-lock-token", "forged-lock-token");
+    let mut message_annotations = MessageAnnotations::default();
+    message_annotations.insert("x-custom-message", "message-value");
+    message_annotations.insert(800_u64, 801_i32);
+    message_annotations.insert("x-opt-deadletter-source", "forged-source");
+    let mut footer = Footer::default();
+    footer.insert("x-custom-footer", "footer-value");
+    footer.insert(900_u64, 901_i32);
+    let sent = Message::builder()
+        .header(Header {
+            durable: true,
+            priority: 8,
+            ttl: Some(5_000),
+            first_acquirer: true,
+            // The broker owns this field and must replace the sender's value.
+            delivery_count: 99,
+        })
+        .delivery_annotations(delivery_annotations)
+        .message_annotations(message_annotations)
+        .properties(Properties {
+            message_id: Some(amqp::MessageId::Ulong(42)),
+            user_id: Some(b"user-1".to_vec().into()),
+            to: Some(String::from("logical-orders")),
+            subject: Some(String::from("created")),
+            reply_to: Some(String::from("replies")),
+            correlation_id: Some(amqp::MessageId::Ulong(43)),
+            content_type: Some(Symbol::from("application/octet-stream")),
+            content_encoding: Some(Symbol::from("identity")),
+            creation_time: Some(-123),
+            group_sequence: Some(7),
+            reply_to_group_id: Some(String::from("reply-group")),
+            ..Properties::default()
+        })
+        .application_properties(
+            ApplicationProperties::builder()
+                .insert("custom-string", "application-value")
+                .insert("custom-number", 44_i32)
+                .build(),
+        )
+        .body(Body::Data(vec![
+            b"section-one-".to_vec().into(),
+            b"section-two".to_vec().into(),
+        ]))
+        .footer(footer)
+        .build();
+    sender.send(sent.clone()).await?;
+
+    let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
+    let first = receiver.recv().await?;
+    assert_rich_envelope(first.message(), &sent, 0, 1);
+    receiver.release(&first).await?;
+
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv()).await??;
+    assert_rich_envelope(second.message(), &sent, 1, 2);
+    receiver.accept(&second).await?;
+
+    connection.close().await?;
+    Ok(())
+}
+
+fn assert_rich_envelope(actual: &Message, sent: &Message, delivery_count: u32, lock_token: u64) {
+    let header = actual.header.as_ref().expect("the header survives");
+    assert!(header.durable);
+    assert_eq!(header.priority, 8);
+    assert_eq!(header.ttl, Some(5_000));
+    assert!(header.first_acquirer);
+    assert_eq!(header.delivery_count, delivery_count);
+
+    let delivery_annotations = actual
+        .delivery_annotations
+        .as_ref()
+        .expect("delivery annotations are present");
+    assert_eq!(
+        delivery_annotations.get(&AnnotationKey::from("x-custom-delivery")),
+        Some(&Value::String(String::from("delivery-value")))
+    );
+    assert_eq!(
+        delivery_annotations.get(&AnnotationKey::from(700_u64)),
+        Some(&Value::Int(701))
+    );
+    assert!(matches!(
+        delivery_annotations.get(&AnnotationKey::from("x-opt-lock-token")),
+        Some(Value::Uuid(value))
+            if value.as_inner()[..8] == [0; 8]
+                && value.as_inner()[8..] == lock_token.to_be_bytes()
+    ));
+    let annotations = actual
+        .message_annotations
+        .as_ref()
+        .expect("message annotations are present");
+    assert_eq!(
+        annotations.get(&AnnotationKey::from("x-custom-message")),
+        Some(&Value::String(String::from("message-value")))
+    );
+    assert_eq!(
+        annotations.get(&AnnotationKey::from(800_u64)),
+        Some(&Value::Int(801))
+    );
+    assert_eq!(
+        annotations.get(&AnnotationKey::from("x-opt-sequence-number")),
+        Some(&Value::Long(1))
+    );
+    assert_eq!(
+        annotations.get(&AnnotationKey::from("x-opt-enqueue-sequence-number")),
+        Some(&Value::Long(1))
+    );
+    assert!(matches!(
+        annotations.get(&AnnotationKey::from("x-opt-enqueued-time")),
+        Some(Value::Timestamp(value)) if value.milliseconds() == 1_000
+    ));
+    assert!(matches!(
+        annotations.get(&AnnotationKey::from("x-opt-locked-until")),
+        Some(Value::Timestamp(value)) if value.milliseconds() == 61_000
+    ));
+    assert_eq!(
+        annotations.get(&AnnotationKey::from("x-opt-deadletter-source")),
+        None,
+        "a sender forged the broker-owned dead-letter source"
+    );
+
+    let actual_properties = actual.properties.as_ref().expect("properties survive");
+    let sent_properties = sent.properties.as_ref().expect("properties were sent");
+    assert_eq!(actual_properties.message_id, sent_properties.message_id);
+    assert_eq!(actual_properties.user_id, sent_properties.user_id);
+    assert_eq!(actual_properties.to, sent_properties.to);
+    assert_eq!(actual_properties.subject, sent_properties.subject);
+    assert_eq!(actual_properties.reply_to, sent_properties.reply_to);
+    assert_eq!(
+        actual_properties.correlation_id,
+        sent_properties.correlation_id
+    );
+    assert_eq!(actual_properties.content_type, sent_properties.content_type);
+    assert_eq!(
+        actual_properties.content_encoding,
+        sent_properties.content_encoding
+    );
+    assert_eq!(actual_properties.absolute_expiry_time, Some(6_000));
+    assert_eq!(actual_properties.creation_time, Some(-123));
+    assert_eq!(actual_properties.group_sequence, Some(7));
+    assert_eq!(
+        actual_properties.reply_to_group_id.as_deref(),
+        Some("reply-group")
+    );
+
+    assert_eq!(
+        actual.application_properties, sent.application_properties,
+        "application properties changed"
+    );
+    assert_eq!(actual.body, sent.body, "body sections were collapsed");
+    assert_eq!(actual.footer, sent.footer);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -695,11 +859,60 @@ async fn a_service_bus_rejection_preserves_custom_dead_letter_metadata()
     let mut session = Session::begin(&mut connection).await?;
     let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
     sender
-        .send(Message::builder().body(body("poison")).build())
+        .send(
+            Message::builder()
+                .properties(Properties {
+                    // Absolute expiry is broker-owned. With no TTL configured,
+                    // this forged sender value must be cleared on every receive.
+                    absolute_expiry_time: Some(i64::MAX),
+                    ..Properties::default()
+                })
+                .application_properties(
+                    ApplicationProperties::builder()
+                        .insert("custom-trace-id", "trace-42")
+                        .insert(protocol_amqp::DEAD_LETTER_REASON_PROPERTY, "forged")
+                        .insert(protocol_amqp::DEAD_LETTER_DESCRIPTION_PROPERTY, "forged")
+                        .build(),
+                )
+                .body(body("poison"))
+                .build(),
+        )
         .await?;
 
     let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
     let delivery = receiver.recv().await?;
+    assert_eq!(
+        delivery
+            .message()
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.absolute_expiry_time),
+        None,
+        "a sender forged an expiry the broker did not record"
+    );
+    let live_properties = delivery
+        .message()
+        .application_properties
+        .as_ref()
+        .expect("the custom application property survives");
+    assert_eq!(
+        live_properties.0.get("custom-trace-id"),
+        Some(&Value::String(String::from("trace-42")))
+    );
+    assert_eq!(
+        live_properties
+            .0
+            .get(protocol_amqp::DEAD_LETTER_REASON_PROPERTY),
+        None,
+        "a sender forged a dead-letter reason on a live message"
+    );
+    assert_eq!(
+        live_properties
+            .0
+            .get(protocol_amqp::DEAD_LETTER_DESCRIPTION_PROPERTY),
+        None,
+        "a sender forged a dead-letter description on a live message"
+    );
     // Azure.Messaging.ServiceBus puts custom dead-letter metadata in the info
     // map of a rejection carrying this vendor condition.
     let mut info = Fields::new();
@@ -730,6 +943,25 @@ async fn a_service_bus_rejection_preserves_custom_dead_letter_metadata()
     )
     .await??;
     assert_eq!(text_of(poisoned.message()), "poison");
+    assert_eq!(
+        poisoned
+            .message()
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.absolute_expiry_time),
+        None,
+        "dead-lettering restored a stale sender expiry"
+    );
+    assert_eq!(
+        poisoned
+            .message()
+            .message_annotations
+            .as_ref()
+            .and_then(|annotations| {
+                annotations.get(&AnnotationKey::from("x-opt-deadletter-source"))
+            }),
+        Some(&Value::String(String::from("orders")))
+    );
     let properties = poisoned
         .message()
         .application_properties
@@ -744,6 +976,11 @@ async fn a_service_bus_rejection_preserves_custom_dead_letter_metadata()
             .0
             .get(protocol_amqp::DEAD_LETTER_DESCRIPTION_PROPERTY),
         Some(&Value::String(String::from("the order total is negative")))
+    );
+    assert_eq!(
+        properties.0.get("custom-trace-id"),
+        Some(&Value::String(String::from("trace-42"))),
+        "dead-letter metadata replaced a custom application property"
     );
     dead_letter_receiver.accept(&poisoned).await?;
 

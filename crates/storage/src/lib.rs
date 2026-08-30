@@ -13,7 +13,7 @@ mod memory;
 use thiserror::Error;
 
 pub use crate::{
-    durable::{ACTIVE_STORE_FORMAT, FjallStore, STORE_FORMAT_V1, STORE_FORMAT_V2},
+    durable::{FjallStore, STORE_FORMAT_V1},
     memory::MemoryStore,
 };
 

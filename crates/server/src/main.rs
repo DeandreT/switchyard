@@ -46,12 +46,16 @@ struct Arguments {
     #[arg(long, default_value_t = DEFAULT_SWEEP_INTERVAL.as_millis() as u64)]
     sweep_interval_millis: u64,
 
-    /// Where to accept AMQP connections. Defaults to port 5671 with TLS and
-    /// port 5672 for development plaintext.
+    /// AMQP transport exposed by this listener.
+    #[arg(long, value_enum, default_value_t = TransportArgument::AmqpTcp)]
+    transport: TransportArgument,
+
+    /// Where to accept AMQP connections. Defaults to 443 for WebSockets, 5671
+    /// for AMQP/TLS, and 5672 for development plaintext.
     #[arg(long)]
     listen: Option<SocketAddr>,
 
-    /// PEM certificate chain for AMQP over TLS.
+    /// PEM certificate chain for AMQP over TLS or WebSockets.
     #[arg(long, value_name = "PATH")]
     tls_certificate: Option<PathBuf>,
 
@@ -95,6 +99,14 @@ enum StorageArgument {
     Fjall,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum TransportArgument {
+    #[value(name = "amqp-tcp")]
+    AmqpTcp,
+    #[value(name = "amqp-websockets")]
+    AmqpWebSockets,
+}
+
 fn storage_choice(arguments: &Arguments) -> Result<StorageChoice, StartupError> {
     match arguments.storage {
         StorageArgument::Memory => Ok(StorageChoice::Memory),
@@ -132,17 +144,32 @@ fn read_tls_file(path: &Path) -> Result<Vec<u8>, StartupError> {
     })
 }
 
-fn listen_address(configured: Option<SocketAddr>, tls: bool) -> SocketAddr {
+fn listen_address(
+    configured: Option<SocketAddr>,
+    transport: TransportArgument,
+    tls: bool,
+) -> SocketAddr {
     configured.unwrap_or_else(|| {
         SocketAddr::from((
             [127, 0, 0, 1],
-            if tls {
-                protocol_amqp::AMQP_TLS_PORT
-            } else {
-                5672
+            match (transport, tls) {
+                (TransportArgument::AmqpWebSockets, _) => protocol_amqp::AMQP_WEBSOCKET_PORT,
+                (TransportArgument::AmqpTcp, true) => protocol_amqp::AMQP_TLS_PORT,
+                (TransportArgument::AmqpTcp, false) => 5672,
             },
         ))
     })
+}
+
+fn validate_transport_security(
+    transport: TransportArgument,
+    tls: bool,
+) -> Result<(), StartupError> {
+    if transport == TransportArgument::AmqpWebSockets && !tls {
+        Err(StartupError::WebSocketsRequireTls)
+    } else {
+        Ok(())
+    }
 }
 
 fn load_shared_access_authentication(
@@ -217,6 +244,7 @@ fn run() -> Result<(), StartupError> {
         arguments.tls_certificate.as_deref(),
         arguments.tls_private_key.as_deref(),
     )?;
+    validate_transport_security(arguments.transport, tls.is_some())?;
     let shared_access_authentication = load_shared_access_authentication(
         mode,
         tls.is_some(),
@@ -224,13 +252,14 @@ fn run() -> Result<(), StartupError> {
         arguments.shared_access_key_name.as_deref(),
         arguments.shared_access_key_file.as_deref(),
     )?;
-    let listen = listen_address(arguments.listen, tls.is_some());
+    let listen = listen_address(arguments.listen, arguments.transport, tls.is_some());
     let state = server::open(cluster, storage_choice(&arguments)?)?;
 
     info!(
         ?mode,
         voters = arguments.voters,
         storage = ?arguments.storage,
+        transport = ?arguments.transport,
         "configuration is valid"
     );
     let namespace = namespace_from_hostname(&arguments.namespace)?;
@@ -264,7 +293,7 @@ fn run() -> Result<(), StartupError> {
                 address: listen.to_string(),
                 detail: error.to_string(),
             })?;
-        info!(address = %listen, namespace = %namespace, tls = tls.is_some(), "accepting AMQP connections");
+        info!(address = %listen, namespace = %namespace, tls = tls.is_some(), transport = ?arguments.transport, "accepting AMQP connections");
         let amqp = AmqpListener::new(broker.handle(), namespace);
         let amqp = match tls {
             Some(config) => amqp.with_tls(config),
@@ -274,9 +303,11 @@ fn run() -> Result<(), StartupError> {
             Some(authentication) => amqp.with_shared_access_authentication(authentication),
             None => amqp,
         };
-        amqp.serve(listener)
-            .await
-            .map_err(|error| StartupError::Runtime(error.to_string()))
+        match arguments.transport {
+            TransportArgument::AmqpTcp => amqp.serve(listener).await,
+            TransportArgument::AmqpWebSockets => amqp.serve_websockets(listener).await,
+        }
+        .map_err(|error| StartupError::Runtime(error.to_string()))
     });
 
     shutdown.signal();
@@ -310,10 +341,29 @@ mod tests {
 
     #[test]
     fn listener_defaults_follow_the_transport() {
-        assert_eq!(listen_address(None, false).port(), 5672);
         assert_eq!(
-            listen_address(None, true).port(),
+            listen_address(None, TransportArgument::AmqpTcp, false).port(),
+            5672
+        );
+        assert_eq!(
+            listen_address(None, TransportArgument::AmqpTcp, true).port(),
             protocol_amqp::AMQP_TLS_PORT
+        );
+        assert_eq!(
+            listen_address(None, TransportArgument::AmqpWebSockets, true).port(),
+            protocol_amqp::AMQP_WEBSOCKET_PORT
+        );
+    }
+
+    #[test]
+    fn websockets_are_never_exposed_without_tls() {
+        assert_eq!(
+            validate_transport_security(TransportArgument::AmqpWebSockets, false),
+            Err(StartupError::WebSocketsRequireTls)
+        );
+        assert_eq!(
+            validate_transport_security(TransportArgument::AmqpWebSockets, true),
+            Ok(())
         );
     }
 

@@ -5,17 +5,15 @@
 //! holding one, the lock simply expires and the message is redelivered. That is
 //! what makes an abrupt disconnect safe.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use amqp::{
-    AmqpError, Attach, DeliveryState, DeliveryTag, EngineError, Error as AmqpProtocolError,
-    ErrorCondition, Fields, LinkEndpoint, Outcome, Receiver, Role, Sender, SenderSettleMode,
-    ServerConnection, ServerSession,
+    AmqpError, Attach, EngineError, Error as AmqpProtocolError, ErrorCondition, Fields,
+    LinkEndpoint, Receiver, Role, SenderSettleMode, ServerConnection, ServerSession,
 };
 use auth::{Permission, ResourceScope};
 use domain::{
-    AcceptedSession, CommandKind, CommandOutcome, Delivery, EntityPath, LockToken, NamespaceName,
-    ReceiveMode, SessionHold,
+    AcceptedSession, CommandKind, CommandOutcome, EntityPath, NamespaceName, ReceiveMode,
 };
 use rustls::ServerConfig;
 use serde_amqp::{Value, primitives::Symbol};
@@ -33,14 +31,12 @@ use crate::{
         serve_management_requests,
     },
     parse_attachment, read_incoming, read_session_filter, stamp_session_filter,
+    websocket::accept_amqp_websocket,
 };
 
-/// How long a receiving link waits on a wakeup before asking the broker anyway.
-///
-/// The wakeup is the mechanism; this is the net under it. A notification can be
-/// lost when several links wait on one entity, so a waiter re-asks on a coarse
-/// interval rather than trusting the signal absolutely.
-const EMPTY_QUEUE_FALLBACK: Duration = Duration::from_secs(3);
+mod settlement;
+
+use settlement::serve_receiving_client;
 
 const LOCKED_UNTIL_UTC_PROPERTY: &str = "com.microsoft:locked-until-utc";
 const DOTNET_UNIX_EPOCH_TICKS: u64 = 621_355_968_000_000_000;
@@ -124,6 +120,65 @@ impl<B: Broker> AmqpListener<B> {
                 };
                 if let Err(error) = result {
                     warn!(%peer, %error, "connection ended");
+                }
+            });
+        }
+    }
+
+    /// Accepts AMQP tunneled through the Service Bus WebSocket endpoint.
+    ///
+    /// TLS, when configured, is established before the HTTP upgrade. The
+    /// broker process requires TLS for this transport; permitting an unwrapped
+    /// stream here keeps the protocol binding independently testable.
+    pub async fn serve_websockets(self, listener: TcpListener) -> std::io::Result<()> {
+        loop {
+            let (stream, peer) = listener.accept().await?;
+            debug!(%peer, "WebSocket connection accepted");
+
+            let broker = self.broker.clone();
+            let namespace = self.namespace.clone();
+            let container_id = self.container_id.clone();
+            let tls_acceptor = self.tls_acceptor.clone();
+            let shared_access_authentication = self.shared_access_authentication.clone();
+            tokio::spawn(async move {
+                let result = match tls_acceptor {
+                    Some(acceptor) => match acceptor.accept(stream).await {
+                        Ok(stream) => {
+                            debug!(%peer, "WebSocket TLS established");
+                            match accept_amqp_websocket(stream).await {
+                                Ok(stream) => {
+                                    debug!(%peer, "AMQP WebSocket upgraded");
+                                    serve_connection(
+                                        stream,
+                                        container_id,
+                                        namespace,
+                                        broker,
+                                        shared_access_authentication,
+                                    )
+                                    .await
+                                }
+                                Err(error) => Err(error.into()),
+                            }
+                        }
+                        Err(error) => Err(error.into()),
+                    },
+                    None => match accept_amqp_websocket(stream).await {
+                        Ok(stream) => {
+                            debug!(%peer, "AMQP WebSocket upgraded");
+                            serve_connection(
+                                stream,
+                                container_id,
+                                namespace,
+                                broker,
+                                shared_access_authentication,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error.into()),
+                    },
+                };
+                if let Err(error) = result {
+                    warn!(%peer, %error, "WebSocket connection ended");
                 }
             });
         }
@@ -720,7 +775,7 @@ async fn serve_sending_client<B: Broker>(
             receiver.close_with_error(error).await?;
             return Ok(());
         }
-        let incoming = match read_incoming(delivery.message()) {
+        let incoming = match read_incoming(delivery.message(), delivery.encoded_message()) {
             Ok(incoming) => incoming,
             Err(error) => {
                 // The client's message, the client's fault: reject this transfer
@@ -744,6 +799,7 @@ async fn serve_sending_client<B: Broker>(
                     body: incoming.body,
                     time_to_live_millis: incoming.time_to_live_millis,
                     session_id: incoming.session_id,
+                    envelope: Some(incoming.envelope),
                 },
             )
             .await;
@@ -751,7 +807,18 @@ async fn serve_sending_client<B: Broker>(
         // Accepting only after the command committed is what makes the
         // acknowledgement mean the message is durable.
         match outcome {
-            Ok(_) => receiver.accept(&delivery).await?,
+            Ok(CommandOutcome::Sent { .. }) => receiver.accept(&delivery).await?,
+            Ok(other) => {
+                receiver
+                    .reject(
+                        &delivery,
+                        Some(error_for(
+                            AmqpError::InternalError,
+                            format!("send produced an unexpected outcome: {other:?}"),
+                        )),
+                    )
+                    .await?
+            }
             Err(rejection) => {
                 receiver
                     .reject(&delivery, Some(rejection_error(&rejection)))
@@ -759,339 +826,6 @@ async fn serve_sending_client<B: Broker>(
             }
         }
     }
-}
-
-/// Drives a link the client receives on: fetch, deliver, then settle as the
-/// client's disposition says.
-async fn serve_receiving_client<B: Broker>(
-    mut sender: Sender,
-    namespace: NamespaceName,
-    entity: EntityPath,
-    broker: B,
-    mode: ReceiveMode,
-    session: Option<SessionHold>,
-    protocol: ReceivingLinkProtocol,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ReceivingLinkProtocol {
-        authorization,
-        management,
-    } = protocol;
-
-    loop {
-        // The link is watched the whole time a message is being waited for. A
-        // client that detaches while the queue is empty is waiting for an
-        // answer, and a task that only polls the broker would never send one.
-        let fetched = tokio::select! {
-            biased;
-            _ = sender.on_detach() => {
-                release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                let _ = sender.close().await;
-                return Ok(());
-            }
-            () = wait_until_link_unauthorized(authorization.as_ref()), if authorization.is_some() => {
-                release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                sender
-                    .close_with_error(unauthorized_error("the link's authorization has expired"))
-                    .await?;
-                return Ok(());
-            }
-            fetched = next_delivery(
-                &broker,
-                &namespace,
-                &entity,
-                mode,
-                session.as_ref(),
-                authorization.as_ref(),
-            ) => fetched,
-        };
-
-        match fetched {
-            Ok(delivery) => {
-                if !settle(
-                    &mut sender,
-                    &namespace,
-                    &entity,
-                    &broker,
-                    delivery,
-                    authorization.as_ref(),
-                    &management,
-                )
-                .await?
-                {
-                    release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                    sender
-                        .close_with_error(unauthorized_error(
-                            "the link's authorization expired before settlement",
-                        ))
-                        .await?;
-                    return Ok(());
-                }
-            }
-            Err(NextDeliveryError::Broker(rejection)) => {
-                release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                sender.close_with_error(rejection_error(&rejection)).await?;
-                return Ok(());
-            }
-            Err(NextDeliveryError::Unauthorized) => {
-                release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                sender
-                    .close_with_error(unauthorized_error("the link's authorization has expired"))
-                    .await?;
-                return Ok(());
-            }
-        }
-    }
-}
-
-async fn wait_until_link_unauthorized(authorization: Option<&LinkAuthorization>) {
-    match authorization {
-        Some(authorization) => authorization.wait_until_unauthorized().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Frees the session a link held, so the next receiver need not wait out the
-/// lock. Failure is survivable: expiry frees it anyway.
-async fn release_session<B: Broker>(
-    broker: &B,
-    namespace: &NamespaceName,
-    entity: &EntityPath,
-    session: Option<&SessionHold>,
-) {
-    let Some(hold) = session else { return };
-    if let Err(rejection) = broker
-        .submit(
-            namespace.clone(),
-            entity.clone(),
-            CommandKind::ReleaseSession {
-                session: hold.clone(),
-            },
-        )
-        .await
-    {
-        debug!(session = %hold.session_id, %rejection, "session not released, leaving it to expire");
-    }
-}
-
-/// The next message the queue will part with, however long that takes.
-async fn next_delivery<B: Broker>(
-    broker: &B,
-    namespace: &NamespaceName,
-    entity: &EntityPath,
-    mode: ReceiveMode,
-    session: Option<&SessionHold>,
-    authorization: Option<&LinkAuthorization>,
-) -> Result<Delivery, NextDeliveryError> {
-    loop {
-        if let Some(authorization) = authorization
-            && authorization.ensure().await.is_err()
-        {
-            return Err(NextDeliveryError::Unauthorized);
-        }
-        // Armed before the receive: a message that lands between the empty
-        // answer below and the wait leaves a stored notification, so the wait
-        // returns at once instead of sleeping on a queue that is not empty.
-        let wakeup = broker.deliverable(namespace, entity);
-        let outcome = broker
-            .submit(
-                namespace.clone(),
-                entity.clone(),
-                CommandKind::Receive {
-                    mode,
-                    lock_duration_millis: None,
-                    session: session.cloned(),
-                },
-            )
-            .await
-            .map_err(NextDeliveryError::Broker)?;
-
-        match outcome {
-            CommandOutcome::Received(Some(delivery)) => return Ok(delivery),
-            CommandOutcome::Received(None) => {
-                tokio::select! {
-                    () = wakeup => {}
-                    () = tokio::time::sleep(EMPTY_QUEUE_FALLBACK) => {}
-                }
-            }
-            other => {
-                // A receive that produced anything else means the broker and the
-                // edge disagree about the command, which is not a client problem.
-                return Err(NextDeliveryError::Broker(BrokerRejection::Unavailable(
-                    format!("receive produced an unexpected outcome: {other:?}"),
-                )));
-            }
-        }
-    }
-}
-
-enum NextDeliveryError {
-    Broker(BrokerRejection),
-    Unauthorized,
-}
-
-/// Hands one message to the client and applies whatever it said about it.
-///
-/// The lock is already committed, so a client that never answers costs a
-/// redelivery rather than a lost message.
-async fn settle<B: Broker>(
-    sender: &mut Sender,
-    namespace: &NamespaceName,
-    entity: &EntityPath,
-    broker: &B,
-    delivery: Delivery,
-    authorization: Option<&LinkAuthorization>,
-    management: &ConnectionManagement,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let Some(lock) = delivery.lock else {
-        let delivery_tag = sequence_delivery_tag(delivery.sequence);
-        // Receive-and-delete: the message is already gone, so there is nothing
-        // to settle after the transfer.
-        let sent = match authorization {
-            Some(authorization) => {
-                tokio::select! {
-                    outcome = sender.send(crate::write_delivery(&delivery), delivery_tag.clone()) => {
-                        outcome?;
-                        true
-                    }
-                    () = authorization.wait_until_unauthorized() => false,
-                }
-            }
-            None => {
-                sender
-                    .send(crate::write_delivery(&delivery), delivery_tag)
-                    .await?;
-                true
-            }
-        };
-        return Ok(sent);
-    };
-    let sequence = delivery.sequence;
-    let delivery_tag = lock_delivery_tag(lock.token);
-    let link_name = sender.name().to_owned();
-    management
-        .register_delivery(&link_name, entity.clone(), sequence, lock.token)
-        .await;
-    let outcome = match authorization {
-        Some(authorization) => {
-            tokio::select! {
-                outcome = sender.send_unconfirmed(crate::write_delivery(&delivery), delivery_tag.clone()) => Some(outcome),
-                () = authorization.wait_until_unauthorized() => None,
-            }
-        }
-        None => Some(
-            sender
-                .send_unconfirmed(crate::write_delivery(&delivery), delivery_tag)
-                .await,
-        ),
-    };
-    management.unregister_delivery(&link_name, lock.token).await;
-    let Some(outcome) = outcome else {
-        return Ok(false);
-    };
-    let outcome = outcome?;
-    if let Some(authorization) = authorization
-        && authorization.ensure().await.is_err()
-    {
-        sender
-            .confirm(DeliveryState::Rejected(amqp::Rejected {
-                error: Some(unauthorized_error(
-                    "the link's authorization expired before settlement committed",
-                )),
-            }))
-            .await?;
-        return Ok(false);
-    }
-
-    // Service Bus treats the sender's second-mode disposition as the result of
-    // applying the requested settlement operation, not as an echo of that
-    // request. Accepted means Complete, Abandon, or DeadLetter committed.
-    let confirmation = DeliveryState::Accepted(amqp::Accepted);
-
-    let kind = match outcome {
-        Outcome::Accepted(_) => CommandKind::Complete {
-            sequence,
-            lock_token: lock.token,
-        },
-        // Rejected means the client will never process it, so it goes to the
-        // dead-letter queue rather than round again.
-        Outcome::Rejected(rejected) => {
-            let (reason, description) = dead_letter_details(rejected);
-            CommandKind::DeadLetter {
-                sequence,
-                lock_token: lock.token,
-                reason,
-                description,
-            }
-        }
-        // Released and modified both mean "not now": back to the queue, with the
-        // delivery count already incremented by the receive.
-        Outcome::Released(_) | Outcome::Modified(_) => CommandKind::Abandon {
-            sequence,
-            lock_token: lock.token,
-        },
-    };
-
-    match broker.submit(namespace.clone(), entity.clone(), kind).await {
-        Ok(_) => sender.confirm(confirmation).await?,
-        Err(rejection) => {
-            sender
-                .confirm(DeliveryState::Rejected(amqp::Rejected {
-                    error: Some(rejection_error(&rejection)),
-                }))
-                .await?;
-            // A settlement that fails is not fatal to the link: the lock expires
-            // and the message comes round again.
-            warn!(%sequence, %rejection, "settlement failed, leaving the lock to expire");
-        }
-    }
-    Ok(true)
-}
-
-fn lock_delivery_tag(token: LockToken) -> DeliveryTag {
-    let mut tag = [0_u8; 16];
-    tag[8..].copy_from_slice(&token.as_u64().to_be_bytes());
-    tag.to_vec().into()
-}
-
-fn sequence_delivery_tag(sequence: domain::SequenceNumber) -> DeliveryTag {
-    sequence.as_u64().to_be_bytes().to_vec().into()
-}
-
-/// Reads the Service Bus dead-letter contract from a rejected delivery.
-///
-/// The official clients put an application-supplied reason and description in
-/// the AMQP error's info map. A generic AMQP client may reject without either,
-/// in which case the stable Switchyard fallback still explains how the message
-/// reached the dead-letter queue.
-fn dead_letter_details(rejected: amqp::Rejected) -> (String, String) {
-    let Some(error) = rejected.error else {
-        return (
-            String::from("RejectedByReceiver"),
-            String::from("the receiver rejected the message"),
-        );
-    };
-
-    let reason = error
-        .info
-        .as_ref()
-        .and_then(|info| string_field(info, crate::DEAD_LETTER_REASON_PROPERTY))
-        .unwrap_or_else(|| String::from("RejectedByReceiver"));
-    let description = error
-        .info
-        .as_ref()
-        .and_then(|info| string_field(info, crate::DEAD_LETTER_DESCRIPTION_PROPERTY))
-        .or(error.description)
-        .unwrap_or_else(|| String::from("the receiver rejected the message"));
-    (reason, description)
-}
-
-fn string_field(fields: &Fields, name: &str) -> Option<String> {
-    fields
-        .get(&Symbol::from(name))
-        .and_then(|value| match value {
-            Value::String(value) => Some(value.clone()),
-            _ => None,
-        })
 }
 
 async fn detach_with(endpoint: LinkEndpoint, error: AmqpProtocolError) {
@@ -1160,58 +894,12 @@ mod tests {
     }
 
     #[test]
-    fn a_lock_token_is_a_guid_sized_delivery_tag() {
-        let tag = lock_delivery_tag(LockToken::new(42));
-        assert_eq!(tag.len(), 16);
-        assert_eq!(&tag[8..], &42_u64.to_be_bytes());
-    }
-
-    #[test]
     fn a_rejection_reaches_the_wire_as_its_condition() {
         let rejection = BrokerRejection::Refused(domain::BrokerError::QueueNotFound);
         let error = rejection_error(&rejection);
         assert_eq!(
             error.condition,
             ErrorCondition::Custom(Symbol::from(crate::NOT_FOUND))
-        );
-    }
-
-    #[test]
-    fn a_service_bus_rejection_keeps_its_dead_letter_details() {
-        let mut info = Fields::default();
-        info.insert(
-            Symbol::from(crate::DEAD_LETTER_REASON_PROPERTY),
-            Value::String(String::from("InvalidOrder")),
-        );
-        info.insert(
-            Symbol::from(crate::DEAD_LETTER_DESCRIPTION_PROPERTY),
-            Value::String(String::from("the order has no customer")),
-        );
-        let rejected = amqp::Rejected {
-            error: Some(AmqpProtocolError::new(
-                ErrorCondition::Custom(Symbol::from("com.microsoft:dead-letter")),
-                "the receiver rejected the message",
-                Some(info),
-            )),
-        };
-
-        assert_eq!(
-            dead_letter_details(rejected),
-            (
-                String::from("InvalidOrder"),
-                String::from("the order has no customer")
-            )
-        );
-    }
-
-    #[test]
-    fn a_generic_rejection_gets_stable_dead_letter_details() {
-        assert_eq!(
-            dead_letter_details(amqp::Rejected::default()),
-            (
-                String::from("RejectedByReceiver"),
-                String::from("the receiver rejected the message")
-            )
         );
     }
 }

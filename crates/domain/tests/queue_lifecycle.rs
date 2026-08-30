@@ -9,7 +9,7 @@ use std::error::Error;
 
 use domain::{
     BrokerError, CommandKind, CommandOutcome, DeadLetterReason, Delivery, DeliveryLock, LockToken,
-    MessageState, QueueConfig, ReceiveMode, SequenceNumber, Timestamp,
+    MessageEnvelope, MessageState, QueueConfig, ReceiveMode, SequenceNumber, Timestamp,
 };
 use testkit::{QueueFixture, StoreProvider};
 
@@ -40,6 +40,7 @@ fn send<P: StoreProvider>(
             body: id.as_bytes().to_vec(),
             time_to_live_millis: None,
             session_id: None,
+            envelope: None,
         },
     )? {
         CommandOutcome::Sent { sequence } => Ok(sequence),
@@ -339,6 +340,91 @@ fn abandoning_returns_the_message_and_keeps_its_delivery_count<P: StoreProvider>
     Ok(())
 }
 
+fn a_protocol_envelope_survives_restart_redelivery_and_the_dead_letter_queue<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
+    let envelope = MessageEnvelope::new(vec![0, 0x53, 0x77, 0xa1, 3, b'a', b'm', b'q']);
+    let CommandOutcome::Sent { sequence } = fixture.at(
+        10,
+        CommandKind::Send {
+            message_id: String::from("enveloped"),
+            body: b"normalized-body".to_vec(),
+            time_to_live_millis: Some(1_000),
+            session_id: None,
+            envelope: Some(envelope.clone()),
+        },
+    )?
+    else {
+        panic!("expected a send outcome");
+    };
+
+    assert_eq!(
+        fixture
+            .machine
+            .message(&fixture.namespace, &fixture.entity, sequence)?
+            .expect("the sent message is durable")
+            .envelope,
+        Some(envelope.clone())
+    );
+
+    let fixture = fixture.restart()?;
+    let first = receive(&fixture, 20)?.expect("the restarted queue retains the message");
+    assert_eq!(first.expires_at, Some(Timestamp::from_millis(1_010)));
+    assert_eq!(first.envelope, Some(envelope.clone()));
+    fixture.at(
+        30,
+        CommandKind::Abandon {
+            sequence,
+            lock_token: locked(&first).token,
+        },
+    )?;
+
+    let second = receive(&fixture, 40)?.expect("the envelope is redelivered");
+    assert_eq!(second.envelope, Some(envelope.clone()));
+    fixture.at(
+        50,
+        CommandKind::DeadLetter {
+            sequence,
+            lock_token: locked(&second).token,
+            reason: String::from("SchemaMismatch"),
+            description: String::from("message could not be processed"),
+        },
+    )?;
+
+    let dead_letter_queue = fixture.entity.dead_letter_queue()?;
+    let stored = fixture
+        .machine
+        .message(&fixture.namespace, &dead_letter_queue, sequence)?
+        .expect("the envelope moved into the dead-letter queue");
+    assert_eq!(stored.envelope, Some(envelope.clone()));
+    assert_eq!(stored.expires_at, None);
+
+    let outcome = fixture.machine.apply(&domain::Command::new(
+        fixture.namespace.clone(),
+        dead_letter_queue,
+        Timestamp::from_millis(60),
+        CommandKind::Receive {
+            mode: ReceiveMode::PeekLock,
+            lock_duration_millis: None,
+            session: None,
+        },
+    ))?;
+    let CommandOutcome::Received(Some(dead_lettered)) = outcome else {
+        panic!("expected the envelope from the dead-letter queue, got {outcome:?}");
+    };
+    assert_eq!(dead_lettered.envelope, Some(envelope));
+    assert_eq!(dead_lettered.expires_at, None);
+    assert_eq!(
+        dead_lettered
+            .dead_letter
+            .as_ref()
+            .map(|info| info.reason.as_str()),
+        Some("SchemaMismatch")
+    );
+    Ok(())
+}
+
 fn abandoning_at_the_delivery_limit_dead_letters_the_message<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
@@ -491,6 +577,7 @@ fn the_time_to_live_sweep_dead_letters_expired_messages<P: StoreProvider>(
             body: b"perishable".to_vec(),
             time_to_live_millis: Some(100),
             session_id: None,
+            envelope: None,
         },
     )?;
     let CommandOutcome::Sent { sequence } = sequence else {
@@ -529,6 +616,7 @@ fn a_receive_never_hands_out_an_expired_message<P: StoreProvider>(
             body: b"perishable".to_vec(),
             time_to_live_millis: Some(100),
             session_id: None,
+            envelope: None,
         },
     )?;
     send(&fixture, 11, "durable")?;
@@ -595,6 +683,7 @@ fn a_command_that_moves_time_backward_is_rejected<P: StoreProvider>(
                 body: Vec::new(),
                 time_to_live_millis: None,
                 session_id: None,
+                envelope: None,
             }
         ),
         Err(BrokerError::ClockRegression {
@@ -633,6 +722,7 @@ fn a_send_larger_than_the_queue_limit_is_rejected<P: StoreProvider>(
                 body: vec![0; 9],
                 time_to_live_millis: None,
                 session_id: None,
+                envelope: None,
             }
         ),
         Err(BrokerError::MessageTooLarge {
@@ -644,10 +734,29 @@ fn a_send_larger_than_the_queue_limit_is_rejected<P: StoreProvider>(
         fixture.at(
             11,
             CommandKind::Send {
-                message_id: String::from("exact"),
-                body: vec![0; 8],
+                message_id: String::from("oversized-envelope"),
+                body: Vec::new(),
                 time_to_live_millis: None,
                 session_id: None,
+                envelope: Some(MessageEnvelope::new(vec![0; 9])),
+            }
+        ),
+        Err(BrokerError::MessageTooLarge {
+            body_bytes: 9,
+            maximum_bytes: 8
+        })
+    );
+    assert_eq!(
+        fixture.at(
+            12,
+            CommandKind::Send {
+                message_id: String::from("exact-envelope"),
+                // When a lossless envelope is present it is the complete wire
+                // message, so its length is the authoritative size.
+                body: vec![0; 9],
+                time_to_live_millis: None,
+                session_id: None,
+                envelope: Some(MessageEnvelope::new(vec![0; 8])),
             }
         )?,
         CommandOutcome::Sent {
@@ -671,6 +780,7 @@ fn commands_against_a_missing_queue_are_rejected<P: StoreProvider>(
             body: Vec::new(),
             time_to_live_millis: None,
             session_id: None,
+            envelope: None,
         },
     );
 
@@ -846,6 +956,7 @@ for_each_backend! {
     an_elapsed_lock_cannot_be_renewed,
     settling_after_the_lock_elapsed_is_rejected,
     abandoning_returns_the_message_and_keeps_its_delivery_count,
+    a_protocol_envelope_survives_restart_redelivery_and_the_dead_letter_queue,
     abandoning_at_the_delivery_limit_dead_letters_the_message,
     an_elapsed_lock_returns_the_message_to_the_queue,
     an_elapsed_lock_dead_letters_at_the_delivery_limit,

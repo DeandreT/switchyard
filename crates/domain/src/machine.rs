@@ -14,9 +14,9 @@ use storage::{StateStore, WriteBatch};
 
 use crate::{
     AcceptedSession, BrokerError, Command, CommandKind, CommandOutcome, DeadLetterInfo,
-    DeadLetterReason, Delivery, DeliveryLock, EntityPath, LockToken, MessageRecord, MessageState,
-    NamespaceName, QueueConfig, QueueCounters, ReceiveMode, SequenceNumber, SessionHold, SessionId,
-    SessionLock, SessionRecord, Timestamp, codec, keys,
+    DeadLetterReason, Delivery, DeliveryLock, EntityPath, LockToken, MessageEnvelope,
+    MessageRecord, MessageState, NamespaceName, QueueConfig, QueueCounters, ReceiveMode,
+    SequenceNumber, SessionHold, SessionId, SessionLock, SessionRecord, Timestamp, codec, keys,
 };
 
 /// Ready entries a single receive may walk past while discarding expired
@@ -32,6 +32,14 @@ pub const TIMER_SCAN_LIMIT: usize = 256;
 /// `MAX_SESSION_SCAN` sessions are all held reports none available rather than
 /// walking an unbounded number of them, and the receiver retries.
 const MAX_SESSION_SCAN: usize = 32;
+
+struct SendInput<'a> {
+    message_id: &'a str,
+    body: &'a [u8],
+    time_to_live_millis: Option<u64>,
+    session_id: Option<&'a SessionId>,
+    envelope: Option<&'a MessageEnvelope>,
+}
 
 #[derive(Clone, Debug)]
 pub struct StateMachine<S> {
@@ -70,12 +78,16 @@ impl<S: StateStore> StateMachine<S> {
                 body,
                 time_to_live_millis,
                 session_id,
+                envelope,
             } => self.send(
                 command,
-                message_id,
-                body,
-                *time_to_live_millis,
-                session_id.as_ref(),
+                SendInput {
+                    message_id,
+                    body,
+                    time_to_live_millis: *time_to_live_millis,
+                    session_id: session_id.as_ref(),
+                    envelope: envelope.as_ref(),
+                },
                 &mut batch,
             )?,
             CommandKind::Receive {
@@ -371,20 +383,20 @@ impl<S: StateStore> StateMachine<S> {
     fn send(
         &self,
         command: &Command,
-        message_id: &str,
-        body: &[u8],
-        time_to_live_millis: Option<u64>,
-        session_id: Option<&SessionId>,
+        input: SendInput<'_>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
         if command.entity.is_dead_letter_queue() {
             return Err(BrokerError::DeadLetterQueueIsReserved);
         }
         let config = self.load_config(command)?;
-        require_session_agreement(&config, session_id.is_some())?;
-        if body.len() > config.max_message_bytes {
+        require_session_agreement(&config, input.session_id.is_some())?;
+        let message_bytes = input
+            .envelope
+            .map_or(input.body.len(), MessageEnvelope::len);
+        if message_bytes > config.max_message_bytes {
             return Err(BrokerError::MessageTooLarge {
-                body_bytes: body.len(),
+                body_bytes: message_bytes,
                 maximum_bytes: config.max_message_bytes,
             });
         }
@@ -393,20 +405,22 @@ impl<S: StateStore> StateMachine<S> {
         let sequence = SequenceNumber::new(counters.next_sequence);
         counters.next_sequence = counters.next_sequence.saturating_add(1);
 
-        let expires_at = time_to_live_millis
+        let expires_at = input
+            .time_to_live_millis
             .or(config.default_time_to_live_millis)
             .map(|millis| command.issued_at.saturating_add_millis(millis));
 
         let record = MessageRecord {
             sequence,
-            message_id: message_id.to_owned(),
-            body: body.to_vec(),
+            message_id: input.message_id.to_owned(),
+            body: input.body.to_vec(),
             enqueued_at: command.issued_at,
             expires_at,
             delivery_count: 0,
             state: MessageState::Ready,
-            session_id: session_id.cloned(),
+            session_id: input.session_id.cloned(),
             dead_letter: None,
+            envelope: input.envelope.cloned(),
         };
 
         let namespace = &command.namespace;
@@ -525,10 +539,12 @@ impl<S: StateStore> StateMachine<S> {
                 message_id: record.message_id,
                 body: record.body,
                 enqueued_at: record.enqueued_at,
+                expires_at: record.expires_at,
                 delivery_count,
                 lock,
                 session_id: record.session_id,
                 dead_letter: record.dead_letter,
+                envelope: record.envelope,
             })));
         }
 

@@ -9,6 +9,57 @@ pub type DeliveryTag = Binary;
 pub type Fields = OrderedMap<Symbol, Value>;
 pub type FilterSet = OrderedMap<Symbol, Value>;
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum AnnotationKey {
+    Symbol(Symbol),
+    Ulong(u64),
+}
+
+impl From<Symbol> for AnnotationKey {
+    fn from(value: Symbol) -> Self {
+        Self::Symbol(value)
+    }
+}
+
+impl From<&str> for AnnotationKey {
+    fn from(value: &str) -> Self {
+        Self::Symbol(Symbol::from(value))
+    }
+}
+
+impl From<u64> for AnnotationKey {
+    fn from(value: u64) -> Self {
+        Self::Ulong(value)
+    }
+}
+
+macro_rules! annotations_map {
+    ($name:ident) => {
+        #[derive(Clone, Debug, PartialEq)]
+        pub struct $name(pub OrderedMap<AnnotationKey, Value>);
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self(OrderedMap::new())
+            }
+        }
+
+        impl $name {
+            pub fn get(&self, key: &AnnotationKey) -> Option<&Value> {
+                self.0.get(key)
+            }
+
+            pub fn insert(&mut self, key: impl Into<AnnotationKey>, value: impl Into<Value>) {
+                self.0.insert(key.into(), value.into());
+            }
+        }
+    };
+}
+
+annotations_map!(DeliveryAnnotations);
+annotations_map!(MessageAnnotations);
+annotations_map!(Footer);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Role {
     Sender,
@@ -496,13 +547,25 @@ impl From<&str> for MessageId {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Header {
     pub durable: bool,
     pub priority: u8,
     pub ttl: Option<u32>,
     pub first_acquirer: bool,
     pub delivery_count: u32,
+}
+
+impl Default for Header {
+    fn default() -> Self {
+        Self {
+            durable: false,
+            priority: 4,
+            ttl: None,
+            first_acquirer: false,
+            delivery_count: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -555,7 +618,7 @@ impl ApplicationPropertiesBuilder {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Body {
     Data(Vec<Binary>),
-    Sequence(Vec<Value>),
+    Sequence(Vec<Vec<Value>>),
     Value(Value),
     #[default]
     Empty,
@@ -564,9 +627,12 @@ pub enum Body {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Message {
     pub header: Option<Header>,
+    pub delivery_annotations: Option<DeliveryAnnotations>,
+    pub message_annotations: Option<MessageAnnotations>,
     pub properties: Option<Properties>,
     pub application_properties: Option<ApplicationProperties>,
     pub body: Body,
+    pub footer: Option<Footer>,
 }
 
 impl Message {
@@ -585,6 +651,21 @@ impl Message {
 pub struct MessageBuilder(Message);
 
 impl MessageBuilder {
+    pub fn header(mut self, header: Header) -> Self {
+        self.0.header = Some(header);
+        self
+    }
+
+    pub fn delivery_annotations(mut self, annotations: DeliveryAnnotations) -> Self {
+        self.0.delivery_annotations = Some(annotations);
+        self
+    }
+
+    pub fn message_annotations(mut self, annotations: MessageAnnotations) -> Self {
+        self.0.message_annotations = Some(annotations);
+        self
+    }
+
     pub fn properties(mut self, properties: Properties) -> Self {
         self.0.properties = Some(properties);
         self
@@ -597,6 +678,11 @@ impl MessageBuilder {
 
     pub fn body(mut self, body: Body) -> Self {
         self.0.body = body;
+        self
+    }
+
+    pub fn footer(mut self, footer: Footer) -> Self {
+        self.0.footer = Some(footer);
         self
     }
 
@@ -658,5 +744,52 @@ impl fmt::Display for Error {
             write!(formatter, ": {description}")?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_builder_keeps_each_envelope_section() {
+        let header = Header {
+            durable: true,
+            ..Header::default()
+        };
+        let mut delivery_annotations = DeliveryAnnotations::default();
+        delivery_annotations.insert("delivery", 1_i32);
+        let mut message_annotations = MessageAnnotations::default();
+        message_annotations.insert(42_u64, 2_i32);
+        let mut footer = Footer::default();
+        footer.insert(Symbol::from("footer"), 3_i32);
+
+        let message = Message::builder()
+            .header(header.clone())
+            .delivery_annotations(delivery_annotations.clone())
+            .message_annotations(message_annotations.clone())
+            .footer(footer.clone())
+            .build();
+
+        assert_eq!(message.header, Some(header));
+        assert_eq!(message.delivery_annotations, Some(delivery_annotations));
+        assert_eq!(message.message_annotations, Some(message_annotations));
+        assert_eq!(message.footer, Some(footer));
+    }
+
+    #[test]
+    fn annotation_maps_accept_symbol_and_ulong_keys() {
+        let mut annotations = MessageAnnotations::default();
+        annotations.insert("symbol-key", "symbol-value");
+        annotations.insert(7_u64, "ulong-value");
+
+        assert_eq!(
+            annotations.get(&AnnotationKey::from("symbol-key")),
+            Some(&Value::String(String::from("symbol-value")))
+        );
+        assert_eq!(
+            annotations.get(&AnnotationKey::from(7_u64)),
+            Some(&Value::String(String::from("ulong-value")))
+        );
     }
 }

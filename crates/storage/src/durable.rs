@@ -7,7 +7,7 @@
 //!
 //! Two keyspaces are used. `records` holds exactly the keys the caller writes,
 //! so a scan or a snapshot never surfaces anything this module added of its own.
-//! `meta` holds the on-disk format version, which is checked on every open.
+//! `meta` holds the V1 on-disk format marker, which is checked on every open.
 
 use std::path::{Path, PathBuf};
 
@@ -15,22 +15,9 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 
 use crate::{Key, Mutation, StateStore, StorageError, StoreSnapshot, Value, WriteBatch};
 
-/// Version 1 of the durable layout: caller keys verbatim in `records`, and a
-/// big-endian format version in `meta`.
+/// The durable layout: caller keys verbatim in `records`, and a big-endian V1
+/// format marker in `meta`.
 pub const STORE_FORMAT_V1: u32 = 1;
-
-/// Version 2: the broker's keyspace moved dead-lettered messages out of their
-/// own tag and into shadow dead-letter queues. Same physical layout as
-/// version 1; the caller's keys mean different things.
-pub const STORE_FORMAT_V2: u32 = 2;
-
-/// The layout version this build reads and writes.
-///
-/// Bump it when the bytes in `records` change meaning — a different key
-/// encoding, or a keyspace split. An open refuses any other version in both
-/// directions, because reading a newer store as if it were this one would
-/// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V2;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
@@ -71,7 +58,7 @@ impl FjallStore {
                 batch.insert(
                     &meta,
                     FORMAT_VERSION_KEY,
-                    ACTIVE_STORE_FORMAT.to_be_bytes().to_vec(),
+                    STORE_FORMAT_V1.to_be_bytes().to_vec(),
                 );
                 batch.commit().map_err(|error| {
                     StorageError::backend("stamp the store format version", &error)
@@ -177,10 +164,10 @@ fn require_readable_format(recorded: &[u8]) -> Result<(), StorageError> {
         ),
     })?;
     let found = u32::from_be_bytes(bytes);
-    if found != ACTIVE_STORE_FORMAT {
+    if found != STORE_FORMAT_V1 {
         return Err(StorageError::UnsupportedStoreFormat {
             found,
-            expected: ACTIVE_STORE_FORMAT,
+            expected: STORE_FORMAT_V1,
         });
     }
     Ok(())
@@ -216,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn stamps_the_active_format_when_it_creates_a_store() -> Result<(), StorageError> {
+    fn stamps_version_one_when_it_creates_a_store() -> Result<(), StorageError> {
         let directory = TempDir::new().expect("a temporary directory");
         let store = FjallStore::open(directory.path())?;
         assert_eq!(store.directory(), directory.path());
@@ -230,15 +217,15 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_store_written_by_a_newer_format() -> Result<(), StorageError> {
+    fn refuses_a_store_with_any_other_format() -> Result<(), StorageError> {
         let directory = TempDir::new().expect("a temporary directory");
-        stamp_format(directory.path(), &(ACTIVE_STORE_FORMAT + 1).to_be_bytes())?;
+        stamp_format(directory.path(), &(STORE_FORMAT_V1 + 1).to_be_bytes())?;
 
         assert_eq!(
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
-                found: ACTIVE_STORE_FORMAT + 1,
-                expected: ACTIVE_STORE_FORMAT,
+                found: STORE_FORMAT_V1 + 1,
+                expected: STORE_FORMAT_V1,
             })
         );
         Ok(())

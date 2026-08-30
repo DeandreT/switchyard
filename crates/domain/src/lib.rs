@@ -30,7 +30,7 @@ pub use identifier::{
 pub use machine::{StateMachine, TIMER_SCAN_LIMIT};
 pub use message::{
     DeadLetterInfo, DeadLetterReason, Delivery, DeliveryGuarantee, DeliveryLock, LockToken,
-    MessageRecord, MessageState, ReceiveMode, SequenceNumber,
+    MessageEnvelope, MessageRecord, MessageState, ReceiveMode, SequenceNumber,
 };
 pub use queue::{
     DEFAULT_LOCK_DURATION_MILLIS, DEFAULT_MAX_DELIVERY_COUNT, DEFAULT_MAX_MESSAGE_BYTES,

@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Send, receive, renew, complete, abandon/redelivery, dead-letter, and DLQ receive/complete; session renew/state | Planned | Experimental gate on 7.20.2 |
+| Official .NET SDK, current stable | Send, receive, envelope fidelity, renew, complete, abandon/redelivery, dead-letter, and DLQ receive/complete; session renew/state; AMQP over TCP and WebSockets | Planned | Experimental gates on 7.20.2 |
 | Official .NET SDK, previous stable | Planned | Planned | Not implemented |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -21,9 +21,10 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Capability | Target release | Status |
 | --- | --- | --- |
 | AMQP 1.0 over TLS | Pre-1.0 | Protocol edge, Rust client end to end |
-| AMQP over WebSockets | Pre-1.0 | Not implemented |
+| AMQP over WebSockets | Pre-1.0 | Protocol edge, Rust and current .NET clients end to end |
 | SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. JWT: not implemented |
 | Queue send, receive, and settlement | Pre-1.0 | State machine, AMQP mapping, Rust and current .NET clients end to end |
+| AMQP message envelope fidelity | Pre-1.0 | Durable V1 envelope, broker-owned overlays, Rust and current .NET clients end to end |
 | Abandon and redelivery | Pre-1.0 | State machine, AMQP mapping, Rust and current .NET clients end to end |
 | Peek without lock acquisition | Pre-1.0 | Not implemented |
 | Receive-delete | Pre-1.0 | State machine, AMQP mapping |
@@ -99,7 +100,10 @@ actually releases what has elapsed.
 
 An AMQP 1.0 client can reach a queue. The node accepts AMQP over TLS with the
 socket secured before the protocol handshake, as Service Bus port 5671
-requires. Plain TCP remains available only in development mode. A configured
+requires. It also accepts the `AMQPWSB10` (and standardized `amqp`) binary
+WebSocket tunnel at `/$servicebus/websocket` over WSS, including the current
+official .NET client.
+Plain TCP remains available only in development mode. A configured
 shared-access policy accepts either SASL PLAIN credentials or SASL ANONYMOUS
 or Microsoft's equivalent `MSSBCBS` mechanism followed by a CBS SAS token. CBS
 grants are scoped to a namespace or entity and to Send, Listen, or Manage; they
@@ -118,14 +122,18 @@ state use the entity's `$management` request/reply links, as does message-lock
 renewal. Those operations require Manage authorization when authentication is
 enabled. A transfer is accepted only after its command committed, so the
 acknowledgement means durable. One node still serves one namespace. A message
-drained from a dead-letter queue carries its reason and description in the
-`DeadLetterReason` and `DeadLetterErrorDescription` application properties. The
+keeps its encoded AMQP envelope durably, including all legal body forms,
+identifier types, properties, annotations, application properties, and footer.
+On delivery, reserved sequence, enqueue, expiry, lock, delivery-count, and
+dead-letter fields are replaced with broker-authoritative values while custom
+content remains intact across redelivery and dead-lettering. A message drained
+from a dead-letter queue carries its source, reason, and description. The
 complete protocol coverage uses a Rust AMQP 1.0 client. The current stable
-official .NET SDK also has an opt-in gate for ordinary send, receive,
-message-lock renewal, completion, abandon and redelivery, custom dead-lettering,
-and dead-letter receive and completion plus session state, renewal, receive,
-and completion; the rest of that client gate remains incomplete. Dead-letter
-resubmission is not implemented.
+official .NET SDK also has opt-in gates for envelope fidelity, ordinary send,
+receive, message-lock renewal, completion, abandon and redelivery, custom
+dead-lettering, dead-letter receive and completion, session state and renewal,
+and AMQP-over-WebSockets; the rest of that client gate remains incomplete.
+Dead-letter resubmission is not implemented.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch
 before reporting it applied, and the same semantics suite runs against both

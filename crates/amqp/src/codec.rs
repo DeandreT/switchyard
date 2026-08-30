@@ -10,6 +10,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::types::*;
 
+mod message;
+
+pub use message::{decode_message, encode_message};
+
 pub const AMQP_PROTOCOL_ID: u8 = 0;
 pub const SASL_PROTOCOL_ID: u8 = 3;
 pub const AMQP_HEADER: [u8; 8] = *b"AMQP\x00\x01\x00\x00";
@@ -37,13 +41,6 @@ const RELEASED: u64 = 0x26;
 const MODIFIED: u64 = 0x27;
 const SOURCE: u64 = 0x28;
 const TARGET: u64 = 0x29;
-
-const HEADER: u64 = 0x70;
-const PROPERTIES: u64 = 0x73;
-const APPLICATION_PROPERTIES: u64 = 0x74;
-const DATA: u64 = 0x75;
-const AMQP_SEQUENCE: u64 = 0x76;
-const AMQP_VALUE: u64 = 0x77;
 
 const SASL_MECHANISMS: u64 = 0x40;
 const SASL_INIT: u64 = 0x41;
@@ -237,77 +234,6 @@ fn decode_frame(frame: &[u8]) -> io::Result<Frame> {
             "unsupported AMQP frame type {frame_type}"
         ))),
     }
-}
-
-pub fn encode_message(message: &Message) -> io::Result<Vec<u8>> {
-    let mut encoded = Vec::new();
-    if let Some(header) = &message.header {
-        append_value(&mut encoded, header_to_value(header))?;
-    }
-    if let Some(properties) = &message.properties {
-        append_value(&mut encoded, properties_to_value(properties))?;
-    }
-    if let Some(properties) = &message.application_properties {
-        append_value(&mut encoded, application_properties_to_value(properties))?;
-    }
-    match &message.body {
-        Body::Data(sections) => {
-            for section in sections {
-                append_value(
-                    &mut encoded,
-                    described(DATA, Value::Binary(section.clone())),
-                )?;
-            }
-        }
-        Body::Sequence(sequence) => {
-            append_value(
-                &mut encoded,
-                described(AMQP_SEQUENCE, Value::List(sequence.clone())),
-            )?;
-        }
-        Body::Value(value) => {
-            append_value(&mut encoded, described(AMQP_VALUE, value.clone()))?;
-        }
-        Body::Empty => {}
-    }
-    Ok(encoded)
-}
-
-pub fn decode_message(encoded: &[u8]) -> io::Result<Message> {
-    let mut message = Message::default();
-    let mut offset = 0;
-    let mut data = Vec::new();
-    while offset < encoded.len() {
-        let len = encoded_value_len(&encoded[offset..])?;
-        let value =
-            serde_amqp::from_slice(&encoded[offset..offset + len]).map_err(amqp_codec_error)?;
-        offset += len;
-
-        let (descriptor, value) = take_described(value)?;
-        match descriptor {
-            HEADER => message.header = Some(header_from_value(value)?),
-            PROPERTIES => message.properties = Some(properties_from_value(value)?),
-            APPLICATION_PROPERTIES => {
-                message.application_properties = Some(application_properties_from_value(value)?);
-            }
-            DATA => match value {
-                Value::Binary(section) => data.push(section),
-                _ => return Err(invalid_data("data section is not binary")),
-            },
-            AMQP_SEQUENCE => {
-                let Value::List(sequence) = value else {
-                    return Err(invalid_data("AMQP sequence body is not a list"));
-                };
-                message.body = Body::Sequence(sequence);
-            }
-            AMQP_VALUE => message.body = Body::Value(value),
-            _ => {}
-        }
-    }
-    if !data.is_empty() {
-        message.body = Body::Data(data);
-    }
-    Ok(message)
 }
 
 fn performative_to_value(performative: &Performative) -> io::Result<Value> {
@@ -880,138 +806,6 @@ fn error_from_value(value: Value) -> io::Result<Error> {
     })
 }
 
-fn header_to_value(header: &Header) -> Value {
-    described(
-        HEADER,
-        list(vec![
-            Value::Bool(header.durable),
-            Value::Ubyte(header.priority),
-            optional_u32(header.ttl),
-            Value::Bool(header.first_acquirer),
-            Value::Uint(header.delivery_count),
-        ]),
-    )
-}
-
-fn header_from_value(value: Value) -> io::Result<Header> {
-    let fields = take_list(value)?;
-    Ok(Header {
-        durable: bool_field(&fields, 0)?.unwrap_or(false),
-        priority: u8_field(&fields, 1)?.unwrap_or(4),
-        ttl: u32_field(&fields, 2)?,
-        first_acquirer: bool_field(&fields, 3)?.unwrap_or(false),
-        delivery_count: u32_field(&fields, 4)?.unwrap_or(0),
-    })
-}
-
-fn properties_to_value(properties: &Properties) -> Value {
-    described(
-        PROPERTIES,
-        list(vec![
-            properties
-                .message_id
-                .as_ref()
-                .map(message_id_to_value)
-                .unwrap_or(Value::Null),
-            properties
-                .user_id
-                .as_ref()
-                .map(|value| Value::Binary(value.clone()))
-                .unwrap_or(Value::Null),
-            optional_string(&properties.to),
-            optional_string(&properties.subject),
-            optional_string(&properties.reply_to),
-            properties
-                .correlation_id
-                .as_ref()
-                .map(message_id_to_value)
-                .unwrap_or(Value::Null),
-            properties
-                .content_type
-                .as_ref()
-                .map(|value| Value::Symbol(value.clone()))
-                .unwrap_or(Value::Null),
-            properties
-                .content_encoding
-                .as_ref()
-                .map(|value| Value::Symbol(value.clone()))
-                .unwrap_or(Value::Null),
-            properties
-                .absolute_expiry_time
-                .map(Value::Long)
-                .unwrap_or(Value::Null),
-            properties
-                .creation_time
-                .map(Value::Long)
-                .unwrap_or(Value::Null),
-            optional_string(&properties.group_id),
-            optional_u32(properties.group_sequence),
-            optional_string(&properties.reply_to_group_id),
-        ]),
-    )
-}
-
-fn properties_from_value(value: Value) -> io::Result<Properties> {
-    let fields = take_list(value)?;
-    Ok(Properties {
-        message_id: message_id_field(&fields, 0)?,
-        user_id: binary_field(&fields, 1)?,
-        to: string_field(&fields, 2)?,
-        subject: string_field(&fields, 3)?,
-        reply_to: string_field(&fields, 4)?,
-        correlation_id: message_id_field(&fields, 5)?,
-        content_type: symbol_field(&fields, 6)?,
-        content_encoding: symbol_field(&fields, 7)?,
-        absolute_expiry_time: i64_field(&fields, 8)?,
-        creation_time: i64_field(&fields, 9)?,
-        group_id: string_field(&fields, 10)?,
-        group_sequence: u32_field(&fields, 11)?,
-        reply_to_group_id: string_field(&fields, 12)?,
-    })
-}
-
-fn application_properties_to_value(properties: &ApplicationProperties) -> Value {
-    let mut map = OrderedMap::new();
-    for (key, value) in properties.0.iter() {
-        map.insert(Value::String(key.clone()), value.clone());
-    }
-    described(APPLICATION_PROPERTIES, Value::Map(map))
-}
-
-fn application_properties_from_value(value: Value) -> io::Result<ApplicationProperties> {
-    let Value::Map(map) = value else {
-        return Err(invalid_data("application properties are not a map"));
-    };
-    let mut properties = OrderedMap::new();
-    for (key, value) in map {
-        let Value::String(key) = key else {
-            return Err(invalid_data("application property key is not a string"));
-        };
-        properties.insert(key, value);
-    }
-    Ok(ApplicationProperties(properties))
-}
-
-fn message_id_to_value(message_id: &MessageId) -> Value {
-    match message_id {
-        MessageId::Ulong(value) => Value::Ulong(*value),
-        MessageId::Uuid(value) => Value::Uuid(value.clone()),
-        MessageId::Binary(value) => Value::Binary(value.clone()),
-        MessageId::String(value) => Value::String(value.clone()),
-    }
-}
-
-fn message_id_field(fields: &[Value], index: usize) -> io::Result<Option<MessageId>> {
-    Ok(match field(fields, index) {
-        Value::Null => None,
-        Value::Ulong(value) => Some(MessageId::Ulong(value)),
-        Value::Uuid(value) => Some(MessageId::Uuid(value)),
-        Value::Binary(value) => Some(MessageId::Binary(value)),
-        Value::String(value) => Some(MessageId::String(value)),
-        _ => return Err(invalid_data("invalid AMQP message id")),
-    })
-}
-
 fn unsettled_to_value(
     unsettled: &Option<OrderedMap<DeliveryTag, Option<DeliveryState>>>,
 ) -> io::Result<Value> {
@@ -1224,12 +1018,11 @@ fn u64_field(fields: &[Value], index: usize) -> io::Result<Option<u64>> {
     })
 }
 
-fn i64_field(fields: &[Value], index: usize) -> io::Result<Option<i64>> {
+fn timestamp_field(fields: &[Value], index: usize) -> io::Result<Option<i64>> {
     Ok(match field(fields, index) {
         Value::Null => None,
-        Value::Long(value) => Some(value),
         Value::Timestamp(value) => Some(value.milliseconds()),
-        _ => return Err(invalid_data("value is not long or timestamp")),
+        _ => return Err(invalid_data("value is not a timestamp")),
     })
 }
 
@@ -1338,94 +1131,4 @@ fn invalid_data(error: impl Into<String>) -> io::Error {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn round_trip(performative: Performative) {
-        let frame = Frame::Amqp {
-            channel: 3,
-            performative: Some(performative),
-            payload: b"payload".to_vec(),
-        };
-        let encoded = encode_frame(&frame).expect("frame encodes");
-        assert_eq!(decode_frame(&encoded).expect("frame decodes"), frame);
-    }
-
-    #[test]
-    fn transport_performatives_round_trip() {
-        round_trip(Performative::Open(Open::new("container")));
-        round_trip(Performative::Begin(Begin::default()));
-        round_trip(Performative::Attach(Box::new(Attach {
-            name: String::from("orders"),
-            handle: 7,
-            role: Role::Receiver,
-            snd_settle_mode: SenderSettleMode::Unsettled,
-            rcv_settle_mode: ReceiverSettleMode::Second,
-            source: Some(Source::new("orders")),
-            target: Some(Target::new("client")),
-            unsettled: None,
-            incomplete_unsettled: false,
-            initial_delivery_count: None,
-            max_message_size: Some(262_144),
-            offered_capabilities: None,
-            desired_capabilities: None,
-            properties: None,
-        })));
-        round_trip(Performative::Transfer(Transfer {
-            handle: 7,
-            delivery_id: Some(11),
-            delivery_tag: Some(Binary::from(vec![9; 16])),
-            message_format: Some(0),
-            settled: Some(false),
-            more: false,
-            rcv_settle_mode: None,
-            state: None,
-            resume: false,
-            aborted: false,
-            batchable: false,
-        }));
-        round_trip(Performative::Disposition(Disposition {
-            role: Role::Receiver,
-            first: 11,
-            last: None,
-            settled: false,
-            state: Some(DeliveryState::Accepted(Accepted)),
-            batchable: false,
-        }));
-    }
-
-    #[test]
-    fn message_sections_round_trip() {
-        let mut application_properties = ApplicationProperties::default();
-        application_properties.insert("status-code", 202_i32);
-        application_properties.insert("status-description", String::from("Accepted"));
-        let message = Message {
-            header: Some(Header {
-                ttl: Some(5000),
-                ..Header::default()
-            }),
-            properties: Some(Properties {
-                message_id: Some(MessageId::String(String::from("message-1"))),
-                group_id: Some(String::from("cart-1")),
-                ..Properties::default()
-            }),
-            application_properties: Some(application_properties),
-            body: Body::Data(vec![
-                Binary::from(b"one".to_vec()),
-                Binary::from(b"two".to_vec()),
-            ]),
-        };
-
-        let encoded = encode_message(&message).expect("message encodes");
-        assert_eq!(decode_message(&encoded).expect("message decodes"), message);
-    }
-
-    #[test]
-    fn sasl_performatives_round_trip() {
-        let frame = Frame::Sasl(SaslPerformative::Mechanisms(SaslMechanisms {
-            mechanisms: vec![Symbol::from("ANONYMOUS"), Symbol::from("PLAIN")],
-        }));
-        let encoded = encode_frame(&frame).expect("frame encodes");
-        assert_eq!(decode_frame(&encoded).expect("frame decodes"), frame);
-    }
-}
+mod tests;

@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceptedSession, Delivery, EntityPath, LockToken, NamespaceName, QueueConfig, ReceiveMode,
-    SequenceNumber, SessionHold, SessionId, Timestamp,
+    AcceptedSession, Delivery, EntityPath, LockToken, MessageEnvelope, NamespaceName, QueueConfig,
+    ReceiveMode, SequenceNumber, SessionHold, SessionId, Timestamp,
 };
 
 /// One replicated instruction for the broker state machine.
@@ -48,6 +48,9 @@ pub enum CommandKind {
         /// Required on a queue that requires sessions, and refused on one that
         /// does not.
         session_id: Option<SessionId>,
+        /// Lossless protocol-native message bytes. The broker keeps these
+        /// opaque while using the normalized fields above for its decisions.
+        envelope: Option<MessageEnvelope>,
     },
     Receive {
         mode: ReceiveMode,
