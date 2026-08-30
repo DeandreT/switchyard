@@ -8,9 +8,9 @@
 use std::{sync::Arc, time::Duration};
 
 use amqp::{
-    AmqpError, Attach, DeliveryTag, EngineError, Error as AmqpProtocolError, ErrorCondition,
-    Fields, LinkEndpoint, Outcome, Receiver, Role, Sender, SenderSettleMode, ServerConnection,
-    ServerSession,
+    AmqpError, Attach, DeliveryState, DeliveryTag, EngineError, Error as AmqpProtocolError,
+    ErrorCondition, Fields, LinkEndpoint, Outcome, Receiver, Role, Sender, SenderSettleMode,
+    ServerConnection, ServerSession,
 };
 use auth::{Permission, ResourceScope};
 use domain::{
@@ -974,13 +974,13 @@ async fn settle<B: Broker>(
     let outcome = match authorization {
         Some(authorization) => {
             tokio::select! {
-                outcome = sender.send(crate::write_delivery(&delivery), delivery_tag.clone()) => Some(outcome),
+                outcome = sender.send_unconfirmed(crate::write_delivery(&delivery), delivery_tag.clone()) => Some(outcome),
                 () = authorization.wait_until_unauthorized() => None,
             }
         }
         None => Some(
             sender
-                .send(crate::write_delivery(&delivery), delivery_tag)
+                .send_unconfirmed(crate::write_delivery(&delivery), delivery_tag)
                 .await,
         ),
     };
@@ -992,8 +992,20 @@ async fn settle<B: Broker>(
     if let Some(authorization) = authorization
         && authorization.ensure().await.is_err()
     {
+        sender
+            .confirm(DeliveryState::Rejected(amqp::Rejected {
+                error: Some(unauthorized_error(
+                    "the link's authorization expired before settlement committed",
+                )),
+            }))
+            .await?;
         return Ok(false);
     }
+
+    // Service Bus treats the sender's second-mode disposition as the result of
+    // applying the requested settlement operation, not as an echo of that
+    // request. Accepted means Complete, Abandon, or DeadLetter committed.
+    let confirmation = DeliveryState::Accepted(amqp::Accepted);
 
     let kind = match outcome {
         Outcome::Accepted(_) => CommandKind::Complete {
@@ -1002,15 +1014,15 @@ async fn settle<B: Broker>(
         },
         // Rejected means the client will never process it, so it goes to the
         // dead-letter queue rather than round again.
-        Outcome::Rejected(rejected) => CommandKind::DeadLetter {
-            sequence,
-            lock_token: lock.token,
-            reason: String::from("RejectedByReceiver"),
-            description: rejected
-                .error
-                .and_then(|error| error.description)
-                .unwrap_or_else(|| String::from("the receiver rejected the message")),
-        },
+        Outcome::Rejected(rejected) => {
+            let (reason, description) = dead_letter_details(rejected);
+            CommandKind::DeadLetter {
+                sequence,
+                lock_token: lock.token,
+                reason,
+                description,
+            }
+        }
         // Released and modified both mean "not now": back to the queue, with the
         // delivery count already incremented by the receive.
         Outcome::Released(_) | Outcome::Modified(_) => CommandKind::Abandon {
@@ -1019,10 +1031,18 @@ async fn settle<B: Broker>(
         },
     };
 
-    if let Err(rejection) = broker.submit(namespace.clone(), entity.clone(), kind).await {
-        // A settlement that fails is not fatal to the link: the lock expires and
-        // the message comes round again.
-        warn!(%sequence, %rejection, "settlement failed, leaving the lock to expire");
+    match broker.submit(namespace.clone(), entity.clone(), kind).await {
+        Ok(_) => sender.confirm(confirmation).await?,
+        Err(rejection) => {
+            sender
+                .confirm(DeliveryState::Rejected(amqp::Rejected {
+                    error: Some(rejection_error(&rejection)),
+                }))
+                .await?;
+            // A settlement that fails is not fatal to the link: the lock expires
+            // and the message comes round again.
+            warn!(%sequence, %rejection, "settlement failed, leaving the lock to expire");
+        }
     }
     Ok(true)
 }
@@ -1035,6 +1055,43 @@ fn lock_delivery_tag(token: LockToken) -> DeliveryTag {
 
 fn sequence_delivery_tag(sequence: domain::SequenceNumber) -> DeliveryTag {
     sequence.as_u64().to_be_bytes().to_vec().into()
+}
+
+/// Reads the Service Bus dead-letter contract from a rejected delivery.
+///
+/// The official clients put an application-supplied reason and description in
+/// the AMQP error's info map. A generic AMQP client may reject without either,
+/// in which case the stable Switchyard fallback still explains how the message
+/// reached the dead-letter queue.
+fn dead_letter_details(rejected: amqp::Rejected) -> (String, String) {
+    let Some(error) = rejected.error else {
+        return (
+            String::from("RejectedByReceiver"),
+            String::from("the receiver rejected the message"),
+        );
+    };
+
+    let reason = error
+        .info
+        .as_ref()
+        .and_then(|info| string_field(info, crate::DEAD_LETTER_REASON_PROPERTY))
+        .unwrap_or_else(|| String::from("RejectedByReceiver"));
+    let description = error
+        .info
+        .as_ref()
+        .and_then(|info| string_field(info, crate::DEAD_LETTER_DESCRIPTION_PROPERTY))
+        .or(error.description)
+        .unwrap_or_else(|| String::from("the receiver rejected the message"));
+    (reason, description)
+}
+
+fn string_field(fields: &Fields, name: &str) -> Option<String> {
+    fields
+        .get(&Symbol::from(name))
+        .and_then(|value| match value {
+            Value::String(value) => Some(value.clone()),
+            _ => None,
+        })
 }
 
 async fn detach_with(endpoint: LinkEndpoint, error: AmqpProtocolError) {
@@ -1116,6 +1173,45 @@ mod tests {
         assert_eq!(
             error.condition,
             ErrorCondition::Custom(Symbol::from(crate::NOT_FOUND))
+        );
+    }
+
+    #[test]
+    fn a_service_bus_rejection_keeps_its_dead_letter_details() {
+        let mut info = Fields::default();
+        info.insert(
+            Symbol::from(crate::DEAD_LETTER_REASON_PROPERTY),
+            Value::String(String::from("InvalidOrder")),
+        );
+        info.insert(
+            Symbol::from(crate::DEAD_LETTER_DESCRIPTION_PROPERTY),
+            Value::String(String::from("the order has no customer")),
+        );
+        let rejected = amqp::Rejected {
+            error: Some(AmqpProtocolError::new(
+                ErrorCondition::Custom(Symbol::from("com.microsoft:dead-letter")),
+                "the receiver rejected the message",
+                Some(info),
+            )),
+        };
+
+        assert_eq!(
+            dead_letter_details(rejected),
+            (
+                String::from("InvalidOrder"),
+                String::from("the order has no customer")
+            )
+        );
+    }
+
+    #[test]
+    fn a_generic_rejection_gets_stable_dead_letter_details() {
+        assert_eq!(
+            dead_letter_details(amqp::Rejected::default()),
+            (
+                String::from("RejectedByReceiver"),
+                String::from("the receiver rejected the message")
+            )
         );
     }
 }

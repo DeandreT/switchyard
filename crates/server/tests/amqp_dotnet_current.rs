@@ -15,7 +15,7 @@ const KEY: &str = "test-secret";
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires dotnet and a NuGet restore"]
-async fn current_stable_dotnet_client_completes_message_and_session_workflows()
+async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows()
 -> Result<(), Box<dyn Error>> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -109,13 +109,17 @@ async fn current_stable_dotnet_client_completes_message_and_session_workflows()
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("session renew/state passed"),
+        String::from_utf8_lossy(&output.stdout).contains(
+            "abandon/redelivery, dead-letter/DLQ receive/complete, and session renew/state passed"
+        ),
         "the client exited without reporting the completed workflow"
     );
+    let namespace = domain::NamespaceName::new("tenant")?;
+    let orders = domain::EntityPath::new("orders")?;
     assert_eq!(
         broker.handle().submit_blocking(
-            domain::NamespaceName::new("tenant")?,
-            domain::EntityPath::new("orders")?,
+            namespace.clone(),
+            orders.clone(),
             CommandKind::Receive {
                 mode: ReceiveMode::ReceiveAndDelete,
                 lock_duration_millis: None,
@@ -124,6 +128,19 @@ async fn current_stable_dotnet_client_completes_message_and_session_workflows()
         )?,
         CommandOutcome::Received(None),
         "the SDK returned from completion before the broker removed the message"
+    );
+    assert_eq!(
+        broker.handle().submit_blocking(
+            namespace,
+            orders.dead_letter_queue()?,
+            CommandKind::Receive {
+                mode: ReceiveMode::ReceiveAndDelete,
+                lock_duration_millis: None,
+                session: None,
+            },
+        )?,
+        CommandOutcome::Received(None),
+        "the SDK returned from DLQ completion before the broker removed the message"
     );
     Ok(())
 }

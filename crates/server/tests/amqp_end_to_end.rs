@@ -8,8 +8,9 @@ use std::error::Error;
 
 use amqp::{
     ApplicationProperties, Array, Body, ClientConnection as Connection, ClientReceiver as Receiver,
-    ClientSender as Sender, ClientSession as Session, FilterSet, Message, OrderedMap, Outcome,
-    Properties, SenderSettleMode, Source, Symbol, Uuid, Value,
+    ClientSender as Sender, ClientSession as Session, Error as AmqpError, ErrorCondition, Fields,
+    FilterSet, Message, Modified, OrderedMap, Outcome, Properties, SenderSettleMode, Source,
+    Symbol, Uuid, Value,
 };
 use domain::{CommandKind, QueueConfig, StateMachine};
 use server::{Broker, LocalProposer, ManualClock};
@@ -247,6 +248,31 @@ async fn a_released_message_comes_round_again() -> Result<(), Box<dyn Error>> {
 
     // Releasing abandons the lock, so the message returns to the queue with its
     // delivery count already counted against it.
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv()).await??;
+    assert_eq!(text_of(second.message()), "retry-me");
+    receiver.accept(&second).await?;
+
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_modified_message_comes_round_again() -> Result<(), Box<dyn Error>> {
+    let node = Node::start("orders", QueueConfig::default()).await?;
+
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
+    sender
+        .send(Message::builder().body(body("retry-me")).build())
+        .await?;
+
+    let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
+    let first = receiver.recv().await?;
+    // This is the outcome Azure.Messaging.ServiceBus sends for an abandon with
+    // no properties to modify.
+    receiver.modify(&first, Modified::default()).await?;
+
     let second = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv()).await??;
     assert_eq!(text_of(second.message()), "retry-me");
     receiver.accept(&second).await?;
@@ -655,6 +681,71 @@ async fn a_rejected_message_is_drained_from_the_dead_letter_queue() -> Result<()
     )
     .await;
     assert!(drained.is_err(), "the dead-letter queue still held it");
+
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_bus_rejection_preserves_custom_dead_letter_metadata()
+-> Result<(), Box<dyn Error>> {
+    let node = Node::start("orders", QueueConfig::default()).await?;
+
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
+    sender
+        .send(Message::builder().body(body("poison")).build())
+        .await?;
+
+    let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
+    let delivery = receiver.recv().await?;
+    // Azure.Messaging.ServiceBus puts custom dead-letter metadata in the info
+    // map of a rejection carrying this vendor condition.
+    let mut info = Fields::new();
+    info.insert(
+        Symbol::from(protocol_amqp::DEAD_LETTER_REASON_PROPERTY),
+        Value::String(String::from("InvalidOrder")),
+    );
+    info.insert(
+        Symbol::from(protocol_amqp::DEAD_LETTER_DESCRIPTION_PROPERTY),
+        Value::String(String::from("the order total is negative")),
+    );
+    receiver
+        .reject(
+            &delivery,
+            Some(AmqpError {
+                condition: ErrorCondition::Custom(Symbol::from("com.microsoft:dead-letter")),
+                description: None,
+                info: Some(info),
+            }),
+        )
+        .await?;
+
+    let mut dead_letter_receiver =
+        Receiver::attach(&mut session, "dlq-receiver", "orders/$deadletterqueue").await?;
+    let poisoned = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        dead_letter_receiver.recv(),
+    )
+    .await??;
+    assert_eq!(text_of(poisoned.message()), "poison");
+    let properties = poisoned
+        .message()
+        .application_properties
+        .as_ref()
+        .expect("a dead-lettered message carries its metadata");
+    assert_eq!(
+        properties.0.get(protocol_amqp::DEAD_LETTER_REASON_PROPERTY),
+        Some(&Value::String(String::from("InvalidOrder")))
+    );
+    assert_eq!(
+        properties
+            .0
+            .get(protocol_amqp::DEAD_LETTER_DESCRIPTION_PROPERTY),
+        Some(&Value::String(String::from("the order total is negative")))
+    );
+    dead_letter_receiver.accept(&poisoned).await?;
 
     connection.close().await?;
     Ok(())

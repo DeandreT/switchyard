@@ -71,6 +71,7 @@ pub struct Sender {
     handle: u32,
     commands: mpsc::Sender<Command>,
     detached: watch::Receiver<bool>,
+    pending_confirmation: Option<PendingConfirmation>,
 }
 
 pub struct Receiver {
@@ -259,6 +260,7 @@ impl ServerSession {
                 handle,
                 commands: self.commands.clone(),
                 detached,
+                pending_confirmation: None,
             }),
         })
     }
@@ -274,6 +276,27 @@ impl Sender {
         message: Message,
         delivery_tag: DeliveryTag,
     ) -> Result<Outcome, EngineError> {
+        let outcome = self.send_unconfirmed(message, delivery_tag).await?;
+        self.confirm(outcome_state(&outcome)).await?;
+        Ok(outcome)
+    }
+
+    /// Sends a delivery and returns the receiver's outcome before confirming
+    /// settlement back to it.
+    ///
+    /// A caller that needs to commit application state before acknowledging a
+    /// receiver-settle-mode `second` disposition must call [`Self::confirm`]
+    /// after that commit. Only one such delivery may be pending on a sender.
+    pub async fn send_unconfirmed(
+        &mut self,
+        message: Message,
+        delivery_tag: DeliveryTag,
+    ) -> Result<Outcome, EngineError> {
+        if self.pending_confirmation.is_some() {
+            return Err(invalid_state(
+                "send attempted before the previous outcome was confirmed",
+            ));
+        }
         let (reply, outcome) = oneshot::channel();
         self.commands
             .send(Command::Send {
@@ -285,7 +308,30 @@ impl Sender {
             })
             .await
             .map_err(|_| EngineError::Stopped)?;
-        outcome.await.map_err(|_| EngineError::Stopped)?
+        let remote = outcome.await.map_err(|_| EngineError::Stopped)??;
+        self.pending_confirmation = remote.confirmation;
+        Ok(remote.outcome)
+    }
+
+    /// Confirms the sender's final delivery state after the receiving
+    /// application has durably applied the requested outcome.
+    pub async fn confirm(&mut self, state: DeliveryState) -> Result<(), EngineError> {
+        let Some(confirmation) = self.pending_confirmation else {
+            return Ok(());
+        };
+        let result = request(&self.commands, |reply| Command::Confirm {
+            channel: self.channel,
+            handle: confirmation.handle,
+            delivery_id: confirmation.delivery_id,
+            state,
+            batchable: confirmation.batchable,
+            reply,
+        })
+        .await;
+        if result.is_ok() {
+            self.pending_confirmation = None;
+        }
+        result
     }
 
     pub async fn on_detach(&mut self) {
@@ -308,6 +354,15 @@ impl Sender {
             reply,
         })
         .await
+    }
+}
+
+fn outcome_state(outcome: &Outcome) -> DeliveryState {
+    match outcome {
+        Outcome::Accepted(value) => DeliveryState::Accepted(value.clone()),
+        Outcome::Rejected(value) => DeliveryState::Rejected(value.clone()),
+        Outcome::Released(value) => DeliveryState::Released(value.clone()),
+        Outcome::Modified(value) => DeliveryState::Modified(value.clone()),
     }
 }
 
@@ -441,7 +496,15 @@ enum Command {
         handle: u32,
         message: Box<Message>,
         delivery_tag: DeliveryTag,
-        reply: oneshot::Sender<Result<Outcome, EngineError>>,
+        reply: oneshot::Sender<Result<RemoteOutcome, EngineError>>,
+    },
+    Confirm {
+        channel: u16,
+        handle: u32,
+        delivery_id: u32,
+        state: DeliveryState,
+        batchable: bool,
+        reply: oneshot::Sender<Result<(), EngineError>>,
     },
     Settle {
         channel: u16,
@@ -480,14 +543,26 @@ struct SendingLink {
     delivery_count: u32,
     credit_limit: u64,
     queued: VecDeque<QueuedSend>,
-    unsettled: HashMap<u32, oneshot::Sender<Result<Outcome, EngineError>>>,
+    unsettled: HashMap<u32, oneshot::Sender<Result<RemoteOutcome, EngineError>>>,
     detached: watch::Sender<bool>,
 }
 
 struct QueuedSend {
     message: Message,
     delivery_tag: DeliveryTag,
-    reply: oneshot::Sender<Result<Outcome, EngineError>>,
+    reply: oneshot::Sender<Result<RemoteOutcome, EngineError>>,
+}
+
+struct RemoteOutcome {
+    outcome: Outcome,
+    confirmation: Option<PendingConfirmation>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingConfirmation {
+    handle: u32,
+    delivery_id: u32,
+    batchable: bool,
 }
 
 struct ReceivingLink {
@@ -623,7 +698,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
             receive_transfer(channel, transfer, payload, sessions).await?;
         }
         Performative::Disposition(disposition) => {
-            apply_disposition(channel, disposition, writer, sessions).await?;
+            apply_disposition(channel, disposition, sessions);
         }
         Performative::Detach(detach) => {
             if let Some(session) = sessions.get_mut(&channel)
@@ -810,6 +885,48 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 reply,
             });
             flush_sends(channel, handle, session, writer, remote_max_frame_size).await?;
+        }
+        Command::Confirm {
+            channel,
+            handle,
+            delivery_id,
+            state,
+            batchable,
+            reply,
+        } => {
+            let Some(session) = sessions.get(&channel) else {
+                let _ = reply.send(Err(invalid_state(
+                    "settlement confirmation on an unknown session",
+                )));
+                return Ok(CommandAction::Continue);
+            };
+            if !matches!(session.links.get(&handle), Some(LinkState::Sending(_))) {
+                let _ = reply.send(Err(invalid_state(
+                    "settlement confirmation on an unknown sending link",
+                )));
+                return Ok(CommandAction::Continue);
+            }
+            let result = write_amqp(
+                writer,
+                channel,
+                Performative::Disposition(Disposition {
+                    role: Role::Sender,
+                    first: delivery_id,
+                    last: None,
+                    settled: true,
+                    state: Some(state),
+                    batchable,
+                }),
+                Vec::new(),
+            )
+            .await;
+            let _ = reply.send(
+                result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| EngineError::InvalidState(error.to_string())),
+            );
+            result?;
         }
         Command::Settle {
             channel,
@@ -1011,7 +1128,10 @@ async fn flush_sends<W: AsyncWrite + Unpin>(
         )
         .await?;
         if settled {
-            let _ = queued.reply.send(Ok(Outcome::Accepted(Accepted)));
+            let _ = queued.reply.send(Ok(RemoteOutcome {
+                outcome: Outcome::Accepted(Accepted),
+                confirmation: None,
+            }));
         } else {
             link.unsettled.insert(delivery_id, queued.reply);
         }
@@ -1063,55 +1183,44 @@ async fn write_transfer<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn apply_disposition<W: AsyncWrite + Unpin>(
+fn apply_disposition(
     channel: u16,
     disposition: Disposition,
-    writer: &mut W,
     sessions: &mut HashMap<u16, SessionState>,
-) -> Result<(), EngineError> {
+) {
     if disposition.role != Role::Receiver {
-        return Ok(());
+        return;
     }
-    let Some(state) = disposition.state.clone() else {
-        return Ok(());
+    let Some(state) = disposition.state else {
+        return;
     };
-    let Ok(outcome) = Outcome::try_from(state.clone()) else {
-        return Ok(());
+    let Ok(outcome) = Outcome::try_from(state) else {
+        return;
     };
     let last = disposition.last.unwrap_or(disposition.first);
     let Some(session) = sessions.get_mut(&channel) else {
-        return Ok(());
+        return;
     };
-    let mut echo = false;
-    for link in session.links.values_mut() {
+    for (handle, link) in &mut session.links {
         let LinkState::Sending(link) = link else {
             continue;
         };
         for id in disposition.first..=last {
             if let Some(reply) = link.unsettled.remove(&id) {
-                echo |=
-                    link.receiver_settle_mode == ReceiverSettleMode::Second && !disposition.settled;
-                let _ = reply.send(Ok(outcome.clone()));
+                let confirmation = (link.receiver_settle_mode == ReceiverSettleMode::Second
+                    && !disposition.settled)
+                    .then_some(PendingConfirmation {
+                        handle: *handle,
+                        delivery_id: id,
+                        batchable: disposition.batchable,
+                    });
+                let _ = reply.send(Ok(RemoteOutcome {
+                    outcome: outcome.clone(),
+                    confirmation,
+                }));
             }
         }
     }
-    if echo {
-        write_amqp(
-            writer,
-            channel,
-            Performative::Disposition(Disposition {
-                role: Role::Sender,
-                first: disposition.first,
-                last: disposition.last,
-                settled: true,
-                state: Some(state),
-                batchable: disposition.batchable,
-            }),
-            Vec::new(),
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 fn stop_link(link: &mut LinkState) {
@@ -1164,7 +1273,36 @@ mod tests {
     use serde_amqp::primitives::Binary;
 
     use super::*;
-    use crate::{AmqpError, Source, Target};
+    use crate::{AmqpError, ErrorCondition, Rejected, Source, Target, Value};
+
+    fn sending_session(
+        channel: u16,
+        handle: u32,
+        delivery_id: u32,
+        receiver_settle_mode: ReceiverSettleMode,
+    ) -> (
+        HashMap<u16, SessionState>,
+        oneshot::Receiver<Result<RemoteOutcome, EngineError>>,
+    ) {
+        let (reply, outcome) = oneshot::channel();
+        let (detached, _detached) = watch::channel(false);
+        let link = SendingLink {
+            receiver_settle_mode,
+            settle_mode: SenderSettleMode::Mixed,
+            delivery_count: 0,
+            credit_limit: 0,
+            queued: VecDeque::new(),
+            unsettled: HashMap::from([(delivery_id, reply)]),
+            detached,
+        };
+        let session = SessionState {
+            attach_tx: None,
+            links: HashMap::from([(handle, LinkState::Sending(link))]),
+            pending_flows: HashMap::new(),
+            next_outgoing_id: 0,
+        };
+        (HashMap::from([(channel, session)]), outcome)
+    }
 
     #[test]
     fn a_link_role_selects_the_local_endpoint() {
@@ -1260,5 +1398,120 @@ mod tests {
             panic!("the remote receiver created a local sending link");
         };
         assert_eq!(link.credit_limit, 50);
+    }
+
+    #[tokio::test]
+    async fn second_mode_rejection_waits_for_an_accepted_confirmation() {
+        let channel = 3;
+        let handle = 1;
+        let delivery_id = 7;
+        let (mut sessions, outcome) =
+            sending_session(channel, handle, delivery_id, ReceiverSettleMode::Second);
+        let mut info = Fields::default();
+        info.insert(
+            Symbol::from("dead-letter-reason"),
+            Value::String(String::from("InvalidOrder")),
+        );
+        let rejected = Rejected {
+            error: Some(Error::new(
+                ErrorCondition::Custom(Symbol::from("com.microsoft:dead-letter")),
+                "the order has no customer",
+                Some(info),
+            )),
+        };
+
+        apply_disposition(
+            channel,
+            Disposition {
+                role: Role::Receiver,
+                first: delivery_id,
+                last: None,
+                settled: false,
+                state: Some(DeliveryState::Rejected(rejected.clone())),
+                batchable: true,
+            },
+            &mut sessions,
+        );
+
+        let remote = outcome
+            .await
+            .expect("the outcome reply remains live")
+            .expect("the receiver outcome is valid");
+        assert_eq!(remote.outcome, Outcome::Rejected(rejected));
+        let confirmation = remote
+            .confirmation
+            .expect("second mode leaves confirmation to the application");
+        assert_eq!(confirmation.delivery_id, delivery_id);
+        assert_eq!(confirmation.handle, handle);
+        assert!(confirmation.batchable);
+
+        let (mut wire, mut peer) = tokio::io::duplex(64 * 1024);
+        let (reply, response) = oneshot::channel();
+        handle_command(
+            Command::Confirm {
+                channel,
+                handle: confirmation.handle,
+                delivery_id: confirmation.delivery_id,
+                state: DeliveryState::Accepted(Accepted),
+                batchable: confirmation.batchable,
+                reply,
+            },
+            &mut wire,
+            &mut sessions,
+            u32::MAX,
+        )
+        .await
+        .expect("the confirmation is written");
+        response
+            .await
+            .expect("the confirmation reply remains live")
+            .expect("the confirmation succeeds");
+
+        let Frame::Amqp {
+            channel: written_channel,
+            performative: Some(Performative::Disposition(disposition)),
+            payload,
+        } = read_frame(&mut peer)
+            .await
+            .expect("the disposition decodes")
+        else {
+            panic!("expected an AMQP disposition frame");
+        };
+        assert_eq!(written_channel, channel);
+        assert!(payload.is_empty());
+        assert_eq!(disposition.role, Role::Sender);
+        assert_eq!(disposition.first, delivery_id);
+        assert_eq!(disposition.last, None);
+        assert!(disposition.settled);
+        assert_eq!(disposition.state, Some(DeliveryState::Accepted(Accepted)));
+        assert!(disposition.batchable);
+    }
+
+    #[tokio::test]
+    async fn first_mode_rejection_needs_no_confirmation() {
+        let channel = 3;
+        let delivery_id = 7;
+        let (mut sessions, outcome) =
+            sending_session(channel, 1, delivery_id, ReceiverSettleMode::First);
+
+        apply_disposition(
+            channel,
+            Disposition {
+                role: Role::Receiver,
+                first: delivery_id,
+                last: None,
+                settled: false,
+                state: Some(DeliveryState::Rejected(Rejected::default())),
+                batchable: false,
+            },
+            &mut sessions,
+        );
+
+        let remote = outcome
+            .await
+            .expect("the outcome reply remains live")
+            .expect("the receiver outcome is valid");
+        assert_eq!(remote.outcome, Outcome::Rejected(Rejected::default()));
+        assert!(remote.confirmation.is_none());
     }
 }

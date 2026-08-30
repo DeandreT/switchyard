@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Send, receive, renew and complete; session renew/state | Planned | Experimental gate on 7.20.2 |
+| Official .NET SDK, current stable | Send, receive, renew, complete, abandon/redelivery, dead-letter, and DLQ receive/complete; session renew/state | Planned | Experimental gate on 7.20.2 |
 | Official .NET SDK, previous stable | Planned | Planned | Not implemented |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -23,7 +23,8 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | AMQP 1.0 over TLS | Pre-1.0 | Protocol edge, Rust client end to end |
 | AMQP over WebSockets | Pre-1.0 | Not implemented |
 | SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. JWT: not implemented |
-| Queue send, receive, and settlement | Pre-1.0 | State machine |
+| Queue send, receive, and settlement | Pre-1.0 | State machine, AMQP mapping, Rust and current .NET clients end to end |
+| Abandon and redelivery | Pre-1.0 | State machine, AMQP mapping, Rust and current .NET clients end to end |
 | Peek without lock acquisition | Pre-1.0 | Not implemented |
 | Receive-delete | Pre-1.0 | State machine, AMQP mapping |
 | Lock expiry and redelivery | Pre-1.0 | State machine |
@@ -33,8 +34,8 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
 | Scheduling and cancellation | Pre-1.0 | Not implemented |
 | Deferral and deferred receive | Pre-1.0 | Not implemented |
-| Dead-letter | Pre-1.0 | State machine, AMQP mapping |
-| Dead-letter receive and resubmit | Pre-1.0 | Receive: state machine, AMQP mapping. Resubmit: not implemented |
+| Dead-letter | Pre-1.0 | State machine, AMQP mapping, Rust and current .NET clients end to end |
+| Dead-letter receive and resubmit | Pre-1.0 | Receive: state machine, AMQP mapping, Rust and current .NET clients end to end. Resubmit: not implemented |
 | Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Duplicate detection | Pre-1.0 | Not implemented |
 | Same-placement-group transactions | Pre-1.0 | Not implemented |
@@ -121,8 +122,10 @@ drained from a dead-letter queue carries its reason and description in the
 `DeadLetterReason` and `DeadLetterErrorDescription` application properties. The
 complete protocol coverage uses a Rust AMQP 1.0 client. The current stable
 official .NET SDK also has an opt-in gate for ordinary send, receive,
-message-lock renewal, and completion plus session state, renewal, receive, and
-completion; the rest of that client gate remains incomplete.
+message-lock renewal, completion, abandon and redelivery, custom dead-lettering,
+and dead-letter receive and completion plus session state, renewal, receive,
+and completion; the rest of that client gate remains incomplete. Dead-letter
+resubmission is not implemented.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch
 before reporting it applied, and the same semantics suite runs against both
