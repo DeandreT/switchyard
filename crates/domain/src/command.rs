@@ -90,12 +90,37 @@ pub enum CommandKind {
     Abandon {
         sequence: SequenceNumber,
         lock_token: LockToken,
+        /// An updated protocol envelope after applying properties-to-modify.
+        /// `None` keeps the envelope that arrived with the send.
+        replacement_envelope: Option<MessageEnvelope>,
+    },
+    /// Removes a locked message from ordinary delivery until a receiver asks
+    /// for its sequence number explicitly.
+    Defer {
+        sequence: SequenceNumber,
+        lock_token: LockToken,
+        /// An updated protocol envelope after applying properties-to-modify.
+        /// `None` keeps the envelope that arrived with the send.
+        replacement_envelope: Option<MessageEnvelope>,
+    },
+    /// Atomically retrieves explicitly deferred messages in caller order.
+    ReceiveDeferred {
+        sequences: Vec<SequenceNumber>,
+        mode: ReceiveMode,
+        /// Overrides the queue default when set.
+        lock_duration_millis: Option<u64>,
+        /// Required on a queue that requires sessions. Every requested message
+        /// must belong to the held session.
+        session: Option<SessionHold>,
     },
     DeadLetter {
         sequence: SequenceNumber,
         lock_token: LockToken,
         reason: String,
         description: String,
+        /// An updated protocol envelope after applying properties-to-modify.
+        /// `None` keeps the envelope that arrived with the send.
+        replacement_envelope: Option<MessageEnvelope>,
     },
     /// Extends a message lock without changing its token.
     RenewLock {
@@ -158,9 +183,16 @@ pub enum CommandOutcome {
     Abandoned {
         dead_lettered: bool,
     },
+    Deferred,
+    /// Live requested messages, in caller order. An expired deferred message
+    /// is moved to the dead-letter queue and omitted.
+    DeferredReceived(Vec<Delivery>),
     DeadLettered,
     LockRenewed {
         locked_until: Timestamp,
+        /// Effective duration used to extend the lock, after applying any
+        /// per-renewal override.
+        lock_duration_millis: u64,
     },
     LocksExpired {
         returned_to_ready: u32,

@@ -85,6 +85,7 @@ fn a_peek_lock_delivery_hides_the_message_from_other_receivers<P: StoreProvider>
         locked(&delivery).locked_until,
         Timestamp::from_millis(20 + LOCK_MILLIS)
     );
+    assert_eq!(locked(&delivery).lock_duration_millis, LOCK_MILLIS);
 
     // The lock is still held, so a second receiver sees an empty queue.
     assert_eq!(receive(&fixture, 21)?, None);
@@ -180,11 +181,13 @@ fn a_foreign_lock_token_cannot_settle_a_message<P: StoreProvider>(
 fn renewing_a_lock_moves_its_deadline_without_changing_its_token<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
+    const RENEW_MILLIS: u64 = 60_000;
+
     let fixture = queue(provider)?;
     send(&fixture, 10, "first")?;
     let delivery = receive(&fixture, 20)?.expect("the queue holds one message");
     let lock = locked(&delivery);
-    let renewed_until = Timestamp::from_millis(100 + LOCK_MILLIS);
+    let renewed_until = Timestamp::from_millis(100 + RENEW_MILLIS);
 
     assert_eq!(
         fixture.at(
@@ -192,11 +195,12 @@ fn renewing_a_lock_moves_its_deadline_without_changing_its_token<P: StoreProvide
             CommandKind::RenewLock {
                 sequence: delivery.sequence,
                 lock_token: lock.token,
-                lock_duration_millis: None,
+                lock_duration_millis: Some(RENEW_MILLIS),
             }
         )?,
         CommandOutcome::LockRenewed {
-            locked_until: renewed_until
+            locked_until: renewed_until,
+            lock_duration_millis: RENEW_MILLIS,
         }
     );
     assert_eq!(
@@ -208,6 +212,7 @@ fn renewing_a_lock_moves_its_deadline_without_changing_its_token<P: StoreProvide
         MessageState::Locked {
             token: lock.token,
             locked_until: renewed_until,
+            origin: domain::DeliveryOrigin::Ready,
         }
     );
 
@@ -327,6 +332,7 @@ fn abandoning_returns_the_message_and_keeps_its_delivery_count<P: StoreProvider>
             CommandKind::Abandon {
                 sequence: first.sequence,
                 lock_token: locked(&first).token,
+                replacement_envelope: None,
             }
         )?,
         CommandOutcome::Abandoned {
@@ -377,6 +383,7 @@ fn a_protocol_envelope_survives_restart_redelivery_and_the_dead_letter_queue<P: 
         CommandKind::Abandon {
             sequence,
             lock_token: locked(&first).token,
+            replacement_envelope: None,
         },
     )?;
 
@@ -389,6 +396,7 @@ fn a_protocol_envelope_survives_restart_redelivery_and_the_dead_letter_queue<P: 
             lock_token: locked(&second).token,
             reason: String::from("SchemaMismatch"),
             description: String::from("message could not be processed"),
+            replacement_envelope: None,
         },
     )?;
 
@@ -437,6 +445,7 @@ fn abandoning_at_the_delivery_limit_dead_letters_the_message<P: StoreProvider>(
         CommandKind::Abandon {
             sequence,
             lock_token: locked(&first).token,
+            replacement_envelope: None,
         },
     )?;
 
@@ -449,6 +458,7 @@ fn abandoning_at_the_delivery_limit_dead_letters_the_message<P: StoreProvider>(
             CommandKind::Abandon {
                 sequence,
                 lock_token: locked(&second).token,
+                replacement_envelope: None,
             }
         )?,
         CommandOutcome::Abandoned {
@@ -649,6 +659,7 @@ fn an_application_can_dead_letter_a_locked_message<P: StoreProvider>(
                 lock_token: locked(&delivery).token,
                 reason: String::from("SchemaMismatch"),
                 description: String::from("order payload failed validation"),
+                replacement_envelope: None,
             }
         )?,
         CommandOutcome::DeadLettered

@@ -267,6 +267,16 @@ async fn cbs_grants_send_but_not_listen() -> Result<(), Box<dyn Error>> {
         Outcome::Accepted(_)
     ));
 
+    let mut management =
+        Sender::attach(&mut session, "forbidden-management", "orders/$management").await?;
+    assert!(
+        management
+            .send(Message::builder().body(Body::Value(Value::Null)).build())
+            .await
+            .is_err(),
+        "a Send grant also granted access to receive-side management operations"
+    );
+
     let mut receiver = Receiver::attach(&mut session, "forbidden-receiver", "orders").await?;
     let refused = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await?;
     assert!(refused.is_err(), "a Send grant also granted Listen");
@@ -312,6 +322,49 @@ async fn cbs_grants_listen_but_not_send() -> Result<(), Box<dyn Error>> {
         put_token(&mut session, sas_token(AUDIENCE, expiry_after(60))).await?,
         202
     );
+
+    let reply_to = "authorized-management-replies";
+    let mut management_responses = Receiver::builder()
+        .name("authorized-management-response")
+        .source("orders/$management")
+        .target(reply_to)
+        .attach(&mut session)
+        .await?;
+    let mut management_requests = Sender::attach(
+        &mut session,
+        "authorized-management-request",
+        "orders/$management",
+    )
+    .await?;
+    let request = Message::builder()
+        .properties(Properties {
+            message_id: Some("listen-management-1".into()),
+            reply_to: Some(reply_to.to_owned()),
+            ..Properties::default()
+        })
+        .application_properties(
+            ApplicationProperties::builder()
+                .insert("operation", "unsupported-auth-probe")
+                .build(),
+        )
+        .body(Body::Value(Value::Null))
+        .build();
+    assert!(matches!(
+        management_requests.send(request).await?,
+        Outcome::Accepted(_)
+    ));
+    let management_response =
+        tokio::time::timeout(Duration::from_secs(2), management_responses.recv()).await??;
+    assert_eq!(
+        management_response
+            .message()
+            .application_properties
+            .as_ref()
+            .and_then(|properties| properties.get("statusCode")),
+        Some(&Value::Int(400)),
+        "a Listen grant did not reach management request processing"
+    );
+    management_responses.accept(&management_response).await?;
 
     let mut receiver = Receiver::attach(&mut session, "authorized-receiver", "orders").await?;
     let delivery = receiver.recv().await?;

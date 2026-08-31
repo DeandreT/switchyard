@@ -7,6 +7,8 @@
 //! - the lock index sorts by lock deadline, so the expiry sweep stops at the
 //!   first entry that has not elapsed;
 //! - the expiry index sorts by message deadline for the same reason;
+//! - the deferred index sorts by sequence number for explicit retrieval and
+//!   browsing without making those messages ordinarily ready;
 //! - the session ready index sorts by session first and sequence second, so one
 //!   session's messages are contiguous and in order within the group, and a
 //!   receiver looking for a session to accept walks the groups in turn;
@@ -27,6 +29,7 @@ const TAG_MESSAGE: u8 = 0x03;
 const TAG_READY: u8 = 0x04;
 const TAG_LOCK: u8 = 0x05;
 const TAG_EXPIRY: u8 = 0x06;
+const TAG_DEFERRED: u8 = 0x07;
 const TAG_SESSION: u8 = 0x08;
 const TAG_SESSION_READY: u8 = 0x09;
 const TAG_SESSION_LOCK: u8 = 0x0A;
@@ -138,6 +141,18 @@ pub fn expiry(
 ) -> Vec<u8> {
     let key = with_u64(expiry_prefix(namespace, entity), expires_at.as_millis());
     with_u64(key, sequence.as_u64())
+}
+
+pub fn deferred_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_DEFERRED, namespace, entity)
+}
+
+pub fn deferred(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
+    with_u64(deferred_prefix(namespace, entity), sequence.as_u64())
 }
 
 /// The record holding one session's lock and state.

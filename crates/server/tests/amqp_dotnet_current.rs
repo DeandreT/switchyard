@@ -49,7 +49,7 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
         ResourceScope::namespace(HOST)?,
         SharedAccessKey::new(KEY)?,
         None,
-        PermissionSet::MANAGE,
+        PermissionSet::SEND | PermissionSet::LISTEN,
     )?;
     let authentication =
         protocol_amqp::SharedAccessAuthentication::new(SharedAccessPolicy::new([rule])?, HOST)?
@@ -112,8 +112,10 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
     assert!(
         String::from_utf8_lossy(&output.stdout).contains(concat!(
             "batch send/prefetch/concurrent settlement, envelope fidelity, ",
-            "send/receive/renew/complete, abandon/redelivery, ",
-            "dead-letter/DLQ receive/complete, and session renew/state passed"
+            "send/receive/renew/complete, abandon/redelivery/property-update, ",
+            "dead-letter/DLQ receive/complete, ",
+            "defer/deferred-receive/management-disposition, ",
+            "and session renew/state passed"
         )),
         "the client exited without reporting the completed workflow"
     );

@@ -530,6 +530,7 @@ fn an_abandoned_message_returns_to_its_own_session_order<P: StoreProvider>(
         CommandKind::Abandon {
             sequence: first.sequence,
             lock_token: first.lock.expect("a peek-lock delivery is locked").token,
+            replacement_envelope: None,
         },
     )?;
 

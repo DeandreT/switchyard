@@ -48,7 +48,7 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
         ResourceScope::namespace(HOST)?,
         SharedAccessKey::new(KEY)?,
         None,
-        PermissionSet::MANAGE,
+        PermissionSet::SEND | PermissionSet::LISTEN,
     )?;
     let authentication =
         protocol_amqp::SharedAccessAuthentication::new(SharedAccessPolicy::new([rule])?, HOST)?
@@ -118,7 +118,7 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
     );
     assert!(
         String::from_utf8_lossy(&output.stdout).contains(
-            "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, send/receive/complete, and session attach passed"
+            "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, send/receive/complete, defer/deferred-receive, and session attach passed"
         ),
         "the client exited without reporting the completed WebSocket workflow"
     );

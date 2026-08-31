@@ -9,6 +9,7 @@
 //! Nothing here reads a clock, generates a random value, or performs I/O beyond
 //! the injected store.
 
+mod deferred;
 mod send;
 
 use serde::de::DeserializeOwned;
@@ -16,17 +17,25 @@ use storage::{StateStore, WriteBatch};
 
 use crate::{
     AcceptedSession, BrokerError, Command, CommandKind, CommandOutcome, DeadLetterInfo,
-    DeadLetterReason, Delivery, DeliveryLock, EntityPath, LockToken, MessageRecord, MessageState,
-    NamespaceName, QueueConfig, QueueCounters, ReceiveMode, SequenceNumber, SessionHold, SessionId,
-    SessionLock, SessionRecord, Timestamp, codec, keys,
+    DeadLetterReason, Delivery, DeliveryLock, DeliveryOrigin, EntityPath, LockToken,
+    MessageEnvelope, MessageRecord, MessageState, NamespaceName, QueueConfig, QueueCounters,
+    ReceiveMode, SequenceNumber, SessionHold, SessionId, SessionLock, SessionRecord, Timestamp,
+    codec, keys,
 };
 
+use self::deferred::replace_envelope;
 use self::send::SendInput;
 
 /// Ready entries a single receive may walk past while discarding expired
 /// messages. Bounds the work one command performs so a large backlog of
 /// expired messages cannot stall the group.
 const MAX_RECEIVE_SCAN: usize = 32;
+
+/// Sequence numbers accepted by one atomic deferred receive.
+///
+/// This matches the receiving-link in-flight bound and prevents one management
+/// request from constructing an unbounded storage batch.
+pub const MAX_DEFERRED_RECEIVE_BATCH: usize = 32;
 
 /// Index entries a single timer sweep may process. A sweep that reports this
 /// many may have more waiting, so the worker proposes another command.
@@ -107,18 +116,51 @@ impl<S: StateStore> StateMachine<S> {
             CommandKind::Abandon {
                 sequence,
                 lock_token,
-            } => self.abandon(command, *sequence, *lock_token, &mut batch)?,
+                replacement_envelope,
+            } => self.abandon(
+                command,
+                *sequence,
+                *lock_token,
+                replacement_envelope.as_ref(),
+                &mut batch,
+            )?,
+            CommandKind::Defer {
+                sequence,
+                lock_token,
+                replacement_envelope,
+            } => self.defer(
+                command,
+                *sequence,
+                *lock_token,
+                replacement_envelope.as_ref(),
+                &mut batch,
+            )?,
+            CommandKind::ReceiveDeferred {
+                sequences,
+                mode,
+                lock_duration_millis,
+                session,
+            } => self.receive_deferred(
+                command,
+                sequences,
+                *mode,
+                *lock_duration_millis,
+                session.as_ref(),
+                &mut batch,
+            )?,
             CommandKind::DeadLetter {
                 sequence,
                 lock_token,
                 reason,
                 description,
+                replacement_envelope,
             } => self.dead_letter(
                 command,
                 *sequence,
                 *lock_token,
                 reason,
                 description,
+                replacement_envelope.as_ref(),
                 &mut batch,
             )?,
             CommandKind::RenewLock {
@@ -262,6 +304,17 @@ impl<S: StateStore> StateMachine<S> {
         limit: usize,
     ) -> Result<Vec<SequenceNumber>, BrokerError> {
         self.index_sequences(&keys::ready_prefix(namespace, entity), limit)
+    }
+
+    /// Deferred sequences remain entity-local but outside the ordinary ready
+    /// index until explicitly requested.
+    pub fn deferred_sequences(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+        limit: usize,
+    ) -> Result<Vec<SequenceNumber>, BrokerError> {
+        self.index_sequences(&keys::deferred_prefix(namespace, entity), limit)
     }
 
     /// Sequences ready in the entity's dead-letter queue, in order.
@@ -431,15 +484,24 @@ impl<S: StateStore> StateMachine<S> {
                     let token = LockToken::new(counters.next_lock_token);
                     counters.next_lock_token = counters.next_lock_token.saturating_add(1);
 
-                    let locked_until = command.issued_at.saturating_add_millis(
-                        lock_duration_millis.unwrap_or(config.lock_duration_millis),
-                    );
+                    let lock_duration_millis =
+                        lock_duration_millis.unwrap_or(config.lock_duration_millis);
+                    let locked_until = command
+                        .issued_at
+                        .saturating_add_millis(lock_duration_millis);
                     record.state = MessageState::Locked {
                         token,
                         locked_until,
+                        origin: DeliveryOrigin::Ready,
                     };
 
                     batch.push_delete(ready_key.clone());
+                    // TTL does not invalidate a live lock. The expiry index is
+                    // restored on abandon/lock expiry, or discarded on a
+                    // successful settlement.
+                    if let Some(expires_at) = record.expires_at {
+                        batch.push_delete(keys::expiry(namespace, entity, expires_at, sequence));
+                    }
                     batch.push_put(
                         keys::message(namespace, entity, sequence),
                         codec::encode(&record)?,
@@ -455,6 +517,7 @@ impl<S: StateStore> StateMachine<S> {
                     Some(DeliveryLock {
                         token,
                         locked_until,
+                        lock_duration_millis,
                     })
                 }
                 // At-most-once: the deletion commits before the transfer, so a
@@ -476,6 +539,7 @@ impl<S: StateStore> StateMachine<S> {
                 enqueued_at: record.enqueued_at,
                 expires_at: record.expires_at,
                 delivery_count,
+                origin: DeliveryOrigin::Ready,
                 lock,
                 session_id: record.session_id,
                 dead_letter: record.dead_letter,
@@ -493,7 +557,7 @@ impl<S: StateStore> StateMachine<S> {
         lock_token: LockToken,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
-        let (record, locked_until) = self.held_lock(command, sequence, lock_token)?;
+        let (record, locked_until, _) = self.held_lock(command, sequence, lock_token)?;
         let namespace = &command.namespace;
         let entity = &command.entity;
 
@@ -510,10 +574,27 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         sequence: SequenceNumber,
         lock_token: LockToken,
+        replacement_envelope: Option<&MessageEnvelope>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
         let config = self.load_config(command)?;
-        let (mut record, locked_until) = self.held_lock(command, sequence, lock_token)?;
+        let (mut record, locked_until, origin) = self.held_lock(command, sequence, lock_token)?;
+        replace_envelope(&config, &mut record, replacement_envelope)?;
+
+        // Expiration is suspended while a receiver owns the lock. Once that
+        // receiver gives it up, TTL takes precedence over redelivery.
+        if record.is_expired_at(command.issued_at) {
+            self.move_to_dead_letter(
+                command,
+                record,
+                DeadLetterReason::TimeToLiveExpired,
+                String::from("the message exceeded its time to live"),
+                batch,
+            )?;
+            return Ok(CommandOutcome::Abandoned {
+                dead_lettered: true,
+            });
+        }
 
         if exceeded_delivery_limit(command, &config, &record) {
             self.move_to_dead_letter(
@@ -528,22 +609,13 @@ impl<S: StateStore> StateMachine<S> {
             });
         }
 
-        let namespace = &command.namespace;
-        let entity = &command.entity;
-        record.state = MessageState::Ready;
-        batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
-        batch.push_put(
-            keys::message(namespace, entity, sequence),
-            codec::encode(&record)?,
-        );
-        // Back into its own session's order on a session queue, so an abandon
-        // does not move a message ahead of its siblings.
-        batch.push_put(self.ready_key(command, &record), Vec::new());
+        self.return_unsettled(command, record, locked_until, origin, batch)?;
         Ok(CommandOutcome::Abandoned {
             dead_lettered: false,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dead_letter(
         &self,
         command: &Command,
@@ -551,9 +623,12 @@ impl<S: StateStore> StateMachine<S> {
         lock_token: LockToken,
         reason: &str,
         description: &str,
+        replacement_envelope: Option<&MessageEnvelope>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
-        let (record, _) = self.held_lock(command, sequence, lock_token)?;
+        let config = self.load_config(command)?;
+        let (mut record, _, _) = self.held_lock(command, sequence, lock_token)?;
+        replace_envelope(&config, &mut record, replacement_envelope)?;
         self.move_to_dead_letter(
             command,
             record,
@@ -587,11 +662,24 @@ impl<S: StateStore> StateMachine<S> {
                 break;
             }
 
-            let mut record = self
+            let record = self
                 .message(namespace, entity, sequence)?
                 .ok_or(BrokerError::DanglingIndexEntry { sequence })?;
+            let origin = match record.state {
+                MessageState::Locked { origin, .. } => origin,
+                _ => return Err(BrokerError::MessageNotLocked { sequence }),
+            };
 
-            if exceeded_delivery_limit(command, &config, &record) {
+            if record.is_expired_at(command.issued_at) {
+                self.move_to_dead_letter(
+                    command,
+                    record,
+                    DeadLetterReason::TimeToLiveExpired,
+                    String::from("the message exceeded its time to live"),
+                    batch,
+                )?;
+                dead_lettered += 1;
+            } else if exceeded_delivery_limit(command, &config, &record) {
                 self.move_to_dead_letter(
                     command,
                     record,
@@ -601,13 +689,7 @@ impl<S: StateStore> StateMachine<S> {
                 )?;
                 dead_lettered += 1;
             } else {
-                record.state = MessageState::Ready;
-                batch.push_delete(key);
-                batch.push_put(
-                    keys::message(namespace, entity, sequence),
-                    codec::encode(&record)?,
-                );
-                batch.push_put(self.ready_key(command, &record), Vec::new());
+                self.return_unsettled(command, record, locked_until, origin, batch)?;
                 returned_to_ready += 1;
             }
         }
@@ -640,14 +722,26 @@ impl<S: StateStore> StateMachine<S> {
             let record = self
                 .message(namespace, entity, sequence)?
                 .ok_or(BrokerError::DanglingIndexEntry { sequence })?;
-            self.move_to_dead_letter(
-                command,
-                record,
-                DeadLetterReason::TimeToLiveExpired,
-                String::from("the message exceeded its time to live"),
-                batch,
-            )?;
-            dead_lettered += 1;
+            match record.state {
+                MessageState::Ready => {
+                    self.move_to_dead_letter(
+                        command,
+                        record,
+                        DeadLetterReason::TimeToLiveExpired,
+                        String::from("the message exceeded its time to live"),
+                        batch,
+                    )?;
+                    dead_lettered += 1;
+                }
+                // A lock protects a message from TTL until settlement, abandon,
+                // or lock expiry. Deferred messages are checked only when a
+                // client explicitly retrieves their sequence. Removing a stale
+                // expiry entry prevents either state from blocking later
+                // deadlines in this ordered index.
+                MessageState::Locked { .. } | MessageState::Deferred => {
+                    batch.push_delete(key);
+                }
+            }
         }
 
         Ok(CommandOutcome::MessagesExpired { dead_lettered })
@@ -666,9 +760,10 @@ impl<S: StateStore> StateMachine<S> {
         if !config.requires_session {
             return Err(BrokerError::SessionNotSupported);
         }
+        let lock_duration_millis = lock_duration_millis.unwrap_or(config.lock_duration_millis);
         let locked_until = command
             .issued_at
-            .saturating_add_millis(lock_duration_millis.unwrap_or(config.lock_duration_millis));
+            .saturating_add_millis(lock_duration_millis);
 
         let Some(session_id) = session_id else {
             return self.accept_next_session(command, locked_until, batch);
@@ -834,14 +929,17 @@ impl<S: StateStore> StateMachine<S> {
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
         let config = self.load_config(command)?;
-        let (mut record, previous_locked_until) = self.held_lock(command, sequence, lock_token)?;
+        let (mut record, previous_locked_until, origin) =
+            self.held_lock(command, sequence, lock_token)?;
+        let lock_duration_millis = lock_duration_millis.unwrap_or(config.lock_duration_millis);
         let locked_until = command
             .issued_at
-            .saturating_add_millis(lock_duration_millis.unwrap_or(config.lock_duration_millis));
+            .saturating_add_millis(lock_duration_millis);
 
         record.state = MessageState::Locked {
             token: lock_token,
             locked_until,
+            origin,
         };
         batch.push_delete(keys::lock(
             &command.namespace,
@@ -857,7 +955,10 @@ impl<S: StateStore> StateMachine<S> {
             keys::message(&command.namespace, &command.entity, sequence),
             codec::encode(&record)?,
         );
-        Ok(CommandOutcome::LockRenewed { locked_until })
+        Ok(CommandOutcome::LockRenewed {
+            locked_until,
+            lock_duration_millis,
+        })
     }
 
     fn set_session_state(
@@ -973,12 +1074,13 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         sequence: SequenceNumber,
         lock_token: LockToken,
-    ) -> Result<(MessageRecord, Timestamp), BrokerError> {
+    ) -> Result<(MessageRecord, Timestamp, DeliveryOrigin), BrokerError> {
         let record = self.load_message(command, sequence)?;
         match record.state {
             MessageState::Locked {
                 token,
                 locked_until,
+                origin,
             } => {
                 if token != lock_token {
                     return Err(BrokerError::LockTokenMismatch { sequence });
@@ -989,7 +1091,7 @@ impl<S: StateStore> StateMachine<S> {
                         locked_until,
                     });
                 }
-                Ok((record, locked_until))
+                Ok((record, locked_until, origin))
             }
             _ => Err(BrokerError::MessageNotLocked { sequence }),
         }
@@ -1012,6 +1114,9 @@ impl<S: StateStore> StateMachine<S> {
         match record.state {
             MessageState::Ready => {
                 batch.push_delete(self.ready_key(command, &record));
+            }
+            MessageState::Deferred => {
+                batch.push_delete(keys::deferred(namespace, entity, sequence));
             }
             MessageState::Locked { locked_until, .. } => {
                 batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));

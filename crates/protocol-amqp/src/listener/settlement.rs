@@ -51,6 +51,7 @@ struct SettlementContext<B> {
 enum SettlementFailure {
     Unauthorized,
     Engine(EngineError),
+    Protocol(crate::ProtocolError),
 }
 
 enum PumpExit {
@@ -325,6 +326,7 @@ fn handle_completion(
             EngineError::RemoteClosed | EngineError::RemoteDetached | EngineError::Stopped,
         )) => Some(PumpExit::Clean),
         Err(SettlementFailure::Engine(error)) => Some(PumpExit::Engine(error)),
+        Err(SettlementFailure::Protocol(error)) => Some(PumpExit::Protocol(error)),
     }
 }
 
@@ -495,7 +497,19 @@ async fn settle_started_delivery<B: Broker>(
         return confirm_if_needed(confirmation, delivery_state_for_outcome(&outcome)).await;
     };
     let sequence = delivery.sequence;
-    let (kind, expected) = settlement_command(outcome, sequence, lock.token);
+    let (kind, expected) = match settlement_command(outcome, &delivery, lock.token) {
+        Ok(settlement) => settlement,
+        Err(error) => {
+            confirm_if_needed(
+                confirmation,
+                DeliveryState::Rejected(amqp::Rejected {
+                    error: Some(error_for(AmqpError::InternalError, error.to_string())),
+                }),
+            )
+            .await?;
+            return Err(SettlementFailure::Protocol(error));
+        }
+    };
 
     // Service Bus treats the second-mode confirmation as the result of the
     // durable broker operation, not as an echo of the requested disposition.
@@ -547,40 +561,87 @@ async fn confirm_if_needed(
 
 fn settlement_command(
     outcome: Outcome,
-    sequence: domain::SequenceNumber,
+    delivery: &Delivery,
     lock_token: LockToken,
-) -> (CommandKind, SettlementOutcome) {
+) -> Result<(CommandKind, SettlementOutcome), crate::ProtocolError> {
+    let sequence = delivery.sequence;
     match outcome {
-        Outcome::Accepted(_) => (
+        Outcome::Accepted(_) => Ok((
             CommandKind::Complete {
                 sequence,
                 lock_token,
             },
             SettlementOutcome::Completed,
-        ),
+        )),
         // Rejected means the client will never process it, so it goes to the
         // dead-letter queue rather than round again.
         Outcome::Rejected(rejected) => {
-            let (reason, description) = dead_letter_details(rejected);
-            (
+            let DeadLetterDisposition {
+                reason,
+                description,
+                properties,
+            } = dead_letter_disposition(rejected);
+            let replacement_envelope = properties
+                .as_ref()
+                .map(|properties| crate::message::replacement_envelope(delivery, properties))
+                .transpose()?;
+            Ok((
                 CommandKind::DeadLetter {
                     sequence,
                     lock_token,
                     reason,
                     description,
+                    replacement_envelope,
                 },
                 SettlementOutcome::DeadLettered,
-            )
+            ))
         }
-        // Released and modified both mean "not now": back to the queue, with
-        // the delivery count already incremented by the receive.
-        Outcome::Released(_) | Outcome::Modified(_) => (
+        // Service Bus uses this Modified outcome for deferral. Property
+        // changes ride in its message-annotations map even though the service
+        // applies them to application properties.
+        Outcome::Modified(modified) if modified.undeliverable_here == Some(true) => {
+            let replacement_envelope = modified
+                .message_annotations
+                .as_ref()
+                .map(|properties| crate::message::replacement_envelope(delivery, properties))
+                .transpose()?;
+            Ok((
+                CommandKind::Defer {
+                    sequence,
+                    lock_token,
+                    replacement_envelope,
+                },
+                SettlementOutcome::Deferred,
+            ))
+        }
+        // Released means "not now": back to the queue, with the delivery
+        // count already incremented by receive.
+        Outcome::Released(_) => Ok((
             CommandKind::Abandon {
                 sequence,
                 lock_token,
+                replacement_envelope: None,
             },
             SettlementOutcome::Abandoned,
-        ),
+        )),
+        // The official .NET client carries Abandon properties-to-modify in the
+        // Modified outcome's message-annotations field.
+        Outcome::Modified(modified) => {
+            let replacement_envelope = modified
+                .message_annotations
+                .as_ref()
+                .filter(|properties| !properties.is_empty())
+                .map(|properties| crate::message::replacement_envelope(delivery, properties))
+                .transpose()?;
+            Ok((
+                CommandKind::Abandon {
+                    sequence,
+                    lock_token,
+                    replacement_envelope,
+                },
+                SettlementOutcome::Abandoned,
+            ))
+        }
     }
 }
 
@@ -598,6 +659,7 @@ enum SettlementOutcome {
     Completed,
     Abandoned,
     DeadLettered,
+    Deferred,
 }
 
 impl SettlementOutcome {
@@ -607,6 +669,7 @@ impl SettlementOutcome {
             (Self::Completed, CommandOutcome::Completed)
                 | (Self::Abandoned, CommandOutcome::Abandoned { .. })
                 | (Self::DeadLettered, CommandOutcome::DeadLettered)
+                | (Self::Deferred, CommandOutcome::Deferred)
         )
     }
 }
@@ -627,12 +690,20 @@ fn sequence_delivery_tag(sequence: domain::SequenceNumber) -> DeliveryTag {
 /// the AMQP error's info map. A generic AMQP client may reject without either,
 /// in which case the stable Switchyard fallback still explains how the message
 /// reached the dead-letter queue.
-fn dead_letter_details(rejected: amqp::Rejected) -> (String, String) {
+#[derive(Debug, Eq, PartialEq)]
+struct DeadLetterDisposition {
+    reason: String,
+    description: String,
+    properties: Option<Fields>,
+}
+
+fn dead_letter_disposition(rejected: amqp::Rejected) -> DeadLetterDisposition {
     let Some(error) = rejected.error else {
-        return (
-            String::from("RejectedByReceiver"),
-            String::from("the receiver rejected the message"),
-        );
+        return DeadLetterDisposition {
+            reason: String::from("RejectedByReceiver"),
+            description: String::from("the receiver rejected the message"),
+            properties: None,
+        };
     };
 
     let reason = error
@@ -646,7 +717,25 @@ fn dead_letter_details(rejected: amqp::Rejected) -> (String, String) {
         .and_then(|info| string_field(info, crate::DEAD_LETTER_DESCRIPTION_PROPERTY))
         .or(error.description)
         .unwrap_or_else(|| String::from("the receiver rejected the message"));
-    (reason, description)
+    // Azure's direct-link dead-letter outcome uses this condition and places
+    // both reserved dead-letter metadata and application-property changes in
+    // Error.info. Keep the custom fields in the durable envelope; reason and
+    // description remain broker-owned dead-letter metadata.
+    let properties = matches!(
+        &error.condition,
+        amqp::ErrorCondition::Custom(condition) if condition.as_str() == "com.microsoft:dead-letter"
+    )
+    .then(|| error.info.unwrap_or_default())
+    .and_then(|mut properties| {
+        properties.shift_remove(&Symbol::from(crate::DEAD_LETTER_REASON_PROPERTY));
+        properties.shift_remove(&Symbol::from(crate::DEAD_LETTER_DESCRIPTION_PROPERTY));
+        (!properties.is_empty()).then_some(properties)
+    });
+    DeadLetterDisposition {
+        reason,
+        description,
+        properties,
+    }
 }
 
 fn string_field(fields: &Fields, name: &str) -> Option<String> {
@@ -661,8 +750,25 @@ fn string_field(fields: &Fields, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use amqp::{Error as AmqpProtocolError, ErrorCondition, Modified, Released};
+    use domain::{DeliveryOrigin, MessageEnvelope, Timestamp};
 
     use super::*;
+
+    fn delivery(sequence: domain::SequenceNumber) -> Delivery {
+        Delivery {
+            sequence,
+            message_id: String::from("message-7"),
+            body: b"body".to_vec(),
+            enqueued_at: Timestamp::from_millis(10),
+            expires_at: None,
+            delivery_count: 1,
+            lock: None,
+            session_id: None,
+            dead_letter: None,
+            envelope: None,
+            origin: DeliveryOrigin::Ready,
+        }
+    }
 
     #[test]
     fn a_lock_token_is_a_guid_sized_delivery_tag() {
@@ -672,7 +778,19 @@ mod tests {
     }
 
     #[test]
-    fn a_service_bus_rejection_keeps_its_dead_letter_details() {
+    fn a_service_bus_rejection_keeps_details_and_property_changes() {
+        let sequence = domain::SequenceNumber::new(7);
+        let token = LockToken::new(9);
+        let mut original = amqp::Message::data(b"body".to_vec());
+        original.application_properties = Some(
+            amqp::ApplicationProperties::builder()
+                .insert("existing", "kept")
+                .build(),
+        );
+        let mut delivery = delivery(sequence);
+        delivery.envelope = Some(MessageEnvelope::new(
+            amqp::encode_message(&original).expect("the original message encodes"),
+        ));
         let mut info = Fields::default();
         info.insert(
             Symbol::from(crate::DEAD_LETTER_REASON_PROPERTY),
@@ -682,6 +800,10 @@ mod tests {
             Symbol::from(crate::DEAD_LETTER_DESCRIPTION_PROPERTY),
             Value::String(String::from("the order has no customer")),
         );
+        info.insert(
+            Symbol::from("reviewed-by"),
+            Value::String(String::from("fraud-team")),
+        );
         let rejected = amqp::Rejected {
             error: Some(AmqpProtocolError::new(
                 ErrorCondition::Custom(Symbol::from("com.microsoft:dead-letter")),
@@ -690,23 +812,48 @@ mod tests {
             )),
         };
 
+        let (command, expected) = settlement_command(Outcome::Rejected(rejected), &delivery, token)
+            .expect("the dead-letter envelope update is valid");
+        let CommandKind::DeadLetter {
+            sequence: dead_lettered_sequence,
+            lock_token,
+            reason,
+            description,
+            replacement_envelope: Some(replacement),
+        } = command
+        else {
+            panic!("a Service Bus rejection must carry its property changes")
+        };
+        assert_eq!(dead_lettered_sequence, sequence);
+        assert_eq!(lock_token, token);
+        assert_eq!(reason, "InvalidOrder");
+        assert_eq!(description, "the order has no customer");
+        assert!(expected.matches(&CommandOutcome::DeadLettered));
+
+        let replacement =
+            amqp::decode_message(replacement.as_bytes()).expect("the replacement envelope decodes");
+        let properties = replacement
+            .application_properties
+            .expect("application properties exist");
         assert_eq!(
-            dead_letter_details(rejected),
-            (
-                String::from("InvalidOrder"),
-                String::from("the order has no customer")
-            )
+            properties.get("existing"),
+            Some(&Value::String("kept".into()))
+        );
+        assert_eq!(
+            properties.get("reviewed-by"),
+            Some(&Value::String("fraud-team".into()))
         );
     }
 
     #[test]
     fn a_generic_rejection_gets_stable_dead_letter_details() {
         assert_eq!(
-            dead_letter_details(amqp::Rejected::default()),
-            (
-                String::from("RejectedByReceiver"),
-                String::from("the receiver rejected the message")
-            )
+            dead_letter_disposition(amqp::Rejected::default()),
+            DeadLetterDisposition {
+                reason: String::from("RejectedByReceiver"),
+                description: String::from("the receiver rejected the message"),
+                properties: None,
+            }
         );
     }
 
@@ -714,9 +861,11 @@ mod tests {
     fn independent_outcomes_map_to_their_own_broker_commands() {
         let sequence = domain::SequenceNumber::new(7);
         let token = LockToken::new(9);
+        let delivery = delivery(sequence);
 
         let (complete, expected) =
-            settlement_command(Outcome::Accepted(amqp::Accepted), sequence, token);
+            settlement_command(Outcome::Accepted(amqp::Accepted), &delivery, token)
+                .expect("accepted maps to complete");
         assert_eq!(
             complete,
             CommandKind::Complete {
@@ -730,18 +879,119 @@ mod tests {
             Outcome::Released(Released),
             Outcome::Modified(Modified::default()),
         ] {
-            let (abandon, expected) = settlement_command(outcome, sequence, token);
+            let (abandon, expected) = settlement_command(outcome, &delivery, token)
+                .expect("released outcomes map to abandon");
             assert_eq!(
                 abandon,
                 CommandKind::Abandon {
                     sequence,
-                    lock_token: token
+                    lock_token: token,
+                    replacement_envelope: None,
                 }
             );
             assert!(expected.matches(&CommandOutcome::Abandoned {
                 dead_lettered: false
             }));
         }
+    }
+
+    #[test]
+    fn ordinary_modified_abandon_persists_property_changes() {
+        let sequence = domain::SequenceNumber::new(7);
+        let token = LockToken::new(9);
+        let mut delivery = delivery(sequence);
+        delivery.envelope = Some(MessageEnvelope::new(
+            amqp::encode_message(&amqp::Message::data(b"body".to_vec()))
+                .expect("the original message encodes"),
+        ));
+        let mut properties = Fields::new();
+        properties.insert(Symbol::from("attempt"), Value::Int(2));
+
+        let (command, expected) = settlement_command(
+            Outcome::Modified(Modified {
+                message_annotations: Some(properties),
+                ..Modified::default()
+            }),
+            &delivery,
+            token,
+        )
+        .expect("the abandon envelope update is valid");
+        let CommandKind::Abandon {
+            replacement_envelope: Some(replacement),
+            ..
+        } = command
+        else {
+            panic!("Modified abandon must carry a replacement envelope")
+        };
+        assert!(expected.matches(&CommandOutcome::Abandoned {
+            dead_lettered: false
+        }));
+        let replacement =
+            amqp::decode_message(replacement.as_bytes()).expect("the replacement envelope decodes");
+        assert_eq!(
+            replacement
+                .application_properties
+                .expect("application properties exist")
+                .get("attempt"),
+            Some(&Value::Int(2))
+        );
+    }
+
+    #[test]
+    fn service_bus_modified_defers_and_persists_property_changes() {
+        let sequence = domain::SequenceNumber::new(7);
+        let token = LockToken::new(9);
+        let mut original = amqp::Message::data(b"body".to_vec());
+        original.application_properties = Some(
+            amqp::ApplicationProperties::builder()
+                .insert("existing", "kept")
+                .build(),
+        );
+        let mut delivery = delivery(sequence);
+        delivery.envelope = Some(MessageEnvelope::new(
+            amqp::encode_message(&original).expect("the original message encodes"),
+        ));
+        let mut properties = Fields::new();
+        properties.insert(
+            Symbol::from("deferred-by"),
+            Value::String(String::from("dotnet")),
+        );
+
+        let (command, expected) = settlement_command(
+            Outcome::Modified(Modified {
+                undeliverable_here: Some(true),
+                message_annotations: Some(properties),
+                ..Modified::default()
+            }),
+            &delivery,
+            token,
+        )
+        .expect("the envelope update is valid");
+        let CommandKind::Defer {
+            sequence: deferred_sequence,
+            lock_token,
+            replacement_envelope: Some(replacement),
+        } = command
+        else {
+            panic!("Modified with undeliverable-here must defer")
+        };
+        assert_eq!(deferred_sequence, sequence);
+        assert_eq!(lock_token, token);
+        assert!(expected.matches(&CommandOutcome::Deferred));
+
+        let replacement =
+            amqp::decode_message(replacement.as_bytes()).expect("the replacement envelope decodes");
+        let properties = replacement
+            .application_properties
+            .expect("application properties exist");
+        assert_eq!(
+            properties.get("existing"),
+            Some(&Value::String("kept".into()))
+        );
+        assert_eq!(
+            properties.get("deferred-by"),
+            Some(&Value::String("dotnet".into()))
+        );
     }
 
     #[tokio::test]

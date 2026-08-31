@@ -353,7 +353,9 @@ if (abandoned.DeliveryCount != 1)
     return 26;
 }
 
-await receiver.AbandonMessageAsync(abandoned);
+await receiver.AbandonMessageAsync(
+    abandoned,
+    new Dictionary<string, object> { ["abandon-stage"] = "returned" });
 ServiceBusReceivedMessage? redelivered =
     await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
 if (redelivered is null)
@@ -377,11 +379,21 @@ if (redelivered.DeliveryCount != 2)
     Console.Error.WriteLine($"unexpected redelivery count: {redelivered.DeliveryCount}");
     return 27;
 }
+if (!Equals(redelivered.ApplicationProperties["abandon-stage"], "returned"))
+{
+    Console.Error.WriteLine("direct abandon property update was lost");
+    return 43;
+}
 
 const string deadLetterReason = "SchemaMismatch";
 const string deadLetterDescription = "official .NET validation failed";
+var deadLetterProperties = new Dictionary<string, object>
+{
+    ["deadletter-stage"] = "direct",
+};
 await receiver.DeadLetterMessageAsync(
     redelivered,
+    deadLetterProperties,
     deadLetterReason,
     deadLetterDescription);
 
@@ -418,7 +430,163 @@ if (deadLettered.DeadLetterSource != queue)
         $"unexpected dead-letter source: {deadLettered.DeadLetterSource}");
     return 28;
 }
+if (!Equals(deadLettered.ApplicationProperties["deadletter-stage"], "direct"))
+{
+    Console.Error.WriteLine("direct dead-letter property update was lost");
+    return 44;
+}
 await deadLetterReceiver.CompleteMessageAsync(deadLettered);
+
+const string deferredBody = "official-deferred-current";
+var messageToDefer = new ServiceBusMessage(deferredBody)
+{
+    MessageId = "official-deferred-current",
+};
+messageToDefer.ApplicationProperties["defer-stage"] = "received";
+messageToDefer.ApplicationProperties["defer-preserved"] = "original";
+var followingMessage = new ServiceBusMessage("official-after-deferred-current")
+{
+    MessageId = "official-after-deferred-current",
+};
+await sender.SendMessagesAsync([messageToDefer, followingMessage]);
+
+ServiceBusReceivedMessage? receivedToDefer =
+    await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (receivedToDefer?.Body.ToString() != deferredBody ||
+    receivedToDefer.MessageId != "official-deferred-current" ||
+    receivedToDefer.SequenceNumber <= 0)
+{
+    Console.Error.WriteLine(
+        $"unexpected message selected for deferral: " +
+        $"body={receivedToDefer?.Body}, id={receivedToDefer?.MessageId}, " +
+        $"sequence={receivedToDefer?.SequenceNumber}");
+    return 36;
+}
+long deferredSequence = receivedToDefer.SequenceNumber;
+var deferredProperties = new Dictionary<string, object>
+{
+    ["defer-stage"] = "parked",
+    ["defer-attempt"] = 2,
+};
+await receiver.DeferMessageAsync(receivedToDefer, deferredProperties);
+
+ServiceBusReceivedMessage? receivedAfterDeferred =
+    await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (receivedAfterDeferred?.Body.ToString() != "official-after-deferred-current")
+{
+    Console.Error.WriteLine(
+        "ordinary receive did not skip the deferred message: " +
+        $"{receivedAfterDeferred?.Body}");
+    return 37;
+}
+await receiver.CompleteMessageAsync(receivedAfterDeferred);
+if (await receiver.ReceiveMessageAsync(TimeSpan.FromMilliseconds(500)) is not null)
+{
+    Console.Error.WriteLine("a deferred message remained visible to ordinary receive");
+    return 38;
+}
+
+// Deferred retrieval uses request/response management without first opening
+// this receiver's ordinary AMQP data link. This catches implementations that
+// accidentally depend on delivery state registered by a prior receive.
+await using ServiceBusReceiver deferredReceiver = client.CreateReceiver(queue);
+ServiceBusReceivedMessage? deferred =
+    await deferredReceiver.ReceiveDeferredMessageAsync(deferredSequence);
+if (deferred is null || deferred.Body.ToString() != deferredBody ||
+    deferred.MessageId != "official-deferred-current" ||
+    deferred.SequenceNumber != deferredSequence ||
+    deferred.State != ServiceBusMessageState.Deferred)
+{
+    Console.Error.WriteLine(
+        $"deferred receive returned the wrong message: body={deferred?.Body}, " +
+        $"id={deferred?.MessageId}, sequence={deferred?.SequenceNumber}, " +
+        $"state={deferred?.State}");
+    return 39;
+}
+if (!Equals(deferred.ApplicationProperties["defer-stage"], "parked") ||
+    Convert.ToInt32(deferred.ApplicationProperties["defer-attempt"]) != 2 ||
+    !Equals(deferred.ApplicationProperties["defer-preserved"], "original"))
+{
+    Console.Error.WriteLine("defer property updates did not survive deferred receive");
+    return 40;
+}
+if (deferred.DeliveryCount != 2 || deferred.LockedUntil <= DateTimeOffset.UtcNow)
+{
+    Console.Error.WriteLine(
+        $"deferred receive did not acquire a live second-delivery lock: " +
+        $"delivery={deferred.DeliveryCount}, locked={deferred.LockedUntil:o}");
+    return 41;
+}
+DateTimeOffset deferredLockedUntilBeforeRenewal = deferred.LockedUntil;
+await deferredReceiver.RenewMessageLockAsync(deferred);
+if (deferred.LockedUntil < deferredLockedUntilBeforeRenewal)
+{
+    Console.Error.WriteLine(
+        $"deferred lock renewal moved backward: " +
+        $"{deferredLockedUntilBeforeRenewal:o} -> {deferred.LockedUntil:o}");
+    return 42;
+}
+await deferredReceiver.AbandonMessageAsync(
+    deferred,
+    new Dictionary<string, object>
+    {
+        ["defer-stage"] = "abandoned",
+        ["abandon-attempt"] = 3,
+    });
+if (await receiver.ReceiveMessageAsync(TimeSpan.FromMilliseconds(500)) is not null)
+{
+    Console.Error.WriteLine("abandoning a deferred message made it ordinarily visible");
+    return 45;
+}
+
+ServiceBusReceivedMessage? deferredAfterAbandon =
+    await deferredReceiver.ReceiveDeferredMessageAsync(deferredSequence);
+if (deferredAfterAbandon is null ||
+    deferredAfterAbandon.State != ServiceBusMessageState.Deferred ||
+    deferredAfterAbandon.DeliveryCount != 3)
+{
+    Console.Error.WriteLine(
+        $"deferred abandon did not restore the message: " +
+        $"state={deferredAfterAbandon?.State}, delivery={deferredAfterAbandon?.DeliveryCount}");
+    return 46;
+}
+if (!Equals(deferredAfterAbandon.ApplicationProperties["defer-stage"], "abandoned") ||
+    Convert.ToInt32(deferredAfterAbandon.ApplicationProperties["abandon-attempt"]) != 3 ||
+    !Equals(deferredAfterAbandon.ApplicationProperties["defer-preserved"], "original"))
+{
+    Console.Error.WriteLine("deferred abandon property updates were not durable");
+    return 47;
+}
+
+const string deferredDeadLetterReason = "DeferredRejected";
+const string deferredDeadLetterDescription = "deferred validation failed";
+await deferredReceiver.DeadLetterMessageAsync(
+    deferredAfterAbandon,
+    new Dictionary<string, object> { ["defer-stage"] = "deadlettered" },
+    deferredDeadLetterReason,
+    deferredDeadLetterDescription);
+ServiceBusReceivedMessage? deadLetteredDeferred =
+    await deadLetterReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (deadLetteredDeferred?.Body.ToString() != deferredBody ||
+    deadLetteredDeferred.DeadLetterReason != deferredDeadLetterReason ||
+    deadLetteredDeferred.DeadLetterErrorDescription != deferredDeadLetterDescription ||
+    deadLetteredDeferred.DeadLetterSource != queue)
+{
+    Console.Error.WriteLine(
+        $"deferred dead-letter mismatch: body={deadLetteredDeferred?.Body}, " +
+        $"reason={deadLetteredDeferred?.DeadLetterReason}, " +
+        $"description={deadLetteredDeferred?.DeadLetterErrorDescription}, " +
+        $"source={deadLetteredDeferred?.DeadLetterSource}");
+    return 48;
+}
+if (!Equals(deadLetteredDeferred.ApplicationProperties["defer-stage"], "deadlettered") ||
+    Convert.ToInt32(deadLetteredDeferred.ApplicationProperties["abandon-attempt"]) != 3 ||
+    !Equals(deadLetteredDeferred.ApplicationProperties["defer-preserved"], "original"))
+{
+    Console.Error.WriteLine("deferred dead-letter property updates were not durable");
+    return 49;
+}
+await deadLetterReceiver.CompleteMessageAsync(deadLetteredDeferred);
 
 await using ServiceBusSender sessionSender = client.CreateSender(sessionQueue);
 await sessionSender.SendMessageAsync(new ServiceBusMessage("official-session-current")
@@ -457,5 +625,6 @@ await sessionReceiver.CompleteMessageAsync(sessionMessage);
 Console.WriteLine(
     "official .NET Service Bus client batch send/prefetch/concurrent settlement, " +
     "envelope fidelity, send/receive/renew/complete, " +
-    "abandon/redelivery, dead-letter/DLQ receive/complete, and session renew/state passed");
+    "abandon/redelivery/property-update, dead-letter/DLQ receive/complete, " +
+    "defer/deferred-receive/management-disposition, and session renew/state passed");
 return 0;

@@ -79,6 +79,19 @@ pub enum DeliveryGuarantee {
     AtMostOnce,
 }
 
+/// Where a delivery returns when it is not completed.
+///
+/// A deferred message is temporarily locked while it is received by sequence
+/// number. Persisting its origin in that lock is what makes abandon and lock
+/// expiry put it back in the deferred set instead of making it visible to an
+/// ordinary receiver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryOrigin {
+    Ready,
+    Deferred,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeadLetterReason {
@@ -110,9 +123,11 @@ pub struct DeadLetterInfo {
 #[serde(rename_all = "snake_case")]
 pub enum MessageState {
     Ready,
+    Deferred,
     Locked {
         token: LockToken,
         locked_until: Timestamp,
+        origin: DeliveryOrigin,
     },
 }
 
@@ -209,6 +224,8 @@ pub struct Delivery {
     pub enqueued_at: Timestamp,
     pub expires_at: Option<Timestamp>,
     pub delivery_count: u32,
+    /// Whether this was an ordinary or explicitly deferred receive.
+    pub origin: DeliveryOrigin,
     /// Absent in receive-and-delete, where the message is already gone.
     pub lock: Option<DeliveryLock>,
     /// The session this message was delivered from, on a session queue.
@@ -224,6 +241,9 @@ pub struct Delivery {
 pub struct DeliveryLock {
     pub token: LockToken,
     pub locked_until: Timestamp,
+    /// Effective duration used to create this lock, after applying any
+    /// per-receive override.
+    pub lock_duration_millis: u64,
 }
 
 #[cfg(test)]

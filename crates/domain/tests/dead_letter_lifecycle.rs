@@ -61,6 +61,7 @@ fn dead_letter_one<P: StoreProvider>(
             lock_token: delivery.lock.expect("peek-lock carries a lock").token,
             reason: String::from("SchemaMismatch"),
             description: String::from("failed validation"),
+            replacement_envelope: None,
         },
     )?;
     Ok(sequence)
@@ -162,6 +163,7 @@ fn abandoning_in_the_dead_letter_queue_never_cascades<P: StoreProvider>(
                 CommandKind::Abandon {
                     sequence,
                     lock_token: delivery.lock.expect("peek-lock carries a lock").token,
+                    replacement_envelope: None,
                 }
             )?,
             CommandOutcome::Abandoned {

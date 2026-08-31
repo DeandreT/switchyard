@@ -27,10 +27,10 @@ pub use identifier::{
     MAX_NAMESPACE_NAME_BYTES, MAX_PLACEMENT_GROUP_ID_BYTES, MAX_SESSION_ID_BYTES, NamespaceName,
     PlacementGroupId, SessionId,
 };
-pub use machine::{StateMachine, TIMER_SCAN_LIMIT};
+pub use machine::{MAX_DEFERRED_RECEIVE_BATCH, StateMachine, TIMER_SCAN_LIMIT};
 pub use message::{
-    DeadLetterInfo, DeadLetterReason, Delivery, DeliveryGuarantee, DeliveryLock, LockToken,
-    MessageEnvelope, MessageRecord, MessageState, ReceiveMode, SequenceNumber,
+    DeadLetterInfo, DeadLetterReason, Delivery, DeliveryGuarantee, DeliveryLock, DeliveryOrigin,
+    LockToken, MessageEnvelope, MessageRecord, MessageState, ReceiveMode, SequenceNumber,
 };
 pub use queue::{
     DEFAULT_LOCK_DURATION_MILLIS, DEFAULT_MAX_DELIVERY_COUNT, DEFAULT_MAX_MESSAGE_BYTES,

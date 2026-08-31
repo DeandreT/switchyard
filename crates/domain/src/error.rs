@@ -33,6 +33,18 @@ pub enum BrokerError {
     EmptyMessageBatch,
     #[error("every message in a batch sent to a session queue must use the same session")]
     MessageBatchSessionMismatch,
+    #[error("a deferred receive must name at least one sequence number")]
+    EmptyDeferredReceive,
+    #[error(
+        "deferred receive named {count} sequence numbers, exceeding the batch limit of {maximum}"
+    )]
+    DeferredReceiveBatchTooLarge { count: usize, maximum: usize },
+    #[error("deferred receive named message {sequence} more than once")]
+    DuplicateDeferredSequence { sequence: SequenceNumber },
+    #[error("message {sequence} is not deferred")]
+    MessageNotDeferred { sequence: SequenceNumber },
+    #[error("deferred message {sequence} belongs to another session")]
+    DeferredMessageSessionMismatch { sequence: SequenceNumber },
     #[error("command timestamp {proposed} precedes the applied timestamp {last_applied}")]
     ClockRegression {
         last_applied: Timestamp,

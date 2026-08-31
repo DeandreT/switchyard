@@ -48,6 +48,40 @@ if (received?.Body.ToString() != body)
 }
 await receiver.CompleteMessageAsync(received);
 
+const string deferredBody = "official-websocket-deferred";
+await sender.SendMessageAsync(new ServiceBusMessage(deferredBody)
+{
+    MessageId = "official-websocket-deferred",
+});
+ServiceBusReceivedMessage? receivedToDefer =
+    await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (receivedToDefer?.Body.ToString() != deferredBody)
+{
+    Console.Error.WriteLine(
+        $"unexpected WebSocket message selected for deferral: {receivedToDefer?.Body}");
+    return 8;
+}
+long deferredSequence = receivedToDefer.SequenceNumber;
+await receiver.DeferMessageAsync(receivedToDefer);
+if (await receiver.ReceiveMessageAsync(TimeSpan.FromMilliseconds(500)) is not null)
+{
+    Console.Error.WriteLine("a deferred WebSocket message remained ordinarily visible");
+    return 9;
+}
+await using ServiceBusReceiver deferredReceiver = client.CreateReceiver(queue);
+ServiceBusReceivedMessage? deferred =
+    await deferredReceiver.ReceiveDeferredMessageAsync(deferredSequence);
+if (deferred?.Body.ToString() != deferredBody ||
+    deferred.SequenceNumber != deferredSequence ||
+    deferred.State != ServiceBusMessageState.Deferred)
+{
+    Console.Error.WriteLine(
+        $"unexpected deferred WebSocket message: body={deferred?.Body}, " +
+        $"sequence={deferred?.SequenceNumber}, state={deferred?.State}");
+    return 10;
+}
+await deferredReceiver.CompleteMessageAsync(deferred);
+
 await using ServiceBusSender batchSender = client.CreateSender(batchQueue);
 using ServiceBusMessageBatch batch = await batchSender.CreateMessageBatchAsync();
 for (int index = 0; index < 3; index++)
@@ -102,5 +136,5 @@ await sessionReceiver.CompleteMessageAsync(sessionMessage);
 
 Console.WriteLine(
     "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, " +
-    "send/receive/complete, and session attach passed");
+    "send/receive/complete, defer/deferred-receive, and session attach passed");
 return 0;

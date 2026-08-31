@@ -6,16 +6,24 @@ use amqp::{
 };
 use auth::{Permission, ResourceScope};
 use domain::{
-    CommandKind, CommandOutcome, EntityPath, LockToken, NamespaceName, SequenceNumber, SessionHold,
+    CommandKind, CommandOutcome, Delivery, EntityPath, LockToken, NamespaceName, SequenceNumber,
+    SessionHold,
 };
 use serde_amqp::{
     Value,
     primitives::{Array, Binary, OrderedMap, Symbol, Timestamp as AmqpTimestamp, Uuid},
 };
-use tokio::sync::{Mutex, Notify, RwLock, mpsc};
+use tokio::{
+    sync::{Mutex, Notify, RwLock, mpsc},
+    time::Instant,
+};
 use tracing::debug;
 
 use crate::{Broker, BrokerRejection, authorization::ConnectionAuthorization};
+
+mod deferred;
+
+pub use deferred::{RECEIVE_BY_SEQUENCE_NUMBER_OPERATION, UPDATE_DISPOSITION_OPERATION};
 
 pub const RENEW_LOCK_OPERATION: &str = "com.microsoft:renew-lock";
 pub const RENEW_SESSION_LOCK_OPERATION: &str = "com.microsoft:renew-session-lock";
@@ -42,10 +50,55 @@ struct DeliveryKey {
     lock_token: LockToken,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RequestResponseDeliveryKey {
+    entity: EntityPath,
+    lock_token: LockToken,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ManagedDelivery {
     entity: EntityPath,
     sequence: SequenceNumber,
+    /// Present for deliveries returned inside a management response. It is the
+    /// sender envelope before broker overlays, needed if a later request asks
+    /// to change application properties while settling the lock.
+    delivery: Option<Delivery>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RequestResponseDelivery {
+    managed: ManagedDelivery,
+    /// A protocol-local deadline. Domain timestamps may come from a replay or
+    /// test clock, so they are never compared with this process's wall clock.
+    expires_at: Instant,
+}
+
+fn request_response_deadline(now: Instant, lock_duration_millis: u64) -> Instant {
+    now.checked_add(Duration::from_millis(lock_duration_millis))
+        // Queue validation caps lock durations well below Instant's range. If
+        // a future caller violates that invariant, fail closed rather than
+        // retaining an immortal registry entry.
+        .unwrap_or(now)
+}
+
+fn purge_request_response_deliveries(
+    deliveries: &mut HashMap<RequestResponseDeliveryKey, RequestResponseDelivery>,
+    now: Instant,
+) {
+    deliveries.retain(|_, delivery| delivery.expires_at > now);
+}
+
+fn definitive_message_lock_loss(rejection: &BrokerRejection) -> bool {
+    matches!(
+        rejection,
+        BrokerRejection::Refused(
+            domain::BrokerError::MessageNotFound { .. }
+                | domain::BrokerError::MessageNotLocked { .. }
+                | domain::BrokerError::LockTokenMismatch { .. }
+                | domain::BrokerError::LockExpired { .. }
+        )
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +119,8 @@ struct ReplyRoutes {
 #[derive(Debug, Default)]
 pub(crate) struct ConnectionManagement {
     deliveries: RwLock<HashMap<DeliveryKey, ManagedDelivery>>,
+    request_response_deliveries:
+        RwLock<HashMap<RequestResponseDeliveryKey, RequestResponseDelivery>>,
     sessions: RwLock<HashMap<String, ManagedSession>>,
     routes: Mutex<ReplyRoutes>,
     route_changed: Notify,
@@ -88,7 +143,11 @@ impl ConnectionManagement {
                 link_name: link_name.to_owned(),
                 lock_token,
             },
-            ManagedDelivery { entity, sequence },
+            ManagedDelivery {
+                entity,
+                sequence,
+                delivery: None,
+            },
         );
     }
 
@@ -108,6 +167,155 @@ impl ConnectionManagement {
                 lock_token,
             })
             .cloned()
+    }
+
+    async fn register_request_response_delivery(&self, entity: EntityPath, delivery: Delivery) {
+        self.register_request_response_delivery_at(entity, delivery, Instant::now())
+            .await;
+    }
+
+    async fn register_request_response_delivery_at(
+        &self,
+        entity: EntityPath,
+        delivery: Delivery,
+        now: Instant,
+    ) {
+        let sequence = delivery.sequence;
+        let lock = delivery
+            .lock
+            .expect("only a locked management delivery is registered");
+        let mut deliveries = self.request_response_deliveries.write().await;
+        purge_request_response_deliveries(&mut deliveries, now);
+        deliveries.insert(
+            RequestResponseDeliveryKey {
+                entity: entity.clone(),
+                lock_token: lock.token,
+            },
+            RequestResponseDelivery {
+                managed: ManagedDelivery {
+                    entity,
+                    sequence,
+                    delivery: Some(delivery),
+                },
+                expires_at: request_response_deadline(now, lock.lock_duration_millis),
+            },
+        );
+    }
+
+    async fn request_response_delivery(
+        &self,
+        entity: &EntityPath,
+        lock_token: LockToken,
+    ) -> Option<ManagedDelivery> {
+        self.request_response_delivery_at(entity, lock_token, Instant::now())
+            .await
+    }
+
+    async fn request_response_delivery_at(
+        &self,
+        entity: &EntityPath,
+        lock_token: LockToken,
+        now: Instant,
+    ) -> Option<ManagedDelivery> {
+        let mut deliveries = self.request_response_deliveries.write().await;
+        purge_request_response_deliveries(&mut deliveries, now);
+        deliveries
+            .get(&RequestResponseDeliveryKey {
+                entity: entity.clone(),
+                lock_token,
+            })
+            .map(|delivery| delivery.managed.clone())
+    }
+
+    async fn refresh_request_response_delivery(
+        &self,
+        entity: &EntityPath,
+        lock_token: LockToken,
+        locked_until: domain::Timestamp,
+        lock_duration_millis: u64,
+    ) {
+        self.refresh_request_response_delivery_at(
+            entity,
+            lock_token,
+            locked_until,
+            lock_duration_millis,
+            Instant::now(),
+        )
+        .await;
+    }
+
+    async fn refresh_request_response_delivery_at(
+        &self,
+        entity: &EntityPath,
+        lock_token: LockToken,
+        locked_until: domain::Timestamp,
+        lock_duration_millis: u64,
+        now: Instant,
+    ) {
+        let key = RequestResponseDeliveryKey {
+            entity: entity.clone(),
+            lock_token,
+        };
+        let mut deliveries = self.request_response_deliveries.write().await;
+        if let Some(registered) = deliveries.get_mut(&key) {
+            registered.expires_at = request_response_deadline(now, lock_duration_millis);
+            if let Some(delivery) = registered.managed.delivery.as_mut() {
+                delivery.lock = Some(domain::DeliveryLock {
+                    token: lock_token,
+                    locked_until,
+                    lock_duration_millis,
+                });
+            }
+        }
+        // Update the successfully renewed target before purging: the broker is
+        // authoritative even if its old local deadline elapsed in flight.
+        purge_request_response_deliveries(&mut deliveries, now);
+    }
+
+    async fn unregister_request_response_delivery(
+        &self,
+        entity: &EntityPath,
+        lock_token: LockToken,
+    ) {
+        self.request_response_deliveries
+            .write()
+            .await
+            .remove(&RequestResponseDeliveryKey {
+                entity: entity.clone(),
+                lock_token,
+            });
+    }
+
+    async fn unregister_managed_delivery(
+        &self,
+        entity: &EntityPath,
+        link_name: Option<&str>,
+        lock_token: LockToken,
+    ) {
+        self.unregister_request_response_delivery(entity, lock_token)
+            .await;
+        if let Some(link_name) = link_name {
+            self.unregister_delivery(link_name, lock_token).await;
+        }
+    }
+
+    /// Finds a delivery managed through either an ordinary receive link or a
+    /// request/response receive. The .NET client omits `associated-link-name`
+    /// when it retrieves a deferred message before opening its receive link,
+    /// so the entity-scoped registry is the authority for that path.
+    async fn managed_delivery(
+        &self,
+        entity: &EntityPath,
+        link_name: Option<&str>,
+        lock_token: LockToken,
+    ) -> Option<ManagedDelivery> {
+        if let Some(link_name) = link_name
+            && let Some(delivery) = self.delivery(link_name, lock_token).await
+            && &delivery.entity == entity
+        {
+            return Some(delivery);
+        }
+        self.request_response_delivery(entity, lock_token).await
     }
 
     pub(crate) async fn register_session(
@@ -203,14 +411,14 @@ impl ManagementAuthorization {
 
     async fn ensure(&self) -> Result<(), AmqpProtocolError> {
         self.connection
-            .authorize_resource(&self.resource, Permission::Manage)
+            .authorize_resource(&self.resource, Permission::Listen)
             .await
             .map_err(|_| unauthorized_error("the management link's authorization has expired"))
     }
 
     async fn wait_until_unauthorized(&self) {
         self.connection
-            .wait_until_unauthorized(&self.resource, Permission::Manage)
+            .wait_until_unauthorized(&self.resource, Permission::Listen)
             .await;
     }
 }
@@ -491,6 +699,30 @@ async fn process_request<B: Broker>(
             )
             .await
         }
+        RECEIVE_BY_SEQUENCE_NUMBER_OPERATION => {
+            deferred::receive_by_sequence_number(
+                message,
+                message_id,
+                tracking_id,
+                namespace,
+                entity,
+                broker,
+                management,
+            )
+            .await
+        }
+        UPDATE_DISPOSITION_OPERATION => {
+            deferred::update_disposition(
+                message,
+                message_id,
+                tracking_id,
+                namespace,
+                entity,
+                broker,
+                management,
+            )
+            .await
+        }
         _ => ManagementResponse::bad_request(
             message_id,
             tracking_id,
@@ -516,13 +748,7 @@ async fn renew_message_lock<B: Broker>(
             "application properties are required",
         );
     };
-    let Some(link_name) = string_property(properties, ASSOCIATED_LINK_NAME_PROPERTY) else {
-        return ManagementResponse::bad_request(
-            message_id,
-            tracking_id,
-            "the associated receive link name is required",
-        );
-    };
+    let link_name = string_property(properties, ASSOCIATED_LINK_NAME_PROPERTY);
     let Some(tokens) = lock_tokens(&message.body) else {
         return ManagementResponse::bad_request(
             message_id,
@@ -539,20 +765,16 @@ async fn renew_message_lock<B: Broker>(
     }
 
     let lock_token = tokens[0];
-    let Some(delivery) = management.delivery(link_name, lock_token).await else {
+    let Some(delivery) = management
+        .managed_delivery(entity, link_name, lock_token)
+        .await
+    else {
         return ManagementResponse::lock_lost(
             message_id,
             tracking_id,
-            "the lock token is not active on the associated link",
+            "the lock token is not active for this entity",
         );
     };
-    if &delivery.entity != entity {
-        return ManagementResponse::lock_lost(
-            message_id,
-            tracking_id,
-            "the lock token belongs to another entity",
-        );
-    }
 
     match broker
         .submit(
@@ -566,20 +788,45 @@ async fn renew_message_lock<B: Broker>(
         )
         .await
     {
-        Ok(CommandOutcome::LockRenewed { locked_until }) => ManagementResponse::accepted(
-            message_id,
-            tracking_id,
-            map_body(
-                EXPIRATIONS,
-                Value::Array(Array::from(vec![timestamp_value(locked_until)])),
-            ),
-        ),
+        Ok(CommandOutcome::LockRenewed {
+            locked_until,
+            lock_duration_millis,
+        }) => {
+            management
+                .refresh_request_response_delivery(
+                    entity,
+                    lock_token,
+                    locked_until,
+                    lock_duration_millis,
+                )
+                .await;
+            ManagementResponse::accepted(
+                message_id,
+                tracking_id,
+                map_body(
+                    EXPIRATIONS,
+                    Value::Array(Array::from(vec![timestamp_value(locked_until)])),
+                ),
+            )
+        }
         Ok(other) => ManagementResponse::internal(
             message_id,
             tracking_id,
             format!("renewing a lock produced an unexpected outcome: {other:?}"),
         ),
-        Err(rejection) => ManagementResponse::from_rejection(message_id, tracking_id, &rejection),
+        Err(rejection) => {
+            if definitive_message_lock_loss(&rejection) {
+                management
+                    .unregister_managed_delivery(entity, link_name, lock_token)
+                    .await;
+                return ManagementResponse::lock_lost(
+                    message_id,
+                    tracking_id,
+                    rejection.to_string(),
+                );
+            }
+            ManagementResponse::from_rejection(message_id, tracking_id, &rejection)
+        }
     }
 }
 

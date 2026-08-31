@@ -5,10 +5,10 @@
 //! that envelope and overlays only the fields the broker owns.
 
 use amqp::{
-    AnnotationKey, ApplicationProperties, Body, DeliveryAnnotations, Header, Message,
-    MessageAnnotations, MessageId, Properties, Uuid, Value, decode_message,
+    AnnotationKey, ApplicationProperties, Body, DeliveryAnnotations, Fields, Header, Message,
+    MessageAnnotations, MessageId, Properties, Uuid, Value, decode_message, encode_message,
 };
-use domain::{Delivery, MessageEnvelope, MessageInput, SessionId};
+use domain::{Delivery, DeliveryOrigin, MessageEnvelope, MessageInput, SessionId};
 use serde_amqp::primitives::Timestamp as AmqpTimestamp;
 
 use crate::{ProtocolError, parse_session_id};
@@ -133,6 +133,7 @@ const ENQUEUED_TIME_ANNOTATION: &str = "x-opt-enqueued-time";
 const LOCKED_UNTIL_ANNOTATION: &str = "x-opt-locked-until";
 const LOCK_TOKEN_ANNOTATION: &str = "x-opt-lock-token";
 const DEAD_LETTER_SOURCE_ANNOTATION: &str = "x-opt-deadletter-source";
+const MESSAGE_STATE_ANNOTATION: &str = "x-opt-message-state";
 
 /// Builds the message handed back to a receiving client.
 pub fn write_delivery(delivery: &Delivery) -> Result<Message, ProtocolError> {
@@ -145,26 +146,7 @@ pub(crate) fn write_delivery_from(
     delivery: &Delivery,
     dead_letter_source: Option<&str>,
 ) -> Result<Message, ProtocolError> {
-    let mut message = match &delivery.envelope {
-        Some(envelope) => {
-            decode_message(envelope.as_bytes()).map_err(|error| ProtocolError::InvalidEnvelope {
-                detail: error.to_string(),
-            })?
-        }
-        None => {
-            let properties = Properties {
-                message_id: Some(delivery.message_id.clone().into()),
-                group_id: delivery
-                    .session_id
-                    .as_ref()
-                    .map(|session_id| session_id.as_str().to_owned()),
-                ..Properties::default()
-            };
-            let mut message = Message::data(delivery.body.clone());
-            message.properties = Some(properties);
-            message
-        }
-    };
+    let mut message = stored_message(delivery)?;
 
     overlay_delivery_header(&mut message, delivery);
     overlay_delivery_properties(&mut message, delivery);
@@ -196,6 +178,54 @@ pub(crate) fn write_delivery_from(
         }
     }
     Ok(message)
+}
+
+fn stored_message(delivery: &Delivery) -> Result<Message, ProtocolError> {
+    Ok(match &delivery.envelope {
+        Some(envelope) => {
+            decode_message(envelope.as_bytes()).map_err(|error| ProtocolError::InvalidEnvelope {
+                detail: error.to_string(),
+            })?
+        }
+        None => {
+            let properties = Properties {
+                message_id: Some(delivery.message_id.clone().into()),
+                group_id: delivery
+                    .session_id
+                    .as_ref()
+                    .map(|session_id| session_id.as_str().to_owned()),
+                ..Properties::default()
+            };
+            let mut message = Message::data(delivery.body.clone());
+            message.properties = Some(properties);
+            message
+        }
+    })
+}
+
+/// Applies Service Bus disposition property changes to the durable envelope.
+///
+/// Microsoft carries application-property updates in the `message-annotations`
+/// field of a Modified outcome and in a similarly shaped management map. They
+/// are applied to the sender's original envelope, before broker-owned delivery
+/// overlays are added, so sequence, lock, and enqueue annotations can never be
+/// persisted accidentally.
+pub(crate) fn replacement_envelope(
+    delivery: &Delivery,
+    properties: &Fields,
+) -> Result<MessageEnvelope, ProtocolError> {
+    let mut message = stored_message(delivery)?;
+    let application_properties = message
+        .application_properties
+        .get_or_insert_with(ApplicationProperties::default);
+    for (name, value) in properties {
+        application_properties.insert(name.as_str(), value.clone());
+    }
+    encode_message(&message)
+        .map(MessageEnvelope::new)
+        .map_err(|error| ProtocolError::InvalidEnvelope {
+            detail: error.to_string(),
+        })
 }
 
 fn overlay_delivery_header(message: &mut Message, delivery: &Delivery) {
@@ -269,6 +299,17 @@ fn overlay_message_annotations(
             annotations
                 .0
                 .shift_remove(&AnnotationKey::from(DEAD_LETTER_SOURCE_ANNOTATION));
+        }
+    }
+    match delivery.origin {
+        DeliveryOrigin::Deferred => {
+            // Service Bus numbers Active=0, Deferred=1, Scheduled=2.
+            annotations.insert(MESSAGE_STATE_ANNOTATION, Value::Int(1));
+        }
+        DeliveryOrigin::Ready => {
+            annotations
+                .0
+                .shift_remove(&AnnotationKey::from(MESSAGE_STATE_ANNOTATION));
         }
     }
 }
@@ -504,10 +545,12 @@ mod tests {
             lock: Some(DeliveryLock {
                 token: LockToken::new(1),
                 locked_until: Timestamp::from_millis(100),
+                lock_duration_millis: 60_000,
             }),
             session_id: Some(SessionId::new("cart-1").expect("a valid session id")),
             dead_letter: None,
             envelope: None,
+            origin: DeliveryOrigin::Ready,
         };
 
         // A round trip through the wire shape keeps what the broker recorded, so
@@ -519,6 +562,57 @@ mod tests {
         assert_eq!(
             incoming.session_id.as_ref().map(SessionId::as_str),
             Some("cart-1")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_deferred_delivery_carries_the_service_bus_message_state() -> Result<(), ProtocolError> {
+        let mut delivery = Delivery {
+            sequence: SequenceNumber::new(7),
+            message_id: String::from("deferred"),
+            body: b"payload".to_vec(),
+            enqueued_at: Timestamp::from_millis(10),
+            expires_at: None,
+            delivery_count: 1,
+            lock: Some(DeliveryLock {
+                token: LockToken::new(1),
+                locked_until: Timestamp::from_millis(100),
+                lock_duration_millis: 60_000,
+            }),
+            session_id: None,
+            dead_letter: None,
+            envelope: None,
+            origin: DeliveryOrigin::Deferred,
+        };
+
+        let deferred = write_delivery(&delivery)?;
+        let state_key = AnnotationKey::from(MESSAGE_STATE_ANNOTATION);
+        assert_eq!(
+            deferred
+                .message_annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(&state_key)),
+            Some(&Value::Int(1))
+        );
+
+        // State is broker-owned: an active delivery must clear a sender-forged
+        // scheduled/deferred value rather than reflecting it.
+        let mut forged = Message::data(b"payload".to_vec());
+        let mut forged_annotations = MessageAnnotations::default();
+        forged_annotations.insert(MESSAGE_STATE_ANNOTATION, Value::Long(2));
+        forged.message_annotations = Some(forged_annotations);
+        delivery.envelope = Some(MessageEnvelope::new(
+            encode_message(&forged).expect("the forged envelope encodes"),
+        ));
+        delivery.origin = DeliveryOrigin::Ready;
+        let active = write_delivery(&delivery)?;
+        assert_eq!(
+            active
+                .message_annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(&state_key)),
+            None
         );
         Ok(())
     }

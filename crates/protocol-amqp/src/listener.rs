@@ -376,7 +376,7 @@ async fn serve_session<B: Broker>(
                 Ok(entity) => {
                     let link_authorization = match authorization.as_ref() {
                         Some(authorization) => match authorization
-                            .authorize_entity(entity.as_str(), Permission::Manage)
+                            .authorize_entity(entity.as_str(), Permission::Listen)
                             .await
                         {
                             Ok(resource) => Some(ManagementAuthorization::new(
@@ -398,7 +398,7 @@ async fn serve_session<B: Broker>(
                                 detach_with(
                                     endpoint,
                                     unauthorized_error(format!(
-                                        "Manage is not authorized for {entity}"
+                                        "Listen is not authorized for {entity}"
                                     )),
                                 )
                                 .await;

@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Single and atomic batch send; prefetched multi-message receive; independent settlement; receive-delete; envelope fidelity; renew; abandon/redelivery; dead-letter and DLQ receive/complete; session renew/state; AMQP over TCP and WebSockets | Planned | Experimental gates on 7.20.2 |
+| Official .NET SDK, current stable | Single and atomic batch send; prefetched multi-message receive; independent settlement; receive-delete; envelope fidelity; renew; abandon/redelivery; defer and deferred receive; dead-letter and DLQ receive/complete; session renew/state; AMQP over TCP and WebSockets | Planned | Experimental gates on 7.20.2 |
 | Official .NET SDK, previous stable | Planned | Planned | Not implemented |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -36,7 +36,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Topics and subscriptions | Pre-1.0 | Not implemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
 | Scheduling and cancellation | Pre-1.0 | Not implemented |
-| Deferral and deferred receive | Pre-1.0 | Not implemented |
+| Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Dead-letter | Pre-1.0 | State machine, AMQP mapping, Rust and current .NET clients end to end |
 | Dead-letter receive and resubmit | Pre-1.0 | Receive: state machine, AMQP mapping, Rust and current .NET clients end to end. Resubmit: not implemented |
 | Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -71,8 +71,18 @@ behavior it currently enforces:
 - Abandoning a message, or letting its lock elapse, returns it to the queue
   until it reaches the queue's maximum delivery count, after which it is
   dead-lettered as `MaxDeliveryCountExceeded`.
+- Deferring a locked message hides it from ordinary receive until a client
+  requests its sequence number explicitly. Deferred receive validates a
+  bounded batch atomically and returns results in caller order. Abandon and
+  lock expiry restore a deferred delivery to the deferred set, while
+  receive-delete removes it before replying. Defer, abandon, and dead-letter
+  property updates are merged into the durable message envelope on both
+  delivery-link and management dispositions.
 - Messages past their time to live are dead-lettered as `TTLExpiredException`,
-  both by the timer sweep and by any receive that reaches one first.
+  both by the timer sweep and by any receive that reaches one first. A live
+  message lock remains settleable until its lock deadline; TTL takes effect if
+  that lock is abandoned or expires. Deferred TTL is checked on explicit
+  retrieval.
 - The dead-letter queue is a queue: `entity/$deadletterqueue` is drained with
   the same receive and settlement machinery as its parent. Messages arrive
   there stripped of lifetime and session, keep their sequence numbers and the
@@ -134,9 +144,11 @@ A receiving link's `com.microsoft:session-filter` names a session or, with a
 null value, asks for the next available one; the attach response echoes the
 granted identifier and the initial session-lock deadline. The session is
 released when that link closes; renewing its lock and reading or writing its
-state use the entity's `$management` request/reply links, as does message-lock
-renewal. Those operations require Manage authorization when authentication is
-enabled. A transfer is accepted only after its command committed, so the
+state use the entity's `$management` request/reply links, as do message-lock
+renewal, deferred receive by sequence number, and management disposition
+updates. Those data-plane operations require Listen authorization when
+authentication is enabled; Manage includes that right. A transfer is accepted
+only after its command committed, so the
 acknowledgement means durable. One node still serves one namespace. A message
 keeps its encoded AMQP envelope durably, including all legal body forms,
 identifier types, properties, annotations, application properties, and footer.
@@ -148,9 +160,10 @@ complete protocol coverage uses a Rust AMQP 1.0 client. The current stable
 official .NET SDK also has opt-in gates for envelope fidelity, ordinary send,
 atomic enumerable and explicit SDK batches, prefetched multi-message receive,
 out-of-order completion, receive-delete, message-lock renewal, abandon and
-redelivery, custom dead-lettering, dead-letter receive and completion, session
-state and renewal, and AMQP-over-TCP and WebSockets; the rest of that client
-gate remains incomplete.
+redelivery, deferral with property updates, deferred receive and settlement,
+custom dead-lettering, dead-letter receive and completion, session state and
+renewal, and AMQP-over-TCP and WebSockets; the rest of that client gate remains
+incomplete.
 Dead-letter resubmission is not implemented.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch

@@ -25,7 +25,9 @@ pub const TIMEOUT: &str = "com.microsoft:timeout";
 /// The condition symbol to report `error` as.
 pub fn condition_for(error: &BrokerError) -> &'static str {
     match error {
-        BrokerError::QueueNotFound | BrokerError::MessageNotFound { .. } => NOT_FOUND,
+        BrokerError::QueueNotFound
+        | BrokerError::MessageNotFound { .. }
+        | BrokerError::MessageNotDeferred { .. } => NOT_FOUND,
         BrokerError::QueueAlreadyExists => ENTITY_ALREADY_EXISTS,
 
         // The client's claim on the message is gone. Saying so precisely is what
@@ -47,7 +49,11 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::SessionNotSupported
         | BrokerError::DeadLetterQueueIsReserved
         | BrokerError::EmptyMessageBatch
-        | BrokerError::MessageBatchSessionMismatch => NOT_ALLOWED,
+        | BrokerError::MessageBatchSessionMismatch
+        | BrokerError::EmptyDeferredReceive
+        | BrokerError::DeferredReceiveBatchTooLarge { .. }
+        | BrokerError::DuplicateDeferredSequence { .. }
+        | BrokerError::DeferredMessageSessionMismatch { .. } => NOT_ALLOWED,
 
         BrokerError::MessageTooLarge { .. } => MESSAGE_SIZE_EXCEEDED,
         BrokerError::QueueConfig(_) => PRECONDITION_FAILED,
