@@ -27,7 +27,8 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
     match error {
         BrokerError::QueueNotFound
         | BrokerError::MessageNotFound { .. }
-        | BrokerError::MessageNotDeferred { .. } => NOT_FOUND,
+        | BrokerError::MessageNotDeferred { .. }
+        | BrokerError::MessageNotScheduled { .. } => NOT_FOUND,
         BrokerError::QueueAlreadyExists => ENTITY_ALREADY_EXISTS,
 
         // The client's claim on the message is gone. Saying so precisely is what
@@ -50,6 +51,8 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::DeadLetterQueueIsReserved
         | BrokerError::EmptyMessageBatch
         | BrokerError::MessageBatchSessionMismatch
+        | BrokerError::EmptyScheduledCancellation
+        | BrokerError::DuplicateScheduledSequence { .. }
         | BrokerError::EmptyPeek
         | BrokerError::EmptyDeferredReceive
         | BrokerError::DeferredReceiveBatchTooLarge { .. }
@@ -68,6 +71,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         // failures are the broker's problem and are reported as its fault.
         BrokerError::DanglingIndexEntry { .. }
         | BrokerError::MalformedIndexKey
+        | BrokerError::ScheduledEnqueueTimeMissing { .. }
         | BrokerError::Codec(_)
         | BrokerError::Identifier(_)
         | BrokerError::Storage(_) => INTERNAL_ERROR,

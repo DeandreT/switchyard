@@ -28,6 +28,7 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
     for (path, config) in [
         ("websocket-orders", QueueConfig::default()),
         ("websocket-batch", QueueConfig::default()),
+        ("websocket-schedule", QueueConfig::default()),
         (
             "websocket-sessions",
             QueueConfig {
@@ -103,6 +104,7 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
             .arg(format!("sb://localhost:{}", address.port()))
             .arg("websocket-orders")
             .arg("websocket-batch")
+            .arg("websocket-schedule")
             .arg("websocket-sessions")
             .arg(RULE)
             .arg(KEY)
@@ -118,7 +120,7 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
     );
     assert!(
         String::from_utf8_lossy(&output.stdout).contains(
-            "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, send/receive/complete, defer/peek/deferred-receive, and session attach passed"
+            "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, send/receive/complete, defer/peek/deferred-receive, schedule/cancel, and session attach passed"
         ),
         "the client exited without reporting the completed WebSocket workflow"
     );

@@ -141,6 +141,7 @@ impl<S: StateStore> StateMachine<S> {
                 message_id: record.message_id,
                 body: record.body,
                 enqueued_at: record.enqueued_at,
+                scheduled_enqueue_at: record.scheduled_enqueue_at,
                 expires_at: record.expires_at,
                 delivery_count,
                 origin: DeliveryOrigin::Deferred,
@@ -188,6 +189,19 @@ impl<S: StateStore> StateMachine<S> {
             DeliveryOrigin::Deferred => {
                 record.state = MessageState::Deferred;
                 batch.push_put(keys::deferred(namespace, entity, sequence), Vec::new());
+            }
+            // Scheduled placeholders never enter a lock. Treating this as a
+            // ready return keeps a malformed persisted origin from recreating
+            // a scheduled index after activation.
+            DeliveryOrigin::Scheduled => {
+                record.state = MessageState::Ready;
+                batch.push_put(self.ready_key(command, &record), Vec::new());
+                if let Some(expires_at) = record.expires_at {
+                    batch.push_put(
+                        keys::expiry(namespace, entity, expires_at, sequence),
+                        Vec::new(),
+                    );
+                }
             }
         }
         batch.push_put(

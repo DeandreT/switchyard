@@ -126,6 +126,17 @@ impl ConnectionAuthorization {
         Ok(resource)
     }
 
+    pub(crate) async fn authorize_entity_any(
+        &self,
+        entity_path: &str,
+        permissions: &[Permission],
+    ) -> Result<ResourceScope, AuthorizationError> {
+        let resource = ResourceScope::entity(&self.audience_host, entity_path)
+            .map_err(|_| AuthorizationError)?;
+        self.authorize_resource_any(&resource, permissions).await?;
+        Ok(resource)
+    }
+
     pub(crate) async fn authorize_resource(
         &self,
         resource: &ResourceScope,
@@ -138,6 +149,23 @@ impl ConnectionAuthorization {
             .iter()
             .any(|grant| grant.allows(resource, permission, epoch_seconds()))
         {
+            Ok(())
+        } else {
+            Err(AuthorizationError)
+        }
+    }
+
+    pub(crate) async fn authorize_resource_any(
+        &self,
+        resource: &ResourceScope,
+        permissions: &[Permission],
+    ) -> Result<(), AuthorizationError> {
+        let now = epoch_seconds();
+        if self.grants.read().await.iter().any(|grant| {
+            permissions
+                .iter()
+                .any(|permission| grant.allows(resource, *permission, now))
+        }) {
             Ok(())
         } else {
             Err(AuthorizationError)
@@ -159,6 +187,41 @@ impl ConnectionAuthorization {
                 .iter()
                 .filter(|grant| {
                     grant.scope().contains(resource) && grant.permissions().allows(permission)
+                })
+                .map(AccessGrant::expires_at_epoch_seconds)
+                .filter(|expiry| *expiry > now)
+                .max();
+            let Some(expiry) = expiry else { return };
+            if expiry == u64::MAX {
+                changed.await;
+                continue;
+            }
+
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(expiry.saturating_sub(now))) => {}
+                () = changed => {}
+            }
+        }
+    }
+
+    pub(crate) async fn wait_until_unauthorized_any(
+        &self,
+        resource: &ResourceScope,
+        permissions: &[Permission],
+    ) {
+        loop {
+            let changed = self.grant_changed.notified();
+            let now = epoch_seconds();
+            let expiry = self
+                .grants
+                .read()
+                .await
+                .iter()
+                .filter(|grant| {
+                    grant.scope().contains(resource)
+                        && permissions
+                            .iter()
+                            .any(|permission| grant.permissions().allows(*permission))
                 })
                 .map(AccessGrant::expires_at_epoch_seconds)
                 .filter(|expiry| *expiry > now)
@@ -305,3 +368,72 @@ pub(crate) struct AuthorizationError;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RouteError;
+
+#[cfg(test)]
+mod tests {
+    use auth::{PermissionSet, SharedAccessKey, SharedAccessRule};
+
+    use super::*;
+
+    fn authorization(permissions: PermissionSet) -> Arc<ConnectionAuthorization> {
+        let scope = ResourceScope::namespace("tenant.servicebus.windows.net").expect("scope");
+        let rule = SharedAccessRule::new(
+            "rule",
+            scope,
+            SharedAccessKey::new("secret").expect("key"),
+            None,
+            permissions,
+        )
+        .expect("rule");
+        let policy = SharedAccessPolicy::new([rule]).expect("policy");
+        let grant = policy.authenticate_plain("rule", "secret").expect("grant");
+        ConnectionAuthorization::new(
+            SharedAccessAuthentication::new(policy, "tenant.servicebus.windows.net")
+                .expect("authentication"),
+            Some(grant),
+        )
+    }
+
+    #[tokio::test]
+    async fn management_attachment_accepts_either_send_or_listen_without_widening_rights() {
+        for (permissions, allowed, refused) in [
+            (PermissionSet::SEND, Permission::Send, Permission::Listen),
+            (PermissionSet::LISTEN, Permission::Listen, Permission::Send),
+        ] {
+            let authorization = authorization(permissions);
+            let resource = authorization
+                .authorize_entity_any("orders", &[Permission::Send, Permission::Listen])
+                .await
+                .expect("one management permission is enough to attach");
+            assert!(
+                authorization
+                    .authorize_resource(&resource, allowed)
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                authorization
+                    .authorize_resource(&resource, refused)
+                    .await
+                    .is_err(),
+                "attaching a management link must not widen the grant"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn management_attachment_refuses_a_connection_with_neither_right() {
+        let policy = SharedAccessPolicy::new([]).expect("empty policy");
+        let authorization = ConnectionAuthorization::new(
+            SharedAccessAuthentication::new(policy, "tenant.servicebus.windows.net")
+                .expect("authentication"),
+            None,
+        );
+        assert!(
+            authorization
+                .authorize_entity_any("orders", &[Permission::Send, Permission::Listen])
+                .await
+                .is_err()
+        );
+    }
+}

@@ -79,17 +79,21 @@ pub enum DeliveryGuarantee {
     AtMostOnce,
 }
 
-/// Where a delivery returns when it is not completed.
+/// Broker-visible state carried with a delivery or browse result.
 ///
 /// A deferred message is temporarily locked while it is received by sequence
 /// number. Persisting its origin in that lock is what makes abandon and lock
 /// expiry put it back in the deferred set instead of making it visible to an
-/// ordinary receiver.
+/// ordinary receiver. `Scheduled` is browse-only: a scheduled placeholder is
+/// never locked or handed to a receiver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryOrigin {
     Ready,
     Deferred,
+    /// Browse-only origin for a message that has not reached its scheduled
+    /// enqueue time. Scheduled messages never carry delivery locks.
+    Scheduled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -124,6 +128,7 @@ pub struct DeadLetterInfo {
 pub enum MessageState {
     Ready,
     Deferred,
+    Scheduled,
     Locked {
         token: LockToken,
         locked_until: Timestamp,
@@ -181,6 +186,13 @@ pub struct MessageRecord {
     pub message_id: String,
     pub body: Vec<u8>,
     pub enqueued_at: Timestamp,
+    /// Requested enqueue time for a scheduled send. This survives activation
+    /// for protocol observability while `enqueued_at` is replaced with the
+    /// actual activation time.
+    pub scheduled_enqueue_at: Option<Timestamp>,
+    /// Active messages expire at this deadline. For a scheduled placeholder,
+    /// this temporarily records scheduled time plus effective TTL so activation
+    /// can preserve the duration while rebasing it on the actual enqueue time.
     pub expires_at: Option<Timestamp>,
     pub delivery_count: u32,
     pub state: MessageState,
@@ -222,9 +234,10 @@ pub struct Delivery {
     pub message_id: String,
     pub body: Vec<u8>,
     pub enqueued_at: Timestamp,
+    pub scheduled_enqueue_at: Option<Timestamp>,
     pub expires_at: Option<Timestamp>,
     pub delivery_count: u32,
-    /// Whether this was an ordinary or explicitly deferred receive.
+    /// Whether this was active, deferred, or a browse-only scheduled result.
     pub origin: DeliveryOrigin,
     /// Absent in receive-and-delete, where the message is already gone.
     pub lock: Option<DeliveryLock>,
@@ -256,6 +269,7 @@ mod tests {
             message_id: String::from("m-1"),
             body: Vec::new(),
             enqueued_at: Timestamp::from_millis(0),
+            scheduled_enqueue_at: None,
             expires_at,
             delivery_count: 0,
             state: MessageState::Ready,

@@ -37,6 +37,7 @@ fn send<P: StoreProvider>(
             body: id.as_bytes().to_vec(),
             time_to_live_millis: ttl,
             session_id,
+            scheduled_enqueue_at: None,
             envelope: Some(MessageEnvelope::new(format!("envelope:{id}").into_bytes())),
         },
     )? {

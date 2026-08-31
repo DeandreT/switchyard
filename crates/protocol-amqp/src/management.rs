@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use amqp::{
     AmqpError, ApplicationProperties, Body, Error as AmqpProtocolError, Message, MessageId,
-    Properties, Receiver, Sender,
+    Receiver, Sender,
 };
 use auth::{Permission, ResourceScope};
 use domain::{
@@ -11,7 +11,7 @@ use domain::{
 };
 use serde_amqp::{
     Value,
-    primitives::{Array, Binary, OrderedMap, Symbol, Timestamp as AmqpTimestamp, Uuid},
+    primitives::{Array, Binary, OrderedMap, Timestamp as AmqpTimestamp, Uuid},
 };
 use tokio::{
     sync::{Mutex, Notify, RwLock, mpsc},
@@ -23,9 +23,14 @@ use crate::{Broker, BrokerRejection, authorization::ConnectionAuthorization};
 
 mod deferred;
 mod peek;
+mod response;
+mod scheduled;
+
+use self::response::ManagementResponse;
 
 pub use deferred::{RECEIVE_BY_SEQUENCE_NUMBER_OPERATION, UPDATE_DISPOSITION_OPERATION};
 pub use peek::PEEK_MESSAGE_OPERATION;
+pub use scheduled::{CANCEL_SCHEDULED_MESSAGE_OPERATION, SCHEDULE_MESSAGE_OPERATION};
 
 pub const RENEW_LOCK_OPERATION: &str = "com.microsoft:renew-lock";
 pub const RENEW_SESSION_LOCK_OPERATION: &str = "com.microsoft:renew-session-lock";
@@ -411,145 +416,24 @@ impl ManagementAuthorization {
         }
     }
 
-    async fn ensure(&self) -> Result<(), AmqpProtocolError> {
+    async fn ensure(&self, permission: Permission) -> Result<(), AmqpProtocolError> {
         self.connection
-            .authorize_resource(&self.resource, Permission::Listen)
+            .authorize_resource(&self.resource, permission)
+            .await
+            .map_err(|_| unauthorized_error("the management link's authorization has expired"))
+    }
+
+    async fn ensure_any(&self) -> Result<(), AmqpProtocolError> {
+        self.connection
+            .authorize_resource_any(&self.resource, &[Permission::Send, Permission::Listen])
             .await
             .map_err(|_| unauthorized_error("the management link's authorization has expired"))
     }
 
     async fn wait_until_unauthorized(&self) {
         self.connection
-            .wait_until_unauthorized(&self.resource, Permission::Listen)
+            .wait_until_unauthorized_any(&self.resource, &[Permission::Send, Permission::Listen])
             .await;
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ManagementResponse {
-    correlation_id: MessageId,
-    status_code: i32,
-    status_description: String,
-    error_condition: Option<&'static str>,
-    tracking_id: Option<String>,
-    body: Value,
-}
-
-impl ManagementResponse {
-    fn accepted(correlation_id: MessageId, tracking_id: Option<String>, body: Value) -> Self {
-        Self {
-            correlation_id,
-            status_code: 200,
-            status_description: String::from("OK"),
-            error_condition: None,
-            tracking_id,
-            body,
-        }
-    }
-
-    fn bad_request(
-        correlation_id: MessageId,
-        tracking_id: Option<String>,
-        description: impl Into<String>,
-    ) -> Self {
-        Self {
-            correlation_id,
-            status_code: 400,
-            status_description: description.into(),
-            error_condition: None,
-            tracking_id,
-            body: Value::Null,
-        }
-    }
-
-    fn from_rejection(
-        correlation_id: MessageId,
-        tracking_id: Option<String>,
-        rejection: &BrokerRejection,
-    ) -> Self {
-        let condition = rejection.condition();
-        let status_code = match condition {
-            crate::MESSAGE_LOCK_LOST | crate::SESSION_LOCK_LOST => 410,
-            crate::NOT_FOUND => 404,
-            crate::NOT_ALLOWED | crate::PRECONDITION_FAILED => 400,
-            crate::RESOURCE_LOCKED => 503,
-            _ => 500,
-        };
-        Self {
-            correlation_id,
-            status_code,
-            status_description: rejection.to_string(),
-            error_condition: Some(condition),
-            tracking_id,
-            body: Value::Null,
-        }
-    }
-
-    fn lock_lost(
-        correlation_id: MessageId,
-        tracking_id: Option<String>,
-        description: impl Into<String>,
-    ) -> Self {
-        Self {
-            correlation_id,
-            status_code: 410,
-            status_description: description.into(),
-            error_condition: Some(crate::MESSAGE_LOCK_LOST),
-            tracking_id,
-            body: Value::Null,
-        }
-    }
-
-    fn session_lock_lost(
-        correlation_id: MessageId,
-        tracking_id: Option<String>,
-        description: impl Into<String>,
-    ) -> Self {
-        Self {
-            correlation_id,
-            status_code: 410,
-            status_description: description.into(),
-            error_condition: Some(crate::SESSION_LOCK_LOST),
-            tracking_id,
-            body: Value::Null,
-        }
-    }
-
-    fn internal(
-        correlation_id: MessageId,
-        tracking_id: Option<String>,
-        description: impl Into<String>,
-    ) -> Self {
-        Self {
-            correlation_id,
-            status_code: 500,
-            status_description: description.into(),
-            error_condition: Some(crate::INTERNAL_ERROR),
-            tracking_id,
-            body: Value::Null,
-        }
-    }
-
-    fn into_message(self) -> Message {
-        let mut application_properties = ApplicationProperties::default();
-        application_properties.insert(STATUS_CODE_PROPERTY, self.status_code);
-        application_properties.insert(STATUS_DESCRIPTION_PROPERTY, self.status_description);
-        if let Some(condition) = self.error_condition {
-            application_properties.insert(ERROR_CONDITION_PROPERTY, Symbol::from(condition));
-        }
-        if let Some(tracking_id) = self.tracking_id {
-            application_properties.insert(TRACKING_ID_PROPERTY, tracking_id);
-        }
-
-        Message {
-            properties: Some(Properties {
-                correlation_id: Some(self.correlation_id),
-                ..Properties::default()
-            }),
-            application_properties: Some(application_properties),
-            body: Body::Value(self.body),
-            ..Message::default()
-        }
     }
 }
 
@@ -589,7 +473,7 @@ pub(crate) async fn serve_management_requests<B: Broker>(
             Err(error) => return Err(error.into()),
         };
         if let Some(authorization) = authorization.as_ref()
-            && let Err(error) = authorization.ensure().await
+            && let Err(error) = authorization.ensure_any().await
         {
             receiver.close_with_error(error).await?;
             return Ok(());
@@ -613,6 +497,7 @@ pub(crate) async fn serve_management_requests<B: Broker>(
             &entity,
             &broker,
             &management,
+            authorization.as_ref(),
         )
         .await;
         debug!(correlation_id = ?response.correlation_id, %reply_to, status_code = response.status_code, "management request processed");
@@ -636,6 +521,7 @@ async fn process_request<B: Broker>(
     entity: &EntityPath,
     broker: &B,
     management: &ConnectionManagement,
+    authorization: Option<&ManagementAuthorization>,
 ) -> ManagementResponse {
     let tracking_id = message
         .application_properties
@@ -652,6 +538,16 @@ async fn process_request<B: Broker>(
     let Some(operation) = string_property(properties, OPERATION_PROPERTY) else {
         return ManagementResponse::bad_request(message_id, tracking_id, "operation is required");
     };
+    let permission = management_permission(operation);
+    if let Some(authorization) = authorization
+        && authorization.ensure(permission).await.is_err()
+    {
+        return ManagementResponse::unauthorized(
+            message_id,
+            tracking_id,
+            format!("{permission:?} is not authorized for this management operation"),
+        );
+    }
     match operation {
         RENEW_LOCK_OPERATION => {
             renew_message_lock(
@@ -737,11 +633,24 @@ async fn process_request<B: Broker>(
             )
             .await
         }
+        SCHEDULE_MESSAGE_OPERATION => {
+            scheduled::schedule(message, message_id, tracking_id, namespace, entity, broker).await
+        }
+        CANCEL_SCHEDULED_MESSAGE_OPERATION => {
+            scheduled::cancel(message, message_id, tracking_id, namespace, entity, broker).await
+        }
         _ => ManagementResponse::bad_request(
             message_id,
             tracking_id,
             "unsupported management operation",
         ),
+    }
+}
+
+fn management_permission(operation: &str) -> Permission {
+    match operation {
+        SCHEDULE_MESSAGE_OPERATION | CANCEL_SCHEDULED_MESSAGE_OPERATION => Permission::Send,
+        _ => Permission::Listen,
     }
 }
 
@@ -1188,5 +1097,28 @@ mod tests {
                 AmqpTimestamp::from_milliseconds(12_345)
             )])))
         );
+    }
+
+    #[test]
+    fn scheduling_uses_send_permission_and_receive_management_uses_listen() {
+        assert_eq!(
+            management_permission(SCHEDULE_MESSAGE_OPERATION),
+            Permission::Send
+        );
+        assert_eq!(
+            management_permission(CANCEL_SCHEDULED_MESSAGE_OPERATION),
+            Permission::Send
+        );
+        for operation in [
+            RENEW_LOCK_OPERATION,
+            RECEIVE_BY_SEQUENCE_NUMBER_OPERATION,
+            UPDATE_DISPOSITION_OPERATION,
+            PEEK_MESSAGE_OPERATION,
+            RENEW_SESSION_LOCK_OPERATION,
+            GET_SESSION_STATE_OPERATION,
+            SET_SESSION_STATE_OPERATION,
+        ] {
+            assert_eq!(management_permission(operation), Permission::Listen);
+        }
     }
 }

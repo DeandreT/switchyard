@@ -40,6 +40,7 @@ fn send<P: StoreProvider>(
             body: id.as_bytes().to_vec(),
             time_to_live_millis: None,
             session_id: None,
+            scheduled_enqueue_at: None,
             envelope: None,
         },
     )? {
@@ -358,6 +359,7 @@ fn a_protocol_envelope_survives_restart_redelivery_and_the_dead_letter_queue<P: 
             body: b"normalized-body".to_vec(),
             time_to_live_millis: Some(1_000),
             session_id: None,
+            scheduled_enqueue_at: None,
             envelope: Some(envelope.clone()),
         },
     )?
@@ -587,6 +589,7 @@ fn the_time_to_live_sweep_dead_letters_expired_messages<P: StoreProvider>(
             body: b"perishable".to_vec(),
             time_to_live_millis: Some(100),
             session_id: None,
+            scheduled_enqueue_at: None,
             envelope: None,
         },
     )?;
@@ -626,6 +629,7 @@ fn a_receive_never_hands_out_an_expired_message<P: StoreProvider>(
             body: b"perishable".to_vec(),
             time_to_live_millis: Some(100),
             session_id: None,
+            scheduled_enqueue_at: None,
             envelope: None,
         },
     )?;
@@ -694,6 +698,7 @@ fn a_command_that_moves_time_backward_is_rejected<P: StoreProvider>(
                 body: Vec::new(),
                 time_to_live_millis: None,
                 session_id: None,
+                scheduled_enqueue_at: None,
                 envelope: None,
             }
         ),
@@ -733,6 +738,7 @@ fn a_send_larger_than_the_queue_limit_is_rejected<P: StoreProvider>(
                 body: vec![0; 9],
                 time_to_live_millis: None,
                 session_id: None,
+                scheduled_enqueue_at: None,
                 envelope: None,
             }
         ),
@@ -749,6 +755,7 @@ fn a_send_larger_than_the_queue_limit_is_rejected<P: StoreProvider>(
                 body: Vec::new(),
                 time_to_live_millis: None,
                 session_id: None,
+                scheduled_enqueue_at: None,
                 envelope: Some(MessageEnvelope::new(vec![0; 9])),
             }
         ),
@@ -767,6 +774,7 @@ fn a_send_larger_than_the_queue_limit_is_rejected<P: StoreProvider>(
                 body: vec![0; 9],
                 time_to_live_millis: None,
                 session_id: None,
+                scheduled_enqueue_at: None,
                 envelope: Some(MessageEnvelope::new(vec![0; 8])),
             }
         )?,
@@ -791,6 +799,7 @@ fn commands_against_a_missing_queue_are_rejected<P: StoreProvider>(
             body: Vec::new(),
             time_to_live_millis: None,
             session_id: None,
+            scheduled_enqueue_at: None,
             envelope: None,
         },
     );

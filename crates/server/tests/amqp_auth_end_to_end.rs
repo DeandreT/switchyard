@@ -7,9 +7,9 @@ use std::{
 };
 
 use amqp::{
-    ApplicationProperties, Body, ClientConnection as Connection, ClientReceiver as Receiver,
-    ClientSender as Sender, ClientSession as Session, Message, Outcome, Properties, SaslInit,
-    Symbol, Value,
+    AnnotationKey, ApplicationProperties, Array, Body, ClientConnection as Connection,
+    ClientReceiver as Receiver, ClientSender as Sender, ClientSession as Session, Message,
+    MessageAnnotations, OrderedMap, Outcome, Properties, SaslInit, Symbol, Value,
 };
 use auth::{PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -71,6 +71,7 @@ impl AuthNode {
                 body: b"seed".to_vec(),
                 time_to_live_millis: None,
                 session_id: None,
+                scheduled_enqueue_at: None,
                 envelope: None,
             },
         )?;
@@ -240,6 +241,48 @@ fn body(text: &str) -> Body {
     Body::Data(vec![text.as_bytes().to_vec().into()])
 }
 
+async fn management_request(
+    requests: &mut Sender,
+    responses: &mut Receiver,
+    reply_to: &str,
+    message_id: &str,
+    operation: &str,
+    body: OrderedMap<Value, Value>,
+) -> Result<Message, Box<dyn Error>> {
+    let request = Message::builder()
+        .properties(Properties {
+            message_id: Some(message_id.to_owned().into()),
+            reply_to: Some(reply_to.to_owned()),
+            ..Properties::default()
+        })
+        .application_properties(
+            ApplicationProperties::builder()
+                .insert(protocol_amqp::OPERATION_PROPERTY, operation)
+                .build(),
+        )
+        .body(Body::Value(Value::Map(body)))
+        .build();
+    assert!(matches!(
+        requests.send(request).await?,
+        Outcome::Accepted(_)
+    ));
+
+    let response = tokio::time::timeout(Duration::from_secs(2), responses.recv()).await??;
+    let message = response.message().clone();
+    responses.accept(&response).await?;
+    Ok(message)
+}
+
+fn assert_management_status(message: &Message, expected: i32) {
+    assert_eq!(
+        message
+            .application_properties
+            .as_ref()
+            .and_then(|properties| properties.get(protocol_amqp::STATUS_CODE_PROPERTY)),
+        Some(&Value::Int(expected))
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cbs_grants_send_but_not_listen() -> Result<(), Box<dyn Error>> {
     let node = AuthNode::start(PermissionSet::SEND, Duration::from_secs(20)).await?;
@@ -267,15 +310,101 @@ async fn cbs_grants_send_but_not_listen() -> Result<(), Box<dyn Error>> {
         Outcome::Accepted(_)
     ));
 
-    let mut management =
-        Sender::attach(&mut session, "forbidden-management", "orders/$management").await?;
-    assert!(
-        management
-            .send(Message::builder().body(Body::Value(Value::Null)).build())
-            .await
-            .is_err(),
-        "a Send grant also granted access to receive-side management operations"
+    let reply_to = "send-management-replies";
+    let mut management_responses = Receiver::builder()
+        .name("send-management-response")
+        .source("orders/$management")
+        .target(reply_to)
+        .attach(&mut session)
+        .await?;
+    let mut management_requests = Sender::attach(
+        &mut session,
+        "send-management-request",
+        "orders/$management",
+    )
+    .await?;
+
+    let mut scheduled = Message::builder()
+        .properties(Properties {
+            message_id: Some("send-only-scheduled".into()),
+            ..Properties::default()
+        })
+        .body(body("send-only-scheduled"))
+        .build();
+    let mut annotations = MessageAnnotations::default();
+    annotations.insert(
+        AnnotationKey::from("x-opt-scheduled-enqueue-time"),
+        Value::Timestamp(5_000_i64.into()),
     );
+    scheduled.message_annotations = Some(annotations);
+    let mut schedule_entry = OrderedMap::new();
+    schedule_entry.insert(
+        Value::String(String::from("message")),
+        Value::Binary(amqp::encode_message(&scheduled)?.into()),
+    );
+    schedule_entry.insert(
+        Value::String(String::from("message-id")),
+        Value::String(String::from("send-only-scheduled")),
+    );
+    let mut schedule_body = OrderedMap::new();
+    schedule_body.insert(
+        Value::String(String::from("messages")),
+        Value::List(vec![Value::Map(schedule_entry)]),
+    );
+    let schedule_response = management_request(
+        &mut management_requests,
+        &mut management_responses,
+        reply_to,
+        "send-schedule-1",
+        protocol_amqp::SCHEDULE_MESSAGE_OPERATION,
+        schedule_body,
+    )
+    .await?;
+    assert_management_status(&schedule_response, 200);
+    let Body::Value(Value::Map(schedule_response_body)) = &schedule_response.body else {
+        return Err("schedule response body was not an AMQP map".into());
+    };
+    let Some(Value::Array(sequence_values)) =
+        schedule_response_body.get(&Value::String(String::from("sequence-numbers")))
+    else {
+        return Err("schedule response omitted sequence-numbers".into());
+    };
+    let [Value::Long(scheduled_sequence)] = sequence_values.as_slice() else {
+        return Err("schedule response did not contain one long sequence".into());
+    };
+
+    let mut peek_body = OrderedMap::new();
+    peek_body.insert(
+        Value::String(String::from("from-sequence-number")),
+        Value::Long(*scheduled_sequence),
+    );
+    peek_body.insert(Value::String(String::from("message-count")), Value::Int(1));
+    let peek_response = management_request(
+        &mut management_requests,
+        &mut management_responses,
+        reply_to,
+        "send-peek-1",
+        protocol_amqp::PEEK_MESSAGE_OPERATION,
+        peek_body,
+    )
+    .await?;
+    assert_management_status(&peek_response, 401);
+
+    let mut cancel_body = OrderedMap::new();
+    cancel_body.insert(
+        Value::String(String::from("sequence-numbers")),
+        Value::Array(Array::from(vec![Value::Long(*scheduled_sequence)])),
+    );
+    let cancel_response = management_request(
+        &mut management_requests,
+        &mut management_responses,
+        reply_to,
+        "send-cancel-1",
+        protocol_amqp::CANCEL_SCHEDULED_MESSAGE_OPERATION,
+        cancel_body,
+    )
+    .await?;
+    assert_management_status(&cancel_response, 200);
 
     let mut receiver = Receiver::attach(&mut session, "forbidden-receiver", "orders").await?;
     let refused = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await?;

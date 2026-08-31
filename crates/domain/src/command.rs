@@ -19,6 +19,9 @@ pub struct MessageInput {
     /// Required on a queue that requires sessions, and refused on one that
     /// does not.
     pub session_id: Option<SessionId>,
+    /// Keeps the message outside the ready and expiry indexes until this
+    /// replicated timestamp is reached by the timer worker.
+    pub scheduled_enqueue_at: Option<Timestamp>,
     /// Lossless protocol-native message bytes. The broker keeps these opaque
     /// while using the normalized fields above for its decisions.
     pub envelope: Option<MessageEnvelope>,
@@ -67,6 +70,9 @@ pub enum CommandKind {
         /// Required on a queue that requires sessions, and refused on one that
         /// does not.
         session_id: Option<SessionId>,
+        /// When set, persists a browseable scheduled placeholder instead of
+        /// making the message immediately available to receivers.
+        scheduled_enqueue_at: Option<Timestamp>,
         /// Lossless protocol-native message bytes. The broker keeps these
         /// opaque while using the normalized fields above for its decisions.
         envelope: Option<MessageEnvelope>,
@@ -74,6 +80,11 @@ pub enum CommandKind {
     /// Persists every message in one atomic storage commit.
     SendBatch {
         messages: Vec<MessageInput>,
+    },
+    /// Atomically removes scheduled placeholders. Every sequence must still
+    /// name a scheduled message or the command writes nothing.
+    CancelScheduled {
+        sequences: Vec<SequenceNumber>,
     },
     /// Browses stored messages without acquiring a lock or changing their
     /// delivery state. `from_sequence` is inclusive; zero starts at the first
@@ -176,6 +187,9 @@ pub enum CommandKind {
     /// Proposed by the leader's timer worker. Releases sessions whose lock has
     /// elapsed.
     ExpireSessionLocks,
+    /// Proposed by the leader's timer worker. Re-enqueues due scheduled
+    /// placeholders with new active sequence numbers.
+    ActivateScheduled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -186,6 +200,12 @@ pub enum CommandOutcome {
     },
     BatchSent {
         sequences: Vec<SequenceNumber>,
+    },
+    ScheduledCancelled {
+        cancelled: u32,
+    },
+    ScheduledActivated {
+        activated: u32,
     },
     Peeked(Vec<Delivery>),
     /// `None` when the queue held no deliverable message.

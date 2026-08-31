@@ -760,6 +760,7 @@ mod tests {
             message_id: String::from("message-7"),
             body: b"body".to_vec(),
             enqueued_at: Timestamp::from_millis(10),
+            scheduled_enqueue_at: None,
             expires_at: None,
             delivery_count: 1,
             lock: None,

@@ -47,6 +47,7 @@ enum Request {
     /// goes through the owner anyway so that a handle needs no type parameter
     /// and the protocol edge never has to name a backend.
     ListQueues {
+        after: Option<(NamespaceName, EntityPath)>,
         limit: usize,
         reply: flume::Sender<Result<Vec<(NamespaceName, EntityPath)>, ProposeError>>,
     },
@@ -107,6 +108,7 @@ fn makes_deliverable(outcome: &CommandOutcome) -> bool {
         } => *returned_to_ready > 0,
         CommandOutcome::SessionReleased => true,
         CommandOutcome::SessionLocksExpired { released } => *released > 0,
+        CommandOutcome::ScheduledActivated { activated } => *activated > 0,
         _ => false,
     }
 }
@@ -189,9 +191,22 @@ impl BrokerHandle {
         &self,
         limit: usize,
     ) -> Result<Vec<(NamespaceName, EntityPath)>, SubmitError> {
+        self.queues_after_blocking(None, limit)
+    }
+
+    /// Queues strictly after `after`, up to `limit`, in key order.
+    pub fn queues_after_blocking(
+        &self,
+        after: Option<&(NamespaceName, EntityPath)>,
+        limit: usize,
+    ) -> Result<Vec<(NamespaceName, EntityPath)>, SubmitError> {
         let (reply, queues) = flume::bounded(1);
         self.requests
-            .send(Request::ListQueues { limit, reply })
+            .send(Request::ListQueues {
+                after: after.cloned(),
+                limit,
+                reply,
+            })
             .map_err(|_| SubmitError::BrokerStopped)?;
         queues
             .recv()
@@ -232,9 +247,17 @@ impl Broker {
                             // command still applied, and it gave up, not us.
                             let _ = reply.send(outcome);
                         }
-                        Request::ListQueues { limit, reply } => {
-                            let _ = reply
-                                .send(proposer.machine().queues(limit).map_err(ProposeError::from));
+                        Request::ListQueues {
+                            after,
+                            limit,
+                            reply,
+                        } => {
+                            let _ = reply.send(
+                                proposer
+                                    .machine()
+                                    .queues_after(after.as_ref(), limit)
+                                    .map_err(ProposeError::from),
+                            );
                         }
                         Request::LastApplied { reply } => {
                             let _ = reply.send(
@@ -364,6 +387,7 @@ mod tests {
                 body: Vec::new(),
                 time_to_live_millis: None,
                 session_id: None,
+                scheduled_enqueue_at: None,
                 envelope: None,
             },
         )? {
@@ -378,6 +402,16 @@ mod tests {
         assert_eq!(send(&broker.handle(), "first")?, SequenceNumber::new(1));
         assert_eq!(send(&broker.handle(), "second")?, SequenceNumber::new(2));
         Ok(())
+    }
+
+    #[test]
+    fn scheduled_activation_wakes_receivers_only_when_it_made_messages_ready() {
+        assert!(makes_deliverable(&CommandOutcome::ScheduledActivated {
+            activated: 1,
+        }));
+        assert!(!makes_deliverable(&CommandOutcome::ScheduledActivated {
+            activated: 0,
+        }));
     }
 
     #[test]
@@ -478,6 +512,7 @@ mod tests {
                     body: Vec::new(),
                     time_to_live_millis: None,
                     session_id: None,
+                    scheduled_enqueue_at: None,
                     envelope: None,
                 },
             )

@@ -97,19 +97,6 @@ pub(super) async fn peek<B: Broker>(
     )
 }
 
-impl ManagementResponse {
-    fn no_content(correlation_id: MessageId, tracking_id: Option<String>) -> Self {
-        Self {
-            correlation_id,
-            status_code: 204,
-            status_description: String::from("No Content"),
-            error_condition: None,
-            tracking_id,
-            body: Value::Null,
-        }
-    }
-}
-
 fn peek_request(body: &Body) -> Result<(SequenceNumber, u32), &'static str> {
     let from_sequence = match map_value(body, FROM_SEQUENCE_NUMBER) {
         Some(Value::Long(value)) if *value >= 0 => {
@@ -265,6 +252,7 @@ mod tests {
             message_id: String::from("order-7"),
             body: b"payload".to_vec(),
             enqueued_at: Timestamp::from_millis(10),
+            scheduled_enqueue_at: None,
             expires_at: Some(Timestamp::from_millis(1_010)),
             delivery_count: 4,
             origin,
@@ -329,6 +317,7 @@ mod tests {
             &entity(),
             &broker,
             &management,
+            None,
         )
         .await;
 

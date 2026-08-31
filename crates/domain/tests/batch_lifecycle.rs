@@ -37,6 +37,7 @@ fn send_one<P: StoreProvider>(
             body: Vec::new(),
             time_to_live_millis: None,
             session_id: None,
+            scheduled_enqueue_at: None,
             envelope: None,
         },
     )? {
@@ -172,6 +173,7 @@ fn a_batch_preserves_ttl_sessions_and_envelopes<P: StoreProvider>(
         body: b"normalized".to_vec(),
         time_to_live_millis: Some(25),
         session_id: Some(session_id.clone()),
+        scheduled_enqueue_at: None,
         envelope: Some(envelope.clone()),
     };
     let second = MessageInput {
@@ -179,6 +181,7 @@ fn a_batch_preserves_ttl_sessions_and_envelopes<P: StoreProvider>(
         body: b"second-body".to_vec(),
         time_to_live_millis: None,
         session_id: Some(session_id.clone()),
+        scheduled_enqueue_at: None,
         envelope: None,
     };
 

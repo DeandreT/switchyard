@@ -9,7 +9,7 @@ use std::error::Error;
 
 use domain::{
     CommandKind, CommandOutcome, Delivery, EntityPath, NamespaceName, QueueConfig, ReceiveMode,
-    SessionId, StateMachine, TIMER_SCAN_LIMIT,
+    SequenceNumber, SessionId, StateMachine, TIMER_SCAN_LIMIT, Timestamp,
 };
 use server::{
     Broker, BrokerHandle, LocalProposer, ManualClock, SubmitError, SweepReport, TimerWorker,
@@ -58,6 +58,7 @@ impl<P: StoreProvider> Runtime<P> {
             body: message_id.as_bytes().to_vec(),
             time_to_live_millis,
             session_id: None,
+            scheduled_enqueue_at: None,
             envelope: None,
         })?;
         Ok(())
@@ -158,6 +159,7 @@ fn a_sweep_releases_a_session_whose_lock_elapsed<P: StoreProvider>(
         body: Vec::new(),
         time_to_live_millis: None,
         session_id: Some(session_id.clone()),
+        scheduled_enqueue_at: None,
         envelope: None,
     })?;
 
@@ -236,6 +238,50 @@ fn a_sweep_never_moves_the_applied_clock_backward<P: StoreProvider>(
     Ok(())
 }
 
+fn a_sweep_activates_a_due_scheduled_message<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let runtime = Runtime::new(provider, queue_config())?;
+    let CommandOutcome::Sent { sequence } = runtime.propose(CommandKind::Send {
+        message_id: String::from("scheduled"),
+        body: b"scheduled".to_vec(),
+        time_to_live_millis: Some(100),
+        session_id: None,
+        scheduled_enqueue_at: Some(Timestamp::from_millis(2_000)),
+        envelope: None,
+    })?
+    else {
+        panic!("expected the scheduled placeholder sequence");
+    };
+    assert_eq!(sequence, SequenceNumber::new(1));
+    assert_eq!(runtime.receive()?, None);
+
+    runtime.clock.set(1_999);
+    assert!(runtime.sweep()?.is_idle());
+    runtime.clock.set(2_000);
+    assert_eq!(
+        runtime.sweep()?,
+        SweepReport {
+            queues_swept: 2,
+            scheduled_activated: 1,
+            ..SweepReport::default()
+        }
+    );
+
+    let delivery = runtime
+        .receive()?
+        .expect("the timer made the message ready");
+    assert_eq!(delivery.sequence, SequenceNumber::new(2));
+    assert_eq!(delivery.message_id, "scheduled");
+    assert_eq!(delivery.enqueued_at, Timestamp::from_millis(2_000));
+    assert_eq!(
+        delivery.scheduled_enqueue_at,
+        Some(Timestamp::from_millis(2_000))
+    );
+    assert_eq!(delivery.expires_at, Some(Timestamp::from_millis(2_100)));
+    Ok(())
+}
+
 // ---- instantiation ---------------------------------------------------------
 
 macro_rules! for_each_backend {
@@ -266,4 +312,5 @@ for_each_backend! {
     a_sweep_releases_a_session_whose_lock_elapsed,
     one_sweep_drains_a_backlog_larger_than_a_single_command,
     a_sweep_never_moves_the_applied_clock_backward,
+    a_sweep_activates_a_due_scheduled_message,
 }

@@ -15,6 +15,7 @@ pub(super) struct SendInput<'a> {
     pub(super) body: &'a [u8],
     pub(super) time_to_live_millis: Option<u64>,
     pub(super) session_id: Option<&'a crate::SessionId>,
+    pub(super) scheduled_enqueue_at: Option<crate::Timestamp>,
     pub(super) envelope: Option<&'a MessageEnvelope>,
 }
 
@@ -25,6 +26,7 @@ impl<'a> From<&'a MessageInput> for SendInput<'a> {
             body: &input.body,
             time_to_live_millis: input.time_to_live_millis,
             session_id: input.session_id.as_ref(),
+            scheduled_enqueue_at: input.scheduled_enqueue_at,
             envelope: input.envelope.as_ref(),
         }
     }
@@ -95,12 +97,19 @@ impl<S: StateStore> StateMachine<S> {
         let entity = &command.entity;
         for PreparedMessage { record, encoded } in prepared {
             batch.push_put(keys::message(namespace, entity, record.sequence), encoded);
-            batch.push_put(self.ready_key(command, &record), Vec::new());
-            if let Some(expires_at) = record.expires_at {
+            if let Some(enqueue_at) = record.scheduled_enqueue_at {
                 batch.push_put(
-                    keys::expiry(namespace, entity, expires_at, record.sequence),
+                    keys::scheduled(namespace, entity, enqueue_at, record.sequence),
                     Vec::new(),
                 );
+            } else {
+                batch.push_put(self.ready_key(command, &record), Vec::new());
+                if let Some(expires_at) = record.expires_at {
+                    batch.push_put(
+                        keys::expiry(namespace, entity, expires_at, record.sequence),
+                        Vec::new(),
+                    );
+                }
             }
         }
         batch.push_put(keys::queue_counters(namespace, entity), encoded_counters);
@@ -147,18 +156,24 @@ fn message_record(
     input: SendInput<'_>,
     sequence: SequenceNumber,
 ) -> MessageRecord {
+    let lifetime_starts_at = input.scheduled_enqueue_at.unwrap_or(command.issued_at);
     let expires_at = input
         .time_to_live_millis
         .or(config.default_time_to_live_millis)
-        .map(|millis| command.issued_at.saturating_add_millis(millis));
+        .map(|millis| lifetime_starts_at.saturating_add_millis(millis));
     MessageRecord {
         sequence,
         message_id: input.message_id.to_owned(),
         body: input.body.to_vec(),
         enqueued_at: command.issued_at,
+        scheduled_enqueue_at: input.scheduled_enqueue_at,
         expires_at,
         delivery_count: 0,
-        state: MessageState::Ready,
+        state: if input.scheduled_enqueue_at.is_some() {
+            MessageState::Scheduled
+        } else {
+            MessageState::Ready
+        },
         session_id: input.session_id.cloned(),
         dead_letter: None,
         envelope: input.envelope.cloned(),

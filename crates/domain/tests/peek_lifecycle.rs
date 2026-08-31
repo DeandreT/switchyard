@@ -51,6 +51,7 @@ fn send<P: StoreProvider>(
             body: message_id.as_bytes().to_vec(),
             time_to_live_millis: ttl,
             session_id,
+            scheduled_enqueue_at: None,
             envelope: Some(MessageEnvelope::new(
                 format!("envelope:{message_id}").into_bytes(),
             )),
@@ -158,6 +159,7 @@ fn input(index: usize, ttl: Option<u64>) -> MessageInput {
         body: Vec::new(),
         time_to_live_millis: ttl,
         session_id: None,
+        scheduled_enqueue_at: None,
         envelope: None,
     }
 }

@@ -146,6 +146,7 @@ mod tests {
                 body: Vec::new(),
                 time_to_live_millis: None,
                 session_id: None,
+                scheduled_enqueue_at: None,
                 envelope: None,
             },
         )

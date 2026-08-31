@@ -568,6 +568,7 @@ mod tests {
             message_id: String::from("deferred"),
             body: b"body".to_vec(),
             enqueued_at: domain::Timestamp::from_millis(10),
+            scheduled_enqueue_at: None,
             expires_at: None,
             delivery_count: 1,
             lock: None,
@@ -656,6 +657,7 @@ mod tests {
             message_id: format!("deferred-{sequence}"),
             body: Vec::new(),
             enqueued_at: domain::Timestamp::from_millis(10),
+            scheduled_enqueue_at: None,
             expires_at: None,
             delivery_count: 1,
             lock: Some(domain::DeliveryLock {
@@ -789,6 +791,7 @@ mod tests {
             message_id: String::from("deferred"),
             body: Vec::new(),
             enqueued_at: domain::Timestamp::from_millis(10),
+            scheduled_enqueue_at: None,
             expires_at: None,
             delivery_count: 1,
             lock: Some(domain::DeliveryLock {
@@ -848,6 +851,7 @@ mod tests {
             message_id: String::from("deferred"),
             body: Vec::new(),
             enqueued_at: domain::Timestamp::from_millis(10),
+            scheduled_enqueue_at: None,
             expires_at: None,
             delivery_count: 1,
             lock: Some(domain::DeliveryLock {

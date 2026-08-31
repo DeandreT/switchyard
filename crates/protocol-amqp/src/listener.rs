@@ -376,7 +376,10 @@ async fn serve_session<B: Broker>(
                 Ok(entity) => {
                     let link_authorization = match authorization.as_ref() {
                         Some(authorization) => match authorization
-                            .authorize_entity(entity.as_str(), Permission::Listen)
+                            .authorize_entity_any(
+                                entity.as_str(),
+                                &[Permission::Send, Permission::Listen],
+                            )
                             .await
                         {
                             Ok(resource) => Some(ManagementAuthorization::new(
@@ -398,7 +401,7 @@ async fn serve_session<B: Broker>(
                                 detach_with(
                                     endpoint,
                                     unauthorized_error(format!(
-                                        "Listen is not authorized for {entity}"
+                                        "neither Send nor Listen is authorized for {entity}"
                                     )),
                                 )
                                 .await;
@@ -838,6 +841,7 @@ async fn serve_sending_client<B: Broker>(
                     body: incoming.body,
                     time_to_live_millis: incoming.time_to_live_millis,
                     session_id: incoming.session_id,
+                    scheduled_enqueue_at: incoming.scheduled_enqueue_at,
                     envelope: Some(incoming.envelope),
                 },
                 SendOutcome::Single,

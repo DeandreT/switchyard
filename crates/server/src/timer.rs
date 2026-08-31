@@ -1,9 +1,10 @@
-//! The worker that proposes expiry commands.
+//! The worker that proposes scheduled activation and expiry commands.
 //!
 //! The state machine has no clock of its own, so nothing expires until something
-//! asks it to. This is that something: on every tick it walks the queues and
-//! proposes the three expiry commands for each. Without it, locks are held
-//! forever and messages outlive their time to live.
+//! asks it to. This is that something: on every tick it walks the queues,
+//! activates scheduled messages, and proposes the three expiry commands for
+//! each. Without it, scheduled messages remain hidden, locks are held forever,
+//! and messages outlive their time to live.
 //!
 //! The sweep itself is deterministic given the clock, so a test drives it
 //! directly and only the surrounding loop deals in real time.
@@ -19,7 +20,8 @@ use tracing::{debug, warn};
 use crate::{BrokerHandle, ProposeError, SubmitError};
 
 /// Queues one sweep will visit. A store with more than this is swept in the
-/// order its keys sort, and the rest wait for the next tick.
+/// order its keys sort, and the worker's cursor resumes with the next page on
+/// the following tick.
 pub const MAX_QUEUES_PER_SWEEP: usize = 1_024;
 
 /// Times one sweep will re-propose against a single index before moving on.
@@ -35,6 +37,7 @@ pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SweepReport {
     pub queues_swept: usize,
+    pub scheduled_activated: u32,
     pub locks_returned_to_ready: u32,
     pub messages_dead_lettered: u32,
     pub sessions_released: u32,
@@ -43,7 +46,8 @@ pub struct SweepReport {
 impl SweepReport {
     /// True when the sweep changed nothing, which is the steady state.
     pub fn is_idle(&self) -> bool {
-        self.locks_returned_to_ready == 0
+        self.scheduled_activated == 0
+            && self.locks_returned_to_ready == 0
             && self.messages_dead_lettered == 0
             && self.sessions_released == 0
     }
@@ -51,30 +55,76 @@ impl SweepReport {
 
 pub struct TimerWorker<'a> {
     broker: &'a BrokerHandle,
+    queue_cursor: Mutex<Option<(NamespaceName, EntityPath)>>,
 }
 
 impl<'a> TimerWorker<'a> {
     pub fn new(broker: &'a BrokerHandle) -> Self {
-        Self { broker }
+        Self {
+            broker,
+            queue_cursor: Mutex::new(None),
+        }
     }
 
-    /// Proposes one round of expiry commands for every queue in the store.
+    /// Proposes one round of timer commands for every queue in the store.
     ///
     /// An error abandons the rest of the sweep. Each command was atomic, so what
     /// already applied stands and the next tick resumes from there.
     pub fn sweep_once(&self) -> Result<SweepReport, SubmitError> {
-        let queues = self.broker.queues_blocking(MAX_QUEUES_PER_SWEEP)?;
+        // Hold the cursor for the complete sweep so concurrent callers cannot
+        // fetch the same page and accidentally skip the one that follows it.
+        let mut cursor = self
+            .queue_cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut queues = self
+            .broker
+            .queues_after_blocking(cursor.as_ref(), MAX_QUEUES_PER_SWEEP + 1)?;
+        let next_cursor = if queues.len() > MAX_QUEUES_PER_SWEEP {
+            queues.truncate(MAX_QUEUES_PER_SWEEP);
+            queues.last().cloned()
+        } else {
+            // This page reached the end. The next tick wraps to the first queue,
+            // including any queue inserted before the old cursor meanwhile.
+            None
+        };
         let mut report = SweepReport {
             queues_swept: queues.len(),
             ..SweepReport::default()
         };
 
         for (namespace, entity) in queues {
+            self.activate_scheduled(&namespace, &entity, &mut report)?;
             self.expire_locks(&namespace, &entity, &mut report)?;
             self.expire_messages(&namespace, &entity, &mut report)?;
             self.expire_session_locks(&namespace, &entity, &mut report)?;
         }
+        *cursor = next_cursor;
         Ok(report)
+    }
+
+    fn activate_scheduled(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+        report: &mut SweepReport,
+    ) -> Result<(), SubmitError> {
+        for _ in 0..MAX_ROUNDS_PER_INDEX {
+            let outcome = self.broker.submit_blocking(
+                namespace.clone(),
+                entity.clone(),
+                CommandKind::ActivateScheduled,
+            )?;
+            let CommandOutcome::ScheduledActivated { activated } = outcome else {
+                return Err(unexpected(outcome));
+            };
+            report.scheduled_activated += activated;
+
+            if (activated as usize) < TIMER_SCAN_LIMIT {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn expire_locks(
@@ -171,6 +221,7 @@ impl<'a> TimerWorker<'a> {
                 Ok(report) => {
                     debug!(
                         queues = report.queues_swept,
+                        scheduled_activated = report.scheduled_activated,
                         locks_returned_to_ready = report.locks_returned_to_ready,
                         messages_dead_lettered = report.messages_dead_lettered,
                         sessions_released = report.sessions_released,
@@ -234,7 +285,7 @@ impl Shutdown {
 mod tests {
     use std::{sync::Arc, thread, time::Instant};
 
-    use domain::{QueueConfig, StateMachine};
+    use domain::{QueueConfig, ReceiveMode, StateMachine, Timestamp};
     use storage::MemoryStore;
 
     use super::*;
@@ -322,6 +373,113 @@ mod tests {
                 .queues_swept,
             6
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_sweep_rotates_to_queues_beyond_the_first_page() -> Result<(), SubmitError> {
+        let broker = Broker::spawn(LocalProposer::new(
+            StateMachine::new(MemoryStore::default()),
+            ManualClock::at(10_000),
+        ));
+        let namespace = NamespaceName::new("tenant").expect("a valid namespace");
+
+        // CreateQueue also creates its dead-letter shadow. These 513 user queues
+        // therefore produce 1,026 independently swept queue records: the final
+        // pair sits strictly beyond MAX_QUEUES_PER_SWEEP.
+        let mut target = None;
+        for index in 0..=(MAX_QUEUES_PER_SWEEP / 2) {
+            let entity = EntityPath::new(format!("queue-{index:04}"))
+                .expect("a generated entity path is valid");
+            broker.handle().submit_blocking(
+                namespace.clone(),
+                entity.clone(),
+                CommandKind::CreateQueue {
+                    config: QueueConfig::default(),
+                },
+            )?;
+            target = Some(entity);
+        }
+        let target = target.expect("at least one queue was created");
+
+        assert!(matches!(
+            broker.handle().submit_blocking(
+                namespace.clone(),
+                target.clone(),
+                CommandKind::Send {
+                    message_id: String::from("scheduled-on-later-page"),
+                    body: b"scheduled".to_vec(),
+                    time_to_live_millis: None,
+                    session_id: None,
+                    scheduled_enqueue_at: Some(Timestamp::from_millis(10_000)),
+                    envelope: None,
+                },
+            )?,
+            CommandOutcome::Sent { .. }
+        ));
+        assert!(matches!(
+            broker.handle().submit_blocking(
+                namespace.clone(),
+                target.clone(),
+                CommandKind::Send {
+                    message_id: String::from("expired-on-later-page"),
+                    body: b"expired".to_vec(),
+                    time_to_live_millis: Some(0),
+                    session_id: None,
+                    scheduled_enqueue_at: None,
+                    envelope: None,
+                },
+            )?,
+            CommandOutcome::Sent { .. }
+        ));
+
+        let timer_handle = broker.handle();
+        let worker = TimerWorker::new(&timer_handle);
+        let first = worker.sweep_once()?;
+        assert_eq!(first.queues_swept, MAX_QUEUES_PER_SWEEP);
+        assert!(first.is_idle(), "the first page must not touch the target");
+
+        let second = worker.sweep_once()?;
+        assert_eq!(
+            second,
+            SweepReport {
+                queues_swept: 2,
+                scheduled_activated: 1,
+                messages_dead_lettered: 1,
+                ..SweepReport::default()
+            },
+            "the next tick must resume after the first page"
+        );
+
+        let outcome = broker.handle().submit_blocking(
+            namespace.clone(),
+            target.clone(),
+            CommandKind::Receive {
+                mode: ReceiveMode::ReceiveAndDelete,
+                lock_duration_millis: None,
+                session: None,
+            },
+        )?;
+        let CommandOutcome::Received(Some(activated)) = outcome else {
+            panic!("expected the scheduled message to activate, got {outcome:?}");
+        };
+        assert_eq!(activated.message_id, "scheduled-on-later-page");
+
+        let outcome = broker.handle().submit_blocking(
+            namespace,
+            target
+                .dead_letter_queue()
+                .expect("the target has a valid dead-letter shadow"),
+            CommandKind::Receive {
+                mode: ReceiveMode::ReceiveAndDelete,
+                lock_duration_millis: None,
+                session: None,
+            },
+        )?;
+        let CommandOutcome::Received(Some(expired)) = outcome else {
+            panic!("expected expiry on the later page, got {outcome:?}");
+        };
+        assert_eq!(expired.message_id, "expired-on-later-page");
         Ok(())
     }
 }

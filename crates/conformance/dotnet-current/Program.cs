@@ -2,10 +2,10 @@ using Azure;
 using Azure.Core.Amqp;
 using Azure.Messaging.ServiceBus;
 
-if (args.Length != 8)
+if (args.Length != 9)
 {
     Console.Error.WriteLine(
-        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <peek-queue> <session-queue> <key-name> <key>");
+        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <peek-queue> <schedule-queue> <session-queue> <key-name> <key>");
     return 2;
 }
 
@@ -14,9 +14,10 @@ var customEndpoint = new Uri(args[1]);
 string queue = args[2];
 string batchQueue = args[3];
 string peekQueue = args[4];
-string sessionQueue = args[5];
-string keyName = args[6];
-string key = args[7];
+string scheduleQueue = args[5];
+string sessionQueue = args[6];
+string keyName = args[7];
+string key = args[8];
 
 var options = new ServiceBusClientOptions
 {
@@ -452,6 +453,125 @@ if (await cappedPeekReceiver.PeekMessageAsync() is not null)
     return 64;
 }
 
+await using ServiceBusSender scheduleSender = client.CreateSender(scheduleQueue);
+await using ServiceBusReceiver schedulePeekReceiver = client.CreateReceiver(scheduleQueue);
+DateTimeOffset scheduledAt = DateTimeOffset.UtcNow.AddSeconds(15);
+var scheduledMessages = new[]
+{
+    new ServiceBusMessage("scheduled-management-active")
+    {
+        MessageId = "scheduled-management-active",
+        Subject = "schedule.management",
+        TimeToLive = TimeSpan.FromMinutes(2),
+    },
+    new ServiceBusMessage("scheduled-management-cancelled")
+    {
+        MessageId = "scheduled-management-cancelled",
+        Subject = "schedule.management",
+        TimeToLive = TimeSpan.FromMinutes(2),
+    },
+};
+scheduledMessages[0].ApplicationProperties["schedule-path"] = "management";
+IReadOnlyList<long> scheduledSequences =
+    await scheduleSender.ScheduleMessagesAsync(scheduledMessages, scheduledAt);
+if (scheduledSequences.Count != 2 ||
+    scheduledSequences[0] <= 0 ||
+    scheduledSequences[1] != scheduledSequences[0] + 1)
+{
+    Console.Error.WriteLine(
+        $"schedule management returned invalid placeholder sequences: " +
+        $"[{string.Join(", ", scheduledSequences)}]");
+    return 65;
+}
+await scheduleSender.CancelScheduledMessageAsync(scheduledSequences[1]);
+
+var directScheduled = new ServiceBusMessage("scheduled-direct-cancelled")
+{
+    MessageId = "scheduled-direct-cancelled",
+    Subject = "schedule.direct",
+    ScheduledEnqueueTime = scheduledAt,
+};
+directScheduled.ApplicationProperties["schedule-path"] = "direct";
+await scheduleSender.SendMessageAsync(directScheduled);
+
+IReadOnlyList<ServiceBusReceivedMessage> scheduledPeek =
+    await schedulePeekReceiver.PeekMessagesAsync(10, scheduledSequences[0]);
+if (scheduledPeek.Count != 2 ||
+    scheduledPeek[0].Body.ToString() != "scheduled-management-active" ||
+    scheduledPeek[0].SequenceNumber != scheduledSequences[0] ||
+    scheduledPeek[0].State != ServiceBusMessageState.Scheduled ||
+    scheduledPeek[0].DeliveryCount != 0 ||
+    scheduledPeek[1].Body.ToString() != "scheduled-direct-cancelled" ||
+    scheduledPeek[1].State != ServiceBusMessageState.Scheduled ||
+    scheduledPeek[1].SequenceNumber <= scheduledSequences[1])
+{
+    Console.Error.WriteLine(
+        "peek did not expose the management/direct scheduled placeholders in order");
+    return 66;
+}
+foreach (ServiceBusReceivedMessage scheduled in scheduledPeek)
+{
+    if ((scheduled.ScheduledEnqueueTime - scheduledAt).Duration() >
+            TimeSpan.FromSeconds(1) ||
+        scheduled.GetRawAmqpMessage().MessageAnnotations.ContainsKey("x-opt-locked-until") ||
+        scheduled.GetRawAmqpMessage().DeliveryAnnotations.ContainsKey("x-opt-lock-token"))
+    {
+        Console.Error.WriteLine(
+            "a scheduled peek lost its enqueue timestamp or exposed settlement authority");
+        return 67;
+    }
+}
+await scheduleSender.CancelScheduledMessageAsync(scheduledPeek[1].SequenceNumber);
+
+await using (ServiceBusReceiver earlyScheduleReceiver = client.CreateReceiver(scheduleQueue))
+{
+    if (await earlyScheduleReceiver.ReceiveMessageAsync(
+            TimeSpan.FromMilliseconds(500)) is not null)
+    {
+        Console.Error.WriteLine("a scheduled message was receivable before its enqueue time");
+        return 68;
+    }
+}
+
+await using ServiceBusReceiver activatedScheduleReceiver =
+    client.CreateReceiver(scheduleQueue);
+ServiceBusReceivedMessage? activatedScheduled =
+    await activatedScheduleReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(30));
+if (activatedScheduled?.Body.ToString() != "scheduled-management-active" ||
+    activatedScheduled.MessageId != "scheduled-management-active" ||
+    activatedScheduled.SequenceNumber == scheduledSequences[0] ||
+    activatedScheduled.State != ServiceBusMessageState.Active ||
+    activatedScheduled.DeliveryCount != 1 ||
+    !Equals(activatedScheduled.ApplicationProperties["schedule-path"], "management"))
+{
+    Console.Error.WriteLine(
+        $"scheduled activation mismatch: body={activatedScheduled?.Body}, " +
+        $"sequence={activatedScheduled?.SequenceNumber}, " +
+        $"placeholder={scheduledSequences[0]}, state={activatedScheduled?.State}, " +
+        $"delivery={activatedScheduled?.DeliveryCount}");
+    return 69;
+}
+if ((activatedScheduled.ScheduledEnqueueTime - scheduledAt).Duration() >
+        TimeSpan.FromSeconds(1) ||
+    activatedScheduled.EnqueuedTime < scheduledAt - TimeSpan.FromSeconds(1) ||
+    activatedScheduled.ExpiresAt - activatedScheduled.EnqueuedTime !=
+        TimeSpan.FromMinutes(2))
+{
+    Console.Error.WriteLine(
+        $"scheduled activation timestamps are invalid: " +
+        $"scheduled={activatedScheduled.ScheduledEnqueueTime:o}, " +
+        $"enqueued={activatedScheduled.EnqueuedTime:o}, " +
+        $"expires={activatedScheduled.ExpiresAt:o}");
+    return 70;
+}
+await activatedScheduleReceiver.CompleteMessageAsync(activatedScheduled);
+if (await activatedScheduleReceiver.ReceiveMessageAsync(
+        TimeSpan.FromMilliseconds(500)) is not null)
+{
+    Console.Error.WriteLine("a cancelled scheduled message became active");
+    return 71;
+}
+
 const string settlementBody = "official-settlement-current";
 await sender.SendMessageAsync(new ServiceBusMessage(settlementBody)
 {
@@ -816,5 +936,5 @@ Console.WriteLine(
     "envelope fidelity, send/receive/renew/complete, " +
     "abandon/redelivery/property-update, dead-letter/DLQ receive/complete, " +
     "defer/deferred-receive/management-disposition, peek/browse pagination, " +
-    "and session renew/state/peek passed");
+    "schedule/cancel/timer activation, and session renew/state/peek passed");
 return 0;

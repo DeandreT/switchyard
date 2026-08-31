@@ -8,7 +8,7 @@ use amqp::{
     AnnotationKey, ApplicationProperties, Body, DeliveryAnnotations, Fields, Header, Message,
     MessageAnnotations, MessageId, Properties, Uuid, Value, decode_message, encode_message,
 };
-use domain::{Delivery, DeliveryOrigin, MessageEnvelope, MessageInput, SessionId};
+use domain::{Delivery, DeliveryOrigin, MessageEnvelope, MessageInput, SessionId, Timestamp};
 use serde_amqp::primitives::Timestamp as AmqpTimestamp;
 
 use crate::{ProtocolError, parse_session_id};
@@ -20,6 +20,7 @@ pub struct IncomingMessage {
     pub body: Vec<u8>,
     pub session_id: Option<SessionId>,
     pub time_to_live_millis: Option<u64>,
+    pub scheduled_enqueue_at: Option<Timestamp>,
     pub envelope: MessageEnvelope,
 }
 
@@ -30,6 +31,7 @@ impl From<IncomingMessage> for MessageInput {
             body: message.body,
             session_id: message.session_id,
             time_to_live_millis: message.time_to_live_millis,
+            scheduled_enqueue_at: message.scheduled_enqueue_at,
             envelope: Some(message.envelope),
         }
     }
@@ -74,6 +76,7 @@ pub fn read_incoming(
             .as_ref()
             .and_then(|header| header.ttl)
             .map(u64::from),
+        scheduled_enqueue_at: scheduled_enqueue_at(message)?,
         envelope: MessageEnvelope::new(encoded_message.to_vec()),
     })
 }
@@ -134,6 +137,7 @@ const LOCKED_UNTIL_ANNOTATION: &str = "x-opt-locked-until";
 const LOCK_TOKEN_ANNOTATION: &str = "x-opt-lock-token";
 const DEAD_LETTER_SOURCE_ANNOTATION: &str = "x-opt-deadletter-source";
 const MESSAGE_STATE_ANNOTATION: &str = "x-opt-message-state";
+const SCHEDULED_ENQUEUE_TIME_ANNOTATION: &str = "x-opt-scheduled-enqueue-time";
 
 /// Builds the message handed back to a receiving client.
 pub fn write_delivery(delivery: &Delivery) -> Result<Message, ProtocolError> {
@@ -258,9 +262,15 @@ pub(crate) fn replacement_envelope(
 
 fn overlay_delivery_header(message: &mut Message, delivery: &Delivery, view: DeliveryView) {
     let ttl = delivery.expires_at.map(|expires_at| {
+        let lifetime_start = match delivery.origin {
+            DeliveryOrigin::Scheduled => delivery
+                .scheduled_enqueue_at
+                .unwrap_or(delivery.enqueued_at),
+            DeliveryOrigin::Ready | DeliveryOrigin::Deferred => delivery.enqueued_at,
+        };
         let millis = expires_at
             .as_millis()
-            .saturating_sub(delivery.enqueued_at.as_millis());
+            .saturating_sub(lifetime_start.as_millis());
         u32::try_from(millis).unwrap_or(u32::MAX)
     });
     let delivery_count = match view {
@@ -309,6 +319,19 @@ fn overlay_message_annotations(
             delivery.enqueued_at.as_millis(),
         ))),
     );
+    match delivery.scheduled_enqueue_at {
+        Some(scheduled_enqueue_at) => annotations.insert(
+            SCHEDULED_ENQUEUE_TIME_ANNOTATION,
+            Value::Timestamp(AmqpTimestamp::from_milliseconds(timestamp_millis(
+                scheduled_enqueue_at.as_millis(),
+            ))),
+        ),
+        None => {
+            annotations
+                .0
+                .shift_remove(&AnnotationKey::from(SCHEDULED_ENQUEUE_TIME_ANNOTATION));
+        }
+    }
     match (view, delivery.lock) {
         (DeliveryView::Receive, Some(lock)) => annotations.insert(
             LOCKED_UNTIL_ANNOTATION,
@@ -335,12 +358,38 @@ fn overlay_message_annotations(
             // Service Bus numbers Active=0, Deferred=1, Scheduled=2.
             annotations.insert(MESSAGE_STATE_ANNOTATION, Value::Int(1));
         }
+        DeliveryOrigin::Scheduled => {
+            annotations.insert(MESSAGE_STATE_ANNOTATION, Value::Int(2));
+        }
         DeliveryOrigin::Ready => {
             annotations
                 .0
                 .shift_remove(&AnnotationKey::from(MESSAGE_STATE_ANNOTATION));
         }
     }
+}
+
+fn scheduled_enqueue_at(message: &Message) -> Result<Option<Timestamp>, ProtocolError> {
+    let Some(value) = message
+        .message_annotations
+        .as_ref()
+        .and_then(|annotations| {
+            annotations.get(&AnnotationKey::from(SCHEDULED_ENQUEUE_TIME_ANNOTATION))
+        })
+    else {
+        return Ok(None);
+    };
+    let Value::Timestamp(value) = value else {
+        return Err(ProtocolError::InvalidScheduledEnqueueTime {
+            detail: String::from("x-opt-scheduled-enqueue-time must be an AMQP timestamp"),
+        });
+    };
+    let millis = u64::try_from(value.milliseconds()).map_err(|_| {
+        ProtocolError::InvalidScheduledEnqueueTime {
+            detail: String::from("x-opt-scheduled-enqueue-time cannot precede the Unix epoch"),
+        }
+    })?;
+    Ok(Some(Timestamp::from_millis(millis)))
 }
 
 fn overlay_lock_token(message: &mut Message, delivery: &Delivery, view: DeliveryView) {
@@ -435,6 +484,36 @@ mod tests {
             Some("cart-1")
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_scheduled_enqueue_timestamp_crosses_in_as_broker_state() -> Result<(), ProtocolError> {
+        let mut message = sent(None, b"later".to_vec());
+        let mut annotations = MessageAnnotations::default();
+        annotations.insert(
+            SCHEDULED_ENQUEUE_TIME_ANNOTATION,
+            Value::Timestamp(AmqpTimestamp::from_milliseconds(12_345)),
+        );
+        message.message_annotations = Some(annotations);
+
+        assert_eq!(
+            read(&message)?.scheduled_enqueue_at,
+            Some(Timestamp::from_millis(12_345))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_malformed_scheduled_enqueue_annotation_is_not_ignored() {
+        let mut message = sent(None, b"later".to_vec());
+        let mut annotations = MessageAnnotations::default();
+        annotations.insert(SCHEDULED_ENQUEUE_TIME_ANNOTATION, Value::Long(12_345));
+        message.message_annotations = Some(annotations);
+
+        assert!(matches!(
+            read(&message),
+            Err(ProtocolError::InvalidScheduledEnqueueTime { .. })
+        ));
     }
 
     #[test]
@@ -569,6 +648,7 @@ mod tests {
             message_id: String::from("order-1"),
             body: b"payload".to_vec(),
             enqueued_at: Timestamp::from_millis(10),
+            scheduled_enqueue_at: None,
             expires_at: None,
             delivery_count: 1,
             lock: Some(DeliveryLock {
@@ -602,6 +682,7 @@ mod tests {
             message_id: String::from("deferred"),
             body: b"payload".to_vec(),
             enqueued_at: Timestamp::from_millis(10),
+            scheduled_enqueue_at: None,
             expires_at: None,
             delivery_count: 1,
             lock: Some(DeliveryLock {
@@ -642,6 +723,56 @@ mod tests {
                 .as_ref()
                 .and_then(|annotations| annotations.get(&state_key)),
             None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_scheduled_peek_has_state_two_and_keeps_its_requested_time() -> Result<(), ProtocolError> {
+        let delivery = Delivery {
+            sequence: SequenceNumber::new(7),
+            message_id: String::from("scheduled"),
+            body: b"later".to_vec(),
+            enqueued_at: Timestamp::from_millis(10),
+            scheduled_enqueue_at: Some(Timestamp::from_millis(12_345)),
+            expires_at: Some(Timestamp::from_millis(15_345)),
+            delivery_count: 0,
+            lock: None,
+            session_id: None,
+            dead_letter: None,
+            envelope: None,
+            origin: DeliveryOrigin::Scheduled,
+        };
+
+        let message = write_peeked_delivery_from(&delivery, None)?;
+        let annotations = message.message_annotations.expect("broker annotations");
+        assert_eq!(
+            annotations.get(&AnnotationKey::from(MESSAGE_STATE_ANNOTATION)),
+            Some(&Value::Int(2))
+        );
+        assert!(matches!(
+            annotations.get(&AnnotationKey::from(SCHEDULED_ENQUEUE_TIME_ANNOTATION)),
+            Some(Value::Timestamp(value)) if value.milliseconds() == 12_345
+        ));
+        assert_eq!(
+            message.header.as_ref().and_then(|header| header.ttl),
+            Some(3_000),
+            "scheduled peek TTL begins at scheduled enqueue, not acceptance"
+        );
+        assert!(
+            !annotations
+                .0
+                .contains_key(&AnnotationKey::from(LOCKED_UNTIL_ANNOTATION))
+        );
+        assert!(
+            message
+                .delivery_annotations
+                .as_ref()
+                .is_none_or(|annotations| {
+                    !annotations
+                        .0
+                        .contains_key(&AnnotationKey::from(LOCK_TOKEN_ANNOTATION))
+                })
         );
         Ok(())
     }

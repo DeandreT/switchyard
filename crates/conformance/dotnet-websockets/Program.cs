@@ -1,10 +1,10 @@
 using Azure;
 using Azure.Messaging.ServiceBus;
 
-if (args.Length != 7)
+if (args.Length != 8)
 {
     Console.Error.WriteLine(
-        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <session-queue> <key-name> <key>");
+        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <schedule-queue> <session-queue> <key-name> <key>");
     return 2;
 }
 
@@ -12,9 +12,10 @@ string fullyQualifiedNamespace = args[0];
 var customEndpoint = new Uri(args[1]);
 string queue = args[2];
 string batchQueue = args[3];
-string sessionQueue = args[4];
-string keyName = args[5];
-string key = args[6];
+string scheduleQueue = args[4];
+string sessionQueue = args[5];
+string keyName = args[6];
+string key = args[7];
 
 var options = new ServiceBusClientOptions
 {
@@ -102,6 +103,38 @@ if (deferred?.Body.ToString() != deferredBody ||
 }
 await deferredReceiver.CompleteMessageAsync(deferred);
 
+await using ServiceBusSender scheduleSender = client.CreateSender(scheduleQueue);
+await using ServiceBusReceiver scheduleReceiver = client.CreateReceiver(scheduleQueue);
+DateTimeOffset scheduledAt = DateTimeOffset.UtcNow.AddHours(1);
+long scheduledSequence = await scheduleSender.ScheduleMessageAsync(
+    new ServiceBusMessage("websocket-scheduled-cancelled")
+    {
+        MessageId = "websocket-scheduled-cancelled",
+    },
+    scheduledAt);
+ServiceBusReceivedMessage? peekedScheduled =
+    await scheduleReceiver.PeekMessageAsync(scheduledSequence);
+if (peekedScheduled?.Body.ToString() != "websocket-scheduled-cancelled" ||
+    peekedScheduled.SequenceNumber != scheduledSequence ||
+    peekedScheduled.State != ServiceBusMessageState.Scheduled ||
+    (peekedScheduled.ScheduledEnqueueTime - scheduledAt).Duration() >
+        TimeSpan.FromSeconds(1))
+{
+    Console.Error.WriteLine(
+        $"unexpected scheduled WebSocket peek: body={peekedScheduled?.Body}, " +
+        $"sequence={peekedScheduled?.SequenceNumber}, " +
+        $"state={peekedScheduled?.State}, " +
+        $"scheduled={peekedScheduled?.ScheduledEnqueueTime:o}");
+    return 13;
+}
+await scheduleSender.CancelScheduledMessageAsync(scheduledSequence);
+await using ServiceBusReceiver afterScheduleCancel = client.CreateReceiver(scheduleQueue);
+if (await afterScheduleCancel.PeekMessageAsync(scheduledSequence) is not null)
+{
+    Console.Error.WriteLine("the WebSocket scheduled cancellation left a message behind");
+    return 14;
+}
+
 await using ServiceBusSender batchSender = client.CreateSender(batchQueue);
 using ServiceBusMessageBatch batch = await batchSender.CreateMessageBatchAsync();
 for (int index = 0; index < 3; index++)
@@ -156,5 +189,6 @@ await sessionReceiver.CompleteMessageAsync(sessionMessage);
 
 Console.WriteLine(
     "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, " +
-    "send/receive/complete, defer/peek/deferred-receive, and session attach passed");
+    "send/receive/complete, defer/peek/deferred-receive, schedule/cancel, " +
+    "and session attach passed");
 return 0;

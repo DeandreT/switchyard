@@ -1,11 +1,11 @@
 //! Opt-in gate for the current stable official .NET Service Bus client.
 
-use std::{error::Error, path::PathBuf, process::Command, time::Duration};
+use std::{error::Error, path::PathBuf, process::Command, sync::Arc, time::Duration};
 
 use auth::{PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule};
 use domain::{CommandKind, CommandOutcome, QueueConfig, ReceiveMode, StateMachine};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
-use server::{Broker, LocalProposer, SystemClock};
+use server::{Broker, LocalProposer, Shutdown, SystemClock, TimerWorker};
 use storage::MemoryStore;
 use tokio::net::TcpListener;
 
@@ -30,6 +30,7 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
         ("orders", QueueConfig::default()),
         ("batch-orders", QueueConfig::default()),
         ("peek-orders", QueueConfig::default()),
+        ("scheduled-orders", QueueConfig::default()),
         (
             "sessions",
             QueueConfig {
@@ -72,6 +73,13 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             .await;
     });
 
+    let timer_shutdown = Arc::new(Shutdown::default());
+    let timer_stop = Arc::clone(&timer_shutdown);
+    let timer_broker = broker.handle();
+    let timer = std::thread::spawn(move || {
+        TimerWorker::new(&timer_broker).run(Duration::from_millis(25), &timer_stop);
+    });
+
     let project = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../conformance/dotnet-current/Switchyard.Conformance.DotNetCurrent.csproj");
     let output = tokio::task::spawn_blocking(move || {
@@ -98,12 +106,18 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             .arg("orders")
             .arg("batch-orders")
             .arg("peek-orders")
+            .arg("scheduled-orders")
             .arg("sessions")
             .arg(RULE)
             .arg(KEY)
             .output()
     })
-    .await??;
+    .await;
+    timer_shutdown.signal();
+    timer
+        .join()
+        .map_err(|_| std::io::Error::other("the test timer worker panicked"))?;
+    let output = output??;
 
     assert!(
         output.status.success(),
@@ -117,7 +131,8 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             "send/receive/renew/complete, abandon/redelivery/property-update, ",
             "dead-letter/DLQ receive/complete, ",
             "defer/deferred-receive/management-disposition, ",
-            "peek/browse pagination, and session renew/state/peek passed"
+            "peek/browse pagination, schedule/cancel/timer activation, ",
+            "and session renew/state/peek passed"
         )),
         "the client exited without reporting the completed workflow"
     );
@@ -161,6 +176,19 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
         )?,
         CommandOutcome::Received(None),
         "the batch queue was not empty after concurrent and receive-delete workflows"
+    );
+    assert_eq!(
+        broker.handle().submit_blocking(
+            domain::NamespaceName::new("tenant")?,
+            domain::EntityPath::new("scheduled-orders")?,
+            CommandKind::Receive {
+                mode: ReceiveMode::ReceiveAndDelete,
+                lock_duration_millis: None,
+                session: None,
+            },
+        )?,
+        CommandOutcome::Received(None),
+        "the schedule queue retained an activated or cancelled message"
     );
     Ok(())
 }

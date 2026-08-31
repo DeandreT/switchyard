@@ -10,7 +10,9 @@
 //! the injected store.
 
 mod deferred;
+mod expiry;
 mod peek;
+mod scheduling;
 mod send;
 
 use serde::de::DeserializeOwned;
@@ -86,6 +88,7 @@ impl<S: StateStore> StateMachine<S> {
                 body,
                 time_to_live_millis,
                 session_id,
+                scheduled_enqueue_at,
                 envelope,
             } => self.send(
                 command,
@@ -94,12 +97,16 @@ impl<S: StateStore> StateMachine<S> {
                     body,
                     time_to_live_millis: *time_to_live_millis,
                     session_id: session_id.as_ref(),
+                    scheduled_enqueue_at: *scheduled_enqueue_at,
                     envelope: envelope.as_ref(),
                 },
                 &mut batch,
             )?,
             CommandKind::SendBatch { messages } => {
                 self.send_batch(command, messages, &mut batch)?
+            }
+            CommandKind::CancelScheduled { sequences } => {
+                self.cancel_scheduled(command, sequences, &mut batch)?
             }
             CommandKind::Peek {
                 from_sequence,
@@ -205,6 +212,7 @@ impl<S: StateStore> StateMachine<S> {
             CommandKind::ExpireLocks => self.expire_locks(command, &mut batch)?,
             CommandKind::ExpireMessages => self.expire_messages(command, &mut batch)?,
             CommandKind::ExpireSessionLocks => self.expire_session_locks(command, &mut batch)?,
+            CommandKind::ActivateScheduled => self.activate_scheduled(command, &mut batch)?,
         };
 
         // A command that changed nothing commits nothing. The clock advance is
@@ -239,12 +247,36 @@ impl<S: StateStore> StateMachine<S> {
     /// Every queue in the store, in key order, across every namespace. The timer
     /// worker walks this to learn what there is to sweep.
     pub fn queues(&self, limit: usize) -> Result<Vec<(NamespaceName, EntityPath)>, BrokerError> {
+        self.queues_after(None, limit)
+    }
+
+    /// Queues strictly after `after`, in key order across every namespace.
+    ///
+    /// The timer keeps the last queue from a full page and resumes here on its
+    /// next tick. The cursor is an entity identity rather than a storage key so
+    /// it remains meaningful if that queue is deleted between pages.
+    pub fn queues_after(
+        &self,
+        after: Option<&(NamespaceName, EntityPath)>,
+        limit: usize,
+    ) -> Result<Vec<(NamespaceName, EntityPath)>, BrokerError> {
+        let prefix = keys::queue_config_prefix();
+        let after_key = after.map(|(namespace, entity)| keys::queue_config(namespace, entity));
+        // `scan_from` is inclusive. Read one extra entry when resuming so the
+        // cursor itself can be discarded without shrinking the requested page.
+        let scan_limit = limit.saturating_add(usize::from(after_key.is_some()));
         self.store
-            .scan_prefix(&keys::queue_config_prefix(), limit)?
-            .iter()
+            .scan_from(&prefix, after_key.as_deref().unwrap_or(&prefix), scan_limit)?
+            .into_iter()
+            .filter(|(key, _)| {
+                after_key
+                    .as_ref()
+                    .is_none_or(|after_key| key.as_slice() > after_key.as_slice())
+            })
+            .take(limit)
             .map(|(key, _)| {
                 let (namespace, entity) =
-                    keys::entity_scope_parts(key).ok_or(BrokerError::MalformedIndexKey)?;
+                    keys::entity_scope_parts(&key).ok_or(BrokerError::MalformedIndexKey)?;
                 Ok((NamespaceName::new(namespace)?, EntityPath::new(entity)?))
             })
             .collect()
@@ -323,6 +355,16 @@ impl<S: StateStore> StateMachine<S> {
         limit: usize,
     ) -> Result<Vec<SequenceNumber>, BrokerError> {
         self.index_sequences(&keys::deferred_prefix(namespace, entity), limit)
+    }
+
+    /// Scheduled placeholder sequences, ordered by requested enqueue time.
+    pub fn scheduled_sequences(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+        limit: usize,
+    ) -> Result<Vec<SequenceNumber>, BrokerError> {
+        self.index_sequences(&keys::scheduled_prefix(namespace, entity), limit)
     }
 
     /// Sequences ready in the entity's dead-letter queue, in order.
@@ -546,6 +588,7 @@ impl<S: StateStore> StateMachine<S> {
                 body: record.body,
                 enqueued_at: record.enqueued_at,
                 expires_at: record.expires_at,
+                scheduled_enqueue_at: record.scheduled_enqueue_at,
                 delivery_count,
                 origin: DeliveryOrigin::Ready,
                 lock,
@@ -645,114 +688,6 @@ impl<S: StateStore> StateMachine<S> {
             batch,
         )?;
         Ok(CommandOutcome::DeadLettered)
-    }
-
-    fn expire_locks(
-        &self,
-        command: &Command,
-        batch: &mut WriteBatch,
-    ) -> Result<CommandOutcome, BrokerError> {
-        let config = self.load_config(command)?;
-        let namespace = &command.namespace;
-        let entity = &command.entity;
-        let locks = self
-            .store
-            .scan_prefix(&keys::lock_prefix(namespace, entity), TIMER_SCAN_LIMIT)?;
-
-        let mut returned_to_ready = 0;
-        let mut dead_lettered = 0;
-        for (key, _) in locks {
-            let (locked_until, sequence) =
-                keys::trailing_deadline(&key).ok_or(BrokerError::MalformedIndexKey)?;
-            // The index is ordered by deadline, so the first lock still held
-            // ends the sweep.
-            if locked_until > command.issued_at {
-                break;
-            }
-
-            let record = self
-                .message(namespace, entity, sequence)?
-                .ok_or(BrokerError::DanglingIndexEntry { sequence })?;
-            let origin = match record.state {
-                MessageState::Locked { origin, .. } => origin,
-                _ => return Err(BrokerError::MessageNotLocked { sequence }),
-            };
-
-            if record.is_expired_at(command.issued_at) {
-                self.move_to_dead_letter(
-                    command,
-                    record,
-                    DeadLetterReason::TimeToLiveExpired,
-                    String::from("the message exceeded its time to live"),
-                    batch,
-                )?;
-                dead_lettered += 1;
-            } else if exceeded_delivery_limit(command, &config, &record) {
-                self.move_to_dead_letter(
-                    command,
-                    record,
-                    DeadLetterReason::MaxDeliveryCountExceeded,
-                    String::from("the message reached its maximum delivery count"),
-                    batch,
-                )?;
-                dead_lettered += 1;
-            } else {
-                self.return_unsettled(command, record, locked_until, origin, batch)?;
-                returned_to_ready += 1;
-            }
-        }
-
-        Ok(CommandOutcome::LocksExpired {
-            returned_to_ready,
-            dead_lettered,
-        })
-    }
-
-    fn expire_messages(
-        &self,
-        command: &Command,
-        batch: &mut WriteBatch,
-    ) -> Result<CommandOutcome, BrokerError> {
-        let namespace = &command.namespace;
-        let entity = &command.entity;
-        let expiring = self
-            .store
-            .scan_prefix(&keys::expiry_prefix(namespace, entity), TIMER_SCAN_LIMIT)?;
-
-        let mut dead_lettered = 0;
-        for (key, _) in expiring {
-            let (expires_at, sequence) =
-                keys::trailing_deadline(&key).ok_or(BrokerError::MalformedIndexKey)?;
-            if expires_at > command.issued_at {
-                break;
-            }
-
-            let record = self
-                .message(namespace, entity, sequence)?
-                .ok_or(BrokerError::DanglingIndexEntry { sequence })?;
-            match record.state {
-                MessageState::Ready => {
-                    self.move_to_dead_letter(
-                        command,
-                        record,
-                        DeadLetterReason::TimeToLiveExpired,
-                        String::from("the message exceeded its time to live"),
-                        batch,
-                    )?;
-                    dead_lettered += 1;
-                }
-                // A lock protects a message from TTL until settlement, abandon,
-                // or lock expiry. Deferred messages are checked only when a
-                // client explicitly retrieves their sequence. Removing a stale
-                // expiry entry prevents either state from blocking later
-                // deadlines in this ordered index.
-                MessageState::Locked { .. } | MessageState::Deferred => {
-                    batch.push_delete(key);
-                }
-            }
-        }
-
-        Ok(CommandOutcome::MessagesExpired { dead_lettered })
     }
 
     // ---- sessions ----------------------------------------------------------
@@ -1128,6 +1063,12 @@ impl<S: StateStore> StateMachine<S> {
             }
             MessageState::Locked { locked_until, .. } => {
                 batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
+            }
+            MessageState::Scheduled => {
+                let enqueue_at = record
+                    .scheduled_enqueue_at
+                    .ok_or(BrokerError::ScheduledEnqueueTimeMissing { sequence })?;
+                batch.push_delete(keys::scheduled(namespace, entity, enqueue_at, sequence));
             }
         }
         batch.push_delete(keys::message(namespace, entity, sequence));

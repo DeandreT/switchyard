@@ -45,6 +45,14 @@ pub enum BrokerError {
     DuplicateDeferredSequence { sequence: SequenceNumber },
     #[error("message {sequence} is not deferred")]
     MessageNotDeferred { sequence: SequenceNumber },
+    #[error("scheduled cancellation must name at least one sequence number")]
+    EmptyScheduledCancellation,
+    #[error("scheduled cancellation named message {sequence} more than once")]
+    DuplicateScheduledSequence { sequence: SequenceNumber },
+    #[error("message {sequence} is not scheduled")]
+    MessageNotScheduled { sequence: SequenceNumber },
+    #[error("scheduled message {sequence} has no scheduled enqueue timestamp")]
+    ScheduledEnqueueTimeMissing { sequence: SequenceNumber },
     #[error("deferred message {sequence} belongs to another session")]
     DeferredMessageSessionMismatch { sequence: SequenceNumber },
     #[error("command timestamp {proposed} precedes the applied timestamp {last_applied}")]

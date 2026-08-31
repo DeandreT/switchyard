@@ -37,6 +37,7 @@ fn dead_letter_one<P: StoreProvider>(
             body: b"poison".to_vec(),
             time_to_live_millis: None,
             session_id: None,
+            scheduled_enqueue_at: None,
             envelope: None,
         },
     )?
@@ -210,6 +211,7 @@ fn the_dead_letter_queue_ignores_time_to_live<P: StoreProvider>(
             body: Vec::new(),
             time_to_live_millis: Some(100),
             session_id: None,
+            scheduled_enqueue_at: None,
             envelope: None,
         },
     )?;
@@ -254,6 +256,7 @@ fn a_session_message_dead_letters_out_of_its_session<P: StoreProvider>(
             body: Vec::new(),
             time_to_live_millis: Some(100),
             session_id: Some(domain::SessionId::new("cart-1")?),
+            scheduled_enqueue_at: None,
             envelope: None,
         },
     )?;
@@ -290,6 +293,7 @@ fn reserved_paths_cannot_be_created_or_sent_to<P: StoreProvider>(
                 body: Vec::new(),
                 time_to_live_millis: None,
                 session_id: None,
+                scheduled_enqueue_at: None,
                 envelope: None,
             }
         ),

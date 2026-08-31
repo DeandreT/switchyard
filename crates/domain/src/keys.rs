@@ -7,6 +7,8 @@
 //! - the lock index sorts by lock deadline, so the expiry sweep stops at the
 //!   first entry that has not elapsed;
 //! - the expiry index sorts by message deadline for the same reason;
+//! - the scheduled index sorts by requested enqueue time, then placeholder
+//!   sequence number, so activation is deterministic and bounded;
 //! - the deferred index sorts by sequence number for explicit retrieval and
 //!   browsing without making those messages ordinarily ready;
 //! - the session ready index sorts by session first and sequence second, so one
@@ -33,6 +35,7 @@ const TAG_DEFERRED: u8 = 0x07;
 const TAG_SESSION: u8 = 0x08;
 const TAG_SESSION_READY: u8 = 0x09;
 const TAG_SESSION_LOCK: u8 = 0x0A;
+const TAG_SCHEDULED: u8 = 0x0B;
 
 const SEPARATOR: u8 = 0x00;
 
@@ -142,6 +145,22 @@ pub fn expiry(
     sequence: SequenceNumber,
 ) -> Vec<u8> {
     let key = with_u64(expiry_prefix(namespace, entity), expires_at.as_millis());
+    with_u64(key, sequence.as_u64())
+}
+
+pub fn scheduled_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_SCHEDULED, namespace, entity)
+}
+
+/// A scheduled placeholder ordered by requested enqueue time and then its
+/// temporary sequence number.
+pub fn scheduled(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    enqueue_at: Timestamp,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
+    let key = with_u64(scheduled_prefix(namespace, entity), enqueue_at.as_millis());
     with_u64(key, sequence.as_u64())
 }
 
@@ -310,6 +329,42 @@ mod tests {
         assert_eq!(
             trailing_deadline(&early),
             Some((Timestamp::from_millis(100), SequenceNumber::new(9)))
+        );
+    }
+
+    #[test]
+    fn scheduled_keys_sort_by_enqueue_time_before_placeholder_sequence() {
+        let mut keys = [
+            scheduled(
+                &namespace(),
+                &entity(),
+                Timestamp::from_millis(200),
+                SequenceNumber::new(1),
+            ),
+            scheduled(
+                &namespace(),
+                &entity(),
+                Timestamp::from_millis(100),
+                SequenceNumber::new(9),
+            ),
+            scheduled(
+                &namespace(),
+                &entity(),
+                Timestamp::from_millis(100),
+                SequenceNumber::new(2),
+            ),
+        ];
+        keys.sort();
+
+        assert_eq!(
+            keys.iter()
+                .filter_map(|key| trailing_deadline(key))
+                .collect::<Vec<_>>(),
+            vec![
+                (Timestamp::from_millis(100), SequenceNumber::new(2)),
+                (Timestamp::from_millis(100), SequenceNumber::new(9)),
+                (Timestamp::from_millis(200), SequenceNumber::new(1)),
+            ]
         );
     }
 

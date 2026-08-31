@@ -109,6 +109,7 @@ fn peeked_delivery(record: MessageRecord) -> Delivery {
     let origin = match record.state {
         MessageState::Ready => DeliveryOrigin::Ready,
         MessageState::Deferred => DeliveryOrigin::Deferred,
+        MessageState::Scheduled => DeliveryOrigin::Scheduled,
         MessageState::Locked { origin, .. } => origin,
     };
     Delivery {
@@ -116,6 +117,7 @@ fn peeked_delivery(record: MessageRecord) -> Delivery {
         message_id: record.message_id,
         body: record.body,
         enqueued_at: record.enqueued_at,
+        scheduled_enqueue_at: record.scheduled_enqueue_at,
         expires_at: record.expires_at,
         delivery_count: record.delivery_count,
         origin,
