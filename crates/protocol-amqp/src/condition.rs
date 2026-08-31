@@ -45,7 +45,9 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         // no retry fixes.
         BrokerError::SessionRequired
         | BrokerError::SessionNotSupported
-        | BrokerError::DeadLetterQueueIsReserved => NOT_ALLOWED,
+        | BrokerError::DeadLetterQueueIsReserved
+        | BrokerError::EmptyMessageBatch
+        | BrokerError::MessageBatchSessionMismatch => NOT_ALLOWED,
 
         BrokerError::MessageTooLarge { .. } => MESSAGE_SIZE_EXCEEDED,
         BrokerError::QueueConfig(_) => PRECONDITION_FAILED,
@@ -130,6 +132,17 @@ mod tests {
             }),
             INTERNAL_ERROR
         );
+    }
+
+    #[test]
+    fn invalid_batch_shapes_are_not_retryable() {
+        for error in [
+            BrokerError::EmptyMessageBatch,
+            BrokerError::MessageBatchSessionMismatch,
+        ] {
+            assert_eq!(condition_for(&error), NOT_ALLOWED);
+            assert!(!is_retryable(&error));
+        }
     }
 
     #[test]

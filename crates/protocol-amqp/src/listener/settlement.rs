@@ -1,12 +1,16 @@
 //! Receiving-link delivery and settlement.
 
-use std::time::Duration;
+use std::{collections::HashSet, future::Future, pin::Pin, time::Duration};
 
-use amqp::{AmqpError, DeliveryState, DeliveryTag, Fields, Outcome, Sender};
+use amqp::{
+    AmqpError, DeliveryConfirmation, DeliveryState, DeliveryTag, EngineError, Fields, Outcome,
+    PendingDelivery, Sender,
+};
 use domain::{
     CommandKind, CommandOutcome, Delivery, EntityPath, LockToken, NamespaceName, ReceiveMode,
     SessionHold,
 };
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_amqp::{Value, primitives::Symbol};
 use tracing::{debug, warn};
 
@@ -23,8 +27,46 @@ use super::{
 /// interval rather than trusting the signal absolutely.
 const EMPTY_QUEUE_FALLBACK: Duration = Duration::from_secs(3);
 
-/// Drives a link the client receives on: fetch, deliver, then settle as the
-/// client's disposition says.
+/// Bounds broker locks retained by one link even when the peer grants a very
+/// large credit window and delays every disposition.
+const MAX_IN_FLIGHT_DELIVERIES: usize = 32;
+
+type InFlightSettlement = Pin<Box<dyn Future<Output = SettlementCompletion> + Send + 'static>>;
+
+struct SettlementCompletion {
+    lock_token: Option<LockToken>,
+    result: Result<(), SettlementFailure>,
+}
+
+#[derive(Clone)]
+struct SettlementContext<B> {
+    namespace: NamespaceName,
+    entity: EntityPath,
+    broker: B,
+    authorization: Option<LinkAuthorization>,
+    management: std::sync::Arc<ConnectionManagement>,
+    link_name: String,
+}
+
+enum SettlementFailure {
+    Unauthorized,
+    Engine(EngineError),
+}
+
+enum PumpExit {
+    Clean,
+    Unauthorized,
+    Broker(BrokerRejection),
+    Engine(EngineError),
+    Protocol(crate::ProtocolError),
+}
+
+/// Drives a link the client receives on with bounded, credit-driven concurrency.
+///
+/// A broker delivery is fetched only after the preceding transfer consumed
+/// remote credit and reached the wire. Once started, its remote disposition is
+/// independent: several peek locks may remain outstanding and settle in any
+/// order without stalling new credit.
 pub(super) async fn serve_receiving_client<B: Broker>(
     mut sender: Sender,
     namespace: NamespaceName,
@@ -38,70 +80,261 @@ pub(super) async fn serve_receiving_client<B: Broker>(
         authorization,
         management,
     } = protocol;
+    let link_name = sender.name().to_owned();
+    let settlement_context = SettlementContext {
+        namespace: namespace.clone(),
+        entity: entity.clone(),
+        broker: broker.clone(),
+        authorization: authorization.clone(),
+        management: management.clone(),
+        link_name: link_name.clone(),
+    };
+    let mut in_flight = FuturesUnordered::<InFlightSettlement>::new();
+    let mut registered_locks = HashSet::new();
 
-    loop {
-        // The link is watched the whole time a message is being waited for. A
-        // client that detaches while the queue is empty is waiting for an
-        // answer, and a task that only polls the broker would never send one.
-        let fetched = tokio::select! {
-            biased;
-            _ = sender.on_detach() => {
-                release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                let _ = sender.close().await;
-                return Ok(());
+    let exit = 'pump: loop {
+        if in_flight.len() == MAX_IN_FLIGHT_DELIVERIES {
+            tokio::select! {
+                biased;
+                () = wait_until_link_unauthorized(authorization.as_ref()), if authorization.is_some() => {
+                    break 'pump PumpExit::Unauthorized;
+                }
+                drain = sender.on_drain() => match drain {
+                    Ok(request) => {
+                        if let Err(error) = sender.drained(request).await {
+                            break 'pump PumpExit::Engine(error);
+                        }
+                    }
+                    Err(error) => break 'pump PumpExit::Engine(error),
+                },
+                completion = in_flight.next() => {
+                    let completion = completion
+                        .expect("a full in-flight set cannot end before yielding a completion");
+                    if let Some(exit) = handle_completion(completion, &mut registered_locks) {
+                        break 'pump exit;
+                    }
+                }
             }
-            () = wait_until_link_unauthorized(authorization.as_ref()), if authorization.is_some() => {
-                release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                sender
-                    .close_with_error(unauthorized_error("the link's authorization has expired"))
-                    .await?;
-                return Ok(());
+            continue;
+        }
+
+        // Reserve before touching broker state. In receive-and-delete mode the
+        // following Receive is irreversible, so readiness alone is not enough:
+        // a concurrent drain must not revoke the credit that will carry it.
+        let reservation = {
+            let credit = sender.on_credit();
+            tokio::pin!(credit);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = wait_until_link_unauthorized(authorization.as_ref()), if authorization.is_some() => {
+                        break 'pump PumpExit::Unauthorized;
+                    }
+                    completion = in_flight.next(), if !in_flight.is_empty() => {
+                        let completion = completion
+                            .expect("a non-empty in-flight set must yield a completion");
+                        if let Some(exit) = handle_completion(completion, &mut registered_locks) {
+                            break 'pump exit;
+                        }
+                    }
+                    credit = &mut credit => match credit {
+                        Ok(reservation) => break reservation,
+                        Err(error) => break 'pump PumpExit::Engine(error),
+                    },
+                }
             }
-            fetched = next_delivery(
+        };
+
+        // Keep the receive future alive when an earlier settlement completes.
+        // Dropping a broker submission after it committed could strand a lock
+        // until expiry even though its returned Delivery was never observed.
+        let wakeup = broker.deliverable(&namespace, &entity);
+        tokio::pin!(wakeup);
+        let fetched = {
+            let fetched = receive_delivery(
                 &broker,
                 &namespace,
                 &entity,
                 mode,
                 session.as_ref(),
                 authorization.as_ref(),
-            ) => fetched,
-        };
-
-        match fetched {
-            Ok(delivery) => {
-                if !settle(
-                    &mut sender,
-                    &namespace,
-                    &entity,
-                    &broker,
-                    delivery,
-                    authorization.as_ref(),
-                    &management,
-                )
-                .await?
-                {
-                    release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                    sender
-                        .close_with_error(unauthorized_error(
-                            "the link's authorization expired before settlement",
-                        ))
-                        .await?;
-                    return Ok(());
+            );
+            tokio::pin!(fetched);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = sender.on_detach() => break 'pump PumpExit::Clean,
+                    () = wait_until_link_unauthorized(authorization.as_ref()), if authorization.is_some() => {
+                        break 'pump PumpExit::Unauthorized;
+                    }
+                    completion = in_flight.next(), if !in_flight.is_empty() => {
+                        let completion = completion
+                            .expect("a non-empty in-flight set must yield a completion");
+                        if let Some(exit) = handle_completion(completion, &mut registered_locks) {
+                            break 'pump exit;
+                        }
+                    }
+                    fetched = &mut fetched => break fetched,
                 }
             }
+        };
+        let delivery = match fetched {
+            Ok(Some(delivery)) => delivery,
+            Ok(None) => {
+                if let Err(error) = reservation.release().await {
+                    break 'pump PumpExit::Engine(error);
+                }
+                let fallback = tokio::time::sleep(EMPTY_QUEUE_FALLBACK);
+                tokio::pin!(fallback);
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = wait_until_link_unauthorized(authorization.as_ref()), if authorization.is_some() => {
+                            break 'pump PumpExit::Unauthorized;
+                        }
+                        completion = in_flight.next(), if !in_flight.is_empty() => {
+                            let completion = completion
+                                .expect("a non-empty in-flight set must yield a completion");
+                            if let Some(exit) = handle_completion(completion, &mut registered_locks) {
+                                break 'pump exit;
+                            }
+                        }
+                        drain = sender.on_drain() => match drain {
+                            Ok(request) => {
+                                if let Err(error) = sender.drained(request).await {
+                                    break 'pump PumpExit::Engine(error);
+                                }
+                                break;
+                            }
+                            Err(error) => break 'pump PumpExit::Engine(error),
+                        },
+                        () = &mut wakeup => break,
+                        () = &mut fallback => break,
+                    }
+                }
+                continue 'pump;
+            }
             Err(NextDeliveryError::Broker(rejection)) => {
-                release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                sender.close_with_error(rejection_error(&rejection)).await?;
-                return Ok(());
+                break 'pump PumpExit::Broker(rejection);
             }
-            Err(NextDeliveryError::Unauthorized) => {
-                release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                sender
-                    .close_with_error(unauthorized_error("the link's authorization has expired"))
-                    .await?;
-                return Ok(());
-            }
+            Err(NextDeliveryError::Unauthorized) => break 'pump PumpExit::Unauthorized,
+        };
+
+        let dead_letter_source = delivery
+            .dead_letter
+            .as_ref()
+            .and_then(|_| entity.as_str().strip_suffix(crate::DEAD_LETTER_SUFFIX));
+        let message = match crate::message::write_delivery_from(&delivery, dead_letter_source) {
+            Ok(message) => message,
+            Err(error) => break 'pump PumpExit::Protocol(error),
+        };
+        let lock_token = delivery.lock.map(|lock| lock.token);
+        if let Some(lock) = delivery.lock {
+            management
+                .register_delivery(&link_name, entity.clone(), delivery.sequence, lock.token)
+                .await;
+            registered_locks.insert(lock.token);
         }
+        let delivery_tag = match lock_token {
+            Some(token) => lock_delivery_tag(token),
+            None => sequence_delivery_tag(delivery.sequence),
+        };
+
+        // `send_pending` resolves only after this transfer consumed remote
+        // credit and was written. Existing remote outcomes remain live while
+        // it waits, so slow credit cannot serialize unrelated settlements.
+        let pending = {
+            let started = sender.send_pending_with_credit(reservation, message, delivery_tag);
+            tokio::pin!(started);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = wait_until_link_unauthorized(authorization.as_ref()), if authorization.is_some() => {
+                        break 'pump PumpExit::Unauthorized;
+                    }
+                    completion = in_flight.next(), if !in_flight.is_empty() => {
+                        let completion = completion
+                            .expect("a non-empty in-flight set must yield a completion");
+                        if let Some(exit) = handle_completion(completion, &mut registered_locks) {
+                            break 'pump exit;
+                        }
+                    }
+                    started = &mut started => match started {
+                        Ok(pending) => break pending,
+                        Err(error) => break 'pump PumpExit::Engine(error),
+                    },
+                }
+            }
+        };
+        in_flight.push(settlement_future(
+            pending,
+            delivery,
+            settlement_context.clone(),
+        ));
+    };
+
+    // Cancel every pending waiter before removing its management route. A
+    // completed future unregisters itself; removing twice is harmless and
+    // makes teardown correct at every possible cancellation point.
+    drop(in_flight);
+    unregister_deliveries(&management, &link_name, &mut registered_locks).await;
+    release_session(&broker, &namespace, &entity, session.as_ref()).await;
+
+    match exit {
+        // The engine already answered a remote Detach before surfacing the
+        // notification. Closing this stale endpoint after the asynchronous
+        // lock/session cleanup could target a new link that reused its handle.
+        PumpExit::Clean => Ok(()),
+        PumpExit::Unauthorized => {
+            sender
+                .close_with_error(unauthorized_error("the link's authorization has expired"))
+                .await?;
+            Ok(())
+        }
+        PumpExit::Broker(rejection) => {
+            sender.close_with_error(rejection_error(&rejection)).await?;
+            Ok(())
+        }
+        PumpExit::Protocol(error) => {
+            sender
+                .close_with_error(error_for(AmqpError::InternalError, error.to_string()))
+                .await?;
+            Err(error.into())
+        }
+        PumpExit::Engine(
+            EngineError::RemoteClosed | EngineError::RemoteDetached | EngineError::Stopped,
+        ) => Ok(()),
+        PumpExit::Engine(error) => {
+            let _ = sender.close().await;
+            Err(error.into())
+        }
+    }
+}
+
+fn handle_completion(
+    completion: SettlementCompletion,
+    registered_locks: &mut HashSet<LockToken>,
+) -> Option<PumpExit> {
+    if let Some(lock_token) = completion.lock_token {
+        registered_locks.remove(&lock_token);
+    }
+    match completion.result {
+        Ok(()) => None,
+        Err(SettlementFailure::Unauthorized) => Some(PumpExit::Unauthorized),
+        Err(SettlementFailure::Engine(
+            EngineError::RemoteClosed | EngineError::RemoteDetached | EngineError::Stopped,
+        )) => Some(PumpExit::Clean),
+        Err(SettlementFailure::Engine(error)) => Some(PumpExit::Engine(error)),
+    }
+}
+
+async fn unregister_deliveries(
+    management: &ConnectionManagement,
+    link_name: &str,
+    registered_locks: &mut HashSet<LockToken>,
+) {
+    for lock_token in std::mem::take(registered_locks) {
+        management.unregister_delivery(link_name, lock_token).await;
     }
 }
 
@@ -114,7 +347,7 @@ async fn wait_until_link_unauthorized(authorization: Option<&LinkAuthorization>)
 
 /// Frees the session a link held, so the next receiver need not wait out the
 /// lock. Failure is survivable: expiry frees it anyway.
-async fn release_session<B: Broker>(
+pub(super) async fn release_session<B: Broker>(
     broker: &B,
     namespace: &NamespaceName,
     entity: &EntityPath,
@@ -135,53 +368,45 @@ async fn release_session<B: Broker>(
     }
 }
 
-/// The next message the queue will part with, however long that takes.
-async fn next_delivery<B: Broker>(
+/// Makes one broker receive attempt.
+///
+/// Reporting an empty result to the pump is significant: only after that
+/// observation may it acknowledge a remote AMQP drain request. The wakeup is
+/// armed by the caller before this command so a concurrent send is not lost.
+async fn receive_delivery<B: Broker>(
     broker: &B,
     namespace: &NamespaceName,
     entity: &EntityPath,
     mode: ReceiveMode,
     session: Option<&SessionHold>,
     authorization: Option<&LinkAuthorization>,
-) -> Result<Delivery, NextDeliveryError> {
-    loop {
-        if let Some(authorization) = authorization
-            && authorization.ensure().await.is_err()
-        {
-            return Err(NextDeliveryError::Unauthorized);
-        }
-        // Armed before the receive: a message that lands between the empty
-        // answer below and the wait leaves a stored notification, so the wait
-        // returns at once instead of sleeping on a queue that is not empty.
-        let wakeup = broker.deliverable(namespace, entity);
-        let outcome = broker
-            .submit(
-                namespace.clone(),
-                entity.clone(),
-                CommandKind::Receive {
-                    mode,
-                    lock_duration_millis: None,
-                    session: session.cloned(),
-                },
-            )
-            .await
-            .map_err(NextDeliveryError::Broker)?;
+) -> Result<Option<Delivery>, NextDeliveryError> {
+    if let Some(authorization) = authorization
+        && authorization.ensure().await.is_err()
+    {
+        return Err(NextDeliveryError::Unauthorized);
+    }
+    let outcome = broker
+        .submit(
+            namespace.clone(),
+            entity.clone(),
+            CommandKind::Receive {
+                mode,
+                lock_duration_millis: None,
+                session: session.cloned(),
+            },
+        )
+        .await
+        .map_err(NextDeliveryError::Broker)?;
 
-        match outcome {
-            CommandOutcome::Received(Some(delivery)) => return Ok(delivery),
-            CommandOutcome::Received(None) => {
-                tokio::select! {
-                    () = wakeup => {}
-                    () = tokio::time::sleep(EMPTY_QUEUE_FALLBACK) => {}
-                }
-            }
-            other => {
-                // A receive that produced anything else means the broker and the
-                // edge disagree about the command, which is not a client problem.
-                return Err(NextDeliveryError::Broker(BrokerRejection::Unavailable(
-                    format!("receive produced an unexpected outcome: {other:?}"),
-                )));
-            }
+    match outcome {
+        CommandOutcome::Received(delivery) => Ok(delivery),
+        other => {
+            // A receive that produced anything else means the broker and the
+            // edge disagree about the command, which is not a client problem.
+            Err(NextDeliveryError::Broker(BrokerRejection::Unavailable(
+                format!("receive produced an unexpected outcome: {other:?}"),
+            )))
         }
     }
 }
@@ -191,96 +416,145 @@ enum NextDeliveryError {
     Unauthorized,
 }
 
-/// Hands one message to the client and applies whatever it said about it.
-///
-/// The lock is already committed, so a client that never answers costs a
-/// redelivery rather than a lost message.
-async fn settle<B: Broker>(
-    sender: &mut Sender,
-    namespace: &NamespaceName,
-    entity: &EntityPath,
-    broker: &B,
+fn settlement_future<B: Broker>(
+    pending: PendingDelivery,
     delivery: Delivery,
-    authorization: Option<&LinkAuthorization>,
-    management: &ConnectionManagement,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let dead_letter_source = delivery
-        .dead_letter
-        .as_ref()
-        .and_then(|_| entity.as_str().strip_suffix(crate::DEAD_LETTER_SUFFIX));
-    let message = match crate::message::write_delivery_from(&delivery, dead_letter_source) {
-        Ok(message) => message,
-        Err(error) => {
-            sender
-                .close_with_error(error_for(AmqpError::InternalError, error.to_string()))
-                .await?;
-            return Err(error.into());
-        }
-    };
-    let Some(lock) = delivery.lock else {
-        let delivery_tag = sequence_delivery_tag(delivery.sequence);
-        // Receive-and-delete: the message is already gone, so there is nothing
-        // to settle after the transfer.
-        let sent = match authorization {
-            Some(authorization) => {
-                tokio::select! {
-                    outcome = sender.send(message, delivery_tag.clone()) => {
-                        outcome?;
-                        true
-                    }
-                    () = authorization.wait_until_unauthorized() => false,
-                }
-            }
-            None => {
-                sender.send(message, delivery_tag).await?;
-                true
-            }
-        };
-        return Ok(sent);
-    };
-    let sequence = delivery.sequence;
-    let delivery_tag = lock_delivery_tag(lock.token);
-    let link_name = sender.name().to_owned();
-    management
-        .register_delivery(&link_name, entity.clone(), sequence, lock.token)
-        .await;
-    let outcome = match authorization {
-        Some(authorization) => {
-            tokio::select! {
-                outcome = sender.send_unconfirmed(message, delivery_tag.clone()) => Some(outcome),
-                () = authorization.wait_until_unauthorized() => None,
-            }
-        }
-        None => Some(sender.send_unconfirmed(message, delivery_tag).await),
-    };
-    management.unregister_delivery(&link_name, lock.token).await;
-    let Some(outcome) = outcome else {
-        return Ok(false);
-    };
-    let outcome = outcome?;
-    if let Some(authorization) = authorization
+    context: SettlementContext<B>,
+) -> InFlightSettlement {
+    let lock_token = delivery.lock.map(|lock| lock.token);
+    shield_settlement(lock_token, async move {
+        settle_started_delivery(pending, delivery, context).await
+    })
+}
+
+fn shield_settlement<F>(lock_token: Option<LockToken>, settlement: F) -> InFlightSettlement
+where
+    F: Future<Output = Result<(), SettlementFailure>> + Send + 'static,
+{
+    // Once a remote outcome is available, applying it to the broker must
+    // survive link teardown. Dropping a Tokio join handle detaches rather than
+    // cancels its task, so the durable settlement continues even when the pump
+    // discards outcome waiters after Detach or End.
+    let settlement = tokio::spawn(async move {
+        let result = settlement.await;
+        SettlementCompletion { lock_token, result }
+    });
+    Box::pin(async move {
+        settlement.await.unwrap_or(SettlementCompletion {
+            lock_token,
+            result: Err(SettlementFailure::Engine(EngineError::Stopped)),
+        })
+    })
+}
+
+/// Awaits and applies one independently identified remote disposition.
+///
+/// The lock is already committed and the transfer is already on the wire. A
+/// peer that never answers therefore costs a redelivery rather than a lost
+/// message, without preventing later delivery identities from settling first.
+async fn settle_started_delivery<B: Broker>(
+    pending: PendingDelivery,
+    delivery: Delivery,
+    context: SettlementContext<B>,
+) -> Result<(), SettlementFailure> {
+    let SettlementContext {
+        namespace,
+        entity,
+        broker,
+        authorization,
+        management,
+        link_name,
+    } = context;
+    let lock_token = delivery.lock.map(|lock| lock.token);
+    let remote = pending.await;
+    if let Some(lock_token) = lock_token {
+        management.unregister_delivery(&link_name, lock_token).await;
+    }
+    let remote = remote.map_err(SettlementFailure::Engine)?;
+    let (_, outcome, confirmation) = remote.into_parts();
+
+    if let Some(authorization) = authorization.as_ref()
         && authorization.ensure().await.is_err()
     {
-        sender
-            .confirm(DeliveryState::Rejected(amqp::Rejected {
+        confirm_if_needed(
+            confirmation,
+            DeliveryState::Rejected(amqp::Rejected {
                 error: Some(unauthorized_error(
                     "the link's authorization expired before settlement committed",
                 )),
-            }))
-            .await?;
-        return Ok(false);
+            }),
+        )
+        .await?;
+        return Err(SettlementFailure::Unauthorized);
     }
 
-    // Service Bus treats the sender's second-mode disposition as the result of
-    // applying the requested settlement operation, not as an echo of that
-    // request. Accepted means Complete, Abandon, or DeadLetter committed.
-    let confirmation = DeliveryState::Accepted(amqp::Accepted);
+    let Some(lock) = delivery.lock else {
+        // Receive-and-delete is already durable. In receiver settle mode second
+        // the peer still expects its outcome to be acknowledged, so echo the
+        // state against this delivery's independent identity.
+        return confirm_if_needed(confirmation, delivery_state_for_outcome(&outcome)).await;
+    };
+    let sequence = delivery.sequence;
+    let (kind, expected) = settlement_command(outcome, sequence, lock.token);
 
-    let (kind, expected) = match outcome {
+    // Service Bus treats the second-mode confirmation as the result of the
+    // durable broker operation, not as an echo of the requested disposition.
+    match broker.submit(namespace, entity, kind).await {
+        Ok(outcome) if expected.matches(&outcome) => {
+            confirm_if_needed(confirmation, DeliveryState::Accepted(amqp::Accepted)).await?
+        }
+        Ok(other) => {
+            confirm_if_needed(
+                confirmation,
+                DeliveryState::Rejected(amqp::Rejected {
+                    error: Some(error_for(
+                        AmqpError::InternalError,
+                        format!("settlement produced an unexpected outcome: {other:?}"),
+                    )),
+                }),
+            )
+            .await?;
+            warn!(%sequence, ?other, "settlement produced an unexpected broker outcome");
+        }
+        Err(rejection) => {
+            confirm_if_needed(
+                confirmation,
+                DeliveryState::Rejected(amqp::Rejected {
+                    error: Some(rejection_error(&rejection)),
+                }),
+            )
+            .await?;
+            // A settlement that fails is not fatal to the link: the lock
+            // expires and the message comes round again.
+            warn!(%sequence, %rejection, "settlement failed, leaving the lock to expire");
+        }
+    }
+    Ok(())
+}
+
+async fn confirm_if_needed(
+    confirmation: Option<DeliveryConfirmation>,
+    state: DeliveryState,
+) -> Result<(), SettlementFailure> {
+    match confirmation {
+        Some(confirmation) => confirmation
+            .confirm(state)
+            .await
+            .map_err(SettlementFailure::Engine),
+        None => Ok(()),
+    }
+}
+
+fn settlement_command(
+    outcome: Outcome,
+    sequence: domain::SequenceNumber,
+    lock_token: LockToken,
+) -> (CommandKind, SettlementOutcome) {
+    match outcome {
         Outcome::Accepted(_) => (
             CommandKind::Complete {
                 sequence,
-                lock_token: lock.token,
+                lock_token,
             },
             SettlementOutcome::Completed,
         ),
@@ -291,49 +565,32 @@ async fn settle<B: Broker>(
             (
                 CommandKind::DeadLetter {
                     sequence,
-                    lock_token: lock.token,
+                    lock_token,
                     reason,
                     description,
                 },
                 SettlementOutcome::DeadLettered,
             )
         }
-        // Released and modified both mean "not now": back to the queue, with the
-        // delivery count already incremented by the receive.
+        // Released and modified both mean "not now": back to the queue, with
+        // the delivery count already incremented by the receive.
         Outcome::Released(_) | Outcome::Modified(_) => (
             CommandKind::Abandon {
                 sequence,
-                lock_token: lock.token,
+                lock_token,
             },
             SettlementOutcome::Abandoned,
         ),
-    };
-
-    match broker.submit(namespace.clone(), entity.clone(), kind).await {
-        Ok(outcome) if expected.matches(&outcome) => sender.confirm(confirmation).await?,
-        Ok(other) => {
-            sender
-                .confirm(DeliveryState::Rejected(amqp::Rejected {
-                    error: Some(error_for(
-                        AmqpError::InternalError,
-                        format!("settlement produced an unexpected outcome: {other:?}"),
-                    )),
-                }))
-                .await?;
-            warn!(%sequence, ?other, "settlement produced an unexpected broker outcome");
-        }
-        Err(rejection) => {
-            sender
-                .confirm(DeliveryState::Rejected(amqp::Rejected {
-                    error: Some(rejection_error(&rejection)),
-                }))
-                .await?;
-            // A settlement that fails is not fatal to the link: the lock expires
-            // and the message comes round again.
-            warn!(%sequence, %rejection, "settlement failed, leaving the lock to expire");
-        }
     }
-    Ok(true)
+}
+
+fn delivery_state_for_outcome(outcome: &Outcome) -> DeliveryState {
+    match outcome {
+        Outcome::Accepted(value) => DeliveryState::Accepted(value.clone()),
+        Outcome::Rejected(value) => DeliveryState::Rejected(value.clone()),
+        Outcome::Released(value) => DeliveryState::Released(value.clone()),
+        Outcome::Modified(value) => DeliveryState::Modified(value.clone()),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -403,7 +660,7 @@ fn string_field(fields: &Fields, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use amqp::{Error as AmqpProtocolError, ErrorCondition};
+    use amqp::{Error as AmqpProtocolError, ErrorCondition, Modified, Released};
 
     use super::*;
 
@@ -451,5 +708,62 @@ mod tests {
                 String::from("the receiver rejected the message")
             )
         );
+    }
+
+    #[test]
+    fn independent_outcomes_map_to_their_own_broker_commands() {
+        let sequence = domain::SequenceNumber::new(7);
+        let token = LockToken::new(9);
+
+        let (complete, expected) =
+            settlement_command(Outcome::Accepted(amqp::Accepted), sequence, token);
+        assert_eq!(
+            complete,
+            CommandKind::Complete {
+                sequence,
+                lock_token: token
+            }
+        );
+        assert!(expected.matches(&CommandOutcome::Completed));
+
+        for outcome in [
+            Outcome::Released(Released),
+            Outcome::Modified(Modified::default()),
+        ] {
+            let (abandon, expected) = settlement_command(outcome, sequence, token);
+            assert_eq!(
+                abandon,
+                CommandKind::Abandon {
+                    sequence,
+                    lock_token: token
+                }
+            );
+            assert!(expected.matches(&CommandOutcome::Abandoned {
+                dead_lettered: false
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_active_settlement_survives_its_pump_waiter_being_dropped() {
+        let (started_tx, started) = tokio::sync::oneshot::channel();
+        let (release_tx, release) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished) = tokio::sync::oneshot::channel();
+        let waiter = shield_settlement(None, async move {
+            let _ = started_tx.send(());
+            let _ = release.await;
+            let _ = finished_tx.send(());
+            Ok(())
+        });
+
+        started.await.expect("the shielded settlement starts");
+        drop(waiter);
+        release_tx
+            .send(())
+            .expect("dropping the waiter leaves the settlement alive");
+        tokio::time::timeout(Duration::from_secs(1), finished)
+            .await
+            .expect("the detached settlement finishes promptly")
+            .expect("the detached settlement retains its completion channel");
     }
 }

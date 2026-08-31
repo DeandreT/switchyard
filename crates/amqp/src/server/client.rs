@@ -19,14 +19,17 @@ pub struct ClientSession {
 pub struct ClientSender {
     channel: u16,
     handle: u32,
+    incarnation: u64,
     next_tag: u64,
     commands: mpsc::Sender<ClientCommand>,
     detached: watch::Receiver<bool>,
+    send_capacity: Arc<Semaphore>,
 }
 
 pub struct ClientReceiver {
     channel: u16,
     handle: u32,
+    incarnation: u64,
     source: Option<Source>,
     commands: mpsc::Sender<ClientCommand>,
     deliveries: mpsc::Receiver<Delivery>,
@@ -187,27 +190,34 @@ impl ClientSession {
         let name = name.into();
         let (deliveries_tx, _) = mpsc::channel(1);
         let (detached_tx, detached) = watch::channel(false);
-        let (handle, _) = client_request(&self.commands, |reply| ClientCommand::Attach {
-            channel: self.channel,
-            request: Box::new(AttachRequest {
-                name,
-                role: Role::Sender,
-                sender_settle_mode: SenderSettleMode::Mixed,
-                receiver_settle_mode: ReceiverSettleMode::First,
-                source: None,
-                target: Some(target),
-            }),
-            deliveries_tx,
-            detached_tx,
-            reply,
-        })
-        .await?;
+        let (drain_tx, _drains) = watch::channel(None);
+        let (credit_tx, _credits) = watch::channel(false);
+        let (handle, incarnation, _) =
+            client_request(&self.commands, |reply| ClientCommand::Attach {
+                channel: self.channel,
+                request: Box::new(AttachRequest {
+                    name,
+                    role: Role::Sender,
+                    sender_settle_mode: SenderSettleMode::Mixed,
+                    receiver_settle_mode: ReceiverSettleMode::First,
+                    source: None,
+                    target: Some(target),
+                }),
+                deliveries_tx,
+                detached_tx,
+                drain_tx,
+                credit_tx,
+                reply,
+            })
+            .await?;
         Ok(ClientSender {
             channel: self.channel,
             handle,
+            incarnation,
             next_tag: 0,
             commands: self.commands.clone(),
             detached,
+            send_capacity: Arc::new(Semaphore::new(OUTGOING_DELIVERY_LIMIT)),
         })
     }
 
@@ -235,24 +245,30 @@ impl ClientSession {
         let name = name.into();
         let (deliveries_tx, deliveries) = mpsc::channel(32);
         let (detached_tx, detached) = watch::channel(false);
-        let (handle, response) = client_request(&self.commands, |reply| ClientCommand::Attach {
-            channel: self.channel,
-            request: Box::new(AttachRequest {
-                name,
-                role: Role::Receiver,
-                sender_settle_mode,
-                receiver_settle_mode: ReceiverSettleMode::First,
-                source: Some(source),
-                target,
-            }),
-            deliveries_tx,
-            detached_tx,
-            reply,
-        })
-        .await?;
+        let (drain_tx, _drains) = watch::channel(None);
+        let (credit_tx, _credits) = watch::channel(false);
+        let (handle, incarnation, response) =
+            client_request(&self.commands, |reply| ClientCommand::Attach {
+                channel: self.channel,
+                request: Box::new(AttachRequest {
+                    name,
+                    role: Role::Receiver,
+                    sender_settle_mode,
+                    receiver_settle_mode: ReceiverSettleMode::First,
+                    source: Some(source),
+                    target,
+                }),
+                deliveries_tx,
+                detached_tx,
+                drain_tx,
+                credit_tx,
+                reply,
+            })
+            .await?;
         Ok(ClientReceiver {
             channel: self.channel,
             handle,
+            incarnation,
             source: response.source,
             commands: self.commands.clone(),
             deliveries,
@@ -279,19 +295,41 @@ impl ClientSender {
     }
 
     pub async fn send(&mut self, message: Message) -> Result<Outcome, EngineError> {
+        self.send_with_format(message, 0).await
+    }
+
+    /// Sends a message with an explicit AMQP message-format value.
+    ///
+    /// This is primarily useful for interoperability tests of extension
+    /// formats while retaining the ordinary decoded [`Message`] model.
+    pub async fn send_with_format(
+        &mut self,
+        message: Message,
+        message_format: u32,
+    ) -> Result<Outcome, EngineError> {
         let tag = self.next_tag.to_be_bytes().to_vec().into();
         self.next_tag = self.next_tag.wrapping_add(1);
+        let permit = Arc::clone(&self.send_capacity)
+            .acquire_owned()
+            .await
+            .map_err(|_| EngineError::Stopped)?;
+        let (started, start) = oneshot::channel();
         let (reply, outcome) = oneshot::channel();
         self.commands
             .send(ClientCommand::Send {
                 channel: self.channel,
                 handle: self.handle,
+                incarnation: self.incarnation,
                 message: Box::new(message),
+                message_format,
                 delivery_tag: tag,
+                permit,
+                started,
                 reply,
             })
             .await
             .map_err(|_| EngineError::Stopped)?;
+        start.await.map_err(|_| EngineError::Stopped)??;
         Ok(outcome.await.map_err(|_| EngineError::Stopped)??.outcome)
     }
 
@@ -299,6 +337,7 @@ impl ClientSender {
         client_request(&self.commands, |reply| ClientCommand::Detach {
             channel: self.channel,
             handle: self.handle,
+            incarnation: self.incarnation,
             reply,
         })
         .await
@@ -380,6 +419,7 @@ impl ClientReceiver {
         client_request(&self.commands, |reply| ClientCommand::Settle {
             channel: self.channel,
             handle: self.handle,
+            incarnation: self.incarnation,
             delivery_id: delivery.id,
             state,
             reply,
@@ -391,6 +431,7 @@ impl ClientReceiver {
         client_request(&self.commands, |reply| ClientCommand::Detach {
             channel: self.channel,
             handle: self.handle,
+            incarnation: self.incarnation,
             reply,
         })
         .await
@@ -460,18 +501,25 @@ enum ClientCommand {
         request: Box<AttachRequest>,
         deliveries_tx: mpsc::Sender<Delivery>,
         detached_tx: watch::Sender<bool>,
-        reply: oneshot::Sender<Result<(u32, Attach), EngineError>>,
+        drain_tx: watch::Sender<Option<DrainRequest>>,
+        credit_tx: watch::Sender<bool>,
+        reply: oneshot::Sender<Result<(u32, u64, Attach), EngineError>>,
     },
     Send {
         channel: u16,
         handle: u32,
+        incarnation: u64,
         message: Box<Message>,
+        message_format: u32,
         delivery_tag: DeliveryTag,
+        permit: OwnedSemaphorePermit,
+        started: oneshot::Sender<Result<DeliveryIdentity, EngineError>>,
         reply: oneshot::Sender<Result<RemoteOutcome, EngineError>>,
     },
     Settle {
         channel: u16,
         handle: u32,
+        incarnation: u64,
         delivery_id: u32,
         state: DeliveryState,
         reply: oneshot::Sender<Result<(), EngineError>>,
@@ -479,6 +527,7 @@ enum ClientCommand {
     Detach {
         channel: u16,
         handle: u32,
+        incarnation: u64,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
     End {
@@ -492,7 +541,8 @@ enum ClientCommand {
 
 struct PendingAttach {
     handle: u32,
-    reply: oneshot::Sender<Result<(u32, Attach), EngineError>>,
+    incarnation: u64,
+    reply: oneshot::Sender<Result<(u32, u64, Attach), EngineError>>,
 }
 
 async fn client_request<T>(
@@ -571,7 +621,11 @@ where
                                     Vec::new(),
                                 ).await?;
                             }
-                            let _ = pending.reply.send(Ok((pending.handle, attach)));
+                            let _ = pending.reply.send(Ok((
+                                pending.handle,
+                                pending.incarnation,
+                                attach,
+                            )));
                         }
                         Ok(false)
                     }
@@ -652,7 +706,9 @@ where
                         let channel = next_channel;
                         next_channel = next_channel.wrapping_add(1);
                         sessions.insert(channel, SessionState {
+                            incarnation: next_session_incarnation(),
                             attach_tx: Some(unused_attach_tx.clone()),
+                            pending_attaches: HashMap::new(),
                             links: HashMap::new(),
                             pending_flows: HashMap::new(),
                             next_outgoing_id: 0,
@@ -671,6 +727,8 @@ where
                         request,
                         deliveries_tx,
                         detached_tx,
+                        drain_tx,
+                        credit_tx,
                         reply,
                     } => {
                         let request = *request;
@@ -698,8 +756,10 @@ where
                         let session = sessions
                             .get_mut(&channel)
                             .ok_or_else(|| invalid_state("attach on an unknown session"))?;
-                        match request.role {
+                        let incarnation = match request.role {
                             Role::Sender => {
+                                let drain = LinkDrain::new(drain_tx);
+                                let incarnation = drain.incarnation;
                                 session.links.insert(handle, LinkState::Sending(SendingLink {
                                     receiver_settle_mode: request.receiver_settle_mode,
                                     settle_mode: request.sender_settle_mode,
@@ -708,18 +768,33 @@ where
                                     queued: VecDeque::new(),
                                     unsettled: HashMap::new(),
                                     detached: detached_tx,
+                                    drain,
+                                    credit: credit_tx,
+                                    credit_reservations: HashSet::new(),
+                                    next_credit_reservation: 0,
                                 }));
+                                incarnation
                             }
                             Role::Receiver => {
+                                let incarnation = next_link_incarnation();
                                 session.links.insert(handle, LinkState::Receiving(ReceivingLink {
+                                    incarnation,
                                     max_message_size: usize::MAX as u64,
                                     deliveries: deliveries_tx,
                                     partial: None,
                                     detached: detached_tx,
                                 }));
+                                incarnation
                             }
-                        }
-                        pending_attaches.insert(request.name, PendingAttach { handle, reply });
+                        };
+                        pending_attaches.insert(
+                            request.name,
+                            PendingAttach {
+                                handle,
+                                incarnation,
+                                reply,
+                            },
+                        );
                         write_amqp(
                             &mut writer,
                             channel,
@@ -730,20 +805,41 @@ where
                     ClientCommand::Send {
                         channel,
                         handle,
+                        incarnation,
                         message,
+                        message_format,
                         delivery_tag,
+                        permit,
+                        started,
                         reply,
                     } => {
-                        let session = sessions
-                            .get_mut(&channel)
-                            .ok_or_else(|| invalid_state("send on an unknown session"))?;
-                        let Some(LinkState::Sending(link)) = session.links.get_mut(&handle) else {
+                        let Some(session) = sessions.get_mut(&channel) else {
+                            let _ = started.send(Err(EngineError::RemoteDetached));
                             let _ = reply.send(Err(EngineError::RemoteDetached));
+                            continue;
+                        };
+                        let Some(link) = session.links.get_mut(&handle) else {
+                            let _ = started.send(Err(EngineError::RemoteDetached));
+                            let _ = reply.send(Err(EngineError::RemoteDetached));
+                            continue;
+                        };
+                        if link.incarnation() != incarnation {
+                            let _ = started.send(Err(EngineError::RemoteDetached));
+                            let _ = reply.send(Err(EngineError::RemoteDetached));
+                            continue;
+                        }
+                        let LinkState::Sending(link) = link else {
+                            let _ = started.send(Err(invalid_state("send on a receiving link")));
+                            let _ = reply.send(Err(invalid_state("send on a receiving link")));
                             continue;
                         };
                         link.queued.push_back(QueuedSend {
                             message: *message,
+                            message_format,
                             delivery_tag,
+                            reservation: None,
+                            permit,
+                            started,
                             reply,
                         });
                         flush_sends(
@@ -757,13 +853,14 @@ where
                     ClientCommand::Settle {
                         channel,
                         handle,
+                        incarnation,
                         delivery_id,
                         state,
                         reply,
                     } => {
                         if !matches!(
                             sessions.get(&channel).and_then(|session| session.links.get(&handle)),
-                            Some(LinkState::Receiving(_))
+                            Some(LinkState::Receiving(link)) if link.incarnation == incarnation
                         ) {
                             let _ = reply.send(Err(EngineError::RemoteDetached));
                             continue;
@@ -786,18 +883,32 @@ where
                         }));
                         result
                     }
-                    ClientCommand::Detach { channel, handle, reply } => {
-                        pending_detaches.insert((channel, handle), reply);
-                        write_amqp(
-                            &mut writer,
-                            channel,
-                            Performative::Detach(Detach {
-                                handle,
-                                closed: true,
-                                error: None,
-                            }),
-                            Vec::new(),
-                        ).await
+                    ClientCommand::Detach {
+                        channel,
+                        handle,
+                        incarnation,
+                        reply,
+                    } => {
+                        let is_current = sessions
+                            .get(&channel)
+                            .and_then(|session| session.links.get(&handle))
+                            .is_some_and(|link| link.incarnation() == incarnation);
+                        if is_current {
+                            pending_detaches.insert((channel, handle), reply);
+                            write_amqp(
+                                &mut writer,
+                                channel,
+                                Performative::Detach(Detach {
+                                    handle,
+                                    closed: true,
+                                    error: None,
+                                }),
+                                Vec::new(),
+                            ).await
+                        } else {
+                            let _ = reply.send(Ok(()));
+                            Ok(())
+                        }
                     }
                     ClientCommand::End { channel, reply } => {
                         let result = write_amqp(
@@ -852,4 +963,71 @@ where
     }
     let _ = closed.send(true);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn client_sender_can_send_an_explicit_message_format() {
+        let message_format = 0x8001_3700;
+        let message = Message::data(b"formatted-batch".to_vec());
+        let encoded = encode_message(&message).expect("message encodes");
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let server = tokio::spawn(async move {
+            let mut connection = ServerConnection::accept(server_io, "server", None)
+                .await
+                .expect("server accepts the connection");
+            let incoming = connection
+                .next_incoming_session()
+                .await
+                .expect("client begins a session");
+            let mut session = connection
+                .accept_session(incoming)
+                .await
+                .expect("server accepts the session");
+            let attach = session
+                .next_incoming_attach()
+                .await
+                .expect("client attaches a sender");
+            let LinkEndpoint::Receiver(mut receiver) = session
+                .accept_attach(attach, 64 * 1024)
+                .await
+                .expect("server accepts the link")
+            else {
+                panic!("a client sender creates a server receiver");
+            };
+            let delivery = receiver.recv().await.expect("server receives the message");
+            let received_format = delivery.message_format();
+            let received_message = delivery.message().clone();
+            let received_bytes = delivery.encoded_message().to_vec();
+            receiver
+                .accept(&delivery)
+                .await
+                .expect("server accepts the delivery");
+            (received_format, received_message, received_bytes)
+        });
+
+        let mut connection = ClientConnection::open(client_io, "client", None)
+            .await
+            .expect("client opens the connection");
+        let mut session = connection.begin().await.expect("client begins a session");
+        let mut sender = session
+            .attach_sender("sender", "queue")
+            .await
+            .expect("client attaches a sender");
+        let outcome = sender
+            .send_with_format(message.clone(), message_format)
+            .await
+            .expect("formatted delivery receives an outcome");
+        assert_eq!(outcome, Outcome::Accepted(Accepted));
+
+        let (received_format, received_message, received_bytes) =
+            server.await.expect("server task joins");
+        assert_eq!(received_format, message_format);
+        assert_eq!(received_message, message);
+        assert_eq!(received_bytes, encoded);
+    }
 }

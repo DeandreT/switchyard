@@ -8,7 +8,7 @@ use amqp::{
     AnnotationKey, ApplicationProperties, Body, DeliveryAnnotations, Header, Message,
     MessageAnnotations, MessageId, Properties, Uuid, Value, decode_message,
 };
-use domain::{Delivery, MessageEnvelope, SessionId};
+use domain::{Delivery, MessageEnvelope, MessageInput, SessionId};
 use serde_amqp::primitives::Timestamp as AmqpTimestamp;
 
 use crate::{ProtocolError, parse_session_id};
@@ -22,6 +22,29 @@ pub struct IncomingMessage {
     pub time_to_live_millis: Option<u64>,
     pub envelope: MessageEnvelope,
 }
+
+impl From<IncomingMessage> for MessageInput {
+    fn from(message: IncomingMessage) -> Self {
+        Self {
+            message_id: message.message_id,
+            body: message.body,
+            session_id: message.session_id,
+            time_to_live_millis: message.time_to_live_millis,
+            envelope: Some(message.envelope),
+        }
+    }
+}
+
+/// The messages represented by one incoming AMQP delivery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IncomingMessages {
+    Single(IncomingMessage),
+    Batch(Vec<IncomingMessage>),
+}
+
+/// Microsoft Service Bus extension format whose Data sections each contain a
+/// complete encoded child AMQP message.
+pub const SERVICE_BUS_BATCH_MESSAGE_FORMAT: u32 = 0x8001_3700;
 
 /// Reads an incoming AMQP message into the parts a send command needs.
 ///
@@ -53,6 +76,50 @@ pub fn read_incoming(
             .map(u64::from),
         envelope: MessageEnvelope::new(encoded_message.to_vec()),
     })
+}
+
+/// Expands the message-format on one transfer into broker message inputs.
+///
+/// Ordinary AMQP messages use format zero. A Service Bus batch is an outer
+/// message whose body consists exclusively of Data sections, with each Data
+/// value holding one complete encoded AMQP child message. The child bytes are
+/// retained verbatim as their lossless envelopes.
+pub fn read_incoming_messages(
+    message_format: u32,
+    message: &Message,
+    encoded_message: &[u8],
+) -> Result<IncomingMessages, ProtocolError> {
+    match message_format {
+        0 => read_incoming(message, encoded_message).map(IncomingMessages::Single),
+        SERVICE_BUS_BATCH_MESSAGE_FORMAT => read_batch(message).map(IncomingMessages::Batch),
+        message_format => Err(ProtocolError::UnsupportedMessageFormat { message_format }),
+    }
+}
+
+fn read_batch(message: &Message) -> Result<Vec<IncomingMessage>, ProtocolError> {
+    let Body::Data(sections) = &message.body else {
+        return Err(ProtocolError::InvalidBatch {
+            detail: String::from("the Service Bus batch body must contain only AMQP Data sections"),
+        });
+    };
+    if sections.is_empty() {
+        return Err(ProtocolError::InvalidBatch {
+            detail: String::from("the Service Bus batch contains no child messages"),
+        });
+    }
+
+    sections
+        .iter()
+        .enumerate()
+        .map(|(index, encoded)| {
+            let child = decode_message(encoded).map_err(|error| ProtocolError::InvalidBatch {
+                detail: format!("child message {index} is not a complete AMQP message: {error}"),
+            })?;
+            read_incoming(&child, encoded).map_err(|error| ProtocolError::InvalidBatch {
+                detail: format!("child message {index} is invalid: {error}"),
+            })
+        })
+        .collect()
 }
 
 /// The application property Service Bus clients read a dead-letter reason from.
@@ -319,6 +386,109 @@ mod tests {
         let incoming = read(&sent(None, b"payload".to_vec()))?;
         assert_eq!(incoming.message_id, "");
         assert_eq!(incoming.body, b"payload".to_vec());
+        Ok(())
+    }
+
+    #[test]
+    fn a_service_bus_batch_expands_complete_child_envelopes() -> Result<(), ProtocolError> {
+        let first = sent(
+            Some(Properties {
+                message_id: Some(String::from("order-1").into()),
+                group_id: Some(String::from("cart-1")),
+                ..Properties::default()
+            }),
+            b"first".to_vec(),
+        );
+        let second = sent(
+            Some(Properties {
+                message_id: Some(String::from("order-2").into()),
+                ..Properties::default()
+            }),
+            b"second".to_vec(),
+        );
+        let first_encoded = amqp::encode_message(&first).expect("the first child encodes");
+        let second_encoded = amqp::encode_message(&second).expect("the second child encodes");
+        let outer = Message {
+            body: Body::Data(vec![
+                first_encoded.clone().into(),
+                second_encoded.clone().into(),
+            ]),
+            ..Message::default()
+        };
+
+        let IncomingMessages::Batch(children) =
+            read_incoming_messages(SERVICE_BUS_BATCH_MESSAGE_FORMAT, &outer, &[])?
+        else {
+            panic!("the batched format must produce a batch")
+        };
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].message_id, "order-1");
+        assert_eq!(children[0].body, b"first");
+        assert_eq!(
+            children[0].session_id.as_ref().map(SessionId::as_str),
+            Some("cart-1")
+        );
+        assert_eq!(children[0].envelope.as_bytes(), first_encoded);
+        assert_eq!(children[1].message_id, "order-2");
+        assert_eq!(children[1].body, b"second");
+        assert_eq!(children[1].envelope.as_bytes(), second_encoded);
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_or_non_data_service_bus_batch_is_rejected() {
+        for message in [
+            Message::default(),
+            Message {
+                body: Body::Value(Value::String(String::from("not a batch"))),
+                ..Message::default()
+            },
+        ] {
+            assert!(matches!(
+                read_incoming_messages(SERVICE_BUS_BATCH_MESSAGE_FORMAT, &message, &[]),
+                Err(ProtocolError::InvalidBatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn one_malformed_child_rejects_the_whole_service_bus_batch() {
+        let valid =
+            amqp::encode_message(&sent(None, b"valid".to_vec())).expect("the valid child encodes");
+        let outer = Message {
+            body: Body::Data(vec![valid.into(), b"not an AMQP message".to_vec().into()]),
+            ..Message::default()
+        };
+
+        assert!(matches!(
+            read_incoming_messages(SERVICE_BUS_BATCH_MESSAGE_FORMAT, &outer, &[]),
+            Err(ProtocolError::InvalidBatch { .. })
+        ));
+    }
+
+    #[test]
+    fn an_unknown_message_format_is_rejected_without_reinterpreting_the_body() {
+        let message = sent(None, b"ordinary".to_vec());
+        assert_eq!(
+            read_incoming_messages(7, &message, &[]),
+            Err(ProtocolError::UnsupportedMessageFormat { message_format: 7 })
+        );
+    }
+
+    #[test]
+    fn ordinary_multiple_data_sections_remain_one_message() -> Result<(), ProtocolError> {
+        let message = Message {
+            body: Body::Data(vec![b"one".to_vec().into(), b"two".to_vec().into()]),
+            ..Message::default()
+        };
+        let encoded = amqp::encode_message(&message).expect("the ordinary message encodes");
+
+        let IncomingMessages::Single(incoming) = read_incoming_messages(0, &message, &encoded)?
+        else {
+            panic!("format zero must never be inferred to be a batch")
+        };
+        assert_eq!(incoming.body, b"onetwo");
+        assert_eq!(incoming.envelope.as_bytes(), encoded);
         Ok(())
     }
 

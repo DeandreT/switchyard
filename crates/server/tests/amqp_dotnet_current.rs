@@ -26,23 +26,23 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
         SystemClock,
     ));
     let namespace = domain::NamespaceName::new("tenant")?;
-    broker.handle().submit_blocking(
-        namespace.clone(),
-        domain::EntityPath::new("orders")?,
-        CommandKind::CreateQueue {
-            config: QueueConfig::default(),
-        },
-    )?;
-    broker.handle().submit_blocking(
-        namespace.clone(),
-        domain::EntityPath::new("sessions")?,
-        CommandKind::CreateQueue {
-            config: QueueConfig {
+    for (path, config) in [
+        ("orders", QueueConfig::default()),
+        ("batch-orders", QueueConfig::default()),
+        (
+            "sessions",
+            QueueConfig {
                 requires_session: true,
                 ..QueueConfig::default()
             },
-        },
-    )?;
+        ),
+    ] {
+        broker.handle().submit_blocking(
+            namespace.clone(),
+            domain::EntityPath::new(path)?,
+            CommandKind::CreateQueue { config },
+        )?;
+    }
 
     let rule = SharedAccessRule::new(
         RULE,
@@ -95,6 +95,7 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             .arg(HOST)
             .arg(format!("sb://localhost:{}", address.port()))
             .arg("orders")
+            .arg("batch-orders")
             .arg("sessions")
             .arg(RULE)
             .arg(KEY)
@@ -110,7 +111,8 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
     );
     assert!(
         String::from_utf8_lossy(&output.stdout).contains(concat!(
-            "envelope fidelity, send/receive/renew/complete, abandon/redelivery, ",
+            "batch send/prefetch/concurrent settlement, envelope fidelity, ",
+            "send/receive/renew/complete, abandon/redelivery, ",
             "dead-letter/DLQ receive/complete, and session renew/state passed"
         )),
         "the client exited without reporting the completed workflow"
@@ -142,6 +144,19 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
         )?,
         CommandOutcome::Received(None),
         "the SDK returned from DLQ completion before the broker removed the message"
+    );
+    assert_eq!(
+        broker.handle().submit_blocking(
+            domain::NamespaceName::new("tenant")?,
+            domain::EntityPath::new("batch-orders")?,
+            CommandKind::Receive {
+                mode: ReceiveMode::ReceiveAndDelete,
+                lock_duration_millis: None,
+                session: None,
+            },
+        )?,
+        CommandOutcome::Received(None),
+        "the batch queue was not empty after concurrent and receive-delete workflows"
     );
     Ok(())
 }

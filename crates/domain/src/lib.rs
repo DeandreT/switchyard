@@ -20,7 +20,7 @@ mod session;
 mod time;
 
 pub use codec::CodecError;
-pub use command::{Command, CommandKind, CommandOutcome};
+pub use command::{Command, CommandKind, CommandOutcome, MessageInput};
 pub use error::BrokerError;
 pub use identifier::{
     DEAD_LETTER_QUEUE_SUFFIX, EntityPath, IdentifierError, MAX_ENTITY_PATH_BYTES,

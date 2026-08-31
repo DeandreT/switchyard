@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Send, receive, envelope fidelity, renew, complete, abandon/redelivery, dead-letter, and DLQ receive/complete; session renew/state; AMQP over TCP and WebSockets | Planned | Experimental gates on 7.20.2 |
+| Official .NET SDK, current stable | Single and atomic batch send; prefetched multi-message receive; independent settlement; receive-delete; envelope fidelity; renew; abandon/redelivery; dead-letter and DLQ receive/complete; session renew/state; AMQP over TCP and WebSockets | Planned | Experimental gates on 7.20.2 |
 | Official .NET SDK, previous stable | Planned | Planned | Not implemented |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -24,6 +24,8 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | AMQP over WebSockets | Pre-1.0 | Protocol edge, Rust and current .NET clients end to end |
 | SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. JWT: not implemented |
 | Queue send, receive, and settlement | Pre-1.0 | State machine, AMQP mapping, Rust and current .NET clients end to end |
+| Atomic message batches | Pre-1.0 | State machine, Service Bus AMQP batch format, Rust and current .NET clients end to end |
+| Prefetch and concurrent settlement | Pre-1.0 | Bounded AMQP delivery pipeline, link-credit drain, Rust and current .NET clients end to end |
 | AMQP message envelope fidelity | Pre-1.0 | Durable V1 envelope, broker-owned overlays, Rust and current .NET clients end to end |
 | Abandon and redelivery | Pre-1.0 | State machine, AMQP mapping, Rust and current .NET clients end to end |
 | Peek without lock acquisition | Pre-1.0 | Not implemented |
@@ -56,6 +58,11 @@ behavior it currently enforces:
 
 - Peek-lock delivery is at-least-once: the lock commits before the message is
   handed out, and completion removes it only after settlement commits.
+- A send batch validates every child before writing anything, then persists all
+  children and their consecutive sequence numbers in one storage commit. One
+  invalid or oversized child rejects the whole batch without consuming a
+  sequence number. Session batches require every child to name the same
+  session.
 - Receive-delete is at-most-once: the deletion commits before the transfer.
 - A settlement is rejected unless it presents the live lock token, and rejected
   again once the lock deadline has passed.
@@ -114,6 +121,15 @@ The edge resolves a link's address to an entity, turns transfers into send
 commands and dispositions into settlements, and answers a rejection with the
 condition an SDK keys its behaviour off. A receiving link's settle mode selects
 the delivery guarantee: unsettled is peek-lock, pre-settled is receive-delete.
+A transfer using the Service Bus batch message format is decoded into its
+individual AMQP child envelopes and submitted as one atomic broker command;
+unknown or malformed formats are rejected at the delivery without poisoning
+the link. Before touching broker state, outbound delivery atomically reserves
+one unit of remote link credit; an empty receive releases it. The edge keeps a
+bounded set of outcomes independently identifiable, so prefetched messages may
+settle out of order without ever locking or deleting beyond available credit.
+When a receiver asks to drain, reservations are either consumed or released
+before the remaining credit is returned through the AMQP drain handshake.
 A receiving link's `com.microsoft:session-filter` names a session or, with a
 null value, asks for the next available one; the attach response echoes the
 granted identifier and the initial session-lock deadline. The session is
@@ -130,9 +146,11 @@ content remains intact across redelivery and dead-lettering. A message drained
 from a dead-letter queue carries its source, reason, and description. The
 complete protocol coverage uses a Rust AMQP 1.0 client. The current stable
 official .NET SDK also has opt-in gates for envelope fidelity, ordinary send,
-receive, message-lock renewal, completion, abandon and redelivery, custom
-dead-lettering, dead-letter receive and completion, session state and renewal,
-and AMQP-over-WebSockets; the rest of that client gate remains incomplete.
+atomic enumerable and explicit SDK batches, prefetched multi-message receive,
+out-of-order completion, receive-delete, message-lock renewal, abandon and
+redelivery, custom dead-lettering, dead-letter receive and completion, session
+state and renewal, and AMQP-over-TCP and WebSockets; the rest of that client
+gate remains incomplete.
 Dead-letter resubmission is not implemented.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch

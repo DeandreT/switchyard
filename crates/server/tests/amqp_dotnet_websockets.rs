@@ -27,6 +27,7 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
     let namespace = domain::NamespaceName::new("tenant")?;
     for (path, config) in [
         ("websocket-orders", QueueConfig::default()),
+        ("websocket-batch", QueueConfig::default()),
         (
             "websocket-sessions",
             QueueConfig {
@@ -101,6 +102,7 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
             .arg(HOST)
             .arg(format!("sb://localhost:{}", address.port()))
             .arg("websocket-orders")
+            .arg("websocket-batch")
             .arg("websocket-sessions")
             .arg(RULE)
             .arg(KEY)
@@ -116,7 +118,7 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
     );
     assert!(
         String::from_utf8_lossy(&output.stdout).contains(
-            "official .NET Service Bus client AMQP-over-WebSockets send/receive/complete and session attach passed"
+            "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, send/receive/complete, and session attach passed"
         ),
         "the client exited without reporting the completed WebSocket workflow"
     );
@@ -133,6 +135,19 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
         )?,
         CommandOutcome::Received(None),
         "the official client returned before completion emptied the queue"
+    );
+    assert_eq!(
+        broker.handle().submit_blocking(
+            domain::NamespaceName::new("tenant")?,
+            domain::EntityPath::new("websocket-batch")?,
+            CommandKind::Receive {
+                mode: ReceiveMode::ReceiveAndDelete,
+                lock_duration_millis: None,
+                session: None,
+            },
+        )?,
+        CommandOutcome::Received(None),
+        "the official client returned before completing the WebSocket batch"
     );
     Ok(())
 }

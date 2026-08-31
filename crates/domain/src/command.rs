@@ -5,6 +5,25 @@ use crate::{
     ReceiveMode, SequenceNumber, SessionHold, SessionId, Timestamp,
 };
 
+/// One message supplied to an atomic broker operation.
+///
+/// This is the reusable form of the fields on [`CommandKind::Send`]. Keeping
+/// it independent of the command lets protocol adapters build a collection
+/// without changing the singular send contract.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MessageInput {
+    pub message_id: String,
+    pub body: Vec<u8>,
+    /// Overrides the queue default when set.
+    pub time_to_live_millis: Option<u64>,
+    /// Required on a queue that requires sessions, and refused on one that
+    /// does not.
+    pub session_id: Option<SessionId>,
+    /// Lossless protocol-native message bytes. The broker keeps these opaque
+    /// while using the normalized fields above for its decisions.
+    pub envelope: Option<MessageEnvelope>,
+}
+
 /// One replicated instruction for the broker state machine.
 ///
 /// The leader stamps `issued_at` before proposing. Followers apply the same
@@ -51,6 +70,10 @@ pub enum CommandKind {
         /// Lossless protocol-native message bytes. The broker keeps these
         /// opaque while using the normalized fields above for its decisions.
         envelope: Option<MessageEnvelope>,
+    },
+    /// Persists every message in one atomic storage commit.
+    SendBatch {
+        messages: Vec<MessageInput>,
     },
     Receive {
         mode: ReceiveMode,
@@ -125,6 +148,9 @@ pub enum CommandOutcome {
     QueueCreated,
     Sent {
         sequence: SequenceNumber,
+    },
+    BatchSent {
+        sequences: Vec<SequenceNumber>,
     },
     /// `None` when the queue held no deliverable message.
     Received(Option<Delivery>),

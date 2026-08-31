@@ -41,7 +41,8 @@ pub use crate::{
     },
     message::{
         DEAD_LETTER_DESCRIPTION_PROPERTY, DEAD_LETTER_REASON_PROPERTY, IncomingMessage,
-        read_incoming, write_delivery,
+        IncomingMessages, SERVICE_BUS_BATCH_MESSAGE_FORMAT, read_incoming, read_incoming_messages,
+        write_delivery,
     },
     session_filter::{SESSION_FILTER, SessionRequest, read_session_filter, stamp_session_filter},
     tls::{TlsConfigurationError, tls_server_config},
@@ -90,6 +91,10 @@ pub enum ProtocolError {
     InvalidSessionId { session_id: String, detail: String },
     #[error("the stored AMQP message envelope is invalid: {detail}")]
     InvalidEnvelope { detail: String },
+    #[error("AMQP message format {message_format:#010x} is not supported")]
+    UnsupportedMessageFormat { message_format: u32 },
+    #[error("the Service Bus AMQP batch is invalid: {detail}")]
+    InvalidBatch { detail: String },
 }
 
 #[cfg(test)]

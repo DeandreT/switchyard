@@ -23,14 +23,15 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::{
-    Attachment, Broker, BrokerRejection, ProtocolError, SessionRequest, SharedAccessAuthentication,
+    Attachment, Broker, BrokerRejection, IncomingMessages, ProtocolError, SessionRequest,
+    SharedAccessAuthentication,
     authorization::{ConnectionAuthorization, SharedAccessSaslAcceptor},
     cbs::{serve_cbs_replies, serve_cbs_requests},
     management::{
         ConnectionManagement, ManagementAuthorization, serve_management_replies,
         serve_management_requests,
     },
-    parse_attachment, read_incoming, read_session_filter, stamp_session_filter,
+    parse_attachment, read_incoming_messages, read_session_filter, stamp_session_filter,
     websocket::accept_amqp_websocket,
 };
 
@@ -260,7 +261,14 @@ async fn serve_open_connection<B: Broker>(
         };
         let Some(incoming) = incoming else { break };
 
-        let session = connection.accept_session(incoming).await?;
+        let session = match connection.accept_session(incoming).await {
+            Ok(session) => session,
+            // End may overtake application acceptance, and the channel may
+            // already belong to a newer Begin. That stale work is session-
+            // scoped and must not close the replacement connection.
+            Err(EngineError::RemoteDetached) => continue,
+            Err(error) => return Err(error.into()),
+        };
         let broker = broker.clone();
         let namespace = namespace.clone();
         let authorization = authorization.clone();
@@ -311,9 +319,14 @@ async fn serve_session<B: Broker>(
                 attach.initial_delivery_count = Some(0);
             }
             debug!(?attach, "accepting CBS link");
-            let endpoint = session
+            let endpoint = match session
                 .accept_attach(attach, crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64)
-                .await?;
+                .await
+            {
+                Ok(endpoint) => endpoint,
+                Err(EngineError::RemoteDetached) => continue,
+                Err(error) => return Err(error.into()),
+            };
             let authorization = Arc::clone(authorization);
             match (target_address.as_str(), source_address.as_str(), endpoint) {
                 (crate::CBS_NODE, _, LinkEndpoint::Receiver(receiver)) => {
@@ -371,12 +384,17 @@ async fn serve_session<B: Broker>(
                                 resource,
                             )),
                             Err(_) => {
-                                let endpoint = session
+                                let endpoint = match session
                                     .accept_attach(
                                         attach,
                                         crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64,
                                     )
-                                    .await?;
+                                    .await
+                                {
+                                    Ok(endpoint) => endpoint,
+                                    Err(EngineError::RemoteDetached) => continue,
+                                    Err(error) => return Err(error.into()),
+                                };
                                 detach_with(
                                     endpoint,
                                     unauthorized_error(format!(
@@ -395,9 +413,14 @@ async fn serve_session<B: Broker>(
             };
 
             debug!(%address, ?attach, "accepting management link");
-            let endpoint = session
+            let endpoint = match session
                 .accept_attach(attach, crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64)
-                .await?;
+                .await
+            {
+                Ok(endpoint) => endpoint,
+                Err(EngineError::RemoteDetached) => continue,
+                Err(error) => return Err(error.into()),
+            };
             let (entity, link_authorization) = match plan {
                 Ok(plan) => plan,
                 Err(error) => {
@@ -494,13 +517,30 @@ async fn serve_session<B: Broker>(
             .ok()
             .and_then(|(_, accepted, _)| accepted.as_ref())
             .map(session_attach_properties);
-        let endpoint = session
+        let endpoint = match session
             .accept_attach_with_properties(
                 attach,
                 crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64,
                 response_properties,
             )
-            .await?;
+            .await
+        {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                // Planning a session receiver acquires its broker hold before
+                // the attach can be accepted. If the peer detached meanwhile,
+                // that hold belongs to no link and must not block its
+                // replacement until lock expiry.
+                if let Ok((entity, Some(accepted), _)) = &plan {
+                    let hold = accepted.hold();
+                    settlement::release_session(&broker, &namespace, entity, Some(&hold)).await;
+                }
+                match error {
+                    EngineError::RemoteDetached => continue,
+                    error => return Err(error.into()),
+                }
+            }
+        };
         let (entity, accepted, link_authorization) = match plan {
             Ok(plan) => plan,
             Err(error) => {
@@ -761,10 +801,9 @@ async fn serve_sending_client<B: Broker>(
         };
         let delivery = match received {
             Ok(delivery) => delivery,
-            // The client hung up. Its detach is waiting for an answer, and a
-            // dropped handle would leave it waiting; closing sends it.
+            // The engine already answered a remote Detach. A late local close
+            // could detach a replacement link that reused this handle.
             Err(EngineError::RemoteClosed | EngineError::RemoteDetached | EngineError::Stopped) => {
-                let _ = receiver.close().await;
                 return Ok(());
             }
             Err(error) => return Err(error.into()),
@@ -775,7 +814,11 @@ async fn serve_sending_client<B: Broker>(
             receiver.close_with_error(error).await?;
             return Ok(());
         }
-        let incoming = match read_incoming(delivery.message(), delivery.encoded_message()) {
+        let incoming = match read_incoming_messages(
+            delivery.message_format(),
+            delivery.message(),
+            delivery.encoded_message(),
+        ) {
             Ok(incoming) => incoming,
             Err(error) => {
                 // The client's message, the client's fault: reject this transfer
@@ -790,10 +833,8 @@ async fn serve_sending_client<B: Broker>(
             }
         };
 
-        let outcome = broker
-            .submit(
-                namespace.clone(),
-                entity.clone(),
+        let (command, expected) = match incoming {
+            IncomingMessages::Single(incoming) => (
                 CommandKind::Send {
                     message_id: incoming.message_id,
                     body: incoming.body,
@@ -801,13 +842,26 @@ async fn serve_sending_client<B: Broker>(
                     session_id: incoming.session_id,
                     envelope: Some(incoming.envelope),
                 },
-            )
+                SendOutcome::Single,
+            ),
+            IncomingMessages::Batch(messages) => {
+                let count = messages.len();
+                (
+                    CommandKind::SendBatch {
+                        messages: messages.into_iter().map(Into::into).collect(),
+                    },
+                    SendOutcome::Batch(count),
+                )
+            }
+        };
+        let outcome = broker
+            .submit(namespace.clone(), entity.clone(), command)
             .await;
 
         // Accepting only after the command committed is what makes the
         // acknowledgement mean the message is durable.
         match outcome {
-            Ok(CommandOutcome::Sent { .. }) => receiver.accept(&delivery).await?,
+            Ok(outcome) if expected.matches(&outcome) => receiver.accept(&delivery).await?,
             Ok(other) => {
                 receiver
                     .reject(
@@ -824,6 +878,24 @@ async fn serve_sending_client<B: Broker>(
                     .reject(&delivery, Some(rejection_error(&rejection)))
                     .await?
             }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SendOutcome {
+    Single,
+    Batch(usize),
+}
+
+impl SendOutcome {
+    fn matches(self, outcome: &CommandOutcome) -> bool {
+        match (self, outcome) {
+            (Self::Single, CommandOutcome::Sent { .. }) => true,
+            (Self::Batch(expected), CommandOutcome::BatchSent { sequences }) => {
+                sequences.len() == expected
+            }
+            _ => false,
         }
     }
 }
@@ -901,5 +973,21 @@ mod tests {
             error.condition,
             ErrorCondition::Custom(Symbol::from(crate::NOT_FOUND))
         );
+    }
+
+    #[test]
+    fn a_batch_send_requires_one_sequence_per_child() {
+        assert!(SendOutcome::Batch(2).matches(&CommandOutcome::BatchSent {
+            sequences: vec![
+                domain::SequenceNumber::new(1),
+                domain::SequenceNumber::new(2)
+            ]
+        }));
+        assert!(!SendOutcome::Batch(2).matches(&CommandOutcome::BatchSent {
+            sequences: vec![domain::SequenceNumber::new(1)]
+        }));
+        assert!(!SendOutcome::Batch(1).matches(&CommandOutcome::Sent {
+            sequence: domain::SequenceNumber::new(1)
+        }));
     }
 }

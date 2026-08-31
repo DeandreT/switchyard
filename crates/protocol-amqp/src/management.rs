@@ -375,10 +375,7 @@ pub(crate) async fn serve_management_requests<B: Broker>(
                 amqp::EngineError::RemoteClosed
                 | amqp::EngineError::RemoteDetached
                 | amqp::EngineError::Stopped,
-            ) => {
-                let _ = receiver.close().await;
-                return Ok(());
-            }
+            ) => return Ok(()),
             Err(error) => return Err(error.into()),
         };
         if let Some(authorization) = authorization.as_ref()
@@ -840,7 +837,6 @@ pub(crate) async fn serve_management_replies(
         tokio::select! {
             _ = sender.on_detach() => {
                 management.unregister_reply_route(&address, &route).await;
-                let _ = sender.close().await;
                 return Ok(());
             }
             () = wait_until_unauthorized(authorization.as_ref()), if authorization.is_some() => {

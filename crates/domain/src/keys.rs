@@ -27,8 +27,6 @@ const TAG_MESSAGE: u8 = 0x03;
 const TAG_READY: u8 = 0x04;
 const TAG_LOCK: u8 = 0x05;
 const TAG_EXPIRY: u8 = 0x06;
-// 0x07 held the dead-letter keyspace before dead-letter queues became queues;
-// retired with store format 2 and not to be reused.
 const TAG_SESSION: u8 = 0x08;
 const TAG_SESSION_READY: u8 = 0x09;
 const TAG_SESSION_LOCK: u8 = 0x0A;

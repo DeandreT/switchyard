@@ -100,7 +100,7 @@ impl Watchers {
 /// what a waiting link wants to be woken for.
 fn makes_deliverable(outcome: &CommandOutcome) -> bool {
     match outcome {
-        CommandOutcome::Sent { .. } => true,
+        CommandOutcome::Sent { .. } | CommandOutcome::BatchSent { .. } => true,
         CommandOutcome::Abandoned { dead_lettered } => !dead_lettered,
         CommandOutcome::LocksExpired {
             returned_to_ready, ..

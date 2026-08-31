@@ -2,19 +2,20 @@ using Azure;
 using Azure.Core.Amqp;
 using Azure.Messaging.ServiceBus;
 
-if (args.Length != 6)
+if (args.Length != 7)
 {
     Console.Error.WriteLine(
-        "usage: <namespace> <custom-endpoint> <queue> <session-queue> <key-name> <key>");
+        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <session-queue> <key-name> <key>");
     return 2;
 }
 
 string fullyQualifiedNamespace = args[0];
 var customEndpoint = new Uri(args[1]);
 string queue = args[2];
-string sessionQueue = args[3];
-string keyName = args[4];
-string key = args[5];
+string batchQueue = args[3];
+string sessionQueue = args[4];
+string keyName = args[5];
+string key = args[6];
 
 var options = new ServiceBusClientOptions
 {
@@ -179,6 +180,156 @@ foreach (string brokerAnnotation in new[]
 }
 await receiver.CompleteMessageAsync(fidelity);
 
+await using ServiceBusSender batchSender = client.CreateSender(batchQueue);
+var enumerableBatch = Enumerable.Range(0, 3)
+    .Select(index =>
+    {
+        var message = new ServiceBusMessage($"enumerable-batch-{index}")
+        {
+            MessageId = $"enumerable-batch-{index}",
+            Subject = "batch.enumerable",
+        };
+        message.ApplicationProperties["batch-index"] = index;
+        return message;
+    })
+    .ToArray();
+await batchSender.SendMessagesAsync(enumerableBatch);
+
+using ServiceBusMessageBatch explicitBatch = await batchSender.CreateMessageBatchAsync();
+for (int index = 0; index < 3; index++)
+{
+    var message = new ServiceBusMessage($"explicit-batch-{index}")
+    {
+        MessageId = $"explicit-batch-{index}",
+        Subject = "batch.explicit",
+    };
+    message.ApplicationProperties["batch-index"] = index + 3;
+    if (!explicitBatch.TryAddMessage(message))
+    {
+        Console.Error.WriteLine($"message {index} did not fit in an empty SDK batch");
+        return 29;
+    }
+}
+await batchSender.SendMessagesAsync(explicitBatch);
+
+ServiceBusReceiver batchReceiver = client.CreateReceiver(
+    batchQueue,
+    new ServiceBusReceiverOptions { PrefetchCount = 8 });
+IReadOnlyList<ServiceBusReceivedMessage> batched =
+    await batchReceiver.ReceiveMessagesAsync(6, TimeSpan.FromSeconds(10));
+if (batched.Count != 6)
+{
+    Console.Error.WriteLine($"expected six batched messages, received {batched.Count}");
+    return 30;
+}
+for (int index = 0; index < batched.Count; index++)
+{
+    string prefix = index < 3 ? "enumerable" : "explicit";
+    int childIndex = index % 3;
+    ServiceBusReceivedMessage message = batched[index];
+    if (message.Body.ToString() != $"{prefix}-batch-{childIndex}" ||
+        message.MessageId != $"{prefix}-batch-{childIndex}" ||
+        message.Subject != $"batch.{prefix}" ||
+        Convert.ToInt32(message.ApplicationProperties["batch-index"]) != index)
+    {
+        Console.Error.WriteLine($"batch child {index} lost content or envelope fields");
+        return 31;
+    }
+    if (index > 0 && message.SequenceNumber != batched[index - 1].SequenceNumber + 1)
+    {
+        Console.Error.WriteLine(
+            $"batch sequence is not consecutive at {index}: " +
+            $"{batched[index - 1].SequenceNumber} -> {message.SequenceNumber}");
+        return 32;
+    }
+}
+await Task.WhenAll(
+    batched.Reverse().Select(message => batchReceiver.CompleteMessageAsync(message)));
+await batchReceiver.DisposeAsync();
+
+var receiveAndDeleteMessages = Enumerable.Range(0, 3)
+    .Select(index => new ServiceBusMessage($"receive-delete-batch-{index}")
+    {
+        MessageId = $"receive-delete-batch-{index}",
+    });
+await batchSender.SendMessagesAsync(receiveAndDeleteMessages);
+await using (ServiceBusReceiver receiveAndDelete = client.CreateReceiver(
+    batchQueue,
+    new ServiceBusReceiverOptions
+    {
+        PrefetchCount = 3,
+        ReceiveMode = ServiceBusReceiveMode.ReceiveAndDelete,
+    }))
+{
+    IReadOnlyList<ServiceBusReceivedMessage> deleted =
+        await receiveAndDelete.ReceiveMessagesAsync(3, TimeSpan.FromSeconds(10));
+    if (deleted.Count != 3 ||
+        deleted.Select(message => message.Body.ToString()).ToArray() is not
+        ["receive-delete-batch-0", "receive-delete-batch-1", "receive-delete-batch-2"])
+    {
+        Console.Error.WriteLine("receive-and-delete did not return the complete batch in order");
+        return 33;
+    }
+}
+
+var creditDrainMessages = Enumerable.Range(0, 5)
+    .Select(index => new ServiceBusMessage($"credit-drain-{index}")
+    {
+        MessageId = $"credit-drain-{index}",
+    })
+    .ToArray();
+await batchSender.SendMessagesAsync(creditDrainMessages);
+await using (ServiceBusReceiver limitedCredit = client.CreateReceiver(
+    batchQueue,
+    new ServiceBusReceiverOptions
+    {
+        PrefetchCount = 0,
+        ReceiveMode = ServiceBusReceiveMode.ReceiveAndDelete,
+    }))
+{
+    ServiceBusReceivedMessage? firstCredited =
+        await limitedCredit.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+    ServiceBusReceivedMessage? secondCredited =
+        await limitedCredit.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+    if (firstCredited?.Body.ToString() != "credit-drain-0" ||
+        secondCredited?.Body.ToString() != "credit-drain-1")
+    {
+        Console.Error.WriteLine(
+            "the two credited receives consumed the wrong messages: " +
+            $"first={firstCredited?.Body.ToString() ?? "<none>"}, " +
+            $"second={secondCredited?.Body.ToString() ?? "<none>"}");
+        return 34;
+    }
+}
+await using (ServiceBusReceiver afterDrain = client.CreateReceiver(
+    batchQueue,
+    new ServiceBusReceiverOptions
+    {
+        PrefetchCount = 0,
+        ReceiveMode = ServiceBusReceiveMode.ReceiveAndDelete,
+    }))
+{
+    ServiceBusReceivedMessage? third =
+        await afterDrain.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+    ServiceBusReceivedMessage? fourth =
+        await afterDrain.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+    ServiceBusReceivedMessage? fifth =
+        await afterDrain.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+    string[] remainingAfterDrain =
+        [
+            third?.Body.ToString() ?? "<none>",
+            fourth?.Body.ToString() ?? "<none>",
+            fifth?.Body.ToString() ?? "<none>",
+        ];
+    if (remainingAfterDrain is not ["credit-drain-2", "credit-drain-3", "credit-drain-4"])
+    {
+        Console.Error.WriteLine(
+            $"draining a limited receive deleted a message beyond remote link credit: " +
+            $"bodies=[{string.Join(", ", remainingAfterDrain)}]");
+        return 35;
+    }
+}
+
 const string settlementBody = "official-settlement-current";
 await sender.SendMessageAsync(new ServiceBusMessage(settlementBody)
 {
@@ -304,6 +455,7 @@ if (sessionMessage?.Body.ToString() != "official-session-current")
 await sessionReceiver.CompleteMessageAsync(sessionMessage);
 
 Console.WriteLine(
-    "official .NET Service Bus client envelope fidelity, send/receive/renew/complete, " +
+    "official .NET Service Bus client batch send/prefetch/concurrent settlement, " +
+    "envelope fidelity, send/receive/renew/complete, " +
     "abandon/redelivery, dead-letter/DLQ receive/complete, and session renew/state passed");
 return 0;

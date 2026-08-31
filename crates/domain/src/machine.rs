@@ -9,15 +9,19 @@
 //! Nothing here reads a clock, generates a random value, or performs I/O beyond
 //! the injected store.
 
+mod send;
+
 use serde::de::DeserializeOwned;
 use storage::{StateStore, WriteBatch};
 
 use crate::{
     AcceptedSession, BrokerError, Command, CommandKind, CommandOutcome, DeadLetterInfo,
-    DeadLetterReason, Delivery, DeliveryLock, EntityPath, LockToken, MessageEnvelope,
-    MessageRecord, MessageState, NamespaceName, QueueConfig, QueueCounters, ReceiveMode,
-    SequenceNumber, SessionHold, SessionId, SessionLock, SessionRecord, Timestamp, codec, keys,
+    DeadLetterReason, Delivery, DeliveryLock, EntityPath, LockToken, MessageRecord, MessageState,
+    NamespaceName, QueueConfig, QueueCounters, ReceiveMode, SequenceNumber, SessionHold, SessionId,
+    SessionLock, SessionRecord, Timestamp, codec, keys,
 };
+
+use self::send::SendInput;
 
 /// Ready entries a single receive may walk past while discarding expired
 /// messages. Bounds the work one command performs so a large backlog of
@@ -32,14 +36,6 @@ pub const TIMER_SCAN_LIMIT: usize = 256;
 /// `MAX_SESSION_SCAN` sessions are all held reports none available rather than
 /// walking an unbounded number of them, and the receiver retries.
 const MAX_SESSION_SCAN: usize = 32;
-
-struct SendInput<'a> {
-    message_id: &'a str,
-    body: &'a [u8],
-    time_to_live_millis: Option<u64>,
-    session_id: Option<&'a SessionId>,
-    envelope: Option<&'a MessageEnvelope>,
-}
 
 #[derive(Clone, Debug)]
 pub struct StateMachine<S> {
@@ -90,6 +86,9 @@ impl<S: StateStore> StateMachine<S> {
                 },
                 &mut batch,
             )?,
+            CommandKind::SendBatch { messages } => {
+                self.send_batch(command, messages, &mut batch)?
+            }
             CommandKind::Receive {
                 mode,
                 lock_duration_millis,
@@ -294,8 +293,7 @@ impl<S: StateStore> StateMachine<S> {
         }
     }
 
-    /// Messages are the one record whose stored shape has changed, so they read
-    /// through their own version-aware decode rather than through [`Self::read`].
+    /// Reads the complete durable message representation.
     fn read_message(&self, key: &[u8]) -> Result<Option<MessageRecord>, BrokerError> {
         match self.store.get(key)? {
             Some(bytes) => Ok(Some(MessageRecord::decode(&bytes)?)),
@@ -378,69 +376,6 @@ impl<S: StateStore> StateMachine<S> {
             codec::encode(&shadow)?,
         );
         Ok(CommandOutcome::QueueCreated)
-    }
-
-    fn send(
-        &self,
-        command: &Command,
-        input: SendInput<'_>,
-        batch: &mut WriteBatch,
-    ) -> Result<CommandOutcome, BrokerError> {
-        if command.entity.is_dead_letter_queue() {
-            return Err(BrokerError::DeadLetterQueueIsReserved);
-        }
-        let config = self.load_config(command)?;
-        require_session_agreement(&config, input.session_id.is_some())?;
-        let message_bytes = input
-            .envelope
-            .map_or(input.body.len(), MessageEnvelope::len);
-        if message_bytes > config.max_message_bytes {
-            return Err(BrokerError::MessageTooLarge {
-                body_bytes: message_bytes,
-                maximum_bytes: config.max_message_bytes,
-            });
-        }
-
-        let mut counters = self.load_counters(command)?;
-        let sequence = SequenceNumber::new(counters.next_sequence);
-        counters.next_sequence = counters.next_sequence.saturating_add(1);
-
-        let expires_at = input
-            .time_to_live_millis
-            .or(config.default_time_to_live_millis)
-            .map(|millis| command.issued_at.saturating_add_millis(millis));
-
-        let record = MessageRecord {
-            sequence,
-            message_id: input.message_id.to_owned(),
-            body: input.body.to_vec(),
-            enqueued_at: command.issued_at,
-            expires_at,
-            delivery_count: 0,
-            state: MessageState::Ready,
-            session_id: input.session_id.cloned(),
-            dead_letter: None,
-            envelope: input.envelope.cloned(),
-        };
-
-        let namespace = &command.namespace;
-        let entity = &command.entity;
-        batch.push_put(
-            keys::message(namespace, entity, sequence),
-            codec::encode(&record)?,
-        );
-        batch.push_put(self.ready_key(command, &record), Vec::new());
-        if let Some(expires_at) = expires_at {
-            batch.push_put(
-                keys::expiry(namespace, entity, expires_at, sequence),
-                Vec::new(),
-            );
-        }
-        batch.push_put(
-            keys::queue_counters(namespace, entity),
-            codec::encode(&counters)?,
-        );
-        Ok(CommandOutcome::Sent { sequence })
     }
 
     fn receive(

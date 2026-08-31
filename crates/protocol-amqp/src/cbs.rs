@@ -71,10 +71,11 @@ pub(crate) async fn serve_cbs_requests(
     loop {
         let delivery = match receiver.recv().await {
             Ok(delivery) => delivery,
-            Err(amqp::EngineError::RemoteClosed | amqp::EngineError::RemoteDetached) => {
-                let _ = receiver.close().await;
-                return Ok(());
-            }
+            Err(
+                amqp::EngineError::RemoteClosed
+                | amqp::EngineError::RemoteDetached
+                | amqp::EngineError::Stopped,
+            ) => return Ok(()),
             Err(error) => return Err(error.into()),
         };
 
@@ -147,7 +148,6 @@ pub(crate) async fn serve_cbs_replies(
         tokio::select! {
             _ = sender.on_detach() => {
                 authorization.unregister_reply_route(&address, &route).await;
-                let _ = sender.close().await;
                 return Ok(());
             }
             response = responses.recv() => {

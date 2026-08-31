@@ -29,6 +29,10 @@ pub enum BrokerError {
         body_bytes: usize,
         maximum_bytes: usize,
     },
+    #[error("a message batch must contain at least one message")]
+    EmptyMessageBatch,
+    #[error("every message in a batch sent to a session queue must use the same session")]
+    MessageBatchSessionMismatch,
     #[error("command timestamp {proposed} precedes the applied timestamp {last_applied}")]
     ClockRegression {
         last_applied: Timestamp,
