@@ -29,6 +29,7 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
     for (path, config) in [
         ("orders", QueueConfig::default()),
         ("batch-orders", QueueConfig::default()),
+        ("peek-orders", QueueConfig::default()),
         (
             "sessions",
             QueueConfig {
@@ -96,6 +97,7 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             .arg(format!("sb://localhost:{}", address.port()))
             .arg("orders")
             .arg("batch-orders")
+            .arg("peek-orders")
             .arg("sessions")
             .arg(RULE)
             .arg(KEY)
@@ -115,7 +117,7 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             "send/receive/renew/complete, abandon/redelivery/property-update, ",
             "dead-letter/DLQ receive/complete, ",
             "defer/deferred-receive/management-disposition, ",
-            "and session renew/state passed"
+            "peek/browse pagination, and session renew/state/peek passed"
         )),
         "the client exited without reporting the completed workflow"
     );

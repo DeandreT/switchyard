@@ -764,12 +764,10 @@ fn address_for_role<'a>(role: &Role, source: &'a str, target: &'a str) -> &'a st
 
 fn management_entity(address: &str) -> Option<Result<EntityPath, ProtocolError>> {
     let entity = address.strip_suffix("/$management")?;
-    Some(
-        EntityPath::new(entity).map_err(|error| ProtocolError::InvalidAddress {
-            address: address.to_owned(),
-            detail: error.to_string(),
-        }),
-    )
+    // Management links use the same well-known entity suffixes as data links.
+    // In particular, the official .NET client spells the DLQ segment with
+    // capitals here even though Switchyard's shadow key is canonicalized.
+    Some(resolve_entity(entity, Role::Receiver))
 }
 
 /// Drives a link the client sends on: every transfer becomes one send command.
@@ -951,6 +949,24 @@ mod tests {
         );
         assert!(resolve_entity("orders/$deadletterqueue", Role::Sender).is_err());
         assert!(resolve_entity("billing/Subscriptions/accounting", Role::Receiver).is_err());
+    }
+
+    #[test]
+    fn management_addresses_canonicalize_the_dotnet_dead_letter_suffix() {
+        assert_eq!(
+            management_entity("orders/$DeadLetterQueue/$management")
+                .expect("management suffix")
+                .expect("the DLQ management entity resolves")
+                .as_str(),
+            "orders/$deadletterqueue"
+        );
+        assert_eq!(
+            management_entity("orders/$management")
+                .expect("management suffix")
+                .expect("the queue management entity resolves")
+                .as_str(),
+            "orders"
+        );
     }
 
     #[test]

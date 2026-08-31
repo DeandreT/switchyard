@@ -75,6 +75,16 @@ pub enum CommandKind {
     SendBatch {
         messages: Vec<MessageInput>,
     },
+    /// Browses stored messages without acquiring a lock or changing their
+    /// delivery state. `from_sequence` is inclusive; zero starts at the first
+    /// available message.
+    Peek {
+        from_sequence: SequenceNumber,
+        max_messages: u32,
+        /// `None` browses every session on a session queue. A supplied hold
+        /// must still be live and restricts the page to that session.
+        session: Option<SessionHold>,
+    },
     Receive {
         mode: ReceiveMode,
         /// Overrides the queue default when set.
@@ -177,6 +187,7 @@ pub enum CommandOutcome {
     BatchSent {
         sequences: Vec<SequenceNumber>,
     },
+    Peeked(Vec<Delivery>),
     /// `None` when the queue held no deliverable message.
     Received(Option<Delivery>),
     Completed,

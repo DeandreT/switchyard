@@ -68,6 +68,26 @@ if (await receiver.ReceiveMessageAsync(TimeSpan.FromMilliseconds(500)) is not nu
     Console.Error.WriteLine("a deferred WebSocket message remained ordinarily visible");
     return 9;
 }
+ServiceBusReceivedMessage? peekedDeferred =
+    await receiver.PeekMessageAsync(deferredSequence);
+if (peekedDeferred?.Body.ToString() != deferredBody ||
+    peekedDeferred.SequenceNumber != deferredSequence ||
+    peekedDeferred.State != ServiceBusMessageState.Deferred ||
+    peekedDeferred.DeliveryCount != 1)
+{
+    Console.Error.WriteLine(
+        $"unexpected deferred WebSocket peek: body={peekedDeferred?.Body}, " +
+        $"sequence={peekedDeferred?.SequenceNumber}, state={peekedDeferred?.State}, " +
+        $"delivery={peekedDeferred?.DeliveryCount}");
+    return 11;
+}
+var rawPeekedDeferred = peekedDeferred.GetRawAmqpMessage();
+if (rawPeekedDeferred.MessageAnnotations.ContainsKey("x-opt-locked-until") ||
+    rawPeekedDeferred.DeliveryAnnotations.ContainsKey("x-opt-lock-token"))
+{
+    Console.Error.WriteLine("a peeked WebSocket message exposed settlement authority");
+    return 12;
+}
 await using ServiceBusReceiver deferredReceiver = client.CreateReceiver(queue);
 ServiceBusReceivedMessage? deferred =
     await deferredReceiver.ReceiveDeferredMessageAsync(deferredSequence);
@@ -136,5 +156,5 @@ await sessionReceiver.CompleteMessageAsync(sessionMessage);
 
 Console.WriteLine(
     "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, " +
-    "send/receive/complete, defer/deferred-receive, and session attach passed");
+    "send/receive/complete, defer/peek/deferred-receive, and session attach passed");
 return 0;

@@ -33,6 +33,8 @@ pub enum BrokerError {
     EmptyMessageBatch,
     #[error("every message in a batch sent to a session queue must use the same session")]
     MessageBatchSessionMismatch,
+    #[error("peek must request at least one message")]
+    EmptyPeek,
     #[error("a deferred receive must name at least one sequence number")]
     EmptyDeferredReceive,
     #[error(

@@ -2,10 +2,10 @@ using Azure;
 using Azure.Core.Amqp;
 using Azure.Messaging.ServiceBus;
 
-if (args.Length != 7)
+if (args.Length != 8)
 {
     Console.Error.WriteLine(
-        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <session-queue> <key-name> <key>");
+        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <peek-queue> <session-queue> <key-name> <key>");
     return 2;
 }
 
@@ -13,9 +13,10 @@ string fullyQualifiedNamespace = args[0];
 var customEndpoint = new Uri(args[1]);
 string queue = args[2];
 string batchQueue = args[3];
-string sessionQueue = args[4];
-string keyName = args[5];
-string key = args[6];
+string peekQueue = args[4];
+string sessionQueue = args[5];
+string keyName = args[6];
+string key = args[7];
 
 var options = new ServiceBusClientOptions
 {
@@ -330,6 +331,127 @@ await using (ServiceBusReceiver afterDrain = client.CreateReceiver(
     }
 }
 
+var messagesToPeek = Enumerable.Range(0, 3)
+    .Select(index => new ServiceBusMessage($"peek-batch-{index}")
+    {
+        MessageId = $"peek-batch-{index}",
+    })
+    .ToArray();
+await using ServiceBusSender peekSender = client.CreateSender(peekQueue);
+await peekSender.SendMessagesAsync(messagesToPeek);
+await using ServiceBusReceiver peekStateReceiver = client.CreateReceiver(peekQueue);
+ServiceBusReceivedMessage? lockedForPeek =
+    await peekStateReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+ServiceBusReceivedMessage? deferredForPeek =
+    await peekStateReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (lockedForPeek?.Body.ToString() != "peek-batch-0" ||
+    deferredForPeek?.Body.ToString() != "peek-batch-1")
+{
+    Console.Error.WriteLine(
+        $"peek setup received the wrong messages: " +
+        $"locked={lockedForPeek?.Body}, deferred={deferredForPeek?.Body}");
+    return 52;
+}
+await peekStateReceiver.DeferMessageAsync(deferredForPeek);
+
+await using ServiceBusReceiver peekReceiver = client.CreateReceiver(peekQueue);
+IReadOnlyList<ServiceBusReceivedMessage> firstPeekPage =
+    await peekReceiver.PeekMessagesAsync(2, lockedForPeek.SequenceNumber);
+if (firstPeekPage.Count != 2 ||
+    firstPeekPage[0].Body.ToString() != "peek-batch-0" ||
+    firstPeekPage[1].Body.ToString() != "peek-batch-1" ||
+    firstPeekPage[0].SequenceNumber != lockedForPeek.SequenceNumber ||
+    firstPeekPage[1].SequenceNumber != deferredForPeek.SequenceNumber ||
+    firstPeekPage[0].State != ServiceBusMessageState.Active ||
+    firstPeekPage[1].State != ServiceBusMessageState.Deferred ||
+    firstPeekPage[0].DeliveryCount != 1 ||
+    firstPeekPage[1].DeliveryCount != 1)
+{
+    Console.Error.WriteLine(
+        "peek did not return the inclusive locked/deferred page with exact state and count");
+    return 53;
+}
+foreach (ServiceBusReceivedMessage peeked in firstPeekPage)
+{
+    AmqpAnnotatedMessage rawPeeked = peeked.GetRawAmqpMessage();
+    if (rawPeeked.MessageAnnotations.ContainsKey("x-opt-locked-until") ||
+        rawPeeked.DeliveryAnnotations.ContainsKey("x-opt-lock-token"))
+    {
+        Console.Error.WriteLine("a peeked message exposed settlement authority");
+        return 54;
+    }
+}
+
+IReadOnlyList<ServiceBusReceivedMessage> secondPeekPage =
+    await peekReceiver.PeekMessagesAsync(2);
+if (secondPeekPage.Count != 1 ||
+    secondPeekPage[0].Body.ToString() != "peek-batch-2" ||
+    secondPeekPage[0].SequenceNumber != deferredForPeek.SequenceNumber + 1 ||
+    secondPeekPage[0].State != ServiceBusMessageState.Active ||
+    secondPeekPage[0].DeliveryCount != 0)
+{
+    Console.Error.WriteLine("peek cursor pagination did not return the remaining active message");
+    return 55;
+}
+if (await peekReceiver.PeekMessageAsync() is not null)
+{
+    Console.Error.WriteLine("peek did not return an empty page after the final sequence");
+    return 56;
+}
+
+await peekStateReceiver.CompleteMessageAsync(lockedForPeek);
+ServiceBusReceivedMessage? deferredPeekCleanup =
+    await peekStateReceiver.ReceiveDeferredMessageAsync(deferredForPeek.SequenceNumber);
+if (deferredPeekCleanup is null)
+{
+    Console.Error.WriteLine("the peeked deferred message disappeared during browsing");
+    return 57;
+}
+await peekStateReceiver.CompleteMessageAsync(deferredPeekCleanup);
+ServiceBusReceivedMessage? activePeekCleanup =
+    await peekStateReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (activePeekCleanup?.Body.ToString() != "peek-batch-2")
+{
+    Console.Error.WriteLine("the peeked active message disappeared during browsing");
+    return 58;
+}
+await peekStateReceiver.CompleteMessageAsync(activePeekCleanup);
+
+var oversizedPeekRequestMessages = Enumerable.Range(0, 251)
+    .Select(index => new ServiceBusMessage($"peek-cap-{index}")
+    {
+        MessageId = $"peek-cap-{index}",
+    })
+    .ToArray();
+await peekSender.SendMessagesAsync(oversizedPeekRequestMessages);
+await using ServiceBusReceiver cappedPeekReceiver = client.CreateReceiver(peekQueue);
+IReadOnlyList<ServiceBusReceivedMessage> cappedPeekPage =
+    await cappedPeekReceiver.PeekMessagesAsync(
+        500,
+        activePeekCleanup.SequenceNumber + 1);
+if (cappedPeekPage.Count != 250 ||
+    cappedPeekPage[0].Body.ToString() != "peek-cap-0" ||
+    cappedPeekPage[249].Body.ToString() != "peek-cap-249")
+{
+    Console.Error.WriteLine(
+        $"a 500-message peek request was not capped to the first 250 results: " +
+        $"count={cappedPeekPage.Count}");
+    return 62;
+}
+IReadOnlyList<ServiceBusReceivedMessage> cappedPeekRemainder =
+    await cappedPeekReceiver.PeekMessagesAsync(500);
+if (cappedPeekRemainder.Count != 1 ||
+    cappedPeekRemainder[0].Body.ToString() != "peek-cap-250")
+{
+    Console.Error.WriteLine("the capped peek cursor did not expose the remaining message");
+    return 63;
+}
+if (await cappedPeekReceiver.PeekMessageAsync() is not null)
+{
+    Console.Error.WriteLine("the capped peek cursor did not reach true end of entity");
+    return 64;
+}
+
 const string settlementBody = "official-settlement-current";
 await sender.SendMessageAsync(new ServiceBusMessage(settlementBody)
 {
@@ -400,6 +522,30 @@ await receiver.DeadLetterMessageAsync(
 await using ServiceBusReceiver deadLetterReceiver = client.CreateReceiver(
     queue,
     new ServiceBusReceiverOptions { SubQueue = SubQueue.DeadLetter });
+ServiceBusReceivedMessage? peekedDeadLetter =
+    await deadLetterReceiver.PeekMessageAsync();
+if (peekedDeadLetter is null ||
+    peekedDeadLetter.Body.ToString() != settlementBody ||
+    peekedDeadLetter.DeadLetterReason != deadLetterReason ||
+    peekedDeadLetter.DeadLetterErrorDescription != deadLetterDescription ||
+    peekedDeadLetter.DeadLetterSource != queue ||
+    peekedDeadLetter.DeliveryCount != 2)
+{
+    Console.Error.WriteLine(
+        $"dead-letter peek mismatch: body={peekedDeadLetter?.Body}, " +
+        $"reason={peekedDeadLetter?.DeadLetterReason}, " +
+        $"description={peekedDeadLetter?.DeadLetterErrorDescription}, " +
+        $"source={peekedDeadLetter?.DeadLetterSource}, " +
+        $"delivery={peekedDeadLetter?.DeliveryCount}");
+    return 50;
+}
+AmqpAnnotatedMessage peekedDeadLetterEnvelope = peekedDeadLetter.GetRawAmqpMessage();
+if (peekedDeadLetterEnvelope.MessageAnnotations.ContainsKey("x-opt-locked-until") ||
+    peekedDeadLetterEnvelope.DeliveryAnnotations.ContainsKey("x-opt-lock-token"))
+{
+    Console.Error.WriteLine("a peeked dead-letter message exposed settlement authority");
+    return 51;
+}
 ServiceBusReceivedMessage? deadLettered =
     await deadLetterReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
 if (deadLettered is null)
@@ -591,10 +737,42 @@ await deadLetterReceiver.CompleteMessageAsync(deadLetteredDeferred);
 await using ServiceBusSender sessionSender = client.CreateSender(sessionQueue);
 await sessionSender.SendMessageAsync(new ServiceBusMessage("official-session-current")
 {
+    MessageId = "official-session-current",
     SessionId = "session-1",
 });
+await sessionSender.SendMessageAsync(new ServiceBusMessage("official-session-other")
+{
+    MessageId = "official-session-other",
+    SessionId = "session-2",
+});
+
+await using (ServiceBusReceiver crossSessionPeek = client.CreateReceiver(sessionQueue))
+{
+    IReadOnlyList<ServiceBusReceivedMessage> sessionMessages =
+        await crossSessionPeek.PeekMessagesAsync(2);
+    if (sessionMessages.Count != 2 ||
+        sessionMessages[0].Body.ToString() != "official-session-current" ||
+        sessionMessages[0].SessionId != "session-1" ||
+        sessionMessages[1].Body.ToString() != "official-session-other" ||
+        sessionMessages[1].SessionId != "session-2")
+    {
+        Console.Error.WriteLine("regular peek did not browse across all queue sessions");
+        return 59;
+    }
+}
+
 await using ServiceBusSessionReceiver sessionReceiver =
     await client.AcceptSessionAsync(sessionQueue, "session-1");
+
+IReadOnlyList<ServiceBusReceivedMessage> sessionPeek =
+    await sessionReceiver.PeekMessagesAsync(2);
+if (sessionPeek.Count != 1 ||
+    sessionPeek[0].Body.ToString() != "official-session-current" ||
+    sessionPeek[0].SessionId != "session-1")
+{
+    Console.Error.WriteLine("session peek escaped the session whose lock is held");
+    return 60;
+}
 
 await sessionReceiver.SetSessionStateAsync(BinaryData.FromString("checkout-step-2"));
 BinaryData sessionState = await sessionReceiver.GetSessionStateAsync();
@@ -622,9 +800,21 @@ if (sessionMessage?.Body.ToString() != "official-session-current")
 }
 await sessionReceiver.CompleteMessageAsync(sessionMessage);
 
+await using ServiceBusSessionReceiver otherSessionReceiver =
+    await client.AcceptSessionAsync(sessionQueue, "session-2");
+ServiceBusReceivedMessage? otherSessionMessage =
+    await otherSessionReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (otherSessionMessage?.Body.ToString() != "official-session-other")
+{
+    Console.Error.WriteLine($"unexpected second session message: {otherSessionMessage?.Body}");
+    return 61;
+}
+await otherSessionReceiver.CompleteMessageAsync(otherSessionMessage);
+
 Console.WriteLine(
     "official .NET Service Bus client batch send/prefetch/concurrent settlement, " +
     "envelope fidelity, send/receive/renew/complete, " +
     "abandon/redelivery/property-update, dead-letter/DLQ receive/complete, " +
-    "defer/deferred-receive/management-disposition, and session renew/state passed");
+    "defer/deferred-receive/management-disposition, peek/browse pagination, " +
+    "and session renew/state/peek passed");
 return 0;

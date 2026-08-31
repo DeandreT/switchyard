@@ -27,7 +27,9 @@ pub use identifier::{
     MAX_NAMESPACE_NAME_BYTES, MAX_PLACEMENT_GROUP_ID_BYTES, MAX_SESSION_ID_BYTES, NamespaceName,
     PlacementGroupId, SessionId,
 };
-pub use machine::{MAX_DEFERRED_RECEIVE_BATCH, StateMachine, TIMER_SCAN_LIMIT};
+pub use machine::{
+    MAX_DEFERRED_RECEIVE_BATCH, MAX_PEEK_BATCH, MAX_PEEK_SCAN, StateMachine, TIMER_SCAN_LIMIT,
+};
 pub use message::{
     DeadLetterInfo, DeadLetterReason, Delivery, DeliveryGuarantee, DeliveryLock, DeliveryOrigin,
     LockToken, MessageEnvelope, MessageRecord, MessageState, ReceiveMode, SequenceNumber,

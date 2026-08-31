@@ -50,6 +50,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::DeadLetterQueueIsReserved
         | BrokerError::EmptyMessageBatch
         | BrokerError::MessageBatchSessionMismatch
+        | BrokerError::EmptyPeek
         | BrokerError::EmptyDeferredReceive
         | BrokerError::DeferredReceiveBatchTooLarge { .. }
         | BrokerError::DuplicateDeferredSequence { .. }

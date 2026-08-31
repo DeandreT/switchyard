@@ -22,8 +22,10 @@ use tracing::debug;
 use crate::{Broker, BrokerRejection, authorization::ConnectionAuthorization};
 
 mod deferred;
+mod peek;
 
 pub use deferred::{RECEIVE_BY_SEQUENCE_NUMBER_OPERATION, UPDATE_DISPOSITION_OPERATION};
+pub use peek::PEEK_MESSAGE_OPERATION;
 
 pub const RENEW_LOCK_OPERATION: &str = "com.microsoft:renew-lock";
 pub const RENEW_SESSION_LOCK_OPERATION: &str = "com.microsoft:renew-session-lock";
@@ -713,6 +715,18 @@ async fn process_request<B: Broker>(
         }
         UPDATE_DISPOSITION_OPERATION => {
             deferred::update_disposition(
+                message,
+                message_id,
+                tracking_id,
+                namespace,
+                entity,
+                broker,
+                management,
+            )
+            .await
+        }
+        PEEK_MESSAGE_OPERATION => {
+            peek::peek(
                 message,
                 message_id,
                 tracking_id,

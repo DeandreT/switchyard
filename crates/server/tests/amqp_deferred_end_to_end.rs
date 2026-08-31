@@ -77,6 +77,21 @@ async fn management_request(
     operation: &str,
     body: OrderedMap<Value, Value>,
 ) -> Result<Message, Box<dyn Error>> {
+    management_request_with_status(
+        requests, responses, reply_to, message_id, operation, body, 200,
+    )
+    .await
+}
+
+async fn management_request_with_status(
+    requests: &mut Sender,
+    responses: &mut Receiver,
+    reply_to: &str,
+    message_id: &str,
+    operation: &str,
+    body: OrderedMap<Value, Value>,
+    expected_status: i32,
+) -> Result<Message, Box<dyn Error>> {
     let request = Message::builder()
         .properties(Properties {
             message_id: Some(message_id.to_owned().into()),
@@ -102,7 +117,7 @@ async fn management_request(
             .application_properties
             .as_ref()
             .and_then(|properties| properties.get(protocol_amqp::STATUS_CODE_PROPERTY)),
-        Some(&Value::Int(200))
+        Some(&Value::Int(expected_status))
     );
     let message = response.message().clone();
     responses.accept(&response).await?;
@@ -129,6 +144,51 @@ fn deferred_response(response: Message) -> Result<(Message, amqp::Uuid), Box<dyn
         _ => return Err("the deferred response did not contain a lock token".into()),
     };
     Ok((message, lock_token))
+}
+
+fn peek_response(response: Message) -> Result<Vec<Message>, Box<dyn Error>> {
+    let Body::Value(Value::Map(response_body)) = response.body else {
+        return Err("the peek response must carry an AMQP value map".into());
+    };
+    let Some(Value::List(entries)) = response_body.get(&Value::String(String::from("messages")))
+    else {
+        return Err("the peek response did not contain messages".into());
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            let Value::Map(entry) = entry else {
+                return Err("a peek entry must be an AMQP map".into());
+            };
+            let Some(Value::Binary(encoded)) = entry.get(&Value::String(String::from("message")))
+            else {
+                return Err("a peek entry did not contain an encoded message".into());
+            };
+            if entry.contains_key(&Value::String(String::from("lock-token"))) {
+                return Err("a peek entry exposed a lock token".into());
+            }
+            amqp::decode_message(encoded).map_err(Into::into)
+        })
+        .collect()
+}
+
+fn assert_peek_has_no_settlement_authority(message: &Message) {
+    assert!(
+        message
+            .message_annotations
+            .as_ref()
+            .and_then(|annotations| { annotations.get(&AnnotationKey::from("x-opt-locked-until")) })
+            .is_none(),
+        "a peeked message exposed its lock deadline"
+    );
+    assert!(
+        message
+            .delivery_annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(&AnnotationKey::from("x-opt-lock-token")))
+            .is_none(),
+        "a peeked message exposed its lock token"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -199,6 +259,62 @@ async fn a_deferred_message_is_retrieved_and_settled_by_sequence() -> Result<(),
     )
     .await?;
 
+    let mut peek_body = OrderedMap::new();
+    peek_body.insert(
+        Value::String(String::from("from-sequence-number")),
+        Value::Long(sequence),
+    );
+    peek_body.insert(
+        Value::String(String::from("message-count")),
+        Value::Int(251),
+    );
+    let peeked = peek_response(
+        management_request(
+            &mut requests,
+            &mut responses,
+            reply_to,
+            "peek-deferred-1",
+            "com.microsoft:peek-message",
+            peek_body,
+        )
+        .await?,
+    )?;
+    let [peeked] = peeked.as_slice() else {
+        return Err("peek did not return exactly one deferred message".into());
+    };
+    assert_eq!(text_of(peeked), "park-me");
+    assert_eq!(
+        peeked.header.as_ref().map(|header| header.delivery_count),
+        Some(1),
+        "peek must expose the stored delivery count without receive adjustment"
+    );
+    assert_eq!(
+        peeked
+            .message_annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(&AnnotationKey::from("x-opt-message-state"))),
+        Some(&Value::Int(1))
+    );
+    assert_peek_has_no_settlement_authority(peeked);
+
+    let mut empty_peek_body = OrderedMap::new();
+    empty_peek_body.insert(
+        Value::String(String::from("from-sequence-number")),
+        Value::Long(sequence + 1),
+    );
+    empty_peek_body.insert(Value::String(String::from("message-count")), Value::Int(1));
+    let empty = management_request_with_status(
+        &mut requests,
+        &mut responses,
+        reply_to,
+        "peek-empty",
+        "com.microsoft:peek-message",
+        empty_peek_body,
+        204,
+    )
+    .await?;
+    assert_eq!(empty.body, Body::Value(Value::Null));
+
     let mut receive_body = OrderedMap::new();
     receive_body.insert(
         Value::String(String::from("sequence-numbers")),
@@ -243,6 +359,41 @@ async fn a_deferred_message_is_retrieved_and_settled_by_sequence() -> Result<(),
         properties.0.get("preserved"),
         Some(&Value::String(String::from("original")))
     );
+    let mut locked_peek_body = OrderedMap::new();
+    locked_peek_body.insert(
+        Value::String(String::from("from-sequence-number")),
+        Value::Long(sequence),
+    );
+    locked_peek_body.insert(Value::String(String::from("message-count")), Value::Int(1));
+    let locked_peek = peek_response(
+        management_request(
+            &mut requests,
+            &mut responses,
+            reply_to,
+            "peek-locked-deferred",
+            "com.microsoft:peek-message",
+            locked_peek_body,
+        )
+        .await?,
+    )?;
+    let [locked_peek] = locked_peek.as_slice() else {
+        return Err("peek did not return the locked deferred message".into());
+    };
+    assert_eq!(
+        locked_peek
+            .header
+            .as_ref()
+            .map(|header| header.delivery_count),
+        Some(2)
+    );
+    assert_eq!(
+        locked_peek
+            .message_annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(&AnnotationKey::from("x-opt-message-state"))),
+        Some(&Value::Int(1))
+    );
+    assert_peek_has_no_settlement_authority(locked_peek);
     let mut locked_body = OrderedMap::new();
     locked_body.insert(
         Value::String(String::from(protocol_amqp::LOCK_TOKENS)),

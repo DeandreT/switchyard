@@ -10,6 +10,7 @@
 //! the injected store.
 
 mod deferred;
+mod peek;
 mod send;
 
 use serde::de::DeserializeOwned;
@@ -25,6 +26,8 @@ use crate::{
 
 use self::deferred::replace_envelope;
 use self::send::SendInput;
+
+pub use self::peek::{MAX_PEEK_BATCH, MAX_PEEK_SCAN};
 
 /// Ready entries a single receive may walk past while discarding expired
 /// messages. Bounds the work one command performs so a large backlog of
@@ -98,6 +101,11 @@ impl<S: StateStore> StateMachine<S> {
             CommandKind::SendBatch { messages } => {
                 self.send_batch(command, messages, &mut batch)?
             }
+            CommandKind::Peek {
+                from_sequence,
+                max_messages,
+                session,
+            } => self.peek(command, *from_sequence, *max_messages, session.as_ref())?,
             CommandKind::Receive {
                 mode,
                 lock_duration_millis,

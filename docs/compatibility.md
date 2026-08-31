@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Single and atomic batch send; prefetched multi-message receive; independent settlement; receive-delete; envelope fidelity; renew; abandon/redelivery; defer and deferred receive; dead-letter and DLQ receive/complete; session renew/state; AMQP over TCP and WebSockets | Planned | Experimental gates on 7.20.2 |
+| Official .NET SDK, current stable | Single and atomic batch send; prefetched multi-message receive; independent settlement; receive-delete; envelope fidelity; renew; abandon/redelivery; defer and deferred receive; ordered peek pagination across active, locked, deferred, session, and DLQ messages; dead-letter and DLQ receive/complete; session renew/state; AMQP over TCP and WebSockets | Planned | Experimental gates on 7.20.2 |
 | Official .NET SDK, previous stable | Planned | Planned | Not implemented |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -28,7 +28,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Prefetch and concurrent settlement | Pre-1.0 | Bounded AMQP delivery pipeline, link-credit drain, Rust and current .NET clients end to end |
 | AMQP message envelope fidelity | Pre-1.0 | Durable V1 envelope, broker-owned overlays, Rust and current .NET clients end to end |
 | Abandon and redelivery | Pre-1.0 | State machine, AMQP mapping, Rust and current .NET clients end to end |
-| Peek without lock acquisition | Pre-1.0 | Not implemented |
+| Peek without lock acquisition | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Receive-delete | Pre-1.0 | State machine, AMQP mapping |
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -64,6 +64,12 @@ behavior it currently enforces:
   sequence number. Session batches require every child to name the same
   session.
 - Receive-delete is at-most-once: the deletion commits before the transfer.
+- Peek is an inclusive, sequence-ordered, read-only snapshot over active,
+  locked, and deferred records. It never increments delivery count or exposes
+  a lock token. A regular receiver can browse across sessions; a receiver that
+  holds a session sees only that session. Every positive signed request count
+  is accepted, responses are capped at 250 messages, and scanning continues
+  until that cap or the true end of the entity so an empty page is definitive.
 - A settlement is rejected unless it presents the live lock token, and rejected
   again once the lock deadline has passed.
 - A live message lock can be renewed without changing its token. Renewal moves
@@ -146,7 +152,9 @@ granted identifier and the initial session-lock deadline. The session is
 released when that link closes; renewing its lock and reading or writing its
 state use the entity's `$management` request/reply links, as do message-lock
 renewal, deferred receive by sequence number, and management disposition
-updates. Those data-plane operations require Listen authorization when
+updates. Ordered peeking uses the same management node and returns either a
+bounded page or a no-content response without changing broker state. Those
+data-plane operations require Listen authorization when
 authentication is enabled; Manage includes that right. A transfer is accepted
 only after its command committed, so the
 acknowledgement means durable. One node still serves one namespace. A message
@@ -161,9 +169,10 @@ official .NET SDK also has opt-in gates for envelope fidelity, ordinary send,
 atomic enumerable and explicit SDK batches, prefetched multi-message receive,
 out-of-order completion, receive-delete, message-lock renewal, abandon and
 redelivery, deferral with property updates, deferred receive and settlement,
-custom dead-lettering, dead-letter receive and completion, session state and
-renewal, and AMQP-over-TCP and WebSockets; the rest of that client gate remains
-incomplete.
+ordered peek pagination across active, locked, deferred, session, and
+dead-letter messages, custom dead-lettering, dead-letter receive and
+completion, session state and renewal, and AMQP-over-TCP and WebSockets; the
+rest of that client gate remains incomplete.
 Dead-letter resubmission is not implemented.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch

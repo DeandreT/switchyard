@@ -146,13 +146,42 @@ pub(crate) fn write_delivery_from(
     delivery: &Delivery,
     dead_letter_source: Option<&str>,
 ) -> Result<Message, ProtocolError> {
+    write_delivery_view(delivery, dead_letter_source, DeliveryView::Receive)
+}
+
+/// Builds the embedded message returned by the Service Bus peek management
+/// operation. A peek describes durable broker state, not a new delivery: it
+/// reports the stored delivery count exactly and never exposes a message lock.
+pub(crate) fn write_peeked_delivery_from(
+    delivery: &Delivery,
+    dead_letter_source: Option<&str>,
+) -> Result<Message, ProtocolError> {
+    write_delivery_view(delivery, dead_letter_source, DeliveryView::Peek)
+}
+
+#[derive(Clone, Copy)]
+enum DeliveryView {
+    Receive,
+    Peek,
+}
+
+fn write_delivery_view(
+    delivery: &Delivery,
+    dead_letter_source: Option<&str>,
+    view: DeliveryView,
+) -> Result<Message, ProtocolError> {
     let mut message = stored_message(delivery)?;
 
-    overlay_delivery_header(&mut message, delivery);
+    overlay_delivery_header(&mut message, delivery, view);
     overlay_delivery_properties(&mut message, delivery);
-    overlay_message_annotations(&mut message, delivery, dead_letter_source);
-    overlay_lock_token(&mut message, delivery);
+    overlay_message_annotations(&mut message, delivery, dead_letter_source, view);
+    overlay_lock_token(&mut message, delivery, view);
+    overlay_dead_letter_properties(&mut message, delivery);
 
+    Ok(message)
+}
+
+fn overlay_dead_letter_properties(message: &mut Message, delivery: &Delivery) {
     // A message drained from a dead-letter queue says why it is there, in the
     // properties the Service Bus SDKs read. Custom application properties stay
     // alongside the broker-owned reason and description.
@@ -177,7 +206,6 @@ pub(crate) fn write_delivery_from(
             }
         }
     }
-    Ok(message)
 }
 
 fn stored_message(delivery: &Delivery) -> Result<Message, ProtocolError> {
@@ -228,22 +256,22 @@ pub(crate) fn replacement_envelope(
         })
 }
 
-fn overlay_delivery_header(message: &mut Message, delivery: &Delivery) {
+fn overlay_delivery_header(message: &mut Message, delivery: &Delivery, view: DeliveryView) {
     let ttl = delivery.expires_at.map(|expires_at| {
         let millis = expires_at
             .as_millis()
             .saturating_sub(delivery.enqueued_at.as_millis());
         u32::try_from(millis).unwrap_or(u32::MAX)
     });
-    let delivery_count = delivery.delivery_count.saturating_sub(1);
+    let delivery_count = match view {
+        DeliveryView::Receive => delivery.delivery_count.saturating_sub(1),
+        DeliveryView::Peek => delivery.delivery_count,
+    };
 
-    // Service Bus always supplies a header on deliveries. In particular, the
-    // official SDK expects the first delivery's explicit zero rather than an
-    // omitted default when calculating its one-based DeliveryCount.
+    // Service Bus always supplies a header. Receive transfers report prior
+    // attempts, while the peek management response reports the stored count.
     let header = message.header.get_or_insert_with(Header::default);
     header.ttl = ttl;
-    // AMQP counts prior unsuccessful delivery attempts; the domain and Service
-    // Bus SDKs count the current attempt as well.
     header.delivery_count = delivery_count;
 }
 
@@ -267,6 +295,7 @@ fn overlay_message_annotations(
     message: &mut Message,
     delivery: &Delivery,
     dead_letter_source: Option<&str>,
+    view: DeliveryView,
 ) {
     let annotations = message
         .message_annotations
@@ -280,14 +309,14 @@ fn overlay_message_annotations(
             delivery.enqueued_at.as_millis(),
         ))),
     );
-    match delivery.lock {
-        Some(lock) => annotations.insert(
+    match (view, delivery.lock) {
+        (DeliveryView::Receive, Some(lock)) => annotations.insert(
             LOCKED_UNTIL_ANNOTATION,
             Value::Timestamp(AmqpTimestamp::from_milliseconds(timestamp_millis(
                 lock.locked_until.as_millis(),
             ))),
         ),
-        None => {
+        (DeliveryView::Receive, None) | (DeliveryView::Peek, _) => {
             annotations
                 .0
                 .shift_remove(&AnnotationKey::from(LOCKED_UNTIL_ANNOTATION));
@@ -314,10 +343,10 @@ fn overlay_message_annotations(
     }
 }
 
-fn overlay_lock_token(message: &mut Message, delivery: &Delivery) {
+fn overlay_lock_token(message: &mut Message, delivery: &Delivery, view: DeliveryView) {
     let key = AnnotationKey::from(LOCK_TOKEN_ANNOTATION);
-    match delivery.lock {
-        Some(lock) => {
+    match (view, delivery.lock) {
+        (DeliveryView::Receive, Some(lock)) => {
             let annotations = message
                 .delivery_annotations
                 .get_or_insert_with(DeliveryAnnotations::default);
@@ -325,7 +354,7 @@ fn overlay_lock_token(message: &mut Message, delivery: &Delivery) {
             bytes[8..].copy_from_slice(&lock.token.as_u64().to_be_bytes());
             annotations.insert(key, Value::Uuid(Uuid::from(bytes)));
         }
-        None => {
+        (DeliveryView::Receive, None) | (DeliveryView::Peek, _) => {
             if let Some(annotations) = message.delivery_annotations.as_mut() {
                 annotations.0.shift_remove(&key);
             }

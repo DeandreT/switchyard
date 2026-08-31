@@ -101,10 +101,12 @@ pub fn message(
     entity: &EntityPath,
     sequence: SequenceNumber,
 ) -> Vec<u8> {
-    with_u64(
-        entity_scope(TAG_MESSAGE, namespace, entity),
-        sequence.as_u64(),
-    )
+    with_u64(message_prefix(namespace, entity), sequence.as_u64())
+}
+
+/// Every primary message record in an entity, ordered by sequence number.
+pub fn message_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_MESSAGE, namespace, entity)
 }
 
 pub fn ready_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {

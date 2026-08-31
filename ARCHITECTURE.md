@@ -5,20 +5,20 @@
 This document is the implementation contract for Switchyard. The repository is
 currently pre-alpha. A deterministic state machine covers queue send and
 receive, both settlement modes, lock expiry, time-to-live expiry,
-dead-lettering and dead-letter receive, and the session ownership and session
-state described under [Message Semantics](#message-semantics). It runs over
-either the Fjall backend or the memory backend, so a single node survives a
-restart.
+dead-lettering and dead-letter receive, deferral and deferred retrieval,
+read-only message browsing, and the session ownership and session state
+described under [Message Semantics](#message-semantics). It runs over either
+the Fjall backend or the memory backend, so a single node survives a restart.
 
 The `switchyard` binary accepts AMQP connections over development plaintext or
 TLS, authenticates a configured shared-access policy through SASL PLAIN or CBS
 SAS, carries messages and sessions across that edge, and sweeps lock,
 time-to-live, and session-lock expiry. JWT/OIDC, mTLS, policy administration,
 Raft, and compliance implementations remain to be built. Within the semantics
-below, scheduling, deferral, duplicate detection, and topics are not
-implemented, the timer worker covers only the three expiry indexes that exist,
-and the storage keyspace layout under [Storage](#storage) is still a single
-record keyspace rather than the split listed there.
+below, scheduling, duplicate detection, and topics are not implemented, the
+timer worker covers only the three expiry indexes that exist, and the storage
+keyspace layout under [Storage](#storage) is still a single record keyspace
+rather than the split listed there.
 
 Compatibility means observable protocol and SDK behavior backed by automated
 tests. It does not mean byte-for-byte implementation similarity, Microsoft
