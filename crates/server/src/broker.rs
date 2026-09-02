@@ -95,6 +95,31 @@ impl Watchers {
             notify.notify_one();
         }
     }
+
+    /// Wakes the concrete receive paths made deliverable by an outcome.
+    ///
+    /// A queue command affects the entity it was submitted against. A topic
+    /// publish is different: the topic itself is never receivable, and fanout
+    /// may populate several subscriptions. The domain returns those paths so
+    /// every already-waiting subscription link gets its own permit.
+    fn notify_outcome(
+        &self,
+        namespace: &NamespaceName,
+        submitted_entity: &EntityPath,
+        outcome: &CommandOutcome,
+    ) {
+        match outcome {
+            CommandOutcome::Published { subscriptions, .. } => {
+                for subscription in subscriptions {
+                    self.notify(namespace, subscription);
+                }
+            }
+            outcome if makes_deliverable(outcome) => {
+                self.notify(namespace, submitted_entity);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Whether applying this outcome may have made something deliverable, which is
@@ -242,8 +267,8 @@ impl Broker {
                             reply,
                         } => {
                             let outcome = proposer.propose(&namespace, &entity, kind);
-                            if outcome.as_ref().is_ok_and(makes_deliverable) {
-                                watching.notify(&namespace, &entity);
+                            if let Ok(outcome) = outcome.as_ref() {
+                                watching.notify_outcome(&namespace, &entity, outcome);
                             }
                             // A caller that stopped waiting is not an error: the
                             // command still applied, and it gave up, not us.
@@ -432,6 +457,51 @@ mod tests {
             ],
             stored: 1,
         }));
+    }
+
+    #[tokio::test]
+    async fn a_publish_wakes_every_populated_subscription_but_not_the_topic() {
+        let watchers = Watchers::default();
+        let namespace = NamespaceName::new("tenant").expect("valid namespace");
+        let topic = EntityPath::new("billing").expect("valid topic");
+        let accounting =
+            EntityPath::new("billing/subscriptions/accounting").expect("valid subscription");
+        let analytics =
+            EntityPath::new("billing/subscriptions/analytics").expect("valid subscription");
+
+        let topic_waiter = watchers.watch(&namespace, &topic);
+        let accounting_waiter = watchers.watch(&namespace, &accounting);
+        let analytics_waiter = watchers.watch(&namespace, &analytics);
+        watchers.notify_outcome(
+            &namespace,
+            &topic,
+            &CommandOutcome::Published {
+                sequences: vec![SequenceNumber::new(1)],
+                subscriptions: vec![accounting, analytics],
+            },
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            accounting_waiter.notified(),
+        )
+        .await
+        .expect("the first populated subscription is notified");
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            analytics_waiter.notified(),
+        )
+        .await
+        .expect("the second populated subscription is notified");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                topic_waiter.notified(),
+            )
+            .await
+            .is_err(),
+            "a publish must not wake the non-receivable topic"
+        );
     }
 
     #[test]

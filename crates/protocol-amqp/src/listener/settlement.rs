@@ -221,11 +221,9 @@ pub(super) async fn serve_receiving_client<B: Broker>(
             Err(NextDeliveryError::Unauthorized) => break 'pump PumpExit::Unauthorized,
         };
 
-        let dead_letter_source = delivery
-            .dead_letter
-            .as_ref()
-            .and_then(|_| entity.as_str().strip_suffix(crate::DEAD_LETTER_SUFFIX));
-        let message = match crate::message::write_delivery_from(&delivery, dead_letter_source) {
+        // Azure sets DeadLetterSource only after a DLQ message has been
+        // auto-forwarded to another entity, not while it is drained directly.
+        let message = match crate::message::write_delivery_from(&delivery, None) {
             Ok(message) => message,
             Err(error) => break 'pump PumpExit::Protocol(error),
         };

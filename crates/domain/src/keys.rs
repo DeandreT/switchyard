@@ -24,7 +24,7 @@
 //! [`crate::SessionId`] reject control characters, so no name can contain a zero
 //! byte and forge another scope's prefix.
 
-use crate::{EntityPath, NamespaceName, SequenceNumber, SessionId, Timestamp};
+use crate::{EntityPath, NamespaceName, SequenceNumber, SessionId, SubscriptionName, Timestamp};
 
 const TAG_CLOCK: u8 = 0x00;
 const TAG_QUEUE_CONFIG: u8 = 0x01;
@@ -40,6 +40,8 @@ const TAG_SESSION_LOCK: u8 = 0x0A;
 const TAG_SCHEDULED: u8 = 0x0B;
 const TAG_DUPLICATE_ID: u8 = 0x0C;
 const TAG_DUPLICATE_EXPIRY: u8 = 0x0D;
+const TAG_TOPIC_CONFIG: u8 = 0x0E;
+const TAG_TOPIC_SUBSCRIPTION: u8 = 0x0F;
 
 const SEPARATOR: u8 = 0x00;
 
@@ -85,6 +87,25 @@ pub fn queue_config(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
 /// how the timer worker learns what there is to sweep.
 pub fn queue_config_prefix() -> Vec<u8> {
     vec![TAG_QUEUE_CONFIG]
+}
+
+pub fn topic_config(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_TOPIC_CONFIG, namespace, entity)
+}
+
+pub fn topic_subscription_prefix(namespace: &NamespaceName, topic: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_TOPIC_SUBSCRIPTION, namespace, topic)
+}
+
+/// One subscription below a topic, ordered by its validated name.
+pub fn topic_subscription(
+    namespace: &NamespaceName,
+    topic: &EntityPath,
+    subscription: &SubscriptionName,
+) -> Vec<u8> {
+    let mut key = topic_subscription_prefix(namespace, topic);
+    key.extend_from_slice(subscription.as_str().as_bytes());
+    key
 }
 
 /// Reads the namespace and entity path back out of an entity-scoped key.
@@ -455,6 +476,24 @@ mod tests {
         let short_prefix = ready_prefix(&namespace(), &short);
         let long_prefix = ready_prefix(&namespace(), &long);
         assert!(!long_prefix.starts_with(&short_prefix));
+    }
+
+    #[test]
+    fn topic_subscription_keys_are_scoped_and_name_ordered() {
+        let alpha = SubscriptionName::new("alpha").expect("valid subscription");
+        let zeta = SubscriptionName::new("zeta").expect("valid subscription");
+        let prefix = topic_subscription_prefix(&namespace(), &entity());
+        let alpha_key = topic_subscription(&namespace(), &entity(), &alpha);
+        let zeta_key = topic_subscription(&namespace(), &entity(), &zeta);
+        assert!(alpha_key.starts_with(&prefix));
+        assert!(zeta_key.starts_with(&prefix));
+        assert!(alpha_key < zeta_key);
+
+        let other = EntityPath::new("orders-archive").expect("valid topic");
+        assert!(
+            !topic_subscription(&namespace(), &other, &alpha)
+                .starts_with(&topic_subscription_prefix(&namespace(), &entity()))
+        );
     }
 
     fn session_id(value: &str) -> SessionId {

@@ -3,7 +3,10 @@
 use std::{error::Error, path::PathBuf, process::Command, time::Duration};
 
 use auth::{PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule};
-use domain::{CommandKind, CommandOutcome, QueueConfig, ReceiveMode, StateMachine};
+use domain::{
+    CommandKind, CommandOutcome, QueueConfig, ReceiveMode, StateMachine, SubscriptionConfig,
+    SubscriptionName, TopicConfig,
+};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use server::{Broker, LocalProposer, ManualClock};
 use storage::MemoryStore;
@@ -49,6 +52,24 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
             namespace.clone(),
             domain::EntityPath::new(path)?,
             CommandKind::CreateQueue { config },
+        )?;
+    }
+    let topic = domain::EntityPath::new("websocket-events")?;
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        topic.clone(),
+        CommandKind::CreateTopic {
+            config: TopicConfig::default(),
+        },
+    )?;
+    for name in ["first", "second"] {
+        broker.handle().submit_blocking(
+            namespace.clone(),
+            topic.clone(),
+            CommandKind::CreateSubscription {
+                name: SubscriptionName::new(name)?,
+                config: SubscriptionConfig::default(),
+            },
         )?;
     }
 
@@ -115,6 +136,9 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
             .arg("websocket-schedule")
             .arg("websocket-dedupe")
             .arg("websocket-sessions")
+            .arg("websocket-events")
+            .arg("first")
+            .arg("second")
             .arg(RULE)
             .arg(KEY)
             .output()
@@ -129,7 +153,7 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
     );
     assert!(
         String::from_utf8_lossy(&output.stdout).contains(
-            "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, send/receive/complete, defer/peek/deferred-receive, schedule/cancel, duplicate detection, and session attach passed"
+            "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, send/receive/complete, defer/peek/deferred-receive, schedule/cancel, duplicate detection, topic fan-out, and session attach passed"
         ),
         "the client exited without reporting the completed WebSocket workflow"
     );

@@ -14,6 +14,7 @@ pub const INTERNAL_ERROR: &str = "amqp:internal-error";
 pub const INVALID_FIELD: &str = "amqp:invalid-field";
 pub const PRECONDITION_FAILED: &str = "amqp:precondition-failed";
 pub const RESOURCE_LOCKED: &str = "amqp:resource-locked";
+pub const RESOURCE_LIMIT_EXCEEDED: &str = "amqp:resource-limit-exceeded";
 pub const MESSAGE_SIZE_EXCEEDED: &str = "amqp:link:message-size-exceeded";
 
 pub const MESSAGE_LOCK_LOST: &str = "com.microsoft:message-lock-lost";
@@ -27,10 +28,14 @@ pub const TIMEOUT: &str = "com.microsoft:timeout";
 pub fn condition_for(error: &BrokerError) -> &'static str {
     match error {
         BrokerError::QueueNotFound
+        | BrokerError::TopicNotFound
         | BrokerError::MessageNotFound { .. }
         | BrokerError::MessageNotDeferred { .. }
         | BrokerError::MessageNotScheduled { .. } => NOT_FOUND,
-        BrokerError::QueueAlreadyExists => ENTITY_ALREADY_EXISTS,
+        BrokerError::QueueAlreadyExists
+        | BrokerError::TopicAlreadyExists
+        | BrokerError::EntityAlreadyExists
+        | BrokerError::SubscriptionAlreadyExists => ENTITY_ALREADY_EXISTS,
 
         // The client's claim on the message is gone. Saying so precisely is what
         // lets an SDK stop trying to settle and wait for redelivery instead.
@@ -50,6 +55,11 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         BrokerError::SessionRequired
         | BrokerError::SessionNotSupported
         | BrokerError::DeadLetterQueueIsReserved
+        | BrokerError::EntityPathReserved
+        | BrokerError::SubscriptionSendNotAllowed
+        | BrokerError::TopicReceiveNotSupported
+        | BrokerError::TopicSchedulingNotSupported
+        | BrokerError::TopicSessionNotSupported
         | BrokerError::EmptyMessageBatch
         | BrokerError::MessageBatchSessionMismatch
         | BrokerError::EmptyScheduledCancellation
@@ -60,9 +70,13 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::DuplicateDeferredSequence { .. }
         | BrokerError::DeferredMessageSessionMismatch { .. } => NOT_ALLOWED,
 
+        BrokerError::SubscriptionLimitExceeded { .. } => RESOURCE_LIMIT_EXCEEDED,
+
         BrokerError::MessageTooLarge { .. } => MESSAGE_SIZE_EXCEEDED,
         BrokerError::MessageIdTooLong { .. } => INVALID_FIELD,
-        BrokerError::QueueConfig(_) => PRECONDITION_FAILED,
+        BrokerError::QueueConfig(_)
+        | BrokerError::TopicConfig(_)
+        | BrokerError::SubscriptionConfig(_) => PRECONDITION_FAILED,
 
         // The node's clock disagrees with what it already applied. A client
         // retry can succeed once it settles, so this is locked rather than
@@ -72,6 +86,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         // Nothing a client did. Corrupt indexes, unreadable records, and storage
         // failures are the broker's problem and are reported as its fault.
         BrokerError::DanglingIndexEntry { .. }
+        | BrokerError::DanglingSubscription { .. }
         | BrokerError::MalformedIndexKey
         | BrokerError::ScheduledEnqueueTimeMissing { .. }
         | BrokerError::Codec(_)
@@ -159,6 +174,13 @@ mod tests {
     }
 
     #[test]
+    fn the_subscription_cap_is_a_resource_limit() {
+        let error = BrokerError::SubscriptionLimitExceeded { maximum: 2_000 };
+        assert_eq!(condition_for(&error), RESOURCE_LIMIT_EXCEEDED);
+        assert!(!is_retryable(&error));
+    }
+
+    #[test]
     fn an_overlong_message_identifier_is_an_invalid_wire_field() {
         assert_eq!(
             condition_for(&BrokerError::MessageIdTooLong {
@@ -174,6 +196,8 @@ mod tests {
         for error in [
             BrokerError::SessionRequired,
             BrokerError::SessionNotSupported,
+            BrokerError::SubscriptionSendNotAllowed,
+            BrokerError::TopicReceiveNotSupported,
         ] {
             assert_eq!(condition_for(&error), NOT_ALLOWED);
             assert!(!is_retryable(&error), "{error} should not invite a retry");

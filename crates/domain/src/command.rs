@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AcceptedSession, Delivery, EntityPath, LockToken, MessageEnvelope, NamespaceName, QueueConfig,
-    ReceiveMode, SequenceNumber, SessionHold, SessionId, Timestamp,
+    ReceiveMode, SequenceNumber, SessionHold, SessionId, SubscriptionConfig, SubscriptionName,
+    Timestamp, TopicConfig,
 };
 
 /// One message supplied to an atomic broker operation.
@@ -61,6 +62,15 @@ impl Command {
 pub enum CommandKind {
     CreateQueue {
         config: QueueConfig,
+    },
+    CreateTopic {
+        config: TopicConfig,
+    },
+    /// Creates one durable match-all subscription below `Command::entity`,
+    /// which names its already-existing topic.
+    CreateSubscription {
+        name: SubscriptionName,
+        config: SubscriptionConfig,
     },
     Send {
         message_id: String,
@@ -198,6 +208,10 @@ pub enum CommandKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandOutcome {
     QueueCreated,
+    TopicCreated,
+    SubscriptionCreated {
+        entity: EntityPath,
+    },
     Sent {
         sequence: SequenceNumber,
     },
@@ -211,6 +225,14 @@ pub enum CommandOutcome {
         /// Children that were actually persisted; every input still receives a
         /// deterministic sequence slot in `sequences`.
         stored: u32,
+    },
+    /// Immediate topic fanout committed atomically. Every sequence is owned by
+    /// the topic and stamped identically into that message's subscription
+    /// copies. An empty subscription list is a successful publish to a topic
+    /// that currently has no subscribers.
+    Published {
+        sequences: Vec<SequenceNumber>,
+        subscriptions: Vec<EntityPath>,
     },
     ScheduledCancelled {
         cancelled: u32,

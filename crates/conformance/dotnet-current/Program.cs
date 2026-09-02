@@ -2,10 +2,10 @@ using Azure;
 using Azure.Core.Amqp;
 using Azure.Messaging.ServiceBus;
 
-if (args.Length != 10)
+if (args.Length != 13)
 {
     Console.Error.WriteLine(
-        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <peek-queue> <schedule-queue> <dedupe-queue> <session-queue> <key-name> <key>");
+        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <peek-queue> <schedule-queue> <dedupe-queue> <session-queue> <topic> <subscription-a> <subscription-b> <key-name> <key>");
     return 2;
 }
 
@@ -17,8 +17,11 @@ string peekQueue = args[4];
 string scheduleQueue = args[5];
 string dedupeQueue = args[6];
 string sessionQueue = args[7];
-string keyName = args[8];
-string key = args[9];
+string topic = args[8];
+string firstSubscription = args[9];
+string secondSubscription = args[10];
+string keyName = args[11];
+string key = args[12];
 
 var options = new ServiceBusClientOptions
 {
@@ -649,7 +652,7 @@ if (peekedDeadLetter is null ||
     peekedDeadLetter.Body.ToString() != settlementBody ||
     peekedDeadLetter.DeadLetterReason != deadLetterReason ||
     peekedDeadLetter.DeadLetterErrorDescription != deadLetterDescription ||
-    peekedDeadLetter.DeadLetterSource != queue ||
+    peekedDeadLetter.DeadLetterSource is not null ||
     peekedDeadLetter.DeliveryCount != 2)
 {
     Console.Error.WriteLine(
@@ -691,10 +694,10 @@ if (deadLettered.DeadLetterErrorDescription != deadLetterDescription)
         $"unexpected dead-letter description: {deadLettered.DeadLetterErrorDescription}");
     return 14;
 }
-if (deadLettered.DeadLetterSource != queue)
+if (deadLettered.DeadLetterSource is not null)
 {
     Console.Error.WriteLine(
-        $"unexpected dead-letter source: {deadLettered.DeadLetterSource}");
+        $"a direct DLQ delivery claimed an auto-forward source: {deadLettered.DeadLetterSource}");
     return 28;
 }
 if (!Equals(deadLettered.ApplicationProperties["deadletter-stage"], "direct"))
@@ -837,7 +840,7 @@ ServiceBusReceivedMessage? deadLetteredDeferred =
 if (deadLetteredDeferred?.Body.ToString() != deferredBody ||
     deadLetteredDeferred.DeadLetterReason != deferredDeadLetterReason ||
     deadLetteredDeferred.DeadLetterErrorDescription != deferredDeadLetterDescription ||
-    deadLetteredDeferred.DeadLetterSource != queue)
+    deadLetteredDeferred.DeadLetterSource is not null)
 {
     Console.Error.WriteLine(
         $"deferred dead-letter mismatch: body={deadLetteredDeferred?.Body}, " +
@@ -1031,11 +1034,21 @@ if (otherSessionMessage?.Body.ToString() != "official-session-other")
 }
 await otherSessionReceiver.CompleteMessageAsync(otherSessionMessage);
 
+int topicResult = await TopicConformance.RunAsync(
+    client,
+    topic,
+    firstSubscription,
+    secondSubscription);
+if (topicResult != 0)
+{
+    return topicResult;
+}
+
 Console.WriteLine(
     "official .NET Service Bus client batch send/prefetch/concurrent settlement, " +
     "envelope fidelity, send/receive/renew/complete, " +
     "abandon/redelivery/property-update, dead-letter/DLQ receive/complete, " +
     "defer/deferred-receive/management-disposition, peek/browse pagination, " +
-    "schedule/cancel/timer activation, duplicate detection, " +
+    "schedule/cancel/timer activation, duplicate detection, topic fan-out, " +
     "and session renew/state/peek passed");
 return 0;

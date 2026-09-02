@@ -1,7 +1,10 @@
 use storage::StorageError;
 use thiserror::Error;
 
-use crate::{CodecError, IdentifierError, QueueConfigError, SequenceNumber, SessionId, Timestamp};
+use crate::{
+    CodecError, EntityPath, IdentifierError, QueueConfigError, SequenceNumber, SessionId,
+    SubscriptionConfigError, Timestamp, TopicConfigError,
+};
 
 /// Every rejection the state machine can produce.
 ///
@@ -13,6 +16,28 @@ pub enum BrokerError {
     QueueNotFound,
     #[error("queue already exists")]
     QueueAlreadyExists,
+    #[error("topic does not exist")]
+    TopicNotFound,
+    #[error("topic already exists")]
+    TopicAlreadyExists,
+    #[error("an entity of another kind already exists at this path")]
+    EntityAlreadyExists,
+    #[error("the entity path uses a reserved Service Bus suffix")]
+    EntityPathReserved,
+    #[error("subscription already exists")]
+    SubscriptionAlreadyExists,
+    #[error("a topic cannot have more than {maximum} subscriptions")]
+    SubscriptionLimitExceeded { maximum: usize },
+    #[error("topic subscription index references missing queue {entity}")]
+    DanglingSubscription { entity: EntityPath },
+    #[error("messages cannot be sent directly to a topic subscription")]
+    SubscriptionSendNotAllowed,
+    #[error("messages cannot be received directly from a topic")]
+    TopicReceiveNotSupported,
+    #[error("scheduled topic messages are not supported yet")]
+    TopicSchedulingNotSupported,
+    #[error("session-bearing topic messages are not supported yet")]
+    TopicSessionNotSupported,
     #[error("message {sequence} does not exist")]
     MessageNotFound { sequence: SequenceNumber },
     #[error("message {sequence} is not locked")]
@@ -66,6 +91,10 @@ pub enum BrokerError {
     },
     #[error("invalid queue configuration: {0}")]
     QueueConfig(#[from] QueueConfigError),
+    #[error("invalid topic configuration: {0}")]
+    TopicConfig(#[from] TopicConfigError),
+    #[error("invalid subscription configuration: {0}")]
+    SubscriptionConfig(#[from] SubscriptionConfigError),
     #[error("a dead-letter queue exists only as the shadow of its parent")]
     DeadLetterQueueIsReserved,
     #[error("queue requires a session and the command named none")]

@@ -4,8 +4,8 @@
 use std::error::Error;
 
 use domain::{
-    BrokerError, CommandKind, CommandOutcome, DeadLetterReason, Delivery, EntityPath, QueueConfig,
-    ReceiveMode, SequenceNumber, Timestamp,
+    BrokerError, CommandKind, CommandOutcome, DeadLetterReason, Delivery, QueueConfig, ReceiveMode,
+    SequenceNumber, Timestamp,
 };
 use testkit::{QueueFixture, StoreProvider};
 
@@ -302,20 +302,20 @@ fn reserved_paths_cannot_be_created_or_sent_to<P: StoreProvider>(
     Ok(())
 }
 
-fn a_parent_whose_shadow_path_would_be_too_long_is_refused<P: StoreProvider>(
+fn a_maximum_length_parent_can_address_its_shadow<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
-    // Valid as an entity path on its own, but its shadow would exceed the
-    // limit; refused at creation rather than at the first dead-lettering.
-    let parent = "q".repeat(domain::MAX_ENTITY_PATH_BYTES - 1);
-    let Err(error) = QueueFixture::new(provider, "tenant", &parent, QueueConfig::default()) else {
-        panic!("a queue that could never dead-letter is refused");
-    };
-    assert!(matches!(
-        error,
-        testkit::FixtureError::Broker(BrokerError::Identifier(_))
-    ));
-    let _ = EntityPath::new(parent).expect("the parent alone is a valid path");
+    let parent = "q".repeat(domain::MAX_ENTITY_PATH_BYTES);
+    let fixture = QueueFixture::new(provider, "tenant", &parent, QueueConfig::default())?;
+    let shadow = fixture.entity.dead_letter_queue()?;
+    assert!(shadow.as_str().len() > domain::MAX_ENTITY_PATH_BYTES);
+    assert!(
+        fixture
+            .machine
+            .queue_config(&fixture.namespace, &shadow)?
+            .is_some(),
+        "the maximum-length queue has a durable DLQ shadow"
+    );
     Ok(())
 }
 
@@ -350,5 +350,5 @@ for_each_backend! {
     the_dead_letter_queue_ignores_time_to_live,
     a_session_message_dead_letters_out_of_its_session,
     reserved_paths_cannot_be_created_or_sent_to,
-    a_parent_whose_shadow_path_would_be_too_long_is_refused,
+    a_maximum_length_parent_can_address_its_shadow,
 }

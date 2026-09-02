@@ -15,6 +15,7 @@ mod expiry;
 mod peek;
 mod scheduling;
 mod send;
+mod topic;
 
 use serde::de::DeserializeOwned;
 use storage::{StateStore, WriteBatch};
@@ -84,6 +85,12 @@ impl<S: StateStore> StateMachine<S> {
             CommandKind::CreateQueue { config } => {
                 self.create_queue(command, *config, &mut batch)?
             }
+            CommandKind::CreateTopic { config } => {
+                self.create_topic(command, *config, &mut batch)?
+            }
+            CommandKind::CreateSubscription { name, config } => {
+                self.create_subscription(command, name, *config, &mut batch)?
+            }
             CommandKind::Send {
                 message_id,
                 body,
@@ -91,22 +98,42 @@ impl<S: StateStore> StateMachine<S> {
                 session_id,
                 scheduled_enqueue_at,
                 envelope,
-            } => self.send(
-                command,
-                SendInput {
+            } => {
+                let input = SendInput {
                     message_id,
                     body,
                     time_to_live_millis: *time_to_live_millis,
                     session_id: session_id.as_ref(),
                     scheduled_enqueue_at: *scheduled_enqueue_at,
                     envelope: envelope.as_ref(),
-                },
-                &mut batch,
-            )?,
+                };
+                if self
+                    .topic_config(&command.namespace, &command.entity)?
+                    .is_some()
+                {
+                    self.publish(command, &[input], &mut batch)?
+                } else {
+                    self.send(command, input, &mut batch)?
+                }
+            }
             CommandKind::SendBatch { messages } => {
-                self.send_batch(command, messages, &mut batch)?
+                if self
+                    .topic_config(&command.namespace, &command.entity)?
+                    .is_some()
+                {
+                    let inputs = messages.iter().map(SendInput::from).collect::<Vec<_>>();
+                    self.publish(command, &inputs, &mut batch)?
+                } else {
+                    self.send_batch(command, messages, &mut batch)?
+                }
             }
             CommandKind::CancelScheduled { sequences } => {
+                if self
+                    .topic_config(&command.namespace, &command.entity)?
+                    .is_some()
+                {
+                    return Err(BrokerError::TopicSchedulingNotSupported);
+                }
                 self.cancel_scheduled(command, sequences, &mut batch)?
             }
             CommandKind::Peek {
@@ -213,7 +240,15 @@ impl<S: StateStore> StateMachine<S> {
             CommandKind::ExpireLocks => self.expire_locks(command, &mut batch)?,
             CommandKind::ExpireMessages => self.expire_messages(command, &mut batch)?,
             CommandKind::ExpireSessionLocks => self.expire_session_locks(command, &mut batch)?,
-            CommandKind::ActivateScheduled => self.activate_scheduled(command, &mut batch)?,
+            CommandKind::ActivateScheduled => {
+                if self
+                    .topic_config(&command.namespace, &command.entity)?
+                    .is_some()
+                {
+                    return Err(BrokerError::TopicSchedulingNotSupported);
+                }
+                self.activate_scheduled(command, &mut batch)?
+            }
             CommandKind::ExpireDuplicateHistory => {
                 self.expire_duplicate_history(command, &mut batch)?
             }
@@ -281,7 +316,10 @@ impl<S: StateStore> StateMachine<S> {
             .map(|(key, _)| {
                 let (namespace, entity) =
                     keys::entity_scope_parts(&key).ok_or(BrokerError::MalformedIndexKey)?;
-                Ok((NamespaceName::new(namespace)?, EntityPath::new(entity)?))
+                Ok((
+                    NamespaceName::new(namespace)?,
+                    EntityPath::from_internal(entity)?,
+                ))
             })
             .collect()
     }
@@ -430,8 +468,16 @@ impl<S: StateStore> StateMachine<S> {
     }
 
     fn load_config(&self, command: &Command) -> Result<QueueConfig, BrokerError> {
-        self.queue_config(&command.namespace, &command.entity)?
-            .ok_or(BrokerError::QueueNotFound)
+        match self.queue_config(&command.namespace, &command.entity)? {
+            Some(config) => Ok(config),
+            None if self
+                .topic_config(&command.namespace, &command.entity)?
+                .is_some() =>
+            {
+                Err(BrokerError::TopicReceiveNotSupported)
+            }
+            None => Err(BrokerError::QueueNotFound),
+        }
     }
 
     fn load_counters(&self, command: &Command) -> Result<QueueCounters, BrokerError> {
@@ -460,9 +506,19 @@ impl<S: StateStore> StateMachine<S> {
         if command.entity.is_dead_letter_queue() {
             return Err(BrokerError::DeadLetterQueueIsReserved);
         }
+        if command.entity.is_subscription() || command.entity.is_management() {
+            return Err(BrokerError::EntityPathReserved);
+        }
         let key = keys::queue_config(&command.namespace, &command.entity);
         if self.store.get(&key)?.is_some() {
             return Err(BrokerError::QueueAlreadyExists);
+        }
+        if self
+            .store
+            .get(&keys::topic_config(&command.namespace, &command.entity))?
+            .is_some()
+        {
+            return Err(BrokerError::EntityAlreadyExists);
         }
         let config = config.validate()?;
 

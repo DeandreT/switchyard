@@ -7,20 +7,23 @@ currently pre-alpha. A deterministic state machine covers queue send and
 receive, both settlement modes, lock expiry, time-to-live expiry,
 dead-lettering and dead-letter receive, deferral and deferred retrieval,
 read-only message browsing, scheduled delivery and cancellation, duplicate
-detection, and the session ownership and session state described under
-[Message Semantics](#message-semantics). It runs over either the Fjall backend
-or the memory backend, so a single node survives a restart.
+detection, immediate default-rule topic fanout, and the session ownership and
+session state described under [Message Semantics](#message-semantics). It runs
+over either the Fjall backend or the memory backend, so a single node survives
+a restart.
 
 The `switchyard` binary accepts AMQP connections over development plaintext or
 TLS, authenticates a configured shared-access policy through SASL PLAIN or CBS
-SAS, carries messages and sessions across that edge, and sweeps lock,
-time-to-live, session-lock, and duplicate-history expiry while activating
-scheduled messages.
+SAS, carries queue messages, immediate topic publications, subscription
+copies, and sessions across that edge, and sweeps lock, time-to-live,
+session-lock, and duplicate-history expiry while activating scheduled messages.
 JWT/OIDC, mTLS, policy administration,
 Raft, and compliance implementations remain to be built. Within the semantics
-below, topics are not implemented, and the storage
-keyspace layout under [Storage](#storage) is still a single record keyspace
-rather than the split listed there.
+below, custom subscription rules and actions, session-aware subscriptions,
+topic scheduling, topic duplicate detection, and configurable discard versus
+dead-letter behavior on TTL expiry are not implemented. The storage keyspace
+layout under [Storage](#storage) is still a single record keyspace rather than
+the split listed there.
 
 Compatibility means observable protocol and SDK behavior backed by automated
 tests. It does not mean byte-for-byte implementation similarity, Microsoft
@@ -226,11 +229,18 @@ it. The history begins at the replicated command timestamp and a duplicate hit
 does not extend it. Those last two boundary choices make replay deterministic;
 Azure documents the window behavior but not either detail.
 
-Topic sends evaluate the current subscription rule revision before proposing
-fanout. The command records the matched subscriptions and encrypted property
-overlays, making follower application deterministic. One encrypted payload can
-be referenced by multiple subscriptions and is removed after the final
-reference disappears.
+An immediate topic command validates the whole singular or batch publication,
+allocates topic-owned sequence numbers, then materializes one envelope copy in
+every subscription present at that command's position in the replicated order.
+All copies and the topic counter commit in one storage batch. A topic with no
+subscriptions still accepts the publication, and a subscription created later
+sees only later publications. Every subscription currently has only the
+implicit `$Default` true rule and otherwise uses the ordinary queue lifecycle,
+including independent lock, settlement, expiry, deferral, browsing, and DLQ
+state. The current backend stores a full payload copy per subscription; shared
+encrypted payload records and reference counting remain an optimization for
+the production storage layout. Custom filters and actions will require durable
+rule revisions and deterministic property overlays before they are exposed.
 
 ## Transactions And Forwarding
 

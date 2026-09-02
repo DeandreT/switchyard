@@ -93,7 +93,7 @@ pub(super) async fn receive_by_sequence_number<B: Broker>(
         }
     };
 
-    let entries = match encode_deliveries(entity, &deliveries) {
+    let entries = match encode_deliveries(&deliveries) {
         Ok(entries) => entries,
         Err(error) => {
             return ManagementResponse::internal(
@@ -261,15 +261,11 @@ fn receiver_settle_mode(body: &Body) -> Option<ReceiveMode> {
     }
 }
 
-fn encode_deliveries(
-    entity: &EntityPath,
-    deliveries: &[Delivery],
-) -> Result<Vec<Value>, crate::ProtocolError> {
-    let dead_letter_source = entity.as_str().strip_suffix(crate::DEAD_LETTER_SUFFIX);
+fn encode_deliveries(deliveries: &[Delivery]) -> Result<Vec<Value>, crate::ProtocolError> {
     deliveries
         .iter()
         .map(|delivery| {
-            let message = crate::message::write_delivery_from(delivery, dead_letter_source)?;
+            let message = crate::message::write_delivery_from(delivery, None)?;
             let encoded = encode_message(&message).map_err(|error| {
                 crate::ProtocolError::InvalidEnvelope {
                     detail: error.to_string(),
@@ -804,7 +800,7 @@ mod tests {
             envelope: None,
             origin: domain::DeliveryOrigin::Deferred,
         };
-        let entries = encode_deliveries(&entity, std::slice::from_ref(&delivery))
+        let entries = encode_deliveries(std::slice::from_ref(&delivery))
             .expect("the deferred response entry encodes");
         let [Value::Map(entry)] = entries.as_slice() else {
             panic!("one delivery must produce one AMQP map entry")

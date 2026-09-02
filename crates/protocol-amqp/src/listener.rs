@@ -736,8 +736,11 @@ async fn plan_link<B: Broker>(
 
 /// The entity a link may attach to, or why it may not.
 ///
-/// A dead-letter address resolves to the shadow queue for a receiver and is
-/// refused for a sender: the only way in is dead-lettering.
+/// Queue and topic paths share the same wire shape; the domain decides which
+/// one a plain path names. Subscription paths are unambiguous and are
+/// canonicalized here so the SDK's `Subscriptions` spelling reaches the same
+/// durable entity key as administration. Dead-letter addresses resolve to a
+/// shadow only for receivers: the only way in is dead-lettering.
 fn resolve_entity(address: &str, role: Role) -> Result<EntityPath, ProtocolError> {
     match parse_attachment(address)? {
         Attachment::Queue(entity) => Ok(entity),
@@ -751,9 +754,34 @@ fn resolve_entity(address: &str, role: Role) -> Result<EntityPath, ProtocolError
             address: address.to_owned(),
             detail: format!("the dead-letter queue of {entity} cannot be sent to"),
         }),
+        Attachment::Subscription {
+            topic,
+            subscription,
+        } if role == Role::Receiver => {
+            topic
+                .subscription(&subscription)
+                .map_err(|error| ProtocolError::InvalidAddress {
+                    address: address.to_owned(),
+                    detail: error.to_string(),
+                })
+        }
         Attachment::Subscription { topic, .. } => Err(ProtocolError::InvalidAddress {
             address: address.to_owned(),
-            detail: format!("subscriptions of topic {topic} are not implemented"),
+            detail: format!("subscriptions of topic {topic} cannot be sent to"),
+        }),
+        Attachment::SubscriptionDeadLetter {
+            topic,
+            subscription,
+        } if role == Role::Receiver => topic
+            .subscription(&subscription)
+            .and_then(|entity| entity.dead_letter_queue())
+            .map_err(|error| ProtocolError::InvalidAddress {
+                address: address.to_owned(),
+                detail: error.to_string(),
+            }),
+        Attachment::SubscriptionDeadLetter { topic, .. } => Err(ProtocolError::InvalidAddress {
+            address: address.to_owned(),
+            detail: format!("the dead-letter queue of a subscription of {topic} cannot be sent to"),
         }),
     }
 }
@@ -897,9 +925,13 @@ impl SendOutcome {
                 Self::Single,
                 CommandOutcome::Sent { .. } | CommandOutcome::DuplicateSuppressed { .. },
             ) => true,
+            (Self::Single, CommandOutcome::Published { sequences, .. }) => sequences.len() == 1,
             (Self::Batch(expected), CommandOutcome::BatchSent { sequences, stored }) => {
                 sequences.len() == expected
                     && u32::try_from(expected).is_ok_and(|expected| *stored <= expected)
+            }
+            (Self::Batch(expected), CommandOutcome::Published { sequences, .. }) => {
+                sequences.len() == expected
             }
             _ => false,
         }
@@ -956,7 +988,43 @@ mod tests {
             "orders/$deadletterqueue"
         );
         assert!(resolve_entity("orders/$deadletterqueue", Role::Sender).is_err());
-        assert!(resolve_entity("billing/Subscriptions/accounting", Role::Receiver).is_err());
+        assert_eq!(
+            resolve_entity("billing/Subscriptions/accounting", Role::Receiver)
+                .expect("a subscription accepts receivers")
+                .as_str(),
+            "billing/subscriptions/accounting"
+        );
+        assert_eq!(
+            resolve_entity(
+                "billing/Subscriptions/accounting/$DeadLetterQueue",
+                Role::Receiver,
+            )
+            .expect("a subscription dead-letter queue accepts receivers")
+            .as_str(),
+            "billing/subscriptions/accounting/$deadletterqueue"
+        );
+        assert!(resolve_entity("billing/Subscriptions/accounting", Role::Sender).is_err());
+        assert!(
+            resolve_entity(
+                "billing/Subscriptions/accounting/$DeadLetterQueue",
+                Role::Sender,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn maximum_topic_and_subscription_components_resolve_with_their_dlq() {
+        let topic = "t".repeat(domain::MAX_ENTITY_PATH_BYTES);
+        let subscription = "s".repeat(domain::MAX_SUBSCRIPTION_NAME_CHARACTERS);
+        let address = format!("{topic}/Subscriptions/{subscription}/$DeadLetterQueue");
+        let resolved = resolve_entity(&address, Role::Receiver)
+            .expect("separately valid maximum components form a valid composite address");
+        assert_eq!(
+            resolved.as_str(),
+            format!("{topic}/subscriptions/{subscription}/$deadletterqueue")
+        );
+        assert!(resolved.as_str().len() > domain::MAX_ENTITY_PATH_BYTES);
     }
 
     #[test]
@@ -974,6 +1042,20 @@ mod tests {
                 .expect("the queue management entity resolves")
                 .as_str(),
             "orders"
+        );
+        assert_eq!(
+            management_entity("billing/Subscriptions/accounting/$management")
+                .expect("management suffix")
+                .expect("the subscription management entity resolves")
+                .as_str(),
+            "billing/subscriptions/accounting"
+        );
+        assert_eq!(
+            management_entity("billing/Subscriptions/accounting/$DeadLetterQueue/$management")
+                .expect("management suffix")
+                .expect("the subscription DLQ management entity resolves")
+                .as_str(),
+            "billing/subscriptions/accounting/$deadletterqueue"
         );
     }
 
@@ -1026,6 +1108,24 @@ mod tests {
         }));
         assert!(!SendOutcome::Batch(1).matches(&CommandOutcome::Sent {
             sequence: domain::SequenceNumber::new(1)
+        }));
+        assert!(SendOutcome::Single.matches(&CommandOutcome::Published {
+            sequences: vec![domain::SequenceNumber::new(1)],
+            subscriptions: vec![],
+        }));
+        assert!(!SendOutcome::Single.matches(&CommandOutcome::Published {
+            sequences: vec![
+                domain::SequenceNumber::new(1),
+                domain::SequenceNumber::new(2),
+            ],
+            subscriptions: vec![],
+        }));
+        assert!(SendOutcome::Batch(2).matches(&CommandOutcome::Published {
+            sequences: vec![
+                domain::SequenceNumber::new(1),
+                domain::SequenceNumber::new(2),
+            ],
+            subscriptions: vec![],
         }));
     }
 }

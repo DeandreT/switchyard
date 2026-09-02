@@ -246,6 +246,79 @@ fn a_batch_preserves_ttl_sessions_and_envelopes<P: StoreProvider>(
     Ok(())
 }
 
+fn a_queue_default_ttl_caps_singular_and_batch_messages<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = QueueFixture::new(
+        provider,
+        "tenant",
+        "orders",
+        QueueConfig {
+            default_time_to_live_millis: Some(50),
+            ..QueueConfig::default()
+        },
+    )?;
+
+    let CommandOutcome::Sent { sequence } = fixture.at(
+        10,
+        CommandKind::Send {
+            message_id: String::from("singular"),
+            body: Vec::new(),
+            time_to_live_millis: Some(500),
+            session_id: None,
+            scheduled_enqueue_at: None,
+            envelope: None,
+        },
+    )?
+    else {
+        panic!("expected a send outcome");
+    };
+    assert_eq!(
+        fixture
+            .machine
+            .message(&fixture.namespace, &fixture.entity, sequence)?
+            .expect("the singular message was stored")
+            .expires_at,
+        Some(Timestamp::from_millis(60)),
+        "the queue default is a ceiling for an explicit singular TTL"
+    );
+
+    let sequences = send_batch(
+        &fixture,
+        20,
+        vec![
+            MessageInput {
+                time_to_live_millis: Some(500),
+                ..input("capped", b"")
+            },
+            MessageInput {
+                time_to_live_millis: Some(25),
+                ..input("shorter", b"")
+            },
+            input("defaulted", b""),
+        ],
+    )?;
+    let expirations = sequences
+        .into_iter()
+        .map(|sequence| {
+            Ok(fixture
+                .machine
+                .message(&fixture.namespace, &fixture.entity, sequence)?
+                .expect("the batch message was stored")
+                .expires_at)
+        })
+        .collect::<Result<Vec<_>, BrokerError>>()?;
+    assert_eq!(
+        expirations,
+        vec![
+            Some(Timestamp::from_millis(70)),
+            Some(Timestamp::from_millis(45)),
+            Some(Timestamp::from_millis(70)),
+        ]
+    );
+    Ok(())
+}
+
 fn a_batch_survives_a_restart_with_its_counter<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
@@ -380,6 +453,7 @@ for_each_backend! {
     a_batch_commits_messages_with_consecutive_sequences,
     one_invalid_child_rejects_the_whole_batch,
     a_batch_preserves_ttl_sessions_and_envelopes,
+    a_queue_default_ttl_caps_singular_and_batch_messages,
     a_batch_survives_a_restart_with_its_counter,
     an_empty_batch_is_rejected,
     a_session_batch_cannot_mix_sessions,

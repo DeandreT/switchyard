@@ -1,6 +1,6 @@
 # Switchyard
 
-Switchyard is an message broker written in Rust. Its compatibility
+Switchyard is a message broker written in Rust. Its compatibility
 target is the Azure Service Bus Standard messaging model and its official
 client SDKs, without requiring an Azure subscription.
 
@@ -11,7 +11,8 @@ development, conformance tests, and applications such as the Sift demo.
 
 > [!IMPORTANT]
 > Switchyard is pre-alpha. A single node accepts AMQP connections over
-> development plaintext or authenticated TLS and persists queue state, but
+> development plaintext or authenticated TLS and persists queue plus immediate
+> default-rule topic/subscription state, but
 > replication, administration, and the official client gates are incomplete.
 > Do not use it for production workloads.
 

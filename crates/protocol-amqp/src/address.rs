@@ -5,7 +5,7 @@
 //! broker names both explicitly, so the edge resolves one into the other before
 //! any command is proposed.
 
-use domain::{EntityPath, NamespaceName, SessionId};
+use domain::{EntityPath, NamespaceName, SessionId, SubscriptionName};
 
 use crate::ProtocolError;
 
@@ -19,12 +19,16 @@ pub const SUBSCRIPTION_SEGMENT: &str = "/subscriptions/";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Attachment {
     Queue(EntityPath),
-    /// Recognised so that attaching to one is refused as unimplemented rather
-    /// than silently creating a queue whose name ends in the suffix.
+    /// The shadow of a queue, before the link role decides whether it may be
+    /// received from or must be refused as a send target.
     DeadLetter(EntityPath),
     Subscription {
         topic: EntityPath,
-        subscription: String,
+        subscription: SubscriptionName,
+    },
+    SubscriptionDeadLetter {
+        topic: EntityPath,
+        subscription: SubscriptionName,
     },
 }
 
@@ -62,26 +66,37 @@ pub fn parse_attachment(address: &str) -> Result<Attachment, ProtocolError> {
 
     // Matched against the folded copy, but sliced out of the original, so the
     // entity keeps the case the client wrote.
-    if let Some(folded) = lowercase.strip_suffix(DEAD_LETTER_SUFFIX) {
-        return Ok(Attachment::DeadLetter(entity(
-            address,
-            &trimmed[..folded.len()],
-        )?));
-    }
-    if let Some(position) = lowercase.find(SUBSCRIPTION_SEGMENT) {
-        let subscription = &trimmed[position + SUBSCRIPTION_SEGMENT.len()..];
-        if subscription.is_empty() {
-            return Err(ProtocolError::InvalidAddress {
-                address: address.to_owned(),
-                detail: String::from("address names a topic but no subscription"),
-            });
-        }
-        return Ok(Attachment::Subscription {
-            topic: entity(address, &trimmed[..position])?,
-            subscription: subscription.to_owned(),
+    let (path, folded, dead_letter) = match lowercase.strip_suffix(DEAD_LETTER_SUFFIX) {
+        Some(folded) => (&trimmed[..folded.len()], folded, true),
+        None => (trimmed, lowercase.as_str(), false),
+    };
+    if let Some(position) = folded.find(SUBSCRIPTION_SEGMENT) {
+        let topic = entity(address, &path[..position])?;
+        let subscription = subscription(address, &path[position + SUBSCRIPTION_SEGMENT.len()..])?;
+        return Ok(if dead_letter {
+            Attachment::SubscriptionDeadLetter {
+                topic,
+                subscription,
+            }
+        } else {
+            Attachment::Subscription {
+                topic,
+                subscription,
+            }
         });
     }
-    Ok(Attachment::Queue(entity(address, trimmed)?))
+    let entity = entity(address, path)?;
+    if dead_letter && entity.is_dead_letter_queue() {
+        return Err(ProtocolError::InvalidAddress {
+            address: address.to_owned(),
+            detail: String::from("a dead-letter queue cannot have its own dead-letter queue"),
+        });
+    }
+    Ok(if dead_letter {
+        Attachment::DeadLetter(entity)
+    } else {
+        Attachment::Queue(entity)
+    })
 }
 
 /// Reads a session identifier a client asked for, rejecting one the broker
@@ -95,6 +110,13 @@ pub fn parse_session_id(value: &str) -> Result<SessionId, ProtocolError> {
 
 fn entity(address: &str, path: &str) -> Result<EntityPath, ProtocolError> {
     EntityPath::new(path).map_err(|source| ProtocolError::InvalidAddress {
+        address: address.to_owned(),
+        detail: source.to_string(),
+    })
+}
+
+fn subscription(address: &str, name: &str) -> Result<SubscriptionName, ProtocolError> {
+    SubscriptionName::new(name).map_err(|source| ProtocolError::InvalidAddress {
         address: address.to_owned(),
         detail: source.to_string(),
     })
@@ -161,7 +183,18 @@ mod tests {
             queue("billing/Subscriptions/accounting"),
             Attachment::Subscription {
                 topic: EntityPath::new("billing").expect("valid"),
-                subscription: String::from("accounting"),
+                subscription: SubscriptionName::new("accounting").expect("valid"),
+            }
+        );
+    }
+
+    #[test]
+    fn a_subscription_dead_letter_address_keeps_both_owners() {
+        assert_eq!(
+            queue("billing/Subscriptions/accounting/$DeadLetterQueue"),
+            Attachment::SubscriptionDeadLetter {
+                topic: EntityPath::new("billing").expect("valid"),
+                subscription: SubscriptionName::new("accounting").expect("valid"),
             }
         );
     }
@@ -179,7 +212,13 @@ mod tests {
 
     #[test]
     fn an_address_that_names_nothing_is_refused() {
-        for address in ["", "/", "billing/subscriptions/"] {
+        for address in [
+            "",
+            "/",
+            "billing/subscriptions/",
+            "billing/subscriptions/a/b",
+            "orders/$deadletterqueue/$deadletterqueue",
+        ] {
             assert!(
                 parse_attachment(address).is_err(),
                 "{address:?} should not resolve"

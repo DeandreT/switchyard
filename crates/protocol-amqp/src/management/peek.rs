@@ -80,7 +80,7 @@ pub(super) async fn peek<B: Broker>(
     if deliveries.is_empty() {
         return ManagementResponse::no_content(message_id, tracking_id);
     }
-    let entries = match encode_deliveries(entity, &deliveries) {
+    let entries = match encode_deliveries(&deliveries) {
         Ok(entries) => entries,
         Err(error) => {
             return ManagementResponse::internal(
@@ -129,15 +129,13 @@ async fn optional_session(
         .map_err(|error| session_lookup_response(message_id, tracking_id, error))
 }
 
-fn encode_deliveries(
-    entity: &EntityPath,
-    deliveries: &[Delivery],
-) -> Result<Vec<Value>, crate::ProtocolError> {
-    let dead_letter_source = entity.as_str().strip_suffix(crate::DEAD_LETTER_SUFFIX);
+fn encode_deliveries(deliveries: &[Delivery]) -> Result<Vec<Value>, crate::ProtocolError> {
     deliveries
         .iter()
         .map(|delivery| {
-            let message = crate::message::write_peeked_delivery_from(delivery, dead_letter_source)?;
+            // Direct DLQ browsing has no DeadLetterSource. Azure reserves it
+            // for messages auto-forwarded out of a DLQ.
+            let message = crate::message::write_peeked_delivery_from(delivery, None)?;
             let encoded = encode_message(&message).map_err(|error| {
                 crate::ProtocolError::InvalidEnvelope {
                     detail: error.to_string(),
@@ -540,7 +538,8 @@ mod tests {
             message.message_annotations.as_ref().and_then(
                 |annotations| annotations.get(&AnnotationKey::from("x-opt-deadletter-source"))
             ),
-            Some(&Value::String(String::from("orders")))
+            None,
+            "direct DLQ browsing must not claim an auto-forward source"
         );
         let properties = message
             .application_properties

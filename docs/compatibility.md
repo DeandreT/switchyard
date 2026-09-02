@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Single and atomic batch send; duplicate detection across immediate, batch, and scheduled sends; scheduled send/batch activation and cancellation; prefetched multi-message receive; independent settlement; receive-delete; envelope fidelity; renew; abandon/redelivery; defer and deferred receive; ordered peek pagination across active, locked, scheduled, deferred, session, and DLQ messages; dead-letter and DLQ receive/complete; session renew/state; AMQP over TCP and WebSockets | Planned | Experimental gates on 7.20.2 |
+| Official .NET SDK, current stable | Queue single and atomic batch send; duplicate detection across immediate, batch, and scheduled sends; scheduled send/batch activation and cancellation; prefetched multi-message receive; independent settlement; receive-delete; envelope fidelity; renew; abandon/redelivery; defer and deferred receive; ordered peek pagination across active, locked, scheduled, deferred, session, and DLQ messages; dead-letter and DLQ receive/complete; session renew/state; immediate default-rule topic fanout and independent subscription settlement; AMQP over TCP and WebSockets | Planned | Experimental gates on 7.20.2 |
 | Official .NET SDK, previous stable | Planned | Planned | Not implemented |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -33,7 +33,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine |
-| Topics and subscriptions | Pre-1.0 | Not implemented |
+| Topics and subscriptions | Pre-1.0 | Immediate non-session singular/batch fanout through the implicit `$Default` true rule; durable subscription queue lifecycle; AMQP mapping; Rust and current .NET clients end to end. Custom rules, sessions, scheduling, and topic duplicate detection: not implemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
 | Scheduling and cancellation | Pre-1.0 | State machine, timer activation, AMQP management and annotated-send mapping, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -77,6 +77,16 @@ behavior it currently enforces:
   Missing raw-AMQP identifiers bypass detection; the official SDK supplies an
   identifier. This is send-side suppression and does not remove the normal
   possibility of receive redelivery under peek-lock.
+- An immediate topic send validates every child before allocating a
+  topic-owned sequence number, then materializes the same durable envelope in
+  every subscription present at that command's position in the log. Singular
+  and batch fanout, every subscription copy, and the topic counter commit
+  atomically. A topic with no subscriptions accepts and drops the publication;
+  subscriptions created later receive only later publications. Each copy then
+  follows the ordinary queue lifecycle independently, including settlement,
+  expiry, deferral, browsing, and its subscription DLQ. This first vertical
+  implements only the implicit `$Default` true rule and non-session immediate
+  publications; session IDs and scheduled topic sends are explicitly refused.
 - Receive-delete is at-most-once: the deletion commits before the transfer.
 - Peek is an inclusive, sequence-ordered, read-only snapshot over active,
   locked, scheduled, and deferred records. It never increments delivery count
@@ -105,11 +115,13 @@ behavior it currently enforces:
   receive-delete removes it before replying. Defer, abandon, and dead-letter
   property updates are merged into the durable message envelope on both
   delivery-link and management dispositions.
-- Messages past their time to live are dead-lettered as `TTLExpiredException`,
-  both by the timer sweep and by any receive that reaches one first. A live
-  message lock remains settleable until its lock deadline; TTL takes effect if
-  that lock is abandoned or expires. Deferred TTL is checked on explicit
-  retrieval.
+- Messages past their time to live are currently dead-lettered as
+  `TTLExpiredException`, both by the timer sweep and by any receive that reaches
+  one first. A live message lock remains settleable until its lock deadline;
+  TTL takes effect if that lock is abandoned or expires. Deferred TTL is
+  checked on explicit retrieval. Azure makes expiration dead-lettering
+  configurable and defaults it off; Switchyard does not yet expose that policy
+  and therefore always takes the dead-letter branch.
 - The dead-letter queue is a queue: `entity/$deadletterqueue` is drained with
   the same receive and settlement machinery as its parent. Messages arrive
   there stripped of lifetime and session, keep their sequence numbers and the
@@ -138,11 +150,17 @@ a rejection or a bound rather than a silent difference:
   reports none available if they are all held, rather than walking the entity.
   The receiver retries.
 
+Entity and subscription identities are currently case-sensitive in storage.
+Azure administration treats them case-insensitively, so clients must use the
+same casing that provisioned the entity until canonical identity handling is
+implemented across every entity kind.
+
 Expiry is not merely expressible: the `server` crate's timer worker proposes the
 lock, time-to-live, session-lock, and duplicate-history sweeps on an interval,
 so a running node actually releases what has elapsed.
 
-An AMQP 1.0 client can reach a queue. The node accepts AMQP over TLS with the
+An AMQP 1.0 client can send to a queue or topic and receive from a queue,
+subscription, or their dead-letter queues. The node accepts AMQP over TLS with the
 socket secured before the protocol handshake, as Service Bus port 5671
 requires. It also accepts the `AMQPWSB10` (and standardized `amqp`) binary
 WebSocket tunnel at `/$servicebus/websocket` over WSS, including the current
@@ -184,8 +202,10 @@ identifier types, properties, annotations, application properties, and footer.
 On delivery, reserved sequence, enqueue, expiry, lock, delivery-count, and
 dead-letter fields are replaced with broker-authoritative values while custom
 content remains intact across redelivery and dead-lettering. A message drained
-from a dead-letter queue carries its source, reason, and description. The
-complete protocol coverage uses a Rust AMQP 1.0 client. The current stable
+directly from a dead-letter queue carries its reason and description but no
+`DeadLetterSource`; Azure sets that field only after auto-forwarding it out of
+the DLQ. The complete protocol coverage uses a Rust AMQP 1.0 client. The
+current stable
 official .NET SDK also has opt-in gates for envelope fidelity, ordinary send,
 atomic enumerable and explicit SDK batches, prefetched multi-message receive,
 out-of-order completion, receive-delete, message-lock renewal, abandon and
@@ -194,7 +214,8 @@ ordered peek pagination across active, locked, scheduled, deferred, session, and
 dead-letter messages, management and annotated-transfer scheduling,
 cancellation and timer activation, custom dead-lettering, dead-letter receive
 and completion, duplicate detection across immediate, batch, and scheduled
-sends, session state and renewal, and AMQP-over-TCP and WebSockets;
+sends, immediate topic fanout and independent subscription settlement, session
+state and renewal, and AMQP-over-TCP and WebSockets;
 the rest of that client gate remains incomplete.
 Dead-letter resubmission is not implemented.
 
@@ -204,7 +225,8 @@ backends, so a single node keeps its messages, locks, delivery counts, and
 sequence numbers across a restart. Preserving them across the loss of a node
 still needs replication.
 
-Switchyard intentionally does not reproduce Azure subscription, namespace
-capacity, or operations-per-second commercial quotas. It defaults to compatible
-wire validation, including the Standard 256 KiB message-size limit, while
-allowing operators to configure larger namespace storage quotas.
+Switchyard enforces the Standard limit of 2,000 subscriptions per topic, the
+separate documented name bounds for topics and subscriptions, and the Standard
+256 KiB wire-message limit. It does not yet reproduce Azure namespace capacity
+or operations-per-second commercial quotas, and operators may configure larger
+namespace storage quotas.

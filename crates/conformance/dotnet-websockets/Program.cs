@@ -1,10 +1,10 @@
 using Azure;
 using Azure.Messaging.ServiceBus;
 
-if (args.Length != 9)
+if (args.Length != 12)
 {
     Console.Error.WriteLine(
-        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <schedule-queue> <dedupe-queue> <session-queue> <key-name> <key>");
+        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <schedule-queue> <dedupe-queue> <session-queue> <topic> <subscription-a> <subscription-b> <key-name> <key>");
     return 2;
 }
 
@@ -15,8 +15,11 @@ string batchQueue = args[3];
 string scheduleQueue = args[4];
 string dedupeQueue = args[5];
 string sessionQueue = args[6];
-string keyName = args[7];
-string key = args[8];
+string topic = args[7];
+string firstSubscription = args[8];
+string secondSubscription = args[9];
+string keyName = args[10];
+string key = args[11];
 
 var options = new ServiceBusClientOptions
 {
@@ -213,8 +216,14 @@ if (sessionMessage?.Body.ToString() != "official-websocket-session")
 }
 await sessionReceiver.CompleteMessageAsync(sessionMessage);
 
+if (!await TopicConformance.RunAsync(client, topic, firstSubscription, secondSubscription))
+{
+    Console.Error.WriteLine("WebSocket topic fan-out did not preserve both copies");
+    return 17;
+}
+
 Console.WriteLine(
     "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, " +
     "send/receive/complete, defer/peek/deferred-receive, schedule/cancel, " +
-    "duplicate detection, and session attach passed");
+    "duplicate detection, topic fan-out, and session attach passed");
 return 0;

@@ -144,8 +144,8 @@ pub fn write_delivery(delivery: &Delivery) -> Result<Message, ProtocolError> {
     write_delivery_from(delivery, None)
 }
 
-/// Builds a delivery while identifying the entity that originally
-/// dead-lettered it, when it is being drained from a dead-letter queue.
+/// Builds a delivery with the original dead-letter entity when a future
+/// auto-forwarding path moves it out of a DLQ. Direct DLQ drains pass `None`.
 pub(crate) fn write_delivery_from(
     delivery: &Delivery,
     dead_letter_source: Option<&str>,

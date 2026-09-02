@@ -960,7 +960,8 @@ async fn a_service_bus_rejection_preserves_custom_dead_letter_metadata()
             .and_then(|annotations| {
                 annotations.get(&AnnotationKey::from("x-opt-deadletter-source"))
             }),
-        Some(&Value::String(String::from("orders")))
+        None,
+        "a direct DLQ drain must not claim an auto-forward source"
     );
     let properties = poisoned
         .message()

@@ -85,6 +85,9 @@ impl<S: StateStore> StateMachine<S> {
         if command.entity.is_dead_letter_queue() {
             return Err(BrokerError::DeadLetterQueueIsReserved);
         }
+        if command.entity.is_subscription() {
+            return Err(BrokerError::SubscriptionSendNotAllowed);
+        }
         let config = self.load_config(command)?;
         for input in inputs {
             validate_input(&config, input)?;
@@ -105,7 +108,11 @@ impl<S: StateStore> StateMachine<S> {
             counters.next_sequence = counters.next_sequence.saturating_add(1);
             sequences.push(sequence);
             if store_message {
-                let record = message_record(command, &config, *input, sequence);
+                let lifetime_millis = effective_time_to_live(
+                    input.time_to_live_millis,
+                    config.default_time_to_live_millis,
+                );
+                let record = message_record(command, *input, sequence, lifetime_millis);
                 let encoded = codec::encode(&record)?;
                 prepared.push(PreparedMessage { record, encoded });
             }
@@ -177,17 +184,14 @@ fn validate_batch_session(
     Ok(())
 }
 
-fn message_record(
+pub(super) fn message_record(
     command: &Command,
-    config: &QueueConfig,
     input: SendInput<'_>,
     sequence: SequenceNumber,
+    lifetime_millis: Option<u64>,
 ) -> MessageRecord {
     let lifetime_starts_at = input.scheduled_enqueue_at.unwrap_or(command.issued_at);
-    let expires_at = input
-        .time_to_live_millis
-        .or(config.default_time_to_live_millis)
-        .map(|millis| lifetime_starts_at.saturating_add_millis(millis));
+    let expires_at = lifetime_millis.map(|millis| lifetime_starts_at.saturating_add_millis(millis));
     MessageRecord {
         sequence,
         message_id: input.message_id.to_owned(),
@@ -204,5 +208,19 @@ fn message_record(
         session_id: input.session_id.cloned(),
         dead_letter: None,
         envelope: input.envelope.cloned(),
+    }
+}
+
+/// Applies an entity default as both the fallback and ceiling for a message's
+/// explicit lifetime. `None` is an unbounded value.
+pub(super) fn effective_time_to_live(
+    requested: Option<u64>,
+    entity_default: Option<u64>,
+) -> Option<u64> {
+    match (requested, entity_default) {
+        (Some(requested), Some(entity_default)) => Some(requested.min(entity_default)),
+        (Some(requested), None) => Some(requested),
+        (None, Some(entity_default)) => Some(entity_default),
+        (None, None) => None,
     }
 }

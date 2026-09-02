@@ -3,7 +3,10 @@
 use std::{error::Error, path::PathBuf, process::Command, sync::Arc, time::Duration};
 
 use auth::{PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule};
-use domain::{CommandKind, CommandOutcome, QueueConfig, ReceiveMode, StateMachine};
+use domain::{
+    CommandKind, CommandOutcome, QueueConfig, ReceiveMode, StateMachine, SubscriptionConfig,
+    SubscriptionName, TopicConfig,
+};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use server::{Broker, LocalProposer, Shutdown, SystemClock, TimerWorker};
 use storage::MemoryStore;
@@ -51,6 +54,24 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             namespace.clone(),
             domain::EntityPath::new(path)?,
             CommandKind::CreateQueue { config },
+        )?;
+    }
+    let topic = domain::EntityPath::new("events")?;
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        topic.clone(),
+        CommandKind::CreateTopic {
+            config: TopicConfig::default(),
+        },
+    )?;
+    for name in ["accounting", "analytics"] {
+        broker.handle().submit_blocking(
+            namespace.clone(),
+            topic.clone(),
+            CommandKind::CreateSubscription {
+                name: SubscriptionName::new(name)?,
+                config: SubscriptionConfig::default(),
+            },
         )?;
     }
 
@@ -117,6 +138,9 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             .arg("scheduled-orders")
             .arg("dedupe-orders")
             .arg("sessions")
+            .arg("events")
+            .arg("accounting")
+            .arg("analytics")
             .arg(RULE)
             .arg(KEY)
             .output()
@@ -140,7 +164,7 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             "send/receive/renew/complete, abandon/redelivery/property-update, ",
             "dead-letter/DLQ receive/complete, ",
             "defer/deferred-receive/management-disposition, ",
-            "peek/browse pagination, schedule/cancel/timer activation, duplicate detection, ",
+            "peek/browse pagination, schedule/cancel/timer activation, duplicate detection, topic fan-out, ",
             "and session renew/state/peek passed"
         )),
         "the client exited without reporting the completed workflow"
