@@ -50,10 +50,10 @@ pub fn namespace_from_hostname(hostname: &str) -> Result<NamespaceName, Protocol
 
 /// Resolves a link's source or target address to the entity it attaches to.
 ///
-/// Matching is case-insensitive on the well-known suffixes, because the Service
-/// Bus SDKs do not agree on their casing, but the entity path itself is passed
-/// through as written: it is part of a storage key, and folding its case would
-/// merge two entities a client considers distinct.
+/// Service Bus entity identity is case-insensitive. Caller-controlled entity
+/// and subscription components are resolved through canonical domain
+/// identifiers, while well-known path segments are matched without regard to
+/// case, so every spelling reaches one canonical storage identity.
 pub fn parse_attachment(address: &str) -> Result<Attachment, ProtocolError> {
     let trimmed = address.trim_start_matches('/');
     if trimmed.is_empty() {
@@ -64,8 +64,8 @@ pub fn parse_attachment(address: &str) -> Result<Attachment, ProtocolError> {
     }
     let lowercase = trimmed.to_ascii_lowercase();
 
-    // Matched against the folded copy, but sliced out of the original, so the
-    // entity keeps the case the client wrote.
+    // Match against the folded copy but retain the original slices until each
+    // caller-controlled component is validated and canonicalized below.
     let (path, folded, dead_letter) = match lowercase.strip_suffix(DEAD_LETTER_SUFFIX) {
         Some(folded) => (&trimmed[..folded.len()], folded, true),
         None => (trimmed, lowercase.as_str(), false),
@@ -139,6 +139,12 @@ mod tests {
             "tenant"
         );
         assert_eq!(
+            namespace_from_hostname("Tenant.Switchyard.Example")
+                .expect("hostname identity is case-insensitive")
+                .as_str(),
+            "tenant"
+        );
+        assert_eq!(
             namespace_from_hostname("tenant")
                 .expect("a bare hostname is a namespace")
                 .as_str(),
@@ -180,7 +186,7 @@ mod tests {
     #[test]
     fn a_subscription_address_carries_its_topic() {
         assert_eq!(
-            queue("billing/Subscriptions/accounting"),
+            queue("BiLlInG/Subscriptions/AcCoUnTiNg"),
             Attachment::Subscription {
                 topic: EntityPath::new("billing").expect("valid"),
                 subscription: SubscriptionName::new("accounting").expect("valid"),
@@ -191,7 +197,7 @@ mod tests {
     #[test]
     fn a_subscription_dead_letter_address_keeps_both_owners() {
         assert_eq!(
-            queue("billing/Subscriptions/accounting/$DeadLetterQueue"),
+            queue("BiLlInG/Subscriptions/AcCoUnTiNg/$DeadLetterQueue"),
             Attachment::SubscriptionDeadLetter {
                 topic: EntityPath::new("billing").expect("valid"),
                 subscription: SubscriptionName::new("accounting").expect("valid"),
@@ -200,14 +206,16 @@ mod tests {
     }
 
     #[test]
-    fn an_entity_path_keeps_the_case_it_was_written_with() {
-        // The path is part of a storage key: folding case would merge entities
-        // the client considers distinct.
+    fn entity_paths_resolve_to_one_case_insensitive_identity() {
         assert_eq!(
             queue("Orders"),
-            Attachment::Queue(EntityPath::new("Orders").expect("valid"))
+            Attachment::Queue(EntityPath::new("orders").expect("valid"))
         );
-        assert_ne!(queue("Orders"), queue("orders"));
+        assert_eq!(queue("Orders"), queue("orders"));
+        assert_eq!(
+            queue("Orders/$DeadLetterQueue"),
+            queue("orders/$deadletterqueue")
+        );
     }
 
     #[test]

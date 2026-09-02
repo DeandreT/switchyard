@@ -479,6 +479,30 @@ mod tests {
     }
 
     #[test]
+    fn identity_case_variants_produce_the_same_storage_keys() {
+        let lowercase_namespace = NamespaceName::new("tenant").expect("valid namespace");
+        let mixed_namespace = NamespaceName::new("TeNaNt").expect("valid namespace");
+        let lowercase_entity = EntityPath::new("orders").expect("valid entity");
+        let mixed_entity = EntityPath::new("OrDeRs").expect("valid entity");
+        assert_eq!(
+            queue_config(&lowercase_namespace, &lowercase_entity),
+            queue_config(&mixed_namespace, &mixed_entity)
+        );
+
+        let lowercase_subscription =
+            SubscriptionName::new("accounting").expect("valid subscription");
+        let mixed_subscription = SubscriptionName::new("Accounting").expect("valid subscription");
+        assert_eq!(
+            topic_subscription(
+                &lowercase_namespace,
+                &lowercase_entity,
+                &lowercase_subscription,
+            ),
+            topic_subscription(&mixed_namespace, &mixed_entity, &mixed_subscription)
+        );
+    }
+
+    #[test]
     fn topic_subscription_keys_are_scoped_and_name_ordered() {
         let alpha = SubscriptionName::new("alpha").expect("valid subscription");
         let zeta = SubscriptionName::new("zeta").expect("valid subscription");

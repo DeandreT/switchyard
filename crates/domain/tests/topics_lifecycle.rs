@@ -674,6 +674,75 @@ fn maximum_topic_and_subscription_names_remain_addressable<P: StoreProvider>(
     Ok(())
 }
 
+fn mixed_case_topic_and_subscription_addresses_share_one_identity<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = TopicFixture::new(provider, TopicConfig::default())?;
+    let mixed_case_topic = EntityPath::new("EvEnTs")?;
+    assert_eq!(mixed_case_topic, fixture.topic);
+    assert_eq!(
+        fixture.at_entity(
+            &mixed_case_topic,
+            1,
+            CommandKind::CreateTopic {
+                config: TopicConfig::default(),
+            },
+        ),
+        Err(BrokerError::TopicAlreadyExists),
+        "case variants cannot create a second topic identity"
+    );
+
+    let subscription = fixture.subscribe(2, "Accounting", SubscriptionConfig::default())?;
+    assert_eq!(subscription.as_str(), "events/subscriptions/accounting");
+    assert_eq!(
+        fixture.at_entity(
+            &EntityPath::new("EVENTS")?,
+            3,
+            CommandKind::CreateSubscription {
+                name: SubscriptionName::new("ACCOUNTING")?,
+                config: SubscriptionConfig::default(),
+            },
+        ),
+        Err(BrokerError::SubscriptionAlreadyExists),
+        "case variants cannot create a second subscription identity"
+    );
+
+    let outcome = fixture.at_entity(
+        &EntityPath::new("EVENTS")?,
+        4,
+        CommandKind::Send {
+            message_id: String::from("canonical"),
+            body: b"payload".to_vec(),
+            time_to_live_millis: None,
+            session_id: None,
+            scheduled_enqueue_at: None,
+            envelope: None,
+        },
+    )?;
+    assert_eq!(
+        outcome,
+        CommandOutcome::Published {
+            sequences: vec![SequenceNumber::new(1)],
+            subscriptions: vec![subscription.clone()],
+        }
+    );
+
+    let fixture = fixture.restart()?;
+    assert_eq!(
+        fixture
+            .machine
+            .subscriptions(&fixture.namespace, &EntityPath::new("EVENTS")?, 10)?,
+        vec![subscription]
+    );
+    let mixed_case_subscription = EntityPath::new("EVENTS/SUBSCRIPTIONS/ACCOUNTING")?;
+    let delivery = fixture
+        .receive(&mixed_case_subscription, 5, ReceiveMode::ReceiveAndDelete)?
+        .expect("the canonical subscription copy is addressable through any case");
+    assert_eq!(delivery.sequence, SequenceNumber::new(1));
+    assert_eq!(delivery.body, b"payload".to_vec());
+    Ok(())
+}
+
 #[test]
 fn a_topic_enforces_the_standard_subscription_limit() -> Result<(), Box<dyn Error>> {
     let fixture = TopicFixture::new(testkit::MemoryProvider::new(), TopicConfig::default())?;
@@ -741,4 +810,5 @@ for_each_backend! {
     entity_conflicts_reserved_paths_and_deferred_shapes_are_rejected,
     queue_and_missing_topic_conflicts_are_rejected,
     maximum_topic_and_subscription_names_remain_addressable,
+    mixed_case_topic_and_subscription_addresses_share_one_identity,
 }

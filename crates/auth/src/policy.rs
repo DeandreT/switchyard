@@ -49,8 +49,9 @@ impl BitOrAssign for PermissionSet {
 
 /// A namespace or entity audience, split on resource boundaries.
 ///
-/// The path is stored as decoded segments so authorization is a hierarchy
-/// comparison, never a string prefix comparison.
+/// The path is stored as decoded, ASCII-case-folded segments so authorization
+/// is a case-insensitive hierarchy comparison, never a string prefix
+/// comparison.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ResourceScope {
     host: String,
@@ -143,7 +144,7 @@ fn decode_path_segment(segment: &str) -> Result<String, ResourceScopeError> {
     {
         return Err(ResourceScopeError::InvalidPath);
     }
-    Ok(decoded)
+    Ok(decoded.to_ascii_lowercase())
 }
 
 fn validate_literal_path_segment(segment: &str) -> Result<String, ResourceScopeError> {
@@ -154,7 +155,7 @@ fn validate_literal_path_segment(segment: &str) -> Result<String, ResourceScopeE
     {
         return Err(ResourceScopeError::InvalidPath);
     }
-    Ok(segment.to_owned())
+    Ok(segment.to_ascii_lowercase())
 }
 
 pub(crate) fn validate_percent_encoding(value: &str) -> Result<(), ResourceScopeError> {
@@ -309,15 +310,35 @@ mod tests {
 
     #[test]
     fn scope_comparison_uses_path_segments() {
-        let orders = ResourceScope::parse("amqps://tenant.servicebus.windows.net/orders").unwrap();
+        let orders = ResourceScope::parse("amqps://tenant.servicebus.windows.net/Orders").unwrap();
         let dead_letters =
-            ResourceScope::parse("amqps://tenant.servicebus.windows.net/orders/$deadletterqueue")
+            ResourceScope::parse("amqps://tenant.servicebus.windows.net/ORDERS/$DeadLetterQueue")
                 .unwrap();
         let archive =
             ResourceScope::parse("amqps://tenant.servicebus.windows.net/orders-archive").unwrap();
 
         assert!(orders.contains(&dead_letters));
         assert!(!orders.contains(&archive));
+        assert_eq!(orders.path().collect::<Vec<_>>(), vec!["orders"]);
+    }
+
+    #[test]
+    fn literal_entity_scopes_fold_each_path_segment() {
+        let granted = ResourceScope::entity(
+            "TENANT.servicebus.windows.net",
+            "Billing/Subscriptions/Gold",
+        )
+        .unwrap();
+        let requested = ResourceScope::parse(
+            "amqps://tenant.servicebus.windows.net/billing/subscriptions/GOLD/$DeadLetterQueue",
+        )
+        .unwrap();
+
+        assert!(granted.contains(&requested));
+        assert_eq!(
+            granted.path().collect::<Vec<_>>(),
+            vec!["billing", "subscriptions", "gold"]
+        );
     }
 
     #[test]

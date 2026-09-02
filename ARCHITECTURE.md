@@ -277,7 +277,10 @@ messages to make room.
 Authorization supports Azure-style SAS rights (`Send`, `Listen`, `Manage`),
 OIDC issuer/audience validation with claim-to-role bindings, and mTLS
 certificate or SPIFFE mappings. Native roles are scoped to cluster, namespace,
-or entity.
+or entity. Namespace, queue, topic, and subscription identities are normalized
+with ASCII case folding at every construction and deserialization boundary;
+AMQP links and entity-scoped SAS audiences use that same canonical identity.
+Session identifiers and placement-group identifiers remain case-preserving.
 
 Bodies, user properties, session state, credentials, and sensitive identifiers
 are encrypted with per-namespace AES-256-GCM data keys. Required sequence,

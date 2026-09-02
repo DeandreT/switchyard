@@ -1,6 +1,6 @@
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 pub const MAX_NAMESPACE_NAME_BYTES: usize = 50;
@@ -22,19 +22,27 @@ const MAX_INTERNAL_ENTITY_PATH_BYTES: usize = MAX_ENTITY_PATH_BYTES
     + MAX_SUBSCRIPTION_NAME_CHARACTERS
     + DEAD_LETTER_QUEUE_SUFFIX.len();
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct NamespaceName(String);
 
 impl NamespaceName {
     pub fn new(value: impl Into<String>) -> Result<Self, IdentifierError> {
-        let value = value.into();
+        let mut value = value.into();
         validate_identifier("namespace", &value, MAX_NAMESPACE_NAME_BYTES)?;
+        value.make_ascii_lowercase();
         Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for NamespaceName {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -44,14 +52,15 @@ impl fmt::Display for NamespaceName {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct EntityPath(String);
 
 impl EntityPath {
     pub fn new(value: impl Into<String>) -> Result<Self, IdentifierError> {
-        let value = value.into();
+        let mut value = value.into();
         validate_identifier("entity path", &value, MAX_ENTITY_PATH_BYTES)?;
+        value.make_ascii_lowercase();
         Ok(Self(value))
     }
 
@@ -63,8 +72,17 @@ impl EntityPath {
     /// topic and subscription components may exceed the top-level name bound
     /// once their well-known path segments are joined.
     pub(crate) fn from_internal(value: impl Into<String>) -> Result<Self, IdentifierError> {
-        let value = value.into();
+        let mut value = value.into();
         validate_identifier("entity path", &value, MAX_INTERNAL_ENTITY_PATH_BYTES)?;
+        value.make_ascii_lowercase();
+
+        if value.len() > MAX_ENTITY_PATH_BYTES && !is_valid_oversized_internal_entity_path(&value) {
+            return Err(IdentifierError::TooLong {
+                kind: "entity path",
+                maximum: MAX_ENTITY_PATH_BYTES,
+            });
+        }
+
         Ok(Self(value))
     }
 
@@ -98,14 +116,21 @@ impl EntityPath {
     }
 
     /// The canonical storage and protocol path of a subscription below this
-    /// topic. The well-known segment is folded while the caller-controlled
-    /// topic and subscription names retain their case.
+    /// topic. Both validated components and the well-known segment are already
+    /// ASCII case-folded.
     pub fn subscription(&self, name: &SubscriptionName) -> Result<Self, IdentifierError> {
         Self::from_internal(format!(
             "{}{SUBSCRIPTION_PATH_SEGMENT}{}",
             self.0,
             name.as_str()
         ))
+    }
+}
+
+impl<'de> Deserialize<'de> for EntityPath {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::from_internal(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -120,7 +145,7 @@ impl fmt::Display for EntityPath {
 /// Ordering within a session is the only FIFO guarantee the broker makes, and a
 /// session identifier is part of the key of every message in it, so the same
 /// control-character rule applies here as to the entity scope.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SessionId(String);
 
@@ -136,6 +161,13 @@ impl SessionId {
     }
 }
 
+impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 impl fmt::Display for SessionId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
@@ -143,13 +175,13 @@ impl fmt::Display for SessionId {
 }
 
 /// One durable subscription below a topic.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SubscriptionName(String);
 
 impl SubscriptionName {
     pub fn new(value: impl Into<String>) -> Result<Self, IdentifierError> {
-        let value = value.into();
+        let mut value = value.into();
         if value.is_empty() {
             return Err(IdentifierError::Empty {
                 kind: "subscription name",
@@ -179,11 +211,19 @@ impl SubscriptionName {
                 kind: "subscription name",
             });
         }
+        value.make_ascii_lowercase();
         Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SubscriptionName {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -193,7 +233,7 @@ impl fmt::Display for SubscriptionName {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct PlacementGroupId(String);
 
@@ -206,6 +246,13 @@ impl PlacementGroupId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for PlacementGroupId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -243,6 +290,29 @@ fn validate_identifier(
     Ok(())
 }
 
+/// Paths longer than the public entity-name limit can only be assembled by
+/// the broker from separately validated caller-controlled components.
+fn is_valid_oversized_internal_entity_path(value: &str) -> bool {
+    let (path, has_dead_letter_suffix) = value
+        .strip_suffix(DEAD_LETTER_QUEUE_SUFFIX)
+        .map_or((value, false), |parent| (parent, true));
+
+    if let Some((topic, subscription)) = path.split_once(SUBSCRIPTION_PATH_SEGMENT) {
+        return is_valid_top_level_entity_path(topic)
+            && SubscriptionName::new(subscription).is_ok();
+    }
+
+    has_dead_letter_suffix && is_valid_top_level_entity_path(path)
+}
+
+fn is_valid_top_level_entity_path(value: &str) -> bool {
+    validate_identifier("entity path", value, MAX_ENTITY_PATH_BYTES).is_ok()
+        && !value.ends_with(DEAD_LETTER_QUEUE_SUFFIX)
+        && !value.contains(SUBSCRIPTION_PATH_SEGMENT)
+        && !value.ends_with(SUBSCRIPTION_COLLECTION_SUFFIX)
+        && !value.ends_with(MANAGEMENT_SUFFIX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +323,172 @@ mod tests {
             NamespaceName::new(""),
             Err(IdentifierError::Empty { kind: "namespace" })
         );
+    }
+
+    #[test]
+    fn broker_identities_are_ascii_case_folded_but_session_and_placement_ids_are_not() {
+        assert_eq!(
+            NamespaceName::new("Tenant-North")
+                .expect("valid namespace")
+                .as_str(),
+            "tenant-north"
+        );
+        assert_eq!(
+            EntityPath::new("Orders/HighPriority")
+                .expect("valid entity")
+                .as_str(),
+            "orders/highpriority"
+        );
+        assert_eq!(
+            SubscriptionName::new("Accounting_US")
+                .expect("valid subscription")
+                .as_str(),
+            "accounting_us"
+        );
+        assert_eq!(
+            SessionId::new("Cart-A").expect("valid session").as_str(),
+            "Cart-A"
+        );
+        assert_eq!(
+            PlacementGroupId::new("Placement-A")
+                .expect("valid placement group")
+                .as_str(),
+            "Placement-A"
+        );
+    }
+
+    #[test]
+    fn deserialization_reestablishes_canonical_identity() {
+        let encoded_namespace =
+            postcard::to_stdvec(&String::from("Tenant")).expect("namespace encodes");
+        let namespace: NamespaceName =
+            postcard::from_bytes(&encoded_namespace).expect("namespace decodes");
+        assert_eq!(namespace.as_str(), "tenant");
+
+        let encoded_entity = postcard::to_stdvec(&String::from(
+            "Orders/Subscriptions/Accounting/$DeadLetterQueue",
+        ))
+        .expect("entity encodes");
+        let entity: EntityPath = postcard::from_bytes(&encoded_entity).expect("entity decodes");
+        assert_eq!(
+            entity.as_str(),
+            "orders/subscriptions/accounting/$deadletterqueue"
+        );
+
+        let encoded_subscription =
+            postcard::to_stdvec(&String::from("Accounting")).expect("subscription encodes");
+        let subscription: SubscriptionName =
+            postcard::from_bytes(&encoded_subscription).expect("subscription decodes");
+        assert_eq!(subscription.as_str(), "accounting");
+    }
+
+    #[test]
+    fn deserialization_validates_case_sensitive_session_and_placement_ids() {
+        let encoded_session =
+            postcard::to_stdvec(&String::from("Cart-A")).expect("session encodes");
+        let session: SessionId = postcard::from_bytes(&encoded_session).expect("session decodes");
+        assert_eq!(session.as_str(), "Cart-A");
+
+        let encoded_placement =
+            postcard::to_stdvec(&String::from("Placement-A")).expect("placement group encodes");
+        let placement: PlacementGroupId =
+            postcard::from_bytes(&encoded_placement).expect("placement group decodes");
+        assert_eq!(placement.as_str(), "Placement-A");
+
+        for invalid in [String::new(), "cart\0forged".to_owned()] {
+            let encoded = postcard::to_stdvec(&invalid).expect("raw session encodes");
+            assert!(
+                postcard::from_bytes::<SessionId>(&encoded).is_err(),
+                "session deserialization accepted {invalid:?}"
+            );
+        }
+        let oversized_session = "s".repeat(MAX_SESSION_ID_BYTES + 1);
+        let encoded = postcard::to_stdvec(&oversized_session).expect("raw session encodes");
+        assert!(postcard::from_bytes::<SessionId>(&encoded).is_err());
+        let maximum_session = "S".repeat(MAX_SESSION_ID_BYTES);
+        let encoded = postcard::to_stdvec(&maximum_session).expect("maximum session encodes");
+        let decoded: SessionId = postcard::from_bytes(&encoded).expect("maximum session decodes");
+        assert_eq!(decoded.as_str(), maximum_session);
+
+        for invalid in [String::new(), "placement\0forged".to_owned()] {
+            let encoded = postcard::to_stdvec(&invalid).expect("raw placement group encodes");
+            assert!(
+                postcard::from_bytes::<PlacementGroupId>(&encoded).is_err(),
+                "placement-group deserialization accepted {invalid:?}"
+            );
+        }
+        let oversized_placement = "p".repeat(MAX_PLACEMENT_GROUP_ID_BYTES + 1);
+        let encoded =
+            postcard::to_stdvec(&oversized_placement).expect("raw placement group encodes");
+        assert!(postcard::from_bytes::<PlacementGroupId>(&encoded).is_err());
+        let maximum_placement = "P".repeat(MAX_PLACEMENT_GROUP_ID_BYTES);
+        let encoded =
+            postcard::to_stdvec(&maximum_placement).expect("maximum placement group encodes");
+        let decoded: PlacementGroupId =
+            postcard::from_bytes(&encoded).expect("maximum placement group decodes");
+        assert_eq!(decoded.as_str(), maximum_placement);
+    }
+
+    #[test]
+    fn oversized_deserialized_entity_paths_must_be_broker_owned_composites() {
+        let maximum_dlq_parent = format!(
+            "{}{DEAD_LETTER_QUEUE_SUFFIX}",
+            "q".repeat(MAX_ENTITY_PATH_BYTES - DEAD_LETTER_QUEUE_SUFFIX.len())
+        );
+        let maximum_management_parent = format!(
+            "{}{MANAGEMENT_SUFFIX}",
+            "q".repeat(MAX_ENTITY_PATH_BYTES - MANAGEMENT_SUFFIX.len())
+        );
+        let maximum_subscription_collection = format!(
+            "{}{SUBSCRIPTION_COLLECTION_SUFFIX}",
+            "t".repeat(MAX_ENTITY_PATH_BYTES - SUBSCRIPTION_COLLECTION_SUFFIX.len())
+        );
+
+        let invalid_paths = [
+            "x".repeat(MAX_ENTITY_PATH_BYTES + 1),
+            "x".repeat(MAX_INTERNAL_ENTITY_PATH_BYTES + 1),
+            format!(
+                "{}{DEAD_LETTER_QUEUE_SUFFIX}",
+                "q".repeat(MAX_ENTITY_PATH_BYTES + 1)
+            ),
+            format!("{maximum_dlq_parent}{DEAD_LETTER_QUEUE_SUFFIX}"),
+            format!("{maximum_dlq_parent}{SUBSCRIPTION_PATH_SEGMENT}s"),
+            format!("{maximum_management_parent}{DEAD_LETTER_QUEUE_SUFFIX}"),
+            format!("{maximum_subscription_collection}{DEAD_LETTER_QUEUE_SUFFIX}"),
+            format!(
+                "{}{DEAD_LETTER_QUEUE_SUFFIX}/tail",
+                "q".repeat(MAX_ENTITY_PATH_BYTES - DEAD_LETTER_QUEUE_SUFFIX.len())
+            ),
+            format!(
+                "{}{SUBSCRIPTION_PATH_SEGMENT}s",
+                "t".repeat(MAX_ENTITY_PATH_BYTES + 1)
+            ),
+            format!(
+                "{}{SUBSCRIPTION_PATH_SEGMENT}{}",
+                "t".repeat(MAX_ENTITY_PATH_BYTES),
+                "s".repeat(MAX_SUBSCRIPTION_NAME_CHARACTERS + 1)
+            ),
+            format!(
+                "{}{SUBSCRIPTION_PATH_SEGMENT}",
+                "t".repeat(MAX_ENTITY_PATH_BYTES)
+            ),
+            format!(
+                "{}{SUBSCRIPTION_PATH_SEGMENT}bad/name",
+                "t".repeat(MAX_ENTITY_PATH_BYTES)
+            ),
+            format!(
+                "{}{SUBSCRIPTION_PATH_SEGMENT}a{SUBSCRIPTION_PATH_SEGMENT}b",
+                "t".repeat(MAX_ENTITY_PATH_BYTES - SUBSCRIPTION_PATH_SEGMENT.len() - 1)
+            ),
+        ];
+
+        for invalid in invalid_paths {
+            let encoded = postcard::to_stdvec(&invalid).expect("raw entity path encodes");
+            assert!(
+                postcard::from_bytes::<EntityPath>(&encoded).is_err(),
+                "entity-path deserialization accepted {invalid:?}"
+            );
+        }
     }
 
     #[test]
@@ -363,12 +599,17 @@ mod tests {
         let topic = EntityPath::new("billing").expect("valid topic");
         let name = SubscriptionName::new("Accounting").expect("valid subscription");
         let subscription = topic.subscription(&name).expect("valid path");
-        assert_eq!(subscription.as_str(), "billing/subscriptions/Accounting");
+        assert_eq!(subscription.as_str(), "billing/subscriptions/accounting");
         assert!(subscription.is_subscription());
     }
 
     #[test]
     fn broker_owned_composite_paths_apply_component_limits_separately() {
+        let queue = EntityPath::new("q".repeat(MAX_ENTITY_PATH_BYTES)).expect("maximum queue");
+        let queue_dead_letters = queue
+            .dead_letter_queue()
+            .expect("the maximum queue DLQ path is valid");
+
         let topic = EntityPath::new("t".repeat(MAX_ENTITY_PATH_BYTES)).expect("maximum topic");
         let subscription = topic
             .subscription(
@@ -388,5 +629,12 @@ mod tests {
                 maximum: MAX_ENTITY_PATH_BYTES,
             })
         );
+
+        for path in [&queue_dead_letters, &subscription, &dead_letters] {
+            let encoded = postcard::to_stdvec(path).expect("internal entity path encodes");
+            let decoded: EntityPath =
+                postcard::from_bytes(&encoded).expect("internal entity path decodes");
+            assert_eq!(&decoded, path);
+        }
     }
 }

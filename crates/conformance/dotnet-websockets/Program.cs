@@ -1,10 +1,10 @@
 using Azure;
 using Azure.Messaging.ServiceBus;
 
-if (args.Length != 12)
+if (args.Length != 15)
 {
     Console.Error.WriteLine(
-        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <schedule-queue> <dedupe-queue> <session-queue> <topic> <subscription-a> <subscription-b> <key-name> <key>");
+        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <schedule-queue> <dedupe-queue> <session-queue> <topic> <subscription-a> <subscription-b> <case-queue> <case-topic> <case-subscription> <key-name> <key>");
     return 2;
 }
 
@@ -18,8 +18,11 @@ string sessionQueue = args[6];
 string topic = args[7];
 string firstSubscription = args[8];
 string secondSubscription = args[9];
-string keyName = args[10];
-string key = args[11];
+string caseQueue = args[10];
+string caseTopic = args[11];
+string caseSubscription = args[12];
+string keyName = args[13];
+string key = args[14];
 
 var options = new ServiceBusClientOptions
 {
@@ -222,8 +225,20 @@ if (!await TopicConformance.RunAsync(client, topic, firstSubscription, secondSub
     return 17;
 }
 
+string? caseIdentityFailure = await CaseInsensitiveIdentityConformance.RunAsync(
+    client,
+    caseQueue,
+    caseTopic,
+    caseSubscription);
+if (caseIdentityFailure is not null)
+{
+    Console.Error.WriteLine(caseIdentityFailure);
+    return 18;
+}
+
 Console.WriteLine(
     "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, " +
     "send/receive/complete, defer/peek/deferred-receive, schedule/cancel, " +
-    "duplicate detection, topic fan-out, and session attach passed");
+    "duplicate detection, topic fan-out, case-insensitive queue/topic/subscription identity, " +
+    "and session attach passed");
 return 0;

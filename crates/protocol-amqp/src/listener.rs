@@ -794,10 +794,17 @@ fn address_for_role<'a>(role: &Role, source: &'a str, target: &'a str) -> &'a st
 }
 
 fn management_entity(address: &str) -> Option<Result<EntityPath, ProtocolError>> {
-    let entity = address.strip_suffix("/$management")?;
+    const MANAGEMENT_SUFFIX: &str = "/$management";
+    let split = address.len().checked_sub(MANAGEMENT_SUFFIX.len())?;
+    let entity = address.get(..split)?;
+    let suffix = address.get(split..)?;
+    if !suffix.eq_ignore_ascii_case(MANAGEMENT_SUFFIX) {
+        return None;
+    }
     // Management links use the same well-known entity suffixes as data links.
     // In particular, the official .NET client spells the DLQ segment with
-    // capitals here even though Switchyard's shadow key is canonicalized.
+    // capitals here even though Switchyard's shadow key is canonicalized. The
+    // management suffix itself is another case-insensitive identity segment.
     Some(resolve_entity(entity, Role::Receiver))
 }
 
@@ -1028,35 +1035,36 @@ mod tests {
     }
 
     #[test]
-    fn management_addresses_canonicalize_the_dotnet_dead_letter_suffix() {
+    fn management_addresses_canonicalize_every_identity_segment() {
         assert_eq!(
-            management_entity("orders/$DeadLetterQueue/$management")
+            management_entity("OrDeRs/$DeadLetterQueue/$MaNaGeMeNt")
                 .expect("management suffix")
                 .expect("the DLQ management entity resolves")
                 .as_str(),
             "orders/$deadletterqueue"
         );
         assert_eq!(
-            management_entity("orders/$management")
+            management_entity("ORDERS/$MANAGEMENT")
                 .expect("management suffix")
                 .expect("the queue management entity resolves")
                 .as_str(),
             "orders"
         );
         assert_eq!(
-            management_entity("billing/Subscriptions/accounting/$management")
+            management_entity("BiLlInG/Subscriptions/AcCoUnTiNg/$Management")
                 .expect("management suffix")
                 .expect("the subscription management entity resolves")
                 .as_str(),
             "billing/subscriptions/accounting"
         );
         assert_eq!(
-            management_entity("billing/Subscriptions/accounting/$DeadLetterQueue/$management")
+            management_entity("Billing/Subscriptions/Accounting/$DeadLetterQueue/$MANAGEMENT")
                 .expect("management suffix")
                 .expect("the subscription DLQ management entity resolves")
                 .as_str(),
             "billing/subscriptions/accounting/$deadletterqueue"
         );
+        assert!(management_entity("éxxxxxxxxxxx").is_none());
     }
 
     #[test]

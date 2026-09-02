@@ -8,8 +8,9 @@
 use std::error::Error;
 
 use domain::{
-    BrokerError, CommandKind, CommandOutcome, DeadLetterReason, Delivery, DeliveryLock, LockToken,
-    MessageEnvelope, MessageState, QueueConfig, ReceiveMode, SequenceNumber, Timestamp,
+    BrokerError, Command, CommandKind, CommandOutcome, DeadLetterReason, Delivery, DeliveryLock,
+    EntityPath, LockToken, MessageEnvelope, MessageState, NamespaceName, QueueConfig, ReceiveMode,
+    SequenceNumber, Timestamp,
 };
 use testkit::{QueueFixture, StoreProvider};
 
@@ -941,6 +942,62 @@ fn a_restart_preserves_locks_counters_and_queue_order<P: StoreProvider>(
     Ok(())
 }
 
+fn mixed_case_queue_addresses_share_one_durable_identity<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = QueueFixture::new(provider, "Tenant", "Orders", QueueConfig::default())?;
+    assert_eq!(fixture.namespace.as_str(), "tenant");
+    assert_eq!(fixture.entity.as_str(), "orders");
+
+    assert_eq!(
+        fixture.machine.apply(&Command::new(
+            NamespaceName::new("TENANT")?,
+            EntityPath::new("ORDERS")?,
+            Timestamp::from_millis(1),
+            CommandKind::CreateQueue {
+                config: QueueConfig::default(),
+            },
+        )),
+        Err(BrokerError::QueueAlreadyExists),
+        "case variants cannot create a second queue identity"
+    );
+
+    let CommandOutcome::Sent { sequence } = fixture.machine.apply(&Command::new(
+        NamespaceName::new("TeNaNt")?,
+        EntityPath::new("oRdErS")?,
+        Timestamp::from_millis(2),
+        CommandKind::Send {
+            message_id: String::from("mixed-case"),
+            body: b"canonical".to_vec(),
+            time_to_live_millis: None,
+            session_id: None,
+            scheduled_enqueue_at: None,
+            envelope: None,
+        },
+    ))?
+    else {
+        panic!("expected a send outcome");
+    };
+
+    let fixture = fixture.restart()?;
+    let outcome = fixture.machine.apply(&Command::new(
+        NamespaceName::new("tenant")?,
+        EntityPath::new("OrDeRs")?,
+        Timestamp::from_millis(3),
+        CommandKind::Receive {
+            mode: ReceiveMode::ReceiveAndDelete,
+            lock_duration_millis: None,
+            session: None,
+        },
+    ))?;
+    let CommandOutcome::Received(Some(delivery)) = outcome else {
+        panic!("expected the mixed-case queue delivery, got {outcome:?}");
+    };
+    assert_eq!(delivery.sequence, sequence);
+    assert_eq!(delivery.body, b"canonical".to_vec());
+    Ok(())
+}
+
 // ---- instantiation ---------------------------------------------------------
 
 /// Runs every named case against both backends, so the two suites cannot drift.
@@ -992,4 +1049,5 @@ for_each_backend! {
     two_queues_in_one_namespace_do_not_share_messages,
     a_command_that_changes_nothing_commits_nothing,
     a_restart_preserves_locks_counters_and_queue_order,
+    mixed_case_queue_addresses_share_one_durable_identity,
 }

@@ -15,6 +15,9 @@ use tokio::net::TcpListener;
 const HOST: &str = "tenant.servicebus.windows.net";
 const RULE: &str = "test-rule";
 const KEY: &str = "test-secret";
+const CASE_QUEUE: &str = "Case-Identity-Queue";
+const CASE_TOPIC: &str = "Case-Identity-Topic";
+const CASE_SUBSCRIPTION: &str = "Case-Identity-Subscription";
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires dotnet and a NuGet restore"]
@@ -49,6 +52,7 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
                 ..QueueConfig::default()
             },
         ),
+        (CASE_QUEUE, QueueConfig::default()),
     ] {
         broker.handle().submit_blocking(
             namespace.clone(),
@@ -74,6 +78,22 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             },
         )?;
     }
+    let case_topic = domain::EntityPath::new(CASE_TOPIC)?;
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        case_topic.clone(),
+        CommandKind::CreateTopic {
+            config: TopicConfig::default(),
+        },
+    )?;
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        case_topic,
+        CommandKind::CreateSubscription {
+            name: SubscriptionName::new(CASE_SUBSCRIPTION)?,
+            config: SubscriptionConfig::default(),
+        },
+    )?;
 
     let rule = SharedAccessRule::new(
         RULE,
@@ -141,6 +161,9 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             .arg("events")
             .arg("accounting")
             .arg("analytics")
+            .arg(CASE_QUEUE)
+            .arg(CASE_TOPIC)
+            .arg(CASE_SUBSCRIPTION)
             .arg(RULE)
             .arg(KEY)
             .output()
@@ -165,6 +188,7 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             "dead-letter/DLQ receive/complete, ",
             "defer/deferred-receive/management-disposition, ",
             "peek/browse pagination, schedule/cancel/timer activation, duplicate detection, topic fan-out, ",
+            "case-insensitive queue/topic/subscription identity, ",
             "and session renew/state/peek passed"
         )),
         "the client exited without reporting the completed workflow"

@@ -310,6 +310,27 @@ mod tests {
     }
 
     #[test]
+    fn sas_audience_paths_are_case_insensitive_without_rewriting_signed_bytes() {
+        const ENCODED_MIXED_CASE: &str = "amqps%3A%2F%2Ftenant.servicebus.windows.net%2FOrDeRs";
+        let policy = policy(
+            ResourceScope::entity(HOST, "ORDERS").unwrap(),
+            "secret",
+            None,
+        );
+        // `token` signs the mixed-case encoded resource verbatim. Validation
+        // can fold the decoded scope for comparison, but changing these signed
+        // bytes before HMAC verification would make this token fail.
+        let signed = token(ENCODED_MIXED_CASE, "send", EXPIRY, "secret");
+
+        let grant = policy
+            .validate_sas(&signed, ORDERS, EXPIRY - 1)
+            .expect("resource path casing does not change SAS identity");
+        assert!(grant.scope().contains(
+            &ResourceScope::parse("amqps://tenant.servicebus.windows.net/oRdErS").unwrap()
+        ));
+    }
+
+    #[test]
     fn plain_accepts_either_key_without_disclosing_which_part_failed() {
         let policy = policy(
             ResourceScope::namespace(HOST).unwrap(),

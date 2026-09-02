@@ -31,6 +31,7 @@ use url::form_urlencoded::byte_serialize;
 
 const HOST: &str = "tenant.servicebus.windows.net";
 const AUDIENCE: &str = "amqps://tenant.servicebus.windows.net/orders";
+const MIXED_CASE_AUDIENCE: &str = "amqps://tenant.servicebus.windows.net/oRdErS";
 const RULE: &str = "test-rule";
 const KEY: &str = "test-secret";
 const REPLY_TO: &str = "cbs-client-reply-to";
@@ -48,6 +49,19 @@ enum SaslProfile {
 
 impl AuthNode {
     async fn start(
+        permissions: PermissionSet,
+        authorization_timeout: Duration,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::start_with_scope(
+            ResourceScope::namespace(HOST)?,
+            permissions,
+            authorization_timeout,
+        )
+        .await
+    }
+
+    async fn start_with_scope(
+        scope: ResourceScope,
         permissions: PermissionSet,
         authorization_timeout: Duration,
     ) -> Result<Self, Box<dyn Error>> {
@@ -76,13 +90,8 @@ impl AuthNode {
             },
         )?;
 
-        let rule = SharedAccessRule::new(
-            RULE,
-            ResourceScope::namespace(HOST)?,
-            SharedAccessKey::new(KEY)?,
-            None,
-            permissions,
-        )?;
+        let rule =
+            SharedAccessRule::new(RULE, scope, SharedAccessKey::new(KEY)?, None, permissions)?;
         let authentication =
             protocol_amqp::SharedAccessAuthentication::new(SharedAccessPolicy::new([rule])?, HOST)?
                 .with_authorization_timeout(authorization_timeout);
@@ -179,6 +188,14 @@ fn sas_token(audience: &str, expiry: u64) -> String {
 }
 
 async fn put_token(session: &mut Session, token: String) -> Result<i32, Box<dyn Error>> {
+    put_token_for_audience(session, AUDIENCE, token).await
+}
+
+async fn put_token_for_audience(
+    session: &mut Session,
+    audience: &str,
+    token: String,
+) -> Result<i32, Box<dyn Error>> {
     let mut request_link = Sender::attach(session, "cbs-request", protocol_amqp::CBS_NODE).await?;
     let mut response_link = Receiver::builder()
         .name("cbs-response")
@@ -198,7 +215,7 @@ async fn put_token(session: &mut Session, token: String) -> Result<i32, Box<dyn 
             ApplicationProperties::builder()
                 .insert("operation", String::from("put-token"))
                 .insert("type", String::from("servicebus.windows.net:sastoken"))
-                .insert("name", String::from(AUDIENCE))
+                .insert("name", String::from(audience))
                 .build(),
         )
         .body(Body::Value(Value::String(token)))
@@ -281,6 +298,47 @@ fn assert_management_status(message: &Message, expected: i32) {
             .and_then(|properties| properties.get(protocol_amqp::STATUS_CODE_PROPERTY)),
         Some(&Value::Int(expected))
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn entity_scoped_cbs_authorization_and_links_share_case_insensitive_identity()
+-> Result<(), Box<dyn Error>> {
+    let node = AuthNode::start_with_scope(
+        ResourceScope::entity(HOST, "ORDERS")?,
+        PermissionSet::SEND | PermissionSet::LISTEN,
+        Duration::from_secs(20),
+    )
+    .await?;
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    assert_eq!(
+        put_token_for_audience(
+            &mut session,
+            MIXED_CASE_AUDIENCE,
+            sas_token(MIXED_CASE_AUDIENCE, expiry_after(60)),
+        )
+        .await?,
+        202
+    );
+
+    let mut receiver = Receiver::attach(&mut session, "case-folded-receiver", "OrDeRs").await?;
+    let seed = receiver.recv().await?;
+    assert_eq!(seed.message().body, body("seed"));
+    receiver.accept(&seed).await?;
+
+    let mut sender = Sender::attach(&mut session, "case-folded-sender", "orders").await?;
+    assert!(matches!(
+        sender
+            .send(Message::builder().body(body("case-authorized")).build())
+            .await?,
+        Outcome::Accepted(_)
+    ));
+    let delivery = receiver.recv().await?;
+    assert_eq!(delivery.message().body, body("case-authorized"));
+    receiver.accept(&delivery).await?;
+
+    connection.close().await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

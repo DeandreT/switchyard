@@ -15,6 +15,9 @@ use tokio::net::TcpListener;
 const HOST: &str = "tenant.servicebus.windows.net";
 const RULE: &str = "test-rule";
 const KEY: &str = "test-secret";
+const CASE_QUEUE: &str = "Case-Identity-Queue";
+const CASE_TOPIC: &str = "Case-Identity-Topic";
+const CASE_SUBSCRIPTION: &str = "Case-Identity-Subscription";
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires dotnet and a NuGet restore"]
@@ -47,6 +50,7 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
                 ..QueueConfig::default()
             },
         ),
+        (CASE_QUEUE, QueueConfig::default()),
     ] {
         broker.handle().submit_blocking(
             namespace.clone(),
@@ -72,6 +76,22 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
             },
         )?;
     }
+    let case_topic = domain::EntityPath::new(CASE_TOPIC)?;
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        case_topic.clone(),
+        CommandKind::CreateTopic {
+            config: TopicConfig::default(),
+        },
+    )?;
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        case_topic,
+        CommandKind::CreateSubscription {
+            name: SubscriptionName::new(CASE_SUBSCRIPTION)?,
+            config: SubscriptionConfig::default(),
+        },
+    )?;
 
     let rule = SharedAccessRule::new(
         RULE,
@@ -139,6 +159,9 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
             .arg("websocket-events")
             .arg("first")
             .arg("second")
+            .arg(CASE_QUEUE)
+            .arg(CASE_TOPIC)
+            .arg(CASE_SUBSCRIPTION)
             .arg(RULE)
             .arg(KEY)
             .output()
@@ -153,7 +176,7 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
     );
     assert!(
         String::from_utf8_lossy(&output.stdout).contains(
-            "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, send/receive/complete, defer/peek/deferred-receive, schedule/cancel, duplicate detection, topic fan-out, and session attach passed"
+            "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, send/receive/complete, defer/peek/deferred-receive, schedule/cancel, duplicate detection, topic fan-out, case-insensitive queue/topic/subscription identity, and session attach passed"
         ),
         "the client exited without reporting the completed WebSocket workflow"
     );

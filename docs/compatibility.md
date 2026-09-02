@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Queue single and atomic batch send; duplicate detection across immediate, batch, and scheduled sends; scheduled send/batch activation and cancellation; prefetched multi-message receive; independent settlement; receive-delete; envelope fidelity; renew; abandon/redelivery; defer and deferred receive; ordered peek pagination across active, locked, scheduled, deferred, session, and DLQ messages; dead-letter and DLQ receive/complete; session renew/state; immediate default-rule topic fanout and independent subscription settlement; AMQP over TCP and WebSockets | Planned | Experimental gates on 7.20.2 |
+| Official .NET SDK, current stable | Queue single and atomic batch send; duplicate detection across immediate, batch, and scheduled sends; scheduled send/batch activation and cancellation; prefetched multi-message receive; independent settlement; receive-delete; envelope fidelity; renew; abandon/redelivery; defer and deferred receive; ordered peek pagination across active, locked, scheduled, deferred, session, and DLQ messages; dead-letter and DLQ receive/complete; session renew/state; immediate default-rule topic fanout and independent subscription settlement; case-insensitive queue, topic, and subscription identity; AMQP over TCP and WebSockets | Planned | Experimental gates on 7.20.2 |
 | Official .NET SDK, previous stable | Planned | Planned | Not implemented |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -27,6 +27,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Atomic message batches | Pre-1.0 | State machine, Service Bus AMQP batch format, Rust and current .NET clients end to end |
 | Prefetch and concurrent settlement | Pre-1.0 | Bounded AMQP delivery pipeline, link-credit drain, Rust and current .NET clients end to end |
 | AMQP message envelope fidelity | Pre-1.0 | Durable V1 envelope, broker-owned overlays, Rust and current .NET clients end to end |
+| Case-insensitive entity identity | Pre-1.0 | Canonical namespace, queue, topic, and subscription storage/addressing; entity-scoped SAS authorization; Rust and current .NET clients over TCP and WebSockets |
 | Abandon and redelivery | Pre-1.0 | State machine, AMQP mapping, Rust and current .NET clients end to end |
 | Peek without lock acquisition | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Receive-delete | Pre-1.0 | State machine, AMQP mapping |
@@ -150,10 +151,12 @@ a rejection or a bound rather than a silent difference:
   reports none available if they are all held, rather than walking the entity.
   The receiver retries.
 
-Entity and subscription identities are currently case-sensitive in storage.
-Azure administration treats them case-insensitively, so clients must use the
-same casing that provisioned the entity until canonical identity handling is
-implemented across every entity kind.
+Namespace, queue, topic, and subscription identities are ASCII
+case-insensitive from construction and durable storage through AMQP addressing
+and entity-scoped SAS authorization. Mixed-case aliases therefore reach the
+same entity over both AMQP TCP and WebSockets. Session identifiers and
+placement-group identifiers retain their case because they are not Service Bus
+entity identities.
 
 Expiry is not merely expressible: the `server` crate's timer worker proposes the
 lock, time-to-live, session-lock, and duplicate-history sweeps on an interval,
