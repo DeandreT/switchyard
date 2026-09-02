@@ -17,6 +17,7 @@ use server::{
 use testkit::StoreProvider;
 
 const LOCK_MILLIS: u64 = 30_000;
+const DUPLICATE_HISTORY_MILLIS: u64 = 20_000;
 
 struct Runtime<P: StoreProvider> {
     _provider: P,
@@ -223,6 +224,49 @@ fn one_sweep_drains_a_backlog_larger_than_a_single_command<P: StoreProvider>(
     Ok(())
 }
 
+fn one_sweep_drains_duplicate_history_larger_than_a_single_command<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let runtime = Runtime::new(
+        provider,
+        QueueConfig {
+            requires_duplicate_detection: true,
+            duplicate_detection_history_millis: DUPLICATE_HISTORY_MILLIS,
+            ..queue_config()
+        },
+    )?;
+    let backlog = TIMER_SCAN_LIMIT + 1;
+    for index in 0..backlog {
+        runtime.send(&format!("duplicate-history-{index}"), None)?;
+    }
+
+    // A state-machine command removes at most TIMER_SCAN_LIMIT generations.
+    // The worker must re-propose so one sweep drains the complete backlog and
+    // reports every removed generation.
+    runtime.clock.advance(DUPLICATE_HISTORY_MILLIS);
+    assert_eq!(
+        runtime.sweep()?,
+        SweepReport {
+            queues_swept: 2, // the queue and its dead-letter shadow
+            duplicate_history_removed: backlog as u32,
+            ..SweepReport::default()
+        }
+    );
+
+    assert!(matches!(
+        runtime.propose(CommandKind::Send {
+            message_id: String::from("duplicate-history-0"),
+            body: Vec::new(),
+            time_to_live_millis: None,
+            session_id: None,
+            scheduled_enqueue_at: None,
+            envelope: None,
+        })?,
+        CommandOutcome::Sent { .. }
+    ));
+    Ok(())
+}
+
 fn a_sweep_never_moves_the_applied_clock_backward<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
@@ -311,6 +355,7 @@ for_each_backend! {
     a_sweep_dead_letters_a_message_past_its_time_to_live,
     a_sweep_releases_a_session_whose_lock_elapsed,
     one_sweep_drains_a_backlog_larger_than_a_single_command,
+    one_sweep_drains_duplicate_history_larger_than_a_single_command,
     a_sweep_never_moves_the_applied_clock_backward,
     a_sweep_activates_a_due_scheduled_message,
 }

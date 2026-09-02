@@ -30,6 +30,14 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
         ("websocket-batch", QueueConfig::default()),
         ("websocket-schedule", QueueConfig::default()),
         (
+            "websocket-dedupe",
+            QueueConfig {
+                requires_duplicate_detection: true,
+                duplicate_detection_history_millis: 10 * 60 * 1_000,
+                ..QueueConfig::default()
+            },
+        ),
+        (
             "websocket-sessions",
             QueueConfig {
                 requires_session: true,
@@ -105,6 +113,7 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
             .arg("websocket-orders")
             .arg("websocket-batch")
             .arg("websocket-schedule")
+            .arg("websocket-dedupe")
             .arg("websocket-sessions")
             .arg(RULE)
             .arg(KEY)
@@ -120,7 +129,7 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
     );
     assert!(
         String::from_utf8_lossy(&output.stdout).contains(
-            "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, send/receive/complete, defer/peek/deferred-receive, schedule/cancel, and session attach passed"
+            "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, send/receive/complete, defer/peek/deferred-receive, schedule/cancel, duplicate detection, and session attach passed"
         ),
         "the client exited without reporting the completed WebSocket workflow"
     );

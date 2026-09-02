@@ -29,6 +29,10 @@ pub enum BrokerError {
         body_bytes: usize,
         maximum_bytes: usize,
     },
+    #[error(
+        "message identifier has {characters} characters, exceeding the {maximum}-character limit"
+    )]
+    MessageIdTooLong { characters: usize, maximum: usize },
     #[error("a message batch must contain at least one message")]
     EmptyMessageBatch,
     #[error("every message in a batch sent to a session queue must use the same session")]

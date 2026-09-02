@@ -6,18 +6,19 @@ This document is the implementation contract for Switchyard. The repository is
 currently pre-alpha. A deterministic state machine covers queue send and
 receive, both settlement modes, lock expiry, time-to-live expiry,
 dead-lettering and dead-letter receive, deferral and deferred retrieval,
-read-only message browsing, scheduled delivery and cancellation, and the
-session ownership and session state described under
+read-only message browsing, scheduled delivery and cancellation, duplicate
+detection, and the session ownership and session state described under
 [Message Semantics](#message-semantics). It runs over either the Fjall backend
 or the memory backend, so a single node survives a restart.
 
 The `switchyard` binary accepts AMQP connections over development plaintext or
 TLS, authenticates a configured shared-access policy through SASL PLAIN or CBS
 SAS, carries messages and sessions across that edge, and sweeps lock,
-time-to-live, and session-lock expiry while activating scheduled messages.
+time-to-live, session-lock, and duplicate-history expiry while activating
+scheduled messages.
 JWT/OIDC, mTLS, policy administration,
 Raft, and compliance implementations remain to be built. Within the semantics
-below, duplicate detection and topics are not implemented, and the storage
+below, topics are not implemented, and the storage
 keyspace layout under [Storage](#storage) is still a single record keyspace
 rather than the split listed there.
 
@@ -206,14 +207,24 @@ time from moving backward. Clock jumps beyond the configured safety threshold
 pause timers and fail readiness until an operator resolves the condition.
 
 The worker that exists today activates the scheduled index and sweeps the
-lock-expiry, TTL, and session-lock indexes. One sweep command processes a
-bounded number of entries, so the worker re-proposes until an index reports less
-than a full batch, and a backlog on one queue cannot starve the rest of the tick.
+lock-expiry, TTL, session-lock, and duplicate-history indexes. One sweep
+command processes a bounded number of entries, so the worker re-proposes until
+an index reports less than a full batch, and a backlog on one queue cannot
+starve the rest of the tick.
 Time reaches the state machine only through the proposer, which stamps each
 command: a host clock that steps back a little holds the applied timestamp still
 rather than regressing it, and one that steps back further has the command
 refused. Refusal is not yet wired to a readiness signal — the sweep is logged and
 retried on the next tick.
+
+Duplicate detection is configured per queue and keyed by the exact, non-empty
+message identifier. The first accepted send owns that identifier until its
+history deadline; another send in that window is acknowledged without storing
+another message. Scheduled and immediately available sends share the same
+history, and settlement, cancellation, expiry, or dead-lettering does not erase
+it. The history begins at the replicated command timestamp and a duplicate hit
+does not extend it. Those last two boundary choices make replay deterministic;
+Azure documents the window behavior but not either detail.
 
 Topic sends evaluate the current subscription rule revision before proposing
 fanout. The command records the matched subscriptions and encrypted property

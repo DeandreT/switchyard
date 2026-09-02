@@ -11,6 +11,7 @@ use domain::BrokerError;
 pub const NOT_FOUND: &str = "amqp:not-found";
 pub const NOT_ALLOWED: &str = "amqp:not-allowed";
 pub const INTERNAL_ERROR: &str = "amqp:internal-error";
+pub const INVALID_FIELD: &str = "amqp:invalid-field";
 pub const PRECONDITION_FAILED: &str = "amqp:precondition-failed";
 pub const RESOURCE_LOCKED: &str = "amqp:resource-locked";
 pub const MESSAGE_SIZE_EXCEEDED: &str = "amqp:link:message-size-exceeded";
@@ -60,6 +61,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::DeferredMessageSessionMismatch { .. } => NOT_ALLOWED,
 
         BrokerError::MessageTooLarge { .. } => MESSAGE_SIZE_EXCEEDED,
+        BrokerError::MessageIdTooLong { .. } => INVALID_FIELD,
         BrokerError::QueueConfig(_) => PRECONDITION_FAILED,
 
         // The node's clock disagrees with what it already applied. A client
@@ -154,6 +156,17 @@ mod tests {
             assert_eq!(condition_for(&error), NOT_ALLOWED);
             assert!(!is_retryable(&error));
         }
+    }
+
+    #[test]
+    fn an_overlong_message_identifier_is_an_invalid_wire_field() {
+        assert_eq!(
+            condition_for(&BrokerError::MessageIdTooLong {
+                characters: domain::MAX_MESSAGE_ID_CHARACTERS + 1,
+                maximum: domain::MAX_MESSAGE_ID_CHARACTERS,
+            }),
+            INVALID_FIELD
+        );
     }
 
     #[test]

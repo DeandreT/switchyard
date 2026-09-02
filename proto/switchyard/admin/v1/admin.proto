@@ -100,6 +100,10 @@ message CreateEntityRequest {
   uint64 lock_duration_millis = 7;
   uint32 max_delivery_count = 8;
   bool requires_session = 9;
+  bool requires_duplicate_detection = 10;
+  // Zero selects the 600000 ms (10 minute) default. Nonzero values must be
+  // between 20000 ms and 604800000 ms, inclusive.
+  uint64 duplicate_detection_history_millis = 11;
 }
 
 message GetEntityRequest {
@@ -125,6 +129,9 @@ message Entity {
   string placement_group_id = 4;
   uint64 max_size_bytes = 5;
   uint64 used_logical_bytes = 6;
+  bool requires_duplicate_detection = 7;
+  // The entity's concrete effective history window, including the default.
+  uint64 duplicate_detection_history_millis = 8;
 }
 
 message ListEntitiesResponse {
@@ -162,4 +169,3 @@ message AuditRecord {
   bytes previous_hash = 8;
   bytes record_hash = 9;
 }
-

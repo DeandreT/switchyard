@@ -1,10 +1,10 @@
 using Azure;
 using Azure.Messaging.ServiceBus;
 
-if (args.Length != 8)
+if (args.Length != 9)
 {
     Console.Error.WriteLine(
-        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <schedule-queue> <session-queue> <key-name> <key>");
+        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <schedule-queue> <dedupe-queue> <session-queue> <key-name> <key>");
     return 2;
 }
 
@@ -13,9 +13,10 @@ var customEndpoint = new Uri(args[1]);
 string queue = args[2];
 string batchQueue = args[3];
 string scheduleQueue = args[4];
-string sessionQueue = args[5];
-string keyName = args[6];
-string key = args[7];
+string dedupeQueue = args[5];
+string sessionQueue = args[6];
+string keyName = args[7];
+string key = args[8];
 
 var options = new ServiceBusClientOptions
 {
@@ -170,6 +171,31 @@ for (int index = batchReceived.Count - 1; index >= 0; index--)
     await batchReceiver.CompleteMessageAsync(batchReceived[index]);
 }
 
+await using ServiceBusSender dedupeSender = client.CreateSender(dedupeQueue);
+await using ServiceBusReceiver dedupeReceiver = client.CreateReceiver(dedupeQueue);
+await dedupeSender.SendMessageAsync(new ServiceBusMessage("websocket-dedupe-first")
+{
+    MessageId = "websocket-dedupe",
+});
+await dedupeSender.SendMessageAsync(new ServiceBusMessage("websocket-dedupe-second")
+{
+    MessageId = "websocket-dedupe",
+});
+ServiceBusReceivedMessage? deduplicated =
+    await dedupeReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (deduplicated?.Body.ToString() != "websocket-dedupe-first")
+{
+    Console.Error.WriteLine($"unexpected WebSocket dedupe winner: {deduplicated?.Body}");
+    return 15;
+}
+await dedupeReceiver.CompleteMessageAsync(deduplicated);
+if (await dedupeReceiver.ReceiveMessageAsync(TimeSpan.FromMilliseconds(500)) is not null ||
+    await dedupeReceiver.PeekMessageAsync() is not null)
+{
+    Console.Error.WriteLine("a duplicate WebSocket message remained in the queue");
+    return 16;
+}
+
 await using ServiceBusSender sessionSender = client.CreateSender(sessionQueue);
 await sessionSender.SendMessageAsync(new ServiceBusMessage("official-websocket-session")
 {
@@ -190,5 +216,5 @@ await sessionReceiver.CompleteMessageAsync(sessionMessage);
 Console.WriteLine(
     "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, " +
     "send/receive/complete, defer/peek/deferred-receive, schedule/cancel, " +
-    "and session attach passed");
+    "duplicate detection, and session attach passed");
 return 0;

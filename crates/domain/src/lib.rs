@@ -32,11 +32,14 @@ pub use machine::{
 };
 pub use message::{
     DeadLetterInfo, DeadLetterReason, Delivery, DeliveryGuarantee, DeliveryLock, DeliveryOrigin,
-    LockToken, MessageEnvelope, MessageRecord, MessageState, ReceiveMode, SequenceNumber,
+    LockToken, MAX_MESSAGE_ID_CHARACTERS, MessageEnvelope, MessageRecord, MessageState,
+    ReceiveMode, SequenceNumber,
 };
 pub use queue::{
-    DEFAULT_LOCK_DURATION_MILLIS, DEFAULT_MAX_DELIVERY_COUNT, DEFAULT_MAX_MESSAGE_BYTES,
-    MAX_LOCK_DURATION_MILLIS, QueueConfig, QueueConfigError, QueueCounters,
+    DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS, DEFAULT_LOCK_DURATION_MILLIS,
+    DEFAULT_MAX_DELIVERY_COUNT, DEFAULT_MAX_MESSAGE_BYTES, MAX_DUPLICATE_DETECTION_HISTORY_MILLIS,
+    MAX_LOCK_DURATION_MILLIS, MIN_DUPLICATE_DETECTION_HISTORY_MILLIS, QueueConfig,
+    QueueConfigError, QueueCounters,
 };
 pub use session::{AcceptedSession, SessionHold, SessionLock, SessionRecord};
 pub use time::Timestamp;

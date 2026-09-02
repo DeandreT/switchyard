@@ -44,7 +44,10 @@ pub(super) async fn schedule<B: Broker>(
         )
         .await
     {
-        Ok(CommandOutcome::BatchSent { sequences }) if sequences.len() == expected => {
+        Ok(CommandOutcome::BatchSent { sequences, stored })
+            if sequences.len() == expected
+                && u32::try_from(expected).is_ok_and(|expected| stored <= expected) =>
+        {
             match sequence_values(&sequences) {
                 Ok(values) => ManagementResponse::accepted(
                     message_id,
@@ -311,6 +314,7 @@ mod tests {
     async fn schedule_decodes_complete_messages_and_returns_long_sequences() {
         let broker = RecordingBroker::returning(CommandOutcome::BatchSent {
             sequences: vec![SequenceNumber::new(7), SequenceNumber::new(8)],
+            stored: 1,
         });
         let (namespace, entity) = names();
         let response = schedule(
@@ -355,8 +359,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_suppressed_schedule_still_returns_its_sequence_slot() {
+        let broker = RecordingBroker::returning(CommandOutcome::BatchSent {
+            sequences: vec![SequenceNumber::new(9)],
+            stored: 0,
+        });
+        let (namespace, entity) = names();
+        let response = schedule(
+            &schedule_request(vec![entry("duplicate", encoded("duplicate", 12_000))]),
+            MessageId::Ulong(1),
+            None,
+            &namespace,
+            &entity,
+            &broker,
+        )
+        .await
+        .into_message();
+
+        assert_eq!(
+            response
+                .application_properties
+                .as_ref()
+                .and_then(|properties| properties.get("statusCode")),
+            Some(&Value::Int(200))
+        );
+        assert_eq!(
+            map_value(&response.body, SEQUENCE_NUMBERS),
+            Some(&Value::Array(Array::from(vec![Value::Long(9)])))
+        );
+    }
+
+    #[tokio::test]
     async fn one_malformed_entry_rejects_the_whole_schedule_before_submission() {
-        let broker = RecordingBroker::returning(CommandOutcome::BatchSent { sequences: vec![] });
+        let broker = RecordingBroker::returning(CommandOutcome::BatchSent {
+            sequences: vec![],
+            stored: 0,
+        });
         let (namespace, entity) = names();
         let response = schedule(
             &schedule_request(vec![

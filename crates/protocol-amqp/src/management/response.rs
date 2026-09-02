@@ -84,7 +84,7 @@ impl ManagementResponse {
         let status_code = match condition {
             crate::MESSAGE_LOCK_LOST | crate::SESSION_LOCK_LOST => 410,
             crate::NOT_FOUND => 404,
-            crate::NOT_ALLOWED | crate::PRECONDITION_FAILED => 400,
+            crate::INVALID_FIELD | crate::NOT_ALLOWED | crate::PRECONDITION_FAILED => 400,
             crate::RESOURCE_LOCKED => 503,
             _ => 500,
         };
@@ -163,5 +163,25 @@ impl ManagementResponse {
             body: Body::Value(self.body),
             ..Message::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use domain::BrokerError;
+
+    use super::*;
+
+    #[test]
+    fn an_invalid_message_field_is_a_bad_management_request() {
+        let rejection = BrokerRejection::Refused(BrokerError::MessageIdTooLong {
+            characters: domain::MAX_MESSAGE_ID_CHARACTERS + 1,
+            maximum: domain::MAX_MESSAGE_ID_CHARACTERS,
+        });
+
+        let response = ManagementResponse::from_rejection(MessageId::Ulong(1), None, &rejection);
+
+        assert_eq!(response.status_code, 400);
+        assert_eq!(response.error_condition, Some(crate::INVALID_FIELD));
     }
 }

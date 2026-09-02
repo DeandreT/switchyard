@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CodecError, SessionId, Timestamp, codec};
 
+/// Maximum number of Unicode scalar values Service Bus accepts in a message
+/// identifier. This is a character limit, not a UTF-8 byte limit.
+pub const MAX_MESSAGE_ID_CHARACTERS: usize = 128;
+
 /// Position of a message in its entity's total order. Allocated from a
 /// replicated counter, never from a local generator.
 #[derive(

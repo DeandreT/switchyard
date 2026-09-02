@@ -3,8 +3,8 @@
 use storage::{StateStore, WriteBatch};
 
 use crate::{
-    BrokerError, Command, CommandOutcome, MessageEnvelope, MessageInput, MessageRecord,
-    MessageState, QueueConfig, SequenceNumber, codec, keys,
+    BrokerError, Command, CommandOutcome, MAX_MESSAGE_ID_CHARACTERS, MessageEnvelope, MessageInput,
+    MessageRecord, MessageState, QueueConfig, SequenceNumber, codec, keys,
 };
 
 use super::{StateMachine, require_session_agreement};
@@ -37,6 +37,11 @@ struct PreparedMessage {
     encoded: Vec<u8>,
 }
 
+struct PersistedMessages {
+    sequences: Vec<SequenceNumber>,
+    stored: u32,
+}
+
 impl<S: StateStore> StateMachine<S> {
     pub(super) fn send(
         &self,
@@ -44,8 +49,13 @@ impl<S: StateStore> StateMachine<S> {
         input: SendInput<'_>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
-        let sequence = self.persist_messages(command, &[input], batch)?[0];
-        Ok(CommandOutcome::Sent { sequence })
+        let persisted = self.persist_messages(command, &[input], batch)?;
+        let sequence = persisted.sequences[0];
+        if persisted.stored == 1 {
+            Ok(CommandOutcome::Sent { sequence })
+        } else {
+            Ok(CommandOutcome::DuplicateSuppressed { sequence })
+        }
     }
 
     pub(super) fn send_batch(
@@ -58,8 +68,11 @@ impl<S: StateStore> StateMachine<S> {
             return Err(BrokerError::EmptyMessageBatch);
         }
         let inputs = messages.iter().map(SendInput::from).collect::<Vec<_>>();
-        let sequences = self.persist_messages(command, &inputs, batch)?;
-        Ok(CommandOutcome::BatchSent { sequences })
+        let persisted = self.persist_messages(command, &inputs, batch)?;
+        Ok(CommandOutcome::BatchSent {
+            sequences: persisted.sequences,
+            stored: persisted.stored,
+        })
     }
 
     /// Validates and encodes every child before adding any storage mutation.
@@ -68,7 +81,7 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         inputs: &[SendInput<'_>],
         batch: &mut WriteBatch,
-    ) -> Result<Vec<SequenceNumber>, BrokerError> {
+    ) -> Result<PersistedMessages, BrokerError> {
         if command.entity.is_dead_letter_queue() {
             return Err(BrokerError::DeadLetterQueueIsReserved);
         }
@@ -77,21 +90,28 @@ impl<S: StateStore> StateMachine<S> {
             validate_input(&config, input)?;
         }
         validate_batch_session(&config, inputs)?;
+        let store_message = self.stage_duplicate_history(
+            command,
+            &config,
+            inputs.iter().map(|input| input.message_id),
+            batch,
+        )?;
 
         let mut counters = self.load_counters(command)?;
         let mut prepared = Vec::with_capacity(inputs.len());
-        for input in inputs {
+        let mut sequences = Vec::with_capacity(inputs.len());
+        for (input, store_message) in inputs.iter().zip(store_message) {
             let sequence = SequenceNumber::new(counters.next_sequence);
             counters.next_sequence = counters.next_sequence.saturating_add(1);
-            let record = message_record(command, &config, *input, sequence);
-            let encoded = codec::encode(&record)?;
-            prepared.push(PreparedMessage { record, encoded });
+            sequences.push(sequence);
+            if store_message {
+                let record = message_record(command, &config, *input, sequence);
+                let encoded = codec::encode(&record)?;
+                prepared.push(PreparedMessage { record, encoded });
+            }
         }
         let encoded_counters = codec::encode(&counters)?;
-        let sequences = prepared
-            .iter()
-            .map(|message| message.record.sequence)
-            .collect();
+        let stored = u32::try_from(prepared.len()).unwrap_or(u32::MAX);
 
         let namespace = &command.namespace;
         let entity = &command.entity;
@@ -113,12 +133,19 @@ impl<S: StateStore> StateMachine<S> {
             }
         }
         batch.push_put(keys::queue_counters(namespace, entity), encoded_counters);
-        Ok(sequences)
+        Ok(PersistedMessages { sequences, stored })
     }
 }
 
 fn validate_input(config: &QueueConfig, input: &SendInput<'_>) -> Result<(), BrokerError> {
     require_session_agreement(config, input.session_id.is_some())?;
+    let message_id_characters = input.message_id.chars().count();
+    if message_id_characters > MAX_MESSAGE_ID_CHARACTERS {
+        return Err(BrokerError::MessageIdTooLong {
+            characters: message_id_characters,
+            maximum: MAX_MESSAGE_ID_CHARACTERS,
+        });
+    }
     let message_bytes = input
         .envelope
         .map_or(input.body.len(), MessageEnvelope::len);

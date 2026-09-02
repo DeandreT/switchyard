@@ -2,9 +2,9 @@
 //!
 //! The state machine has no clock of its own, so nothing expires until something
 //! asks it to. This is that something: on every tick it walks the queues,
-//! activates scheduled messages, and proposes the three expiry commands for
+//! activates scheduled messages, and proposes the four expiry commands for
 //! each. Without it, scheduled messages remain hidden, locks are held forever,
-//! and messages outlive their time to live.
+//! messages outlive their time to live, and duplicate history grows forever.
 //!
 //! The sweep itself is deterministic given the clock, so a test drives it
 //! directly and only the surrounding loop deals in real time.
@@ -38,6 +38,7 @@ pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 pub struct SweepReport {
     pub queues_swept: usize,
     pub scheduled_activated: u32,
+    pub duplicate_history_removed: u32,
     pub locks_returned_to_ready: u32,
     pub messages_dead_lettered: u32,
     pub sessions_released: u32,
@@ -47,6 +48,7 @@ impl SweepReport {
     /// True when the sweep changed nothing, which is the steady state.
     pub fn is_idle(&self) -> bool {
         self.scheduled_activated == 0
+            && self.duplicate_history_removed == 0
             && self.locks_returned_to_ready == 0
             && self.messages_dead_lettered == 0
             && self.sessions_released == 0
@@ -95,6 +97,7 @@ impl<'a> TimerWorker<'a> {
 
         for (namespace, entity) in queues {
             self.activate_scheduled(&namespace, &entity, &mut report)?;
+            self.expire_duplicate_history(&namespace, &entity, &mut report)?;
             self.expire_locks(&namespace, &entity, &mut report)?;
             self.expire_messages(&namespace, &entity, &mut report)?;
             self.expire_session_locks(&namespace, &entity, &mut report)?;
@@ -121,6 +124,30 @@ impl<'a> TimerWorker<'a> {
             report.scheduled_activated += activated;
 
             if (activated as usize) < TIMER_SCAN_LIMIT {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn expire_duplicate_history(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+        report: &mut SweepReport,
+    ) -> Result<(), SubmitError> {
+        for _ in 0..MAX_ROUNDS_PER_INDEX {
+            let outcome = self.broker.submit_blocking(
+                namespace.clone(),
+                entity.clone(),
+                CommandKind::ExpireDuplicateHistory,
+            )?;
+            let CommandOutcome::DuplicateHistoryExpired { removed } = outcome else {
+                return Err(unexpected(outcome));
+            };
+            report.duplicate_history_removed += removed;
+
+            if (removed as usize) < TIMER_SCAN_LIMIT {
                 break;
             }
         }
@@ -222,6 +249,7 @@ impl<'a> TimerWorker<'a> {
                     debug!(
                         queues = report.queues_swept,
                         scheduled_activated = report.scheduled_activated,
+                        duplicate_history_removed = report.duplicate_history_removed,
                         locks_returned_to_ready = report.locks_returned_to_ready,
                         messages_dead_lettered = report.messages_dead_lettered,
                         sessions_released = report.sessions_released,
@@ -344,6 +372,16 @@ mod tests {
         assert_eq!(report, SweepReport::default());
         assert!(report.is_idle());
         Ok(())
+    }
+
+    #[test]
+    fn duplicate_history_cleanup_makes_a_sweep_non_idle() {
+        let report = SweepReport {
+            duplicate_history_removed: 1,
+            ..SweepReport::default()
+        };
+
+        assert!(!report.is_idle());
     }
 
     #[test]

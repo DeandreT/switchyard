@@ -72,7 +72,7 @@ fn send_batch<P: StoreProvider>(
     messages: Vec<MessageInput>,
 ) -> Result<Vec<SequenceNumber>, BrokerError> {
     match fixture.at(issued_at, CommandKind::SendBatch { messages })? {
-        CommandOutcome::BatchSent { sequences } => Ok(sequences),
+        CommandOutcome::BatchSent { sequences, .. } => Ok(sequences),
         other => panic!("expected batch send, got {other:?}"),
     }
 }

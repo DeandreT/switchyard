@@ -101,7 +101,9 @@ impl Watchers {
 /// what a waiting link wants to be woken for.
 fn makes_deliverable(outcome: &CommandOutcome) -> bool {
     match outcome {
-        CommandOutcome::Sent { .. } | CommandOutcome::BatchSent { .. } => true,
+        CommandOutcome::Sent { .. } => true,
+        CommandOutcome::DuplicateSuppressed { .. } => false,
+        CommandOutcome::BatchSent { stored, .. } => *stored > 0,
         CommandOutcome::Abandoned { dead_lettered } => !dead_lettered,
         CommandOutcome::LocksExpired {
             returned_to_ready, ..
@@ -411,6 +413,24 @@ mod tests {
         }));
         assert!(!makes_deliverable(&CommandOutcome::ScheduledActivated {
             activated: 0,
+        }));
+    }
+
+    #[test]
+    fn duplicate_suppression_wakes_only_for_messages_that_were_stored() {
+        assert!(!makes_deliverable(&CommandOutcome::DuplicateSuppressed {
+            sequence: domain::SequenceNumber::new(2),
+        }));
+        assert!(!makes_deliverable(&CommandOutcome::BatchSent {
+            sequences: vec![domain::SequenceNumber::new(3)],
+            stored: 0,
+        }));
+        assert!(makes_deliverable(&CommandOutcome::BatchSent {
+            sequences: vec![
+                domain::SequenceNumber::new(4),
+                domain::SequenceNumber::new(5),
+            ],
+            stored: 1,
         }));
     }
 

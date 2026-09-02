@@ -15,6 +15,8 @@
 //!   session's messages are contiguous and in order within the group, and a
 //!   receiver looking for a session to accept walks the groups in turn;
 //! - the session lock index sorts by lock deadline, like the message one.
+//! - the duplicate-history expiry index sorts by retention deadline, then
+//!   exact message identifier, so cleanup is deterministic and bounded.
 //!
 //! Every entity-scoped key is `tag || namespace || 0x00 || path || 0x00 || ..`,
 //! and a session-scoped key appends `session || 0x00` to that. The terminators
@@ -36,6 +38,8 @@ const TAG_SESSION: u8 = 0x08;
 const TAG_SESSION_READY: u8 = 0x09;
 const TAG_SESSION_LOCK: u8 = 0x0A;
 const TAG_SCHEDULED: u8 = 0x0B;
+const TAG_DUPLICATE_ID: u8 = 0x0C;
+const TAG_DUPLICATE_EXPIRY: u8 = 0x0D;
 
 const SEPARATOR: u8 = 0x00;
 
@@ -162,6 +166,46 @@ pub fn scheduled(
 ) -> Vec<u8> {
     let key = with_u64(scheduled_prefix(namespace, entity), enqueue_at.as_millis());
     with_u64(key, sequence.as_u64())
+}
+
+/// Exact nonpartitioned message-identifier lookup for duplicate detection.
+///
+/// The identifier is the final key component, so it needs no separator or
+/// escaping even when it contains arbitrary Unicode.
+pub fn duplicate_id(namespace: &NamespaceName, entity: &EntityPath, message_id: &str) -> Vec<u8> {
+    let mut key = entity_scope(TAG_DUPLICATE_ID, namespace, entity);
+    key.extend_from_slice(message_id.as_bytes());
+    key
+}
+
+pub fn duplicate_expiry_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_DUPLICATE_EXPIRY, namespace, entity)
+}
+
+/// One duplicate-history generation ordered by deadline before identifier.
+pub fn duplicate_expiry(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    expires_at: Timestamp,
+    message_id: &str,
+) -> Vec<u8> {
+    let mut key = with_u64(
+        duplicate_expiry_prefix(namespace, entity),
+        expires_at.as_millis(),
+    );
+    key.extend_from_slice(message_id.as_bytes());
+    key
+}
+
+/// Reads the deadline and exact identifier from a duplicate expiry key.
+pub fn duplicate_expiry_parts<'a>(prefix: &[u8], key: &'a [u8]) -> Option<(Timestamp, &'a str)> {
+    let rest = key.get(prefix.len()..)?;
+    let deadline: [u8; 8] = rest.get(..8)?.try_into().ok()?;
+    let message_id = std::str::from_utf8(rest.get(8..)?).ok()?;
+    Some((
+        Timestamp::from_millis(u64::from_be_bytes(deadline)),
+        message_id,
+    ))
 }
 
 pub fn deferred_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
@@ -365,6 +409,42 @@ mod tests {
                 (Timestamp::from_millis(100), SequenceNumber::new(9)),
                 (Timestamp::from_millis(200), SequenceNumber::new(1)),
             ]
+        );
+    }
+
+    #[test]
+    fn duplicate_expiry_keys_sort_by_deadline_and_preserve_exact_ids() {
+        let prefix = duplicate_expiry_prefix(&namespace(), &entity());
+        let mut keys = [
+            duplicate_expiry(
+                &namespace(),
+                &entity(),
+                Timestamp::from_millis(200),
+                "same\0bytes",
+            ),
+            duplicate_expiry(&namespace(), &entity(), Timestamp::from_millis(100), "zeta"),
+            duplicate_expiry(
+                &namespace(),
+                &entity(),
+                Timestamp::from_millis(100),
+                "alpha",
+            ),
+        ];
+        keys.sort();
+
+        assert_eq!(
+            keys.iter()
+                .filter_map(|key| duplicate_expiry_parts(&prefix, key))
+                .collect::<Vec<_>>(),
+            vec![
+                (Timestamp::from_millis(100), "alpha"),
+                (Timestamp::from_millis(100), "zeta"),
+                (Timestamp::from_millis(200), "same\0bytes"),
+            ]
+        );
+        assert_ne!(
+            duplicate_id(&namespace(), &entity(), "42"),
+            duplicate_id(&namespace(), &entity(), "042")
         );
     }
 

@@ -893,9 +893,13 @@ enum SendOutcome {
 impl SendOutcome {
     fn matches(self, outcome: &CommandOutcome) -> bool {
         match (self, outcome) {
-            (Self::Single, CommandOutcome::Sent { .. }) => true,
-            (Self::Batch(expected), CommandOutcome::BatchSent { sequences }) => {
+            (
+                Self::Single,
+                CommandOutcome::Sent { .. } | CommandOutcome::DuplicateSuppressed { .. },
+            ) => true,
+            (Self::Batch(expected), CommandOutcome::BatchSent { sequences, stored }) => {
                 sequences.len() == expected
+                    && u32::try_from(expected).is_ok_and(|expected| *stored <= expected)
             }
             _ => false,
         }
@@ -996,15 +1000,29 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_send_requires_one_sequence_per_child() {
+    fn a_send_accepts_suppression_and_a_batch_requires_one_sequence_per_child() {
+        assert!(
+            SendOutcome::Single.matches(&CommandOutcome::DuplicateSuppressed {
+                sequence: domain::SequenceNumber::new(1)
+            })
+        );
         assert!(SendOutcome::Batch(2).matches(&CommandOutcome::BatchSent {
             sequences: vec![
                 domain::SequenceNumber::new(1),
                 domain::SequenceNumber::new(2)
-            ]
+            ],
+            stored: 1,
         }));
         assert!(!SendOutcome::Batch(2).matches(&CommandOutcome::BatchSent {
-            sequences: vec![domain::SequenceNumber::new(1)]
+            sequences: vec![domain::SequenceNumber::new(1)],
+            stored: 1,
+        }));
+        assert!(!SendOutcome::Batch(2).matches(&CommandOutcome::BatchSent {
+            sequences: vec![
+                domain::SequenceNumber::new(1),
+                domain::SequenceNumber::new(2)
+            ],
+            stored: 3,
         }));
         assert!(!SendOutcome::Batch(1).matches(&CommandOutcome::Sent {
             sequence: domain::SequenceNumber::new(1)

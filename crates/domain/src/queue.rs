@@ -7,6 +7,11 @@ pub const MAX_LOCK_DURATION_MILLIS: u64 = 5 * 60 * 1_000;
 pub const DEFAULT_LOCK_DURATION_MILLIS: u64 = 60 * 1_000;
 pub const DEFAULT_MAX_DELIVERY_COUNT: u32 = 10;
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 256 * 1024;
+/// Service Bus default when duplicate detection is configured without an
+/// explicit history window.
+pub const DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS: u64 = 10 * 60 * 1_000;
+pub const MIN_DUPLICATE_DETECTION_HISTORY_MILLIS: u64 = 20 * 1_000;
+pub const MAX_DUPLICATE_DETECTION_HISTORY_MILLIS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueueConfig {
@@ -20,6 +25,11 @@ pub struct QueueConfig {
     /// delivered to a receiver holding that session's lock. Ordering within a
     /// session is the only FIFO guarantee the broker makes.
     pub requires_session: bool,
+    /// Whether repeated non-empty message identifiers are accepted but
+    /// suppressed within this entity's configured history window.
+    pub requires_duplicate_detection: bool,
+    /// How long an accepted message identifier remains a duplicate.
+    pub duplicate_detection_history_millis: u64,
 }
 
 impl Default for QueueConfig {
@@ -30,6 +40,8 @@ impl Default for QueueConfig {
             default_time_to_live_millis: None,
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             requires_session: false,
+            requires_duplicate_detection: false,
+            duplicate_detection_history_millis: DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS,
         }
     }
 }
@@ -52,6 +64,16 @@ impl QueueConfig {
         }
         if self.default_time_to_live_millis == Some(0) {
             return Err(QueueConfigError::TimeToLiveTooShort);
+        }
+        if self.duplicate_detection_history_millis < MIN_DUPLICATE_DETECTION_HISTORY_MILLIS {
+            return Err(QueueConfigError::DuplicateDetectionHistoryTooShort {
+                minimum_millis: MIN_DUPLICATE_DETECTION_HISTORY_MILLIS,
+            });
+        }
+        if self.duplicate_detection_history_millis > MAX_DUPLICATE_DETECTION_HISTORY_MILLIS {
+            return Err(QueueConfigError::DuplicateDetectionHistoryTooLong {
+                maximum_millis: MAX_DUPLICATE_DETECTION_HISTORY_MILLIS,
+            });
         }
         Ok(self)
     }
@@ -89,6 +111,10 @@ pub enum QueueConfigError {
     MaxMessageBytesTooSmall,
     #[error("default time to live must be at least one millisecond when set")]
     TimeToLiveTooShort,
+    #[error("duplicate-detection history must be at least {minimum_millis} milliseconds")]
+    DuplicateDetectionHistoryTooShort { minimum_millis: u64 },
+    #[error("duplicate-detection history cannot exceed {maximum_millis} milliseconds")]
+    DuplicateDetectionHistoryTooLong { maximum_millis: u64 },
 }
 
 #[cfg(test)]
@@ -134,5 +160,44 @@ mod tests {
         let counters = QueueCounters::default();
         assert_eq!(counters.next_sequence, 1);
         assert_eq!(counters.next_lock_token, 1);
+    }
+
+    #[test]
+    fn duplicate_detection_history_enforces_service_bus_bounds() {
+        let too_short = QueueConfig {
+            duplicate_detection_history_millis: MIN_DUPLICATE_DETECTION_HISTORY_MILLIS - 1,
+            ..QueueConfig::default()
+        };
+        assert_eq!(
+            too_short.validate(),
+            Err(QueueConfigError::DuplicateDetectionHistoryTooShort {
+                minimum_millis: MIN_DUPLICATE_DETECTION_HISTORY_MILLIS,
+            })
+        );
+
+        let too_long = QueueConfig {
+            duplicate_detection_history_millis: MAX_DUPLICATE_DETECTION_HISTORY_MILLIS + 1,
+            ..QueueConfig::default()
+        };
+        assert_eq!(
+            too_long.validate(),
+            Err(QueueConfigError::DuplicateDetectionHistoryTooLong {
+                maximum_millis: MAX_DUPLICATE_DETECTION_HISTORY_MILLIS,
+            })
+        );
+
+        for history in [
+            MIN_DUPLICATE_DETECTION_HISTORY_MILLIS,
+            MAX_DUPLICATE_DETECTION_HISTORY_MILLIS,
+        ] {
+            assert!(
+                QueueConfig {
+                    duplicate_detection_history_millis: history,
+                    ..QueueConfig::default()
+                }
+                .validate()
+                .is_ok()
+            );
+        }
     }
 }

@@ -2,10 +2,10 @@ using Azure;
 using Azure.Core.Amqp;
 using Azure.Messaging.ServiceBus;
 
-if (args.Length != 9)
+if (args.Length != 10)
 {
     Console.Error.WriteLine(
-        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <peek-queue> <schedule-queue> <session-queue> <key-name> <key>");
+        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <peek-queue> <schedule-queue> <dedupe-queue> <session-queue> <key-name> <key>");
     return 2;
 }
 
@@ -15,9 +15,10 @@ string queue = args[2];
 string batchQueue = args[3];
 string peekQueue = args[4];
 string scheduleQueue = args[5];
-string sessionQueue = args[6];
-string keyName = args[7];
-string key = args[8];
+string dedupeQueue = args[6];
+string sessionQueue = args[7];
+string keyName = args[8];
+string key = args[9];
 
 var options = new ServiceBusClientOptions
 {
@@ -854,6 +855,105 @@ if (!Equals(deadLetteredDeferred.ApplicationProperties["defer-stage"], "deadlett
 }
 await deadLetterReceiver.CompleteMessageAsync(deadLetteredDeferred);
 
+await using ServiceBusSender dedupeSender = client.CreateSender(dedupeQueue);
+await using ServiceBusReceiver dedupeReceiver = client.CreateReceiver(
+    dedupeQueue,
+    new ServiceBusReceiverOptions { PrefetchCount = 8 });
+await dedupeSender.SendMessageAsync(new ServiceBusMessage("dedupe-singular-first")
+{
+    MessageId = "dedupe-singular",
+});
+await dedupeSender.SendMessageAsync(new ServiceBusMessage("dedupe-singular-second")
+{
+    MessageId = "dedupe-singular",
+});
+await dedupeSender.SendMessagesAsync(new[]
+{
+    new ServiceBusMessage("dedupe-batch-a-first") { MessageId = "dedupe-batch-a" },
+    new ServiceBusMessage("dedupe-batch-a-second") { MessageId = "dedupe-batch-a" },
+    new ServiceBusMessage("dedupe-batch-b-first") { MessageId = "dedupe-batch-b" },
+    new ServiceBusMessage("dedupe-batch-b-second") { MessageId = "dedupe-batch-b" },
+});
+
+IReadOnlyList<ServiceBusReceivedMessage> deduplicated =
+    await dedupeReceiver.ReceiveMessagesAsync(3, TimeSpan.FromSeconds(10));
+if (deduplicated.Count != 3 ||
+    deduplicated.Select(message => message.Body.ToString()).ToArray() is not
+    ["dedupe-singular-first", "dedupe-batch-a-first", "dedupe-batch-b-first"])
+{
+    Console.Error.WriteLine(
+        "duplicate detection retained the wrong singular or batch messages: " +
+        string.Join(", ", deduplicated.Select(message => message.Body.ToString())));
+    return 72;
+}
+await Task.WhenAll(
+    deduplicated.Select(message => dedupeReceiver.CompleteMessageAsync(message)));
+if (await dedupeReceiver.ReceiveMessageAsync(TimeSpan.FromMilliseconds(500)) is not null)
+{
+    Console.Error.WriteLine("a duplicate singular or batch message remained receivable");
+    return 73;
+}
+
+DateTimeOffset dedupeScheduledAt = DateTimeOffset.UtcNow.AddHours(1);
+long scheduledFirstSequence = await dedupeSender.ScheduleMessageAsync(
+    new ServiceBusMessage("dedupe-scheduled-first")
+    {
+        MessageId = "dedupe-scheduled-first",
+    },
+    dedupeScheduledAt);
+await dedupeSender.SendMessageAsync(new ServiceBusMessage("dedupe-immediate-second")
+{
+    MessageId = "dedupe-scheduled-first",
+});
+ServiceBusReceivedMessage? scheduledFirst =
+    await dedupeReceiver.PeekMessageAsync(scheduledFirstSequence);
+if (scheduledFirst?.Body.ToString() != "dedupe-scheduled-first" ||
+    scheduledFirst.State != ServiceBusMessageState.Scheduled ||
+    scheduledFirst.SequenceNumber != scheduledFirstSequence)
+{
+    Console.Error.WriteLine(
+        $"scheduled-first duplicate detection kept the wrong message: " +
+        $"body={scheduledFirst?.Body}, state={scheduledFirst?.State}, " +
+        $"sequence={scheduledFirst?.SequenceNumber}");
+    return 74;
+}
+if (await dedupeReceiver.ReceiveMessageAsync(TimeSpan.FromMilliseconds(500)) is not null)
+{
+    Console.Error.WriteLine("an immediate duplicate of a scheduled message became receivable");
+    return 75;
+}
+await dedupeSender.CancelScheduledMessageAsync(scheduledFirstSequence);
+if (await dedupeReceiver.PeekMessageAsync(scheduledFirstSequence) is not null)
+{
+    Console.Error.WriteLine("cancelling the scheduled-first winner left a message behind");
+    return 76;
+}
+
+await dedupeSender.SendMessageAsync(new ServiceBusMessage("dedupe-immediate-first")
+{
+    MessageId = "dedupe-immediate-first",
+});
+await dedupeSender.SendMessageAsync(new ServiceBusMessage("dedupe-scheduled-second")
+{
+    MessageId = "dedupe-immediate-first",
+    ScheduledEnqueueTime = dedupeScheduledAt,
+});
+ServiceBusReceivedMessage? immediateFirst =
+    await dedupeReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (immediateFirst?.Body.ToString() != "dedupe-immediate-first")
+{
+    Console.Error.WriteLine(
+        $"immediate-first duplicate detection kept the wrong message: {immediateFirst?.Body}");
+    return 77;
+}
+await dedupeReceiver.CompleteMessageAsync(immediateFirst);
+if (await dedupeReceiver.PeekMessageAsync() is not null ||
+    await dedupeReceiver.ReceiveMessageAsync(TimeSpan.FromMilliseconds(500)) is not null)
+{
+    Console.Error.WriteLine("the dedupe queue was not truly empty after cross-suppression");
+    return 78;
+}
+
 await using ServiceBusSender sessionSender = client.CreateSender(sessionQueue);
 await sessionSender.SendMessageAsync(new ServiceBusMessage("official-session-current")
 {
@@ -936,5 +1036,6 @@ Console.WriteLine(
     "envelope fidelity, send/receive/renew/complete, " +
     "abandon/redelivery/property-update, dead-letter/DLQ receive/complete, " +
     "defer/deferred-receive/management-disposition, peek/browse pagination, " +
-    "schedule/cancel/timer activation, and session renew/state/peek passed");
+    "schedule/cancel/timer activation, duplicate detection, " +
+    "and session renew/state/peek passed");
 return 0;

@@ -22,4 +22,6 @@ pub struct EntityDefinition {
     pub placement_group_id: PlacementGroupId,
     pub max_size_bytes: u64,
     pub requires_session: bool,
+    pub requires_duplicate_detection: bool,
+    pub duplicate_detection_history_millis: u64,
 }

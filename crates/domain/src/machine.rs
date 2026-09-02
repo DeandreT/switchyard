@@ -10,6 +10,7 @@
 //! the injected store.
 
 mod deferred;
+mod duplicate;
 mod expiry;
 mod peek;
 mod scheduling;
@@ -213,6 +214,9 @@ impl<S: StateStore> StateMachine<S> {
             CommandKind::ExpireMessages => self.expire_messages(command, &mut batch)?,
             CommandKind::ExpireSessionLocks => self.expire_session_locks(command, &mut batch)?,
             CommandKind::ActivateScheduled => self.activate_scheduled(command, &mut batch)?,
+            CommandKind::ExpireDuplicateHistory => {
+                self.expire_duplicate_history(command, &mut batch)?
+            }
         };
 
         // A command that changed nothing commits nothing. The clock advance is
@@ -471,6 +475,7 @@ impl<S: StateStore> StateMachine<S> {
             max_delivery_count: u32::MAX,
             default_time_to_live_millis: None,
             requires_session: false,
+            requires_duplicate_detection: false,
             ..config
         };
         batch.push_put(key, codec::encode(&config)?);

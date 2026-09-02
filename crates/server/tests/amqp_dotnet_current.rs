@@ -32,6 +32,14 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
         ("peek-orders", QueueConfig::default()),
         ("scheduled-orders", QueueConfig::default()),
         (
+            "dedupe-orders",
+            QueueConfig {
+                requires_duplicate_detection: true,
+                duplicate_detection_history_millis: 10 * 60 * 1_000,
+                ..QueueConfig::default()
+            },
+        ),
+        (
             "sessions",
             QueueConfig {
                 requires_session: true,
@@ -107,6 +115,7 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             .arg("batch-orders")
             .arg("peek-orders")
             .arg("scheduled-orders")
+            .arg("dedupe-orders")
             .arg("sessions")
             .arg(RULE)
             .arg(KEY)
@@ -131,7 +140,7 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             "send/receive/renew/complete, abandon/redelivery/property-update, ",
             "dead-letter/DLQ receive/complete, ",
             "defer/deferred-receive/management-disposition, ",
-            "peek/browse pagination, schedule/cancel/timer activation, ",
+            "peek/browse pagination, schedule/cancel/timer activation, duplicate detection, ",
             "and session renew/state/peek passed"
         )),
         "the client exited without reporting the completed workflow"

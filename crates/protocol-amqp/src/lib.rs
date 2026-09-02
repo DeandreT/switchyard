@@ -28,9 +28,9 @@ pub use crate::{
     authorization::SharedAccessAuthentication,
     broker::{Broker, BrokerRejection},
     condition::{
-        ENTITY_ALREADY_EXISTS, INTERNAL_ERROR, MESSAGE_LOCK_LOST, MESSAGE_SIZE_EXCEEDED,
-        NOT_ALLOWED, NOT_FOUND, PRECONDITION_FAILED, RESOURCE_LOCKED, SESSION_CANNOT_BE_LOCKED,
-        SESSION_LOCK_LOST, TIMEOUT, condition_for, is_retryable,
+        ENTITY_ALREADY_EXISTS, INTERNAL_ERROR, INVALID_FIELD, MESSAGE_LOCK_LOST,
+        MESSAGE_SIZE_EXCEEDED, NOT_ALLOWED, NOT_FOUND, PRECONDITION_FAILED, RESOURCE_LOCKED,
+        SESSION_CANNOT_BE_LOCKED, SESSION_LOCK_LOST, TIMEOUT, condition_for, is_retryable,
     },
     listener::AmqpListener,
     management::{

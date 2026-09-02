@@ -190,6 +190,9 @@ pub enum CommandKind {
     /// Proposed by the leader's timer worker. Re-enqueues due scheduled
     /// placeholders with new active sequence numbers.
     ActivateScheduled,
+    /// Proposed by the leader's timer worker. Removes message identifiers whose
+    /// duplicate-detection history window elapsed.
+    ExpireDuplicateHistory,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -198,14 +201,25 @@ pub enum CommandOutcome {
     Sent {
         sequence: SequenceNumber,
     },
+    /// The send was accepted but its message identifier was still present in
+    /// the entity's duplicate-detection history.
+    DuplicateSuppressed {
+        sequence: SequenceNumber,
+    },
     BatchSent {
         sequences: Vec<SequenceNumber>,
+        /// Children that were actually persisted; every input still receives a
+        /// deterministic sequence slot in `sequences`.
+        stored: u32,
     },
     ScheduledCancelled {
         cancelled: u32,
     },
     ScheduledActivated {
         activated: u32,
+    },
+    DuplicateHistoryExpired {
+        removed: u32,
     },
     Peeked(Vec<Delivery>),
     /// `None` when the queue held no deliverable message.
