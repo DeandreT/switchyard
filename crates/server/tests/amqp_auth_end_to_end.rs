@@ -448,6 +448,20 @@ async fn cbs_grants_send_but_not_listen() -> Result<(), Box<dyn Error>> {
     .await?;
     assert_management_status(&peek_response, 401);
 
+    let mut rules_body = OrderedMap::new();
+    rules_body.insert(Value::String(String::from("skip")), Value::Int(0));
+    rules_body.insert(Value::String(String::from("top")), Value::Int(100));
+    let rules_response = management_request(
+        &mut management_requests,
+        &mut management_responses,
+        reply_to,
+        "send-rules-1",
+        protocol_amqp::ENUMERATE_RULES_OPERATION,
+        rules_body,
+    )
+    .await?;
+    assert_management_status(&rules_response, 401);
+
     let mut cancel_body = OrderedMap::new();
     cancel_body.insert(
         Value::String(String::from("sequence-numbers")),

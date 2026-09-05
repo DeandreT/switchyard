@@ -9,10 +9,12 @@
 //! Nothing here reads a clock, generates a random value, or performs I/O beyond
 //! the injected store.
 
+mod catalog;
 mod deferred;
 mod duplicate;
 mod expiry;
 mod peek;
+mod rules;
 mod scheduling;
 mod send;
 mod topic;
@@ -90,6 +92,13 @@ impl<S: StateStore> StateMachine<S> {
             }
             CommandKind::CreateSubscription { name, config } => {
                 self.create_subscription(command, name, *config, &mut batch)?
+            }
+            CommandKind::CreateRule { name, filter } => {
+                self.create_rule(command, name, filter, &mut batch)?
+            }
+            CommandKind::DeleteRule { name } => self.delete_rule(command, name, &mut batch)?,
+            CommandKind::ListRules { skip, max_rules } => {
+                self.list_rules(command, *skip, *max_rules)?
             }
             CommandKind::Send {
                 message_id,
@@ -273,55 +282,6 @@ impl<S: StateStore> StateMachine<S> {
 
     pub fn last_applied_time(&self) -> Result<Timestamp, BrokerError> {
         Ok(self.read(&keys::clock())?.unwrap_or(Timestamp::UNIX_EPOCH))
-    }
-
-    pub fn queue_config(
-        &self,
-        namespace: &NamespaceName,
-        entity: &EntityPath,
-    ) -> Result<Option<QueueConfig>, BrokerError> {
-        self.read(&keys::queue_config(namespace, entity))
-    }
-
-    /// Every queue in the store, in key order, across every namespace. The timer
-    /// worker walks this to learn what there is to sweep.
-    pub fn queues(&self, limit: usize) -> Result<Vec<(NamespaceName, EntityPath)>, BrokerError> {
-        self.queues_after(None, limit)
-    }
-
-    /// Queues strictly after `after`, in key order across every namespace.
-    ///
-    /// The timer keeps the last queue from a full page and resumes here on its
-    /// next tick. The cursor is an entity identity rather than a storage key so
-    /// it remains meaningful if that queue is deleted between pages.
-    pub fn queues_after(
-        &self,
-        after: Option<&(NamespaceName, EntityPath)>,
-        limit: usize,
-    ) -> Result<Vec<(NamespaceName, EntityPath)>, BrokerError> {
-        let prefix = keys::queue_config_prefix();
-        let after_key = after.map(|(namespace, entity)| keys::queue_config(namespace, entity));
-        // `scan_from` is inclusive. Read one extra entry when resuming so the
-        // cursor itself can be discarded without shrinking the requested page.
-        let scan_limit = limit.saturating_add(usize::from(after_key.is_some()));
-        self.store
-            .scan_from(&prefix, after_key.as_deref().unwrap_or(&prefix), scan_limit)?
-            .into_iter()
-            .filter(|(key, _)| {
-                after_key
-                    .as_ref()
-                    .is_none_or(|after_key| key.as_slice() > after_key.as_slice())
-            })
-            .take(limit)
-            .map(|(key, _)| {
-                let (namespace, entity) =
-                    keys::entity_scope_parts(&key).ok_or(BrokerError::MalformedIndexKey)?;
-                Ok((
-                    NamespaceName::new(namespace)?,
-                    EntityPath::from_internal(entity)?,
-                ))
-            })
-            .collect()
     }
 
     pub fn message(

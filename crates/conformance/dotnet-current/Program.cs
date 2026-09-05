@@ -2,10 +2,10 @@ using Azure;
 using Azure.Core.Amqp;
 using Azure.Messaging.ServiceBus;
 
-if (args.Length != 16)
+if (args.Length != 18)
 {
     Console.Error.WriteLine(
-        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <peek-queue> <schedule-queue> <dedupe-queue> <session-queue> <topic> <subscription-a> <subscription-b> <case-queue> <case-topic> <case-subscription> <key-name> <key>");
+        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <peek-queue> <schedule-queue> <dedupe-queue> <session-queue> <topic> <subscription-a> <subscription-b> <case-queue> <case-topic> <case-subscription> <rule-topic> <rule-subscription> <key-name> <key>");
     return 2;
 }
 
@@ -23,8 +23,10 @@ string secondSubscription = args[10];
 string caseQueue = args[11];
 string caseTopic = args[12];
 string caseSubscription = args[13];
-string keyName = args[14];
-string key = args[15];
+string ruleTopic = args[14];
+string ruleSubscription = args[15];
+string keyName = args[16];
+string key = args[17];
 
 var options = new ServiceBusClientOptions
 {
@@ -1058,6 +1060,13 @@ if (caseIdentityFailure is not null)
     return 96;
 }
 
+string? ruleFailure = await RuleConformance.RunAsync(client, ruleTopic, ruleSubscription);
+if (ruleFailure is not null)
+{
+    Console.Error.WriteLine(ruleFailure);
+    return 97;
+}
+
 Console.WriteLine(
     "official .NET Service Bus client batch send/prefetch/concurrent settlement, " +
     "envelope fidelity, send/receive/renew/complete, " +
@@ -1065,5 +1074,6 @@ Console.WriteLine(
     "defer/deferred-receive/management-disposition, peek/browse pagination, " +
     "schedule/cancel/timer activation, duplicate detection, topic fan-out, " +
     "case-insensitive queue/topic/subscription identity, " +
+    "durable correlation rule management and filtered fan-out, " +
     "and session renew/state/peek passed");
 return 0;

@@ -1,6 +1,10 @@
-use std::fmt;
+use std::{
+    cmp::Ordering,
+    fmt,
+    hash::{Hash, Hasher},
+};
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 pub const MAX_NAMESPACE_NAME_BYTES: usize = 50;
@@ -11,6 +15,8 @@ pub const MAX_PLACEMENT_GROUP_ID_BYTES: usize = 128;
 pub const MAX_SESSION_ID_BYTES: usize = 128;
 /// The Service Bus subscription-name limit.
 pub const MAX_SUBSCRIPTION_NAME_CHARACTERS: usize = 50;
+/// The Service Bus subscription-rule name limit in UTF-16 code units.
+pub const MAX_RULE_NAME_CHARACTERS: usize = 50;
 /// Suffix naming an entity's dead-letter queue, per the Service Bus path model.
 pub const DEAD_LETTER_QUEUE_SUFFIX: &str = "/$deadletterqueue";
 
@@ -230,6 +236,108 @@ impl<'de> Deserialize<'de> for SubscriptionName {
 impl fmt::Display for SubscriptionName {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
+    }
+}
+
+/// One case-insensitive rule identity below a subscription.
+///
+/// Custom rule names use the same resource-name grammar as subscriptions.
+/// Every new subscription also owns the well-known `$Default` system rule,
+/// which is the only exception to that grammar.
+#[derive(Clone, Debug)]
+pub struct RuleName {
+    canonical: String,
+    display: String,
+}
+
+impl RuleName {
+    pub fn new(value: impl Into<String>) -> Result<Self, IdentifierError> {
+        let display = value.into();
+        if display.trim().is_empty() {
+            return Err(IdentifierError::Empty { kind: "rule name" });
+        }
+        if display.encode_utf16().count() > MAX_RULE_NAME_CHARACTERS {
+            return Err(IdentifierError::TooManyCharacters {
+                kind: "rule name",
+                maximum: MAX_RULE_NAME_CHARACTERS,
+            });
+        }
+        let is_default = display.eq_ignore_ascii_case("$default");
+        let first = display
+            .chars()
+            .next()
+            .expect("a blank rule name was rejected above");
+        let last = display
+            .chars()
+            .next_back()
+            .expect("a blank rule name was rejected above");
+        if !is_default
+            && (!first.is_ascii_alphanumeric()
+                || !last.is_ascii_alphanumeric()
+                || !display.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || ".-_".contains(character)
+                }))
+        {
+            return Err(IdentifierError::RestrictedCharacter { kind: "rule name" });
+        }
+        let mut canonical = display.clone();
+        canonical.make_ascii_lowercase();
+        Ok(Self { canonical, display })
+    }
+
+    /// The ASCII case-folded identity used for keys and comparisons.
+    pub fn as_str(&self) -> &str {
+        &self.canonical
+    }
+
+    /// The caller-provided spelling returned by management enumeration.
+    pub fn display_name(&self) -> &str {
+        &self.display
+    }
+}
+
+impl PartialEq for RuleName {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical == other.canonical
+    }
+}
+
+impl Eq for RuleName {}
+
+impl PartialOrd for RuleName {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RuleName {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.canonical.cmp(&other.canonical)
+    }
+}
+
+impl Hash for RuleName {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.canonical.hash(state);
+    }
+}
+
+impl Serialize for RuleName {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.display)
+    }
+}
+
+impl<'de> Deserialize<'de> for RuleName {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for RuleName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.display)
     }
 }
 
@@ -592,6 +700,71 @@ mod tests {
         for name in ["Accounting", "north-america", "priority.high", "team_2"] {
             assert!(SubscriptionName::new(name).is_ok(), "{name:?}");
         }
+    }
+
+    #[test]
+    fn rule_names_are_case_insensitive_and_accept_the_default_name() {
+        let default = RuleName::new("$Default").expect("the well-known default rule is valid");
+        assert_eq!(default.as_str(), "$default");
+        assert_eq!(default.display_name(), "$Default");
+
+        let custom = RuleName::new("HighPriority").expect("a custom rule is valid");
+        assert_eq!(custom.as_str(), "highpriority");
+        assert_eq!(custom.display_name(), "HighPriority");
+        assert_eq!(
+            custom,
+            RuleName::new("HIGHPRIORITY").expect("same identity")
+        );
+        assert_eq!(
+            RuleName::new("r".repeat(MAX_RULE_NAME_CHARACTERS + 1)),
+            Err(IdentifierError::TooManyCharacters {
+                kind: "rule name",
+                maximum: MAX_RULE_NAME_CHARACTERS,
+            })
+        );
+        assert!(RuleName::new("r".repeat(MAX_RULE_NAME_CHARACTERS)).is_ok());
+        for invalid in [
+            String::new(),
+            String::from("   \t"),
+            String::from("forged\0rule"),
+            String::from("folder/rule"),
+            String::from("folder\\rule"),
+            String::from("rule@host"),
+            String::from("rule?query"),
+            String::from("rule#fragment"),
+            String::from("rule*wildcard"),
+            String::from("rule with space"),
+            String::from(".leading"),
+            String::from("trailing-"),
+            String::from("café"),
+        ] {
+            assert!(RuleName::new(invalid).is_err());
+        }
+        for valid in [
+            "a",
+            "Accounting",
+            "north-america",
+            "priority.high",
+            "team_2",
+        ] {
+            assert!(RuleName::new(valid).is_ok(), "{valid:?}");
+        }
+    }
+
+    #[test]
+    fn rule_name_deserialization_reestablishes_canonical_identity() {
+        let encoded = postcard::to_stdvec(&String::from("$Default")).expect("rule name encodes");
+        let decoded: RuleName = postcard::from_bytes(&encoded).expect("rule name decodes");
+        assert_eq!(decoded.as_str(), "$default");
+        assert_eq!(decoded.display_name(), "$Default");
+
+        let reencoded = postcard::to_stdvec(&decoded).expect("rule name re-encodes");
+        let display: String = postcard::from_bytes(&reencoded).expect("display name decodes");
+        assert_eq!(display, "$Default");
+
+        let invalid =
+            postcard::to_stdvec(&String::from("forged\0rule")).expect("raw invalid name encodes");
+        assert!(postcard::from_bytes::<RuleName>(&invalid).is_err());
     }
 
     #[test]

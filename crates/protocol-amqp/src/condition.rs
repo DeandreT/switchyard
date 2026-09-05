@@ -29,13 +29,16 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
     match error {
         BrokerError::QueueNotFound
         | BrokerError::TopicNotFound
+        | BrokerError::SubscriptionNotFound
+        | BrokerError::RuleNotFound { .. }
         | BrokerError::MessageNotFound { .. }
         | BrokerError::MessageNotDeferred { .. }
         | BrokerError::MessageNotScheduled { .. } => NOT_FOUND,
         BrokerError::QueueAlreadyExists
         | BrokerError::TopicAlreadyExists
         | BrokerError::EntityAlreadyExists
-        | BrokerError::SubscriptionAlreadyExists => ENTITY_ALREADY_EXISTS,
+        | BrokerError::SubscriptionAlreadyExists
+        | BrokerError::RuleAlreadyExists { .. } => ENTITY_ALREADY_EXISTS,
 
         // The client's claim on the message is gone. Saying so precisely is what
         // lets an SDK stop trying to settle and wait for redelivery instead.
@@ -70,10 +73,15 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::DuplicateDeferredSequence { .. }
         | BrokerError::DeferredMessageSessionMismatch { .. } => NOT_ALLOWED,
 
-        BrokerError::SubscriptionLimitExceeded { .. } => RESOURCE_LIMIT_EXCEEDED,
+        BrokerError::SubscriptionLimitExceeded { .. } | BrokerError::RuleLimitExceeded { .. } => {
+            RESOURCE_LIMIT_EXCEEDED
+        }
 
         BrokerError::MessageTooLarge { .. } => MESSAGE_SIZE_EXCEEDED,
-        BrokerError::MessageIdTooLong { .. } => INVALID_FIELD,
+        BrokerError::MessageIdTooLong { .. }
+        | BrokerError::EmptyRulePage
+        | BrokerError::RulePageTooLarge { .. }
+        | BrokerError::RuleConfig(_) => INVALID_FIELD,
         BrokerError::QueueConfig(_)
         | BrokerError::TopicConfig(_)
         | BrokerError::SubscriptionConfig(_) => PRECONDITION_FAILED,

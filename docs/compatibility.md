@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Queue single and atomic batch send; duplicate detection across immediate, batch, and scheduled sends; scheduled send/batch activation and cancellation; prefetched multi-message receive; independent settlement; receive-delete; envelope fidelity; renew; abandon/redelivery; defer and deferred receive; ordered peek pagination across active, locked, scheduled, deferred, session, and DLQ messages; dead-letter and DLQ receive/complete; session renew/state; immediate default-rule topic fanout and independent subscription settlement; case-insensitive queue, topic, and subscription identity; AMQP over TCP and WebSockets | Planned | Experimental gates on 7.20.2 |
+| Official .NET SDK, current stable | Queue single and atomic batch send; duplicate detection across immediate, batch, and scheduled sends; scheduled send/batch activation and cancellation; prefetched multi-message receive; independent settlement; receive-delete; envelope fidelity; renew; abandon/redelivery; defer and deferred receive; ordered peek pagination across active, locked, scheduled, deferred, session, and DLQ messages; dead-letter and DLQ receive/complete; session renew/state; immediate topic fanout and independent subscription settlement; actionless true/false/correlation rule management and filtering; case-insensitive queue, topic, subscription, and rule identity; AMQP over TCP and WebSockets | Planned | Experimental gates on 7.20.2 |
 | Official .NET SDK, previous stable | Planned | Planned | Not implemented |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -34,8 +34,8 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine |
-| Topics and subscriptions | Pre-1.0 | Immediate non-session singular/batch fanout through the implicit `$Default` true rule; durable subscription queue lifecycle; AMQP mapping; Rust and current .NET clients end to end. Custom rules, sessions, scheduling, and topic duplicate detection: not implemented |
-| Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
+| Topics and subscriptions | Pre-1.0 | Immediate non-session singular/batch fanout through durable actionless rules; implicit `$Default`; subscription queue lifecycle; AMQP mapping; Rust and current .NET clients end to end. Sessions, scheduling, and topic duplicate detection: not implemented |
+| Correlation and SQL filters/actions | Pre-1.0 | True/false and typed correlation equality for non-session publications; durable create/delete/paginated enumeration through AMQP `ServiceBusRuleManager`; Rust and current .NET clients over TCP and WebSockets. Session-ID predicates, general SQL filters, and actions: not implemented |
 | Scheduling and cancellation | Pre-1.0 | State machine, timer activation, AMQP management and annotated-send mapping, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Dead-letter | Pre-1.0 | State machine, AMQP mapping, Rust and current .NET clients end to end |
@@ -86,8 +86,11 @@ behavior it currently enforces:
   subscriptions created later receive only later publications. Each copy then
   follows the ordinary queue lifecycle independently, including settlement,
   expiry, deferral, browsing, and its subscription DLQ. This first vertical
-  implements only the implicit `$Default` true rule and non-session immediate
-  publications; session IDs and scheduled topic sends are explicitly refused.
+  evaluates durable actionless true, false, and correlation rules for
+  non-session immediate publications. Predicates within one correlation filter
+  are ANDed, rules are ORed, and several actionless matches still produce one
+  copy. General SQL filters, rule actions, session IDs, and scheduled topic
+  sends are explicitly refused.
 - Receive-delete is at-most-once: the deletion commits before the transfer.
 - Peek is an inclusive, sequence-ordered, read-only snapshot over active,
   locked, scheduled, and deferred records. It never increments delivery count
@@ -193,8 +196,9 @@ null value, asks for the next available one; the attach response echoes the
 granted identifier and the initial session-lock deadline. The session is
 released when that link closes; renewing its lock and reading or writing its
 state use the entity's `$management` request/reply links, as do message-lock
-renewal, deferred receive by sequence number, and management disposition
-updates. Ordered peeking uses the same management node and returns either a
+renewal, deferred receive by sequence number, management disposition updates,
+and subscription rule creation, deletion, and enumeration. Ordered peeking
+uses the same management node and returns either a
 bounded page or a no-content response without changing broker state. Scheduling
 and cancellation use that node with Send authorization; receive-side operations
 require Listen authorization. Manage includes both rights. A transfer is
@@ -217,8 +221,9 @@ ordered peek pagination across active, locked, scheduled, deferred, session, and
 dead-letter messages, management and annotated-transfer scheduling,
 cancellation and timer activation, custom dead-lettering, dead-letter receive
 and completion, duplicate detection across immediate, batch, and scheduled
-sends, immediate topic fanout and independent subscription settlement, session
-state and renewal, and AMQP-over-TCP and WebSockets;
+sends, immediate filtered topic fanout, independent subscription settlement,
+actionless correlation-rule lifecycle, session state and renewal, and
+AMQP-over-TCP and WebSockets;
 the rest of that client gate remains incomplete.
 Dead-letter resubmission is not implemented.
 

@@ -7,7 +7,7 @@ currently pre-alpha. A deterministic state machine covers queue send and
 receive, both settlement modes, lock expiry, time-to-live expiry,
 dead-lettering and dead-letter receive, deferral and deferred retrieval,
 read-only message browsing, scheduled delivery and cancellation, duplicate
-detection, immediate default-rule topic fanout, and the session ownership and
+detection, immediate rule-filtered topic fanout, and the session ownership and
 session state described under [Message Semantics](#message-semantics). It runs
 over either the Fjall backend or the memory backend, so a single node survives
 a restart.
@@ -19,9 +19,9 @@ copies, and sessions across that edge, and sweeps lock, time-to-live,
 session-lock, and duplicate-history expiry while activating scheduled messages.
 JWT/OIDC, mTLS, policy administration,
 Raft, and compliance implementations remain to be built. Within the semantics
-below, custom subscription rules and actions, session-aware subscriptions,
-topic scheduling, topic duplicate detection, and configurable discard versus
-dead-letter behavior on TTL expiry are not implemented. The storage keyspace
+below, general SQL subscription filters and actions, session-aware
+subscriptions, topic scheduling, topic duplicate detection, and configurable
+discard versus dead-letter behavior on TTL expiry are not implemented. The storage keyspace
 layout under [Storage](#storage) is still a single record keyspace rather than
 the split listed there.
 
@@ -97,6 +97,7 @@ that engine starts. Switchyard implements the Service Bus-specific layer:
 - `$management` request/reply operations
 - Peek-lock and receive-delete settlement mappings
 - Scheduled, deferred, dead-letter, session, and sequence annotations
+- Subscription rule add, remove, and enumeration through AMQP management
 - AMQP transaction coordinator links and transactional dispositions
 - Compatible errors, status codes, link detach conditions, and retry hints
 
@@ -234,13 +235,18 @@ allocates topic-owned sequence numbers, then materializes one envelope copy in
 every subscription present at that command's position in the replicated order.
 All copies and the topic counter commit in one storage batch. A topic with no
 subscriptions still accepts the publication, and a subscription created later
-sees only later publications. Every subscription currently has only the
-implicit `$Default` true rule and otherwise uses the ordinary queue lifecycle,
-including independent lock, settlement, expiry, deferral, browsing, and DLQ
-state. The current backend stores a full payload copy per subscription; shared
-encrypted payload records and reference counting remain an optimization for
-the production storage layout. Custom filters and actions will require durable
-rule revisions and deterministic property overlays before they are exposed.
+sees only later publications. Every subscription is created atomically with
+the implicit `$Default` true rule and otherwise uses the ordinary queue
+lifecycle, including independent lock, settlement, expiry, deferral, browsing,
+and DLQ state. Actionless true, false, and correlation rules are durable and
+combined with OR semantics; every populated field inside one correlation
+filter is an exact, typed AND predicate. Several matching actionless rules
+still produce one subscription copy. Rule creation, deletion, and paginated
+enumeration use the Service Bus AMQP management contract. General SQL filters
+and SQL actions remain unimplemented; actions require deterministic per-copy
+property overlays before exposure. The current backend stores a full payload
+copy per subscription; shared encrypted payload records and reference counting
+remain an optimization for the production storage layout.
 
 ## Transactions And Forwarding
 

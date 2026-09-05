@@ -24,7 +24,9 @@
 //! [`crate::SessionId`] reject control characters, so no name can contain a zero
 //! byte and forge another scope's prefix.
 
-use crate::{EntityPath, NamespaceName, SequenceNumber, SessionId, SubscriptionName, Timestamp};
+use crate::{
+    EntityPath, NamespaceName, RuleName, SequenceNumber, SessionId, SubscriptionName, Timestamp,
+};
 
 const TAG_CLOCK: u8 = 0x00;
 const TAG_QUEUE_CONFIG: u8 = 0x01;
@@ -42,6 +44,7 @@ const TAG_DUPLICATE_ID: u8 = 0x0C;
 const TAG_DUPLICATE_EXPIRY: u8 = 0x0D;
 const TAG_TOPIC_CONFIG: u8 = 0x0E;
 const TAG_TOPIC_SUBSCRIPTION: u8 = 0x0F;
+const TAG_SUBSCRIPTION_RULE: u8 = 0x10;
 
 const SEPARATOR: u8 = 0x00;
 
@@ -105,6 +108,21 @@ pub fn topic_subscription(
 ) -> Vec<u8> {
     let mut key = topic_subscription_prefix(namespace, topic);
     key.extend_from_slice(subscription.as_str().as_bytes());
+    key
+}
+
+/// Every rule below one subscription, ordered by canonical rule name.
+pub fn subscription_rule_prefix(namespace: &NamespaceName, subscription: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_SUBSCRIPTION_RULE, namespace, subscription)
+}
+
+pub fn subscription_rule(
+    namespace: &NamespaceName,
+    subscription: &EntityPath,
+    rule: &RuleName,
+) -> Vec<u8> {
+    let mut key = subscription_rule_prefix(namespace, subscription);
+    key.extend_from_slice(rule.as_str().as_bytes());
     key
 }
 
@@ -517,6 +535,29 @@ mod tests {
         assert!(
             !topic_subscription(&namespace(), &other, &alpha)
                 .starts_with(&topic_subscription_prefix(&namespace(), &entity()))
+        );
+    }
+
+    #[test]
+    fn subscription_rule_keys_are_scoped_case_insensitive_and_name_ordered() {
+        let subscription = entity()
+            .subscription(&SubscriptionName::new("accounting").expect("valid subscription"))
+            .expect("valid subscription path");
+        let alpha = RuleName::new("Alpha").expect("valid rule");
+        let zeta = RuleName::new("zeta").expect("valid rule");
+        let prefix = subscription_rule_prefix(&namespace(), &subscription);
+        let alpha_key = subscription_rule(&namespace(), &subscription, &alpha);
+        let zeta_key = subscription_rule(&namespace(), &subscription, &zeta);
+        assert!(alpha_key.starts_with(&prefix));
+        assert!(zeta_key.starts_with(&prefix));
+        assert!(alpha_key < zeta_key);
+        assert_eq!(
+            alpha_key,
+            subscription_rule(
+                &namespace(),
+                &subscription,
+                &RuleName::new("ALPHA").expect("same canonical rule")
+            )
         );
     }
 

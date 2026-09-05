@@ -84,6 +84,8 @@ impl ManagementResponse {
         let status_code = match condition {
             crate::MESSAGE_LOCK_LOST | crate::SESSION_LOCK_LOST => 410,
             crate::NOT_FOUND => 404,
+            crate::ENTITY_ALREADY_EXISTS => 409,
+            crate::RESOURCE_LIMIT_EXCEEDED | crate::MESSAGE_SIZE_EXCEEDED => 403,
             crate::INVALID_FIELD | crate::NOT_ALLOWED | crate::PRECONDITION_FAILED => 400,
             crate::RESOURCE_LOCKED => 503,
             _ => 500,
@@ -183,5 +185,20 @@ mod tests {
 
         assert_eq!(response.status_code, 400);
         assert_eq!(response.error_condition, Some(crate::INVALID_FIELD));
+    }
+
+    #[test]
+    fn a_rule_quota_refusal_is_a_forbidden_management_response() {
+        let rejection = BrokerRejection::Refused(BrokerError::RuleLimitExceeded {
+            maximum: domain::MAX_SUBSCRIPTION_RULES,
+        });
+
+        let response = ManagementResponse::from_rejection(MessageId::Ulong(1), None, &rejection);
+
+        assert_eq!(response.status_code, 403);
+        assert_eq!(
+            response.error_condition,
+            Some(crate::RESOURCE_LIMIT_EXCEEDED)
+        );
     }
 }

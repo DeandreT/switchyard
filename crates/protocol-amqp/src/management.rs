@@ -24,12 +24,14 @@ use crate::{Broker, BrokerRejection, authorization::ConnectionAuthorization};
 mod deferred;
 mod peek;
 mod response;
+mod rules;
 mod scheduled;
 
 use self::response::ManagementResponse;
 
 pub use deferred::{RECEIVE_BY_SEQUENCE_NUMBER_OPERATION, UPDATE_DISPOSITION_OPERATION};
 pub use peek::PEEK_MESSAGE_OPERATION;
+pub use rules::{ADD_RULE_OPERATION, ENUMERATE_RULES_OPERATION, REMOVE_RULE_OPERATION};
 pub use scheduled::{CANCEL_SCHEDULED_MESSAGE_OPERATION, SCHEDULE_MESSAGE_OPERATION};
 
 pub const RENEW_LOCK_OPERATION: &str = "com.microsoft:renew-lock";
@@ -633,6 +635,15 @@ async fn process_request<B: Broker>(
             )
             .await
         }
+        ADD_RULE_OPERATION => {
+            rules::add(message, message_id, tracking_id, namespace, entity, broker).await
+        }
+        REMOVE_RULE_OPERATION => {
+            rules::remove(message, message_id, tracking_id, namespace, entity, broker).await
+        }
+        ENUMERATE_RULES_OPERATION => {
+            rules::enumerate(message, message_id, tracking_id, namespace, entity, broker).await
+        }
         SCHEDULE_MESSAGE_OPERATION => {
             scheduled::schedule(message, message_id, tracking_id, namespace, entity, broker).await
         }
@@ -1117,6 +1128,9 @@ mod tests {
             RENEW_SESSION_LOCK_OPERATION,
             GET_SESSION_STATE_OPERATION,
             SET_SESSION_STATE_OPERATION,
+            ADD_RULE_OPERATION,
+            REMOVE_RULE_OPERATION,
+            ENUMERATE_RULES_OPERATION,
         ] {
             assert_eq!(management_permission(operation), Permission::Listen);
         }

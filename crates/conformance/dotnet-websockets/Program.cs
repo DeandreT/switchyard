@@ -1,10 +1,10 @@
 using Azure;
 using Azure.Messaging.ServiceBus;
 
-if (args.Length != 15)
+if (args.Length != 17)
 {
     Console.Error.WriteLine(
-        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <schedule-queue> <dedupe-queue> <session-queue> <topic> <subscription-a> <subscription-b> <case-queue> <case-topic> <case-subscription> <key-name> <key>");
+        "usage: <namespace> <custom-endpoint> <queue> <batch-queue> <schedule-queue> <dedupe-queue> <session-queue> <topic> <subscription-a> <subscription-b> <case-queue> <case-topic> <case-subscription> <rule-topic> <rule-subscription> <key-name> <key>");
     return 2;
 }
 
@@ -21,8 +21,10 @@ string secondSubscription = args[9];
 string caseQueue = args[10];
 string caseTopic = args[11];
 string caseSubscription = args[12];
-string keyName = args[13];
-string key = args[14];
+string ruleTopic = args[13];
+string ruleSubscription = args[14];
+string keyName = args[15];
+string key = args[16];
 
 var options = new ServiceBusClientOptions
 {
@@ -236,9 +238,17 @@ if (caseIdentityFailure is not null)
     return 18;
 }
 
+string? ruleFailure = await RuleConformance.RunAsync(client, ruleTopic, ruleSubscription);
+if (ruleFailure is not null)
+{
+    Console.Error.WriteLine(ruleFailure);
+    return 19;
+}
+
 Console.WriteLine(
     "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, " +
     "send/receive/complete, defer/peek/deferred-receive, schedule/cancel, " +
     "duplicate detection, topic fan-out, case-insensitive queue/topic/subscription identity, " +
+    "durable correlation rule management and filtered fan-out, " +
     "and session attach passed");
 return 0;

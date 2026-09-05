@@ -18,6 +18,8 @@ const KEY: &str = "test-secret";
 const CASE_QUEUE: &str = "Case-Identity-Queue";
 const CASE_TOPIC: &str = "Case-Identity-Topic";
 const CASE_SUBSCRIPTION: &str = "Case-Identity-Subscription";
+const FILTER_TOPIC: &str = "Filtered-Events";
+const FILTER_SUBSCRIPTION: &str = "Filtered-Subscription";
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires dotnet and a NuGet restore"]
@@ -66,6 +68,22 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
         topic.clone(),
         CommandKind::CreateTopic {
             config: TopicConfig::default(),
+        },
+    )?;
+    let filter_topic = domain::EntityPath::new(FILTER_TOPIC)?;
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        filter_topic.clone(),
+        CommandKind::CreateTopic {
+            config: TopicConfig::default(),
+        },
+    )?;
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        filter_topic,
+        CommandKind::CreateSubscription {
+            name: SubscriptionName::new(FILTER_SUBSCRIPTION)?,
+            config: SubscriptionConfig::default(),
         },
     )?;
     for name in ["accounting", "analytics"] {
@@ -164,6 +182,8 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             .arg(CASE_QUEUE)
             .arg(CASE_TOPIC)
             .arg(CASE_SUBSCRIPTION)
+            .arg(FILTER_TOPIC)
+            .arg(FILTER_SUBSCRIPTION)
             .arg(RULE)
             .arg(KEY)
             .output()
@@ -189,6 +209,7 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             "defer/deferred-receive/management-disposition, ",
             "peek/browse pagination, schedule/cancel/timer activation, duplicate detection, topic fan-out, ",
             "case-insensitive queue/topic/subscription identity, ",
+            "durable correlation rule management and filtered fan-out, ",
             "and session renew/state/peek passed"
         )),
         "the client exited without reporting the completed workflow"

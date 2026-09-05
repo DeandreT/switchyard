@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CodecError, SessionId, Timestamp, codec};
+use crate::{CodecError, FilterProperties, SessionId, Timestamp, codec};
 
 /// Maximum number of Unicode scalar values Service Bus accepts in a message
 /// identifier. This is a character limit, not a UTF-8 byte limit.
@@ -147,28 +147,45 @@ pub enum MessageState {
 /// decisions, then use the envelope to reconstruct the message without losing
 /// protocol-specific metadata or body forms.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct MessageEnvelope(Vec<u8>);
+pub struct MessageEnvelope {
+    bytes: Vec<u8>,
+    /// Protocol-neutral projection used only by subscription filters. Keeping
+    /// it beside the opaque envelope lets the replicated state machine make the
+    /// routing decision without learning how to decode AMQP.
+    filter_properties: Box<FilterProperties>,
+}
 
 impl MessageEnvelope {
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+        Self {
+            bytes,
+            filter_properties: Box::default(),
+        }
+    }
+
+    pub fn with_filter_properties(mut self, properties: FilterProperties) -> Self {
+        self.filter_properties = Box::new(properties);
+        self
+    }
+
+    pub fn filter_properties(&self) -> &FilterProperties {
+        self.filter_properties.as_ref()
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.bytes
     }
 
     pub fn into_bytes(self) -> Vec<u8> {
-        self.0
+        self.bytes
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.bytes.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.bytes.is_empty()
     }
 }
 

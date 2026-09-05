@@ -40,7 +40,7 @@ enum Request {
     Apply {
         namespace: NamespaceName,
         entity: EntityPath,
-        kind: CommandKind,
+        kind: Box<CommandKind>,
         reply: flume::Sender<Result<CommandOutcome, ProposeError>>,
     },
     /// Reading which queues exist does not race the way applying does, but it
@@ -167,7 +167,7 @@ impl BrokerHandle {
             .send(Request::Apply {
                 namespace,
                 entity,
-                kind,
+                kind: Box::new(kind),
                 reply,
             })
             .map_err(|_| SubmitError::BrokerStopped)?;
@@ -189,7 +189,7 @@ impl BrokerHandle {
             .send_async(Request::Apply {
                 namespace,
                 entity,
-                kind,
+                kind: Box::new(kind),
                 reply,
             })
             .await
@@ -266,7 +266,7 @@ impl Broker {
                             kind,
                             reply,
                         } => {
-                            let outcome = proposer.propose(&namespace, &entity, kind);
+                            let outcome = proposer.propose(&namespace, &entity, *kind);
                             if let Ok(outcome) = outcome.as_ref() {
                                 watching.notify_outcome(&namespace, &entity, outcome);
                             }

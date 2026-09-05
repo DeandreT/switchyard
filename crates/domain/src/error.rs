@@ -2,8 +2,8 @@ use storage::StorageError;
 use thiserror::Error;
 
 use crate::{
-    CodecError, EntityPath, IdentifierError, QueueConfigError, SequenceNumber, SessionId,
-    SubscriptionConfigError, Timestamp, TopicConfigError,
+    CodecError, EntityPath, IdentifierError, QueueConfigError, RuleConfigError, RuleName,
+    SequenceNumber, SessionId, SubscriptionConfigError, Timestamp, TopicConfigError,
 };
 
 /// Every rejection the state machine can produce.
@@ -26,6 +26,18 @@ pub enum BrokerError {
     EntityPathReserved,
     #[error("subscription already exists")]
     SubscriptionAlreadyExists,
+    #[error("subscription does not exist")]
+    SubscriptionNotFound,
+    #[error("rule {name} already exists")]
+    RuleAlreadyExists { name: RuleName },
+    #[error("rule {name} does not exist")]
+    RuleNotFound { name: RuleName },
+    #[error("a subscription cannot have more than {maximum} rules")]
+    RuleLimitExceeded { maximum: usize },
+    #[error("a rule listing must request at least one rule")]
+    EmptyRulePage,
+    #[error("a rule listing requested {requested} rules, exceeding the page limit of {maximum}")]
+    RulePageTooLarge { requested: u32, maximum: u32 },
     #[error("a topic cannot have more than {maximum} subscriptions")]
     SubscriptionLimitExceeded { maximum: usize },
     #[error("topic subscription index references missing queue {entity}")]
@@ -95,6 +107,8 @@ pub enum BrokerError {
     TopicConfig(#[from] TopicConfigError),
     #[error("invalid subscription configuration: {0}")]
     SubscriptionConfig(#[from] SubscriptionConfigError),
+    #[error("invalid rule configuration: {0}")]
+    RuleConfig(#[from] RuleConfigError),
     #[error("a dead-letter queue exists only as the shadow of its parent")]
     DeadLetterQueueIsReserved,
     #[error("queue requires a session and the command named none")]

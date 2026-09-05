@@ -3,9 +3,9 @@
 use storage::{StateStore, WriteBatch};
 
 use crate::{
-    BrokerError, Command, CommandOutcome, EntityPath, MAX_MESSAGE_ID_CHARACTERS,
-    MAX_TOPIC_SUBSCRIPTIONS, MessageEnvelope, QueueConfig, SequenceNumber, SubscriptionConfig,
-    SubscriptionName, TopicConfig, codec, keys,
+    BrokerError, Command, CommandOutcome, EntityPath, FilterProperties, MAX_MESSAGE_ID_CHARACTERS,
+    MAX_TOPIC_SUBSCRIPTIONS, MessageEnvelope, QueueConfig, RuleDefinition, SequenceNumber,
+    SubscriptionConfig, SubscriptionName, TopicConfig, codec, keys,
 };
 
 use super::{
@@ -117,6 +117,7 @@ impl<S: StateStore> StateMachine<S> {
             keys::queue_config(&command.namespace, &dead_letter_queue),
             codec::encode(&shadow)?,
         );
+        self.stage_default_rule(command, &entity, batch)?;
         Ok(CommandOutcome::SubscriptionCreated { entity })
     }
 
@@ -144,28 +145,39 @@ impl<S: StateStore> StateMachine<S> {
                 maximum: MAX_TOPIC_SUBSCRIPTIONS,
             });
         }
-        let subscription_configs = subscriptions
+        let subscription_state = subscriptions
             .iter()
             .map(|entity| {
-                self.queue_config(&command.namespace, entity)?
+                let config = self
+                    .queue_config(&command.namespace, entity)?
                     .ok_or_else(|| BrokerError::DanglingSubscription {
                         entity: entity.clone(),
-                    })
+                    })?;
+                let rules = self.all_rules(&command.namespace, entity)?;
+                Ok::<_, BrokerError>((config, rules))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut counters = self.load_counters(command)?;
         let mut sequences = Vec::with_capacity(inputs.len());
+        let mut populated = vec![false; subscriptions.len()];
         for input in inputs {
             let sequence = SequenceNumber::new(counters.next_sequence);
             counters.next_sequence = counters.next_sequence.saturating_add(1);
             sequences.push(sequence);
+            let properties = filter_properties(input)?;
 
             let topic_lifetime = effective_time_to_live(
                 input.time_to_live_millis,
                 topic.default_time_to_live_millis,
             );
-            for (subscription, config) in subscriptions.iter().zip(&subscription_configs) {
+            for (index, (subscription, (config, rules))) in
+                subscriptions.iter().zip(&subscription_state).enumerate()
+            {
+                if !matches_any(rules, &properties) {
+                    continue;
+                }
+                populated[index] = true;
                 let lifetime =
                     effective_time_to_live(topic_lifetime, config.default_time_to_live_millis);
                 let record = message_record(command, *input, sequence, lifetime);
@@ -195,7 +207,11 @@ impl<S: StateStore> StateMachine<S> {
         );
         Ok(CommandOutcome::Published {
             sequences,
-            subscriptions,
+            subscriptions: subscriptions
+                .into_iter()
+                .zip(populated)
+                .filter_map(|(subscription, populated)| populated.then_some(subscription))
+                .collect(),
         })
     }
 
@@ -203,6 +219,26 @@ impl<S: StateStore> StateMachine<S> {
         self.topic_config(&command.namespace, &command.entity)?
             .ok_or(BrokerError::TopicNotFound)
     }
+}
+
+fn filter_properties(input: &SendInput<'_>) -> Result<FilterProperties, BrokerError> {
+    let mut properties = input
+        .envelope
+        .map(|envelope| envelope.filter_properties().clone())
+        .unwrap_or_default();
+    if !input.message_id.is_empty() {
+        properties.message_id = Some(input.message_id.to_owned());
+    }
+    if let Some(session_id) = input.session_id {
+        properties.session_id = Some(session_id.as_str().to_owned());
+    }
+    Ok(properties.canonicalized()?)
+}
+
+fn matches_any(rules: &[RuleDefinition], properties: &FilterProperties) -> bool {
+    rules
+        .iter()
+        .any(|definition| definition.filter.matches(properties))
 }
 
 fn validate_topic_input(config: &TopicConfig, input: &SendInput<'_>) -> Result<(), BrokerError> {

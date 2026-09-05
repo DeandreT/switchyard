@@ -12,7 +12,7 @@ development, conformance tests, and applications such as the Sift demo.
 > [!IMPORTANT]
 > Switchyard is pre-alpha. A single node accepts AMQP connections over
 > development plaintext or authenticated TLS and persists queue plus immediate
-> default-rule topic/subscription state, but
+> rule-filtered topic/subscription state, but
 > replication, administration, and the official client gates are incomplete.
 > Do not use it for production workloads.
 

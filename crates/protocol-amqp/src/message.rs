@@ -8,7 +8,10 @@ use amqp::{
     AnnotationKey, ApplicationProperties, Body, DeliveryAnnotations, Fields, Header, Message,
     MessageAnnotations, MessageId, Properties, Uuid, Value, decode_message, encode_message,
 };
-use domain::{Delivery, DeliveryOrigin, MessageEnvelope, MessageInput, SessionId, Timestamp};
+use domain::{
+    CorrelationValue, Delivery, DeliveryOrigin, FilterProperties, MessageEnvelope, MessageInput,
+    SessionId, Timestamp,
+};
 use serde_amqp::primitives::Timestamp as AmqpTimestamp;
 
 use crate::{ProtocolError, parse_session_id};
@@ -77,7 +80,8 @@ pub fn read_incoming(
             .and_then(|header| header.ttl)
             .map(u64::from),
         scheduled_enqueue_at: scheduled_enqueue_at(message)?,
-        envelope: MessageEnvelope::new(encoded_message.to_vec()),
+        envelope: MessageEnvelope::new(encoded_message.to_vec())
+            .with_filter_properties(filter_properties(message)?),
     })
 }
 
@@ -440,8 +444,56 @@ fn message_id_text(message_id: &MessageId) -> String {
     }
 }
 
+/// Projects the AMQP properties correlation rules may inspect into replicated,
+/// protocol-neutral state. Scalar encodings are canonicalized after decode so
+/// the same logical AMQP type and value compare byte-for-byte whether they came
+/// from a rule request or a publication.
+fn filter_properties(message: &Message) -> Result<FilterProperties, ProtocolError> {
+    let properties = message.properties.as_ref();
+    let application_properties = message
+        .application_properties
+        .as_ref()
+        .map(|properties| {
+            properties
+                .0
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), correlation_value(value)?)))
+                .collect::<Result<_, ProtocolError>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(FilterProperties {
+        correlation_id: properties
+            .and_then(|properties| properties.correlation_id.as_ref())
+            .map(message_id_text),
+        message_id: properties
+            .and_then(|properties| properties.message_id.as_ref())
+            .map(message_id_text),
+        to: properties.and_then(|properties| properties.to.clone()),
+        reply_to: properties.and_then(|properties| properties.reply_to.clone()),
+        subject: properties.and_then(|properties| properties.subject.clone()),
+        session_id: properties.and_then(|properties| properties.group_id.clone()),
+        reply_to_session_id: properties.and_then(|properties| properties.reply_to_group_id.clone()),
+        content_type: properties
+            .and_then(|properties| properties.content_type.as_ref())
+            .map(|content_type| content_type.as_str().to_owned()),
+        application_properties,
+    })
+}
+
+pub(crate) fn correlation_value(value: &Value) -> Result<CorrelationValue, ProtocolError> {
+    let bytes = serde_amqp::to_vec(value).map_err(|error| ProtocolError::InvalidEnvelope {
+        detail: format!("a filterable application property could not be encoded: {error}"),
+    })?;
+    CorrelationValue::new(bytes).map_err(|error| ProtocolError::InvalidEnvelope {
+        detail: error.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use amqp::Symbol;
     use domain::{DeliveryLock, LockToken, SequenceNumber, Timestamp};
 
     use super::*;
@@ -468,6 +520,58 @@ mod tests {
         assert_eq!(incoming.message_id, "order-1");
         assert_eq!(incoming.body, b"payload".to_vec());
         assert_eq!(incoming.session_id, None);
+        Ok(())
+    }
+
+    #[test]
+    fn every_correlation_field_crosses_into_the_replicated_filter_projection()
+    -> Result<(), ProtocolError> {
+        let message = Message::builder()
+            .properties(Properties {
+                message_id: Some(String::from("message-7").into()),
+                correlation_id: Some(String::from("correlation-7").into()),
+                to: Some(String::from("logical-destination")),
+                reply_to: Some(String::from("logical-reply")),
+                subject: Some(String::from("orders.created")),
+                group_id: Some(String::from("session-7")),
+                reply_to_group_id: Some(String::from("reply-session-7")),
+                content_type: Some(Symbol::from("application/json")),
+                ..Properties::default()
+            })
+            .application_properties(
+                ApplicationProperties::builder()
+                    .insert("priority", 7_i32)
+                    .insert("region", "West")
+                    .build(),
+            )
+            .build();
+
+        let incoming = read(&message)?;
+        let projected = incoming.envelope.filter_properties();
+        assert_eq!(projected.message_id.as_deref(), Some("message-7"));
+        assert_eq!(projected.correlation_id.as_deref(), Some("correlation-7"));
+        assert_eq!(projected.to.as_deref(), Some("logical-destination"));
+        assert_eq!(projected.reply_to.as_deref(), Some("logical-reply"));
+        assert_eq!(projected.subject.as_deref(), Some("orders.created"));
+        assert_eq!(projected.session_id.as_deref(), Some("session-7"));
+        assert_eq!(
+            projected.reply_to_session_id.as_deref(),
+            Some("reply-session-7")
+        );
+        assert_eq!(projected.content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            projected.application_properties.get("priority"),
+            Some(&correlation_value(&Value::Int(7))?)
+        );
+        assert_eq!(
+            projected.application_properties.get("region"),
+            Some(&correlation_value(&Value::String(String::from("West")))?)
+        );
+        assert_ne!(
+            correlation_value(&Value::Int(7))?,
+            correlation_value(&Value::Long(7))?,
+            "correlation equality preserves the AMQP scalar type"
+        );
         Ok(())
     }
 

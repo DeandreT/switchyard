@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AcceptedSession, Delivery, EntityPath, LockToken, MessageEnvelope, NamespaceName, QueueConfig,
-    ReceiveMode, SequenceNumber, SessionHold, SessionId, SubscriptionConfig, SubscriptionName,
-    Timestamp, TopicConfig,
+    ReceiveMode, RuleDefinition, RuleFilter, RuleName, SequenceNumber, SessionHold, SessionId,
+    SubscriptionConfig, SubscriptionName, Timestamp, TopicConfig,
 };
 
 /// One message supplied to an atomic broker operation.
@@ -71,6 +71,20 @@ pub enum CommandKind {
     CreateSubscription {
         name: SubscriptionName,
         config: SubscriptionConfig,
+    },
+    /// Creates one actionless rule below the subscription named by
+    /// `Command::entity`.
+    CreateRule {
+        name: RuleName,
+        filter: RuleFilter,
+    },
+    DeleteRule {
+        name: RuleName,
+    },
+    /// Lists rules in canonical-name order. `skip` is zero-based.
+    ListRules {
+        skip: u32,
+        max_rules: u32,
     },
     Send {
         message_id: String,
@@ -211,6 +225,11 @@ pub enum CommandOutcome {
     TopicCreated,
     SubscriptionCreated {
         entity: EntityPath,
+    },
+    RuleCreated,
+    RuleDeleted,
+    RulesListed {
+        rules: Vec<RuleDefinition>,
     },
     Sent {
         sequence: SequenceNumber,
