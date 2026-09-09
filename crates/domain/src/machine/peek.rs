@@ -24,18 +24,32 @@ impl<S: StateStore> StateMachine<S> {
         session: Option<&SessionHold>,
     ) -> Result<CommandOutcome, BrokerError> {
         validate_page_size(max_messages)?;
-        let config = self.load_config(command)?;
-        let session_id = match session {
-            Some(_) if !config.requires_session => {
-                return Err(BrokerError::SessionNotSupported);
+        let session_id = match self.queue_config(&command.namespace, &command.entity)? {
+            Some(config) => match session {
+                Some(_) if !config.requires_session => {
+                    return Err(BrokerError::SessionNotSupported);
+                }
+                Some(hold) => {
+                    self.held_session(command, hold)?;
+                    Some(&hold.session_id)
+                }
+                // A regular receiver may browse across every session without
+                // acquiring one. Session receivers supply their hold above.
+                None => None,
+            },
+            // A topic retains only scheduled placeholders. Azure permits those
+            // to be browsed through a receiver addressed directly to the topic,
+            // while ordinary receive remains unsupported.
+            None if self
+                .topic_config(&command.namespace, &command.entity)?
+                .is_some() =>
+            {
+                if session.is_some() {
+                    return Err(BrokerError::SessionNotSupported);
+                }
+                None
             }
-            Some(hold) => {
-                self.held_session(command, hold)?;
-                Some(&hold.session_id)
-            }
-            // A regular receiver may browse across every session without
-            // acquiring one. Session receivers supply their hold above.
-            None => None,
+            None => return Err(BrokerError::QueueNotFound),
         };
 
         let namespace = &command.namespace;

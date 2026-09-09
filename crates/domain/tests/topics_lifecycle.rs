@@ -488,24 +488,6 @@ fn entity_conflicts_reserved_paths_and_deferred_shapes_are_rejected<P: StoreProv
     );
 
     assert_eq!(
-        fixture.at(
-            4,
-            CommandKind::Send {
-                message_id: String::from("scheduled"),
-                body: Vec::new(),
-                time_to_live_millis: None,
-                session_id: None,
-                scheduled_enqueue_at: Some(Timestamp::from_millis(100)),
-                envelope: None,
-            },
-        ),
-        Err(BrokerError::TopicSchedulingNotSupported)
-    );
-    assert_eq!(
-        fixture.at(4, CommandKind::ActivateScheduled),
-        Err(BrokerError::TopicSchedulingNotSupported)
-    );
-    assert_eq!(
         fixture.receive(&fixture.topic, 4, ReceiveMode::ReceiveAndDelete),
         Err(BrokerError::TopicReceiveNotSupported)
     );
@@ -522,15 +504,6 @@ fn entity_conflicts_reserved_paths_and_deferred_shapes_are_rejected<P: StoreProv
             },
         ),
         Err(BrokerError::TopicSessionNotSupported)
-    );
-    assert_eq!(
-        fixture.at(
-            4,
-            CommandKind::CancelScheduled {
-                sequences: vec![SequenceNumber::new(1)],
-            },
-        ),
-        Err(BrokerError::TopicSchedulingNotSupported)
     );
     assert_eq!(
         fixture.publish(5, input("first-valid", b"valid"))?.0,

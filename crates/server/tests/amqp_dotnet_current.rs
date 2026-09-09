@@ -207,7 +207,7 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             "send/receive/renew/complete, abandon/redelivery/property-update, ",
             "dead-letter/DLQ receive/complete, ",
             "defer/deferred-receive/management-disposition, ",
-            "peek/browse pagination, schedule/cancel/timer activation, duplicate detection, topic fan-out, ",
+            "peek/browse pagination, schedule/cancel/timer activation, duplicate detection, immediate and scheduled topic fan-out, ",
             "case-insensitive queue/topic/subscription identity, ",
             "durable correlation rule management and filtered fan-out, ",
             "and session renew/state/peek passed"

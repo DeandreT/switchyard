@@ -12,5 +12,7 @@
              Link="CaseInsensitiveIdentityConformance.cs" />
     <Compile Include="../shared/RuleConformance.cs"
              Link="RuleConformance.cs" />
+    <Compile Include="../shared/ScheduledTopicConformance.cs"
+             Link="ScheduledTopicConformance.cs" />
   </ItemGroup>
 </Project>

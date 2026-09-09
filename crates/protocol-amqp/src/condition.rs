@@ -61,7 +61,6 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::EntityPathReserved
         | BrokerError::SubscriptionSendNotAllowed
         | BrokerError::TopicReceiveNotSupported
-        | BrokerError::TopicSchedulingNotSupported
         | BrokerError::TopicSessionNotSupported
         | BrokerError::EmptyMessageBatch
         | BrokerError::MessageBatchSessionMismatch

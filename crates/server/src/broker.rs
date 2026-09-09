@@ -51,6 +51,13 @@ enum Request {
         limit: usize,
         reply: flume::Sender<Result<Vec<(NamespaceName, EntityPath)>, ProposeError>>,
     },
+    /// Topics are catalogued separately because only scheduled activation runs
+    /// against them; queue expiry and lock maintenance do not apply.
+    ListTopics {
+        after: Option<(NamespaceName, EntityPath)>,
+        limit: usize,
+        reply: flume::Sender<Result<Vec<(NamespaceName, EntityPath)>, ProposeError>>,
+    },
     /// The highest timestamp the machine has applied. Readiness and
     /// diagnostics need it, and it is what a caller compares its own clock
     /// against.
@@ -110,8 +117,16 @@ impl Watchers {
     ) {
         match outcome {
             CommandOutcome::Published { subscriptions, .. } => {
-                for subscription in subscriptions {
-                    self.notify(namespace, subscription);
+                for entity in subscriptions {
+                    self.notify(namespace, entity);
+                }
+            }
+            CommandOutcome::ScheduledActivated {
+                deliverable_entities,
+                ..
+            } => {
+                for entity in deliverable_entities {
+                    self.notify(namespace, entity);
                 }
             }
             outcome if makes_deliverable(outcome) => {
@@ -135,7 +150,6 @@ fn makes_deliverable(outcome: &CommandOutcome) -> bool {
         } => *returned_to_ready > 0,
         CommandOutcome::SessionReleased => true,
         CommandOutcome::SessionLocksExpired { released } => *released > 0,
-        CommandOutcome::ScheduledActivated { activated } => *activated > 0,
         _ => false,
     }
 }
@@ -240,6 +254,26 @@ impl BrokerHandle {
             .map_err(|_| SubmitError::BrokerStopped)?
             .map_err(SubmitError::Propose)
     }
+
+    /// Topics strictly after `after`, up to `limit`, in key order.
+    pub fn topics_after_blocking(
+        &self,
+        after: Option<&(NamespaceName, EntityPath)>,
+        limit: usize,
+    ) -> Result<Vec<(NamespaceName, EntityPath)>, SubmitError> {
+        let (reply, topics) = flume::bounded(1);
+        self.requests
+            .send(Request::ListTopics {
+                after: after.cloned(),
+                limit,
+                reply,
+            })
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        topics
+            .recv()
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
 }
 
 /// The owner thread, and the handle onto it.
@@ -283,6 +317,18 @@ impl Broker {
                                 proposer
                                     .machine()
                                     .queues_after(after.as_ref(), limit)
+                                    .map_err(ProposeError::from),
+                            );
+                        }
+                        Request::ListTopics {
+                            after,
+                            limit,
+                            reply,
+                        } => {
+                            let _ = reply.send(
+                                proposer
+                                    .machine()
+                                    .topics_after(after.as_ref(), limit)
                                     .map_err(ProposeError::from),
                             );
                         }
@@ -432,16 +478,6 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_activation_wakes_receivers_only_when_it_made_messages_ready() {
-        assert!(makes_deliverable(&CommandOutcome::ScheduledActivated {
-            activated: 1,
-        }));
-        assert!(!makes_deliverable(&CommandOutcome::ScheduledActivated {
-            activated: 0,
-        }));
-    }
-
-    #[test]
     fn duplicate_suppression_wakes_only_for_messages_that_were_stored() {
         assert!(!makes_deliverable(&CommandOutcome::DuplicateSuppressed {
             sequence: domain::SequenceNumber::new(2),
@@ -502,6 +538,83 @@ mod tests {
             .is_err(),
             "a publish must not wake the non-receivable topic"
         );
+    }
+
+    #[tokio::test]
+    async fn scheduled_topic_activation_wakes_populated_subscriptions_not_the_topic() {
+        let watchers = Watchers::default();
+        let namespace = NamespaceName::new("tenant").expect("valid namespace");
+        let topic = EntityPath::new("billing").expect("valid topic");
+        let accounting =
+            EntityPath::new("billing/subscriptions/accounting").expect("valid subscription");
+
+        let topic_waiter = watchers.watch(&namespace, &topic);
+        let accounting_waiter = watchers.watch(&namespace, &accounting);
+        watchers.notify_outcome(
+            &namespace,
+            &topic,
+            &CommandOutcome::ScheduledActivated {
+                activated: 1,
+                deliverable_entities: vec![accounting],
+            },
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            accounting_waiter.notified(),
+        )
+        .await
+        .expect("the populated subscription is notified");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                topic_waiter.notified(),
+            )
+            .await
+            .is_err(),
+            "scheduled topic activation must not wake the non-receivable topic"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_queue_activation_wakes_the_queue_but_empty_activation_does_not() {
+        let watchers = Watchers::default();
+        let namespace = NamespaceName::new("tenant").expect("valid namespace");
+        let queue = EntityPath::new("orders").expect("valid queue");
+        let queue_waiter = watchers.watch(&namespace, &queue);
+
+        watchers.notify_outcome(
+            &namespace,
+            &queue,
+            &CommandOutcome::ScheduledActivated {
+                activated: 0,
+                deliverable_entities: Vec::new(),
+            },
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                queue_waiter.notified(),
+            )
+            .await
+            .is_err(),
+            "an empty activation must not wake a waiting receiver"
+        );
+
+        watchers.notify_outcome(
+            &namespace,
+            &queue,
+            &CommandOutcome::ScheduledActivated {
+                activated: 1,
+                deliverable_entities: vec![queue.clone()],
+            },
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            queue_waiter.notified(),
+        )
+        .await
+        .expect("the activated queue is notified");
     }
 
     #[test]

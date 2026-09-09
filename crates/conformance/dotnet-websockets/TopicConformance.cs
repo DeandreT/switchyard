@@ -32,6 +32,19 @@ internal static class TopicConformance
 
         await first.CompleteMessageAsync(firstCopy);
         await second.CompleteMessageAsync(secondCopy);
+
+        string? schedulingFailure = await ScheduledTopicConformance.RunAsync(
+            client,
+            topic,
+            secondSubscription,
+            sender,
+            first,
+            second);
+        if (schedulingFailure is not null)
+        {
+            Console.Error.WriteLine(schedulingFailure);
+            return false;
+        }
         return true;
     }
 }

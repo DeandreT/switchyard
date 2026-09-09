@@ -449,7 +449,10 @@ fn activation_does_not_refresh_history<P: StoreProvider>(
     )?;
     assert_eq!(
         fixture.at(1_000, CommandKind::ActivateScheduled)?,
-        CommandOutcome::ScheduledActivated { activated: 1 }
+        CommandOutcome::ScheduledActivated {
+            activated: 1,
+            deliverable_entities: vec![fixture.entity.clone()],
+        }
     );
 
     // The original send's deadline is 20_100. If activation refreshed the

@@ -1,6 +1,6 @@
 //! Opt-in AMQP-over-WebSockets gate for the current official .NET client.
 
-use std::{error::Error, path::PathBuf, process::Command, time::Duration};
+use std::{error::Error, path::PathBuf, process::Command, sync::Arc, time::Duration};
 
 use auth::{PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule};
 use domain::{
@@ -8,7 +8,7 @@ use domain::{
     SubscriptionName, TopicConfig,
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
-use server::{Broker, LocalProposer, ManualClock};
+use server::{Broker, LocalProposer, Shutdown, SystemClock, TimerWorker};
 use storage::MemoryStore;
 use tokio::net::TcpListener;
 
@@ -30,7 +30,7 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
         .try_init();
     let broker = Broker::spawn(LocalProposer::new(
         StateMachine::new(MemoryStore::default()),
-        ManualClock::at(1_000),
+        SystemClock,
     ));
     let namespace = domain::NamespaceName::new("tenant")?;
     for (path, config) in [
@@ -144,6 +144,13 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
             .await;
     });
 
+    let timer_shutdown = Arc::new(Shutdown::default());
+    let timer_stop = Arc::clone(&timer_shutdown);
+    let timer_broker = broker.handle();
+    let timer = std::thread::spawn(move || {
+        TimerWorker::new(&timer_broker).run(Duration::from_millis(25), &timer_stop);
+    });
+
     let project = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../conformance/dotnet-websockets/Switchyard.Conformance.DotNetWebSockets.csproj");
     let output = tokio::task::spawn_blocking(move || {
@@ -186,7 +193,12 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
             .arg(KEY)
             .output()
     })
-    .await??;
+    .await;
+    timer_shutdown.signal();
+    timer
+        .join()
+        .map_err(|_| std::io::Error::other("the test timer worker panicked"))?;
+    let output = output??;
 
     assert!(
         output.status.success(),
@@ -196,7 +208,7 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
     );
     assert!(
         String::from_utf8_lossy(&output.stdout).contains(
-            "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, send/receive/complete, defer/peek/deferred-receive, schedule/cancel, duplicate detection, topic fan-out, case-insensitive queue/topic/subscription identity, durable correlation rule management and filtered fan-out, and session attach passed"
+            "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, send/receive/complete, defer/peek/deferred-receive, schedule/cancel, duplicate detection, immediate and scheduled topic fan-out, case-insensitive queue/topic/subscription identity, durable correlation rule management and filtered fan-out, and session attach passed"
         ),
         "the client exited without reporting the completed WebSocket workflow"
     );

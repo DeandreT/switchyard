@@ -7,21 +7,22 @@ currently pre-alpha. A deterministic state machine covers queue send and
 receive, both settlement modes, lock expiry, time-to-live expiry,
 dead-lettering and dead-letter receive, deferral and deferred retrieval,
 read-only message browsing, scheduled delivery and cancellation, duplicate
-detection, immediate rule-filtered topic fanout, and the session ownership and
-session state described under [Message Semantics](#message-semantics). It runs
-over either the Fjall backend or the memory backend, so a single node survives
-a restart.
+detection, immediate and scheduled rule-filtered topic fanout, and the session
+ownership and session state described under [Message Semantics](#message-semantics).
+It runs over either the Fjall backend or the memory backend, so a single node
+survives a restart.
 
 The `switchyard` binary accepts AMQP connections over development plaintext or
 TLS, authenticates a configured shared-access policy through SASL PLAIN or CBS
-SAS, carries queue messages, immediate topic publications, subscription
-copies, and sessions across that edge, and sweeps lock, time-to-live,
-session-lock, and duplicate-history expiry while activating scheduled messages.
+SAS, carries queue messages, immediate and scheduled topic publications,
+subscription copies, and sessions across that edge, and sweeps lock,
+time-to-live, session-lock, and duplicate-history expiry while activating
+scheduled messages.
 JWT/OIDC, mTLS, policy administration,
 Raft, and compliance implementations remain to be built. Within the semantics
 below, general SQL subscription filters and actions, session-aware
-subscriptions, topic scheduling, topic duplicate detection, and configurable
-discard versus dead-letter behavior on TTL expiry are not implemented. The storage keyspace
+subscriptions, topic duplicate detection, and configurable discard versus
+dead-letter behavior on TTL expiry are not implemented. The storage keyspace
 layout under [Storage](#storage) is still a single record keyspace rather than
 the split listed there.
 
@@ -210,11 +211,14 @@ clock never mutates state directly. An injected hybrid logical clock prevents
 time from moving backward. Clock jumps beyond the configured safety threshold
 pause timers and fail readiness until an operator resolves the condition.
 
-The worker that exists today activates the scheduled index and sweeps the
-lock-expiry, TTL, session-lock, and duplicate-history indexes. One sweep
-command processes a bounded number of entries, so the worker re-proposes until
-an index reports less than a full batch, and a backlog on one queue cannot
-starve the rest of the tick.
+The worker that exists today activates queue and topic scheduled indexes and
+sweeps the queue lock-expiry, TTL, session-lock, and duplicate-history indexes.
+One sweep command processes a bounded number of entries, so the worker
+re-proposes until an index reports less than a full batch; queue and topic
+catalogs have independent cursors, topic activation runs before queue
+maintenance, and one entity's failure does not stop unrelated entities. A
+saturated bounded sweep schedules its continuation immediately instead of
+adding another timer interval of latency.
 Time reaches the state machine only through the proposer, which stamps each
 command: a host clock that steps back a little holds the applied timestamp still
 rather than regressing it, and one that steps back further has the command
@@ -232,18 +236,25 @@ Azure documents the window behavior but not either detail.
 
 An immediate topic command validates the whole singular or batch publication,
 allocates topic-owned sequence numbers, then materializes one envelope copy in
-every subscription present at that command's position in the replicated order.
-All copies and the topic counter commit in one storage batch. A topic with no
-subscriptions still accepts the publication, and a subscription created later
-sees only later publications. Every subscription is created atomically with
-the implicit `$Default` true rule and otherwise uses the ordinary queue
-lifecycle, including independent lock, settlement, expiry, deferral, browsing,
-and DLQ state. Actionless true, false, and correlation rules are durable and
+every matching subscription present at that command's position in the
+replicated order. A scheduled topic command persists one topic-owned placeholder
+instead; topic-targeted peek can browse it, and cancellation can remove it,
+without exposing a subscription copy early. When it becomes due, one replicated
+activation command retires the placeholder, allocates a new active topic
+sequence, evaluates the subscriptions and rules present at that command's log
+position, and atomically materializes every matching copy. A topic with no
+matches still accepts the immediate or activated publication. Every
+subscription is created atomically with the implicit `$Default` true rule and
+otherwise uses the ordinary queue lifecycle, including independent lock,
+settlement, expiry, deferral, browsing, and DLQ state. Actionless true, false,
+and correlation rules are durable and
 combined with OR semantics; every populated field inside one correlation
 filter is an exact, typed AND predicate. Several matching actionless rules
 still produce one subscription copy. Rule creation, deletion, and paginated
-enumeration use the Service Bus AMQP management contract. General SQL filters
-and SQL actions remain unimplemented; actions require deterministic per-copy
+enumeration use the Service Bus AMQP management contract. Management scheduling
+and cancellation plus annotated scheduled transfers work for queues and topics.
+General SQL filters and SQL actions remain unimplemented; actions require
+deterministic per-copy
 property overlays before exposure. The current backend stores a full payload
 copy per subscription; shared encrypted payload records and reference counting
 remain an optimization for the production storage layout.

@@ -13,6 +13,9 @@ use super::{
     send::{SendInput, effective_time_to_live, message_record},
 };
 
+type SubscriptionFanoutState = (QueueConfig, Vec<RuleDefinition>);
+type TopicFanoutState = (Vec<EntityPath>, Vec<SubscriptionFanoutState>);
+
 impl<S: StateStore> StateMachine<S> {
     pub fn topic_config(
         &self,
@@ -134,47 +137,55 @@ impl<S: StateStore> StateMachine<S> {
         for input in inputs {
             validate_topic_input(&topic, input)?;
         }
-
-        let subscriptions = self.subscriptions(
-            &command.namespace,
-            &command.entity,
-            MAX_TOPIC_SUBSCRIPTIONS + 1,
-        )?;
-        if subscriptions.len() > MAX_TOPIC_SUBSCRIPTIONS {
-            return Err(BrokerError::SubscriptionLimitExceeded {
-                maximum: MAX_TOPIC_SUBSCRIPTIONS,
-            });
-        }
-        let subscription_state = subscriptions
+        // Scheduled publications are routed only when they activate, but their
+        // filter projection must be valid before accepting the placeholder. A
+        // malformed durable projection must never poison every future timer
+        // attempt for this topic.
+        let properties = inputs
             .iter()
-            .map(|entity| {
-                let config = self
-                    .queue_config(&command.namespace, entity)?
-                    .ok_or_else(|| BrokerError::DanglingSubscription {
-                        entity: entity.clone(),
-                    })?;
-                let rules = self.all_rules(&command.namespace, entity)?;
-                Ok::<_, BrokerError>((config, rules))
-            })
+            .map(|input| filter_properties(input))
             .collect::<Result<Vec<_>, _>>()?;
+
+        // An all-scheduled request must not snapshot the topology or its rules.
+        // Those are read at the activation command's replicated-log position.
+        let (subscriptions, subscription_state) = if inputs
+            .iter()
+            .any(|input| input.scheduled_enqueue_at.is_none())
+        {
+            self.topic_fanout_state(command)?
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         let mut counters = self.load_counters(command)?;
         let mut sequences = Vec::with_capacity(inputs.len());
         let mut populated = vec![false; subscriptions.len()];
-        for input in inputs {
+        for (input, properties) in inputs.iter().zip(&properties) {
             let sequence = SequenceNumber::new(counters.next_sequence);
             counters.next_sequence = counters.next_sequence.saturating_add(1);
             sequences.push(sequence);
-            let properties = filter_properties(input)?;
 
             let topic_lifetime = effective_time_to_live(
                 input.time_to_live_millis,
                 topic.default_time_to_live_millis,
             );
+            if let Some(enqueue_at) = input.scheduled_enqueue_at {
+                let record = message_record(command, *input, sequence, topic_lifetime);
+                batch.push_put(
+                    keys::message(&command.namespace, &command.entity, sequence),
+                    codec::encode(&record)?,
+                );
+                batch.push_put(
+                    keys::scheduled(&command.namespace, &command.entity, enqueue_at, sequence),
+                    Vec::new(),
+                );
+                continue;
+            }
+
             for (index, (subscription, (config, rules))) in
                 subscriptions.iter().zip(&subscription_state).enumerate()
             {
-                if !matches_any(rules, &properties) {
+                if !matches_any(rules, properties) {
                     continue;
                 }
                 populated[index] = true;
@@ -215,13 +226,48 @@ impl<S: StateStore> StateMachine<S> {
         })
     }
 
-    fn load_topic_config(&self, command: &Command) -> Result<TopicConfig, BrokerError> {
+    pub(super) fn topic_exists(&self, command: &Command) -> Result<bool, BrokerError> {
+        Ok(self
+            .topic_config(&command.namespace, &command.entity)?
+            .is_some())
+    }
+
+    pub(super) fn load_topic_config(&self, command: &Command) -> Result<TopicConfig, BrokerError> {
         self.topic_config(&command.namespace, &command.entity)?
             .ok_or(BrokerError::TopicNotFound)
     }
+
+    pub(super) fn topic_fanout_state(
+        &self,
+        command: &Command,
+    ) -> Result<TopicFanoutState, BrokerError> {
+        let subscriptions = self.subscriptions(
+            &command.namespace,
+            &command.entity,
+            MAX_TOPIC_SUBSCRIPTIONS + 1,
+        )?;
+        if subscriptions.len() > MAX_TOPIC_SUBSCRIPTIONS {
+            return Err(BrokerError::SubscriptionLimitExceeded {
+                maximum: MAX_TOPIC_SUBSCRIPTIONS,
+            });
+        }
+        let state = subscriptions
+            .iter()
+            .map(|entity| {
+                let config = self
+                    .queue_config(&command.namespace, entity)?
+                    .ok_or_else(|| BrokerError::DanglingSubscription {
+                        entity: entity.clone(),
+                    })?;
+                let rules = self.all_rules(&command.namespace, entity)?;
+                Ok::<_, BrokerError>((config, rules))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((subscriptions, state))
+    }
 }
 
-fn filter_properties(input: &SendInput<'_>) -> Result<FilterProperties, BrokerError> {
+pub(super) fn filter_properties(input: &SendInput<'_>) -> Result<FilterProperties, BrokerError> {
     let mut properties = input
         .envelope
         .map(|envelope| envelope.filter_properties().clone())
@@ -235,16 +281,13 @@ fn filter_properties(input: &SendInput<'_>) -> Result<FilterProperties, BrokerEr
     Ok(properties.canonicalized()?)
 }
 
-fn matches_any(rules: &[RuleDefinition], properties: &FilterProperties) -> bool {
+pub(super) fn matches_any(rules: &[RuleDefinition], properties: &FilterProperties) -> bool {
     rules
         .iter()
         .any(|definition| definition.filter.matches(properties))
 }
 
 fn validate_topic_input(config: &TopicConfig, input: &SendInput<'_>) -> Result<(), BrokerError> {
-    if input.scheduled_enqueue_at.is_some() {
-        return Err(BrokerError::TopicSchedulingNotSupported);
-    }
     if input.session_id.is_some() {
         return Err(BrokerError::TopicSessionNotSupported);
     }

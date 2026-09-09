@@ -127,11 +127,17 @@ impl<S: StateStore> StateMachine<S> {
                 codec::encode(&counters)?,
             );
         }
-        Ok(CommandOutcome::ScheduledActivated { activated })
+        Ok(CommandOutcome::ScheduledActivated {
+            activated,
+            deliverable_entities: (activated > 0)
+                .then(|| command.entity.clone())
+                .into_iter()
+                .collect(),
+        })
     }
 }
 
-fn scheduled_lifetime(record: &MessageRecord, enqueue_at: Timestamp) -> Option<u64> {
+pub(super) fn scheduled_lifetime(record: &MessageRecord, enqueue_at: Timestamp) -> Option<u64> {
     record.expires_at.map(|expires_at| {
         expires_at
             .as_millis()
@@ -139,7 +145,7 @@ fn scheduled_lifetime(record: &MessageRecord, enqueue_at: Timestamp) -> Option<u
     })
 }
 
-fn validate_cancellation(sequences: &[SequenceNumber]) -> Result<(), BrokerError> {
+pub(super) fn validate_cancellation(sequences: &[SequenceNumber]) -> Result<(), BrokerError> {
     if sequences.is_empty() {
         return Err(BrokerError::EmptyScheduledCancellation);
     }

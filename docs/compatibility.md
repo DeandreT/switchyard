@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Queue single and atomic batch send; duplicate detection across immediate, batch, and scheduled sends; scheduled send/batch activation and cancellation; prefetched multi-message receive; independent settlement; receive-delete; envelope fidelity; renew; abandon/redelivery; defer and deferred receive; ordered peek pagination across active, locked, scheduled, deferred, session, and DLQ messages; dead-letter and DLQ receive/complete; session renew/state; immediate topic fanout and independent subscription settlement; actionless true/false/correlation rule management and filtering; case-insensitive queue, topic, subscription, and rule identity; AMQP over TCP and WebSockets | Planned | Experimental gates on 7.20.2 |
+| Official .NET SDK, current stable | Queue single and atomic batch send; duplicate detection across immediate, batch, and scheduled sends; scheduled queue and topic send/batch activation, cancellation, and browse; prefetched multi-message receive; independent settlement; receive-delete; envelope fidelity; renew; abandon/redelivery; defer and deferred receive; ordered peek pagination across active, locked, scheduled, deferred, session, and DLQ messages; dead-letter and DLQ receive/complete; session renew/state; immediate and scheduled rule-filtered topic fanout and independent subscription settlement; actionless true/false/correlation rule management and filtering; case-insensitive queue, topic, subscription, and rule identity; AMQP over TCP and WebSockets | Planned | Experimental gates on 7.20.2 |
 | Official .NET SDK, previous stable | Planned | Planned | Not implemented |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -34,9 +34,9 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine |
-| Topics and subscriptions | Pre-1.0 | Immediate non-session singular/batch fanout through durable actionless rules; implicit `$Default`; subscription queue lifecycle; AMQP mapping; Rust and current .NET clients end to end. Sessions, scheduling, and topic duplicate detection: not implemented |
-| Correlation and SQL filters/actions | Pre-1.0 | True/false and typed correlation equality for non-session publications; durable create/delete/paginated enumeration through AMQP `ServiceBusRuleManager`; Rust and current .NET clients over TCP and WebSockets. Session-ID predicates, general SQL filters, and actions: not implemented |
-| Scheduling and cancellation | Pre-1.0 | State machine, timer activation, AMQP management and annotated-send mapping, Rust and current .NET clients end to end |
+| Topics and subscriptions | Pre-1.0 | Immediate and scheduled non-session singular/batch fanout through durable actionless rules; topic-owned scheduled browsing and cancellation; implicit `$Default`; subscription queue lifecycle; AMQP mapping; Rust and current .NET clients end to end. Sessions and topic duplicate detection: not implemented |
+| Correlation and SQL filters/actions | Pre-1.0 | True/false and typed correlation equality for non-session immediate and scheduled publications; durable create/delete/paginated enumeration through AMQP `ServiceBusRuleManager`; Rust and current .NET clients over TCP and WebSockets. Session-ID predicates, general SQL filters, and actions: not implemented |
+| Scheduling and cancellation | Pre-1.0 | Queue and topic state machines, timer activation, AMQP management and annotated-send mapping, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Dead-letter | Pre-1.0 | State machine, AMQP mapping, Rust and current .NET clients end to end |
 | Dead-letter receive and resubmit | Pre-1.0 | Receive: state machine, AMQP mapping, Rust and current .NET clients end to end. Resubmit: not implemented |
@@ -80,17 +80,23 @@ behavior it currently enforces:
   possibility of receive redelivery under peek-lock.
 - An immediate topic send validates every child before allocating a
   topic-owned sequence number, then materializes the same durable envelope in
-  every subscription present at that command's position in the log. Singular
-  and batch fanout, every subscription copy, and the topic counter commit
-  atomically. A topic with no subscriptions accepts and drops the publication;
-  subscriptions created later receive only later publications. Each copy then
-  follows the ordinary queue lifecycle independently, including settlement,
-  expiry, deferral, browsing, and its subscription DLQ. This first vertical
-  evaluates durable actionless true, false, and correlation rules for
-  non-session immediate publications. Predicates within one correlation filter
-  are ANDed, rules are ORed, and several actionless matches still produce one
-  copy. General SQL filters, rule actions, session IDs, and scheduled topic
-  sends are explicitly refused.
+  every matching subscription present at that command's position in the log.
+  Singular and batch fanout, every subscription copy, and the topic counter
+  commit atomically. A scheduled topic send instead persists one topic-owned,
+  browseable placeholder and does not materialize any subscription copy before
+  it is due. Cancellation atomically removes those placeholders. Activation
+  retires one due placeholder and evaluates the subscriptions and rules present
+  at that later command's position, then commits every matching active copy and
+  its newly allocated topic sequence atomically. A topic with no matches accepts
+  and drops an immediate or activated publication; subscriptions created before
+  activation can receive a previously scheduled publication, while ones created
+  after it cannot. Each copy then follows the ordinary queue lifecycle
+  independently, including settlement, expiry, deferral, browsing, and its
+  subscription DLQ. Durable actionless true, false, and correlation rules apply
+  to non-session immediate and scheduled publications. Predicates within one
+  correlation filter are ANDed, rules are ORed, and several actionless matches
+  still produce one copy. General SQL filters, rule actions, and session IDs are
+  explicitly refused.
 - Receive-delete is at-most-once: the deletion commits before the transfer.
 - Peek is an inclusive, sequence-ordered, read-only snapshot over active,
   locked, scheduled, and deferred records. It never increments delivery count
@@ -100,11 +106,13 @@ behavior it currently enforces:
   continues until that cap or the true end of the entity so an empty page is
   definitive.
 - Scheduling persists an ordered placeholder immediately without making it
-  receivable or making its session available. Peek exposes that placeholder as
-  `Scheduled`, and cancellation removes it atomically. When the replicated
-  timer command activates a due message, the placeholder is retired, a new
-  active sequence number and enqueue timestamp are assigned, and its TTL starts
-  from that activation timestamp.
+  receivable or making its session available. Peek exposes a queue placeholder,
+  or a topic placeholder through a receiver addressed directly to that topic,
+  as `Scheduled`; cancellation removes it atomically. When the replicated timer
+  command activates a due message, the placeholder is retired, a new active
+  sequence number and enqueue timestamp are assigned, and its TTL starts from
+  that activation timestamp. Topic activation also performs the rule-filtered
+  fanout described above in the same commit.
 - A settlement is rejected unless it presents the live lock token, and rejected
   again once the lock deadline has passed.
 - A live message lock can be renewed without changing its token. Renewal moves
@@ -161,9 +169,10 @@ same entity over both AMQP TCP and WebSockets. Session identifiers and
 placement-group identifiers retain their case because they are not Service Bus
 entity identities.
 
-Expiry is not merely expressible: the `server` crate's timer worker proposes the
-lock, time-to-live, session-lock, and duplicate-history sweeps on an interval,
-so a running node actually releases what has elapsed.
+Expiry and activation are not merely expressible: the `server` crate's timer
+worker scans queues and topics on an interval, activates their scheduled
+messages, and proposes the queue lock, time-to-live, session-lock, and
+duplicate-history sweeps, so a running node actually releases what has elapsed.
 
 An AMQP 1.0 client can send to a queue or topic and receive from a queue,
 subscription, or their dead-letter queues. The node accepts AMQP over TLS with the
@@ -218,12 +227,12 @@ atomic enumerable and explicit SDK batches, prefetched multi-message receive,
 out-of-order completion, receive-delete, message-lock renewal, abandon and
 redelivery, deferral with property updates, deferred receive and settlement,
 ordered peek pagination across active, locked, scheduled, deferred, session, and
-dead-letter messages, management and annotated-transfer scheduling,
-cancellation and timer activation, custom dead-lettering, dead-letter receive
-and completion, duplicate detection across immediate, batch, and scheduled
-sends, immediate filtered topic fanout, independent subscription settlement,
-actionless correlation-rule lifecycle, session state and renewal, and
-AMQP-over-TCP and WebSockets;
+dead-letter messages, queue and topic management and annotated-transfer
+scheduling, cancellation, browsing, and timer activation, custom dead-lettering,
+dead-letter receive and completion, duplicate detection across immediate, batch,
+and scheduled sends, immediate and scheduled filtered topic fanout, independent
+subscription settlement, actionless correlation-rule lifecycle, session state
+and renewal, and AMQP-over-TCP and WebSockets;
 the rest of that client gate remains incomplete.
 Dead-letter resubmission is not implemented.
 

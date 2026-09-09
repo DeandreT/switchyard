@@ -36,7 +36,7 @@ pub(super) async fn schedule<B: Broker>(
         }
     };
     let expected = messages.len();
-    match broker
+    let sequences = match broker
         .submit(
             namespace.clone(),
             entity.clone(),
@@ -48,23 +48,30 @@ pub(super) async fn schedule<B: Broker>(
             if sequences.len() == expected
                 && u32::try_from(expected).is_ok_and(|expected| stored <= expected) =>
         {
-            match sequence_values(&sequences) {
-                Ok(values) => ManagementResponse::accepted(
-                    message_id,
-                    tracking_id,
-                    map_body(SEQUENCE_NUMBERS, Value::Array(Array::from(values))),
-                ),
-                Err(description) => {
-                    ManagementResponse::internal(message_id, tracking_id, description)
-                }
-            }
+            sequences
         }
-        Ok(other) => ManagementResponse::internal(
+        Ok(CommandOutcome::Published {
+            sequences,
+            subscriptions,
+        }) if sequences.len() == expected && subscriptions.is_empty() => sequences,
+        Ok(other) => {
+            return ManagementResponse::internal(
+                message_id,
+                tracking_id,
+                format!("scheduling messages produced an unexpected outcome: {other:?}"),
+            );
+        }
+        Err(rejection) => {
+            return ManagementResponse::from_rejection(message_id, tracking_id, &rejection);
+        }
+    };
+    match sequence_values(&sequences) {
+        Ok(values) => ManagementResponse::accepted(
             message_id,
             tracking_id,
-            format!("scheduling messages produced an unexpected outcome: {other:?}"),
+            map_body(SEQUENCE_NUMBERS, Value::Array(Array::from(values))),
         ),
-        Err(rejection) => ManagementResponse::from_rejection(message_id, tracking_id, &rejection),
+        Err(description) => ManagementResponse::internal(message_id, tracking_id, description),
     }
 }
 
@@ -386,6 +393,43 @@ mod tests {
         assert_eq!(
             map_value(&response.body, SEQUENCE_NUMBERS),
             Some(&Value::Array(Array::from(vec![Value::Long(9)])))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_topic_publish_returns_its_placeholder_sequences() {
+        let broker = RecordingBroker::returning(CommandOutcome::Published {
+            sequences: vec![SequenceNumber::new(11), SequenceNumber::new(12)],
+            subscriptions: Vec::new(),
+        });
+        let (namespace, entity) = names();
+        let response = schedule(
+            &schedule_request(vec![
+                entry("one", encoded("one", 12_000)),
+                entry("two", encoded("two", 13_000)),
+            ]),
+            MessageId::Ulong(1),
+            None,
+            &namespace,
+            &entity,
+            &broker,
+        )
+        .await
+        .into_message();
+
+        assert_eq!(
+            response
+                .application_properties
+                .as_ref()
+                .and_then(|properties| properties.get("statusCode")),
+            Some(&Value::Int(200))
+        );
+        assert_eq!(
+            map_value(&response.body, SEQUENCE_NUMBERS),
+            Some(&Value::Array(Array::from(vec![
+                Value::Long(11),
+                Value::Long(12)
+            ])))
         );
     }
 

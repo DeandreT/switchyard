@@ -82,7 +82,7 @@ fn activate<P: StoreProvider>(
     issued_at: u64,
 ) -> Result<u32, BrokerError> {
     match fixture.at(issued_at, CommandKind::ActivateScheduled)? {
-        CommandOutcome::ScheduledActivated { activated } => Ok(activated),
+        CommandOutcome::ScheduledActivated { activated, .. } => Ok(activated),
         other => panic!("expected scheduled activation, got {other:?}"),
     }
 }

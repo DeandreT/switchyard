@@ -18,6 +18,7 @@ mod rules;
 mod scheduling;
 mod send;
 mod topic;
+mod topic_scheduling;
 
 use serde::de::DeserializeOwned;
 use storage::{StateStore, WriteBatch};
@@ -137,13 +138,11 @@ impl<S: StateStore> StateMachine<S> {
                 }
             }
             CommandKind::CancelScheduled { sequences } => {
-                if self
-                    .topic_config(&command.namespace, &command.entity)?
-                    .is_some()
-                {
-                    return Err(BrokerError::TopicSchedulingNotSupported);
+                if self.topic_exists(command)? {
+                    self.cancel_topic_scheduled(command, sequences, &mut batch)?
+                } else {
+                    self.cancel_scheduled(command, sequences, &mut batch)?
                 }
-                self.cancel_scheduled(command, sequences, &mut batch)?
             }
             CommandKind::Peek {
                 from_sequence,
@@ -250,13 +249,11 @@ impl<S: StateStore> StateMachine<S> {
             CommandKind::ExpireMessages => self.expire_messages(command, &mut batch)?,
             CommandKind::ExpireSessionLocks => self.expire_session_locks(command, &mut batch)?,
             CommandKind::ActivateScheduled => {
-                if self
-                    .topic_config(&command.namespace, &command.entity)?
-                    .is_some()
-                {
-                    return Err(BrokerError::TopicSchedulingNotSupported);
+                if self.topic_exists(command)? {
+                    self.activate_topic_scheduled(command, &mut batch)?
+                } else {
+                    self.activate_scheduled(command, &mut batch)?
                 }
-                self.activate_scheduled(command, &mut batch)?
             }
             CommandKind::ExpireDuplicateHistory => {
                 self.expire_duplicate_history(command, &mut batch)?

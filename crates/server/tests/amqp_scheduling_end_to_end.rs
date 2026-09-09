@@ -80,7 +80,7 @@ impl Node {
             domain::EntityPath::new(queue)?,
             CommandKind::ActivateScheduled,
         )? {
-            CommandOutcome::ScheduledActivated { activated } => Ok(activated),
+            CommandOutcome::ScheduledActivated { activated, .. } => Ok(activated),
             other => Err(format!("unexpected activation outcome: {other:?}").into()),
         }
     }

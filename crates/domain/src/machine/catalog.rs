@@ -55,4 +55,41 @@ impl<S: StateStore> StateMachine<S> {
             })
             .collect()
     }
+
+    /// Every topic in the store, in key order, across every namespace.
+    pub fn topics(&self, limit: usize) -> Result<Vec<(NamespaceName, EntityPath)>, BrokerError> {
+        self.topics_after(None, limit)
+    }
+
+    /// Topics strictly after `after`, in key order across every namespace.
+    ///
+    /// Like the queue catalog, this uses entity identities as cursors so a
+    /// future entity deletion cannot make a timer cursor ambiguous.
+    pub fn topics_after(
+        &self,
+        after: Option<&(NamespaceName, EntityPath)>,
+        limit: usize,
+    ) -> Result<Vec<(NamespaceName, EntityPath)>, BrokerError> {
+        let prefix = keys::topic_config_prefix();
+        let after_key = after.map(|(namespace, entity)| keys::topic_config(namespace, entity));
+        let scan_limit = limit.saturating_add(usize::from(after_key.is_some()));
+        self.store()
+            .scan_from(&prefix, after_key.as_deref().unwrap_or(&prefix), scan_limit)?
+            .into_iter()
+            .filter(|(key, _)| {
+                after_key
+                    .as_ref()
+                    .is_none_or(|after_key| key.as_slice() > after_key.as_slice())
+            })
+            .take(limit)
+            .map(|(key, _)| {
+                let (namespace, entity) =
+                    keys::entity_scope_parts(&key).ok_or(BrokerError::MalformedIndexKey)?;
+                Ok((
+                    NamespaceName::new(namespace)?,
+                    EntityPath::from_internal(entity)?,
+                ))
+            })
+            .collect()
+    }
 }

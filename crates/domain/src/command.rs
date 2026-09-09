@@ -211,8 +211,9 @@ pub enum CommandKind {
     /// Proposed by the leader's timer worker. Releases sessions whose lock has
     /// elapsed.
     ExpireSessionLocks,
-    /// Proposed by the leader's timer worker. Re-enqueues due scheduled
-    /// placeholders with new active sequence numbers.
+    /// Proposed by the leader's timer worker. Activates due placeholders with
+    /// new sequence numbers, either making queue messages ready or atomically
+    /// routing topic publications to their current matching subscriptions.
     ActivateScheduled,
     /// Proposed by the leader's timer worker. Removes message identifiers whose
     /// duplicate-detection history window elapsed.
@@ -245,10 +246,11 @@ pub enum CommandOutcome {
         /// deterministic sequence slot in `sequences`.
         stored: u32,
     },
-    /// Immediate topic fanout committed atomically. Every sequence is owned by
-    /// the topic and stamped identically into that message's subscription
-    /// copies. An empty subscription list is a successful publish to a topic
-    /// that currently has no subscribers.
+    /// A topic publication committed atomically. Every sequence is owned by the
+    /// topic and is either stamped into its immediate subscription copies or
+    /// names a topic-owned scheduled placeholder. The returned subscriptions
+    /// contain only paths populated immediately; scheduled fanout reports its
+    /// destinations from [`CommandOutcome::ScheduledActivated`].
     Published {
         sequences: Vec<SequenceNumber>,
         subscriptions: Vec<EntityPath>,
@@ -258,6 +260,10 @@ pub enum CommandOutcome {
     },
     ScheduledActivated {
         activated: u32,
+        /// Concrete receive paths made ready by activation, with each path
+        /// reported once. Queue activation names its queue; topic activation
+        /// names only the subscriptions that received a matching copy.
+        deliverable_entities: Vec<EntityPath>,
     },
     DuplicateHistoryExpired {
         removed: u32,

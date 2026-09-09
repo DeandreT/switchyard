@@ -248,7 +248,7 @@ if (ruleFailure is not null)
 Console.WriteLine(
     "official .NET Service Bus client AMQP-over-WebSockets batch/prefetch, " +
     "send/receive/complete, defer/peek/deferred-receive, schedule/cancel, " +
-    "duplicate detection, topic fan-out, case-insensitive queue/topic/subscription identity, " +
+    "duplicate detection, immediate and scheduled topic fan-out, case-insensitive queue/topic/subscription identity, " +
     "durable correlation rule management and filtered fan-out, " +
     "and session attach passed");
 return 0;

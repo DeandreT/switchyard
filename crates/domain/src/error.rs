@@ -46,8 +46,6 @@ pub enum BrokerError {
     SubscriptionSendNotAllowed,
     #[error("messages cannot be received directly from a topic")]
     TopicReceiveNotSupported,
-    #[error("scheduled topic messages are not supported yet")]
-    TopicSchedulingNotSupported,
     #[error("session-bearing topic messages are not supported yet")]
     TopicSessionNotSupported,
     #[error("message {sequence} does not exist")]

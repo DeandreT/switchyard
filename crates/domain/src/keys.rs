@@ -96,6 +96,12 @@ pub fn topic_config(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
     entity_scope(TAG_TOPIC_CONFIG, namespace, entity)
 }
 
+/// Every topic configuration in the store, across every namespace. Walking it
+/// lets the timer worker discover topic-owned scheduled placeholders.
+pub fn topic_config_prefix() -> Vec<u8> {
+    vec![TAG_TOPIC_CONFIG]
+}
+
 pub fn topic_subscription_prefix(namespace: &NamespaceName, topic: &EntityPath) -> Vec<u8> {
     entity_scope(TAG_TOPIC_SUBSCRIPTION, namespace, topic)
 }

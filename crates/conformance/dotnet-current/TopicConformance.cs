@@ -105,6 +105,19 @@ internal static class TopicConformance
         await Task.WhenAll(
             secondBatch.Reverse().Select(message => second.CompleteMessageAsync(message)));
 
+        string? schedulingFailure = await ScheduledTopicConformance.RunAsync(
+            client,
+            topic,
+            secondSubscription,
+            sender,
+            first,
+            second);
+        if (schedulingFailure is not null)
+        {
+            Console.Error.WriteLine(schedulingFailure);
+            return 98;
+        }
+
         return 0;
     }
 
