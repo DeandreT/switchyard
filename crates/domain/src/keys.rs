@@ -11,6 +11,7 @@
 //!   session's messages are contiguous and in order within the group, and a
 //!   receiver looking for a session to accept walks the groups in turn;
 //! - the session lock index sorts by lock deadline, like the message one.
+//! - the scheduled index sorts by enqueue time, then cancellation handle.
 //!
 //! Every entity-scoped key is `tag || namespace || 0x00 || path || 0x00 || ..`,
 //! and a session-scoped key appends `session || 0x00` to that. The terminators
@@ -32,6 +33,7 @@ const TAG_EXPIRY: u8 = 0x06;
 const TAG_SESSION: u8 = 0x08;
 const TAG_SESSION_READY: u8 = 0x09;
 const TAG_SESSION_LOCK: u8 = 0x0A;
+const TAG_SCHEDULED: u8 = 0x0B;
 
 const SEPARATOR: u8 = 0x00;
 
@@ -146,6 +148,20 @@ pub fn expiry(
     with_u64(key, sequence.as_u64())
 }
 
+pub fn scheduled_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_SCHEDULED, namespace, entity)
+}
+
+pub fn scheduled(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    enqueue_at: Timestamp,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
+    let key = with_u64(scheduled_prefix(namespace, entity), enqueue_at.as_millis());
+    with_u64(key, sequence.as_u64())
+}
+
 /// The record holding one session's lock and state.
 pub fn session(namespace: &NamespaceName, entity: &EntityPath, session_id: &SessionId) -> Vec<u8> {
     session_scope(TAG_SESSION, namespace, entity, session_id)
@@ -241,7 +257,7 @@ pub fn trailing_sequence(key: &[u8]) -> Option<SequenceNumber> {
     Some(SequenceNumber::new(u64::from_be_bytes(bytes)))
 }
 
-/// Reads the deadline and sequence number from a lock or expiry index key.
+/// Reads the deadline and sequence number from a lock, expiry, or scheduled index key.
 pub fn trailing_deadline(key: &[u8]) -> Option<(Timestamp, SequenceNumber)> {
     let sequence = trailing_sequence(key)?;
     let start = key.len().checked_sub(16)?;
@@ -299,6 +315,42 @@ mod tests {
         assert_eq!(
             trailing_deadline(&early),
             Some((Timestamp::from_millis(100), SequenceNumber::new(9)))
+        );
+    }
+
+    #[test]
+    fn scheduled_keys_sort_by_enqueue_time_then_cancellation_handle() {
+        let mut entries = [
+            scheduled(
+                &namespace(),
+                &entity(),
+                Timestamp::from_millis(200),
+                SequenceNumber::new(1),
+            ),
+            scheduled(
+                &namespace(),
+                &entity(),
+                Timestamp::from_millis(100),
+                SequenceNumber::new(9),
+            ),
+            scheduled(
+                &namespace(),
+                &entity(),
+                Timestamp::from_millis(100),
+                SequenceNumber::new(2),
+            ),
+        ];
+        entries.sort();
+        assert_eq!(
+            entries
+                .iter()
+                .filter_map(|key| trailing_deadline(key))
+                .collect::<Vec<_>>(),
+            vec![
+                (Timestamp::from_millis(100), SequenceNumber::new(2)),
+                (Timestamp::from_millis(100), SequenceNumber::new(9)),
+                (Timestamp::from_millis(200), SequenceNumber::new(1)),
+            ]
         );
     }
 

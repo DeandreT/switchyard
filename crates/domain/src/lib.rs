@@ -20,7 +20,7 @@ mod session;
 mod time;
 
 pub use codec::CodecError;
-pub use command::{Command, CommandKind, CommandOutcome};
+pub use command::{Command, CommandKind, CommandOutcome, ScheduledMessage};
 pub use error::BrokerError;
 pub use identifier::{
     DEAD_LETTER_QUEUE_SUFFIX, EntityPath, IdentifierError, MAX_ENTITY_PATH_BYTES,
@@ -30,7 +30,7 @@ pub use identifier::{
 pub use machine::{StateMachine, TIMER_SCAN_LIMIT};
 pub use message::{
     DeadLetterInfo, DeadLetterReason, Delivery, DeliveryGuarantee, DeliveryLock, LockToken,
-    MessageRecord, MessageState, ReceiveMode, SequenceNumber,
+    MessageRecord, MessageState, MessageStatus, ReceiveMode, SequenceNumber,
 };
 pub use queue::{
     DEFAULT_LOCK_DURATION_MILLIS, DEFAULT_MAX_DELIVERY_COUNT, DEFAULT_MAX_MESSAGE_BYTES,

@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Send, peek, receive, defer, renew and complete; session renew/state | Planned | Experimental gate on 7.20.2 |
+| Official .NET SDK, current stable | Send, peek, receive, defer, renew, complete, schedule and cancel; session renew/state/scheduling | Planned | Experimental gate on 7.20.2 |
 | Official .NET SDK, previous stable | Planned | Planned | Not implemented |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -31,7 +31,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Time-to-live expiry | Pre-1.0 | State machine |
 | Topics and subscriptions | Pre-1.0 | Not implemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
-| Scheduling and cancellation | Pre-1.0 | Not implemented |
+| Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Dead-letter | Pre-1.0 | State machine, AMQP mapping |
 | Dead-letter receive and resubmit | Pre-1.0 | Receive: state machine, AMQP mapping. Resubmit: not implemented |
@@ -60,6 +60,14 @@ behavior it currently enforces:
 - Deferral removes a locked message from the ready path while keeping its
   sequence number. A deferred receive by sequence can lock it again or consume
   it in receive-delete mode, and deferred messages still expire.
+- Scheduling keeps messages visible to peek but out of the ready path until
+  their requested time. The timer atomically activates each due message under
+  a new sequence number, appending it to the queue, and starts its lifetime at
+  that activation. The requested scheduling timestamp remains attached.
+  Scheduling a batch is atomic, including validation failures. Cancellation
+  removes the scheduled record and deadline entry atomically; it rejects a
+  missing or already-active handle. Exact Azure behavior for those rejected
+  cancellation cases has not yet been verified.
 - A settlement is rejected unless it presents the live lock token, and rejected
   again once the lock deadline has passed.
 - A live message lock can be renewed without changing its token. Renewal moves
@@ -97,9 +105,9 @@ a rejection or a bound rather than a silent difference:
   reports none available if they are all held, rather than walking the entity.
   The receiver retries.
 
-Expiry is not merely expressible: the `server` crate's timer worker proposes the
-lock, time-to-live, and session-lock sweeps on an interval, so a running node
-actually releases what has elapsed.
+The `server` crate's timer worker proposes scheduled activation, lock,
+time-to-live, and session-lock sweeps on an interval, so a running node
+activates what is due and releases what has elapsed.
 
 An AMQP 1.0 client can reach a queue. The node accepts AMQP over TLS with the
 socket secured before the protocol handshake, as Service Bus port 5671
@@ -118,21 +126,34 @@ Peeking is served through the entity's `$management` request/reply links and
 returns encoded AMQP messages without touching their broker state.
 Deferred receive is also served through `$management`, and locks returned that
 way are settled through the management `update-disposition` operation.
+Scheduling and cancellation use the management node, while an ordinary send
+can also schedule through the `x-opt-scheduled-enqueue-time` timestamp
+annotation. Peek returns active, deferred, and scheduled state annotations.
 A receiving link's `com.microsoft:session-filter` names a session or, with a
 null value, asks for the next available one; the attach response echoes the
 granted identifier and the initial session-lock deadline. The session is
 released when that link closes; renewing its lock and reading or writing its
 state use the entity's `$management` request/reply links, as does message-lock
-renewal. Those operations require Manage authorization when authentication is
-enabled. A transfer is accepted only after its command committed, so the
+renewal. Scheduling and cancellation require Send authorization; receiving,
+peeking, settlement, and lock or session operations require Listen. Management
+links accept either permission, and every request rechecks its own permission
+when authentication is enabled. A transfer is accepted only after its command
+committed, so the
 acknowledgement means durable. One node still serves one namespace. A message
 drained from a dead-letter queue carries its reason and description in the
 `DeadLetterReason` and `DeadLetterErrorDescription` application properties. The
 complete protocol coverage uses a Rust AMQP 1.0 client. The current stable
 official .NET SDK also has an opt-in gate for ordinary send, receive,
-peek, deferral, deferred receive, message-lock renewal, and completion plus
-session state, renewal, receive, and completion; the rest of that client gate
+peek, deferral, deferred receive, message-lock renewal, completion, scheduling,
+and cancellation plus session state, renewal, receive, completion, and
+scheduling; the rest of that client gate
 remains incomplete.
+
+The current message-record format is version 5 and durable store layout is
+version 3. Earlier record shapes have tested decoders, but an earlier store
+directory is refused at open because its broker indexes have a different
+contract. There is no directory migration tooling yet; development directories
+from older builds must be recreated. A rollback likewise refuses a newer layout.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch
 before reporting it applied, and the same semantics suite runs against both

@@ -9,7 +9,7 @@ use std::error::Error;
 
 use domain::{
     CommandKind, CommandOutcome, Delivery, EntityPath, NamespaceName, QueueConfig, ReceiveMode,
-    SessionId, StateMachine, TIMER_SCAN_LIMIT,
+    ScheduledMessage, SessionId, StateMachine, TIMER_SCAN_LIMIT, Timestamp,
 };
 use server::{
     Broker, BrokerHandle, LocalProposer, ManualClock, SubmitError, SweepReport, TimerWorker,
@@ -234,6 +234,62 @@ fn a_sweep_never_moves_the_applied_clock_backward<P: StoreProvider>(
     Ok(())
 }
 
+fn a_sweep_activates_scheduled_messages_and_starts_their_ttl<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let runtime = Runtime::new(provider, queue_config())?;
+    runtime.propose(CommandKind::Schedule {
+        messages: vec![ScheduledMessage {
+            message_id: String::from("scheduled"),
+            body: b"scheduled".to_vec(),
+            time_to_live_millis: Some(100),
+            session_id: None,
+            enqueue_at: Timestamp::from_millis(2_000),
+        }],
+    })?;
+    runtime.clock.set(1_999);
+    assert!(runtime.sweep()?.is_idle());
+    assert_eq!(runtime.receive()?, None);
+
+    runtime.clock.set(2_000);
+    let report = runtime.sweep()?;
+    assert_eq!(report.messages_activated, 1);
+    assert!(!report.is_idle());
+    let delivery = runtime
+        .receive()?
+        .expect("the timer made the message ready");
+    assert_eq!(delivery.body, b"scheduled");
+    assert_eq!(delivery.enqueued_at, Timestamp::from_millis(2_000));
+    assert!(runtime.sweep()?.is_idle());
+
+    runtime.clock.set(2_100);
+    assert_eq!(runtime.sweep()?.messages_dead_lettered, 1);
+    Ok(())
+}
+
+fn a_sweep_drains_a_scheduled_backlog_in_bounded_batches<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let runtime = Runtime::new(provider, queue_config())?;
+    let backlog = TIMER_SCAN_LIMIT + 1;
+    runtime.propose(CommandKind::Schedule {
+        messages: (0..backlog)
+            .map(|index| ScheduledMessage {
+                message_id: format!("scheduled-{index}"),
+                body: Vec::new(),
+                time_to_live_millis: None,
+                session_id: None,
+                enqueue_at: Timestamp::from_millis(2_000),
+            })
+            .collect(),
+    })?;
+    runtime.clock.set(2_000);
+    assert_eq!(runtime.sweep()?.messages_activated, backlog as u32);
+    assert!(runtime.sweep()?.is_idle());
+    assert!(runtime.receive()?.is_some());
+    Ok(())
+}
+
 // ---- instantiation ---------------------------------------------------------
 
 macro_rules! for_each_backend {
@@ -264,4 +320,6 @@ for_each_backend! {
     a_sweep_releases_a_session_whose_lock_elapsed,
     one_sweep_drains_a_backlog_larger_than_a_single_command,
     a_sweep_never_moves_the_applied_clock_backward,
+    a_sweep_activates_scheduled_messages_and_starts_their_ttl,
+    a_sweep_drains_a_scheduled_backlog_in_bounded_batches,
 }

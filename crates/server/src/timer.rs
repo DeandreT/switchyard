@@ -1,9 +1,9 @@
-//! The worker that proposes expiry commands.
+//! The worker that proposes deadline commands.
 //!
 //! The state machine has no clock of its own, so nothing expires until something
 //! asks it to. This is that something: on every tick it walks the queues and
-//! proposes the three expiry commands for each. Without it, locks are held
-//! forever and messages outlive their time to live.
+//! proposes activation and expiry commands for each. Without it, scheduled
+//! messages stay hidden, locks are held forever, and messages outlive their TTL.
 //!
 //! The sweep itself is deterministic given the clock, so a test drives it
 //! directly and only the surrounding loop deals in real time.
@@ -38,6 +38,7 @@ pub struct SweepReport {
     pub locks_returned_to_ready: u32,
     pub messages_dead_lettered: u32,
     pub sessions_released: u32,
+    pub messages_activated: u32,
 }
 
 impl SweepReport {
@@ -46,6 +47,7 @@ impl SweepReport {
         self.locks_returned_to_ready == 0
             && self.messages_dead_lettered == 0
             && self.sessions_released == 0
+            && self.messages_activated == 0
     }
 }
 
@@ -58,7 +60,7 @@ impl<'a> TimerWorker<'a> {
         Self { broker }
     }
 
-    /// Proposes one round of expiry commands for every queue in the store.
+    /// Proposes deadline commands for every queue in the store.
     ///
     /// An error abandons the rest of the sweep. Each command was atomic, so what
     /// already applied stands and the next tick resumes from there.
@@ -70,11 +72,35 @@ impl<'a> TimerWorker<'a> {
         };
 
         for (namespace, entity) in queues {
+            self.activate_scheduled(&namespace, &entity, &mut report)?;
             self.expire_locks(&namespace, &entity, &mut report)?;
             self.expire_messages(&namespace, &entity, &mut report)?;
             self.expire_session_locks(&namespace, &entity, &mut report)?;
         }
         Ok(report)
+    }
+
+    fn activate_scheduled(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+        report: &mut SweepReport,
+    ) -> Result<(), SubmitError> {
+        for _ in 0..MAX_ROUNDS_PER_INDEX {
+            let outcome = self.broker.submit_blocking(
+                namespace.clone(),
+                entity.clone(),
+                CommandKind::ActivateScheduled,
+            )?;
+            let CommandOutcome::ScheduledActivated { activated } = outcome else {
+                return Err(unexpected(outcome));
+            };
+            report.messages_activated += activated;
+            if (activated as usize) < TIMER_SCAN_LIMIT {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn expire_locks(
@@ -174,7 +200,8 @@ impl<'a> TimerWorker<'a> {
                         locks_returned_to_ready = report.locks_returned_to_ready,
                         messages_dead_lettered = report.messages_dead_lettered,
                         sessions_released = report.sessions_released,
-                        "sweep expired entries"
+                        messages_activated = report.messages_activated,
+                        "sweep applied deadlines"
                     );
                 }
                 Err(error) => warn!(%error, "sweep failed, retrying on the next tick"),

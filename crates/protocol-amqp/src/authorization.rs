@@ -120,9 +120,17 @@ impl ConnectionAuthorization {
         entity_path: &str,
         permission: Permission,
     ) -> Result<ResourceScope, AuthorizationError> {
+        self.authorize_entity_any(entity_path, &[permission]).await
+    }
+
+    pub(crate) async fn authorize_entity_any(
+        &self,
+        entity_path: &str,
+        permissions: &[Permission],
+    ) -> Result<ResourceScope, AuthorizationError> {
         let resource = ResourceScope::entity(&self.audience_host, entity_path)
             .map_err(|_| AuthorizationError)?;
-        self.authorize_resource(&resource, permission).await?;
+        self.authorize_resource_any(&resource, permissions).await?;
         Ok(resource)
     }
 
@@ -131,13 +139,20 @@ impl ConnectionAuthorization {
         resource: &ResourceScope,
         permission: Permission,
     ) -> Result<(), AuthorizationError> {
-        if self
-            .grants
-            .read()
-            .await
-            .iter()
-            .any(|grant| grant.allows(resource, permission, epoch_seconds()))
-        {
+        self.authorize_resource_any(resource, &[permission]).await
+    }
+
+    pub(crate) async fn authorize_resource_any(
+        &self,
+        resource: &ResourceScope,
+        permissions: &[Permission],
+    ) -> Result<(), AuthorizationError> {
+        let now = epoch_seconds();
+        if self.grants.read().await.iter().any(|grant| {
+            permissions
+                .iter()
+                .any(|permission| grant.allows(resource, *permission, now))
+        }) {
             Ok(())
         } else {
             Err(AuthorizationError)
@@ -149,6 +164,15 @@ impl ConnectionAuthorization {
         resource: &ResourceScope,
         permission: Permission,
     ) {
+        self.wait_until_unauthorized_any(resource, &[permission])
+            .await;
+    }
+
+    pub(crate) async fn wait_until_unauthorized_any(
+        &self,
+        resource: &ResourceScope,
+        permissions: &[Permission],
+    ) {
         loop {
             let changed = self.grant_changed.notified();
             let now = epoch_seconds();
@@ -158,7 +182,10 @@ impl ConnectionAuthorization {
                 .await
                 .iter()
                 .filter(|grant| {
-                    grant.scope().contains(resource) && grant.permissions().allows(permission)
+                    grant.scope().contains(resource)
+                        && permissions
+                            .iter()
+                            .any(|permission| grant.permissions().allows(*permission))
                 })
                 .map(AccessGrant::expires_at_epoch_seconds)
                 .filter(|expiry| *expiry > now)
@@ -305,3 +332,113 @@ pub(crate) struct AuthorizationError;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RouteError;
+
+#[cfg(test)]
+mod tests {
+    use auth::{PermissionSet, SharedAccessKey, SharedAccessRule};
+
+    use super::*;
+
+    const HOST: &str = "tenant.servicebus.windows.net";
+
+    fn connection(permissions: PermissionSet) -> Arc<ConnectionAuthorization> {
+        let policy = SharedAccessPolicy::new([SharedAccessRule::new(
+            "test-rule",
+            ResourceScope::entity(HOST, "orders").expect("valid scope"),
+            SharedAccessKey::new("test-secret").expect("valid key"),
+            None,
+            permissions,
+        )
+        .expect("valid rule")])
+        .expect("valid policy");
+        let grant = policy
+            .authenticate_plain("test-rule", "test-secret")
+            .expect("valid grant");
+        ConnectionAuthorization::new(
+            SharedAccessAuthentication::new(policy, HOST).expect("valid authentication"),
+            Some(grant),
+        )
+    }
+
+    #[tokio::test]
+    async fn any_permission_accepts_send_listen_or_manage_without_broadening_scope() {
+        for permission in [
+            PermissionSet::SEND,
+            PermissionSet::LISTEN,
+            PermissionSet::MANAGE,
+        ] {
+            let connection = connection(permission);
+            let requested = [Permission::Send, Permission::Listen];
+            assert!(
+                connection
+                    .authorize_entity_any("orders", &requested)
+                    .await
+                    .is_ok()
+            );
+            assert!(
+                connection
+                    .authorize_entity_any("other", &requested)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                connection
+                    .authorize_entity_any("orders", &[])
+                    .await
+                    .is_err()
+            );
+        }
+
+        let connection = connection(PermissionSet::SEND);
+        assert!(
+            connection
+                .authorize_entity("orders", Permission::Send)
+                .await
+                .is_ok()
+        );
+        assert!(
+            connection
+                .authorize_entity("orders", Permission::Listen)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn any_permission_expiry_waits_until_the_last_matching_grant_is_gone() {
+        let connection = connection(PermissionSet::SEND);
+        let resource = ResourceScope::entity(HOST, "orders").expect("valid scope");
+        let requested = [Permission::Send, Permission::Listen];
+        let waiting = connection.wait_until_unauthorized_any(&resource, &requested);
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiting)
+                .await
+                .is_err()
+        );
+
+        connection.grants.write().await.clear();
+        connection.grant_changed.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), &mut waiting)
+            .await
+            .expect("removing the grant ends the wait");
+    }
+
+    #[tokio::test]
+    async fn unmatched_and_empty_permission_sets_are_immediately_unauthorized() {
+        let connection = connection(PermissionSet::SEND);
+        let resource = ResourceScope::entity(HOST, "orders").expect("valid scope");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            connection.wait_until_unauthorized_any(&resource, &[Permission::Listen]),
+        )
+        .await
+        .expect("an unmatched permission does not wait");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            connection.wait_until_unauthorized_any(&resource, &[]),
+        )
+        .await
+        .expect("an empty permission set does not wait");
+    }
+}

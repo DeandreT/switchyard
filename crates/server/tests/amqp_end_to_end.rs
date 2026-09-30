@@ -10,6 +10,7 @@ use amqp::{
     ApplicationProperties, Array, Body, ClientConnection as Connection, ClientReceiver as Receiver,
     ClientSender as Sender, ClientSession as Session, FilterSet, Message, Modified, OrderedMap,
     Outcome, Properties, SenderSettleMode, Source, Symbol, Uuid, Value, decode_message,
+    encode_message,
 };
 use domain::{CommandKind, QueueConfig, StateMachine};
 use server::{Broker, LocalProposer, ManualClock};
@@ -20,13 +21,15 @@ use tokio::net::TcpListener;
 struct Node {
     _broker: Broker,
     address: String,
+    clock: ManualClock,
 }
 
 impl Node {
     async fn start(queue: &str, config: QueueConfig) -> Result<Self, Box<dyn Error>> {
+        let clock = ManualClock::at(1_000);
         let broker = Broker::spawn(LocalProposer::new(
             StateMachine::new(MemoryStore::default()),
-            ManualClock::at(1_000),
+            clock.clone(),
         ));
         let namespace = domain::NamespaceName::new("tenant")?;
         broker.handle().submit_blocking(
@@ -47,6 +50,7 @@ impl Node {
         Ok(Self {
             _broker: broker,
             address,
+            clock,
         })
     }
 
@@ -634,18 +638,50 @@ async fn session_management_request(
     link_name: &str,
     body: OrderedMap<Value, Value>,
 ) -> Result<Message, Box<dyn Error>> {
+    let response = management_request(
+        requests,
+        responses,
+        reply_to,
+        message_id,
+        operation,
+        Some(link_name),
+        body,
+    )
+    .await?;
+    assert_eq!(
+        response
+            .application_properties
+            .as_ref()
+            .and_then(|properties| { properties.get(protocol_amqp::STATUS_CODE_PROPERTY) }),
+        Some(&Value::Int(200))
+    );
+    Ok(response)
+}
+
+async fn management_request(
+    requests: &mut Sender,
+    responses: &mut Receiver,
+    reply_to: &str,
+    message_id: &str,
+    operation: &str,
+    link_name: Option<&str>,
+    body: OrderedMap<Value, Value>,
+) -> Result<Message, Box<dyn Error>> {
+    let mut properties = ApplicationProperties::default();
+    properties.insert(protocol_amqp::OPERATION_PROPERTY, operation.to_owned());
+    if let Some(link_name) = link_name {
+        properties.insert(
+            protocol_amqp::ASSOCIATED_LINK_NAME_PROPERTY,
+            link_name.to_owned(),
+        );
+    }
     let request = Message::builder()
         .properties(Properties {
             message_id: Some(message_id.to_owned().into()),
             reply_to: Some(reply_to.to_owned()),
             ..Properties::default()
         })
-        .application_properties(
-            ApplicationProperties::builder()
-                .insert(protocol_amqp::OPERATION_PROPERTY, operation)
-                .insert(protocol_amqp::ASSOCIATED_LINK_NAME_PROPERTY, link_name)
-                .build(),
-        )
+        .application_properties(properties)
         .body(Body::Value(Value::Map(body)))
         .build();
     assert!(matches!(
@@ -655,17 +691,296 @@ async fn session_management_request(
 
     let response =
         tokio::time::timeout(std::time::Duration::from_secs(2), responses.recv()).await??;
-    assert_eq!(
-        response
-            .message()
-            .application_properties
-            .as_ref()
-            .and_then(|properties| properties.get(protocol_amqp::STATUS_CODE_PROPERTY)),
-        Some(&Value::Int(200))
-    );
     let message = response.message().clone();
     responses.accept(&response).await?;
     Ok(message)
+}
+
+fn scheduled_wire_message(text: &str, enqueue_at: i64) -> Message {
+    let mut message = Message::data(text.as_bytes().to_vec());
+    let mut annotations = OrderedMap::new();
+    annotations.insert(
+        Symbol::from(protocol_amqp::SCHEDULED_ENQUEUE_TIME_ANNOTATION),
+        Value::Timestamp(enqueue_at.into()),
+    );
+    message.message_annotations = Some(annotations);
+    message
+}
+
+fn schedule_request_body(messages: &[Message]) -> Result<OrderedMap<Value, Value>, Box<dyn Error>> {
+    let mut entries = Vec::new();
+    for message in messages {
+        let mut entry = OrderedMap::new();
+        entry.insert(
+            Value::String(protocol_amqp::MESSAGE.to_owned()),
+            Value::Binary(encode_message(message)?.into()),
+        );
+        entry.insert(Value::String("message-id".to_owned()), Value::Null);
+        entries.push(Value::Map(entry));
+    }
+    let mut body = OrderedMap::new();
+    body.insert(
+        Value::String(protocol_amqp::MESSAGES.to_owned()),
+        Value::List(entries),
+    );
+    Ok(body)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_schedules_peeks_cancels_and_receives_after_activation()
+-> Result<(), Box<dyn Error>> {
+    let node = Node::start("orders", QueueConfig::default()).await?;
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let reply_to = "scheduling-replies";
+    let mut responses = Receiver::builder()
+        .name("scheduling-responses")
+        .source("orders/$management")
+        .target(reply_to)
+        .attach(&mut session)
+        .await?;
+    let mut requests =
+        Sender::attach(&mut session, "scheduling-requests", "orders/$management").await?;
+    // Scheduling requires no ordinary sending link and accepts SDK-generated null IDs.
+    let scheduled = management_request(
+        &mut requests,
+        &mut responses,
+        reply_to,
+        "schedule-1",
+        protocol_amqp::SCHEDULE_MESSAGE_OPERATION,
+        None,
+        schedule_request_body(&[
+            scheduled_wire_message("cancel-me", 2_000),
+            scheduled_wire_message("activate-me", 2_000),
+        ])?,
+    )
+    .await?;
+    assert_eq!(
+        scheduled
+            .application_properties
+            .as_ref()
+            .and_then(|properties| { properties.get(protocol_amqp::STATUS_CODE_PROPERTY) }),
+        Some(&Value::Int(200))
+    );
+    let Body::Value(Value::Map(body)) = scheduled.body else {
+        panic!("scheduling responds with a map");
+    };
+    let Some(Value::Array(sequences)) =
+        body.get(&Value::String(protocol_amqp::SEQUENCE_NUMBERS.to_owned()))
+    else {
+        panic!("scheduling responds with an array of long sequence numbers");
+    };
+    assert_eq!(sequences.len(), 2);
+    assert!(
+        sequences
+            .iter()
+            .all(|sequence| matches!(sequence, Value::Long(_)))
+    );
+    let scheduled_sequence = sequences[1].clone();
+    let mut cancel = OrderedMap::new();
+    cancel.insert(
+        Value::String(protocol_amqp::SEQUENCE_NUMBERS.to_owned()),
+        Value::Array(Array::from(vec![sequences[0].clone()])),
+    );
+    let cancelled = management_request(
+        &mut requests,
+        &mut responses,
+        reply_to,
+        "cancel-1",
+        protocol_amqp::CANCEL_SCHEDULED_MESSAGE_OPERATION,
+        None,
+        cancel,
+    )
+    .await?;
+    assert_eq!(
+        cancelled
+            .application_properties
+            .as_ref()
+            .and_then(|properties| { properties.get(protocol_amqp::STATUS_CODE_PROPERTY) }),
+        Some(&Value::Int(200))
+    );
+    let mut peek = OrderedMap::new();
+    peek.insert(
+        Value::String(protocol_amqp::FROM_SEQUENCE_NUMBER.to_owned()),
+        Value::Long(0),
+    );
+    peek.insert(
+        Value::String(protocol_amqp::MESSAGE_COUNT.to_owned()),
+        Value::Int(10),
+    );
+    let peeked = management_request(
+        &mut requests,
+        &mut responses,
+        reply_to,
+        "peek-scheduled",
+        protocol_amqp::PEEK_MESSAGE_OPERATION,
+        None,
+        peek,
+    )
+    .await?;
+    let Body::Value(Value::Map(body)) = peeked.body else {
+        panic!("peek responds with a map");
+    };
+    let Some(Value::List(messages)) = body.get(&Value::String(protocol_amqp::MESSAGES.to_owned()))
+    else {
+        panic!("peek responds with encoded messages");
+    };
+    assert_eq!(
+        messages.len(),
+        1,
+        "cancellation removed the first scheduled message"
+    );
+    let Value::Map(entry) = &messages[0] else {
+        panic!("peek entries are maps");
+    };
+    let Some(Value::Binary(encoded)) = entry.get(&Value::String(protocol_amqp::MESSAGE.to_owned()))
+    else {
+        panic!("peek messages are binary");
+    };
+    let peeked_message = decode_message(encoded)?;
+    assert_eq!(text_of(&peeked_message), "activate-me");
+    let annotations = peeked_message
+        .message_annotations
+        .as_ref()
+        .expect("peek annotations");
+    assert_eq!(
+        annotations.get(&Symbol::from(protocol_amqp::MESSAGE_STATE_ANNOTATION)),
+        Some(&Value::Int(2))
+    );
+    assert_eq!(
+        annotations.get(&Symbol::from(
+            protocol_amqp::SCHEDULED_ENQUEUE_TIME_ANNOTATION
+        )),
+        Some(&Value::Timestamp(2_000_i64.into()))
+    );
+    let mut receiver = Receiver::attach(&mut session, "scheduled-receiver", "orders").await?;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), receiver.recv())
+            .await
+            .is_err()
+    );
+    node.clock.set(2_000);
+    assert_eq!(
+        server::TimerWorker::new(&node._broker.handle())
+            .sweep_once()?
+            .messages_activated,
+        1
+    );
+    let delivery =
+        tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv()).await??;
+    assert_eq!(text_of(delivery.message()), "activate-me");
+    let annotations = delivery
+        .message()
+        .message_annotations
+        .as_ref()
+        .expect("delivery annotations");
+    assert_ne!(
+        annotations.get(&Symbol::from("x-opt-sequence-number")),
+        Some(&scheduled_sequence)
+    );
+    assert_eq!(
+        annotations.get(&Symbol::from(protocol_amqp::MESSAGE_STATE_ANNOTATION)),
+        Some(&Value::Int(0))
+    );
+    assert_eq!(
+        annotations.get(&Symbol::from(
+            protocol_amqp::SCHEDULED_ENQUEUE_TIME_ANNOTATION
+        )),
+        Some(&Value::Timestamp(2_000_i64.into()))
+    );
+    receiver.accept(&delivery).await?;
+    receiver.close().await?;
+    requests.close().await?;
+    responses.close().await?;
+    session.end().await?;
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scheduled_annotation_on_an_ordinary_send_waits_until_due() -> Result<(), Box<dyn Error>>
+{
+    let node = Node::start("orders", QueueConfig::default()).await?;
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
+    assert!(matches!(
+        sender
+            .send(scheduled_wire_message("scheduled-transfer", 2_000))
+            .await?,
+        Outcome::Accepted(_)
+    ));
+    let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), receiver.recv())
+            .await
+            .is_err()
+    );
+    node.clock.set(2_000);
+    server::TimerWorker::new(&node._broker.handle()).sweep_once()?;
+    let delivery =
+        tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv()).await??;
+    assert_eq!(text_of(delivery.message()), "scheduled-transfer");
+    receiver.accept(&delivery).await?;
+    sender.close().await?;
+    receiver.close().await?;
+    session.end().await?;
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_scheduled_batch_does_not_enqueue_earlier_entries() -> Result<(), Box<dyn Error>>
+{
+    let node = Node::start("orders", QueueConfig::default()).await?;
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let reply_to = "malformed-scheduling-replies";
+    let mut responses = Receiver::builder()
+        .name("scheduling-responses")
+        .source("orders/$management")
+        .target(reply_to)
+        .attach(&mut session)
+        .await?;
+    let mut requests =
+        Sender::attach(&mut session, "scheduling-requests", "orders/$management").await?;
+    let response = management_request(
+        &mut requests,
+        &mut responses,
+        reply_to,
+        "invalid-schedule",
+        protocol_amqp::SCHEDULE_MESSAGE_OPERATION,
+        None,
+        schedule_request_body(&[
+            scheduled_wire_message("valid-first", 2_000),
+            Message::data(b"missing-timestamp".to_vec()),
+        ])?,
+    )
+    .await?;
+    assert_eq!(
+        response
+            .application_properties
+            .as_ref()
+            .and_then(|properties| { properties.get(protocol_amqp::STATUS_CODE_PROPERTY) }),
+        Some(&Value::Int(400))
+    );
+    assert_eq!(
+        node._broker.handle().submit_blocking(
+            domain::NamespaceName::new("tenant")?,
+            domain::EntityPath::new("orders")?,
+            CommandKind::Peek {
+                from_sequence: domain::SequenceNumber::new(0),
+                max_messages: 10,
+                session_id: None,
+            },
+        )?,
+        domain::CommandOutcome::Peeked(Vec::new()),
+    );
+    requests.close().await?;
+    responses.close().await?;
+    session.end().await?;
+    connection.close().await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

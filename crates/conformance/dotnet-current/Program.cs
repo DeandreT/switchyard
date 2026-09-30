@@ -86,6 +86,97 @@ if (deferred.Body.ToString() != "official-deferred-current")
 }
 await receiver.CompleteMessageAsync(deferred);
 
+DateTimeOffset cancelEnqueueTime = DateTimeOffset.UtcNow.AddMinutes(1);
+long cancelledSequence = await sender.ScheduleMessageAsync(
+    new ServiceBusMessage("official-cancelled-current"), cancelEnqueueTime);
+ServiceBusReceivedMessage? cancelledPeek =
+    await receiver.PeekMessageAsync(cancelledSequence);
+if (cancelledPeek?.Body.ToString() != "official-cancelled-current"
+    || cancelledPeek.State != ServiceBusMessageState.Scheduled
+    || cancelledPeek.ScheduledEnqueueTime.ToUnixTimeMilliseconds()
+        != cancelEnqueueTime.ToUnixTimeMilliseconds())
+{
+    Console.Error.WriteLine("the scheduled message was not exposed correctly by peek");
+    return 13;
+}
+await sender.CancelScheduledMessageAsync(cancelledSequence);
+if (await receiver.PeekMessageAsync(cancelledSequence) is not null)
+{
+    Console.Error.WriteLine("the cancelled scheduled message remained in the queue");
+    return 14;
+}
+
+IReadOnlyList<long> cancelledBatchSequences = await sender.ScheduleMessagesAsync(
+    new[]
+    {
+        new ServiceBusMessage("official-cancelled-batch-a-current"),
+        new ServiceBusMessage("official-cancelled-batch-b-current"),
+    }, cancelEnqueueTime);
+IReadOnlyList<ServiceBusReceivedMessage> cancelledBatchPeek =
+    await receiver.PeekMessagesAsync(2, cancelledBatchSequences[0]);
+if (cancelledBatchSequences.Count != 2
+    || cancelledBatchPeek.Count != 2
+    || !cancelledBatchPeek.Select(message => message.SequenceNumber)
+        .SequenceEqual(cancelledBatchSequences)
+    || cancelledBatchPeek.Any(message => message.State != ServiceBusMessageState.Scheduled
+        || message.ScheduledEnqueueTime.ToUnixTimeMilliseconds()
+            != cancelEnqueueTime.ToUnixTimeMilliseconds()))
+{
+    Console.Error.WriteLine("the scheduled batch was not exposed correctly by peek");
+    return 15;
+}
+await sender.CancelScheduledMessagesAsync(cancelledBatchSequences);
+if (await receiver.PeekMessageAsync(cancelledBatchSequences[0]) is not null)
+{
+    Console.Error.WriteLine("the cancelled scheduled batch remained in the queue");
+    return 16;
+}
+
+DateTimeOffset scheduledEnqueueTime = DateTimeOffset.UtcNow.AddSeconds(2);
+IReadOnlyList<long> scheduledSequences = await sender.ScheduleMessagesAsync(
+    new[]
+    {
+        new ServiceBusMessage("official-scheduled-batch-a-current"),
+        new ServiceBusMessage("official-scheduled-batch-b-current"),
+    }, scheduledEnqueueTime);
+await sender.SendMessageAsync(new ServiceBusMessage("official-scheduled-transfer-current")
+{
+    ScheduledEnqueueTime = scheduledEnqueueTime,
+});
+IReadOnlyList<ServiceBusReceivedMessage> scheduledPeek =
+    await receiver.PeekMessagesAsync(3, scheduledSequences[0]);
+if (scheduledSequences.Count != 2
+    || scheduledPeek.Count != 3
+    || !scheduledPeek.Take(2).Select(message => message.SequenceNumber)
+        .SequenceEqual(scheduledSequences)
+    || scheduledPeek.Any(message => message.State != ServiceBusMessageState.Scheduled
+        || message.ScheduledEnqueueTime.ToUnixTimeMilliseconds()
+            != scheduledEnqueueTime.ToUnixTimeMilliseconds()))
+{
+    Console.Error.WriteLine("the pending scheduled messages were not exposed correctly by peek");
+    return 17;
+}
+var pendingSequences = scheduledPeek.ToDictionary(
+    message => message.Body.ToString(), message => message.SequenceNumber);
+for (int index = 0; index < scheduledPeek.Count; index++)
+{
+    ServiceBusReceivedMessage? scheduledMessage =
+        await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+    if (scheduledMessage is null
+        || !pendingSequences.Remove(scheduledMessage.Body.ToString(), out long pendingSequence)
+        || scheduledMessage.SequenceNumber == pendingSequence
+        || scheduledMessage.State != ServiceBusMessageState.Active
+        || scheduledMessage.ScheduledEnqueueTime.ToUnixTimeMilliseconds()
+            != scheduledEnqueueTime.ToUnixTimeMilliseconds()
+        || DateTimeOffset.UtcNow < scheduledMessage.ScheduledEnqueueTime
+        || scheduledMessage.EnqueuedTime < scheduledMessage.ScheduledEnqueueTime)
+    {
+        Console.Error.WriteLine($"unexpected activated scheduled message: {scheduledMessage?.Body}");
+        return 18;
+    }
+    await receiver.CompleteMessageAsync(scheduledMessage);
+}
+
 await using ServiceBusSender sessionSender = client.CreateSender(sessionQueue);
 await sessionSender.SendMessageAsync(new ServiceBusMessage("official-session-current")
 {
@@ -129,6 +220,45 @@ if (sessionMessage?.Body.ToString() != "official-session-current")
 }
 await sessionReceiver.CompleteMessageAsync(sessionMessage);
 
+DateTimeOffset scheduledSessionEnqueueTime = DateTimeOffset.UtcNow.AddSeconds(2);
+long scheduledSessionSequence = await sessionSender.ScheduleMessageAsync(
+    new ServiceBusMessage("official-scheduled-session-current")
+    {
+        SessionId = "session-1",
+    }, scheduledSessionEnqueueTime);
+ServiceBusReceivedMessage? scheduledSessionPeek =
+    await sessionReceiver.PeekMessageAsync(scheduledSessionSequence);
+if (scheduledSessionPeek?.Body.ToString() != "official-scheduled-session-current"
+    || scheduledSessionPeek.State != ServiceBusMessageState.Scheduled
+    || scheduledSessionPeek.ScheduledEnqueueTime.ToUnixTimeMilliseconds()
+        != scheduledSessionEnqueueTime.ToUnixTimeMilliseconds())
+{
+    Console.Error.WriteLine("the scheduled session message was not exposed correctly by peek");
+    return 19;
+}
+ServiceBusReceivedMessage? scheduledSessionMessage =
+    await sessionReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (scheduledSessionMessage?.Body.ToString() != "official-scheduled-session-current"
+    || scheduledSessionMessage.SessionId != "session-1"
+    || scheduledSessionMessage.SequenceNumber == scheduledSessionSequence
+    || scheduledSessionMessage.State != ServiceBusMessageState.Active
+    || scheduledSessionMessage.ScheduledEnqueueTime.ToUnixTimeMilliseconds()
+        != scheduledSessionEnqueueTime.ToUnixTimeMilliseconds()
+    || DateTimeOffset.UtcNow < scheduledSessionMessage.ScheduledEnqueueTime
+    || scheduledSessionMessage.EnqueuedTime < scheduledSessionMessage.ScheduledEnqueueTime)
+{
+    Console.Error.WriteLine($"unexpected activated session message: {scheduledSessionMessage?.Body}");
+    return 20;
+}
+await sessionReceiver.CompleteMessageAsync(scheduledSessionMessage);
+
+if (await receiver.PeekMessageAsync(fromSequenceNumber: 1) is not null
+    || await sessionReceiver.PeekMessageAsync(fromSequenceNumber: 1) is not null)
+{
+    Console.Error.WriteLine("the official client left messages in a queue");
+    return 21;
+}
+
 Console.WriteLine(
-    "official .NET Service Bus client send/peek/receive/defer/renew/complete and session renew/state passed");
+    "official .NET Service Bus client send/peek/receive/defer/renew/complete/schedule/cancel and session renew/state passed");
 return 0;

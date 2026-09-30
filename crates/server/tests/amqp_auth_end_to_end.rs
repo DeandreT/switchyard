@@ -7,13 +7,16 @@ use std::{
 };
 
 use amqp::{
-    ApplicationProperties, Body, ClientConnection as Connection, ClientReceiver as Receiver,
-    ClientSender as Sender, ClientSession as Session, Message, Outcome, Properties, SaslInit,
-    Symbol, Value,
+    ApplicationProperties, Array, Body, ClientConnection as Connection, ClientReceiver as Receiver,
+    ClientSender as Sender, ClientSession as Session, Message, OrderedMap, Outcome, Properties,
+    SaslInit, Symbol, Value, encode_message,
 };
 use auth::{PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use domain::{CommandKind, QueueConfig, StateMachine};
+use domain::{
+    CommandKind, CommandOutcome, MessageStatus, QueueConfig, ScheduledMessage, SequenceNumber,
+    StateMachine, Timestamp,
+};
 use hmac::{Hmac, Mac};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::{
@@ -237,6 +240,270 @@ async fn put_token(session: &mut Session, token: String) -> Result<i32, Box<dyn 
 
 fn body(text: &str) -> Body {
     Body::Data(vec![text.as_bytes().to_vec().into()])
+}
+
+struct ManagementClient {
+    requests: Sender,
+    responses: Receiver,
+}
+
+impl ManagementClient {
+    async fn attach(session: &mut Session) -> Result<Self, Box<dyn Error>> {
+        let responses = Receiver::builder()
+            .name("management-responses")
+            .source("orders/$management")
+            .target("management-replies")
+            .attach(session)
+            .await?;
+        let requests = Sender::attach(session, "management-requests", "orders/$management").await?;
+        Ok(Self {
+            requests,
+            responses,
+        })
+    }
+
+    async fn request(
+        &mut self,
+        message_id: &str,
+        operation: &str,
+        body: OrderedMap<Value, Value>,
+    ) -> Result<Message, Box<dyn Error>> {
+        let request = Message::builder()
+            .properties(Properties {
+                message_id: Some(message_id.to_owned().into()),
+                reply_to: Some(String::from("management-replies")),
+                ..Properties::default()
+            })
+            .application_properties(
+                ApplicationProperties::builder()
+                    .insert(protocol_amqp::OPERATION_PROPERTY, operation.to_owned())
+                    .build(),
+            )
+            .body(Body::Value(Value::Map(body)))
+            .build();
+        assert!(matches!(
+            self.requests.send(request).await?,
+            Outcome::Accepted(_)
+        ));
+        let response =
+            tokio::time::timeout(Duration::from_secs(2), self.responses.recv()).await??;
+        let message = response.message().clone();
+        assert_eq!(
+            message
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.correlation_id.clone()),
+            Some(message_id.to_owned().into()),
+        );
+        self.responses.accept(&response).await?;
+        Ok(message)
+    }
+}
+
+fn assert_management_status(response: &Message, expected: i32) {
+    assert_eq!(
+        response
+            .application_properties
+            .as_ref()
+            .and_then(|properties| properties.get(protocol_amqp::STATUS_CODE_PROPERTY)),
+        Some(&Value::Int(expected)),
+    );
+}
+
+fn scheduling_body() -> Result<OrderedMap<Value, Value>, Box<dyn Error>> {
+    let mut message = Message::data(b"scheduled".to_vec());
+    let mut annotations = OrderedMap::new();
+    annotations.insert(
+        Symbol::from(protocol_amqp::SCHEDULED_ENQUEUE_TIME_ANNOTATION),
+        Value::Timestamp(2_000_i64.into()),
+    );
+    message.message_annotations = Some(annotations);
+    let mut entry = OrderedMap::new();
+    entry.insert(
+        Value::String(protocol_amqp::MESSAGE.to_owned()),
+        Value::Binary(encode_message(&message)?.into()),
+    );
+    let mut body = OrderedMap::new();
+    body.insert(
+        Value::String(protocol_amqp::MESSAGES.to_owned()),
+        Value::List(vec![Value::Map(entry)]),
+    );
+    Ok(body)
+}
+
+fn cancel_body(sequence: SequenceNumber) -> OrderedMap<Value, Value> {
+    let mut body = OrderedMap::new();
+    body.insert(
+        Value::String(protocol_amqp::SEQUENCE_NUMBERS.to_owned()),
+        Value::Array(Array::from(vec![Value::Long(
+            i64::try_from(sequence.as_u64()).expect("test sequence fits in an AMQP long"),
+        )])),
+    );
+    body
+}
+
+fn peek_body() -> OrderedMap<Value, Value> {
+    let mut body = OrderedMap::new();
+    body.insert(
+        Value::String(protocol_amqp::FROM_SEQUENCE_NUMBER.to_owned()),
+        Value::Long(0),
+    );
+    body.insert(
+        Value::String(protocol_amqp::MESSAGE_COUNT.to_owned()),
+        Value::Int(10),
+    );
+    body
+}
+
+async fn broker_messages(node: &AuthNode) -> Result<Vec<domain::Delivery>, Box<dyn Error>> {
+    let outcome = node
+        ._broker
+        .handle()
+        .submit(
+            domain::NamespaceName::new("tenant")?,
+            domain::EntityPath::new("orders")?,
+            CommandKind::Peek {
+                from_sequence: SequenceNumber::new(0),
+                max_messages: 10,
+                session_id: None,
+            },
+        )
+        .await?;
+    let CommandOutcome::Peeked(messages) = outcome else {
+        panic!("a broker peek returns messages");
+    };
+    Ok(messages)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_grant_schedules_and_cancels_but_cannot_peek() -> Result<(), Box<dyn Error>> {
+    let node = AuthNode::start(PermissionSet::SEND, Duration::from_secs(20)).await?;
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    assert_eq!(
+        put_token(&mut session, sas_token(AUDIENCE, expiry_after(60))).await?,
+        202
+    );
+    let mut management = ManagementClient::attach(&mut session).await?;
+
+    let denied = management
+        .request(
+            "denied-peek",
+            protocol_amqp::PEEK_MESSAGE_OPERATION,
+            peek_body(),
+        )
+        .await?;
+    assert_management_status(&denied, 401);
+    let scheduled = management
+        .request(
+            "schedule",
+            protocol_amqp::SCHEDULE_MESSAGE_OPERATION,
+            scheduling_body()?,
+        )
+        .await?;
+    assert_management_status(&scheduled, 200);
+    let Body::Value(Value::Map(body)) = scheduled.body else {
+        panic!("scheduling returns a map");
+    };
+    let Some(Value::Array(sequences)) =
+        body.get(&Value::String(protocol_amqp::SEQUENCE_NUMBERS.to_owned()))
+    else {
+        panic!("scheduling returns sequence numbers");
+    };
+    let [Value::Long(sequence)] = sequences.as_slice() else {
+        panic!("scheduling returns one long sequence number");
+    };
+    let sequence = SequenceNumber::new(u64::try_from(*sequence)?);
+    assert_eq!(broker_messages(&node).await?.len(), 2);
+    let cancelled = management
+        .request(
+            "cancel",
+            protocol_amqp::CANCEL_SCHEDULED_MESSAGE_OPERATION,
+            cancel_body(sequence),
+        )
+        .await?;
+    assert_management_status(&cancelled, 200);
+    let messages = broker_messages(&node).await?;
+    assert_eq!(messages.len(), 1, "Send may cancel its scheduled message");
+    assert_eq!(messages[0].body, b"seed");
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_listen_grant_peeks_but_cannot_schedule_or_cancel() -> Result<(), Box<dyn Error>> {
+    let node = AuthNode::start(PermissionSet::LISTEN, Duration::from_secs(20)).await?;
+    let outcome = node
+        ._broker
+        .handle()
+        .submit(
+            domain::NamespaceName::new("tenant")?,
+            domain::EntityPath::new("orders")?,
+            CommandKind::Schedule {
+                messages: vec![ScheduledMessage {
+                    message_id: String::from("scheduled-seed"),
+                    body: b"scheduled-seed".to_vec(),
+                    time_to_live_millis: None,
+                    session_id: None,
+                    enqueue_at: Timestamp::from_millis(2_000),
+                }],
+            },
+        )
+        .await?;
+    let CommandOutcome::Scheduled { sequences } = outcome else {
+        panic!("the broker returns a scheduling handle");
+    };
+    let sequence = sequences[0];
+    let before = broker_messages(&node).await?;
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    assert_eq!(
+        put_token(&mut session, sas_token(AUDIENCE, expiry_after(60))).await?,
+        202
+    );
+    let mut management = ManagementClient::attach(&mut session).await?;
+
+    let peeked = management
+        .request("peek", protocol_amqp::PEEK_MESSAGE_OPERATION, peek_body())
+        .await?;
+    assert_management_status(&peeked, 200);
+    let Body::Value(Value::Map(body)) = peeked.body else {
+        panic!("peek returns a map");
+    };
+    let Some(Value::List(messages)) = body.get(&Value::String(protocol_amqp::MESSAGES.to_owned()))
+    else {
+        panic!("peek returns messages");
+    };
+    assert_eq!(messages.len(), 2);
+    let denied_schedule = management
+        .request(
+            "denied-schedule",
+            protocol_amqp::SCHEDULE_MESSAGE_OPERATION,
+            scheduling_body()?,
+        )
+        .await?;
+    assert_management_status(&denied_schedule, 401);
+    assert_eq!(
+        broker_messages(&node).await?,
+        before,
+        "unauthorized scheduling changed the queue"
+    );
+    let denied_cancel = management
+        .request(
+            "denied-cancel",
+            protocol_amqp::CANCEL_SCHEDULED_MESSAGE_OPERATION,
+            cancel_body(sequence),
+        )
+        .await?;
+    assert_management_status(&denied_cancel, 401);
+    assert_eq!(
+        broker_messages(&node).await?,
+        before,
+        "unauthorized cancellation changed the queue"
+    );
+    assert_eq!(before[1].status, MessageStatus::Scheduled);
+    connection.close().await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]

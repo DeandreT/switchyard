@@ -27,7 +27,8 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
     match error {
         BrokerError::QueueNotFound
         | BrokerError::MessageNotFound { .. }
-        | BrokerError::MessageNotDeferred { .. } => NOT_FOUND,
+        | BrokerError::MessageNotDeferred { .. }
+        | BrokerError::MessageNotScheduled { .. } => NOT_FOUND,
         BrokerError::QueueAlreadyExists => ENTITY_ALREADY_EXISTS,
 
         // The client's claim on the message is gone. Saying so precisely is what

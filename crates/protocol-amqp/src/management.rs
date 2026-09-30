@@ -2,12 +2,12 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use amqp::{
     AmqpError, ApplicationProperties, Body, Error as AmqpProtocolError, Message, MessageId,
-    Properties, Receiver, Sender, encode_message,
+    Properties, Receiver, Sender, decode_message, encode_message,
 };
 use auth::{Permission, ResourceScope};
 use domain::{
-    CommandKind, CommandOutcome, EntityPath, LockToken, NamespaceName, SequenceNumber, SessionHold,
-    SessionId,
+    CommandKind, CommandOutcome, EntityPath, LockToken, NamespaceName, ScheduledMessage,
+    SequenceNumber, SessionHold, SessionId,
 };
 use serde_amqp::{
     Value,
@@ -17,10 +17,14 @@ use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tracing::debug;
 
 use crate::{
-    Broker, BrokerRejection, authorization::ConnectionAuthorization, message::write_delivery,
+    Broker, BrokerRejection,
+    authorization::ConnectionAuthorization,
+    message::{read_incoming, write_delivery},
 };
 
 pub const PEEK_MESSAGE_OPERATION: &str = "com.microsoft:peek-message";
+pub const SCHEDULE_MESSAGE_OPERATION: &str = "com.microsoft:schedule-message";
+pub const CANCEL_SCHEDULED_MESSAGE_OPERATION: &str = "com.microsoft:cancel-scheduled-message";
 pub const RECEIVE_BY_SEQUENCE_NUMBER_OPERATION: &str = "com.microsoft:receive-by-sequence-number";
 pub const RENEW_LOCK_OPERATION: &str = "com.microsoft:renew-lock";
 pub const RENEW_SESSION_LOCK_OPERATION: &str = "com.microsoft:renew-session-lock";
@@ -219,14 +223,21 @@ impl ManagementAuthorization {
 
     async fn ensure(&self) -> Result<(), AmqpProtocolError> {
         self.connection
-            .authorize_resource(&self.resource, Permission::Manage)
+            .authorize_resource_any(&self.resource, &[Permission::Send, Permission::Listen])
             .await
             .map_err(|_| unauthorized_error("the management link's authorization has expired"))
     }
 
+    async fn ensure_permission(&self, permission: Permission) -> Result<(), AmqpProtocolError> {
+        self.connection
+            .authorize_resource(&self.resource, permission)
+            .await
+            .map_err(|_| unauthorized_error("the management operation is not authorized"))
+    }
+
     async fn wait_until_unauthorized(&self) {
         self.connection
-            .wait_until_unauthorized(&self.resource, Permission::Manage)
+            .wait_until_unauthorized_any(&self.resource, &[Permission::Send, Permission::Listen])
             .await;
     }
 }
@@ -336,6 +347,17 @@ impl ManagementResponse {
         }
     }
 
+    fn unauthorized(correlation_id: MessageId, tracking_id: Option<String>) -> Self {
+        Self {
+            correlation_id,
+            status_code: 401,
+            status_description: "the management operation is not authorized".to_owned(),
+            error_condition: Some("amqp:unauthorized-access"),
+            tracking_id,
+            body: Value::Null,
+        }
+    }
+
     fn into_message(self) -> Message {
         let mut application_properties = ApplicationProperties::default();
         application_properties.insert(STATUS_CODE_PROPERTY, self.status_code);
@@ -422,6 +444,7 @@ pub(crate) async fn serve_management_requests<B: Broker>(
             &entity,
             &broker,
             &management,
+            authorization.as_ref(),
         )
         .await;
         debug!(correlation_id = ?response.correlation_id, %reply_to, status_code = response.status_code, "management request processed");
@@ -445,6 +468,7 @@ async fn process_request<B: Broker>(
     entity: &EntityPath,
     broker: &B,
     management: &ConnectionManagement,
+    authorization: Option<&ManagementAuthorization>,
 ) -> ManagementResponse {
     let tracking_id = message
         .application_properties
@@ -461,7 +485,23 @@ async fn process_request<B: Broker>(
     let Some(operation) = string_property(properties, OPERATION_PROPERTY) else {
         return ManagementResponse::bad_request(message_id, tracking_id, "operation is required");
     };
+    let permission = match operation {
+        SCHEDULE_MESSAGE_OPERATION | CANCEL_SCHEDULED_MESSAGE_OPERATION => Permission::Send,
+        _ => Permission::Listen,
+    };
+    if let Some(authorization) = authorization
+        && authorization.ensure_permission(permission).await.is_err()
+    {
+        return ManagementResponse::unauthorized(message_id, tracking_id);
+    }
     match operation {
+        SCHEDULE_MESSAGE_OPERATION => {
+            schedule_messages(message, message_id, tracking_id, namespace, entity, broker).await
+        }
+        CANCEL_SCHEDULED_MESSAGE_OPERATION => {
+            cancel_scheduled_messages(message, message_id, tracking_id, namespace, entity, broker)
+                .await
+        }
         PEEK_MESSAGE_OPERATION => {
             peek_messages(message, message_id, tracking_id, namespace, entity, broker).await
         }
@@ -542,6 +582,120 @@ async fn process_request<B: Broker>(
             tracking_id,
             "unsupported management operation",
         ),
+    }
+}
+
+async fn schedule_messages<B: Broker>(
+    message: &Message,
+    message_id: MessageId,
+    tracking_id: Option<String>,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    broker: &B,
+) -> ManagementResponse {
+    let messages = match scheduled_messages(&message.body) {
+        Ok(messages) => messages,
+        Err(description) => {
+            return ManagementResponse::bad_request(message_id, tracking_id, description);
+        }
+    };
+    match broker
+        .submit(
+            namespace.clone(),
+            entity.clone(),
+            CommandKind::Schedule { messages },
+        )
+        .await
+    {
+        Ok(CommandOutcome::Scheduled { sequences }) => ManagementResponse::accepted(
+            message_id,
+            tracking_id,
+            map_body(
+                SEQUENCE_NUMBERS,
+                Value::Array(Array::from(
+                    sequences
+                        .into_iter()
+                        .map(|sequence| {
+                            Value::Long(i64::try_from(sequence.as_u64()).unwrap_or(i64::MAX))
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+            ),
+        ),
+        Ok(other) => ManagementResponse::internal(
+            message_id,
+            tracking_id,
+            format!("scheduling messages produced an unexpected outcome: {other:?}"),
+        ),
+        Err(rejection) => ManagementResponse::from_rejection(message_id, tracking_id, &rejection),
+    }
+}
+
+fn scheduled_messages(body: &Body) -> Result<Vec<ScheduledMessage>, String> {
+    let Some(Value::List(entries)) = map_value(body, MESSAGES) else {
+        return Err("messages must be an AMQP list of maps".to_owned());
+    };
+    if entries.is_empty() {
+        return Err("at least one message is required".to_owned());
+    }
+    let mut messages = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Value::Map(entry) = entry else {
+            return Err("each scheduled message must be an AMQP map".to_owned());
+        };
+        let Some(Value::Binary(encoded)) = entry.get(&Value::String(MESSAGE.to_owned())) else {
+            return Err("each scheduled message must contain a binary message".to_owned());
+        };
+        crate::validate_standard_message_size(encoded.len()).map_err(|error| error.to_string())?;
+        let decoded = decode_message(encoded).map_err(|error| error.to_string())?;
+        let incoming = read_incoming(&decoded).map_err(|error| error.to_string())?;
+        let enqueue_at = incoming.scheduled_enqueue_time.ok_or_else(|| {
+            "each scheduled message must specify its enqueue timestamp".to_owned()
+        })?;
+        messages.push(ScheduledMessage {
+            message_id: incoming.message_id,
+            body: incoming.body,
+            time_to_live_millis: incoming.time_to_live_millis,
+            session_id: incoming.session_id,
+            enqueue_at,
+        });
+    }
+    Ok(messages)
+}
+
+async fn cancel_scheduled_messages<B: Broker>(
+    message: &Message,
+    message_id: MessageId,
+    tracking_id: Option<String>,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    broker: &B,
+) -> ManagementResponse {
+    let Some(sequences) = sequence_numbers(&message.body).filter(|sequences| !sequences.is_empty())
+    else {
+        return ManagementResponse::bad_request(
+            message_id,
+            tracking_id,
+            "sequence-numbers must contain at least one non-negative integer",
+        );
+    };
+    match broker
+        .submit(
+            namespace.clone(),
+            entity.clone(),
+            CommandKind::CancelScheduled { sequences },
+        )
+        .await
+    {
+        Ok(CommandOutcome::ScheduledCancelled { .. }) => {
+            ManagementResponse::accepted(message_id, tracking_id, Value::Null)
+        }
+        Ok(other) => ManagementResponse::internal(
+            message_id,
+            tracking_id,
+            format!("cancelling scheduled messages produced an unexpected outcome: {other:?}"),
+        ),
+        Err(rejection) => ManagementResponse::from_rejection(message_id, tracking_id, &rejection),
     }
 }
 

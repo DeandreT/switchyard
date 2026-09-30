@@ -101,6 +101,8 @@ impl Watchers {
 fn makes_deliverable(outcome: &CommandOutcome) -> bool {
     match outcome {
         CommandOutcome::Sent { .. } => true,
+        CommandOutcome::Scheduled { .. } => true,
+        CommandOutcome::ScheduledActivated { activated } => *activated > 0,
         CommandOutcome::Abandoned { dead_lettered } => !dead_lettered,
         CommandOutcome::LocksExpired {
             returned_to_ready, ..

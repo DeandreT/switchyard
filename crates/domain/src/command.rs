@@ -34,6 +34,17 @@ impl Command {
     }
 }
 
+/// One message to enqueue at a future time. A batch receives its cancellation
+/// handles atomically, without becoming visible to ordinary receivers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScheduledMessage {
+    pub message_id: String,
+    pub body: Vec<u8>,
+    pub time_to_live_millis: Option<u64>,
+    pub session_id: Option<SessionId>,
+    pub enqueue_at: Timestamp,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandKind {
@@ -48,6 +59,14 @@ pub enum CommandKind {
         /// Required on a queue that requires sessions, and refused on one that
         /// does not.
         session_id: Option<SessionId>,
+    },
+    Schedule {
+        messages: Vec<ScheduledMessage>,
+    },
+    /// Removes scheduled messages before activation. Every sequence must
+    /// still identify a scheduled message, otherwise the batch changes nothing.
+    CancelScheduled {
+        sequences: Vec<SequenceNumber>,
     },
     Receive {
         mode: ReceiveMode,
@@ -137,6 +156,9 @@ pub enum CommandKind {
     /// Proposed by the leader's timer worker. Releases sessions whose lock has
     /// elapsed.
     ExpireSessionLocks,
+    /// Proposed by the leader's timer worker. Enqueues scheduled messages
+    /// whose requested enqueue time has arrived.
+    ActivateScheduled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -144,6 +166,15 @@ pub enum CommandOutcome {
     QueueCreated,
     Sent {
         sequence: SequenceNumber,
+    },
+    Scheduled {
+        sequences: Vec<SequenceNumber>,
+    },
+    ScheduledCancelled {
+        cancelled: u32,
+    },
+    ScheduledActivated {
+        activated: u32,
     },
     /// `None` when the queue held no deliverable message.
     Received(Option<Delivery>),

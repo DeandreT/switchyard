@@ -1,17 +1,47 @@
 //! Opt-in gate for the current stable official .NET Service Bus client.
 
-use std::{error::Error, path::PathBuf, process::Command, time::Duration};
+use std::{
+    error::Error, path::PathBuf, process::Command, sync::Arc, thread::JoinHandle, time::Duration,
+};
 
 use auth::{PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule};
 use domain::{CommandKind, CommandOutcome, QueueConfig, ReceiveMode, StateMachine};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
-use server::{Broker, LocalProposer, ManualClock};
+use server::{Broker, BrokerHandle, LocalProposer, Shutdown, SystemClock, TimerWorker};
 use storage::MemoryStore;
 use tokio::net::TcpListener;
 
 const HOST: &str = "tenant.servicebus.windows.net";
 const RULE: &str = "test-rule";
 const KEY: &str = "test-secret";
+
+struct TestTimer {
+    shutdown: Arc<Shutdown>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl TestTimer {
+    fn start(handle: BrokerHandle) -> Self {
+        let shutdown = Arc::new(Shutdown::default());
+        let worker_shutdown = Arc::clone(&shutdown);
+        let thread = std::thread::spawn(move || {
+            TimerWorker::new(&handle).run(Duration::from_millis(100), &worker_shutdown);
+        });
+        Self {
+            shutdown,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for TestTimer {
+    fn drop(&mut self) {
+        self.shutdown.signal();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires dotnet and a NuGet restore"]
@@ -23,7 +53,7 @@ async fn current_stable_dotnet_client_completes_message_and_session_workflows()
         .try_init();
     let broker = Broker::spawn(LocalProposer::new(
         StateMachine::new(MemoryStore::default()),
-        ManualClock::at(1_000),
+        SystemClock,
     ));
     let namespace = domain::NamespaceName::new("tenant")?;
     broker.handle().submit_blocking(
@@ -43,6 +73,8 @@ async fn current_stable_dotnet_client_completes_message_and_session_workflows()
             },
         },
     )?;
+
+    let _timer = TestTimer::start(broker.handle());
 
     let rule = SharedAccessRule::new(
         RULE,

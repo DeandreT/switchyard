@@ -9,14 +9,16 @@
 //! Nothing here reads a clock, generates a random value, or performs I/O beyond
 //! the injected store.
 
+use std::collections::BTreeSet;
+
 use serde::de::DeserializeOwned;
 use storage::{StateStore, WriteBatch};
 
 use crate::{
     AcceptedSession, BrokerError, Command, CommandKind, CommandOutcome, DeadLetterInfo,
     DeadLetterReason, Delivery, DeliveryLock, EntityPath, LockToken, MessageRecord, MessageState,
-    NamespaceName, QueueConfig, QueueCounters, ReceiveMode, SequenceNumber, SessionHold, SessionId,
-    SessionLock, SessionRecord, Timestamp, codec, keys,
+    MessageStatus, NamespaceName, QueueConfig, QueueCounters, ReceiveMode, ScheduledMessage,
+    SequenceNumber, SessionHold, SessionId, SessionLock, SessionRecord, Timestamp, codec, keys,
 };
 
 /// Ready entries a single receive may walk past while discarding expired
@@ -83,6 +85,10 @@ impl<S: StateStore> StateMachine<S> {
                 session_id.as_ref(),
                 &mut batch,
             )?,
+            CommandKind::Schedule { messages } => self.schedule(command, messages, &mut batch)?,
+            CommandKind::CancelScheduled { sequences } => {
+                self.cancel_scheduled(command, sequences, &mut batch)?
+            }
             CommandKind::Receive {
                 mode,
                 lock_duration_millis,
@@ -171,6 +177,7 @@ impl<S: StateStore> StateMachine<S> {
             CommandKind::ExpireLocks => self.expire_locks(command, &mut batch)?,
             CommandKind::ExpireMessages => self.expire_messages(command, &mut batch)?,
             CommandKind::ExpireSessionLocks => self.expire_session_locks(command, &mut batch)?,
+            CommandKind::ActivateScheduled => self.activate_scheduled(command, &mut batch)?,
         };
 
         // A command that changed nothing commits nothing. The clock advance is
@@ -434,6 +441,7 @@ impl<S: StateStore> StateMachine<S> {
             state: MessageState::Ready,
             session_id: session_id.cloned(),
             dead_letter: None,
+            scheduled_enqueue_time: None,
         };
 
         let namespace = &command.namespace;
@@ -454,6 +462,177 @@ impl<S: StateStore> StateMachine<S> {
             codec::encode(&counters)?,
         );
         Ok(CommandOutcome::Sent { sequence })
+    }
+
+    fn schedule(
+        &self,
+        command: &Command,
+        messages: &[ScheduledMessage],
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        if command.entity.is_dead_letter_queue() {
+            return Err(BrokerError::DeadLetterQueueIsReserved);
+        }
+        let config = self.load_config(command)?;
+        let mut counters = self.load_counters(command)?;
+        let namespace = &command.namespace;
+        let entity = &command.entity;
+        let mut sequences = Vec::with_capacity(messages.len());
+
+        for message in messages {
+            require_session_agreement(&config, message.session_id.is_some())?;
+            if message.body.len() > config.max_message_bytes {
+                return Err(BrokerError::MessageTooLarge {
+                    body_bytes: message.body.len(),
+                    maximum_bytes: config.max_message_bytes,
+                });
+            }
+            let sequence = SequenceNumber::new(counters.next_sequence);
+            counters.next_sequence = counters.next_sequence.saturating_add(1);
+            let time_to_live_millis = message
+                .time_to_live_millis
+                .or(config.default_time_to_live_millis);
+            let future = message.enqueue_at > command.issued_at;
+            let record = MessageRecord {
+                sequence,
+                message_id: message.message_id.clone(),
+                body: message.body.clone(),
+                enqueued_at: command.issued_at,
+                expires_at: if future {
+                    None
+                } else {
+                    time_to_live_millis
+                        .map(|millis| command.issued_at.saturating_add_millis(millis))
+                },
+                delivery_count: 0,
+                state: if future {
+                    MessageState::Scheduled {
+                        enqueue_at: message.enqueue_at,
+                        time_to_live_millis,
+                    }
+                } else {
+                    MessageState::Ready
+                },
+                session_id: message.session_id.clone(),
+                dead_letter: None,
+                scheduled_enqueue_time: Some(message.enqueue_at),
+            };
+            batch.push_put(
+                keys::message(namespace, entity, sequence),
+                codec::encode(&record)?,
+            );
+            if future {
+                batch.push_put(
+                    keys::scheduled(namespace, entity, message.enqueue_at, sequence),
+                    Vec::new(),
+                );
+            } else {
+                batch.push_put(self.ready_key(command, &record), Vec::new());
+                if let Some(expires_at) = record.expires_at {
+                    batch.push_put(
+                        keys::expiry(namespace, entity, expires_at, sequence),
+                        Vec::new(),
+                    );
+                }
+            }
+            sequences.push(sequence);
+        }
+        if !messages.is_empty() {
+            batch.push_put(
+                keys::queue_counters(namespace, entity),
+                codec::encode(&counters)?,
+            );
+        }
+        Ok(CommandOutcome::Scheduled { sequences })
+    }
+
+    fn cancel_scheduled(
+        &self,
+        command: &Command,
+        sequences: &[SequenceNumber],
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        self.load_config(command)?;
+        let namespace = &command.namespace;
+        let entity = &command.entity;
+        let mut cancelled = 0_u32;
+
+        for sequence in sequences.iter().copied().collect::<BTreeSet<_>>() {
+            let record = self.load_message(command, sequence)?;
+            let MessageState::Scheduled { enqueue_at, .. } = record.state else {
+                return Err(BrokerError::MessageNotScheduled { sequence });
+            };
+            batch.push_delete(keys::message(namespace, entity, sequence));
+            batch.push_delete(keys::scheduled(namespace, entity, enqueue_at, sequence));
+            cancelled = cancelled.saturating_add(1);
+        }
+        Ok(CommandOutcome::ScheduledCancelled { cancelled })
+    }
+
+    fn activate_scheduled(
+        &self,
+        command: &Command,
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        self.load_config(command)?;
+        let namespace = &command.namespace;
+        let entity = &command.entity;
+        let scheduled = self
+            .store
+            .scan_prefix(&keys::scheduled_prefix(namespace, entity), TIMER_SCAN_LIMIT)?;
+        let mut counters = self.load_counters(command)?;
+        let mut activated = 0;
+
+        for (key, _) in scheduled {
+            let (enqueue_at, scheduled_sequence) =
+                keys::trailing_deadline(&key).ok_or(BrokerError::MalformedIndexKey)?;
+            if enqueue_at > command.issued_at {
+                break;
+            }
+            let mut record = self.message(namespace, entity, scheduled_sequence)?.ok_or(
+                BrokerError::DanglingIndexEntry {
+                    sequence: scheduled_sequence,
+                },
+            )?;
+            let time_to_live_millis = match record.state {
+                MessageState::Scheduled {
+                    enqueue_at: stored_enqueue_at,
+                    time_to_live_millis,
+                } if stored_enqueue_at == enqueue_at => time_to_live_millis,
+                _ => return Err(BrokerError::MalformedIndexKey),
+            };
+
+            // The scheduling sequence is only a cancellation handle. Activation
+            // gets a new queue position so older scheduled work cannot jump
+            // ahead of messages that became active first.
+            record.sequence = SequenceNumber::new(counters.next_sequence);
+            counters.next_sequence = counters.next_sequence.saturating_add(1);
+            record.state = MessageState::Ready;
+            record.enqueued_at = command.issued_at;
+            record.expires_at =
+                time_to_live_millis.map(|millis| command.issued_at.saturating_add_millis(millis));
+            batch.push_delete(key);
+            batch.push_delete(keys::message(namespace, entity, scheduled_sequence));
+            batch.push_put(
+                keys::message(namespace, entity, record.sequence),
+                codec::encode(&record)?,
+            );
+            batch.push_put(self.ready_key(command, &record), Vec::new());
+            if let Some(expires_at) = record.expires_at {
+                batch.push_put(
+                    keys::expiry(namespace, entity, expires_at, record.sequence),
+                    Vec::new(),
+                );
+            }
+            activated += 1;
+        }
+        if activated != 0 {
+            batch.push_put(
+                keys::queue_counters(namespace, entity),
+                codec::encode(&counters)?,
+            );
+        }
+        Ok(CommandOutcome::ScheduledActivated { activated })
     }
 
     fn receive(
@@ -553,6 +732,8 @@ impl<S: StateStore> StateMachine<S> {
                 body: record.body,
                 enqueued_at: record.enqueued_at,
                 delivery_count,
+                status: MessageStatus::Active,
+                scheduled_enqueue_time: record.scheduled_enqueue_time,
                 lock,
                 session_id: record.session_id,
                 dead_letter: record.dead_letter,
@@ -598,12 +779,16 @@ impl<S: StateStore> StateMachine<S> {
                 continue;
             }
 
+            let status = record.status();
+            let scheduled_enqueue_time = record.scheduled_enqueue_time;
             deliveries.push(Delivery {
                 sequence,
                 message_id: record.message_id,
                 body: record.body,
                 enqueued_at: record.enqueued_at,
                 delivery_count: record.delivery_count,
+                status,
+                scheduled_enqueue_time,
                 lock: None,
                 session_id: record.session_id,
                 dead_letter: record.dead_letter,
@@ -797,6 +982,8 @@ impl<S: StateStore> StateMachine<S> {
                 body: record.body,
                 enqueued_at: record.enqueued_at,
                 delivery_count,
+                status: MessageStatus::Active,
+                scheduled_enqueue_time: record.scheduled_enqueue_time,
                 lock,
                 session_id: record.session_id,
                 dead_letter: record.dead_letter,
@@ -1265,6 +1452,9 @@ impl<S: StateStore> StateMachine<S> {
                 batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
             }
             MessageState::Deferred => {}
+            MessageState::Scheduled { enqueue_at, .. } => {
+                batch.push_delete(keys::scheduled(namespace, entity, enqueue_at, sequence));
+            }
         }
         batch.push_delete(keys::message(namespace, entity, sequence));
         if let Some(expires_at) = record.expires_at {

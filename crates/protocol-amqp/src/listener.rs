@@ -308,7 +308,10 @@ async fn serve_session<B: Broker>(
                 Ok(entity) => {
                     let link_authorization = match authorization.as_ref() {
                         Some(authorization) => match authorization
-                            .authorize_entity(entity.as_str(), Permission::Manage)
+                            .authorize_entity_any(
+                                entity.as_str(),
+                                &[Permission::Send, Permission::Listen],
+                            )
                             .await
                         {
                             Ok(resource) => Some(ManagementAuthorization::new(
@@ -325,7 +328,7 @@ async fn serve_session<B: Broker>(
                                 detach_with(
                                     endpoint,
                                     unauthorized_error(format!(
-                                        "Manage is not authorized for {entity}"
+                                        "Send or Listen is not authorized for {entity}"
                                     )),
                                 )
                                 .await;
@@ -735,18 +738,24 @@ async fn serve_sending_client<B: Broker>(
             }
         };
 
-        let outcome = broker
-            .submit(
-                namespace.clone(),
-                entity.clone(),
-                CommandKind::Send {
+        let kind = match incoming.scheduled_enqueue_time {
+            Some(enqueue_at) => CommandKind::Schedule {
+                messages: vec![domain::ScheduledMessage {
                     message_id: incoming.message_id,
                     body: incoming.body,
                     time_to_live_millis: incoming.time_to_live_millis,
                     session_id: incoming.session_id,
-                },
-            )
-            .await;
+                    enqueue_at,
+                }],
+            },
+            None => CommandKind::Send {
+                message_id: incoming.message_id,
+                body: incoming.body,
+                time_to_live_millis: incoming.time_to_live_millis,
+                session_id: incoming.session_id,
+            },
+        };
+        let outcome = broker.submit(namespace.clone(), entity.clone(), kind).await;
 
         // Accepting only after the command committed is what makes the
         // acknowledgement mean the message is durable.

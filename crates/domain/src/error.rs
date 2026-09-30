@@ -19,6 +19,8 @@ pub enum BrokerError {
     MessageNotLocked { sequence: SequenceNumber },
     #[error("message {sequence} is not deferred")]
     MessageNotDeferred { sequence: SequenceNumber },
+    #[error("message {sequence} is not scheduled")]
+    MessageNotScheduled { sequence: SequenceNumber },
     #[error("lock token does not match the lock held on message {sequence}")]
     LockTokenMismatch { sequence: SequenceNumber },
     #[error("the lock on message {sequence} expired at {locked_until}")]

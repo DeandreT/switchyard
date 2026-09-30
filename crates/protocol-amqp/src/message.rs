@@ -7,7 +7,7 @@
 //! first attempt.
 
 use amqp::{ApplicationProperties, Body, Fields, Header, Message, MessageId, Properties};
-use domain::{Delivery, SessionId};
+use domain::{Delivery, MessageStatus, SessionId, Timestamp};
 use serde_amqp::{
     Value,
     primitives::{Symbol, Timestamp as AmqpTimestamp},
@@ -22,6 +22,7 @@ pub struct IncomingMessage {
     pub body: Vec<u8>,
     pub session_id: Option<SessionId>,
     pub time_to_live_millis: Option<u64>,
+    pub scheduled_enqueue_time: Option<Timestamp>,
 }
 
 /// Reads an incoming AMQP message into the parts a send command needs.
@@ -49,7 +50,25 @@ pub fn read_incoming(message: &Message) -> Result<IncomingMessage, ProtocolError
             .as_ref()
             .and_then(|header| header.ttl)
             .map(u64::from),
+        scheduled_enqueue_time: scheduled_enqueue_time(message)?,
     })
+}
+
+fn scheduled_enqueue_time(message: &Message) -> Result<Option<Timestamp>, ProtocolError> {
+    let Some(value) = message
+        .message_annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(&Symbol::from(SCHEDULED_ENQUEUE_TIME_ANNOTATION)))
+    else {
+        return Ok(None);
+    };
+    match value {
+        Value::Timestamp(value) => u64::try_from(value.milliseconds())
+            .map(Timestamp::from_millis)
+            .map(Some)
+            .map_err(|_| ProtocolError::InvalidScheduledEnqueueTime),
+        _ => Err(ProtocolError::InvalidScheduledEnqueueTime),
+    }
 }
 
 /// The application property Service Bus clients read a dead-letter reason from.
@@ -58,6 +77,8 @@ pub const DEAD_LETTER_REASON_PROPERTY: &str = "DeadLetterReason";
 pub const DEAD_LETTER_DESCRIPTION_PROPERTY: &str = "DeadLetterErrorDescription";
 const SEQUENCE_NUMBER_ANNOTATION: &str = "x-opt-sequence-number";
 const ENQUEUED_TIME_ANNOTATION: &str = "x-opt-enqueued-time";
+pub const SCHEDULED_ENQUEUE_TIME_ANNOTATION: &str = "x-opt-scheduled-enqueue-time";
+pub const MESSAGE_STATE_ANNOTATION: &str = "x-opt-message-state";
 
 /// Builds the message handed back to a receiving client.
 pub fn write_delivery(delivery: &Delivery) -> Message {
@@ -107,6 +128,22 @@ fn message_annotations(delivery: &Delivery) -> Fields {
             i64::try_from(delivery.enqueued_at.as_millis()).unwrap_or(i64::MAX),
         )),
     );
+    annotations.insert(
+        Symbol::from(MESSAGE_STATE_ANNOTATION),
+        Value::Int(match delivery.status {
+            MessageStatus::Active => 0,
+            MessageStatus::Deferred => 1,
+            MessageStatus::Scheduled => 2,
+        }),
+    );
+    if let Some(scheduled) = delivery.scheduled_enqueue_time {
+        annotations.insert(
+            Symbol::from(SCHEDULED_ENQUEUE_TIME_ANNOTATION),
+            Value::Timestamp(AmqpTimestamp::from_milliseconds(
+                i64::try_from(scheduled.as_millis()).unwrap_or(i64::MAX),
+            )),
+        );
+    }
     annotations
 }
 
@@ -212,6 +249,8 @@ mod tests {
             }),
             session_id: Some(SessionId::new("cart-1").expect("a valid session id")),
             dead_letter: None,
+            status: MessageStatus::Active,
+            scheduled_enqueue_time: None,
         };
 
         // A round trip through the wire shape keeps what the broker recorded, so
@@ -224,5 +263,34 @@ mod tests {
             Some("cart-1")
         );
         Ok(())
+    }
+
+    #[test]
+    fn a_scheduled_timestamp_crosses_and_malformed_timestamps_are_refused() {
+        let mut message = Message::data(Vec::new());
+        let mut annotations = Fields::new();
+        annotations.insert(
+            Symbol::from(SCHEDULED_ENQUEUE_TIME_ANNOTATION),
+            Value::Timestamp(12_345_i64.into()),
+        );
+        message.message_annotations = Some(annotations.clone());
+        assert_eq!(
+            read_incoming(&message)
+                .expect("a valid scheduled message")
+                .scheduled_enqueue_time,
+            Some(Timestamp::from_millis(12_345))
+        );
+        for value in [
+            Value::Timestamp((-1_i64).into()),
+            Value::Long(12_345),
+            Value::Null,
+        ] {
+            annotations.insert(Symbol::from(SCHEDULED_ENQUEUE_TIME_ANNOTATION), value);
+            message.message_annotations = Some(annotations.clone());
+            assert_eq!(
+                read_incoming(&message),
+                Err(ProtocolError::InvalidScheduledEnqueueTime)
+            );
+        }
     }
 }

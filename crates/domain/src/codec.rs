@@ -22,7 +22,11 @@ pub const VALUE_FORMAT_V3: u8 = 3;
 /// shape.
 pub const VALUE_FORMAT_V4: u8 = 4;
 
-pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V4;
+/// Adds the scheduled message state and appends its original enqueue time to
+/// message records. The configured lifetime starts once a message becomes active.
+pub const VALUE_FORMAT_V5: u8 = 5;
+
+pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V5;
 
 /// Encodes a value into a versioned envelope.
 ///
@@ -101,6 +105,7 @@ mod tests {
             VALUE_FORMAT_V2,
             VALUE_FORMAT_V3,
             VALUE_FORMAT_V4,
+            VALUE_FORMAT_V5,
         ] {
             let mut envelope = vec![version];
             envelope.extend_from_slice(&payload);
