@@ -6,7 +6,7 @@ use amqp::{
     Annotations, ApplicationProperties, Array, Body, ClientConnection as Connection,
     ClientReceiver as Receiver, ClientSender as Sender, ClientSession as Session, Described,
     Descriptor, FilterSet, Header, Message, MessageId, Modified, OrderedMap, Outcome, Properties,
-    Source, Symbol, Uuid, Value, decode_message, encode_message,
+    SenderSettleMode, Source, Symbol, Uuid, Value, decode_message, encode_message,
 };
 use domain::{CommandKind, QueueConfig, StateMachine};
 use server::{Broker, LocalProposer, ManualClock, TimerWorker};
@@ -78,18 +78,18 @@ struct Management {
 
 impl Management {
     async fn attach(session: &mut Session) -> TestResult<Self> {
+        Self::attach_entity(session, "orders").await
+    }
+
+    async fn attach_entity(session: &mut Session, entity: &str) -> TestResult<Self> {
+        let address = format!("{entity}/$management");
         let responses = Receiver::builder()
             .name("preservation-management-responses")
-            .source("orders/$management")
+            .source(address.clone())
             .target("preservation-management-replies")
             .attach(session)
             .await?;
-        let requests = Sender::attach(
-            session,
-            "preservation-management-requests",
-            "orders/$management",
-        )
-        .await?;
+        let requests = Sender::attach(session, "preservation-management-requests", address).await?;
         Ok(Self {
             requests,
             responses,
@@ -159,6 +159,14 @@ impl Management {
         self.request(protocol_amqp::PEEK_MESSAGE_OPERATION, None, body)
             .await
     }
+}
+
+fn delivery_count(message: &Message) -> u32 {
+    message
+        .header
+        .as_ref()
+        .expect("broker delivery header")
+        .delivery_count
 }
 
 fn special_values() -> Vec<(&'static str, Value)> {
@@ -656,17 +664,26 @@ async fn redelivery_preserves_payload_and_advances_only_broker_fields<P: StorePr
         sender.send(expected.clone()).await?,
         Outcome::Accepted(_)
     ));
+    let mut management = Management::attach(&mut session).await?;
+    let peeked = management_entries(&management.peek().await?)?;
+    assert_eq!(peeked.len(), 1);
+    assert_eq!(delivery_count(&peeked[0].0), 0);
     let mut receiver = Receiver::attach(&mut session, "redelivery-receiver", "orders").await?;
     let first = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await??;
     assert_preserved(first.message(), &expected, Lifetime::Active(1_000))?;
-    let count = first
-        .message()
-        .header
-        .as_ref()
-        .expect("delivery header")
-        .delivery_count;
+    assert_eq!(delivery_count(first.message()), 0);
+    let peeked = management_entries(&management.peek().await?)?;
+    assert_eq!(delivery_count(&peeked[0].0), 1);
     let sequence = annotation(first.message(), "x-opt-sequence-number").clone();
-    receiver.release(&first).await?;
+    receiver
+        .modify(
+            &first,
+            Modified {
+                delivery_failed: Some(true),
+                ..Modified::default()
+            },
+        )
+        .await?;
     let again = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await??;
     assert_preserved(again.message(), &expected, Lifetime::Active(1_000))?;
     assert!(
@@ -678,20 +695,48 @@ async fn redelivery_preserves_payload_and_advances_only_broker_fields<P: StorePr
             .first_acquirer,
         "redelivery cannot claim to be the first acquisition"
     );
-    assert_eq!(
-        again
-            .message()
-            .header
-            .as_ref()
-            .expect("redelivery header")
-            .delivery_count,
-        count + 1
-    );
+    assert_eq!(delivery_count(again.message()), 1);
+    let peeked = management_entries(&management.peek().await?)?;
+    assert_eq!(delivery_count(&peeked[0].0), 2);
     assert_eq!(
         annotation(again.message(), "x-opt-sequence-number"),
         &sequence
     );
     receiver.accept(&again).await?;
+    sender.close().await?;
+    receiver.close().await?;
+    session.end().await?;
+    connection.close().await?;
+    node.stop().await;
+    Ok(())
+}
+
+async fn receive_and_delete_emits_zero_for_the_first_acquisition<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    let node = Node::start(provider, Some(QueueConfig::default())).await?;
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut management = Management::attach(&mut session).await?;
+    let mut sender = Sender::attach(&mut session, "delete-count-sender", "orders").await?;
+    let expected = rich_message(Body::Value(Value::String("delete once".to_owned())));
+    assert!(matches!(
+        sender.send(expected.clone()).await?,
+        Outcome::Accepted(_)
+    ));
+    let peeked = management_entries(&management.peek().await?)?;
+    assert_eq!(peeked.len(), 1);
+    assert_eq!(delivery_count(&peeked[0].0), 0);
+    let mut receiver = Receiver::builder()
+        .name("delete-count-receiver")
+        .source("orders")
+        .sender_settle_mode(SenderSettleMode::Settled)
+        .attach(&mut session)
+        .await?;
+    let delivery = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await??;
+    assert_preserved(delivery.message(), &expected, Lifetime::Active(1_000))?;
+    assert_eq!(delivery_count(delivery.message()), 0);
+    assert!(management_entries(&management.peek().await?)?.is_empty());
     sender.close().await?;
     receiver.close().await?;
     session.end().await?;
@@ -716,12 +761,7 @@ async fn deferred_management_returns_preserved_messages<P: StoreProvider>(
     let mut receiver = Receiver::attach(&mut session, link_name, "orders").await?;
     let delivery = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await??;
     let sequence = annotation(delivery.message(), "x-opt-sequence-number").clone();
-    let delivery_count = delivery
-        .message()
-        .header
-        .as_ref()
-        .expect("delivery header")
-        .delivery_count;
+    assert_eq!(delivery_count(delivery.message()), 0);
     receiver
         .modify(
             &delivery,
@@ -738,6 +778,7 @@ async fn deferred_management_returns_preserved_messages<P: StoreProvider>(
         assert_eq!(entries.len(), 1);
         if annotation(&entries[0].0, protocol_amqp::MESSAGE_STATE_ANNOTATION) == &Value::Int(1) {
             assert_preserved(&entries[0].0, &expected, Lifetime::Active(1_000))?;
+            assert_eq!(delivery_count(&entries[0].0), 1);
             break;
         }
         assert!(
@@ -774,7 +815,9 @@ async fn deferred_management_returns_preserved_messages<P: StoreProvider>(
         .as_ref()
         .expect("deferred delivery header");
     assert!(!header.first_acquirer);
-    assert_eq!(header.delivery_count, delivery_count + 1);
+    assert_eq!(header.delivery_count, 1);
+    let peeked = management_entries(&management.peek().await?)?;
+    assert_eq!(delivery_count(&peeked[0].0), 2);
     let token = entries[0]
         .1
         .clone()
@@ -853,6 +896,7 @@ async fn scheduled_management_preserves_metadata_before_and_after_activation<P: 
     let entries = management_entries(&management.peek().await?)?;
     assert_eq!(entries.len(), 1);
     assert_preserved(&entries[0].0, &expected, Lifetime::Scheduled)?;
+    assert_eq!(delivery_count(&entries[0].0), 0);
     assert_eq!(
         annotation(&entries[0].0, protocol_amqp::MESSAGE_STATE_ANNOTATION),
         &Value::Int(2)
@@ -868,10 +912,14 @@ async fn scheduled_management_preserves_metadata_before_and_after_activation<P: 
             .messages_activated,
         1
     );
+    let peeked = management_entries(&management.peek().await?)?;
+    assert_eq!(peeked.len(), 1);
+    assert_eq!(delivery_count(&peeked[0].0), 0);
     let mut receiver =
         Receiver::attach(&mut session, "activated-preservation-receiver", "orders").await?;
     let delivery = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await??;
     assert_preserved(delivery.message(), &expected, Lifetime::Active(2_000))?;
+    assert_eq!(delivery_count(delivery.message()), 0);
     assert_eq!(
         annotation(delivery.message(), protocol_amqp::MESSAGE_STATE_ANNOTATION),
         &Value::Int(0)
@@ -924,7 +972,24 @@ async fn dead_letters_preserve_user_fields_and_overlay_the_reason<P: StoreProvid
         .await?;
     let delivery = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await??;
     assert_preserved(delivery.message(), &expected, Lifetime::Active(1_000))?;
+    assert_eq!(delivery_count(delivery.message()), 0);
     receiver.reject(&delivery, None).await?;
+    let mut management = Management::attach_entity(&mut session, "orders/$deadletterqueue").await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let peeked = management_entries(&management.peek().await?)?;
+        if !peeked.is_empty() {
+            assert_eq!(peeked.len(), 1);
+            // The shadow retains this broker's source acquisition counter.
+            assert_eq!(delivery_count(&peeked[0].0), 1);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "dead-letter settlement was not applied"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let mut dead_letters = Receiver::attach(
         &mut session,
         "dead-letter-drainer",
@@ -933,6 +998,9 @@ async fn dead_letters_preserve_user_fields_and_overlay_the_reason<P: StoreProvid
     .await?;
     let dead_letter = tokio::time::timeout(Duration::from_secs(2), dead_letters.recv()).await??;
     assert_preserved(dead_letter.message(), &expected, Lifetime::DeadLetter)?;
+    assert_eq!(delivery_count(dead_letter.message()), 1);
+    let peeked = management_entries(&management.peek().await?)?;
+    assert_eq!(delivery_count(&peeked[0].0), 2);
     let properties = dead_letter
         .message()
         .application_properties
@@ -1038,6 +1106,7 @@ both_backends!(
     producer_creation_time_survives_without_a_finite_lifetime,
     typed_missing_and_empty_ids_remain_distinct,
     redelivery_preserves_payload_and_advances_only_broker_fields,
+    receive_and_delete_emits_zero_for_the_first_acquisition,
     deferred_management_returns_preserved_messages,
     scheduled_management_preserves_metadata_before_and_after_activation,
     dead_letters_preserve_user_fields_and_overlay_the_reason,

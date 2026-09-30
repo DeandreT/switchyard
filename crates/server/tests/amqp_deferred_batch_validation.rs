@@ -297,7 +297,7 @@ async fn duplicate_batch_is_atomic_and_management_remains_usable<P: StoreProvide
                 .as_ref()
                 .expect("delivery header")
                 .delivery_count,
-            2
+            1
         );
         if mode == 1 {
             assert_eq!(lock_token.as_ref(), Some(&token(index as u64 + 3)));

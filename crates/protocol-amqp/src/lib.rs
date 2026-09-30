@@ -46,6 +46,7 @@ pub use crate::{
     message::{
         DEAD_LETTER_DESCRIPTION_PROPERTY, DEAD_LETTER_REASON_PROPERTY, IncomingMessage,
         MESSAGE_STATE_ANNOTATION, SCHEDULED_ENQUEUE_TIME_ANNOTATION, read_incoming, write_delivery,
+        write_peek_delivery,
     },
     session_filter::{SESSION_FILTER, SessionRequest, read_session_filter, stamp_session_filter},
     tls::{TlsConfigurationError, tls_server_config},

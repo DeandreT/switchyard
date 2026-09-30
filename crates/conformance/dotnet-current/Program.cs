@@ -56,7 +56,7 @@ foreach (var pair in PreservedApplicationProperties())
 await sender.SendMessageAsync(original);
 IReadOnlyList<ServiceBusReceivedMessage> peeked =
     await receiver.PeekMessagesAsync(maxMessages: 1);
-if (peeked.Count != 1 || !HasPreservedContent(peeked[0]))
+if (peeked.Count != 1 || !HasPreservedContent(peeked[0]) || peeked[0].DeliveryCount != 0)
 {
     Console.Error.WriteLine(
         $"unexpected peek result: count={peeked.Count}, body={peeked.FirstOrDefault()?.Body}");
@@ -70,9 +70,9 @@ if (received is null)
     Console.Error.WriteLine("the official client did not receive its message");
     return 4;
 }
-if (!HasPreservedContent(received))
+if (!HasPreservedContent(received) || received.DeliveryCount != 1)
 {
-    Console.Error.WriteLine($"unexpected body: {received.Body}");
+    Console.Error.WriteLine($"unexpected first delivery: body={received.Body}, count={received.DeliveryCount}");
     return 5;
 }
 
@@ -93,7 +93,7 @@ var abandonUpdates = new Dictionary<string, object>
 };
 await receiver.AbandonMessageAsync(received, abandonUpdates);
 received = await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
-if (received is null || !HasPreservedContent(received) || received.DeliveryCount < 2
+if (received is null || !HasPreservedContent(received) || received.DeliveryCount != 2
     || !HasUpdatedProperties(received, abandonUpdates))
 {
     Console.Error.WriteLine("message content did not survive redelivery");
@@ -298,6 +298,7 @@ if (scheduledSequences.Count != 2
     || !scheduledPeek.Take(2).Select(message => message.SequenceNumber)
         .SequenceEqual(scheduledSequences)
     || scheduledPeek.Any(message => message.State != ServiceBusMessageState.Scheduled
+        || message.DeliveryCount != 0
         || message.ScheduledEnqueueTime.ToUnixTimeMilliseconds()
             != scheduledEnqueueTime.ToUnixTimeMilliseconds()))
 {
@@ -314,6 +315,7 @@ for (int index = 0; index < scheduledPeek.Count; index++)
         || !pendingSequences.Remove(scheduledMessage.Body.ToString(), out long pendingSequence)
         || scheduledMessage.SequenceNumber == pendingSequence
         || scheduledMessage.State != ServiceBusMessageState.Active
+        || scheduledMessage.DeliveryCount != 1
         || scheduledMessage.ScheduledEnqueueTime.ToUnixTimeMilliseconds()
             != scheduledEnqueueTime.ToUnixTimeMilliseconds()
         || DateTimeOffset.UtcNow < scheduledMessage.ScheduledEnqueueTime
@@ -361,7 +363,8 @@ if (sessionReceiver.SessionLockedUntil < sessionLockedUntilBeforeRenewal)
 
 ServiceBusReceivedMessage? sessionMessage =
     await sessionReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
-if (sessionMessage?.Body.ToString() != "official-session-current")
+if (sessionMessage?.Body.ToString() != "official-session-current"
+    || sessionMessage.DeliveryCount != 1)
 {
     Console.Error.WriteLine($"unexpected session message: {sessionMessage?.Body}");
     return 12;
@@ -390,6 +393,7 @@ if (scheduledSessionMessage?.Body.ToString() != "official-scheduled-session-curr
     || scheduledSessionMessage.SessionId != "session-1"
     || scheduledSessionMessage.SequenceNumber == scheduledSessionSequence
     || scheduledSessionMessage.State != ServiceBusMessageState.Active
+    || scheduledSessionMessage.DeliveryCount != 1
     || scheduledSessionMessage.ScheduledEnqueueTime.ToUnixTimeMilliseconds()
         != scheduledSessionEnqueueTime.ToUnixTimeMilliseconds()
     || DateTimeOffset.UtcNow < scheduledSessionMessage.ScheduledEnqueueTime

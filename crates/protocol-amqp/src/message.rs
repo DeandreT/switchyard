@@ -104,8 +104,17 @@ const LOCKED_UNTIL_ANNOTATION: &str = "x-opt-locked-until";
 pub const SCHEDULED_ENQUEUE_TIME_ANNOTATION: &str = "x-opt-scheduled-enqueue-time";
 pub const MESSAGE_STATE_ANNOTATION: &str = "x-opt-message-state";
 
-/// Builds the message handed back to a receiving client.
+/// Builds a transfer whose header counts acquisitions before this delivery.
 pub fn write_delivery(delivery: &Delivery) -> Message {
+    write_delivery_with_count(delivery, delivery.delivery_count.saturating_sub(1))
+}
+
+/// Builds a peeked message without treating the peek as a delivery acquisition.
+pub fn write_peek_delivery(delivery: &Delivery) -> Message {
+    write_delivery_with_count(delivery, delivery.delivery_count)
+}
+
+fn write_delivery_with_count(delivery: &Delivery, delivery_count: u32) -> Message {
     let mut message = match &delivery.envelope {
         Some(envelope) => write_envelope(envelope),
         None => {
@@ -118,7 +127,7 @@ pub fn write_delivery(delivery: &Delivery) -> Message {
         }
     };
     let header = message.header.get_or_insert_with(Header::default);
-    header.delivery_count = delivery.delivery_count;
+    header.delivery_count = delivery_count;
     header.first_acquirer = false;
     let properties = message.properties.get_or_insert_with(Properties::default);
     properties.group_id = delivery
@@ -554,6 +563,123 @@ mod tests {
     }
 
     #[test]
+    fn transfer_delivery_count_is_prior_acquisitions_and_saturates_at_zero() {
+        for envelope in [None, Some(MessageEnvelope::default())] {
+            for (acquisitions, expected) in [(0_u32, 0), (1, 0), (2, 1), (u32::MAX, u32::MAX - 1)] {
+                let mut delivery = delivery(envelope.clone());
+                delivery.delivery_count = acquisitions;
+                let encoded = encode_message(&write_delivery(&delivery)).expect("valid transfer");
+                let message = decode_message(&encoded).expect("valid transfer sections");
+                assert_eq!(
+                    message.header.expect("broker header").delivery_count,
+                    expected
+                );
+                assert_eq!(delivery.delivery_count, acquisitions);
+            }
+        }
+    }
+
+    #[test]
+    fn peek_count_is_unchanged_for_every_state_and_lock_presence() {
+        let envelope = MessageEnvelope {
+            header: Some(MessageHeader {
+                durable: true,
+                priority: 7,
+                first_acquirer: true,
+            }),
+            properties: MessageProperties {
+                message_id: Some(MessageIdentifier::Ulong(42)),
+                subject: Some("retained subject".to_owned()),
+                ..MessageProperties::default()
+            },
+            application_properties: BTreeMap::from([(
+                "retained".to_owned(),
+                MessageValue::Uint(9),
+            )]),
+            message_annotations: BTreeMap::from([(
+                AnnotationKey::Symbol("custom".to_owned()),
+                MessageValue::String("annotation".to_owned()),
+            )]),
+            footer: BTreeMap::from([(AnnotationKey::Ulong(12), MessageValue::Binary(vec![1, 2]))]),
+            body: MessageBody::Data(vec![b"first".to_vec(), b"second".to_vec()]),
+        };
+        for envelope in [None, Some(envelope)] {
+            for count in [0, 1, 2, u32::MAX] {
+                for (status, state) in [
+                    (MessageStatus::Active, 0),
+                    (MessageStatus::Deferred, 1),
+                    (MessageStatus::Scheduled, 2),
+                ] {
+                    for lock in [
+                        None,
+                        Some(DeliveryLock {
+                            token: LockToken::new(9),
+                            locked_until: Timestamp::from_millis(100),
+                        }),
+                    ] {
+                        let mut delivery = delivery(envelope.clone());
+                        delivery.delivery_count = count;
+                        delivery.status = status;
+                        delivery.lock = lock;
+                        delivery.session_id = Some(SessionId::new("cart").expect("valid session"));
+                        delivery.scheduled_enqueue_time = Some(Timestamp::from_millis(1_000));
+                        delivery.dead_letter = Some(DeadLetterInfo {
+                            reason: DeadLetterReason::Application("reason".to_owned()),
+                            description: "description".to_owned(),
+                            dead_lettered_at: Timestamp::from_millis(8),
+                        });
+
+                        let encoded = encode_message(&write_peek_delivery(&delivery))
+                            .expect("valid peek response");
+                        let peeked = decode_message(&encoded).expect("valid peek sections");
+                        assert_eq!(
+                            peeked.header.as_ref().expect("peek header").delivery_count,
+                            count
+                        );
+                        let annotations = peeked
+                            .message_annotations
+                            .as_ref()
+                            .expect("broker metadata");
+                        assert_eq!(
+                            annotations.get(Symbol::from(MESSAGE_STATE_ANNOTATION)),
+                            Some(&Value::Int(state))
+                        );
+                        assert_eq!(
+                            annotations.get(Symbol::from(LOCKED_UNTIL_ANNOTATION)),
+                            lock.as_ref()
+                                .map(|_| Value::Timestamp(100_i64.into()))
+                                .as_ref()
+                        );
+
+                        let encoded = encode_message(&write_delivery(&delivery))
+                            .expect("valid transfer response");
+                        let mut transferred =
+                            decode_message(&encoded).expect("valid transfer sections");
+                        assert_eq!(
+                            transferred
+                                .header
+                                .as_ref()
+                                .expect("transfer header")
+                                .delivery_count,
+                            count.saturating_sub(1)
+                        );
+                        transferred
+                            .header
+                            .as_mut()
+                            .expect("transfer header")
+                            .delivery_count = count;
+                        assert_eq!(
+                            transferred, peeked,
+                            "all other content and broker metadata are shared"
+                        );
+                        assert_eq!(delivery.delivery_count, count);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_body_and_identifier_cross_in() -> Result<(), ProtocolError> {
         let properties = Properties {
             message_id: Some(String::from("order-1").into()),
@@ -784,7 +910,7 @@ mod tests {
         assert!(header.durable);
         assert_eq!(header.priority, 8);
         assert!(!header.first_acquirer);
-        assert_eq!(header.delivery_count, 3);
+        assert_eq!(header.delivery_count, 2);
         let annotations = outgoing.message_annotations.expect("delivery annotations");
         assert_eq!(annotations.get(42_u64), Some(&Value::Int(7)));
         assert_eq!(
@@ -977,7 +1103,7 @@ mod tests {
         assert_eq!(outgoing.header.as_ref().and_then(|header| header.ttl), None);
         assert_eq!(
             outgoing.header.as_ref().map(|header| header.delivery_count),
-            Some(3)
+            Some(2)
         );
         let properties = outgoing.properties.expect("properties retained");
         assert_eq!(properties.creation_time, Some(100));

@@ -153,6 +153,12 @@ condition an SDK keys its behaviour off. A receiving link's settle mode selects
 the delivery guarantee: unsettled is peek-lock, pre-settled is receive-delete.
 Peeking is served through the entity's `$management` request/reply links and
 returns encoded AMQP messages without touching their broker state.
+Receiving transfers encode the number of preceding acquisitions, so the official
+.NET client reports 1 on the first receive and 2 after abandonment and redelivery.
+Peek retains the stored acquisition count without the client's receive increment.
+The core currently counts acquisitions, not only unsuccessful settlements;
+counter parity for deferral, locked-message peek, and dead-letter transfers is
+not established, nor are generic AMQP Released/Modified counter semantics.
 Deferred receive is also served through `$management`, and locks returned that
 way are settled through the management `update-disposition` operation.
 Retrieving only expired deferred messages commits their cleanup before

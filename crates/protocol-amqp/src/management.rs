@@ -19,7 +19,7 @@ use tracing::debug;
 use crate::{
     Broker, BrokerRejection,
     authorization::ConnectionAuthorization,
-    message::{read_incoming, write_delivery},
+    message::{read_incoming, write_delivery, write_peek_delivery},
     settlement::{dead_letter_disposition, read_properties_to_modify},
 };
 
@@ -1078,7 +1078,7 @@ async fn peek_messages<B: Broker>(
         Ok(CommandOutcome::Peeked(deliveries)) => {
             let mut messages = Vec::with_capacity(deliveries.len());
             for delivery in deliveries {
-                let encoded = match encode_message(&write_delivery(&delivery)) {
+                let encoded = match encode_message(&write_peek_delivery(&delivery)) {
                     Ok(encoded) => encoded,
                     Err(error) => {
                         return ManagementResponse::internal(

@@ -449,7 +449,7 @@ async fn link_abandon_updates_survive_restart<P: StoreProvider>(provider: P) -> 
             .as_ref()
             .expect("redelivery header")
             .delivery_count,
-        2
+        1
     );
     // Defer is a deterministic barrier against the client's automatic credit
     // acquiring the ready message again while the broker is being restarted.
