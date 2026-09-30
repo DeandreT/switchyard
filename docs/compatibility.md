@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Send, peek, receive, abandon/defer/dead-letter property updates, renew, complete, schedule, cancel, duplicate detection and message properties; session renew/state/scheduling | Planned | Experimental gate on 7.21.0 |
+| Official .NET SDK, current stable | Send, both batch-send APIs, peek, receive, abandon/defer/dead-letter property updates, renew, complete, schedule, cancel, duplicate detection and message properties; session renew/state/scheduling | Planned | Experimental gate on 7.21.0 |
 | Official .NET SDK, previous stable | Same gated workflows as current | Planned | Experimental gate on 7.20.2 |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -24,6 +24,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | AMQP over WebSockets | Pre-1.0 | Not implemented |
 | SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. JWT: not implemented |
 | Queue send, receive, and settlement | Pre-1.0 | State machine |
+| Atomic message batch send | Pre-1.0 | State machine, AMQP producer mapping, Rust clients on both backends and both pinned .NET batch APIs |
 | Message properties and AMQP body preservation | Pre-1.0 | State machine and AMQP mapping; typed properties, application values, annotations, footer and all body kinds. Rust clients on both backends and official .NET property gate |
 | Peek without lock acquisition | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Receive-delete | Pre-1.0 | State machine, AMQP mapping |
@@ -79,8 +80,8 @@ behavior it currently enforces:
   It accepts at most 1,024 messages, 65,536 retained value items, and 4 MiB of
   retained content, including the compatibility body and normalized identifiers.
   Session queues require every member to name the same session. An empty batch
-  validates its target but writes nothing. These are local resource bounds;
-  the SDK batch-send wire format is not supported yet.
+  validates its target but writes nothing. These are local resource bounds,
+  not Azure batch quotas.
 - A queue can enable duplicate detection by message ID, with a 10-minute
   default history window bounded to 20 seconds through 7 days. A duplicate
   send is accepted and dropped, and history survives completion, dead-lettering,
@@ -222,6 +223,9 @@ four-byte size prefix before allocating or reading their bodies; an open
 connection returns the framing-error Close condition. The test client can
 configure its own receive maximum between 512 bytes and the codec's 4 MiB
 ceiling. SASL reads use the local receive maximum as a resource policy.
+Frames on channels above the locally advertised limit receive a framing-error
+Close without refreshing receive activity. Asymmetric channel/handle routing
+remains a separate unfinished feature.
 Session windows count Transfer frames independently of link delivery counts.
 Incoming windows replenish after bounded frame processing; receive links grant
 32 message slots and return credit only as the application consumes a delivery
@@ -236,18 +240,37 @@ unfinished.
 First transfers require an explicit delivery ID, binary tag, and message format.
 Tags may be empty but cannot exceed 32 bytes. Continuations may omit identity
 fields, but repeated ID, tag, and format values must match the first fragment;
-an invalid fragment closes only its link. Only standard message format zero is
-supported. Nonzero formats, including the official SDK's batch-send format, are
-explicitly refused with `amqp:not-implemented`, not stored as ordinary message
-content. SDK batch sending remains a separate gap. Incoming unsettled identity
-collision checks and link resumption are not implemented by these fragment
-consistency checks.
+an invalid fragment closes only its link. Format zero always uses the standard
+message decoder. The transport can opt a receiving link into at most eight
+additional exact formats with trusted application decoders; zero cannot be
+overridden. A format not registered on that link is refused with
+`amqp:not-implemented` before reserving a delivery slot. CBS, management, and
+test-client receiving links retain the standard-only default. Incoming unsettled
+identity collision checks and link resumption are not implemented by these
+fragment consistency checks.
+Approved producer links register Service Bus batch format `0x80013700`, whose
+[wire constant](https://raw.githubusercontent.com/Azure/azure-amqp/master/src/AmqpConstants.cs)
+identifies one encoded standard message per outer Data section. The nonempty
+wrapper uses one link delivery/credit regardless of member count, shares its
+inner parsing allowance, and submits exactly one atomic ingress command before
+the outer Accepted outcome. The entire wrapper must still fit the 256 KiB
+producer-link limit. Inner properties, lifetimes, identifiers, and optional
+scheduling timestamps remain independent; outer metadata is not inherited or
+used as a batch-wide duplicate identifier. A present outer session must agree
+with present inner sessions and never fills a missing one. A standard inner Data
+body is ordinary content, not another batch. Empty wrappers are refused; an
+empty encoded inner message is valid anonymous content. The
+[pinned SDK converter](https://raw.githubusercontent.com/Azure/azure-sdk-for-net/Azure.Messaging.ServiceBus_7.21.0/sdk/servicebus/Azure.Messaging.ServiceBus/src/Amqp/AmqpMessageConverter.cs)
+normally sends singleton batches in format zero, so raw transport tests also
+force the nonzero singleton format. Both pinned client gates cover the enumerable
+and size-safe batch APIs, session FIFO/refusals, rich content, duplicate detection,
+and an oversized `TryAddMessage` refusal.
 Message decoding can share one cumulative allocation allowance across embedded
 messages: at most 132,096 parsed values and 4 MiB of copied string, symbol, and
 binary content, with depth bounded independently for each value. Array members
 and repeated named descriptors are charged before allocation. Scheduling
-management requests share that inner allowance and reject more than 1,024
-members before decoding them. These bounds do not provide a connection-wide
+management requests and producer batches share that inner allowance and reject
+more than 1,024 members before decoding them. These bounds do not provide a connection-wide
 memory limit and are not Azure batch quotas.
 If a peer detaches a link while application approval is outstanding, a bounded
 canceled-approval tombstone refuses early handle reuse until that approval returns
