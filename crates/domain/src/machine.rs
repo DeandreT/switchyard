@@ -19,8 +19,9 @@ use crate::{
     DeadLetterReason, Delivery, DeliveryBudget, DeliveryLock, EntityPath, LockToken,
     MAX_MESSAGE_HEADER_BYTES, MAX_MESSAGE_ID_LENGTH, MessageBody, MessageEnvelope,
     MessageIdentifier, MessageProperties, MessageRecord, MessageState, MessageStatus, MessageValue,
-    NamespaceName, QueueConfig, QueueCounters, ReceiveMode, SequenceNumber, SessionHold, SessionId,
-    SessionLock, SessionRecord, SettlementDisposition, Timestamp, codec, keys,
+    NamespaceName, QueueConfig, QueueConfigUpdate, QueueCounters, ReceiveMode, SequenceNumber,
+    SessionHold, SessionId, SessionLock, SessionRecord, SettlementDisposition, Timestamp, codec,
+    keys,
 };
 
 /// Ready entries a single receive may walk past while discarding expired
@@ -170,6 +171,9 @@ impl<S: StateStore> StateMachine<S> {
         let outcome = match &command.kind {
             CommandKind::CreateQueue { config } => {
                 self.create_queue(command, *config, &mut batch)?
+            }
+            CommandKind::UpdateQueue { update } => {
+                self.update_queue(command, *update, &mut batch)?
             }
             CommandKind::Send {
                 message_id,
@@ -714,20 +718,39 @@ impl<S: StateStore> StateMachine<S> {
         // Failing here, rather than at the first dead-lettering, is why a
         // parent whose shadow path would be too long cannot be created.
         let dead_letter_queue = command.entity.dead_letter_queue()?;
-        let shadow = QueueConfig {
-            max_delivery_count: u32::MAX,
-            default_time_to_live_millis: None,
-            requires_session: false,
-            requires_duplicate_detection: false,
-            dead_lettering_on_message_expiration: false,
-            ..config
-        };
+        let shadow = config.dead_letter_shadow();
         batch.push_put(key, codec::encode(&config)?);
         batch.push_put(
             keys::queue_config(&command.namespace, &dead_letter_queue),
             codec::encode(&shadow)?,
         );
         Ok(CommandOutcome::QueueCreated)
+    }
+
+    fn update_queue(
+        &self,
+        command: &Command,
+        update: QueueConfigUpdate,
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        if command.entity.is_dead_letter_queue() {
+            return Err(BrokerError::DeadLetterQueueIsReserved);
+        }
+        let current = self.load_config(command)?;
+        let config = update.apply_to(current)?;
+        if config == current {
+            return Ok(CommandOutcome::QueueUpdated);
+        }
+        let shadow = command.entity.dead_letter_queue()?;
+        batch.push_put(
+            keys::queue_config(&command.namespace, &command.entity),
+            codec::encode(&config)?,
+        );
+        batch.push_put(
+            keys::queue_config(&command.namespace, &shadow),
+            codec::encode(&config.dead_letter_shadow())?,
+        );
+        Ok(CommandOutcome::QueueUpdated)
     }
 
     fn send(

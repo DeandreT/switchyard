@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{CodecError, codec};
+use crate::{BrokerError, CodecError, codec};
 
 /// Longest lock Service Bus accepts, and the value Switchyard enforces so that
 /// a client cannot pin a message indefinitely.
@@ -34,6 +34,88 @@ pub struct QueueConfig {
     /// Expired messages are dropped by default. Enabling this moves them to
     /// the dead-letter queue with the TTLExpiredException reason instead.
     pub dead_lettering_on_message_expiration: bool,
+}
+
+/// An explicit lifetime replacement. An absent patch field means unchanged;
+/// `Unlimited` clears a finite default in both JSON and replicated commands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueTimeToLiveUpdate {
+    Unlimited,
+    Finite { millis: u64 },
+}
+
+/// A partial replacement of queue settings. Creation-only properties may be
+/// restated with the same value, but cannot be enabled or disabled afterward.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueueConfigUpdate {
+    pub lock_duration_millis: Option<u64>,
+    pub max_delivery_count: Option<u32>,
+    pub default_time_to_live_millis: Option<QueueTimeToLiveUpdate>,
+    pub max_message_bytes: Option<usize>,
+    pub requires_session: Option<bool>,
+    pub requires_duplicate_detection: Option<bool>,
+    pub duplicate_detection_history_time_window_millis: Option<u64>,
+    pub dead_lettering_on_message_expiration: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueImmutableProperty {
+    RequiresSession,
+    RequiresDuplicateDetection,
+}
+
+impl std::fmt::Display for QueueImmutableProperty {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::RequiresSession => "requires_session",
+            Self::RequiresDuplicateDetection => "requires_duplicate_detection",
+        })
+    }
+}
+
+impl QueueConfigUpdate {
+    pub(crate) fn apply_to(self, current: QueueConfig) -> Result<QueueConfig, BrokerError> {
+        if self
+            .requires_session
+            .is_some_and(|value| value != current.requires_session)
+        {
+            return Err(BrokerError::QueuePropertyIsImmutable {
+                property: QueueImmutableProperty::RequiresSession,
+            });
+        }
+        if self
+            .requires_duplicate_detection
+            .is_some_and(|value| value != current.requires_duplicate_detection)
+        {
+            return Err(BrokerError::QueuePropertyIsImmutable {
+                property: QueueImmutableProperty::RequiresDuplicateDetection,
+            });
+        }
+        Ok(QueueConfig {
+            lock_duration_millis: self
+                .lock_duration_millis
+                .unwrap_or(current.lock_duration_millis),
+            max_delivery_count: self
+                .max_delivery_count
+                .unwrap_or(current.max_delivery_count),
+            default_time_to_live_millis: match self.default_time_to_live_millis {
+                None => current.default_time_to_live_millis,
+                Some(QueueTimeToLiveUpdate::Unlimited) => None,
+                Some(QueueTimeToLiveUpdate::Finite { millis }) => Some(millis),
+            },
+            max_message_bytes: self.max_message_bytes.unwrap_or(current.max_message_bytes),
+            duplicate_detection_history_time_window_millis: self
+                .duplicate_detection_history_time_window_millis
+                .unwrap_or(current.duplicate_detection_history_time_window_millis),
+            dead_lettering_on_message_expiration: self
+                .dead_lettering_on_message_expiration
+                .unwrap_or(current.dead_lettering_on_message_expiration),
+            ..current
+        }
+        .validate()?)
+    }
 }
 
 /// Versions 1 through 5, before queues could retain duplicate-detection history.
@@ -105,6 +187,17 @@ impl Default for QueueConfig {
 }
 
 impl QueueConfig {
+    pub(crate) fn dead_letter_shadow(self) -> Self {
+        Self {
+            max_delivery_count: u32::MAX,
+            default_time_to_live_millis: None,
+            requires_session: false,
+            requires_duplicate_detection: false,
+            dead_lettering_on_message_expiration: false,
+            ..self
+        }
+    }
+
     /// Decodes a stored configuration, preserving older settings and keeping
     /// duplicate detection disabled on queues that predate the feature. Legacy
     /// queues retain their always-dead-letter expiration policy.

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AcceptedSession, Delivery, EntityPath, LockToken, MessageEnvelope, MessageValue, NamespaceName,
-    QueueConfig, ReceiveMode, SequenceNumber, SessionHold, SessionId, Timestamp,
+    QueueConfig, QueueConfigUpdate, ReceiveMode, SequenceNumber, SessionHold, SessionId, Timestamp,
 };
 
 /// One replicated instruction for the broker state machine.
@@ -240,6 +240,11 @@ pub enum CommandKind {
         session: Option<SessionHold>,
         budget: DeliveryBudget,
     },
+    /// Replaces only the supplied mutable settings. Existing message and lock
+    /// deadlines, counters, and duplicate-history entries are retained.
+    UpdateQueue {
+        update: QueueConfigUpdate,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -296,4 +301,5 @@ pub enum CommandOutcome {
     SessionLocksExpired {
         released: u32,
     },
+    QueueUpdated,
 }

@@ -59,7 +59,9 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::InvalidMessageContent { .. }
         | BrokerError::QueuePageLimitExceeded { .. }
         | BrokerError::QueueCursorNamespaceMismatch { .. } => INVALID_FIELD,
-        BrokerError::QueueConfig(_) => PRECONDITION_FAILED,
+        BrokerError::QueueConfig(_) | BrokerError::QueuePropertyIsImmutable { .. } => {
+            PRECONDITION_FAILED
+        }
 
         // The node's clock disagrees with what it already applied. A client
         // retry can succeed once it settles, so this is locked rather than
@@ -88,12 +90,24 @@ pub fn is_retryable(error: &BrokerError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use domain::{SequenceNumber, SessionId, Timestamp};
+    use domain::{QueueImmutableProperty, SequenceNumber, SessionId, Timestamp};
 
     use super::*;
 
     fn session() -> SessionId {
         SessionId::new("cart-1").expect("a valid session id")
+    }
+
+    #[test]
+    fn immutable_queue_property_changes_are_not_retryable() {
+        for property in [
+            QueueImmutableProperty::RequiresSession,
+            QueueImmutableProperty::RequiresDuplicateDetection,
+        ] {
+            let error = BrokerError::QueuePropertyIsImmutable { property };
+            assert_eq!(condition_for(&error), PRECONDITION_FAILED);
+            assert!(!is_retryable(&error));
+        }
     }
 
     #[test]
