@@ -234,9 +234,8 @@ other links. Fragmented sends yield when their session window closes, resume on
 session Flow, and consume only one link credit per message. Flow echo, drain,
 optional credit, wrapping counts, and early second-mode dispositions have raw
 transport regressions. Every outgoing frame is checked against the peer's frame
-cap before writing bytes. Connection-wide outbound byte budgets, asymmetric
-channel/handle routing, and incoming unsettled identity collision checks remain
-unfinished.
+cap before writing bytes. Connection-wide byte budgets and asymmetric
+channel/handle routing remain unfinished.
 First transfers require an explicit delivery ID, binary tag, and message format.
 Tags may be empty but cannot exceed 32 bytes. Continuations may omit identity
 fields, but repeated ID, tag, and format values must match the first fragment;
@@ -245,9 +244,40 @@ message decoder. The transport can opt a receiving link into at most eight
 additional exact formats with trusted application decoders; zero cannot be
 overridden. A format not registered on that link is refused with
 `amqp:not-implemented` before reserving a delivery slot. CBS, management, and
-test-client receiving links retain the standard-only default. Incoming unsettled
-identity collision checks and link resumption are not implemented by these
-fragment consistency checks.
+test-client receiving links retain the standard-only default.
+Incoming delivery IDs are reserved across the session, and tags across their
+receiving link, from the first fragment. A live collision closes only the
+offending link with `amqp:invalid-field`; a different original owner's delivery
+remains available for settlement. This link-local error scope is a Switchyard
+policy. A separate metadata allowance bounds incoming partial, complete, and
+second-mode acknowledgement entries to 1,024 per receiving link and 4,096 per
+session. Admission beyond either limit closes the offending link with
+`amqp:resource-limit-exceeded`, independently of its message-slot credit.
+Consumption returns message-slot credit but does not settle a delivery.
+Application receipts retain opaque link and delivery generations rather than
+relying on reusable numeric aliases. A foreign receiver, retired link, or
+aborted receipt cannot emit a settlement. Repeating a terminal settlement on
+its original open link is a no-op, even after the numeric ID has been reused.
+Local outcomes are checked against the peer's frame cap before state changes;
+an oversized outcome leaves the live receipt available for a smaller retry.
+Receiver-first outcomes settle immediately. Receiver-second outcomes are sent
+unsettled and retain their aliases until the sender acknowledges settlement,
+including a state-less or ranged sender disposition. The application call
+returns after writing its outcome, not after that acknowledgement. A sender
+settling before the application finishes suppresses an unnecessary response;
+partial deliveries retain their aliases until completion or abort. Completing
+sender-settled deliveries need no outcome or retained alias.
+The negotiated sender mode is enforced at completion, with aborted transfers
+implicitly settled. A per-transfer receiver mode defaults to the negotiated
+mode on the completing frame, rather than becoming sticky from an earlier
+fragment; an illegal receiver-second override on a receiver-first link is
+refused unless the delivery is sender-settled or aborted. These policies follow
+the [Transfer and Disposition rules](https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html#type-transfer).
+Switchyard interprets the receiver-mode exception to include a settled sender
+disposition received before completion. Such a disposition never substitutes
+for the explicit settled Transfer required by a negotiated settled sender link.
+Detach, End, and connection teardown retire the affected generation and remove
+its aliases. Link suspension and resumption remain unsupported.
 Approved producer links register Service Bus batch format `0x80013700`, whose
 [wire constant](https://raw.githubusercontent.com/Azure/azure-amqp/master/src/AmqpConstants.cs)
 identifies one encoded standard message per outer Data section. The nonempty
@@ -270,8 +300,8 @@ messages: at most 132,096 parsed values and 4 MiB of copied string, symbol, and
 binary content, with depth bounded independently for each value. Array members
 and repeated named descriptors are charged before allocation. Scheduling
 management requests and producer batches share that inner allowance and reject
-more than 1,024 members before decoding them. These bounds do not provide a connection-wide
-memory limit and are not Azure batch quotas.
+more than 1,024 members before decoding them. These bounds do not provide a
+connection-wide memory limit and are not Azure batch quotas.
 If a peer detaches a link while application approval is outstanding, a bounded
 canceled-approval tombstone refuses early handle reuse until that approval returns
 an error. Canceled approvals count toward the 32 pending link approvals allowed
