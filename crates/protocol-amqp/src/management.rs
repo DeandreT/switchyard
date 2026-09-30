@@ -1,8 +1,9 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use amqp::{
-    AmqpError, ApplicationProperties, Body, Error as AmqpProtocolError, Message, MessageId,
-    Properties, Receiver, Sender, decode_message, encode_message,
+    AmqpError, ApplicationProperties, Body, Error as AmqpProtocolError, Message,
+    MessageDecodeBudget, MessageId, Properties, Receiver, Sender, decode_message_with_budget,
+    encode_message,
 };
 use auth::{Permission, ResourceScope};
 use domain::{
@@ -776,6 +777,8 @@ enum ScheduleRequestError {
     Malformed(String),
     #[error(transparent)]
     Message(#[from] crate::ProtocolError),
+    #[error(transparent)]
+    Refused(#[from] domain::BrokerError),
 }
 
 impl ScheduleRequestError {
@@ -785,6 +788,11 @@ impl ScheduleRequestError {
         tracking_id: Option<String>,
     ) -> ManagementResponse {
         match self {
+            Self::Refused(error) => ManagementResponse::from_rejection(
+                correlation_id,
+                tracking_id,
+                &BrokerRejection::Refused(error),
+            ),
             Self::Message(error @ crate::ProtocolError::MessageTooLarge { .. }) => {
                 ManagementResponse {
                     correlation_id,
@@ -813,7 +821,16 @@ fn scheduled_messages(body: &Body) -> Result<Vec<ScheduledEnvelope>, ScheduleReq
             "at least one message is required".to_owned(),
         ));
     }
+    if entries.len() > domain::MAX_INGRESS_BATCH_MESSAGES {
+        return Err(domain::BrokerError::IngressBatchLimitExceeded {
+            limit: domain::IngressBatchLimit::Messages,
+            actual: entries.len(),
+            maximum: domain::MAX_INGRESS_BATCH_MESSAGES,
+        }
+        .into());
+    }
     let mut messages = Vec::with_capacity(entries.len());
+    let mut decode_budget = MessageDecodeBudget::default();
     for entry in entries {
         let Value::Map(entry) = entry else {
             return Err(ScheduleRequestError::Malformed(
@@ -826,7 +843,7 @@ fn scheduled_messages(body: &Body) -> Result<Vec<ScheduledEnvelope>, ScheduleReq
             ));
         };
         crate::validate_standard_message_size(encoded.len())?;
-        let decoded = decode_message(encoded)
+        let decoded = decode_message_with_budget(encoded, &mut decode_budget)
             .map_err(|error| ScheduleRequestError::Malformed(error.to_string()))?;
         let incoming = read_incoming(&decoded)?;
         let enqueue_at = incoming.scheduled_enqueue_time.ok_or_else(|| {
@@ -1812,6 +1829,65 @@ mod tests {
         let response = error.into_response(MessageId::Ulong(1), None);
         assert_eq!(response.status_code, 400);
         assert_eq!(response.error_condition, Some(crate::INVALID_FIELD));
+    }
+
+    #[test]
+    fn scheduled_message_count_is_refused_before_decoding_entries() {
+        let count = domain::MAX_INGRESS_BATCH_MESSAGES + 1;
+        let body = Body::Value(map_body(MESSAGES, Value::List(vec![Value::Null; count])));
+        let error = scheduled_messages(&body).expect_err("the batch exceeds its entry quota");
+        assert!(matches!(
+            error,
+            ScheduleRequestError::Refused(domain::BrokerError::IngressBatchLimitExceeded {
+                limit: domain::IngressBatchLimit::Messages,
+                actual,
+                maximum: domain::MAX_INGRESS_BATCH_MESSAGES,
+            }) if actual == count
+        ));
+        let response = error.into_response(MessageId::Ulong(7), Some("trace".to_owned()));
+        assert_eq!(response.status_code, 403);
+        assert_eq!(
+            response.error_condition,
+            Some(crate::RESOURCE_LIMIT_EXCEEDED)
+        );
+        assert_eq!(response.correlation_id, MessageId::Ulong(7));
+        assert_eq!(response.tracking_id.as_deref(), Some("trace"));
+    }
+
+    #[test]
+    fn scheduled_messages_share_one_inner_value_budget() {
+        let mut annotations = amqp::Annotations::new();
+        annotations.insert(
+            Symbol::from(crate::message::SCHEDULED_ENQUEUE_TIME_ANNOTATION),
+            Value::Timestamp(AmqpTimestamp::from_milliseconds(3_000)),
+        );
+        let message = Message {
+            message_annotations: Some(annotations),
+            ..Message::default()
+        };
+        let mut encoded = encode_message(&message).expect("valid scheduling annotations");
+        // The null constructor represents 40,000 array members without payload bytes.
+        encoded.extend_from_slice(&[0x00, 0x53, 0x77, 0xf0]);
+        encoded.extend_from_slice(&5_u32.to_be_bytes());
+        encoded.extend_from_slice(&40_000_u32.to_be_bytes());
+        encoded.push(0x40);
+        amqp::decode_message(&encoded).expect("each compact message fits alone");
+        scheduled_messages(&scheduled_request(encoded.clone()))
+            .expect("one decoded message fits the domain limits");
+        let entry = Value::Map(
+            [(
+                Value::String(MESSAGE.to_owned()),
+                Value::Binary(encoded.into()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let body = Body::Value(map_body(MESSAGES, Value::List(vec![entry; 4])));
+        let error = scheduled_messages(&body).expect_err("the cumulative decode quota is exceeded");
+        let response = error.into_response(MessageId::Ulong(8), None);
+        assert_eq!(response.status_code, 400);
+        assert_eq!(response.error_condition, Some(crate::INVALID_FIELD));
+        assert_eq!(response.correlation_id, MessageId::Ulong(8));
     }
 
     #[test]
