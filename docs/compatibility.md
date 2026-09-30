@@ -145,6 +145,21 @@ and maximum delivery count use the current queue policy. A no-op patch does not
 write storage or advance the applied clock. The adjustable per-message size cap
 is a Switchyard policy, not a verified Azure queue-update property.
 
+Identifier allocation refuses exhaustion instead of saturating and reusing a
+stored identity. Sequence numbers are limited to `i64::MAX`, preserving exact
+AMQP `long` values for receive, peek, scheduling handles, and deferred receive.
+That final value can be allocated once; a command requiring another allocation
+is rejected atomically with `amqp:resource-limit-exceeded` (management status
+403, non-retryable). Duplicate sends still consume their ordinary sequence
+allocation. Lock tokens use `u64::MAX` as an exhausted sentinel, so `u64::MAX - 1`
+is the final allocation. Operations that need no fresh identifier, including
+receive-delete, cancellation, settlement, renewal, and cleanup, remain usable.
+Counters keep their existing stored shape and exhaustion survives restart.
+This is a deliberate local bound, not Azure's documented rollover behavior;
+the official .NET [sequence-number property](https://learn.microsoft.com/en-us/dotnet/api/azure.messaging.servicebus.servicebusreceivedmessage.sequencenumber)
+is signed, while Azure documents rollover in its
+[sequencing contract](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sequencing).
+
 The `server` crate's timer worker proposes scheduled activation, lock,
 time-to-live, session-lock, and duplicate-history sweeps on an interval, so a
 running node activates what is due and releases or prunes what has elapsed.
@@ -191,6 +206,15 @@ optional credit, wrapping counts, and early second-mode dispositions have raw
 transport regressions. Every outgoing frame is checked against the peer's frame
 cap before writing bytes. Connection-wide outbound byte budgets, asymmetric
 channel/handle routing, and idle heartbeat negotiation remain unfinished.
+First transfers require an explicit delivery ID, binary tag, and message format.
+Tags may be empty but cannot exceed 32 bytes. Continuations may omit identity
+fields, but repeated ID, tag, and format values must match the first fragment;
+an invalid fragment closes only its link. Only standard message format zero is
+supported. Nonzero formats, including the official SDK's batch-send format, are
+explicitly refused with `amqp:not-implemented`, not stored as ordinary message
+content. SDK batch sending remains a separate gap. Incoming unsettled identity
+collision checks and link resumption are not implemented by these fragment
+consistency checks.
 If a peer detaches a link while application approval is outstanding, a bounded
 canceled-approval tombstone refuses early handle reuse until that approval returns
 an error. Canceled approvals count toward the 32 pending link approvals allowed
