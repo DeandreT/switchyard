@@ -1111,6 +1111,12 @@ impl<S: StateStore> StateMachine<S> {
         session_id: Option<&SessionId>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
+        let mut unique = BTreeSet::new();
+        if sequences.iter().any(|sequence| !unique.insert(*sequence)) {
+            return Err(BrokerError::InvalidMessageContent {
+                reason: String::from("deferred receive sequence numbers must be unique"),
+            });
+        }
         let config = self.load_config(command)?;
         require_session_agreement(&config, session_id.is_some())?;
         let namespace = &command.namespace;

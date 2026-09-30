@@ -159,6 +159,8 @@ Retrieving only expired deferred messages commits their cleanup before
 returning `com.microsoft:message-not-found`; missing messages are distinguished
 from a missing queue. Dead-letter management paths normalize the reserved
 suffix in the same way as receiving links, including the SDK's mixed-case form.
+Deferred receive rejects duplicate sequence numbers before acquiring locks or
+removing expired messages, so one message cannot be returned twice by a batch.
 Modified outcomes carry application-property updates; SDK dead-letter outcomes
 carry the reason, description and updates in their error information. Management
 settlement accepts `properties-to-modify` and promotes reserved dead-letter
