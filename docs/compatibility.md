@@ -277,7 +277,20 @@ Switchyard interprets the receiver-mode exception to include a settled sender
 disposition received before completion. Such a disposition never substitutes
 for the explicit settled Transfer required by a negotiated settled sender link.
 Detach, End, and connection teardown retire the affected generation and remove
-its aliases. Link suspension and resumption remain unsupported.
+its aliases. Link suspension and resumption remain unsupported. An Attach with
+retained unsettled entries or incomplete unsettled state receives a stripped,
+null-terminus Attach response followed by a closed `amqp:not-implemented` Detach;
+it never reaches application approval. A complete empty unsettled map is accepted
+as a fresh attach. Pipelined unsupported attaches wait for the local Begin before
+their refusal, sharing the 32-entry pending-attach bound. The test client also
+refuses retained or incomplete state in an Attach response before exposing an
+endpoint or granting receive credit. Caller-mutated recovery state is refused
+before enqueueing an approval and leaves the original valid approval available.
+A resumed Transfer on a known receiving link is refused before identity, credit,
+payload decoding, or abort admission, while still counting its session frame;
+cleanup affects only that link's partial content and aliases. This explicit
+unsupported-feature policy does not implement the standard's recovery exchange
+or claim its unknown-resumed-delivery ignore behavior.
 Approved producer links register Service Bus batch format `0x80013700`, whose
 [wire constant](https://raw.githubusercontent.com/Azure/azure-amqp/master/src/AmqpConstants.cs)
 identifies one encoded standard message per outer Data section. The nonempty
