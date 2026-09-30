@@ -9,17 +9,18 @@
 //! Nothing here reads a clock, generates a random value, or performs I/O beyond
 //! the injected store.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::de::DeserializeOwned;
 use storage::{StateStore, WriteBatch};
 
 use crate::{
     AcceptedSession, BrokerError, Command, CommandKind, CommandOutcome, DeadLetterInfo,
-    DeadLetterReason, Delivery, DeliveryLock, EntityPath, LockToken, MAX_MESSAGE_ID_LENGTH,
-    MessageEnvelope, MessageRecord, MessageState, MessageStatus, NamespaceName, QueueConfig,
+    DeadLetterReason, Delivery, DeliveryLock, EntityPath, LockToken, MAX_MESSAGE_HEADER_BYTES,
+    MAX_MESSAGE_ID_LENGTH, MessageBody, MessageEnvelope, MessageIdentifier, MessageProperties,
+    MessageRecord, MessageState, MessageStatus, MessageValue, NamespaceName, QueueConfig,
     QueueCounters, ReceiveMode, SequenceNumber, SessionHold, SessionId, SessionLock, SessionRecord,
-    Timestamp, codec, keys,
+    SettlementDisposition, Timestamp, codec, keys,
 };
 
 /// Ready entries a single receive may walk past while discarding expired
@@ -40,6 +41,15 @@ pub const TIMER_SCAN_LIMIT: usize = 256;
 /// `MAX_SESSION_SCAN` sessions are all held reports none available rather than
 /// walking an unbounded number of them, and the receiver retries.
 const MAX_SESSION_SCAN: usize = 32;
+
+/// Local headroom for the broker's fixed header fields and annotations. This
+/// is reserved only against the header limit, not the queue's content limit.
+pub const BROKER_HEADER_RESERVE_BYTES: usize = 512;
+
+const BROKER_BASE_HEADER_RESERVE_BYTES: usize = 256;
+
+/// SDK dead-letter reason and description limits, measured in UTF-16 units.
+pub const MAX_DEAD_LETTER_DETAIL_LENGTH: usize = 4_096;
 
 #[derive(Clone, Copy)]
 struct MessageInput<'a> {
@@ -170,28 +180,65 @@ impl<S: StateStore> StateMachine<S> {
             CommandKind::Complete {
                 sequence,
                 lock_token,
-            } => self.complete(command, *sequence, *lock_token, &mut batch)?,
+            } => self.settle(
+                command,
+                *sequence,
+                *lock_token,
+                &SettlementDisposition::Complete,
+                None,
+                &mut batch,
+            )?,
             CommandKind::Abandon {
                 sequence,
                 lock_token,
-            } => self.abandon(command, *sequence, *lock_token, &mut batch)?,
+            } => self.settle(
+                command,
+                *sequence,
+                *lock_token,
+                &SettlementDisposition::Abandon,
+                None,
+                &mut batch,
+            )?,
             CommandKind::DeadLetter {
                 sequence,
                 lock_token,
                 reason,
                 description,
-            } => self.dead_letter(
+            } => self.settle(
                 command,
                 *sequence,
                 *lock_token,
-                reason,
-                description,
+                &SettlementDisposition::DeadLetter {
+                    reason: reason.clone(),
+                    description: description.clone(),
+                },
+                None,
                 &mut batch,
             )?,
             CommandKind::Defer {
                 sequence,
                 lock_token,
-            } => self.defer(command, *sequence, *lock_token, &mut batch)?,
+            } => self.settle(
+                command,
+                *sequence,
+                *lock_token,
+                &SettlementDisposition::Defer,
+                None,
+                &mut batch,
+            )?,
+            CommandKind::Settle {
+                sequence,
+                lock_token,
+                disposition,
+                properties_to_modify,
+            } => self.settle(
+                command,
+                *sequence,
+                *lock_token,
+                disposition,
+                Some(properties_to_modify),
+                &mut batch,
+            )?,
             CommandKind::RenewLock {
                 sequence,
                 lock_token,
@@ -941,112 +988,110 @@ impl<S: StateStore> StateMachine<S> {
         Ok(CommandOutcome::Peeked(deliveries))
     }
 
-    fn complete(
+    fn settle(
         &self,
         command: &Command,
         sequence: SequenceNumber,
         lock_token: LockToken,
+        disposition: &SettlementDisposition,
+        properties_to_modify: Option<&BTreeMap<String, MessageValue>>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
-        let (record, locked_until) = self.held_lock(command, sequence, lock_token)?;
-        let namespace = &command.namespace;
-        let entity = &command.entity;
-
-        batch.push_delete(keys::message(namespace, entity, sequence));
-        batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
-        if let Some(expires_at) = record.expires_at {
-            batch.push_delete(keys::expiry(namespace, entity, expires_at, sequence));
+        let (mut record, locked_until) = self.held_lock(command, sequence, lock_token)?;
+        if command.entity.is_dead_letter_queue()
+            && matches!(disposition, SettlementDisposition::DeadLetter { .. })
+        {
+            return Err(BrokerError::DeadLetterQueueIsReserved);
         }
-        Ok(CommandOutcome::Completed)
-    }
-
-    fn abandon(
-        &self,
-        command: &Command,
-        sequence: SequenceNumber,
-        lock_token: LockToken,
-        batch: &mut WriteBatch,
-    ) -> Result<CommandOutcome, BrokerError> {
         let config = self.load_config(command)?;
-        let (mut record, locked_until) = self.held_lock(command, sequence, lock_token)?;
-
-        if record.is_expired_at(command.issued_at) {
-            self.expire_message(command, record, batch)?;
-            return Ok(CommandOutcome::Abandoned {
-                dead_lettered: true,
-            });
-        }
-        if exceeded_delivery_limit(command, &config, &record) {
-            self.move_to_dead_letter(
-                command,
-                record,
-                DeadLetterReason::MaxDeliveryCountExceeded,
-                String::from("the message reached its maximum delivery count"),
-                batch,
+        if let Some(properties) = properties_to_modify.filter(|properties| !properties.is_empty()) {
+            MessageEnvelope::validate_application_property_updates(properties)?;
+            if record.envelope.is_none() {
+                record.envelope = Some(Box::new(legacy_envelope(&record)));
+            }
+            record
+                .envelope
+                .as_mut()
+                .expect("the content envelope was initialized")
+                .application_properties
+                .extend(properties.clone());
+            validate_message_input(
+                &config,
+                MessageInput {
+                    message_id: &record.message_id,
+                    body: &record.body,
+                    time_to_live_millis: record.time_to_live_millis(),
+                    session_id: record.session_id.as_ref(),
+                    envelope: record.envelope.as_deref(),
+                },
             )?;
-            return Ok(CommandOutcome::Abandoned {
-                dead_lettered: true,
-            });
         }
-
         let namespace = &command.namespace;
         let entity = &command.entity;
-        record.state = MessageState::Ready;
-        batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
-        batch.push_put(
-            keys::message(namespace, entity, sequence),
-            codec::encode(&record)?,
-        );
-        // Back into its own session's order on a session queue, so an abandon
-        // does not move a message ahead of its siblings.
-        batch.push_put(self.ready_key(command, &record), Vec::new());
-        index_ready_expiry(command, &record, batch);
-        Ok(CommandOutcome::Abandoned {
-            dead_lettered: false,
-        })
-    }
-
-    fn dead_letter(
-        &self,
-        command: &Command,
-        sequence: SequenceNumber,
-        lock_token: LockToken,
-        reason: &str,
-        description: &str,
-        batch: &mut WriteBatch,
-    ) -> Result<CommandOutcome, BrokerError> {
-        let (record, _) = self.held_lock(command, sequence, lock_token)?;
-        self.move_to_dead_letter(
-            command,
-            record,
-            DeadLetterReason::Application(reason.to_owned()),
-            description.to_owned(),
-            batch,
-        )?;
-        Ok(CommandOutcome::DeadLettered)
-    }
-
-    fn defer(
-        &self,
-        command: &Command,
-        sequence: SequenceNumber,
-        lock_token: LockToken,
-        batch: &mut WriteBatch,
-    ) -> Result<CommandOutcome, BrokerError> {
-        let (mut record, locked_until) = self.held_lock(command, sequence, lock_token)?;
-        record.state = MessageState::Deferred;
-        remove_expiry_index(command, &record, batch);
-        batch.push_delete(keys::lock(
-            &command.namespace,
-            &command.entity,
-            locked_until,
-            sequence,
-        ));
-        batch.push_put(
-            keys::message(&command.namespace, &command.entity, sequence),
-            codec::encode(&record)?,
-        );
-        Ok(CommandOutcome::Deferred)
+        match disposition {
+            SettlementDisposition::Complete => {
+                batch.push_delete(keys::message(namespace, entity, sequence));
+                batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
+                remove_expiry_index(command, &record, batch);
+                Ok(CommandOutcome::Completed)
+            }
+            SettlementDisposition::Abandon => {
+                if record.is_expired_at(command.issued_at) {
+                    self.expire_message(command, record, batch)?;
+                    return Ok(CommandOutcome::Abandoned {
+                        dead_lettered: true,
+                    });
+                }
+                if exceeded_delivery_limit(command, &config, &record) {
+                    self.move_to_dead_letter(
+                        command,
+                        record,
+                        DeadLetterReason::MaxDeliveryCountExceeded,
+                        String::from("the message reached its maximum delivery count"),
+                        batch,
+                    )?;
+                    return Ok(CommandOutcome::Abandoned {
+                        dead_lettered: true,
+                    });
+                }
+                record.state = MessageState::Ready;
+                batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
+                batch.push_put(
+                    keys::message(namespace, entity, sequence),
+                    codec::encode(&record)?,
+                );
+                batch.push_put(self.ready_key(command, &record), Vec::new());
+                index_ready_expiry(command, &record, batch);
+                Ok(CommandOutcome::Abandoned {
+                    dead_lettered: false,
+                })
+            }
+            SettlementDisposition::Defer => {
+                record.state = MessageState::Deferred;
+                remove_expiry_index(command, &record, batch);
+                batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
+                batch.push_put(
+                    keys::message(namespace, entity, sequence),
+                    codec::encode(&record)?,
+                );
+                Ok(CommandOutcome::Deferred)
+            }
+            SettlementDisposition::DeadLetter {
+                reason,
+                description,
+            } => {
+                validate_dead_letter_detail("reason", reason)?;
+                validate_dead_letter_detail("description", description)?;
+                self.move_to_dead_letter(
+                    command,
+                    record,
+                    DeadLetterReason::Application(reason.clone()),
+                    description.clone(),
+                    batch,
+                )?;
+                Ok(CommandOutcome::DeadLettered)
+            }
+        }
     }
 
     fn receive_deferred(
@@ -1611,6 +1656,7 @@ impl<S: StateStore> StateMachine<S> {
         description: String,
         batch: &mut WriteBatch,
     ) -> Result<(), BrokerError> {
+        validate_dead_letter_projection(&record, &reason, &description)?;
         let namespace = &command.namespace;
         let entity = &command.entity;
         let sequence = record.sequence;
@@ -1726,6 +1772,112 @@ fn validate_message_id(message_id: &str) -> Result<(), BrokerError> {
     Ok(())
 }
 
+fn legacy_envelope(record: &MessageRecord) -> MessageEnvelope {
+    MessageEnvelope {
+        properties: MessageProperties {
+            message_id: Some(MessageIdentifier::String(record.message_id.clone())),
+            ..MessageProperties::default()
+        },
+        body: MessageBody::Data(vec![record.body.clone()]),
+        ..MessageEnvelope::default()
+    }
+}
+
+fn validate_dead_letter_detail(field: &str, value: &str) -> Result<(), BrokerError> {
+    let length = value.encode_utf16().count();
+    if length > MAX_DEAD_LETTER_DETAIL_LENGTH {
+        return Err(BrokerError::InvalidMessageContent {
+            reason: format!(
+                "dead-letter {field} length of {length} exceeds the {MAX_DEAD_LETTER_DETAIL_LENGTH}-character limit"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_dead_letter_projection(
+    record: &MessageRecord,
+    reason: &DeadLetterReason,
+    description: &str,
+) -> Result<(), BrokerError> {
+    let mut projected = record
+        .envelope
+        .as_deref()
+        .cloned()
+        .unwrap_or_else(|| legacy_envelope(record));
+    projected.application_properties.insert(
+        String::from("DeadLetterReason"),
+        MessageValue::String(reason.as_str().to_owned()),
+    );
+    projected.application_properties.insert(
+        String::from("DeadLetterErrorDescription"),
+        MessageValue::String(description.to_owned()),
+    );
+    projected.properties.absolute_expiry_time = None;
+    // Only the emitted canonical fields count here. The producer envelope is
+    // retained unchanged; the ingress reserve already covered these additions.
+    projected.validate_property_quotas()?;
+    validate_broker_header_reserve(
+        &projected,
+        &record.message_id,
+        None,
+        BROKER_BASE_HEADER_RESERVE_BYTES,
+    )
+}
+
+fn authoritative_property_overhead(
+    envelope: &MessageEnvelope,
+    message_id: &str,
+    session_id: Option<&SessionId>,
+) -> usize {
+    let mut size = if envelope.properties.message_id.is_none() {
+        5_usize.saturating_add(message_id.len())
+    } else {
+        0
+    };
+    if let Some(session_id) = session_id {
+        size = size
+            .saturating_add(5)
+            .saturating_add(session_id.as_str().len());
+    }
+    size
+}
+
+fn validate_envelope_content(
+    envelope: &MessageEnvelope,
+    message_id: &str,
+    session_id: Option<&SessionId>,
+) -> Result<(), BrokerError> {
+    envelope.validate()?;
+    validate_broker_header_reserve(
+        envelope,
+        message_id,
+        session_id,
+        BROKER_HEADER_RESERVE_BYTES,
+    )
+}
+
+fn validate_broker_header_reserve(
+    envelope: &MessageEnvelope,
+    message_id: &str,
+    session_id: Option<&SessionId>,
+    reserve_bytes: usize,
+) -> Result<(), BrokerError> {
+    let header_bytes = envelope
+        .header_content_size()
+        .saturating_add(authoritative_property_overhead(
+            envelope, message_id, session_id,
+        ))
+        .saturating_add(reserve_bytes);
+    if header_bytes > MAX_MESSAGE_HEADER_BYTES {
+        return Err(BrokerError::MessageHeaderTooLarge {
+            header_bytes,
+            maximum_bytes: MAX_MESSAGE_HEADER_BYTES,
+        });
+    }
+    Ok(())
+}
+
 fn validate_message_input(
     config: &QueueConfig,
     message: MessageInput<'_>,
@@ -1737,20 +1889,16 @@ fn validate_message_input(
         {
             validate_message_id(message_id)?;
         }
-        envelope.validate()?;
+        validate_envelope_content(envelope, message.message_id, message.session_id)?;
     }
     let content_bytes = message.envelope.map_or(message.body.len(), |envelope| {
-        let mut size = envelope.content_size();
-        if envelope.properties.message_id.is_none() {
-            size = size
-                .saturating_add(5)
-                .saturating_add(message.message_id.len());
-        }
-        if let Some(session_id) = message.session_id {
-            size = size
-                .saturating_add(5)
-                .saturating_add(session_id.as_str().len());
-        }
+        let size = envelope
+            .content_size()
+            .saturating_add(authoritative_property_overhead(
+                envelope,
+                message.message_id,
+                message.session_id,
+            ));
         // The byte body is only a compatibility view when typed content exists.
         // Count the larger representation, not both copies of the same body.
         size.max(message.body.len())

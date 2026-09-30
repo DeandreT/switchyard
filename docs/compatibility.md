@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Send, peek, receive, defer, renew, complete, schedule, cancel, duplicate detection and message properties; session renew/state/scheduling | Planned | Experimental gate on 7.21.0 |
+| Official .NET SDK, current stable | Send, peek, receive, abandon/defer/dead-letter property updates, renew, complete, schedule, cancel, duplicate detection and message properties; session renew/state/scheduling | Planned | Experimental gate on 7.21.0 |
 | Official .NET SDK, previous stable | Same gated workflows as current | Planned | Experimental gate on 7.20.2 |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -85,6 +85,12 @@ behavior it currently enforces:
   duplicate-history changes, including within an atomic scheduled batch.
 - A settlement is rejected unless it presents the live lock token, and rejected
   again once the lock deadline has passed.
+- Abandon, defer and explicit dead-letter operations merge application-property
+  updates into the held message atomically. Validation checks the complete
+  resulting content before changing the lock or state. Legacy byte-body records
+  gain typed content without losing their body or identifier. Reason and
+  description on explicit dead-letter operations are bounded to 4,096 UTF-16
+  units, matching the official client's argument limit.
 - A live message lock can be renewed without changing its token. Renewal moves
   the replicated deadline record and its expiry index in one storage batch.
 - Abandoning a message, or letting its lock elapse, returns it to the queue
@@ -146,6 +152,19 @@ Peeking is served through the entity's `$management` request/reply links and
 returns encoded AMQP messages without touching their broker state.
 Deferred receive is also served through `$management`, and locks returned that
 way are settled through the management `update-disposition` operation.
+Modified outcomes carry application-property updates; SDK dead-letter outcomes
+carry the reason, description and updates in their error information. Management
+settlement accepts `properties-to-modify` and promotes reserved dead-letter
+fields when explicit reason/description fields are absent. Explicit fields win
+when both forms are present. Null property values are retained, not interpreted
+as deletion; these precedence and null policies have not been compared with a
+live Azure namespace. A malformed or refused direct settlement closes its link
+with the relevant condition and leaves the lock to expire.
+Second-mode settlement is acknowledged only after the broker commits the
+change. The Service Bus acknowledgement is Accepted on success or Rejected
+with the actual refusal, rather than an echo of the receiver's requested
+dead-letter outcome. Receivers that settle in first mode cannot await a broker
+acknowledgement; a refusal still closes their link.
 Scheduling and cancellation use the management node, while an ordinary send
 can also schedule through the `x-opt-scheduled-enqueue-time` timestamp
 annotation. Peek returns active, deferred, and scheduled state annotations.
@@ -221,8 +240,16 @@ Duplicate detection still compares the text-normalized identifier, so distinct
 AMQP identifier types with the same normalized text share history; exact Azure
 behavior for that case is unverified. Rich messages enforce the configured
 size limit using a conservative content tally that includes metadata and body
-sections, rather than only flattened body bytes. Exact AMQP wire-size and
-per-property/header quota parity remains unfinished.
+sections, rather than only flattened body bytes. Properties have a local 32 KiB
+limit, and the header has a local 64 KiB limit, including standard properties,
+application properties and message annotations. Accounting uses UTF-8 key bytes
+plus conservative type/length/value overhead. New sends reserve 512 header bytes
+for broker fields and ordinary dead-letter reasons; projected dead letters use
+256 bytes for remaining broker fields. Footer content counts toward the message
+limit, not the header limit. Settlement checks the merged property bag and
+projected canonical dead-letter fields. These bounds implement the documented
+quota sizes conservatively; exact Azure byte accounting and AMQP wire-size
+parity remain unverified.
 
 The current value format is version 7 and durable store layout is version 6.
 Earlier message and queue-configuration shapes have tested decoders, but an

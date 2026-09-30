@@ -85,9 +85,16 @@ if (received.LockedUntil < lockedUntilBeforeRenewal)
     return 6;
 }
 
-await receiver.AbandonMessageAsync(received);
+var abandonUpdates = new Dictionary<string, object>
+{
+    ["attempt"] = 2,
+    ["nullable"] = null!,
+    ["updated-at"] = new DateTimeOffset(2021, 2, 3, 4, 5, 6, TimeSpan.Zero),
+};
+await receiver.AbandonMessageAsync(received, abandonUpdates);
 received = await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
-if (received is null || !HasPreservedContent(received) || received.DeliveryCount < 2)
+if (received is null || !HasPreservedContent(received) || received.DeliveryCount < 2
+    || !HasUpdatedProperties(received, abandonUpdates))
 {
     Console.Error.WriteLine("message content did not survive redelivery");
     return 26;
@@ -103,15 +110,90 @@ if (deferredSource?.Body.ToString() != "official-deferred-current")
     Console.Error.WriteLine($"unexpected deferred source message: {deferredSource?.Body}");
     return 7;
 }
-await receiver.DeferMessageAsync(deferredSource);
+var deferUpdates = new Dictionary<string, object>
+{
+    ["stage"] = "waiting",
+    ["nullable"] = null!,
+};
+await receiver.DeferMessageAsync(deferredSource, deferUpdates);
 ServiceBusReceivedMessage deferred =
     await receiver.ReceiveDeferredMessageAsync(deferredSource.SequenceNumber);
-if (deferred.Body.ToString() != "official-deferred-current")
+if (deferred.Body.ToString() != "official-deferred-current"
+    || !HasUpdatedProperties(deferred, deferUpdates))
 {
     Console.Error.WriteLine($"unexpected deferred message: {deferred.Body}");
     return 8;
 }
-await receiver.CompleteMessageAsync(deferred);
+var resumedUpdates = new Dictionary<string, object> { ["resumed"] = true };
+await receiver.AbandonMessageAsync(deferred, resumedUpdates);
+ServiceBusReceivedMessage? resumed =
+    await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (resumed?.Body.ToString() != "official-deferred-current"
+    || !HasUpdatedProperties(resumed, deferUpdates)
+    || !HasUpdatedProperties(resumed, resumedUpdates))
+{
+    Console.Error.WriteLine("management abandonment did not preserve property updates");
+    return 27;
+}
+await receiver.DeferMessageAsync(resumed);
+deferred = await receiver.ReceiveDeferredMessageAsync(resumed.SequenceNumber);
+var managementDeferUpdates = new Dictionary<string, object> { ["stage"] = "deferred-again" };
+await receiver.DeferMessageAsync(deferred, managementDeferUpdates);
+deferred = await receiver.ReceiveDeferredMessageAsync(deferred.SequenceNumber);
+if (!HasUpdatedProperties(deferred, managementDeferUpdates)
+    || !HasUpdatedProperties(deferred, resumedUpdates))
+{
+    Console.Error.WriteLine("management deferral did not preserve property updates");
+    return 28;
+}
+var managementDeadLetterUpdates = new Dictionary<string, object>
+{
+    ["DeadLetterReason"] = "deferred-by-client",
+    ["DeadLetterErrorDescription"] = "the deferred work cannot continue",
+    ["dead-letter-route"] = "management",
+};
+await receiver.DeadLetterMessageAsync(deferred, managementDeadLetterUpdates);
+await using ServiceBusReceiver deadLetterReceiver = client.CreateReceiver(queue,
+    new ServiceBusReceiverOptions { SubQueue = SubQueue.DeadLetter });
+ServiceBusReceivedMessage? deadLetter =
+    await deadLetterReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (deadLetter?.Body.ToString() != "official-deferred-current"
+    || deadLetter.DeadLetterReason != "deferred-by-client"
+    || deadLetter.DeadLetterErrorDescription != "the deferred work cannot continue"
+    || !HasUpdatedProperties(deadLetter, managementDeadLetterUpdates)
+    || !HasUpdatedProperties(deadLetter, managementDeferUpdates)
+    || !HasUpdatedProperties(deadLetter, resumedUpdates))
+{
+    Console.Error.WriteLine("management dead-lettering lost the reason or property updates");
+    return 29;
+}
+await deadLetterReceiver.CompleteMessageAsync(deadLetter);
+
+await sender.SendMessageAsync(new ServiceBusMessage("official-direct-dead-letter-current"));
+ServiceBusReceivedMessage? directDeadLetter =
+    await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (directDeadLetter?.Body.ToString() != "official-direct-dead-letter-current")
+{
+    Console.Error.WriteLine("the direct dead-letter source was not received");
+    return 30;
+}
+var directDeadLetterUpdates = new Dictionary<string, object>
+{
+    ["attempt"] = 3,
+    ["dead-letter-route"] = "link",
+};
+await receiver.DeadLetterMessageAsync(directDeadLetter, directDeadLetterUpdates,
+    "invalid-request", "the request is incomplete");
+deadLetter = await deadLetterReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (deadLetter?.Body.ToString() != "official-direct-dead-letter-current"
+    || deadLetter.DeadLetterReason != "invalid-request"
+    || deadLetter.DeadLetterErrorDescription != "the request is incomplete"
+    || !HasUpdatedProperties(deadLetter, directDeadLetterUpdates))
+{
+    Console.Error.WriteLine("link dead-lettering lost the reason or property updates");
+    return 31;
+}
+await deadLetterReceiver.CompleteMessageAsync(deadLetter);
 
 DateTimeOffset cancelEnqueueTime = DateTimeOffset.UtcNow.AddMinutes(1);
 long cancelledSequence = await sender.ScheduleMessageAsync(
@@ -386,7 +468,7 @@ if (await receiver.PeekMessageAsync(fromSequenceNumber: 1) is not null
 }
 
 Console.WriteLine(
-    "official .NET Service Bus client send/peek/receive/defer/renew/complete/schedule/cancel/duplicate and session renew/state passed");
+    "official .NET Service Bus client send/peek/receive/settlement updates/defer/dead-letter/renew/complete/schedule/cancel/duplicate and session renew/state passed");
 return 0;
 
 static Dictionary<string, object> PreservedApplicationProperties() => new()
@@ -432,11 +514,27 @@ static bool HasPreservedContent(ServiceBusReceivedMessage message)
     {
         return false;
     }
-    foreach (var pair in PreservedApplicationProperties())
+    return HasUpdatedProperties(message, PreservedApplicationProperties());
+}
+
+static bool HasUpdatedProperties(ServiceBusReceivedMessage message,
+    IDictionary<string, object> expected)
+{
+    foreach (var pair in expected)
     {
-        if (!message.ApplicationProperties.TryGetValue(pair.Key, out object? actual)
-            || actual is null
-            || actual.GetType() != pair.Value.GetType())
+        if (!message.ApplicationProperties.TryGetValue(pair.Key, out object? actual))
+        {
+            return false;
+        }
+        if (pair.Value is null)
+        {
+            if (actual is not null)
+            {
+                return false;
+            }
+            continue;
+        }
+        if (actual is null || actual.GetType() != pair.Value.GetType())
         {
             return false;
         }

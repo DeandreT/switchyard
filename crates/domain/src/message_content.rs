@@ -15,6 +15,13 @@ pub const MAX_MESSAGE_VALUE_DEPTH: usize = 64;
 /// not. The wire decoder uses the same ceiling with its own section accounting.
 pub const MAX_MESSAGE_VALUE_ITEMS: usize = 65_536;
 
+/// Local conservative per-property content limit, including key overhead.
+pub const MAX_MESSAGE_PROPERTY_BYTES: usize = 32 * 1024;
+
+/// Local conservative brokered-header limit. Footer and body are excluded;
+/// retained message annotations are included as a local policy.
+pub const MAX_MESSAGE_HEADER_BYTES: usize = 64 * 1024;
+
 // Conservative type, length, count, and descriptor overheads. These bound the
 // retained content; they are not an exact AMQP wire-size calculation.
 const VARIABLE_OVERHEAD: usize = 5;
@@ -263,6 +270,60 @@ pub struct MessageProperties {
 }
 
 impl MessageProperties {
+    fn validate_property_sizes(&self) -> Result<(), BrokerError> {
+        let sizes = [
+            (
+                "message-id",
+                self.message_id
+                    .as_ref()
+                    .map(MessageIdentifier::content_size),
+            ),
+            (
+                "correlation-id",
+                self.correlation_id
+                    .as_ref()
+                    .map(MessageIdentifier::content_size),
+            ),
+            (
+                "user-id",
+                self.user_id
+                    .as_ref()
+                    .map(|value| VARIABLE_OVERHEAD.saturating_add(value.len())),
+            ),
+            ("to", self.to.as_deref().map(string_content_size)),
+            ("subject", self.subject.as_deref().map(string_content_size)),
+            (
+                "reply-to",
+                self.reply_to.as_deref().map(string_content_size),
+            ),
+            (
+                "content-type",
+                self.content_type.as_deref().map(string_content_size),
+            ),
+            (
+                "content-encoding",
+                self.content_encoding.as_deref().map(string_content_size),
+            ),
+            (
+                "reply-to-group-id",
+                self.reply_to_group_id.as_deref().map(string_content_size),
+            ),
+            ("creation-time", self.creation_time.map(|_| 9)),
+            ("absolute-expiry-time", self.absolute_expiry_time.map(|_| 9)),
+            ("group-sequence", self.group_sequence.map(|_| 5)),
+        ];
+        for (name, value_bytes) in sizes {
+            if let Some(value_bytes) = value_bytes {
+                validate_property_size(
+                    name,
+                    VARIABLE_OVERHEAD.saturating_add(name.len()),
+                    value_bytes,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn content_size(&self) -> usize {
         let mut size = SECTION_OVERHEAD.saturating_add(COLLECTION_OVERHEAD);
         for value in [&self.message_id, &self.correlation_id] {
@@ -307,6 +368,7 @@ impl MessageEnvelope {
     /// Rejects content that cannot round-trip through the protocol value model.
     /// Float map keys follow the edge codec's map-key equality: signed zero and
     /// all NaNs compare equal, without changing retained producer value bits.
+    /// Valid shapes then pass the local conservative property/header quotas.
     pub fn validate(&self) -> Result<(), BrokerError> {
         self.validate_value_limits()?;
         let invalid = |reason: &str| BrokerError::InvalidMessageContent {
@@ -378,6 +440,85 @@ impl MessageEnvelope {
                 _ => {}
             }
         }
+        self.validate_property_quotas()
+    }
+
+    pub(crate) fn validate_application_property_updates(
+        properties: &BTreeMap<String, MessageValue>,
+    ) -> Result<(), BrokerError> {
+        let invalid = |reason: &str| BrokerError::InvalidMessageContent {
+            reason: reason.to_owned(),
+        };
+        let mut pending = Vec::new();
+        let mut items = 0;
+        push_value_nodes(&mut pending, properties.values(), 0, &mut items)?;
+        while let Some((value, depth)) = pending.pop() {
+            match value {
+                MessageValue::List(_) | MessageValue::Map(_) | MessageValue::Array(_) => {
+                    return Err(invalid("application properties require simple values"));
+                }
+                MessageValue::Described { descriptor, value } => {
+                    if matches!(descriptor, MessageDescriptor::Name(symbol) if !symbol.is_ascii()) {
+                        return Err(invalid("symbolic descriptors require ASCII symbols"));
+                    }
+                    push_value_nodes(
+                        &mut pending,
+                        std::iter::once(value.as_ref()),
+                        depth + 1,
+                        &mut items,
+                    )?;
+                }
+                MessageValue::Symbol(symbol) if !symbol.is_ascii() => {
+                    return Err(invalid("symbol values require ASCII symbols"));
+                }
+                _ => {}
+            }
+        }
+        let mut header_bytes = if properties.is_empty() {
+            0
+        } else {
+            SECTION_OVERHEAD.saturating_add(COLLECTION_OVERHEAD)
+        };
+        for (key, value) in properties {
+            let key_bytes = VARIABLE_OVERHEAD.saturating_add(key.len());
+            let value_bytes = value.content_size();
+            validate_property_size(key, key_bytes, value_bytes)?;
+            header_bytes = header_bytes
+                .saturating_add(key_bytes)
+                .saturating_add(value_bytes);
+            if header_bytes > MAX_MESSAGE_HEADER_BYTES {
+                return Err(BrokerError::MessageHeaderTooLarge {
+                    header_bytes,
+                    maximum_bytes: MAX_MESSAGE_HEADER_BYTES,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_property_quotas(&self) -> Result<(), BrokerError> {
+        self.properties.validate_property_sizes()?;
+        for (key, value) in &self.application_properties {
+            validate_property_size(
+                key,
+                VARIABLE_OVERHEAD.saturating_add(key.len()),
+                value.content_size(),
+            )?;
+        }
+        for (key, value) in &self.message_annotations {
+            let name = match key {
+                AnnotationKey::Symbol(symbol) => symbol.clone(),
+                AnnotationKey::Ulong(code) => format!("annotation[{code}]"),
+            };
+            validate_property_size(&name, key.content_size(), value.content_size())?;
+        }
+        let header_bytes = self.header_content_size();
+        if header_bytes > MAX_MESSAGE_HEADER_BYTES {
+            return Err(BrokerError::MessageHeaderTooLarge {
+                header_bytes,
+                maximum_bytes: MAX_MESSAGE_HEADER_BYTES,
+            });
+        }
         Ok(())
     }
 
@@ -433,13 +574,11 @@ impl MessageEnvelope {
         Ok(())
     }
 
-    /// A conservative content tally, including retained metadata and section
-    /// boundaries, rather than the exact size of any protocol's encoding.
-    pub fn content_size(&self) -> usize {
-        let mut size = self
-            .properties
-            .content_size()
-            .saturating_add(self.body.content_size());
+    /// Conservative retained header tally, not an exact wire calculation.
+    /// Property names are diagnostic-only for positional standard properties;
+    /// application and annotation keys contribute their encoded content sizes.
+    pub fn header_content_size(&self) -> usize {
+        let mut size = self.properties.content_size();
         if self.header.is_some() {
             size = size
                 .saturating_add(SECTION_OVERHEAD)
@@ -457,20 +596,57 @@ impl MessageEnvelope {
                     .saturating_add(value.content_size());
             }
         }
-        for annotations in [&self.message_annotations, &self.footer] {
-            if !annotations.is_empty() {
+        if !self.message_annotations.is_empty() {
+            size = size
+                .saturating_add(SECTION_OVERHEAD)
+                .saturating_add(COLLECTION_OVERHEAD);
+            for (key, value) in &self.message_annotations {
                 size = size
-                    .saturating_add(SECTION_OVERHEAD)
-                    .saturating_add(COLLECTION_OVERHEAD);
-                for (key, value) in annotations {
-                    size = size
-                        .saturating_add(key.content_size())
-                        .saturating_add(value.content_size());
-                }
+                    .saturating_add(key.content_size())
+                    .saturating_add(value.content_size());
             }
         }
         size
     }
+
+    /// A conservative content tally, including retained metadata and section
+    /// boundaries, rather than the exact size of any protocol's encoding.
+    pub fn content_size(&self) -> usize {
+        let mut size = self
+            .header_content_size()
+            .saturating_add(self.body.content_size());
+        if !self.footer.is_empty() {
+            size = size
+                .saturating_add(SECTION_OVERHEAD)
+                .saturating_add(COLLECTION_OVERHEAD);
+            for (key, value) in &self.footer {
+                size = size
+                    .saturating_add(key.content_size())
+                    .saturating_add(value.content_size());
+            }
+        }
+        size
+    }
+}
+
+fn string_content_size(value: &str) -> usize {
+    VARIABLE_OVERHEAD.saturating_add(value.len())
+}
+
+fn validate_property_size(
+    property: &str,
+    key_bytes: usize,
+    value_bytes: usize,
+) -> Result<(), BrokerError> {
+    let property_bytes = key_bytes.saturating_add(value_bytes);
+    if property_bytes > MAX_MESSAGE_PROPERTY_BYTES {
+        return Err(BrokerError::MessagePropertyTooLarge {
+            property: property.to_owned(),
+            property_bytes,
+            maximum_bytes: MAX_MESSAGE_PROPERTY_BYTES,
+        });
+    }
+    Ok(())
 }
 
 fn push_value_nodes<'a>(
@@ -760,6 +936,63 @@ mod tests {
             ..MessageEnvelope::default()
         };
         assert_eq!(valid.validate(), Ok(()));
+    }
+
+    #[test]
+    fn application_property_updates_bound_the_combined_header_before_copying() {
+        let accepted = BTreeMap::from([
+            (String::from("first"), MessageValue::Binary(vec![0; 21_000])),
+            (
+                String::from("second"),
+                MessageValue::Binary(vec![0; 21_000]),
+            ),
+            (String::from("third"), MessageValue::Binary(vec![0; 21_000])),
+        ]);
+        assert_eq!(
+            MessageEnvelope::validate_application_property_updates(&accepted),
+            Ok(())
+        );
+        let rejected = BTreeMap::from([
+            (String::from("first"), MessageValue::Binary(vec![0; 22_000])),
+            (
+                String::from("second"),
+                MessageValue::Binary(vec![0; 22_000]),
+            ),
+            (String::from("third"), MessageValue::Binary(vec![0; 22_000])),
+        ]);
+        assert!(matches!(
+            MessageEnvelope::validate_application_property_updates(&rejected),
+            Err(BrokerError::MessageHeaderTooLarge {
+                maximum_bytes: MAX_MESSAGE_HEADER_BYTES,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn application_property_updates_bound_described_chains_before_copying() {
+        let described = |depth| {
+            let mut value = MessageValue::Null;
+            for _ in 0..depth {
+                value = MessageValue::Described {
+                    descriptor: MessageDescriptor::Code(1),
+                    value: Box::new(value),
+                };
+            }
+            BTreeMap::from([(String::from("key"), value)])
+        };
+        assert_eq!(
+            MessageEnvelope::validate_application_property_updates(&described(
+                MAX_MESSAGE_VALUE_DEPTH
+            )),
+            Ok(())
+        );
+        assert!(matches!(
+            MessageEnvelope::validate_application_property_updates(&described(
+                MAX_MESSAGE_VALUE_DEPTH + 1
+            )),
+            Err(BrokerError::InvalidMessageContent { .. })
+        ));
     }
 
     #[test]

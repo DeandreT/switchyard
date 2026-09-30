@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     sync::Arc,
 };
@@ -71,6 +71,46 @@ pub struct Sender {
     handle: u32,
     commands: mpsc::Sender<Command>,
     detached: watch::Receiver<bool>,
+}
+
+/// A receiver's outcome whose second-mode acknowledgement is still pending.
+pub struct PendingSettlement {
+    outcome: Outcome,
+    delivery_id: Option<u32>,
+    channel: u16,
+    handle: u32,
+    commands: mpsc::Sender<Command>,
+}
+
+impl PendingSettlement {
+    pub fn outcome(&self) -> &Outcome {
+        &self.outcome
+    }
+
+    pub async fn accept(self) -> Result<(), EngineError> {
+        self.finish(DeliveryState::Accepted(Accepted)).await
+    }
+
+    pub async fn reject(self, error: Error) -> Result<(), EngineError> {
+        self.finish(DeliveryState::Rejected(crate::Rejected {
+            error: Some(error),
+        }))
+        .await
+    }
+
+    async fn finish(self, state: DeliveryState) -> Result<(), EngineError> {
+        let Some(delivery_id) = self.delivery_id else {
+            return Ok(());
+        };
+        request(&self.commands, |reply| Command::SettleOutgoing {
+            channel: self.channel,
+            handle: self.handle,
+            delivery_id,
+            state,
+            reply,
+        })
+        .await
+    }
 }
 
 pub struct Receiver {
@@ -274,6 +314,23 @@ impl Sender {
         message: Message,
         delivery_tag: DeliveryTag,
     ) -> Result<Outcome, EngineError> {
+        let settlement = self.send_with_settlement(message, delivery_tag).await?;
+        let outcome = settlement.outcome.clone();
+        let state = match outcome.clone() {
+            Outcome::Accepted(value) => DeliveryState::Accepted(value),
+            Outcome::Rejected(value) => DeliveryState::Rejected(value),
+            Outcome::Released(value) => DeliveryState::Released(value),
+            Outcome::Modified(value) => DeliveryState::Modified(value),
+        };
+        settlement.finish(state).await?;
+        Ok(outcome)
+    }
+
+    pub async fn send_with_settlement(
+        &mut self,
+        message: Message,
+        delivery_tag: DeliveryTag,
+    ) -> Result<PendingSettlement, EngineError> {
         let (reply, outcome) = oneshot::channel();
         self.commands
             .send(Command::Send {
@@ -285,7 +342,14 @@ impl Sender {
             })
             .await
             .map_err(|_| EngineError::Stopped)?;
-        outcome.await.map_err(|_| EngineError::Stopped)?
+        let outcome = outcome.await.map_err(|_| EngineError::Stopped)??;
+        Ok(PendingSettlement {
+            outcome: outcome.outcome,
+            delivery_id: outcome.delivery_id,
+            channel: self.channel,
+            handle: self.handle,
+            commands: self.commands.clone(),
+        })
     }
 
     pub async fn on_detach(&mut self) {
@@ -441,9 +505,16 @@ enum Command {
         handle: u32,
         message: Box<Message>,
         delivery_tag: DeliveryTag,
-        reply: oneshot::Sender<Result<Outcome, EngineError>>,
+        reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
     },
     Settle {
+        channel: u16,
+        handle: u32,
+        delivery_id: u32,
+        state: DeliveryState,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
+    SettleOutgoing {
         channel: u16,
         handle: u32,
         delivery_id: u32,
@@ -480,14 +551,20 @@ struct SendingLink {
     delivery_count: u32,
     credit_limit: u64,
     queued: VecDeque<QueuedSend>,
-    unsettled: HashMap<u32, oneshot::Sender<Result<Outcome, EngineError>>>,
+    unsettled: HashMap<u32, oneshot::Sender<Result<SendOutcome, EngineError>>>,
+    pending_acknowledgements: HashSet<u32>,
     detached: watch::Sender<bool>,
 }
 
 struct QueuedSend {
     message: Message,
     delivery_tag: DeliveryTag,
-    reply: oneshot::Sender<Result<Outcome, EngineError>>,
+    reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
+}
+
+struct SendOutcome {
+    outcome: Outcome,
+    delivery_id: Option<u32>,
 }
 
 struct ReceivingLink {
@@ -775,6 +852,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                             credit_limit: 0,
                             queued: VecDeque::new(),
                             unsettled: HashMap::new(),
+                            pending_acknowledgements: HashSet::new(),
                             detached: detached_tx,
                         }),
                     );
@@ -830,6 +908,40 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 channel,
                 Performative::Disposition(Disposition {
                     role: Role::Receiver,
+                    first: delivery_id,
+                    last: None,
+                    settled: true,
+                    state: Some(state),
+                    batchable: false,
+                }),
+                Vec::new(),
+            )
+            .await?;
+            let _ = reply.send(Ok(()));
+        }
+        Command::SettleOutgoing {
+            channel,
+            handle,
+            delivery_id,
+            state,
+            reply,
+        } => {
+            let Some(LinkState::Sending(link)) = sessions
+                .get_mut(&channel)
+                .and_then(|session| session.links.get_mut(&handle))
+            else {
+                let _ = reply.send(Err(EngineError::RemoteDetached));
+                return Ok(CommandAction::Continue);
+            };
+            if !link.pending_acknowledgements.remove(&delivery_id) {
+                let _ = reply.send(Err(invalid_state("settlement is not pending")));
+                return Ok(CommandAction::Continue);
+            }
+            write_amqp(
+                writer,
+                channel,
+                Performative::Disposition(Disposition {
+                    role: Role::Sender,
                     first: delivery_id,
                     last: None,
                     settled: true,
@@ -1011,7 +1123,10 @@ async fn flush_sends<W: AsyncWrite + Unpin>(
         )
         .await?;
         if settled {
-            let _ = queued.reply.send(Ok(Outcome::Accepted(Accepted)));
+            let _ = queued.reply.send(Ok(SendOutcome {
+                outcome: Outcome::Accepted(Accepted),
+                delivery_id: None,
+            }));
         } else {
             link.unsettled.insert(delivery_id, queued.reply);
         }
@@ -1066,50 +1181,45 @@ async fn write_transfer<W: AsyncWrite + Unpin>(
 async fn apply_disposition<W: AsyncWrite + Unpin>(
     channel: u16,
     disposition: Disposition,
-    writer: &mut W,
+    _writer: &mut W,
     sessions: &mut HashMap<u16, SessionState>,
 ) -> Result<(), EngineError> {
     if disposition.role != Role::Receiver {
         return Ok(());
     }
-    let Some(state) = disposition.state.clone() else {
+    let Some(state) = disposition.state else {
         return Ok(());
     };
-    let Ok(outcome) = Outcome::try_from(state.clone()) else {
+    let Ok(outcome) = Outcome::try_from(state) else {
         return Ok(());
     };
     let last = disposition.last.unwrap_or(disposition.first);
     let Some(session) = sessions.get_mut(&channel) else {
         return Ok(());
     };
-    let mut echo = false;
     for link in session.links.values_mut() {
         let LinkState::Sending(link) = link else {
             continue;
         };
-        for id in disposition.first..=last {
+        let ids: Vec<_> = link
+            .unsettled
+            .keys()
+            .copied()
+            .filter(|id| *id >= disposition.first && *id <= last)
+            .collect();
+        for id in ids {
             if let Some(reply) = link.unsettled.remove(&id) {
-                echo |=
+                let acknowledge =
                     link.receiver_settle_mode == ReceiverSettleMode::Second && !disposition.settled;
-                let _ = reply.send(Ok(outcome.clone()));
+                if acknowledge {
+                    link.pending_acknowledgements.insert(id);
+                }
+                let _ = reply.send(Ok(SendOutcome {
+                    outcome: outcome.clone(),
+                    delivery_id: acknowledge.then_some(id),
+                }));
             }
         }
-    }
-    if echo {
-        write_amqp(
-            writer,
-            channel,
-            Performative::Disposition(Disposition {
-                role: Role::Sender,
-                first: disposition.first,
-                last: disposition.last,
-                settled: true,
-                state: Some(state),
-                batchable: disposition.batchable,
-            }),
-            Vec::new(),
-        )
-        .await?;
     }
     Ok(())
 }

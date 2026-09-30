@@ -51,7 +51,9 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::SessionNotSupported
         | BrokerError::DeadLetterQueueIsReserved => NOT_ALLOWED,
 
-        BrokerError::MessageTooLarge { .. } => MESSAGE_SIZE_EXCEEDED,
+        BrokerError::MessageTooLarge { .. }
+        | BrokerError::MessagePropertyTooLarge { .. }
+        | BrokerError::MessageHeaderTooLarge { .. } => MESSAGE_SIZE_EXCEEDED,
         BrokerError::MessageIdTooLong { .. } | BrokerError::InvalidMessageContent { .. } => {
             INVALID_FIELD
         }

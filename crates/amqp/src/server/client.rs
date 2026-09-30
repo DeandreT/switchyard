@@ -292,7 +292,7 @@ impl ClientSender {
             })
             .await
             .map_err(|_| EngineError::Stopped)?;
-        outcome.await.map_err(|_| EngineError::Stopped)?
+        Ok(outcome.await.map_err(|_| EngineError::Stopped)??.outcome)
     }
 
     pub async fn close(&self) -> Result<(), EngineError> {
@@ -467,7 +467,7 @@ enum ClientCommand {
         handle: u32,
         message: Box<Message>,
         delivery_tag: DeliveryTag,
-        reply: oneshot::Sender<Result<Outcome, EngineError>>,
+        reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
     },
     Settle {
         channel: u16,
@@ -707,6 +707,7 @@ where
                                     credit_limit: 0,
                                     queued: VecDeque::new(),
                                     unsettled: HashMap::new(),
+                                    pending_acknowledgements: HashSet::new(),
                                     detached: detached_tx,
                                 }));
                             }

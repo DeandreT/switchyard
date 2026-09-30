@@ -113,6 +113,16 @@ fn makes_deliverable(outcome: &CommandOutcome) -> bool {
     }
 }
 
+fn makes_dead_letters_deliverable(outcome: &CommandOutcome) -> bool {
+    match outcome {
+        CommandOutcome::DeadLettered => true,
+        CommandOutcome::Abandoned { dead_lettered } => *dead_lettered,
+        CommandOutcome::LocksExpired { dead_lettered, .. }
+        | CommandOutcome::MessagesExpired { dead_lettered } => *dead_lettered > 0,
+        _ => false,
+    }
+}
+
 /// A cheap, shared way to reach the broker.
 ///
 /// Cloning is how every connection, link, and timer gets one; they all queue
@@ -230,6 +240,12 @@ impl Broker {
                             if outcome.as_ref().is_ok_and(makes_deliverable) {
                                 watching.notify(&namespace, &entity);
                             }
+                            if !entity.is_dead_letter_queue()
+                                && outcome.as_ref().is_ok_and(makes_dead_letters_deliverable)
+                                && let Ok(shadow) = entity.dead_letter_queue()
+                            {
+                                watching.notify(&namespace, &shadow);
+                            }
                             // A caller that stopped waiting is not an error: the
                             // command still applied, and it gave up, not us.
                             let _ = reply.send(outcome);
@@ -325,6 +341,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use domain::{QueueConfig, SequenceNumber, StateMachine};
+    use protocol_amqp::Broker as _;
     use storage::MemoryStore;
 
     use super::*;
@@ -378,6 +395,84 @@ mod tests {
         let broker = broker();
         assert_eq!(send(&broker.handle(), "first")?, SequenceNumber::new(1));
         assert_eq!(send(&broker.handle(), "second")?, SequenceNumber::new(2));
+        Ok(())
+    }
+
+    #[test]
+    fn only_dead_letter_transitions_wake_the_shadow() {
+        for (outcome, expected) in [
+            (CommandOutcome::DeadLettered, true),
+            (
+                CommandOutcome::Abandoned {
+                    dead_lettered: true,
+                },
+                true,
+            ),
+            (
+                CommandOutcome::Abandoned {
+                    dead_lettered: false,
+                },
+                false,
+            ),
+            (CommandOutcome::MessagesExpired { dead_lettered: 1 }, true),
+            (CommandOutcome::MessagesExpired { dead_lettered: 0 }, false),
+            (
+                CommandOutcome::LocksExpired {
+                    returned_to_ready: 0,
+                    dead_lettered: 1,
+                },
+                true,
+            ),
+            (
+                CommandOutcome::LocksExpired {
+                    returned_to_ready: 1,
+                    dead_lettered: 0,
+                },
+                false,
+            ),
+            (CommandOutcome::Received(None), false),
+        ] {
+            assert_eq!(makes_dead_letters_deliverable(&outcome), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dead_letter_wakes_an_existing_shadow_waiter() -> Result<(), SubmitError> {
+        let broker = broker();
+        let handle = broker.handle();
+        let (namespace, entity) = names();
+        let shadow = entity.dead_letter_queue().expect("a valid shadow");
+        let wakeup = handle.deliverable(&namespace, &shadow);
+        send(&handle, "poison")?;
+        let CommandOutcome::Received(Some(delivery)) = handle
+            .submit(
+                namespace.clone(),
+                entity.clone(),
+                CommandKind::Receive {
+                    mode: domain::ReceiveMode::PeekLock,
+                    lock_duration_millis: None,
+                    session: None,
+                },
+            )
+            .await?
+        else {
+            panic!("the message is delivered");
+        };
+        handle
+            .submit(
+                namespace.clone(),
+                entity,
+                CommandKind::DeadLetter {
+                    sequence: delivery.sequence,
+                    lock_token: delivery.lock.expect("a delivery lock").token,
+                    reason: "invalid".to_owned(),
+                    description: "cannot process".to_owned(),
+                },
+            )
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_millis(250), wakeup)
+            .await
+            .expect("a dead letter immediately notifies its shadow");
         Ok(())
     }
 

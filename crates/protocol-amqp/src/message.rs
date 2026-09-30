@@ -415,7 +415,7 @@ fn write_annotations(annotations: &BTreeMap<AnnotationKey, MessageValue>) -> Ann
     )
 }
 
-fn read_value(value: &Value) -> MessageValue {
+pub(crate) fn read_value(value: &Value) -> MessageValue {
     match value {
         Value::Null => MessageValue::Null,
         Value::Bool(value) => MessageValue::Bool(*value),
@@ -996,10 +996,7 @@ mod tests {
             annotations.get(Symbol::from(MESSAGE_STATE_ANNOTATION)),
             Some(&Value::Int(0))
         );
-        assert_eq!(
-            annotations.get(Symbol::from(LOCKED_UNTIL_ANNOTATION)),
-            None
-        );
+        assert_eq!(annotations.get(Symbol::from(LOCKED_UNTIL_ANNOTATION)), None);
         let properties = outgoing
             .application_properties
             .expect("application properties retained");

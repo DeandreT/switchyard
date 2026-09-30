@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceptedSession, Delivery, EntityPath, LockToken, MessageEnvelope, NamespaceName, QueueConfig,
-    ReceiveMode, SequenceNumber, SessionHold, SessionId, Timestamp,
+    AcceptedSession, Delivery, EntityPath, LockToken, MessageEnvelope, MessageValue, NamespaceName,
+    QueueConfig, ReceiveMode, SequenceNumber, SessionHold, SessionId, Timestamp,
 };
 
 /// One replicated instruction for the broker state machine.
@@ -57,6 +59,15 @@ pub struct ScheduledEnvelope {
     pub session_id: Option<SessionId>,
     pub enqueue_at: Timestamp,
     pub envelope: MessageEnvelope,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettlementDisposition {
+    Complete,
+    Abandon,
+    Defer,
+    DeadLetter { reason: String, description: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -186,6 +197,14 @@ pub enum CommandKind {
     },
     ScheduleEnvelopes {
         messages: Vec<ScheduledEnvelope>,
+    },
+    /// Settles one delivery while atomically replacing the supplied
+    /// application properties. Unmentioned properties are retained.
+    Settle {
+        sequence: SequenceNumber,
+        lock_token: LockToken,
+        disposition: SettlementDisposition,
+        properties_to_modify: BTreeMap<String, MessageValue>,
     },
 }
 

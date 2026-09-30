@@ -21,22 +21,27 @@ mod session;
 mod time;
 
 pub use codec::CodecError;
-pub use command::{Command, CommandKind, CommandOutcome, ScheduledEnvelope, ScheduledMessage};
+pub use command::{
+    Command, CommandKind, CommandOutcome, ScheduledEnvelope, ScheduledMessage,
+    SettlementDisposition,
+};
 pub use error::BrokerError;
 pub use identifier::{
     DEAD_LETTER_QUEUE_SUFFIX, EntityPath, IdentifierError, MAX_ENTITY_PATH_BYTES,
     MAX_NAMESPACE_NAME_BYTES, MAX_PLACEMENT_GROUP_ID_BYTES, MAX_SESSION_ID_BYTES, NamespaceName,
     PlacementGroupId, SessionId,
 };
-pub use machine::{StateMachine, TIMER_SCAN_LIMIT};
+pub use machine::{
+    BROKER_HEADER_RESERVE_BYTES, MAX_DEAD_LETTER_DETAIL_LENGTH, StateMachine, TIMER_SCAN_LIMIT,
+};
 pub use message::{
     DeadLetterInfo, DeadLetterReason, Delivery, DeliveryGuarantee, DeliveryLock, LockToken,
     MAX_MESSAGE_ID_LENGTH, MessageRecord, MessageState, MessageStatus, ReceiveMode, SequenceNumber,
 };
 pub use message_content::{
-    AnnotationKey, MAX_MESSAGE_VALUE_DEPTH, MAX_MESSAGE_VALUE_ITEMS, MessageBody,
-    MessageDescriptor, MessageEnvelope, MessageHeader, MessageIdentifier, MessageProperties,
-    MessageValue,
+    AnnotationKey, MAX_MESSAGE_HEADER_BYTES, MAX_MESSAGE_PROPERTY_BYTES, MAX_MESSAGE_VALUE_DEPTH,
+    MAX_MESSAGE_VALUE_ITEMS, MessageBody, MessageDescriptor, MessageEnvelope, MessageHeader,
+    MessageIdentifier, MessageProperties, MessageValue,
 };
 pub use queue::{
     DEFAULT_DUPLICATE_DETECTION_WINDOW_MILLIS, DEFAULT_LOCK_DURATION_MILLIS,

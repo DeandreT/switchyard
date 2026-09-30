@@ -37,6 +37,19 @@ pub enum BrokerError {
     MessageIdTooLong { length: usize, maximum: usize },
     #[error("invalid message content: {reason}")]
     InvalidMessageContent { reason: String },
+    #[error(
+        "message property {property} of {property_bytes} bytes exceeds the {maximum_bytes}-byte limit"
+    )]
+    MessagePropertyTooLarge {
+        property: String,
+        property_bytes: usize,
+        maximum_bytes: usize,
+    },
+    #[error("message header of {header_bytes} bytes exceeds the {maximum_bytes}-byte limit")]
+    MessageHeaderTooLarge {
+        header_bytes: usize,
+        maximum_bytes: usize,
+    },
     #[error("command timestamp {proposed} precedes the applied timestamp {last_applied}")]
     ClockRegression {
         last_applied: Timestamp,

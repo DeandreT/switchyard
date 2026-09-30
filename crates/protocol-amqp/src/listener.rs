@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Duration};
 
 use amqp::{
     AmqpError, Attach, DeliveryTag, EngineError, Error as AmqpProtocolError, ErrorCondition,
-    Fields, LinkEndpoint, Outcome, Receiver, Role, Sender, SenderSettleMode, ServerConnection,
+    Fields, LinkEndpoint, Receiver, Role, Sender, SenderSettleMode, ServerConnection,
     ServerSession,
 };
 use auth::{Permission, ResourceScope};
@@ -32,7 +32,9 @@ use crate::{
         ConnectionManagement, ManagementAuthorization, serve_management_replies,
         serve_management_requests,
     },
-    parse_attachment, read_incoming, read_session_filter, stamp_session_filter,
+    parse_attachment, read_incoming, read_session_filter,
+    settlement::settlement_command,
+    stamp_session_filter,
 };
 
 /// How long a receiving link waits on a wakeup before asking the broker anyway.
@@ -985,13 +987,13 @@ async fn settle<B: Broker>(
     let outcome = match authorization {
         Some(authorization) => {
             tokio::select! {
-                outcome = sender.send(crate::write_delivery(&delivery), delivery_tag.clone()) => Some(outcome),
+                outcome = sender.send_with_settlement(crate::write_delivery(&delivery), delivery_tag.clone()) => Some(outcome),
                 () = authorization.wait_until_unauthorized() => None,
             }
         }
         None => Some(
             sender
-                .send(crate::write_delivery(&delivery), delivery_tag)
+                .send_with_settlement(crate::write_delivery(&delivery), delivery_tag)
                 .await,
         ),
     };
@@ -999,47 +1001,29 @@ async fn settle<B: Broker>(
     let Some(outcome) = outcome else {
         return Ok(false);
     };
-    let outcome = outcome?;
+    let settlement = outcome?;
     if let Some(authorization) = authorization
         && authorization.ensure().await.is_err()
     {
         return Ok(false);
     }
 
-    let kind = match outcome {
-        Outcome::Accepted(_) => CommandKind::Complete {
-            sequence,
-            lock_token: lock.token,
-        },
-        // Rejected means the client will never process it, so it goes to the
-        // dead-letter queue rather than round again.
-        Outcome::Rejected(rejected) => CommandKind::DeadLetter {
-            sequence,
-            lock_token: lock.token,
-            reason: String::from("RejectedByReceiver"),
-            description: rejected
-                .error
-                .and_then(|error| error.description)
-                .unwrap_or_else(|| String::from("the receiver rejected the message")),
-        },
-        Outcome::Modified(modified) if modified.undeliverable_here == Some(true) => {
-            CommandKind::Defer {
-                sequence,
-                lock_token: lock.token,
-            }
+    let kind = match settlement_command(sequence, lock.token, settlement.outcome().clone()) {
+        Ok(kind) => kind,
+        Err(error) => {
+            let error = error_for(AmqpError::InvalidField, error.to_string());
+            settlement.reject(error.clone()).await?;
+            sender.close_with_error(error).await?;
+            return Ok(true);
         }
-        // Released and modified both mean "not now": back to the queue, with the
-        // delivery count already incremented by the receive.
-        Outcome::Released(_) | Outcome::Modified(_) => CommandKind::Abandon {
-            sequence,
-            lock_token: lock.token,
-        },
     };
 
     if let Err(rejection) = broker.submit(namespace.clone(), entity.clone(), kind).await {
-        // A settlement that fails is not fatal to the link: the lock expires and
-        // the message comes round again.
-        warn!(%sequence, %rejection, "settlement failed, leaving the lock to expire");
+        warn!(%sequence, %rejection, "settlement refused, leaving the lock to expire");
+        settlement.reject(rejection_error(&rejection)).await?;
+        sender.close_with_error(rejection_error(&rejection)).await?;
+    } else {
+        settlement.accept().await?;
     }
     Ok(true)
 }

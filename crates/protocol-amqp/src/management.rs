@@ -7,7 +7,7 @@ use amqp::{
 use auth::{Permission, ResourceScope};
 use domain::{
     CommandKind, CommandOutcome, EntityPath, LockToken, NamespaceName, ScheduledEnvelope,
-    SequenceNumber, SessionHold, SessionId,
+    SequenceNumber, SessionHold, SessionId, SettlementDisposition,
 };
 use serde_amqp::{
     Value,
@@ -20,6 +20,7 @@ use crate::{
     Broker, BrokerRejection,
     authorization::ConnectionAuthorization,
     message::{read_incoming, write_delivery},
+    settlement::{dead_letter_disposition, read_properties_to_modify},
 };
 
 pub const PEEK_MESSAGE_OPERATION: &str = "com.microsoft:peek-message";
@@ -48,6 +49,7 @@ pub const LOCK_TOKEN: &str = "lock-token";
 pub const SEQUENCE_NUMBERS: &str = "sequence-numbers";
 pub const RECEIVER_SETTLE_MODE: &str = "receiver-settle-mode";
 pub const DISPOSITION_STATUS: &str = "disposition-status";
+pub const PROPERTIES_TO_MODIFY: &str = "properties-to-modify";
 pub const DEAD_LETTER_REASON: &str = "deadletter-reason";
 pub const DEAD_LETTER_DESCRIPTION: &str = "deadletter-description";
 pub const SESSION_ID: &str = "session-id";
@@ -277,6 +279,16 @@ impl ManagementResponse {
             tracking_id,
             body: Value::Null,
         }
+    }
+
+    fn invalid_field(
+        correlation_id: MessageId,
+        tracking_id: Option<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        let mut response = Self::bad_request(correlation_id, tracking_id, description);
+        response.error_condition = Some(crate::INVALID_FIELD);
+        response
     }
 
     fn from_rejection(
@@ -658,10 +670,7 @@ impl ScheduleRequestError {
                 }
             }
             other => {
-                let mut response =
-                    ManagementResponse::bad_request(correlation_id, tracking_id, other.to_string());
-                response.error_condition = Some(crate::INVALID_FIELD);
-                response
+                ManagementResponse::invalid_field(correlation_id, tracking_id, other.to_string())
             }
         }
     }
@@ -916,29 +925,50 @@ async fn update_disposition<B: Broker>(
         );
     }
 
-    let kind = match status {
-        "completed" => CommandKind::Complete {
-            sequence: delivery.sequence,
-            lock_token,
-        },
-        "abandoned" => CommandKind::Abandon {
-            sequence: delivery.sequence,
-            lock_token,
-        },
-        "defered" => CommandKind::Defer {
-            sequence: delivery.sequence,
-            lock_token,
-        },
-        "suspended" => CommandKind::DeadLetter {
-            sequence: delivery.sequence,
-            lock_token,
-            reason: string_map_value(&message.body, DEAD_LETTER_REASON)
-                .unwrap_or("DeadLetteredByReceiver")
-                .to_owned(),
-            description: string_map_value(&message.body, DEAD_LETTER_DESCRIPTION)
-                .unwrap_or("the receiver dead-lettered the message")
-                .to_owned(),
-        },
+    let mut properties_to_modify =
+        match read_properties_to_modify(map_value(&message.body, PROPERTIES_TO_MODIFY)) {
+            Ok(properties) => properties,
+            Err(error) => {
+                return ManagementResponse::invalid_field(
+                    message_id,
+                    tracking_id,
+                    error.to_string(),
+                );
+            }
+        };
+    let disposition = match status {
+        "completed" => SettlementDisposition::Complete,
+        "abandoned" => SettlementDisposition::Abandon,
+        "defered" => SettlementDisposition::Defer,
+        "suspended" => {
+            for name in [DEAD_LETTER_REASON, DEAD_LETTER_DESCRIPTION] {
+                if map_value(&message.body, name)
+                    .is_some_and(|value| !matches!(value, Value::String(_) | Value::Null))
+                {
+                    return ManagementResponse::invalid_field(
+                        message_id,
+                        tracking_id,
+                        format!("{name} must be a string"),
+                    );
+                }
+            }
+            match dead_letter_disposition(
+                string_map_value(&message.body, DEAD_LETTER_REASON).map(str::to_owned),
+                string_map_value(&message.body, DEAD_LETTER_DESCRIPTION).map(str::to_owned),
+                &mut properties_to_modify,
+                "DeadLetteredByReceiver",
+                "the receiver dead-lettered the message",
+            ) {
+                Ok(disposition) => disposition,
+                Err(error) => {
+                    return ManagementResponse::invalid_field(
+                        message_id,
+                        tracking_id,
+                        error.to_string(),
+                    );
+                }
+            }
+        }
         _ => {
             return ManagementResponse::bad_request(
                 message_id,
@@ -946,6 +976,12 @@ async fn update_disposition<B: Broker>(
                 format!("unsupported disposition-status {status:?}"),
             );
         }
+    };
+    let kind = CommandKind::Settle {
+        sequence: delivery.sequence,
+        lock_token,
+        disposition,
+        properties_to_modify,
     };
 
     match broker.submit(namespace.clone(), entity.clone(), kind).await {
