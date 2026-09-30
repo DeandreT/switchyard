@@ -161,6 +161,12 @@ counter parity for deferral, locked-message peek, and dead-letter transfers is
 not established, nor are generic AMQP Released/Modified counter semantics.
 Deferred receive is also served through `$management`, and locks returned that
 way are settled through the management `update-disposition` operation.
+Session deferred receive requires a live session hold on the associated receiver
+link in that same connection. The state machine validates the hold before
+touching message records or expiry cleanup; naming a session or replaying an old
+hold cannot bypass another receiver's ownership. The old identifier-only core
+commands retain their serialized shape for trusted callers, but are not used
+by the management edge.
 Retrieving only expired deferred messages commits their cleanup before
 returning `com.microsoft:message-not-found`; missing messages are distinguished
 from a missing queue. Dead-letter management paths normalize the reserved

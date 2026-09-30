@@ -231,6 +231,15 @@ pub enum CommandKind {
         session_id: Option<SessionId>,
         budget: DeliveryBudget,
     },
+    /// Retrieves a bounded batch while proving live session ownership before
+    /// inspecting or expiring any message. A non-session queue requires None.
+    ReceiveDeferredHeld {
+        sequences: Vec<SequenceNumber>,
+        mode: ReceiveMode,
+        lock_duration_millis: Option<u64>,
+        session: Option<SessionHold>,
+        budget: DeliveryBudget,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

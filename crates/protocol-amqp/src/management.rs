@@ -915,17 +915,27 @@ async fn receive_by_sequence_number<B: Broker>(
             );
         }
     };
-    let session_id = match string_map_value(&message.body, SESSION_ID) {
-        Some(session_id) => match SessionId::new(session_id) {
-            Ok(session_id) => Some(session_id),
-            Err(error) => {
+    let session = match map_value(&message.body, SESSION_ID) {
+        Some(Value::String(session_id)) => {
+            if let Err(error) = SessionId::new(session_id) {
                 return ManagementResponse::bad_request(
                     message_id,
                     tracking_id,
                     format!("session-id is invalid: {error}"),
                 );
             }
-        },
+            match requested_session(message, entity, management).await {
+                Ok(session) => Some(session.hold),
+                Err(error) => return session_lookup_response(message_id, tracking_id, error),
+            }
+        }
+        Some(_) => {
+            return ManagementResponse::bad_request(
+                message_id,
+                tracking_id,
+                "session-id must be an AMQP value string",
+            );
+        }
         None => None,
     };
 
@@ -933,11 +943,11 @@ async fn receive_by_sequence_number<B: Broker>(
         .submit(
             namespace.clone(),
             entity.clone(),
-            CommandKind::ReceiveDeferredBounded {
+            CommandKind::ReceiveDeferredHeld {
                 sequences,
                 mode,
                 lock_duration_millis: None,
-                session_id,
+                session,
                 budget,
             },
         )

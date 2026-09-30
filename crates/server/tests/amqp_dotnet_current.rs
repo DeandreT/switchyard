@@ -134,11 +134,13 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
         let output_directory = artifacts.path().join("bin");
         let intermediate_directory = artifacts.path().join("obj");
         let build = Command::new("dotnet")
+            .env("DOTNET_PROCESSOR_COUNT", "2")
             .arg("build")
             .arg(&project)
             .arg("--configuration")
             .arg("Release")
             .arg("--maxcpucount:2")
+            .arg("--disable-build-servers")
             .arg("--output")
             .arg(&output_directory)
             .arg(format!("-p:ServiceBusSdkVersion={sdk_version}"))
@@ -155,6 +157,7 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
             return Ok::<_, std::io::Error>(build);
         }
         Command::new("dotnet")
+            .env("DOTNET_PROCESSOR_COUNT", "2")
             .arg(output_directory.join("Switchyard.Conformance.DotNetCurrent.dll"))
             .arg(HOST)
             .arg(format!("sb://localhost:{}", address.port()))
@@ -174,7 +177,8 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("session renew/state passed"),
+        String::from_utf8_lossy(&output.stdout)
+            .contains("session renew/state/deferred receive passed"),
         "the client exited without reporting the completed workflow"
     );
     assert_eq!(

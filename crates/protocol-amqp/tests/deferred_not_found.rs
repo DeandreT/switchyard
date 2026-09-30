@@ -42,10 +42,10 @@ impl Broker for ControlledBroker {
     ) -> Decision {
         assert_eq!(namespace.as_str(), "tenant");
         assert_eq!(entity.as_str(), "orders");
-        let CommandKind::ReceiveDeferredBounded {
+        let CommandKind::ReceiveDeferredHeld {
             sequences,
             mode,
-            session_id,
+            session,
             budget,
             ..
         } = kind
@@ -54,7 +54,7 @@ impl Broker for ControlledBroker {
         };
         assert_eq!(sequences, vec![SequenceNumber::new(7)]);
         assert_eq!(mode, ReceiveMode::ReceiveAndDelete);
-        assert_eq!(session_id, None);
+        assert_eq!(session, None);
         assert!(budget.max_bytes > 0 && budget.max_bytes <= 4 * 1024 * 1024);
         assert_eq!(budget.per_message_overhead_bytes, 64);
         self.0

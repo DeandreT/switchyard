@@ -341,6 +341,30 @@ impl<S: StateStore> StateMachine<S> {
                 },
                 &mut batch,
             )?,
+            CommandKind::ReceiveDeferredHeld {
+                sequences,
+                mode,
+                lock_duration_millis,
+                session,
+                budget,
+            } => {
+                let config = self.load_config(command)?;
+                require_session_agreement(&config, session.is_some())?;
+                if let Some(hold) = session {
+                    self.held_session(command, hold)?;
+                }
+                self.receive_deferred(
+                    command,
+                    DeferredReceiveInput {
+                        sequences,
+                        mode: *mode,
+                        lock_duration_millis: *lock_duration_millis,
+                        session_id: session.as_ref().map(|hold| &hold.session_id),
+                        budget: Some(*budget),
+                    },
+                    &mut batch,
+                )?
+            }
             CommandKind::AcceptSession {
                 session_id,
                 lock_duration_millis,

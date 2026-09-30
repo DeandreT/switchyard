@@ -369,7 +369,19 @@ if (sessionMessage?.Body.ToString() != "official-session-current"
     Console.Error.WriteLine($"unexpected session message: {sessionMessage?.Body}");
     return 12;
 }
-await sessionReceiver.CompleteMessageAsync(sessionMessage);
+var sessionDeferUpdates = new Dictionary<string, object> { ["stage"] = "session-waiting" };
+await sessionReceiver.DeferMessageAsync(sessionMessage, sessionDeferUpdates);
+ServiceBusReceivedMessage sessionDeferred =
+    await sessionReceiver.ReceiveDeferredMessageAsync(sessionMessage.SequenceNumber);
+if (sessionDeferred.Body.ToString() != "official-session-current"
+    || sessionDeferred.SessionId != "session-1"
+    || !HasUpdatedProperties(sessionDeferred, sessionDeferUpdates))
+{
+    Console.Error.WriteLine("the held session could not retrieve its deferred message");
+    return 36;
+}
+await sessionReceiver.RenewSessionLockAsync();
+await sessionReceiver.CompleteMessageAsync(sessionDeferred);
 
 DateTimeOffset scheduledSessionEnqueueTime = DateTimeOffset.UtcNow.AddSeconds(2);
 long scheduledSessionSequence = await sessionSender.ScheduleMessageAsync(
@@ -511,7 +523,7 @@ if (await receiver.PeekMessageAsync(fromSequenceNumber: 1) is not null
 }
 
 Console.WriteLine(
-    "official .NET Service Bus client send/peek/receive/settlement updates/defer/dead-letter/expiry/renew/complete/schedule/cancel/duplicate and session renew/state passed");
+    "official .NET Service Bus client send/peek/receive/settlement updates/defer/dead-letter/expiry/renew/complete/schedule/cancel/duplicate and session renew/state/deferred receive passed");
 return 0;
 
 static Dictionary<string, object> PreservedApplicationProperties() => new()
