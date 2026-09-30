@@ -8,7 +8,7 @@
 
 use domain::{
     BrokerError, Command, CommandApplication, CommandKind, CommandOutcome, EntityPath,
-    NamespaceName, QueueCursor, QueuePage, StateMachine, Timestamp,
+    NamespaceName, QueueConfig, QueueCursor, QueuePage, StateMachine, Timestamp,
 };
 use storage::StateStore;
 use thiserror::Error;
@@ -44,6 +44,15 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
 
     pub fn machine(&self) -> &StateMachine<S> {
         &self.machine
+    }
+
+    /// Reads a queue configuration without stamping a replicated command.
+    pub fn queue_config(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+    ) -> Result<Option<QueueConfig>, ProposeError> {
+        Ok(self.machine.queue_config(namespace, entity)?)
     }
 
     /// Reads one queue page without stamping a replicated command.

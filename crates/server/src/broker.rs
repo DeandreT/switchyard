@@ -22,7 +22,8 @@ use std::{
 };
 
 use domain::{
-    CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueCursor, QueuePage, Timestamp,
+    CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueConfig, QueueCursor, QueuePage,
+    Timestamp,
 };
 use storage::StateStore;
 use thiserror::Error;
@@ -57,6 +58,11 @@ enum Request {
         after: Option<QueueCursor>,
         limit: usize,
         reply: flume::Sender<Result<QueuePage, ProposeError>>,
+    },
+    GetQueueConfig {
+        namespace: NamespaceName,
+        entity: EntityPath,
+        reply: flume::Sender<Result<Option<QueueConfig>, ProposeError>>,
     },
     /// The highest timestamp the machine has applied. Readiness and
     /// diagnostics need it, and it is what a caller compares its own clock
@@ -241,6 +247,48 @@ impl BrokerHandle {
             .map_err(SubmitError::Propose)
     }
 
+    /// Reads a committed queue configuration on the owner thread.
+    pub fn queue_config_blocking(
+        &self,
+        namespace: NamespaceName,
+        entity: EntityPath,
+    ) -> Result<Option<QueueConfig>, SubmitError> {
+        let (reply, config) = flume::bounded(1);
+        self.requests
+            .send(Request::GetQueueConfig {
+                namespace,
+                entity,
+                reply,
+            })
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        config
+            .recv()
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
+
+    /// Reads a committed queue configuration without blocking the executor.
+    pub async fn queue_config(
+        &self,
+        namespace: NamespaceName,
+        entity: EntityPath,
+    ) -> Result<Option<QueueConfig>, SubmitError> {
+        let (reply, config) = flume::bounded(1);
+        self.requests
+            .send_async(Request::GetQueueConfig {
+                namespace,
+                entity,
+                reply,
+            })
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        config
+            .recv_async()
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
+
     /// The highest timestamp the machine has applied.
     pub fn last_applied_blocking(&self) -> Result<Timestamp, SubmitError> {
         let (reply, applied) = flume::bounded(1);
@@ -374,6 +422,13 @@ impl Broker {
                                 after.as_ref(),
                                 limit,
                             ));
+                        }
+                        Request::GetQueueConfig {
+                            namespace,
+                            entity,
+                            reply,
+                        } => {
+                            let _ = reply.send(proposer.queue_config(&namespace, &entity));
                         }
                         Request::LastApplied { reply } => {
                             let _ = reply.send(
