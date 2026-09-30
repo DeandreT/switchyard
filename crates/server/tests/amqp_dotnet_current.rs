@@ -1,4 +1,4 @@
-//! Opt-in gate for the current stable official .NET Service Bus client.
+//! Opt-in gates for the current and previous official .NET Service Bus clients.
 
 use std::{
     error::Error, path::PathBuf, process::Command, sync::Arc, thread::JoinHandle, time::Duration,
@@ -14,6 +14,8 @@ use tokio::net::TcpListener;
 const HOST: &str = "tenant.servicebus.windows.net";
 const RULE: &str = "test-rule";
 const KEY: &str = "test-secret";
+const CURRENT_SDK: &str = "7.21.0";
+const PREVIOUS_SDK: &str = "7.20.2";
 
 struct TestTimer {
     shutdown: Arc<Shutdown>,
@@ -47,6 +49,17 @@ impl Drop for TestTimer {
 #[ignore = "requires dotnet and a NuGet restore"]
 async fn current_stable_dotnet_client_completes_message_and_session_workflows()
 -> Result<(), Box<dyn Error>> {
+    run_client_gate(CURRENT_SDK).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires dotnet and a NuGet restore"]
+async fn previous_stable_dotnet_client_completes_message_and_session_workflows()
+-> Result<(), Box<dyn Error>> {
+    run_client_gate(PREVIOUS_SDK).await
+}
+
+async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -117,24 +130,32 @@ async fn current_stable_dotnet_client_completes_message_and_session_workflows()
     let project = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../conformance/dotnet-current/Switchyard.Conformance.DotNetCurrent.csproj");
     let output = tokio::task::spawn_blocking(move || {
+        let artifacts = tempfile::TempDir::new()?;
+        let output_directory = artifacts.path().join("bin");
+        let intermediate_directory = artifacts.path().join("obj");
         let build = Command::new("dotnet")
             .arg("build")
             .arg(&project)
             .arg("--configuration")
             .arg("Release")
             .arg("--maxcpucount:2")
+            .arg("--output")
+            .arg(&output_directory)
+            .arg(format!("-p:ServiceBusSdkVersion={sdk_version}"))
+            .arg(format!(
+                "-p:BaseIntermediateOutputPath={}/",
+                intermediate_directory.display()
+            ))
+            .arg(format!(
+                "-p:MSBuildProjectExtensionsPath={}/",
+                intermediate_directory.display()
+            ))
             .output()?;
         if !build.status.success() {
             return Ok::<_, std::io::Error>(build);
         }
         Command::new("dotnet")
-            .arg("run")
-            .arg("--project")
-            .arg(&project)
-            .arg("--configuration")
-            .arg("Release")
-            .arg("--no-build")
-            .arg("--")
+            .arg(output_directory.join("Switchyard.Conformance.DotNetCurrent.dll"))
             .arg(HOST)
             .arg(format!("sb://localhost:{}", address.port()))
             .arg("orders")
@@ -148,7 +169,7 @@ async fn current_stable_dotnet_client_completes_message_and_session_workflows()
 
     assert!(
         output.status.success(),
-        "official .NET gate failed\nstdout:\n{}\nstderr:\n{}",
+        "official .NET {sdk_version} gate failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

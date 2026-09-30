@@ -4,9 +4,11 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <ServiceBusSdkVersion Condition="'$(ServiceBusSdkVersion)' == ''">7.21.0</ServiceBusSdkVersion>
+    <DefaultItemExcludes>$(DefaultItemExcludes);bin/**;obj/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Azure.Messaging.ServiceBus" Version="7.20.2" />
+    <PackageReference Include="Azure.Messaging.ServiceBus" Version="$(ServiceBusSdkVersion)" />
   </ItemGroup>
 </Project>

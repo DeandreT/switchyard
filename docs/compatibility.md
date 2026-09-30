@@ -8,8 +8,8 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Send, peek, receive, defer, renew, complete, schedule, cancel and duplicate detection; session renew/state/scheduling | Planned | Experimental gate on 7.20.2 |
-| Official .NET SDK, previous stable | Planned | Planned | Not implemented |
+| Official .NET SDK, current stable | Send, peek, receive, defer, renew, complete, schedule, cancel and duplicate detection; session renew/state/scheduling | Planned | Experimental gate on 7.21.0 |
+| Official .NET SDK, previous stable | Same gated workflows as current | Planned | Experimental gate on 7.20.2 |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
 ## Capability Matrix
@@ -156,13 +156,19 @@ committed, so the
 acknowledgement means durable. One node still serves one namespace. A message
 drained from a dead-letter queue carries its reason and description in the
 `DeadLetterReason` and `DeadLetterErrorDescription` application properties. The
-complete protocol coverage uses a Rust AMQP 1.0 client. The current stable
-official .NET SDK also has an opt-in gate for ordinary send, receive,
+complete protocol coverage uses a Rust AMQP 1.0 client. The current and previous
+stable official .NET SDKs also have opt-in gates for ordinary send, receive,
 peek, deferral, deferred receive, message-lock renewal, completion, scheduling,
 and cancellation, duplicate detection for ordinary and scheduled sends, plus
 session state, renewal, receive, completion, and
-scheduling; the rest of that client gate
+scheduling; the rest of those client gates
 remains incomplete.
+
+The SDK gates build into separate temporary directories and run the resulting
+assemblies directly. Run them explicitly with
+`cargo test -j 2 -p server --test amqp_dotnet_current -- --ignored --test-threads=1`;
+each .NET build is limited to two jobs, and serial test execution preserves that
+limit across the two releases.
 
 The current value format is version 6 and durable store layout is version 4.
 Earlier message and queue-configuration shapes have tested decoders, but an
