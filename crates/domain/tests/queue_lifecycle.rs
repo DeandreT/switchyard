@@ -660,6 +660,133 @@ fn an_application_can_dead_letter_a_locked_message<P: StoreProvider>(
     Ok(())
 }
 
+fn a_locked_message_can_be_deferred_and_received_by_sequence<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
+    let sequence = send(&fixture, 10, "first")?;
+    let delivery = receive(&fixture, 20)?.expect("the queue holds one message");
+
+    assert_eq!(
+        fixture.at(
+            30,
+            CommandKind::Defer {
+                sequence,
+                lock_token: locked(&delivery).token,
+            }
+        )?,
+        CommandOutcome::Deferred
+    );
+    assert_eq!(
+        fixture
+            .machine
+            .ready_sequences(&fixture.namespace, &fixture.entity, 16)?,
+        Vec::new()
+    );
+    assert_eq!(receive(&fixture, 31)?, None);
+
+    let deferred = match fixture.at(
+        40,
+        CommandKind::ReceiveDeferred {
+            sequences: vec![sequence],
+            mode: ReceiveMode::PeekLock,
+            lock_duration_millis: None,
+            session_id: None,
+        },
+    )? {
+        CommandOutcome::DeferredReceived(deliveries) => deliveries,
+        other => panic!("expected a deferred receive outcome, got {other:?}"),
+    };
+    assert_eq!(deferred.len(), 1);
+    assert_eq!(deferred[0].sequence, sequence);
+    assert_eq!(deferred[0].delivery_count, 2);
+    let lock = locked(&deferred[0]);
+    assert_eq!(lock.token, LockToken::new(2));
+    assert_eq!(
+        fixture.at(
+            41,
+            CommandKind::Complete {
+                sequence,
+                lock_token: lock.token,
+            }
+        )?,
+        CommandOutcome::Completed
+    );
+    Ok(())
+}
+
+fn a_deferred_message_can_be_received_and_deleted_by_sequence<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
+    let sequence = send(&fixture, 10, "first")?;
+    let delivery = receive(&fixture, 20)?.expect("the queue holds one message");
+    fixture.at(
+        30,
+        CommandKind::Defer {
+            sequence,
+            lock_token: locked(&delivery).token,
+        },
+    )?;
+
+    let deferred = match fixture.at(
+        40,
+        CommandKind::ReceiveDeferred {
+            sequences: vec![sequence],
+            mode: ReceiveMode::ReceiveAndDelete,
+            lock_duration_millis: None,
+            session_id: None,
+        },
+    )? {
+        CommandOutcome::DeferredReceived(deliveries) => deliveries,
+        other => panic!("expected a deferred receive outcome, got {other:?}"),
+    };
+    assert_eq!(deferred[0].lock, None);
+    assert_eq!(
+        fixture
+            .machine
+            .message(&fixture.namespace, &fixture.entity, sequence)?,
+        None
+    );
+    Ok(())
+}
+
+fn a_deferred_message_still_expires<P: StoreProvider>(provider: P) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
+    let sequence = match fixture.at(
+        10,
+        CommandKind::Send {
+            message_id: String::from("perishable"),
+            body: b"perishable".to_vec(),
+            time_to_live_millis: Some(100),
+            session_id: None,
+        },
+    )? {
+        CommandOutcome::Sent { sequence } => sequence,
+        other => panic!("expected a send outcome, got {other:?}"),
+    };
+    let delivery = receive(&fixture, 20)?.expect("the queue holds one message");
+    fixture.at(
+        30,
+        CommandKind::Defer {
+            sequence,
+            lock_token: locked(&delivery).token,
+        },
+    )?;
+
+    assert_eq!(
+        fixture.at(110, CommandKind::ExpireMessages)?,
+        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+    );
+    assert_eq!(
+        fixture
+            .machine
+            .dead_lettered_sequences(&fixture.namespace, &fixture.entity, 16)?,
+        vec![sequence]
+    );
+    Ok(())
+}
+
 fn a_command_that_moves_time_backward_is_rejected<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
@@ -934,6 +1061,9 @@ for_each_backend! {
     the_time_to_live_sweep_dead_letters_expired_messages,
     a_receive_never_hands_out_an_expired_message,
     an_application_can_dead_letter_a_locked_message,
+    a_locked_message_can_be_deferred_and_received_by_sequence,
+    a_deferred_message_can_be_received_and_deleted_by_sequence,
+    a_deferred_message_still_expires,
     a_command_that_moves_time_backward_is_rejected,
     a_send_larger_than_the_queue_limit_is_rejected,
     commands_against_a_missing_queue_are_rejected,

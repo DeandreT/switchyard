@@ -80,12 +80,25 @@ pub enum CommandKind {
         reason: String,
         description: String,
     },
+    Defer {
+        sequence: SequenceNumber,
+        lock_token: LockToken,
+    },
     /// Extends a message lock without changing its token.
     RenewLock {
         sequence: SequenceNumber,
         lock_token: LockToken,
         /// Overrides the queue default when set.
         lock_duration_millis: Option<u64>,
+    },
+    ReceiveDeferred {
+        sequences: Vec<SequenceNumber>,
+        mode: ReceiveMode,
+        /// Overrides the queue default when set.
+        lock_duration_millis: Option<u64>,
+        /// Narrows deferred receive to one session. Required on a session
+        /// queue, and refused on a non-session queue.
+        session_id: Option<SessionId>,
     },
     /// Takes exclusive ownership of a session.
     AcceptSession {
@@ -140,9 +153,11 @@ pub enum CommandOutcome {
         dead_lettered: bool,
     },
     DeadLettered,
+    Deferred,
     LockRenewed {
         locked_until: Timestamp,
     },
+    DeferredReceived(Vec<Delivery>),
     LocksExpired {
         returned_to_ready: u32,
         dead_lettered: u32,

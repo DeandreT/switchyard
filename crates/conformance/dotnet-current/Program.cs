@@ -68,6 +68,24 @@ if (received.LockedUntil < lockedUntilBeforeRenewal)
 
 await receiver.CompleteMessageAsync(received);
 
+await sender.SendMessageAsync(new ServiceBusMessage("official-deferred-current"));
+ServiceBusReceivedMessage? deferredSource =
+    await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (deferredSource?.Body.ToString() != "official-deferred-current")
+{
+    Console.Error.WriteLine($"unexpected deferred source message: {deferredSource?.Body}");
+    return 7;
+}
+await receiver.DeferMessageAsync(deferredSource);
+ServiceBusReceivedMessage deferred =
+    await receiver.ReceiveDeferredMessageAsync(deferredSource.SequenceNumber);
+if (deferred.Body.ToString() != "official-deferred-current")
+{
+    Console.Error.WriteLine($"unexpected deferred message: {deferred.Body}");
+    return 8;
+}
+await receiver.CompleteMessageAsync(deferred);
+
 await using ServiceBusSender sessionSender = client.CreateSender(sessionQueue);
 await sessionSender.SendMessageAsync(new ServiceBusMessage("official-session-current")
 {
@@ -82,7 +100,7 @@ if (peekedSession.Count != 1 || peekedSession[0].Body.ToString() != "official-se
 {
     Console.Error.WriteLine(
         $"unexpected session peek result: count={peekedSession.Count}, body={peekedSession.FirstOrDefault()?.Body}");
-    return 7;
+    return 9;
 }
 
 await sessionReceiver.SetSessionStateAsync(BinaryData.FromString("checkout-step-2"));
@@ -90,7 +108,7 @@ BinaryData sessionState = await sessionReceiver.GetSessionStateAsync();
 if (sessionState.ToString() != "checkout-step-2")
 {
     Console.Error.WriteLine($"unexpected session state: {sessionState}");
-    return 8;
+    return 10;
 }
 
 DateTimeOffset sessionLockedUntilBeforeRenewal = sessionReceiver.SessionLockedUntil;
@@ -99,7 +117,7 @@ if (sessionReceiver.SessionLockedUntil < sessionLockedUntilBeforeRenewal)
 {
     Console.Error.WriteLine(
         $"session renewal moved the lock backward: {sessionLockedUntilBeforeRenewal:o} -> {sessionReceiver.SessionLockedUntil:o}");
-    return 9;
+    return 11;
 }
 
 ServiceBusReceivedMessage? sessionMessage =
@@ -107,10 +125,10 @@ ServiceBusReceivedMessage? sessionMessage =
 if (sessionMessage?.Body.ToString() != "official-session-current")
 {
     Console.Error.WriteLine($"unexpected session message: {sessionMessage?.Body}");
-    return 10;
+    return 12;
 }
 await sessionReceiver.CompleteMessageAsync(sessionMessage);
 
 Console.WriteLine(
-    "official .NET Service Bus client send/peek/receive/renew/complete and session renew/state passed");
+    "official .NET Service Bus client send/peek/receive/defer/renew/complete and session renew/state passed");
 return 0;

@@ -8,8 +8,8 @@ use std::error::Error;
 
 use amqp::{
     ApplicationProperties, Array, Body, ClientConnection as Connection, ClientReceiver as Receiver,
-    ClientSender as Sender, ClientSession as Session, FilterSet, Message, OrderedMap, Outcome,
-    Properties, SenderSettleMode, Source, Symbol, Uuid, Value, decode_message,
+    ClientSender as Sender, ClientSession as Session, FilterSet, Message, Modified, OrderedMap,
+    Outcome, Properties, SenderSettleMode, Source, Symbol, Uuid, Value, decode_message,
 };
 use domain::{CommandKind, QueueConfig, StateMachine};
 use server::{Broker, LocalProposer, ManualClock};
@@ -207,6 +207,163 @@ async fn a_client_peeks_without_locking_or_consuming() -> Result<(), Box<dyn Err
     let delivery = receiver.recv().await?;
     assert_eq!(text_of(delivery.message()), "peek-at-me");
     receiver.accept(&delivery).await?;
+
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_defers_and_receives_by_sequence() -> Result<(), Box<dyn Error>> {
+    let node = Node::start("orders", QueueConfig::default()).await?;
+
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
+    sender
+        .send(Message::builder().body(body("later")).build())
+        .await?;
+
+    let link_name = "test-receiver";
+    let mut receiver = Receiver::attach(&mut session, link_name, "orders").await?;
+    let delivery = receiver.recv().await?;
+    receiver
+        .modify(
+            &delivery,
+            Modified {
+                undeliverable_here: Some(true),
+                ..Modified::default()
+            },
+        )
+        .await?;
+    let starved =
+        tokio::time::timeout(std::time::Duration::from_millis(300), receiver.recv()).await;
+    assert!(starved.is_err(), "a deferred message was still ready");
+
+    let reply_to = "deferred-management-replies";
+    let mut responses = Receiver::builder()
+        .name("deferred-management-response")
+        .source("orders/$management")
+        .target(reply_to)
+        .attach(&mut session)
+        .await?;
+    let mut requests = Sender::attach(
+        &mut session,
+        "deferred-management-request",
+        "orders/$management",
+    )
+    .await?;
+
+    let mut request_body = OrderedMap::new();
+    request_body.insert(
+        Value::String(String::from(protocol_amqp::SEQUENCE_NUMBERS)),
+        Value::Array(Array::from(vec![Value::Long(1)])),
+    );
+    request_body.insert(
+        Value::String(String::from(protocol_amqp::RECEIVER_SETTLE_MODE)),
+        Value::Uint(1),
+    );
+    let request = Message::builder()
+        .properties(Properties {
+            message_id: Some("receive-deferred-1".into()),
+            reply_to: Some(reply_to.to_owned()),
+            ..Properties::default()
+        })
+        .application_properties(
+            ApplicationProperties::builder()
+                .insert(
+                    protocol_amqp::OPERATION_PROPERTY,
+                    protocol_amqp::RECEIVE_BY_SEQUENCE_NUMBER_OPERATION,
+                )
+                .insert(protocol_amqp::ASSOCIATED_LINK_NAME_PROPERTY, link_name)
+                .build(),
+        )
+        .body(Body::Value(Value::Map(request_body)))
+        .build();
+    assert!(matches!(
+        requests.send(request).await?,
+        Outcome::Accepted(_)
+    ));
+
+    let response =
+        tokio::time::timeout(std::time::Duration::from_secs(2), responses.recv()).await??;
+    assert_eq!(
+        response
+            .message()
+            .application_properties
+            .as_ref()
+            .and_then(|properties| properties.get(protocol_amqp::STATUS_CODE_PROPERTY)),
+        Some(&Value::Int(200))
+    );
+    let Body::Value(Value::Map(body)) = &response.message().body else {
+        panic!("the deferred receive response must carry an AMQP value map");
+    };
+    let messages = body
+        .get(&Value::String(String::from(protocol_amqp::MESSAGES)))
+        .expect("deferred receive response carries messages");
+    let Value::List(messages) = messages else {
+        panic!("messages must be an AMQP list, got {messages:?}");
+    };
+    let [Value::Map(entry)] = messages.as_slice() else {
+        panic!("expected exactly one deferred message, got {messages:?}");
+    };
+    let Some(Value::Binary(encoded)) =
+        entry.get(&Value::String(String::from(protocol_amqp::MESSAGE)))
+    else {
+        panic!("the deferred entry must carry encoded message bytes");
+    };
+    let Some(Value::Uuid(lock_token)) =
+        entry.get(&Value::String(String::from(protocol_amqp::LOCK_TOKEN)))
+    else {
+        panic!("the deferred entry must carry a lock token");
+    };
+    let deferred = decode_message(encoded)?;
+    assert_eq!(text_of(&deferred), "later");
+    responses.accept(&response).await?;
+
+    let mut complete_body = OrderedMap::new();
+    complete_body.insert(
+        Value::String(String::from(protocol_amqp::LOCK_TOKENS)),
+        Value::Array(Array::from(vec![Value::Uuid(lock_token.clone())])),
+    );
+    complete_body.insert(
+        Value::String(String::from(protocol_amqp::DISPOSITION_STATUS)),
+        Value::String(String::from("completed")),
+    );
+    let complete = Message::builder()
+        .properties(Properties {
+            message_id: Some("complete-deferred-1".into()),
+            reply_to: Some(reply_to.to_owned()),
+            ..Properties::default()
+        })
+        .application_properties(
+            ApplicationProperties::builder()
+                .insert(
+                    protocol_amqp::OPERATION_PROPERTY,
+                    protocol_amqp::UPDATE_DISPOSITION_OPERATION,
+                )
+                .insert(protocol_amqp::ASSOCIATED_LINK_NAME_PROPERTY, link_name)
+                .build(),
+        )
+        .body(Body::Value(Value::Map(complete_body)))
+        .build();
+    assert!(matches!(
+        requests.send(complete).await?,
+        Outcome::Accepted(_)
+    ));
+    let completed =
+        tokio::time::timeout(std::time::Duration::from_secs(2), responses.recv()).await??;
+    assert_eq!(
+        completed
+            .message()
+            .application_properties
+            .as_ref()
+            .and_then(|properties| properties.get(protocol_amqp::STATUS_CODE_PROPERTY)),
+        Some(&Value::Int(200))
+    );
+    responses.accept(&completed).await?;
+
+    let gone = tokio::time::timeout(std::time::Duration::from_millis(300), receiver.recv()).await;
+    assert!(gone.is_err(), "a completed deferred message came back");
 
     connection.close().await?;
     Ok(())

@@ -1011,6 +1011,12 @@ async fn settle<B: Broker>(
                 .and_then(|error| error.description)
                 .unwrap_or_else(|| String::from("the receiver rejected the message")),
         },
+        Outcome::Modified(modified) if modified.undeliverable_here == Some(true) => {
+            CommandKind::Defer {
+                sequence,
+                lock_token: lock.token,
+            }
+        }
         // Released and modified both mean "not now": back to the queue, with the
         // delivery count already incremented by the receive.
         Outcome::Released(_) | Outcome::Modified(_) => CommandKind::Abandon {

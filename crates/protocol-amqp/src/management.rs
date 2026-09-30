@@ -21,8 +21,10 @@ use crate::{
 };
 
 pub const PEEK_MESSAGE_OPERATION: &str = "com.microsoft:peek-message";
+pub const RECEIVE_BY_SEQUENCE_NUMBER_OPERATION: &str = "com.microsoft:receive-by-sequence-number";
 pub const RENEW_LOCK_OPERATION: &str = "com.microsoft:renew-lock";
 pub const RENEW_SESSION_LOCK_OPERATION: &str = "com.microsoft:renew-session-lock";
+pub const UPDATE_DISPOSITION_OPERATION: &str = "com.microsoft:update-disposition";
 pub const GET_SESSION_STATE_OPERATION: &str = "com.microsoft:get-session-state";
 pub const SET_SESSION_STATE_OPERATION: &str = "com.microsoft:set-session-state";
 pub const OPERATION_PROPERTY: &str = "operation";
@@ -38,6 +40,12 @@ pub const FROM_SEQUENCE_NUMBER: &str = "from-sequence-number";
 pub const MESSAGE_COUNT: &str = "message-count";
 pub const MESSAGES: &str = "messages";
 pub const MESSAGE: &str = "message";
+pub const LOCK_TOKEN: &str = "lock-token";
+pub const SEQUENCE_NUMBERS: &str = "sequence-numbers";
+pub const RECEIVER_SETTLE_MODE: &str = "receiver-settle-mode";
+pub const DISPOSITION_STATUS: &str = "disposition-status";
+pub const DEAD_LETTER_REASON: &str = "deadletter-reason";
+pub const DEAD_LETTER_DESCRIPTION: &str = "deadletter-description";
 pub const SESSION_ID: &str = "session-id";
 pub const SESSION_STATE: &str = "session-state";
 
@@ -457,6 +465,18 @@ async fn process_request<B: Broker>(
         PEEK_MESSAGE_OPERATION => {
             peek_messages(message, message_id, tracking_id, namespace, entity, broker).await
         }
+        RECEIVE_BY_SEQUENCE_NUMBER_OPERATION => {
+            receive_by_sequence_number(
+                message,
+                message_id,
+                tracking_id,
+                namespace,
+                entity,
+                broker,
+                management,
+            )
+            .await
+        }
         RENEW_LOCK_OPERATION => {
             renew_message_lock(
                 message,
@@ -471,6 +491,18 @@ async fn process_request<B: Broker>(
         }
         RENEW_SESSION_LOCK_OPERATION => {
             renew_session_lock(
+                message,
+                message_id,
+                tracking_id,
+                namespace,
+                entity,
+                broker,
+                management,
+            )
+            .await
+        }
+        UPDATE_DISPOSITION_OPERATION => {
+            update_disposition(
                 message,
                 message_id,
                 tracking_id,
@@ -510,6 +542,226 @@ async fn process_request<B: Broker>(
             tracking_id,
             "unsupported management operation",
         ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn receive_by_sequence_number<B: Broker>(
+    message: &Message,
+    message_id: MessageId,
+    tracking_id: Option<String>,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    broker: &B,
+    management: &ConnectionManagement,
+) -> ManagementResponse {
+    let link_name = message
+        .application_properties
+        .as_ref()
+        .and_then(|properties| string_property(properties, ASSOCIATED_LINK_NAME_PROPERTY));
+    let Some(sequences) = sequence_numbers(&message.body) else {
+        return ManagementResponse::bad_request(
+            message_id,
+            tracking_id,
+            "sequence-numbers must be an AMQP array or list of non-negative integer values",
+        );
+    };
+    let mode = match unsigned_map_value(&message.body, RECEIVER_SETTLE_MODE) {
+        Some(0) => domain::ReceiveMode::ReceiveAndDelete,
+        Some(1) => domain::ReceiveMode::PeekLock,
+        _ => {
+            return ManagementResponse::bad_request(
+                message_id,
+                tracking_id,
+                "receiver-settle-mode must be 0 or 1",
+            );
+        }
+    };
+    let session_id = match string_map_value(&message.body, SESSION_ID) {
+        Some(session_id) => match SessionId::new(session_id) {
+            Ok(session_id) => Some(session_id),
+            Err(error) => {
+                return ManagementResponse::bad_request(
+                    message_id,
+                    tracking_id,
+                    format!("session-id is invalid: {error}"),
+                );
+            }
+        },
+        None => None,
+    };
+
+    match broker
+        .submit(
+            namespace.clone(),
+            entity.clone(),
+            CommandKind::ReceiveDeferred {
+                sequences,
+                mode,
+                lock_duration_millis: None,
+                session_id,
+            },
+        )
+        .await
+    {
+        Ok(CommandOutcome::DeferredReceived(deliveries)) => {
+            let mut messages = Vec::with_capacity(deliveries.len());
+            for delivery in deliveries {
+                let encoded = match encode_message(&write_delivery(&delivery)) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        return ManagementResponse::internal(
+                            message_id,
+                            tracking_id,
+                            format!("encoding a deferred message failed: {error}"),
+                        );
+                    }
+                };
+                let lock = delivery.lock;
+                if let (Some(link_name), Some(lock)) = (link_name, lock) {
+                    management
+                        .register_delivery(link_name, entity.clone(), delivery.sequence, lock.token)
+                        .await;
+                }
+
+                let mut entry = OrderedMap::new();
+                entry.insert(
+                    Value::String(MESSAGE.to_owned()),
+                    Value::Binary(Binary::from(encoded)),
+                );
+                if let Some(lock) = lock {
+                    entry.insert(
+                        Value::String(LOCK_TOKEN.to_owned()),
+                        Value::Uuid(lock_token_uuid(lock.token)),
+                    );
+                }
+                messages.push(Value::Map(entry));
+            }
+            ManagementResponse::accepted(
+                message_id,
+                tracking_id,
+                map_body(MESSAGES, Value::List(messages)),
+            )
+        }
+        Ok(other) => ManagementResponse::internal(
+            message_id,
+            tracking_id,
+            format!("receiving deferred messages produced an unexpected outcome: {other:?}"),
+        ),
+        Err(rejection) => ManagementResponse::from_rejection(message_id, tracking_id, &rejection),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_disposition<B: Broker>(
+    message: &Message,
+    message_id: MessageId,
+    tracking_id: Option<String>,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    broker: &B,
+    management: &ConnectionManagement,
+) -> ManagementResponse {
+    let Some(properties) = message.application_properties.as_ref() else {
+        return ManagementResponse::bad_request(
+            message_id,
+            tracking_id,
+            "application properties are required",
+        );
+    };
+    let Some(link_name) = string_property(properties, ASSOCIATED_LINK_NAME_PROPERTY) else {
+        return ManagementResponse::bad_request(
+            message_id,
+            tracking_id,
+            "the associated receive link name is required",
+        );
+    };
+    let Some(tokens) = lock_tokens(&message.body) else {
+        return ManagementResponse::bad_request(
+            message_id,
+            tracking_id,
+            "lock-tokens must be an AMQP value array of UUIDs",
+        );
+    };
+    if tokens.len() != 1 {
+        return ManagementResponse::bad_request(
+            message_id,
+            tracking_id,
+            "exactly one lock token is required",
+        );
+    }
+    let Some(status) = string_map_value(&message.body, DISPOSITION_STATUS) else {
+        return ManagementResponse::bad_request(
+            message_id,
+            tracking_id,
+            "disposition-status must be an AMQP string value",
+        );
+    };
+
+    let lock_token = tokens[0];
+    let Some(delivery) = management.delivery(link_name, lock_token).await else {
+        return ManagementResponse::lock_lost(
+            message_id,
+            tracking_id,
+            "the lock token is not active on the associated link",
+        );
+    };
+    if &delivery.entity != entity {
+        return ManagementResponse::lock_lost(
+            message_id,
+            tracking_id,
+            "the lock token belongs to another entity",
+        );
+    }
+
+    let kind = match status {
+        "completed" => CommandKind::Complete {
+            sequence: delivery.sequence,
+            lock_token,
+        },
+        "abandoned" => CommandKind::Abandon {
+            sequence: delivery.sequence,
+            lock_token,
+        },
+        "defered" => CommandKind::Defer {
+            sequence: delivery.sequence,
+            lock_token,
+        },
+        "suspended" => CommandKind::DeadLetter {
+            sequence: delivery.sequence,
+            lock_token,
+            reason: string_map_value(&message.body, DEAD_LETTER_REASON)
+                .unwrap_or("DeadLetteredByReceiver")
+                .to_owned(),
+            description: string_map_value(&message.body, DEAD_LETTER_DESCRIPTION)
+                .unwrap_or("the receiver dead-lettered the message")
+                .to_owned(),
+        },
+        _ => {
+            return ManagementResponse::bad_request(
+                message_id,
+                tracking_id,
+                format!("unsupported disposition-status {status:?}"),
+            );
+        }
+    };
+
+    match broker.submit(namespace.clone(), entity.clone(), kind).await {
+        Ok(
+            CommandOutcome::Completed
+            | CommandOutcome::Abandoned { .. }
+            | CommandOutcome::Deferred
+            | CommandOutcome::DeadLettered,
+        ) => {
+            management.unregister_delivery(link_name, lock_token).await;
+            ManagementResponse::accepted(message_id, tracking_id, Value::Null)
+        }
+        Ok(other) => ManagementResponse::internal(
+            message_id,
+            tracking_id,
+            format!("updating disposition produced an unexpected outcome: {other:?}"),
+        ),
+        Err(rejection) => ManagementResponse::from_rejection(message_id, tracking_id, &rejection),
     }
 }
 
@@ -895,7 +1147,11 @@ fn string_map_value<'a>(body: &'a Body, name: &str) -> Option<&'a str> {
 }
 
 fn unsigned_map_value(body: &Body, name: &str) -> Option<u64> {
-    match map_value(body, name)? {
+    unsigned_value(map_value(body, name)?)
+}
+
+fn unsigned_value(value: &Value) -> Option<u64> {
+    match value {
         Value::Ubyte(value) => Some(u64::from(*value)),
         Value::Ushort(value) => Some(u64::from(*value)),
         Value::Uint(value) => Some(u64::from(*value)),
@@ -904,6 +1160,21 @@ fn unsigned_map_value(body: &Body, name: &str) -> Option<u64> {
         Value::Short(value) => u64::try_from(*value).ok(),
         Value::Int(value) => u64::try_from(*value).ok(),
         Value::Long(value) => u64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn sequence_numbers(body: &Body) -> Option<Vec<SequenceNumber>> {
+    let value = map_value(body, SEQUENCE_NUMBERS)?;
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .map(|value| unsigned_value(value).map(SequenceNumber::new))
+            .collect(),
+        Value::List(values) => values
+            .iter()
+            .map(|value| unsigned_value(value).map(SequenceNumber::new))
+            .collect(),
         _ => None,
     }
 }
@@ -942,6 +1213,12 @@ fn lock_token(uuid: &Uuid) -> Option<LockToken> {
     Some(LockToken::new(u64::from_be_bytes(
         bytes[8..].try_into().ok()?,
     )))
+}
+
+fn lock_token_uuid(token: LockToken) -> Uuid {
+    let mut bytes = [0_u8; 16];
+    bytes[8..].copy_from_slice(&token.as_u64().to_be_bytes());
+    Uuid::from(bytes)
 }
 
 pub(crate) async fn serve_management_replies(

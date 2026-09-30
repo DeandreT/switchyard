@@ -18,7 +18,11 @@ pub const VALUE_FORMAT_V2: u8 = 2;
 /// or locked record. Every other record keeps its version 2 shape.
 pub const VALUE_FORMAT_V3: u8 = 3;
 
-pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V3;
+/// Adds the deferred message state. Every other record keeps its version 3
+/// shape.
+pub const VALUE_FORMAT_V4: u8 = 4;
+
+pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V4;
 
 /// Encodes a value into a versioned envelope.
 ///
@@ -92,7 +96,12 @@ mod tests {
     #[test]
     fn a_record_that_never_changed_shape_reads_under_either_version() -> Result<(), CodecError> {
         let payload = postcard::to_stdvec(&(7_u64, String::from("orders"))).expect("encodes");
-        for version in [VALUE_FORMAT_V1, VALUE_FORMAT_V2, VALUE_FORMAT_V3] {
+        for version in [
+            VALUE_FORMAT_V1,
+            VALUE_FORMAT_V2,
+            VALUE_FORMAT_V3,
+            VALUE_FORMAT_V4,
+        ] {
             let mut envelope = vec![version];
             envelope.extend_from_slice(&payload);
             assert_eq!(

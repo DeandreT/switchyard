@@ -114,6 +114,7 @@ pub enum MessageState {
         token: LockToken,
         locked_until: Timestamp,
     },
+    Deferred,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -240,7 +241,8 @@ impl MessageRecord {
         match version {
             codec::VALUE_FORMAT_V1 => Ok(codec::decode_payload::<MessageRecordV1>(payload)?.into()),
             codec::VALUE_FORMAT_V2 => Ok(codec::decode_payload::<MessageRecordV2>(payload)?.into()),
-            _ => codec::decode_payload(payload),
+            codec::VALUE_FORMAT_V3 | codec::VALUE_FORMAT_V4 => codec::decode_payload(payload),
+            _ => unreachable!("split rejects unknown value formats"),
         }
     }
 
@@ -342,7 +344,7 @@ mod tests {
             ..record(None)
         };
         let envelope = codec::encode(&original)?;
-        assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V3));
+        assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V4));
         assert_eq!(MessageRecord::decode(&envelope)?, original);
         Ok(())
     }

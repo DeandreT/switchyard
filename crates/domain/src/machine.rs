@@ -120,6 +120,10 @@ impl<S: StateStore> StateMachine<S> {
                 description,
                 &mut batch,
             )?,
+            CommandKind::Defer {
+                sequence,
+                lock_token,
+            } => self.defer(command, *sequence, *lock_token, &mut batch)?,
             CommandKind::RenewLock {
                 sequence,
                 lock_token,
@@ -129,6 +133,19 @@ impl<S: StateStore> StateMachine<S> {
                 *sequence,
                 *lock_token,
                 *lock_duration_millis,
+                &mut batch,
+            )?,
+            CommandKind::ReceiveDeferred {
+                sequences,
+                mode,
+                lock_duration_millis,
+                session_id,
+            } => self.receive_deferred(
+                command,
+                sequences,
+                *mode,
+                *lock_duration_millis,
+                session_id.as_ref(),
                 &mut batch,
             )?,
             CommandKind::AcceptSession {
@@ -677,6 +694,124 @@ impl<S: StateStore> StateMachine<S> {
         Ok(CommandOutcome::DeadLettered)
     }
 
+    fn defer(
+        &self,
+        command: &Command,
+        sequence: SequenceNumber,
+        lock_token: LockToken,
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        let (mut record, locked_until) = self.held_lock(command, sequence, lock_token)?;
+        record.state = MessageState::Deferred;
+        batch.push_delete(keys::lock(
+            &command.namespace,
+            &command.entity,
+            locked_until,
+            sequence,
+        ));
+        batch.push_put(
+            keys::message(&command.namespace, &command.entity, sequence),
+            codec::encode(&record)?,
+        );
+        Ok(CommandOutcome::Deferred)
+    }
+
+    fn receive_deferred(
+        &self,
+        command: &Command,
+        sequences: &[SequenceNumber],
+        mode: ReceiveMode,
+        lock_duration_millis: Option<u64>,
+        session_id: Option<&SessionId>,
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        let config = self.load_config(command)?;
+        require_session_agreement(&config, session_id.is_some())?;
+        let namespace = &command.namespace;
+        let entity = &command.entity;
+        let mut deliveries = Vec::with_capacity(sequences.len());
+        let mut counters = None;
+
+        for sequence in sequences {
+            let mut record = self.load_message(command, *sequence)?;
+            if record.state != MessageState::Deferred {
+                return Err(BrokerError::MessageNotDeferred {
+                    sequence: *sequence,
+                });
+            }
+            if session_id.is_some_and(|session_id| record.session_id.as_ref() != Some(session_id)) {
+                return Err(BrokerError::MessageNotDeferred {
+                    sequence: *sequence,
+                });
+            }
+            if record.is_expired_at(command.issued_at) {
+                self.move_to_dead_letter(
+                    command,
+                    record,
+                    DeadLetterReason::TimeToLiveExpired,
+                    String::from("the message exceeded its time to live"),
+                    batch,
+                )?;
+                continue;
+            }
+
+            record.delivery_count = record.delivery_count.saturating_add(1);
+            let delivery_count = record.delivery_count;
+            let lock = match mode {
+                ReceiveMode::PeekLock => {
+                    let counters = counters.get_or_insert(self.load_counters(command)?);
+                    let token = LockToken::new(counters.next_lock_token);
+                    counters.next_lock_token = counters.next_lock_token.saturating_add(1);
+                    let locked_until = command.issued_at.saturating_add_millis(
+                        lock_duration_millis.unwrap_or(config.lock_duration_millis),
+                    );
+                    record.state = MessageState::Locked {
+                        token,
+                        locked_until,
+                    };
+                    batch.push_put(
+                        keys::message(namespace, entity, *sequence),
+                        codec::encode(&record)?,
+                    );
+                    batch.push_put(
+                        keys::lock(namespace, entity, locked_until, *sequence),
+                        Vec::new(),
+                    );
+                    Some(DeliveryLock {
+                        token,
+                        locked_until,
+                    })
+                }
+                ReceiveMode::ReceiveAndDelete => {
+                    batch.push_delete(keys::message(namespace, entity, *sequence));
+                    if let Some(expires_at) = record.expires_at {
+                        batch.push_delete(keys::expiry(namespace, entity, expires_at, *sequence));
+                    }
+                    None
+                }
+            };
+
+            deliveries.push(Delivery {
+                sequence: *sequence,
+                message_id: record.message_id,
+                body: record.body,
+                enqueued_at: record.enqueued_at,
+                delivery_count,
+                lock,
+                session_id: record.session_id,
+                dead_letter: record.dead_letter,
+            });
+        }
+
+        if let Some(counters) = counters {
+            batch.push_put(
+                keys::queue_counters(namespace, entity),
+                codec::encode(&counters)?,
+            );
+        }
+        Ok(CommandOutcome::DeferredReceived(deliveries))
+    }
+
     fn expire_locks(
         &self,
         command: &Command,
@@ -1129,6 +1264,7 @@ impl<S: StateStore> StateMachine<S> {
             MessageState::Locked { locked_until, .. } => {
                 batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
             }
+            MessageState::Deferred => {}
         }
         batch.push_delete(keys::message(namespace, entity, sequence));
         if let Some(expires_at) = record.expires_at {
