@@ -70,6 +70,16 @@ impl SharedAccessPolicy {
         })
     }
 
+    /// Authenticates a token's own audience without authorizing a requested
+    /// operation. Callers must check the returned grant with `AccessGrant::allows`.
+    pub fn authenticate_sas(
+        &self,
+        token: &str,
+        now_epoch_seconds: u64,
+    ) -> Result<AccessGrant, SasError> {
+        self.validate_sas_inner(token, None, now_epoch_seconds)
+    }
+
     /// Validates one Service Bus shared-access token for the CBS audience.
     ///
     /// The HMAC input deliberately retains the token's encoded `sr` field.
@@ -81,16 +91,30 @@ impl SharedAccessPolicy {
         requested_audience: &str,
         now_epoch_seconds: u64,
     ) -> Result<AccessGrant, SasError> {
+        self.validate_sas_inner(token, Some(requested_audience), now_epoch_seconds)
+    }
+
+    fn validate_sas_inner(
+        &self,
+        token: &str,
+        requested_audience: Option<&str>,
+        now_epoch_seconds: u64,
+    ) -> Result<AccessGrant, SasError> {
         let token = ParsedToken::parse(token)?;
         if token.expiry <= now_epoch_seconds {
             return Err(SasError::Expired);
         }
 
-        let requested =
-            ResourceScope::parse(requested_audience).map_err(|_| SasError::InvalidAudience)?;
+        let requested = requested_audience
+            .map(ResourceScope::parse)
+            .transpose()
+            .map_err(|_| SasError::InvalidAudience)?;
         let token_scope =
             ResourceScope::parse(&token.resource).map_err(|_| SasError::InvalidAudience)?;
-        if !token_scope.contains(&requested) {
+        if requested
+            .as_ref()
+            .is_some_and(|requested| !token_scope.contains(requested))
+        {
             return Err(SasError::AudienceMismatch);
         }
 
@@ -379,6 +403,166 @@ mod tests {
 
         assert_eq!(
             policy.validate_sas(KNOWN_TOKEN, sibling, EXPIRY - 1),
+            Err(SasError::AudienceMismatch)
+        );
+    }
+
+    #[test]
+    fn authentication_returns_the_verified_token_scope_and_permissions() {
+        let policy = policy(ResourceScope::namespace(HOST).unwrap(), "secret", None);
+        let grant = policy.authenticate_sas(KNOWN_TOKEN, EXPIRY - 1).unwrap();
+
+        assert_eq!(grant.subject(), "send");
+        assert_eq!(grant.scope(), &ResourceScope::parse(ORDERS).unwrap());
+        assert_eq!(grant.expires_at_epoch_seconds(), EXPIRY);
+        assert_eq!(grant.permissions(), PermissionSet::SEND);
+        assert_eq!(
+            grant,
+            policy
+                .validate_sas(KNOWN_TOKEN, ORDERS, EXPIRY - 1)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn authentication_is_not_authorization_for_a_sibling_or_namespace() {
+        let policy = policy(ResourceScope::namespace(HOST).unwrap(), "secret", None);
+        let grant = policy.authenticate_sas(KNOWN_TOKEN, EXPIRY - 1).unwrap();
+        let sibling =
+            ResourceScope::parse("amqps://tenant.servicebus.windows.net/orders-archive").unwrap();
+        let namespace = ResourceScope::namespace(HOST).unwrap();
+        let requested = ResourceScope::parse(ORDERS).unwrap();
+
+        assert!(!grant.allows(&sibling, Permission::Send, EXPIRY - 1));
+        assert!(!grant.allows(&namespace, Permission::Send, EXPIRY - 1));
+        assert!(!grant.allows(&requested, Permission::Manage, EXPIRY - 1));
+        assert!(!grant.allows(&requested, Permission::Send, EXPIRY));
+        assert!(grant.allows(&requested, Permission::Send, EXPIRY - 1));
+        assert_eq!(
+            policy.validate_sas(
+                KNOWN_TOKEN,
+                "amqps://tenant.servicebus.windows.net/orders-archive",
+                EXPIRY - 1
+            ),
+            Err(SasError::AudienceMismatch)
+        );
+    }
+
+    #[test]
+    fn authentication_accepts_rotated_keys_and_rejects_forged_signatures() {
+        let policy = policy(
+            ResourceScope::namespace(HOST).unwrap(),
+            "old-key",
+            Some("new-key"),
+        );
+        for key in ["old-key", "new-key"] {
+            let signed = token(ENCODED_ORDERS, "send", EXPIRY, key);
+            assert!(policy.authenticate_sas(&signed, EXPIRY - 1).is_ok());
+        }
+
+        let forged = token(ENCODED_ORDERS, "send", EXPIRY, "unknown-key");
+        assert_eq!(
+            policy.authenticate_sas(&forged, EXPIRY - 1),
+            Err(SasError::InvalidSignature)
+        );
+        let invalid_base64 = KNOWN_TOKEN.replace(
+            "R8KtgcCb7NeOCrECrMXtQ13KLGC8CiJYw0fUnUQCznw%3D",
+            "not-base64",
+        );
+        assert_eq!(
+            policy.authenticate_sas(&invalid_base64, EXPIRY - 1),
+            Err(SasError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn authentication_rejects_unknown_rules_and_rule_scope_escalation() {
+        let namespace_policy = policy(ResourceScope::namespace(HOST).unwrap(), "secret", None);
+        let unknown_rule = token(ENCODED_ORDERS, "unknown", EXPIRY, "secret");
+        assert_eq!(
+            namespace_policy.authenticate_sas(&unknown_rule, EXPIRY - 1),
+            Err(SasError::UnknownRule)
+        );
+
+        let entity_policy = policy(ResourceScope::parse(ORDERS).unwrap(), "secret", None);
+        let namespace_token = token(
+            "amqps%3A%2F%2Ftenant.servicebus.windows.net",
+            "send",
+            EXPIRY,
+            "secret",
+        );
+        let sibling_token = token(
+            "amqps%3A%2F%2Ftenant.servicebus.windows.net%2Forders-archive",
+            "send",
+            EXPIRY,
+            "secret",
+        );
+        for signed in [namespace_token, sibling_token] {
+            assert_eq!(
+                entity_policy.authenticate_sas(&signed, EXPIRY - 1),
+                Err(SasError::RuleScopeMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn authentication_reuses_the_strict_token_parser_and_expiration_check() {
+        let policy = policy(ResourceScope::namespace(HOST).unwrap(), "secret", None);
+        let cases = [
+            ("not-a-token".to_owned(), SasError::Malformed),
+            (
+                format!("{KNOWN_TOKEN}&se={EXPIRY}"),
+                SasError::DuplicateField,
+            ),
+            (
+                format!("{KNOWN_TOKEN}&unexpected=x"),
+                SasError::UnknownField,
+            ),
+            (KNOWN_TOKEN.replace("%3A", "%XZ"), SasError::InvalidEncoding),
+            (
+                KNOWN_TOKEN.replace("se=2000000000", "se=-1"),
+                SasError::InvalidExpiration,
+            ),
+            (
+                KNOWN_TOKEN.replace("&skn=send", ""),
+                SasError::MissingField("skn"),
+            ),
+        ];
+        for (token, error) in cases {
+            assert_eq!(policy.authenticate_sas(&token, EXPIRY - 1), Err(error));
+        }
+        for now in [EXPIRY, EXPIRY + 1, u64::MAX] {
+            assert_eq!(
+                policy.authenticate_sas(KNOWN_TOKEN, now),
+                Err(SasError::Expired)
+            );
+        }
+
+        let invalid_audience = token("not-an-audience", "send", EXPIRY, "secret");
+        assert_eq!(
+            policy.authenticate_sas(&invalid_audience, EXPIRY - 1),
+            Err(SasError::InvalidAudience)
+        );
+    }
+
+    #[test]
+    fn requested_audience_validation_retains_its_error_precedence() {
+        let policy = policy(ResourceScope::namespace(HOST).unwrap(), "secret", None);
+        assert_eq!(
+            policy.validate_sas(KNOWN_TOKEN, "invalid", EXPIRY),
+            Err(SasError::Expired)
+        );
+        assert_eq!(
+            policy.validate_sas(KNOWN_TOKEN, "invalid", EXPIRY - 1),
+            Err(SasError::InvalidAudience)
+        );
+        let forged = token(ENCODED_ORDERS, "send", EXPIRY, "forged-key");
+        assert_eq!(
+            policy.validate_sas(
+                &forged,
+                "amqps://tenant.servicebus.windows.net/orders-archive",
+                EXPIRY - 1
+            ),
             Err(SasError::AudienceMismatch)
         );
     }

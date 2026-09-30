@@ -94,7 +94,11 @@ impl ResourceScope {
     }
 
     pub fn namespace(host: impl AsRef<str>) -> Result<Self, ResourceScopeError> {
-        Self::parse(&format!("amqps://{}", host.as_ref()))
+        let scope = Self::parse(&format!("amqps://{}", host.as_ref()))?;
+        if !scope.path.is_empty() {
+            return Err(ResourceScopeError::InvalidUri);
+        }
+        Ok(scope)
     }
 
     pub fn entity(
@@ -298,6 +302,22 @@ pub enum PolicyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_hosts_cannot_smuggle_an_entity_path() {
+        for host in ["tenant.example/orders", "tenant.example/%6frders"] {
+            assert_eq!(
+                ResourceScope::namespace(host),
+                Err(ResourceScopeError::InvalidUri)
+            );
+            assert_eq!(
+                ResourceScope::entity(host, "other"),
+                Err(ResourceScopeError::InvalidUri)
+            );
+        }
+        assert!(ResourceScope::namespace("tenant.example").is_ok());
+        assert!(ResourceScope::parse("amqps://tenant.example/orders").is_ok());
+    }
 
     #[test]
     fn manage_includes_data_plane_rights() {
