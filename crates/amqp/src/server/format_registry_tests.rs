@@ -92,6 +92,9 @@ impl Harness {
                     } else {
                         MessageFormatDecoders::default()
                     },
+                    identity: LinkIdentity::new(),
+                    sender_settle_mode: SenderSettleMode::Mixed,
+                    receiver_settle_mode: ReceiverSettleMode::First,
                 }),
             );
             receivers.push(receiver);

@@ -26,6 +26,7 @@ mod flow_control;
 mod format_registry;
 mod frame_writer;
 mod idle;
+mod incoming_ledger;
 mod receive_credit;
 
 use flow_control::{LinkCredit, LinkSnapshot, SessionWindow};
@@ -33,6 +34,11 @@ pub use format_registry::MessageFormatDecoders;
 use frame_writer::FrameWriter;
 pub use idle::ConnectionOptions;
 use idle::{Activity, ActivityTimeout, validate_idle_timeout};
+#[cfg(test)]
+use incoming_ledger::Completion;
+use incoming_ledger::{
+    DeliveryIdentity, IncomingLedger, IncomingLedgerError, LinkIdentity, SettlementAction,
+};
 use receive_credit::{Consumption, ReceiveCredit};
 
 const LINK_CREDIT: u32 = 32;
@@ -404,14 +410,18 @@ pub struct Receiver {
     deliveries: mpsc::Receiver<Delivery>,
     detached: watch::Receiver<bool>,
     consumption: Arc<Consumption>,
+    identity: LinkIdentity,
 }
 
 #[derive(Clone, Debug)]
 pub struct Delivery {
+    #[cfg(test)]
     id: u32,
+    #[cfg(test)]
     settled: bool,
     message_format: u32,
     message: Message,
+    identity: DeliveryIdentity,
 }
 
 impl Delivery {
@@ -654,6 +664,7 @@ impl ServerSession {
         }
         let (deliveries_tx, deliveries) = mpsc::channel(DELIVERY_QUEUE_CAPACITY);
         let consumption = Arc::new(Consumption::new(self.consumed.clone()));
+        let identity = LinkIdentity::new();
         let (detached_tx, detached) = watch::channel(false);
         let role = attach.role.clone();
         let name = attach.name.clone();
@@ -668,6 +679,7 @@ impl ServerSession {
             deliveries_tx,
             detached_tx,
             consumption: consumption.clone(),
+            identity: identity.clone(),
             reply,
         })
         .await?;
@@ -680,6 +692,7 @@ impl ServerSession {
                 deliveries,
                 detached,
                 consumption,
+                identity,
             }),
             Role::Receiver => LinkEndpoint::Sender(Sender {
                 name,
@@ -811,13 +824,15 @@ impl Receiver {
     }
 
     async fn settle(&self, delivery: &Delivery, state: DeliveryState) -> Result<(), EngineError> {
-        if delivery.settled {
-            return Ok(());
+        if !delivery.identity.belongs_to(&self.identity) {
+            return Err(invalid_state(
+                "delivery belongs to a different receiving link generation",
+            ));
         }
         request(&self.commands, |reply| Command::Settle {
             channel: self.channel,
             handle: self.handle,
-            delivery_id: delivery.id,
+            identity: delivery.identity.clone(),
             state,
             reply,
         })
@@ -896,6 +911,7 @@ enum Command {
         deliveries_tx: mpsc::Sender<Delivery>,
         detached_tx: watch::Sender<bool>,
         consumption: Arc<Consumption>,
+        identity: LinkIdentity,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
     Send {
@@ -908,7 +924,7 @@ enum Command {
     Settle {
         channel: u16,
         handle: u32,
-        delivery_id: u32,
+        identity: DeliveryIdentity,
         state: DeliveryState,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
@@ -957,6 +973,7 @@ struct SessionState {
     flow: SessionWindow,
     next_delivery_id: u32,
     ending: bool,
+    incoming: IncomingLedger,
 }
 
 struct PendingLinkFlow {
@@ -1022,6 +1039,7 @@ impl SessionState {
             ),
             next_delivery_id: 0,
             ending: false,
+            incoming: IncomingLedger::new(),
         }
     }
 }
@@ -1078,6 +1096,9 @@ struct ReceivingLink {
     detached: watch::Sender<bool>,
     credit: ReceiveCredit,
     decoders: MessageFormatDecoders,
+    identity: LinkIdentity,
+    sender_settle_mode: SenderSettleMode,
+    receiver_settle_mode: ReceiverSettleMode,
 }
 
 struct PartialDelivery {
@@ -1086,6 +1107,9 @@ struct PartialDelivery {
     message_format: u32,
     settled: bool,
     bytes: Vec<u8>,
+    identity: DeliveryIdentity,
+    forbidden_receiver_mode: bool,
+    forbidden_sender_settled: bool,
 }
 
 async fn run_connection<Io>(
@@ -1430,6 +1454,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                             .await?;
                     }
                 } else if let Some(mut link) = session.links.remove(&detach.handle) {
+                    forget_incoming_link(&mut session.incoming, &link);
                     stop_link(&mut link);
                     if !locally_closing {
                         writer
@@ -1526,6 +1551,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             deliveries_tx,
             detached_tx,
             consumption,
+            identity,
             reply,
         } => {
             let attach = *attach;
@@ -1621,6 +1647,9 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                             detached: detached_tx,
                             credit: ReceiveCredit::new(initial_count, LINK_CREDIT, consumption),
                             decoders,
+                            identity,
+                            sender_settle_mode: attach.snd_settle_mode,
+                            receiver_settle_mode: attach.rcv_settle_mode,
                         }),
                     );
                     refill_link(channel, handle, session, writer).await?;
@@ -1685,33 +1714,11 @@ async fn handle_command<W: AsyncWrite + Unpin>(
         Command::Settle {
             channel,
             handle,
-            delivery_id,
+            identity,
             state,
             reply,
         } => {
-            let Some(session) = sessions.get_mut(&channel) else {
-                let _ = reply.send(Err(EngineError::RemoteDetached));
-                return Ok(CommandAction::Continue);
-            };
-            if !matches!(session.links.get(&handle), Some(LinkState::Receiving(_))) {
-                let _ = reply.send(Err(invalid_state("settlement on an unknown link")));
-                return Ok(CommandAction::Continue);
-            }
-            writer
-                .write_amqp(
-                    channel,
-                    Performative::Disposition(Disposition {
-                        role: Role::Receiver,
-                        first: delivery_id,
-                        last: None,
-                        settled: true,
-                        state: Some(state),
-                        batchable: false,
-                    }),
-                    Vec::new(),
-                )
-                .await?;
-            let _ = reply.send(Ok(()));
+            settle_incoming(channel, handle, identity, state, reply, sessions, writer).await?;
         }
         Command::SettleOutgoing {
             channel,
@@ -1756,6 +1763,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             if let Some(session) = sessions.get_mut(&channel)
                 && let Some(mut link) = session.links.remove(&handle)
             {
+                forget_incoming_link(&mut session.incoming, &link);
                 remember_closing_handle(session, handle)?;
                 writer
                     .write_amqp(
@@ -1780,6 +1788,60 @@ async fn handle_command<W: AsyncWrite + Unpin>(
         }
     }
     Ok(CommandAction::Continue)
+}
+
+async fn settle_incoming<W: AsyncWrite + Unpin>(
+    channel: u16,
+    handle: u32,
+    identity: DeliveryIdentity,
+    state: DeliveryState,
+    reply: oneshot::Sender<Result<(), EngineError>>,
+    sessions: &mut HashMap<u16, SessionState>,
+    writer: &mut FrameWriter<W>,
+) -> Result<(), EngineError> {
+    let Some(session) = sessions.get_mut(&channel) else {
+        let _ = reply.send(Err(EngineError::RemoteDetached));
+        return Ok(());
+    };
+    let Some(LinkState::Receiving(link)) = session.links.get(&handle) else {
+        let _ = reply.send(Err(invalid_state(
+            "settlement on an unknown receiving link",
+        )));
+        return Ok(());
+    };
+    let owner = link.identity.clone();
+    let action = match session.incoming.settlement(&owner, &identity) {
+        Ok(action) => action,
+        Err(error) => {
+            let _ = reply.send(Err(invalid_state(error.to_string())));
+            return Ok(());
+        }
+    };
+    if let SettlementAction::SendDisposition { settled } = action {
+        let frame = Frame::Amqp {
+            channel,
+            performative: Some(Performative::Disposition(Disposition {
+                role: Role::Receiver,
+                first: identity.id(),
+                last: None,
+                settled,
+                state: Some(state),
+                batchable: false,
+            })),
+            payload: Vec::new(),
+        };
+        if let Err(error) = writer.encoded_frame(&frame) {
+            let _ = reply.send(Err(error.into()));
+            return Ok(());
+        }
+        writer.write_frame(&frame).await?;
+    }
+    session
+        .incoming
+        .commit_settlement(&owner, &identity)
+        .map_err(|error| invalid_state(error.to_string()))?;
+    let _ = reply.send(Ok(()));
+    Ok(())
 }
 
 async fn receive_transfer<W: AsyncWrite + Unpin>(
@@ -1875,6 +1937,42 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         .await?;
         return refill_link(channel, transfer.handle, session, writer).await;
     }
+    let identity = if let Some(partial) = &link.partial {
+        partial.identity.clone()
+    } else {
+        let result = session.incoming.reserve(
+            &link.identity,
+            transfer
+                .delivery_id
+                .expect("first transfer id was validated"),
+            transfer
+                .delivery_tag
+                .as_ref()
+                .expect("first transfer tag was validated"),
+        );
+        match result {
+            Ok(identity) => identity,
+            Err(error) => {
+                let condition = match error {
+                    IncomingLedgerError::LinkLimitReached { .. }
+                    | IncomingLedgerError::SessionLimitReached { .. } => {
+                        "amqp:resource-limit-exceeded"
+                    }
+                    _ => "amqp:invalid-field",
+                };
+                detach_link_error(
+                    channel,
+                    transfer.handle,
+                    session,
+                    writer,
+                    condition,
+                    error.to_string(),
+                )
+                .await?;
+                return refill_link(channel, transfer.handle, session, writer).await;
+            }
+        }
+    };
     if link.partial.is_none()
         && let Err(error) = link.credit.try_begin_delivery()
     {
@@ -1891,6 +1989,10 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
     }
     if transfer.aborted {
         link.partial = None;
+        session
+            .incoming
+            .abort(&identity)
+            .map_err(|error| invalid_state(error.to_string()))?;
         link.credit
             .abort_delivery()
             .map_err(|error| invalid_state(error.to_string()))?;
@@ -1921,6 +2023,12 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         Some(mut partial) => {
             partial.bytes.extend_from_slice(&payload);
             partial.settled |= transfer.settled.unwrap_or(false);
+            partial.forbidden_receiver_mode |= link.receiver_settle_mode
+                == ReceiverSettleMode::First
+                && transfer.rcv_settle_mode == Some(ReceiverSettleMode::Second);
+            partial.forbidden_sender_settled |= link.sender_settle_mode
+                == SenderSettleMode::Unsettled
+                && transfer.settled == Some(true);
             partial
         }
         None => PartialDelivery {
@@ -1935,10 +2043,43 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
                 .expect("first transfer format was validated"),
             settled: transfer.settled.unwrap_or(false),
             bytes: payload,
+            identity,
+            forbidden_receiver_mode: link.receiver_settle_mode == ReceiverSettleMode::First
+                && transfer.rcv_settle_mode == Some(ReceiverSettleMode::Second),
+            forbidden_sender_settled: link.sender_settle_mode == SenderSettleMode::Unsettled
+                && transfer.settled == Some(true),
         },
     };
     if transfer.more {
         link.partial = Some(partial);
+        return refill_link(channel, transfer.handle, session, writer).await;
+    }
+
+    let mode_error = if partial.forbidden_sender_settled {
+        Some("settled transfer violates the negotiated unsettled sender mode")
+    } else if link.sender_settle_mode == SenderSettleMode::Settled && !partial.settled {
+        Some("delivery has no settled transfer on a settled sender link")
+    } else if partial.forbidden_receiver_mode
+        && !partial.settled
+        && !session
+            .incoming
+            .sender_is_settled(&partial.identity)
+            .map_err(|error| invalid_state(error.to_string()))?
+    {
+        Some("second receiver mode is not permitted on a first-mode link")
+    } else {
+        None
+    };
+    if let Some(description) = mode_error {
+        detach_link_error(
+            channel,
+            transfer.handle,
+            session,
+            writer,
+            "amqp:invalid-field",
+            description,
+        )
+        .await?;
         return refill_link(channel, transfer.handle, session, writer).await;
     }
 
@@ -1966,13 +2107,26 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
             return refill_link(channel, transfer.handle, session, writer).await;
         }
     };
+    let _completion = session
+        .incoming
+        .complete(
+            &partial.identity,
+            partial.settled,
+            transfer
+                .rcv_settle_mode
+                .unwrap_or_else(|| link.receiver_settle_mode.clone()),
+        )
+        .map_err(|error| invalid_state(error.to_string()))?;
     if link
         .deliveries
         .try_send(Delivery {
+            #[cfg(test)]
             id: partial.id,
-            settled: partial.settled,
+            #[cfg(test)]
+            settled: _completion == Completion::SenderSettled,
             message_format: partial.message_format,
             message,
+            identity: partial.identity,
         })
         .is_err()
     {
@@ -2421,6 +2575,7 @@ async fn detach_link_error<W: AsyncWrite + Unpin>(
     writer.encoded_frame(&frame)?;
     remember_closing_handle(session, handle)?;
     if let Some(mut link) = session.links.remove(&handle) {
+        forget_incoming_link(&mut session.incoming, &link);
         stop_link(&mut link);
     }
     writer.write_frame(&frame).await?;
@@ -2705,7 +2860,14 @@ async fn apply_disposition<W: AsyncWrite + Unpin>(
     _writer: &mut FrameWriter<W>,
     sessions: &mut HashMap<u16, SessionState>,
 ) -> Result<(), EngineError> {
-    if disposition.role != Role::Receiver {
+    if disposition.role == Role::Sender {
+        if disposition.settled
+            && let Some(session) = sessions.get_mut(&channel)
+        {
+            session
+                .incoming
+                .sender_settled_range(disposition.first, disposition.last);
+        }
         return Ok(());
     }
     let Some(state) = disposition.state else {
@@ -2742,6 +2904,12 @@ async fn apply_disposition<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+fn forget_incoming_link(incoming: &mut IncomingLedger, link: &LinkState) {
+    if let LinkState::Receiving(link) = link {
+        incoming.remove_link(&link.identity);
+    }
+}
+
 fn stop_link(link: &mut LinkState) {
     match link {
         LinkState::Sending(link) => {
@@ -2759,6 +2927,7 @@ fn stop_link(link: &mut LinkState) {
             }
         }
         LinkState::Receiving(link) => {
+            link.identity.retire();
             let _ = link.detached.send(true);
         }
     }
@@ -2883,6 +3052,7 @@ mod tests {
                 deliveries_tx,
                 detached_tx,
                 consumption: Arc::new(Consumption::new(Arc::new(Notify::new()))),
+                identity: LinkIdentity::new(),
                 reply,
             },
             &mut wire,
@@ -2924,3 +3094,6 @@ mod idle_tests;
 
 #[cfg(test)]
 mod format_registry_tests;
+
+#[cfg(test)]
+mod incoming_settlement_tests;

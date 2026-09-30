@@ -402,6 +402,9 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
             detached,
             credit: receiving_credit(),
             decoders: MessageFormatDecoders::default(),
+            identity: LinkIdentity::new(),
+            sender_settle_mode: SenderSettleMode::Mixed,
+            receiver_settle_mode: ReceiverSettleMode::First,
         }),
     );
     let (healthy_tx, mut healthy_rx) = mpsc::channel(1);
@@ -415,6 +418,9 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
             detached: healthy_detached,
             credit: receiving_credit(),
             decoders: MessageFormatDecoders::default(),
+            identity: LinkIdentity::new(),
+            sender_settle_mode: SenderSettleMode::Mixed,
+            receiver_settle_mode: ReceiverSettleMode::First,
         }),
     );
     let mut sessions = HashMap::from([(CHANNEL, session)]);
@@ -461,6 +467,7 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
             deliveries_tx,
             detached_tx,
             consumption: Arc::new(Consumption::new(Arc::new(Notify::new()))),
+            identity: LinkIdentity::new(),
             reply,
         },
         &mut wire,
@@ -633,7 +640,8 @@ mod client_tests {
             };
             assert_eq!(attach.max_message_size, maximum);
             let handle = attach.handle;
-            let response = attach.response(attach.source.clone(), attach.target.clone());
+            let mut response = attach.response(attach.source.clone(), attach.target.clone());
+            response.snd_settle_mode = SenderSettleMode::Mixed;
             write_amqp(
                 peer,
                 channel,

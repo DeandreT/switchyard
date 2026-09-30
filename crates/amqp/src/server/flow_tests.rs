@@ -384,12 +384,9 @@ async fn full_delivery_queue_keeps_echo_responsive_and_consumption_refills_exact
         },
     )
     .await;
-    let (endpoint, initial) = accept_link(
-        &mut session,
-        &mut peer,
-        attach(0, Role::Sender, false, u32::MAX),
-    )
-    .await;
+    let mut requested = attach(0, Role::Sender, false, u32::MAX);
+    requested.snd_settle_mode = SenderSettleMode::Mixed;
+    let (endpoint, initial) = accept_link(&mut session, &mut peer, requested).await;
     let LinkEndpoint::Receiver(mut receiver) = endpoint else {
         panic!("local receiver");
     };
@@ -488,8 +485,9 @@ async fn full_delivery_queue_keeps_echo_responsive_and_consumption_refills_exact
 async fn partial_and_first_frame_abort_release_only_their_reserved_slot() {
     let (mut connection, mut peer) = server_pair(512).await;
     let mut session = begin(&mut connection, &mut peer, 0, Begin::default()).await;
-    let (endpoint, _) =
-        accept_link(&mut session, &mut peer, attach(0, Role::Sender, false, 0)).await;
+    let mut requested = attach(0, Role::Sender, false, 0);
+    requested.snd_settle_mode = SenderSettleMode::Mixed;
+    let (endpoint, _) = accept_link(&mut session, &mut peer, requested).await;
     let LinkEndpoint::Receiver(mut receiver) = endpoint else {
         panic!("local receiver");
     };
@@ -1193,7 +1191,9 @@ async fn ended_session_rejects_stale_approval_send_and_settlement_without_closin
         .send(Command::Settle {
             channel: 0,
             handle: 0,
-            delivery_id: 0,
+            identity: IncomingLedger::new()
+                .reserve(&LinkIdentity::new(), 0, &[0])
+                .expect("stale token"),
             state: DeliveryState::Accepted(Accepted),
             reply,
         })

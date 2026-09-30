@@ -36,6 +36,7 @@ pub struct ClientReceiver {
     deliveries: mpsc::Receiver<Delivery>,
     detached: watch::Receiver<bool>,
     consumption: Arc<Consumption>,
+    identity: LinkIdentity,
 }
 
 pub type ClientDelivery = Delivery;
@@ -52,6 +53,7 @@ pub struct ClientReceiverBuilder {
     source: Option<Source>,
     target: Option<Target>,
     sender_settle_mode: SenderSettleMode,
+    receiver_settle_mode: ReceiverSettleMode,
     max_message_size: Option<u64>,
 }
 
@@ -346,6 +348,7 @@ impl ClientSession {
             deliveries_tx,
             detached_tx,
             consumption: Arc::new(Consumption::new(self.consumed.clone())),
+            identity: LinkIdentity::new(),
             reply,
         })
         .await?;
@@ -379,8 +382,15 @@ impl ClientSession {
         target: Option<Target>,
         sender_settle_mode: SenderSettleMode,
     ) -> Result<ClientReceiver, EngineError> {
-        self.attach_receiver_with_limit(name, source, target, sender_settle_mode, None)
-            .await
+        self.attach_receiver_with_limit(
+            name,
+            source,
+            target,
+            sender_settle_mode,
+            ReceiverSettleMode::First,
+            None,
+        )
+        .await
     }
 
     async fn attach_receiver_with_limit(
@@ -389,11 +399,13 @@ impl ClientSession {
         source: Source,
         target: Option<Target>,
         sender_settle_mode: SenderSettleMode,
+        receiver_settle_mode: ReceiverSettleMode,
         max_message_size: Option<u64>,
     ) -> Result<ClientReceiver, EngineError> {
         let name = name.into();
         let (deliveries_tx, deliveries) = mpsc::channel(DELIVERY_QUEUE_CAPACITY);
         let consumption = Arc::new(Consumption::new(self.consumed.clone()));
+        let identity = LinkIdentity::new();
         let (detached_tx, detached) = watch::channel(false);
         let (handle, response) = client_request(&self.commands, |reply| ClientCommand::Attach {
             channel: self.channel,
@@ -401,7 +413,7 @@ impl ClientSession {
                 name,
                 role: Role::Receiver,
                 sender_settle_mode,
-                receiver_settle_mode: ReceiverSettleMode::First,
+                receiver_settle_mode,
                 source: Some(source),
                 target,
                 max_message_size,
@@ -409,6 +421,7 @@ impl ClientSession {
             deliveries_tx,
             detached_tx,
             consumption: consumption.clone(),
+            identity: identity.clone(),
             reply,
         })
         .await?;
@@ -420,6 +433,7 @@ impl ClientSession {
             deliveries,
             detached,
             consumption,
+            identity,
         })
     }
 
@@ -488,6 +502,7 @@ impl ClientReceiver {
             source: None,
             target: None,
             sender_settle_mode: SenderSettleMode::Unsettled,
+            receiver_settle_mode: ReceiverSettleMode::First,
             max_message_size: None,
         }
     }
@@ -549,13 +564,15 @@ impl ClientReceiver {
         delivery: &ClientDelivery,
         state: DeliveryState,
     ) -> Result<(), EngineError> {
-        if delivery.settled {
-            return Ok(());
+        if !delivery.identity.belongs_to(&self.identity) {
+            return Err(invalid_state(
+                "delivery belongs to a different receiving link generation",
+            ));
         }
         client_request(&self.commands, |reply| ClientCommand::Settle {
             channel: self.channel,
             handle: self.handle,
-            delivery_id: delivery.id,
+            identity: delivery.identity.clone(),
             state,
             reply,
         })
@@ -593,6 +610,11 @@ impl ClientReceiverBuilder {
         self
     }
 
+    pub fn receiver_settle_mode(mut self, mode: ReceiverSettleMode) -> Self {
+        self.receiver_settle_mode = mode;
+        self
+    }
+
     /// Advertises the encoded-message limit; zero leaves the link unlimited.
     pub fn max_message_size(mut self, maximum: u64) -> Self {
         self.max_message_size = Some(maximum);
@@ -606,6 +628,7 @@ impl ClientReceiverBuilder {
                 self.source.unwrap_or_default(),
                 self.target,
                 self.sender_settle_mode,
+                self.receiver_settle_mode,
                 self.max_message_size,
             )
             .await
@@ -644,6 +667,7 @@ enum ClientCommand {
         deliveries_tx: mpsc::Sender<Delivery>,
         detached_tx: watch::Sender<bool>,
         consumption: Arc<Consumption>,
+        identity: LinkIdentity,
         reply: oneshot::Sender<Result<(u32, Attach), EngineError>>,
     },
     Send {
@@ -657,7 +681,7 @@ enum ClientCommand {
     Settle {
         channel: u16,
         handle: u32,
-        delivery_id: u32,
+        identity: DeliveryIdentity,
         state: DeliveryState,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
@@ -861,6 +885,7 @@ where
                                         match &mut link {
                                             LinkState::Sending(link) if attach.role == Role::Receiver => {
                                                 link.max_message_size = normalized_message_size(attach.max_message_size);
+                                                link.receiver_settle_mode = attach.rcv_settle_mode.clone();
                                                 if let Some(pending_flow) = &pending_flow {
                                                     link.credit = pending_flow.credit.clone();
                                                 }
@@ -879,6 +904,7 @@ where
                                                     continue;
                                                 }
                                                 link.credit = ReceiveCredit::new(initial, LINK_CREDIT, pending.consumption);
+                                                link.sender_settle_mode = attach.snd_settle_mode.clone();
                                             }
                                             _ => {
                                                 let _ = pending.reply.send(Err(invalid_state("attach response has the wrong role")));
@@ -933,6 +959,7 @@ where
                                     if let Some(session) = sessions.get_mut(&channel)
                                         && let Some(mut link) = session.links.remove(&detach.handle)
                                     {
+                                        forget_incoming_link(&mut session.incoming, &link);
                                         stop_link(&mut link);
                                     }
                                     if let Some(reply) = local_reply {
@@ -1025,6 +1052,7 @@ where
                                     deliveries_tx,
                                     detached_tx,
                                     consumption,
+                                    identity,
                                     reply,
                                 } => {
                                     let request = *request;
@@ -1089,6 +1117,9 @@ where
                                                 detached: detached_tx,
                                                 credit: ReceiveCredit::new(0, LINK_CREDIT, consumption.clone()),
                                                 decoders: MessageFormatDecoders::default(),
+                                                identity,
+                                                sender_settle_mode: request.sender_settle_mode,
+                                                receiver_settle_mode: request.receiver_settle_mode,
                                             })
                                         }
                                     };
@@ -1123,35 +1154,17 @@ where
                                 ClientCommand::Settle {
                                     channel,
                                     handle,
-                                    delivery_id,
+                                    identity,
                                     state,
                                     reply,
                                 } => {
-                                    if !matches!(
-                                        sessions.get(&channel).and_then(|session| session.links.get(&handle)),
-                                        Some(LinkState::Receiving(_))
-                                    ) {
-                                        let _ = reply.send(Err(EngineError::RemoteDetached));
-                                        continue;
-                                    }
-                                    let result = writer.write_amqp(channel,
-                                        Performative::Disposition(Disposition {
-                                            role: Role::Receiver,
-                                            first: delivery_id,
-                                            last: None,
-                                            settled: true,
-                                            state: Some(state),
-                                            batchable: false,
-                                        }),
-                                        Vec::new(),
-                                    ).await;
-                                    let _ = reply.send(result.as_ref().map(|_| ()).map_err(|error| {
-                                        EngineError::InvalidState(error.to_string())
-                                    }));
-                                    result.map_err(Into::into)
+                                    settle_incoming(channel, handle, identity, state, reply, &mut sessions, &mut writer).await
                                 }
                                 ClientCommand::Detach { channel, handle, reply } => {
                                     if let Some(session) = sessions.get_mut(&channel) {
+                                        if let Some(link) = session.links.get(&handle) {
+                                            forget_incoming_link(&mut session.incoming, link);
+                                        }
                                         remember_closing_handle(session, handle)?;
                                     }
                                     pending_detaches.insert((channel, handle), reply);

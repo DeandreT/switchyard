@@ -35,6 +35,9 @@ impl Harness {
                     detached,
                     credit,
                     decoders: MessageFormatDecoders::default(),
+                    identity: LinkIdentity::new(),
+                    sender_settle_mode: SenderSettleMode::Mixed,
+                    receiver_settle_mode: ReceiverSettleMode::First,
                 }),
             );
             receivers.push(receiver);
@@ -504,7 +507,8 @@ async fn client_receiver(
             panic!("receiver Attach");
         };
         let handle = attach.handle;
-        let response = attach.response(attach.source.clone(), attach.target.clone());
+        let mut response = attach.response(attach.source.clone(), attach.target.clone());
+        response.snd_settle_mode = SenderSettleMode::Mixed;
         write_amqp(
             peer,
             channel,
