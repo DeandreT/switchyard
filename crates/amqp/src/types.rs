@@ -564,6 +564,7 @@ pub enum Body {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Message {
     pub header: Option<Header>,
+    pub message_annotations: Option<Fields>,
     pub properties: Option<Properties>,
     pub application_properties: Option<ApplicationProperties>,
     pub body: Body,
@@ -587,6 +588,11 @@ pub struct MessageBuilder(Message);
 impl MessageBuilder {
     pub fn properties(mut self, properties: Properties) -> Self {
         self.0.properties = Some(properties);
+        self
+    }
+
+    pub fn message_annotations(mut self, annotations: Fields) -> Self {
+        self.0.message_annotations = Some(annotations);
         self
     }
 

@@ -24,6 +24,11 @@ use crate::{
 /// expired messages cannot stall the group.
 const MAX_RECEIVE_SCAN: usize = 32;
 
+/// Stored messages a single peek may inspect. Peeking is read-only, but it
+/// still has to be bounded because expired messages and session filters can be
+/// skipped before enough results are collected.
+const MAX_PEEK_SCAN: usize = 256;
+
 /// Index entries a single timer sweep may process. A sweep that reports this
 /// many may have more waiting, so the worker proposes another command.
 pub const TIMER_SCAN_LIMIT: usize = 256;
@@ -89,6 +94,11 @@ impl<S: StateStore> StateMachine<S> {
                 session.as_ref(),
                 &mut batch,
             )?,
+            CommandKind::Peek {
+                from_sequence,
+                max_messages,
+                session_id,
+            } => self.peek(command, *from_sequence, *max_messages, session_id.as_ref())?,
             CommandKind::Complete {
                 sequence,
                 lock_token,
@@ -533,6 +543,60 @@ impl<S: StateStore> StateMachine<S> {
         }
 
         Ok(CommandOutcome::Received(None))
+    }
+
+    fn peek(
+        &self,
+        command: &Command,
+        from_sequence: SequenceNumber,
+        max_messages: u32,
+        session_id: Option<&SessionId>,
+    ) -> Result<CommandOutcome, BrokerError> {
+        let config = self.load_config(command)?;
+        require_session_agreement(&config, session_id.is_some())?;
+        if max_messages == 0 {
+            return Ok(CommandOutcome::Peeked(Vec::new()));
+        }
+
+        let namespace = &command.namespace;
+        let entity = &command.entity;
+        let limit = usize::try_from(max_messages)
+            .unwrap_or(usize::MAX)
+            .min(MAX_PEEK_SCAN);
+        let prefix = keys::message_prefix(namespace, entity);
+        let start = keys::message(namespace, entity, from_sequence);
+        let records = self.store.scan_from(&prefix, &start, MAX_PEEK_SCAN)?;
+        let mut deliveries = Vec::with_capacity(limit);
+
+        for (key, _) in records {
+            let sequence = keys::trailing_sequence(&key).ok_or(BrokerError::MalformedIndexKey)?;
+            let record = self
+                .message(namespace, entity, sequence)?
+                .ok_or(BrokerError::DanglingIndexEntry { sequence })?;
+
+            if record.is_expired_at(command.issued_at) {
+                continue;
+            }
+            if session_id.is_some_and(|session_id| record.session_id.as_ref() != Some(session_id)) {
+                continue;
+            }
+
+            deliveries.push(Delivery {
+                sequence,
+                message_id: record.message_id,
+                body: record.body,
+                enqueued_at: record.enqueued_at,
+                delivery_count: record.delivery_count,
+                lock: None,
+                session_id: record.session_id,
+                dead_letter: record.dead_letter,
+            });
+            if deliveries.len() == limit {
+                break;
+            }
+        }
+
+        Ok(CommandOutcome::Peeked(deliveries))
     }
 
     fn complete(

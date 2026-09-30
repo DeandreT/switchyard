@@ -39,6 +39,7 @@ const SOURCE: u64 = 0x28;
 const TARGET: u64 = 0x29;
 
 const HEADER: u64 = 0x70;
+const MESSAGE_ANNOTATIONS: u64 = 0x72;
 const PROPERTIES: u64 = 0x73;
 const APPLICATION_PROPERTIES: u64 = 0x74;
 const DATA: u64 = 0x75;
@@ -244,6 +245,15 @@ pub fn encode_message(message: &Message) -> io::Result<Vec<u8>> {
     if let Some(header) = &message.header {
         append_value(&mut encoded, header_to_value(header))?;
     }
+    if message.message_annotations.is_some() {
+        append_value(
+            &mut encoded,
+            described(
+                MESSAGE_ANNOTATIONS,
+                fields_to_value(&message.message_annotations),
+            ),
+        )?;
+    }
     if let Some(properties) = &message.properties {
         append_value(&mut encoded, properties_to_value(properties))?;
     }
@@ -286,6 +296,9 @@ pub fn decode_message(encoded: &[u8]) -> io::Result<Message> {
         let (descriptor, value) = take_described(value)?;
         match descriptor {
             HEADER => message.header = Some(header_from_value(value)?),
+            MESSAGE_ANNOTATIONS => {
+                message.message_annotations = fields_from_value(value)?;
+            }
             PROPERTIES => message.properties = Some(properties_from_value(value)?),
             APPLICATION_PROPERTIES => {
                 message.application_properties = Some(application_properties_from_value(value)?);
@@ -1080,6 +1093,10 @@ impl FieldKey for Fields {
 
 fn fields_field(fields: &[Value], index: usize) -> io::Result<Option<Fields>> {
     let value = field(fields, index);
+    fields_from_value(value)
+}
+
+fn fields_from_value(value: Value) -> io::Result<Option<Fields>> {
     if value == Value::Null {
         return Ok(None);
     }
@@ -1404,6 +1421,7 @@ mod tests {
                 ttl: Some(5000),
                 ..Header::default()
             }),
+            message_annotations: None,
             properties: Some(Properties {
                 message_id: Some(MessageId::String(String::from("message-1"))),
                 group_id: Some(String::from("cart-1")),

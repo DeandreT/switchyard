@@ -9,7 +9,7 @@ use std::error::Error;
 use amqp::{
     ApplicationProperties, Array, Body, ClientConnection as Connection, ClientReceiver as Receiver,
     ClientSender as Sender, ClientSession as Session, FilterSet, Message, OrderedMap, Outcome,
-    Properties, SenderSettleMode, Source, Symbol, Uuid, Value,
+    Properties, SenderSettleMode, Source, Symbol, Uuid, Value, decode_message,
 };
 use domain::{CommandKind, QueueConfig, StateMachine};
 use server::{Broker, LocalProposer, ManualClock};
@@ -106,6 +106,108 @@ async fn a_client_sends_a_message_and_another_receives_it() -> Result<(), Box<dy
     sender.close().await?;
     receiver.close().await?;
     session.end().await?;
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_peeks_without_locking_or_consuming() -> Result<(), Box<dyn Error>> {
+    let node = Node::start("orders", QueueConfig::default()).await?;
+
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
+    sender
+        .send(Message::builder().body(body("peek-at-me")).build())
+        .await?;
+
+    let reply_to = "peek-management-replies";
+    let mut responses = Receiver::builder()
+        .name("peek-management-response")
+        .source("orders/$management")
+        .target(reply_to)
+        .attach(&mut session)
+        .await?;
+    let mut requests = Sender::attach(
+        &mut session,
+        "peek-management-request",
+        "orders/$management",
+    )
+    .await?;
+
+    let mut request_body = OrderedMap::new();
+    request_body.insert(
+        Value::String(String::from(protocol_amqp::FROM_SEQUENCE_NUMBER)),
+        Value::Long(1),
+    );
+    request_body.insert(
+        Value::String(String::from(protocol_amqp::MESSAGE_COUNT)),
+        Value::Int(1),
+    );
+    let request = Message::builder()
+        .properties(Properties {
+            message_id: Some("peek-1".into()),
+            reply_to: Some(reply_to.to_owned()),
+            ..Properties::default()
+        })
+        .application_properties(
+            ApplicationProperties::builder()
+                .insert(
+                    protocol_amqp::OPERATION_PROPERTY,
+                    protocol_amqp::PEEK_MESSAGE_OPERATION,
+                )
+                .build(),
+        )
+        .body(Body::Value(Value::Map(request_body)))
+        .build();
+    assert!(matches!(
+        requests.send(request).await?,
+        Outcome::Accepted(_)
+    ));
+
+    let response =
+        tokio::time::timeout(std::time::Duration::from_secs(2), responses.recv()).await??;
+    assert_eq!(
+        response
+            .message()
+            .application_properties
+            .as_ref()
+            .and_then(|properties| properties.get(protocol_amqp::STATUS_CODE_PROPERTY)),
+        Some(&Value::Int(200))
+    );
+    let Body::Value(Value::Map(body)) = &response.message().body else {
+        panic!("the peek response must carry an AMQP value map");
+    };
+    let messages = body
+        .get(&Value::String(String::from(protocol_amqp::MESSAGES)))
+        .expect("peek response carries messages");
+    let Value::List(messages) = messages else {
+        panic!("messages must be an AMQP list, got {messages:?}");
+    };
+    let [Value::Map(entry)] = messages.as_slice() else {
+        panic!("expected exactly one peeked message, got {messages:?}");
+    };
+    let Some(Value::Binary(encoded)) =
+        entry.get(&Value::String(String::from(protocol_amqp::MESSAGE)))
+    else {
+        panic!("the peeked entry must carry encoded message bytes");
+    };
+    let peeked = decode_message(encoded)?;
+    assert_eq!(text_of(&peeked), "peek-at-me");
+    assert_eq!(
+        peeked
+            .message_annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(&Symbol::from("x-opt-sequence-number"))),
+        Some(&Value::Long(1))
+    );
+    responses.accept(&response).await?;
+
+    let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
+    let delivery = receiver.recv().await?;
+    assert_eq!(text_of(delivery.message()), "peek-at-me");
+    receiver.accept(&delivery).await?;
+
     connection.close().await?;
     Ok(())
 }

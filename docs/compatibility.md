@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Send, receive, renew and complete; session renew/state | Planned | Experimental gate on 7.20.2 |
+| Official .NET SDK, current stable | Send, peek, receive, renew and complete; session renew/state | Planned | Experimental gate on 7.20.2 |
 | Official .NET SDK, previous stable | Planned | Planned | Not implemented |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -24,7 +24,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | AMQP over WebSockets | Pre-1.0 | Not implemented |
 | SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. JWT: not implemented |
 | Queue send, receive, and settlement | Pre-1.0 | State machine |
-| Peek without lock acquisition | Pre-1.0 | Not implemented |
+| Peek without lock acquisition | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Receive-delete | Pre-1.0 | State machine, AMQP mapping |
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -55,6 +55,8 @@ behavior it currently enforces:
 - Peek-lock delivery is at-least-once: the lock commits before the message is
   handed out, and completion removes it only after settlement commits.
 - Receive-delete is at-most-once: the deletion commits before the transfer.
+- Peeking browses stored messages by sequence number without changing delivery
+  counts, acquiring locks, or consuming from the queue.
 - A settlement is rejected unless it presents the live lock token, and rejected
   again once the lock deadline has passed.
 - A live message lock can be renewed without changing its token. Renewal moves
@@ -109,6 +111,8 @@ The edge resolves a link's address to an entity, turns transfers into send
 commands and dispositions into settlements, and answers a rejection with the
 condition an SDK keys its behaviour off. A receiving link's settle mode selects
 the delivery guarantee: unsettled is peek-lock, pre-settled is receive-delete.
+Peeking is served through the entity's `$management` request/reply links and
+returns encoded AMQP messages without touching their broker state.
 A receiving link's `com.microsoft:session-filter` names a session or, with a
 null value, asks for the next available one; the attach response echoes the
 granted identifier and the initial session-lock deadline. The session is
@@ -121,8 +125,8 @@ drained from a dead-letter queue carries its reason and description in the
 `DeadLetterReason` and `DeadLetterErrorDescription` application properties. The
 complete protocol coverage uses a Rust AMQP 1.0 client. The current stable
 official .NET SDK also has an opt-in gate for ordinary send, receive,
-message-lock renewal, and completion plus session state, renewal, receive, and
-completion; the rest of that client gate remains incomplete.
+peek, message-lock renewal, and completion plus session state, renewal, receive,
+and completion; the rest of that client gate remains incomplete.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch
 before reporting it applied, and the same semantics suite runs against both

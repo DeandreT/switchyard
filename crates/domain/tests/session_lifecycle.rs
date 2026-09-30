@@ -90,6 +90,26 @@ fn receive<P: StoreProvider>(
     }
 }
 
+fn peek<P: StoreProvider>(
+    fixture: &QueueFixture<P>,
+    millis: u64,
+    from_sequence: SequenceNumber,
+    max_messages: u32,
+    session_id: SessionId,
+) -> Result<Vec<Delivery>, BrokerError> {
+    match fixture.at(
+        millis,
+        CommandKind::Peek {
+            from_sequence,
+            max_messages,
+            session_id: Some(session_id),
+        },
+    )? {
+        CommandOutcome::Peeked(deliveries) => Ok(deliveries),
+        other => panic!("expected a peek outcome, got {other:?}"),
+    }
+}
+
 // ---- the suite -------------------------------------------------------------
 
 fn a_session_queue_refuses_a_command_that_names_no_session<P: StoreProvider>(
@@ -241,6 +261,37 @@ fn a_session_delivers_its_own_messages_in_send_order<P: StoreProvider>(
         )?,
         vec![SequenceNumber::new(2)]
     );
+    Ok(())
+}
+
+fn peeking_a_session_browses_only_that_session<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = session_queue(provider)?;
+    send(&fixture, 10, "other", Some(id("cart-2")))?;
+    send(&fixture, 11, "first", Some(id("cart-1")))?;
+    send(&fixture, 12, "second", Some(id("cart-1")))?;
+    let accepted = accept(&fixture, 20, Some(id("cart-1")))?.expect("the session is accepted");
+
+    let peeked = peek(&fixture, 30, SequenceNumber::new(1), 4, id("cart-1"))?;
+    assert_eq!(
+        peeked
+            .iter()
+            .map(|delivery| (
+                delivery.sequence,
+                delivery.message_id.as_str(),
+                delivery.lock
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (SequenceNumber::new(2), "first", None),
+            (SequenceNumber::new(3), "second", None)
+        ]
+    );
+
+    let delivery = receive(&fixture, 31, &accepted.hold())?.expect("peek did not consume anything");
+    assert_eq!(delivery.sequence, SequenceNumber::new(2));
+    assert_eq!(delivery.delivery_count, 1);
     Ok(())
 }
 
@@ -653,6 +704,7 @@ for_each_backend! {
     accepting_a_session_grants_an_exclusive_lock,
     a_named_session_can_be_accepted_before_it_holds_anything,
     a_session_delivers_its_own_messages_in_send_order,
+    peeking_a_session_browses_only_that_session,
     accepting_the_next_session_skips_the_ones_already_held,
     accepting_the_next_session_finds_nothing_in_an_empty_queue,
     a_session_hold_cannot_reach_another_session,

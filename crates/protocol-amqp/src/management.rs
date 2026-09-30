@@ -2,11 +2,12 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use amqp::{
     AmqpError, ApplicationProperties, Body, Error as AmqpProtocolError, Message, MessageId,
-    Properties, Receiver, Sender,
+    Properties, Receiver, Sender, encode_message,
 };
 use auth::{Permission, ResourceScope};
 use domain::{
     CommandKind, CommandOutcome, EntityPath, LockToken, NamespaceName, SequenceNumber, SessionHold,
+    SessionId,
 };
 use serde_amqp::{
     Value,
@@ -15,8 +16,11 @@ use serde_amqp::{
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tracing::debug;
 
-use crate::{Broker, BrokerRejection, authorization::ConnectionAuthorization};
+use crate::{
+    Broker, BrokerRejection, authorization::ConnectionAuthorization, message::write_delivery,
+};
 
+pub const PEEK_MESSAGE_OPERATION: &str = "com.microsoft:peek-message";
 pub const RENEW_LOCK_OPERATION: &str = "com.microsoft:renew-lock";
 pub const RENEW_SESSION_LOCK_OPERATION: &str = "com.microsoft:renew-session-lock";
 pub const GET_SESSION_STATE_OPERATION: &str = "com.microsoft:get-session-state";
@@ -30,6 +34,10 @@ pub const TRACKING_ID_PROPERTY: &str = "com.microsoft:tracking-id";
 pub const LOCK_TOKENS: &str = "lock-tokens";
 pub const EXPIRATIONS: &str = "expirations";
 pub const EXPIRATION: &str = "expiration";
+pub const FROM_SEQUENCE_NUMBER: &str = "from-sequence-number";
+pub const MESSAGE_COUNT: &str = "message-count";
+pub const MESSAGES: &str = "messages";
+pub const MESSAGE: &str = "message";
 pub const SESSION_ID: &str = "session-id";
 pub const SESSION_STATE: &str = "session-state";
 
@@ -446,6 +454,9 @@ async fn process_request<B: Broker>(
         return ManagementResponse::bad_request(message_id, tracking_id, "operation is required");
     };
     match operation {
+        PEEK_MESSAGE_OPERATION => {
+            peek_messages(message, message_id, tracking_id, namespace, entity, broker).await
+        }
         RENEW_LOCK_OPERATION => {
             renew_message_lock(
                 message,
@@ -499,6 +510,97 @@ async fn process_request<B: Broker>(
             tracking_id,
             "unsupported management operation",
         ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn peek_messages<B: Broker>(
+    message: &Message,
+    message_id: MessageId,
+    tracking_id: Option<String>,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    broker: &B,
+) -> ManagementResponse {
+    let Some(from_sequence) = unsigned_map_value(&message.body, FROM_SEQUENCE_NUMBER) else {
+        return ManagementResponse::bad_request(
+            message_id,
+            tracking_id,
+            "from-sequence-number must be a non-negative AMQP integer value",
+        );
+    };
+    let Some(message_count) = unsigned_map_value(&message.body, MESSAGE_COUNT) else {
+        return ManagementResponse::bad_request(
+            message_id,
+            tracking_id,
+            "message-count must be a non-negative AMQP integer value",
+        );
+    };
+    let Ok(message_count) = u32::try_from(message_count) else {
+        return ManagementResponse::bad_request(
+            message_id,
+            tracking_id,
+            "message-count exceeds the supported maximum",
+        );
+    };
+    let session_id = match string_map_value(&message.body, SESSION_ID) {
+        Some(session_id) => match SessionId::new(session_id) {
+            Ok(session_id) => Some(session_id),
+            Err(error) => {
+                return ManagementResponse::bad_request(
+                    message_id,
+                    tracking_id,
+                    format!("session-id is invalid: {error}"),
+                );
+            }
+        },
+        None => None,
+    };
+
+    match broker
+        .submit(
+            namespace.clone(),
+            entity.clone(),
+            CommandKind::Peek {
+                from_sequence: SequenceNumber::new(from_sequence),
+                max_messages: message_count,
+                session_id,
+            },
+        )
+        .await
+    {
+        Ok(CommandOutcome::Peeked(deliveries)) => {
+            let mut messages = Vec::with_capacity(deliveries.len());
+            for delivery in deliveries {
+                let encoded = match encode_message(&write_delivery(&delivery)) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        return ManagementResponse::internal(
+                            message_id,
+                            tracking_id,
+                            format!("encoding a peeked message failed: {error}"),
+                        );
+                    }
+                };
+                let mut entry = OrderedMap::new();
+                entry.insert(
+                    Value::String(MESSAGE.to_owned()),
+                    Value::Binary(Binary::from(encoded)),
+                );
+                messages.push(Value::Map(entry));
+            }
+            ManagementResponse::accepted(
+                message_id,
+                tracking_id,
+                map_body(MESSAGES, Value::List(messages)),
+            )
+        }
+        Ok(other) => ManagementResponse::internal(
+            message_id,
+            tracking_id,
+            format!("peeking messages produced an unexpected outcome: {other:?}"),
+        ),
+        Err(rejection) => ManagementResponse::from_rejection(message_id, tracking_id, &rejection),
     }
 }
 
@@ -788,6 +890,20 @@ fn map_value<'a>(body: &'a Body, name: &str) -> Option<&'a Value> {
 fn string_map_value<'a>(body: &'a Body, name: &str) -> Option<&'a str> {
     match map_value(body, name) {
         Some(Value::String(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn unsigned_map_value(body: &Body, name: &str) -> Option<u64> {
+    match map_value(body, name)? {
+        Value::Ubyte(value) => Some(u64::from(*value)),
+        Value::Ushort(value) => Some(u64::from(*value)),
+        Value::Uint(value) => Some(u64::from(*value)),
+        Value::Ulong(value) => Some(*value),
+        Value::Byte(value) => u64::try_from(*value).ok(),
+        Value::Short(value) => u64::try_from(*value).ok(),
+        Value::Int(value) => u64::try_from(*value).ok(),
+        Value::Long(value) => u64::try_from(*value).ok(),
         _ => None,
     }
 }

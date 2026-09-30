@@ -6,8 +6,12 @@
 //! back out is what the broker recorded, so a redelivery looks the same as the
 //! first attempt.
 
-use amqp::{ApplicationProperties, Body, Message, MessageId, Properties};
+use amqp::{ApplicationProperties, Body, Fields, Header, Message, MessageId, Properties};
 use domain::{Delivery, SessionId};
+use serde_amqp::{
+    Value,
+    primitives::{Symbol, Timestamp as AmqpTimestamp},
+};
 
 use crate::{ProtocolError, parse_session_id};
 
@@ -52,6 +56,8 @@ pub fn read_incoming(message: &Message) -> Result<IncomingMessage, ProtocolError
 pub const DEAD_LETTER_REASON_PROPERTY: &str = "DeadLetterReason";
 /// The application property carrying the dead-letter description.
 pub const DEAD_LETTER_DESCRIPTION_PROPERTY: &str = "DeadLetterErrorDescription";
+const SEQUENCE_NUMBER_ANNOTATION: &str = "x-opt-sequence-number";
+const ENQUEUED_TIME_ANNOTATION: &str = "x-opt-enqueued-time";
 
 /// Builds the message handed back to a receiving client.
 pub fn write_delivery(delivery: &Delivery) -> Message {
@@ -65,6 +71,11 @@ pub fn write_delivery(delivery: &Delivery) -> Message {
     };
 
     let mut message = Message::data(delivery.body.clone());
+    message.header = Some(Header {
+        delivery_count: delivery.delivery_count,
+        ..Header::default()
+    });
+    message.message_annotations = Some(message_annotations(delivery));
     message.properties = Some(properties);
 
     // A message drained from a dead-letter queue says why it is there, in the
@@ -82,6 +93,21 @@ pub fn write_delivery(delivery: &Delivery) -> Message {
         message.application_properties = Some(properties);
     }
     message
+}
+
+fn message_annotations(delivery: &Delivery) -> Fields {
+    let mut annotations = Fields::new();
+    annotations.insert(
+        Symbol::from(SEQUENCE_NUMBER_ANNOTATION),
+        Value::Long(i64::try_from(delivery.sequence.as_u64()).unwrap_or(i64::MAX)),
+    );
+    annotations.insert(
+        Symbol::from(ENQUEUED_TIME_ANNOTATION),
+        Value::Timestamp(AmqpTimestamp::from_milliseconds(
+            i64::try_from(delivery.enqueued_at.as_millis()).unwrap_or(i64::MAX),
+        )),
+    );
+    annotations
 }
 
 /// The bytes a body carries, whatever shape it arrived in.

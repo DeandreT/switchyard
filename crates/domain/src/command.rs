@@ -57,6 +57,15 @@ pub enum CommandKind {
         /// requires sessions, and refused on one that does not.
         session: Option<SessionHold>,
     },
+    /// Browses messages without changing their state.
+    Peek {
+        /// First sequence number to inspect, inclusive.
+        from_sequence: SequenceNumber,
+        max_messages: u32,
+        /// Narrows the browse to one session. Required on a session queue, and
+        /// refused on a non-session queue.
+        session_id: Option<SessionId>,
+    },
     Complete {
         sequence: SequenceNumber,
         lock_token: LockToken,
@@ -125,6 +134,7 @@ pub enum CommandOutcome {
     },
     /// `None` when the queue held no deliverable message.
     Received(Option<Delivery>),
+    Peeked(Vec<Delivery>),
     Completed,
     Abandoned {
         dead_lettered: bool,

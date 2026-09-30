@@ -106,6 +106,10 @@ pub fn message(
     )
 }
 
+pub fn message_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_MESSAGE, namespace, entity)
+}
+
 pub fn ready_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
     entity_scope(TAG_READY, namespace, entity)
 }

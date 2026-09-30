@@ -64,6 +64,25 @@ fn receive<P: StoreProvider>(
     }
 }
 
+fn peek<P: StoreProvider>(
+    fixture: &QueueFixture<P>,
+    millis: u64,
+    from_sequence: SequenceNumber,
+    max_messages: u32,
+) -> Result<Vec<Delivery>, BrokerError> {
+    match fixture.at(
+        millis,
+        CommandKind::Peek {
+            from_sequence,
+            max_messages,
+            session_id: None,
+        },
+    )? {
+        CommandOutcome::Peeked(deliveries) => Ok(deliveries),
+        other => panic!("expected a peek outcome, got {other:?}"),
+    }
+}
+
 fn locked(delivery: &Delivery) -> DeliveryLock {
     delivery.lock.expect("peek-lock delivery carries a lock")
 }
@@ -111,6 +130,66 @@ fn messages_are_delivered_in_send_order<P: StoreProvider>(
         delivered.push(delivery.message_id);
     }
     assert_eq!(delivered, vec!["first", "second", "third"]);
+    Ok(())
+}
+
+fn peeking_browses_without_acquiring_a_lock<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
+    send(&fixture, 10, "first")?;
+    send(&fixture, 11, "second")?;
+    send(&fixture, 12, "third")?;
+
+    let peeked = peek(&fixture, 20, SequenceNumber::new(2), 2)?;
+    assert_eq!(
+        peeked
+            .iter()
+            .map(|delivery| (
+                delivery.sequence,
+                delivery.message_id.as_str(),
+                delivery.lock
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (SequenceNumber::new(2), "second", None),
+            (SequenceNumber::new(3), "third", None)
+        ]
+    );
+
+    // The first real receive still starts at the head and gets the first lock.
+    let delivery = receive(&fixture, 30)?.expect("peek did not consume anything");
+    assert_eq!(delivery.sequence, SequenceNumber::new(1));
+    assert_eq!(delivery.delivery_count, 1);
+    assert_eq!(locked(&delivery).token, LockToken::new(1));
+    Ok(())
+}
+
+fn peeking_does_not_change_an_existing_lock<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = queue(provider)?;
+    send(&fixture, 10, "first")?;
+
+    let delivery = receive(&fixture, 20)?.expect("the queue holds one message");
+    let lock = locked(&delivery);
+    let peeked = peek(&fixture, 30, SequenceNumber::new(1), 1)?;
+
+    assert_eq!(peeked.len(), 1);
+    assert_eq!(peeked[0].sequence, delivery.sequence);
+    assert_eq!(peeked[0].delivery_count, 1);
+    assert_eq!(peeked[0].lock, None);
+    assert_eq!(
+        fixture
+            .machine
+            .message(&fixture.namespace, &fixture.entity, delivery.sequence)?
+            .expect("the message remains stored")
+            .state,
+        MessageState::Locked {
+            token: lock.token,
+            locked_until: lock.locked_until,
+        }
+    );
     Ok(())
 }
 
@@ -839,6 +918,8 @@ macro_rules! for_each_backend {
 for_each_backend! {
     a_peek_lock_delivery_hides_the_message_from_other_receivers,
     messages_are_delivered_in_send_order,
+    peeking_browses_without_acquiring_a_lock,
+    peeking_does_not_change_an_existing_lock,
     completing_a_lock_removes_the_message,
     a_foreign_lock_token_cannot_settle_a_message,
     renewing_a_lock_moves_its_deadline_without_changing_its_token,
