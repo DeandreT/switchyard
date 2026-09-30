@@ -442,6 +442,14 @@ impl ClientSender {
     }
 
     pub async fn send(&mut self, message: Message) -> Result<Outcome, EngineError> {
+        self.send_with_message_format(message, 0).await
+    }
+
+    pub async fn send_with_message_format(
+        &mut self,
+        message: Message,
+        message_format: u32,
+    ) -> Result<Outcome, EngineError> {
         let tag = self.next_tag.to_be_bytes().to_vec().into();
         self.next_tag = self.next_tag.wrapping_add(1);
         let (reply, outcome) = oneshot::channel();
@@ -451,6 +459,7 @@ impl ClientSender {
                 handle: self.handle,
                 message: Box::new(message),
                 delivery_tag: tag,
+                message_format,
                 reply,
             })
             .await
@@ -642,6 +651,7 @@ enum ClientCommand {
         handle: u32,
         message: Box<Message>,
         delivery_tag: DeliveryTag,
+        message_format: u32,
         reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
     },
     Settle {
@@ -818,7 +828,7 @@ where
                                 Ok(frame) => frame,
                                 Err(error) => {
                                     if !activity.is_closing() {
-                                        notify_frame_size_error(&mut writer, &error).await;
+                                        notify_framing_error(&mut writer, &error).await;
                                     }
                                     break;
                                 }
@@ -1078,6 +1088,7 @@ where
                                                 partial: None,
                                                 detached: detached_tx,
                                                 credit: ReceiveCredit::new(0, LINK_CREDIT, consumption.clone()),
+                                                decoders: MessageFormatDecoders::default(),
                                             })
                                         }
                                     };
@@ -1090,6 +1101,7 @@ where
                                     handle,
                                     message,
                                     delivery_tag,
+                                    message_format,
                                     reply,
                                 } => {
                                     let Some(session) = sessions.get_mut(&channel) else {
@@ -1102,6 +1114,7 @@ where
                                         session,
                                         *message,
                                         delivery_tag,
+                                        message_format,
                                         reply,
                                         &mut writer,
                                         remote_max_frame_size,

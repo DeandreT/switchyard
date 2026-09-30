@@ -15,19 +15,21 @@ use crate::{
     Accepted, Attach, Begin, Close, DeliveryState, DeliveryTag, Detach, Disposition, End, Error,
     Fields, Flow, Frame, Message, Open, Outcome, Performative, ProtocolHeader, ReceiverSettleMode,
     Role, SaslCode, SaslInit, SaslMechanisms, SaslOutcome, SaslPerformative, SenderSettleMode,
-    Transfer, decode_message, encode_message, read_frame_with_max_size, read_protocol_header,
-    write_frame, write_protocol_header,
+    Transfer, encode_message, read_frame_with_max_size, read_protocol_header, write_frame,
+    write_protocol_header,
 };
 
 #[cfg(test)]
-use crate::read_frame;
+use crate::{decode_message, read_frame};
 
 mod flow_control;
+mod format_registry;
 mod frame_writer;
 mod idle;
 mod receive_credit;
 
 use flow_control::{LinkCredit, LinkSnapshot, SessionWindow};
+pub use format_registry::MessageFormatDecoders;
 use frame_writer::FrameWriter;
 pub use idle::ConnectionOptions;
 use idle::{Activity, ActivityTimeout, validate_idle_timeout};
@@ -137,6 +139,13 @@ async fn peer_idle_timeout<W: AsyncWrite + Unpin>(
 
 fn validate_activity_frame(frame: &Frame, channel_max: u16) -> io::Result<()> {
     match frame {
+        Frame::Amqp { channel, .. } if *channel > channel_max => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            ChannelLimitError {
+                channel: *channel,
+                maximum: channel_max,
+            },
+        )),
         Frame::Amqp {
             channel,
             performative,
@@ -147,6 +156,13 @@ fn validate_activity_frame(frame: &Frame, channel_max: u16) -> io::Result<()> {
             "invalid post-Open AMQP frame or channel",
         )),
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("AMQP frame channel {channel} exceeds the advertised channel maximum {maximum}")]
+struct ChannelLimitError {
+    channel: u16,
+    maximum: u16,
 }
 
 async fn idle_close<W: AsyncWrite + Unpin>(
@@ -168,16 +184,20 @@ async fn idle_close<W: AsyncWrite + Unpin>(
         .await
 }
 
-async fn notify_frame_size_error<W: AsyncWrite + Unpin>(
+async fn notify_framing_error<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     error: &io::Error,
 ) {
-    let Some(error) = error
-        .get_ref()
-        .and_then(|error| error.downcast_ref::<crate::codec::FrameSizeError>())
-    else {
+    let Some(cause) = error.get_ref() else {
         return;
     };
+    if cause
+        .downcast_ref::<crate::codec::FrameSizeError>()
+        .is_none()
+        && cause.downcast_ref::<ChannelLimitError>().is_none()
+    {
+        return;
+    }
     let _ = tokio::time::timeout(
         DEFAULT_CLOSE_TIMEOUT,
         writer.write_amqp(
@@ -390,12 +410,17 @@ pub struct Receiver {
 pub struct Delivery {
     id: u32,
     settled: bool,
+    message_format: u32,
     message: Message,
 }
 
 impl Delivery {
     pub fn message(&self) -> &Message {
         &self.message
+    }
+
+    pub fn message_format(&self) -> u32 {
+        self.message_format
     }
 }
 
@@ -606,6 +631,27 @@ impl ServerSession {
         max_message_size: u64,
         properties: Option<Fields>,
     ) -> Result<LinkEndpoint, EngineError> {
+        self.accept_attach_with_decoders(
+            attach,
+            max_message_size,
+            properties,
+            MessageFormatDecoders::default(),
+        )
+        .await
+    }
+
+    pub async fn accept_attach_with_decoders(
+        &self,
+        attach: Attach,
+        max_message_size: u64,
+        properties: Option<Fields>,
+        decoders: MessageFormatDecoders,
+    ) -> Result<LinkEndpoint, EngineError> {
+        if attach.role == Role::Receiver && !decoders.is_default() {
+            return Err(invalid_state(
+                "custom message-format decoders require a local receiving endpoint",
+            ));
+        }
         let (deliveries_tx, deliveries) = mpsc::channel(DELIVERY_QUEUE_CAPACITY);
         let consumption = Arc::new(Consumption::new(self.consumed.clone()));
         let (detached_tx, detached) = watch::channel(false);
@@ -618,6 +664,7 @@ impl ServerSession {
             attach: Box::new(attach),
             max_message_size,
             properties,
+            decoders,
             deliveries_tx,
             detached_tx,
             consumption: consumption.clone(),
@@ -845,6 +892,7 @@ enum Command {
         attach: Box<Attach>,
         max_message_size: u64,
         properties: Option<Fields>,
+        decoders: MessageFormatDecoders,
         deliveries_tx: mpsc::Sender<Delivery>,
         detached_tx: watch::Sender<bool>,
         consumption: Arc<Consumption>,
@@ -998,6 +1046,7 @@ struct SendingLink {
 struct QueuedSend {
     payload: Vec<u8>,
     delivery_tag: DeliveryTag,
+    message_format: u32,
     reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
 }
 
@@ -1007,6 +1056,7 @@ struct ActiveSend {
     first_frame_sent: bool,
     delivery_id: u32,
     delivery_tag: DeliveryTag,
+    message_format: u32,
     settled: bool,
     settled_reply: Option<oneshot::Sender<Result<SendOutcome, EngineError>>>,
 }
@@ -1027,6 +1077,7 @@ struct ReceivingLink {
     partial: Option<PartialDelivery>,
     detached: watch::Sender<bool>,
     credit: ReceiveCredit,
+    decoders: MessageFormatDecoders,
 }
 
 struct PartialDelivery {
@@ -1117,7 +1168,7 @@ async fn run_connection<Io>(
                                 Ok(frame) => frame,
                                 Err(error) => {
                                     if !activity.is_closing() {
-                                        notify_frame_size_error(&mut writer, &error).await;
+                                        notify_framing_error(&mut writer, &error).await;
                                     }
                                     break;
                                 }
@@ -1471,12 +1522,19 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             attach,
             max_message_size,
             properties,
+            decoders,
             deliveries_tx,
             detached_tx,
             consumption,
             reply,
         } => {
             let attach = *attach;
+            if attach.role == Role::Receiver && !decoders.is_default() {
+                let _ = reply.send(Err(invalid_state(
+                    "custom message-format decoders require a local receiving endpoint",
+                )));
+                return Ok(CommandAction::Continue);
+            }
             let Some(session) = sessions.get_mut(&channel) else {
                 let _ = reply.send(Err(EngineError::RemoteDetached));
                 return Ok(CommandAction::Continue);
@@ -1562,6 +1620,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                             partial: None,
                             detached: detached_tx,
                             credit: ReceiveCredit::new(initial_count, LINK_CREDIT, consumption),
+                            decoders,
                         }),
                     );
                     refill_link(channel, handle, session, writer).await?;
@@ -1616,6 +1675,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 session,
                 *message,
                 delivery_tag,
+                0,
                 reply,
                 writer,
                 remote_max_frame_size,
@@ -1795,7 +1855,10 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         Some(("amqp:invalid-field", "first transfer has no delivery tag"))
     } else if transfer.message_format.is_none() {
         Some(("amqp:invalid-field", "first transfer has no message format"))
-    } else if transfer.message_format != Some(0) {
+    } else if transfer
+        .message_format
+        .is_some_and(|format| link.decoders.decoder(format).is_none())
+    {
         Some(("amqp:not-implemented", "message format is not supported"))
     } else {
         None
@@ -1879,16 +1942,25 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         return refill_link(channel, transfer.handle, session, writer).await;
     }
 
-    let message = match decode_message(&partial.bytes) {
+    let decoder = link
+        .decoders
+        .decoder(partial.message_format)
+        .expect("first transfer format was approved");
+    let message = match decoder(&partial.bytes) {
         Ok(message) => message,
         Err(error) => {
+            let description = if partial.message_format == 0 {
+                error.to_string()
+            } else {
+                String::from("registered message-format decoder rejected the payload")
+            };
             detach_link_error(
                 channel,
                 transfer.handle,
                 session,
                 writer,
                 "amqp:invalid-field",
-                error.to_string(),
+                description,
             )
             .await?;
             return refill_link(channel, transfer.handle, session, writer).await;
@@ -1899,6 +1971,7 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         .try_send(Delivery {
             id: partial.id,
             settled: partial.settled,
+            message_format: partial.message_format,
             message,
         })
         .is_err()
@@ -2234,6 +2307,7 @@ async fn queue_send<W: AsyncWrite + Unpin>(
     session: &mut SessionState,
     message: Message,
     delivery_tag: DeliveryTag,
+    message_format: u32,
     reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
     writer: &mut FrameWriter<W>,
     _remote_max_frame_size: u32,
@@ -2284,6 +2358,7 @@ async fn queue_send<W: AsyncWrite + Unpin>(
         handle,
         session.next_delivery_id,
         &delivery_tag,
+        message_format,
         link.settle_mode == SenderSettleMode::Settled,
         &payload,
         0,
@@ -2305,6 +2380,7 @@ async fn queue_send<W: AsyncWrite + Unpin>(
     link.queued.push_back(QueuedSend {
         payload,
         delivery_tag,
+        message_format,
         reply,
     });
     Ok(())
@@ -2357,6 +2433,7 @@ fn fragment_frame<W: AsyncWrite + Unpin>(
     handle: u32,
     delivery_id: u32,
     delivery_tag: &DeliveryTag,
+    message_format: u32,
     settled: bool,
     payload: &[u8],
     offset: usize,
@@ -2367,7 +2444,7 @@ fn fragment_frame<W: AsyncWrite + Unpin>(
         handle,
         delivery_id: (!first_frame_sent).then_some(delivery_id),
         delivery_tag: (!first_frame_sent).then_some(delivery_tag.clone()),
-        message_format: (!first_frame_sent).then_some(0),
+        message_format: (!first_frame_sent).then_some(message_format),
         settled: (!first_frame_sent).then_some(settled),
         more: false,
         rcv_settle_mode: None,
@@ -2507,6 +2584,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
             handle,
             active.delivery_id,
             &active.delivery_tag,
+            active.message_format,
             active.settled,
             &active.payload,
             active.offset,
@@ -2522,6 +2600,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
             handle,
             session.next_delivery_id,
             &queued.delivery_tag,
+            queued.message_format,
             link.settle_mode == SenderSettleMode::Settled,
             &queued.payload,
             0,
@@ -2571,6 +2650,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
             first_frame_sent: false,
             delivery_id: id,
             delivery_tag: queued.delivery_tag,
+            message_format: queued.message_format,
             settled,
             settled_reply,
         });
@@ -2799,6 +2879,7 @@ mod tests {
                 }),
                 max_message_size: 1024,
                 properties: None,
+                decoders: MessageFormatDecoders::default(),
                 deliveries_tx,
                 detached_tx,
                 consumption: Arc::new(Consumption::new(Arc::new(Notify::new()))),
@@ -2840,3 +2921,6 @@ mod transfer_identity_tests;
 
 #[cfg(test)]
 mod idle_tests;
+
+#[cfg(test)]
+mod format_registry_tests;

@@ -401,6 +401,7 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
             partial: None,
             detached,
             credit: receiving_credit(),
+            decoders: MessageFormatDecoders::default(),
         }),
     );
     let (healthy_tx, mut healthy_rx) = mpsc::channel(1);
@@ -413,6 +414,7 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
             partial: None,
             detached: healthy_detached,
             credit: receiving_credit(),
+            decoders: MessageFormatDecoders::default(),
         }),
     );
     let mut sessions = HashMap::from([(CHANNEL, session)]);
@@ -455,6 +457,7 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
             attach: Box::new(receiver_attach(0, None, SenderSettleMode::Settled)),
             max_message_size: 1_024,
             properties: None,
+            decoders: MessageFormatDecoders::default(),
             deliveries_tx,
             detached_tx,
             consumption: Arc::new(Consumption::new(Arc::new(Notify::new()))),

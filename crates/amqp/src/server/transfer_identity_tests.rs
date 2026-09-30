@@ -34,6 +34,7 @@ impl Harness {
                     partial: None,
                     detached,
                     credit,
+                    decoders: MessageFormatDecoders::default(),
                 }),
             );
             receivers.push(receiver);
