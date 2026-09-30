@@ -263,6 +263,17 @@ fn a_sweep_activates_scheduled_messages_and_starts_their_ttl<P: StoreProvider>(
     assert!(runtime.sweep()?.is_idle());
 
     runtime.clock.set(2_100);
+    assert!(
+        runtime.sweep()?.is_idle(),
+        "the live lock protects the message"
+    );
+    runtime.clock.set(
+        delivery
+            .lock
+            .expect("the activated message has a live lock")
+            .locked_until
+            .as_millis(),
+    );
     assert_eq!(runtime.sweep()?.messages_dead_lettered, 1);
     Ok(())
 }
