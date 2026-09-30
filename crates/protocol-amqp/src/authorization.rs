@@ -40,6 +40,14 @@ impl SharedAccessAuthentication {
         self.authorization_timeout = timeout;
         self
     }
+
+    pub fn policy(&self) -> &SharedAccessPolicy {
+        &self.policy
+    }
+
+    pub fn audience_host(&self) -> &str {
+        &self.audience_host
+    }
 }
 
 #[derive(Debug)]

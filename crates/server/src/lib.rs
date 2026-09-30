@@ -9,6 +9,8 @@
 
 mod broker;
 mod clock;
+mod native_admin;
+mod native_admin_listener;
 mod proposer;
 mod timer;
 
@@ -22,6 +24,12 @@ use thiserror::Error;
 pub use crate::{
     broker::{Broker, BrokerHandle, SubmitError},
     clock::{Clock, ManualClock, SystemClock},
+    native_admin::NativeAdminService,
+    native_admin_listener::{
+        DEFAULT_NATIVE_ADMIN_CONNECTION_LIMIT, NATIVE_ADMIN_DEVELOPMENT_PORT,
+        NATIVE_ADMIN_REQUEST_LIMIT, NATIVE_ADMIN_RESPONSE_LIMIT, NATIVE_ADMIN_TLS_PORT,
+        NativeAdminError, NativeAdminListener,
+    },
     proposer::{DEFAULT_MAX_CLOCK_REGRESSION_MILLIS, LocalProposer, ProposeError},
     timer::{
         DEFAULT_SWEEP_INTERVAL, MAX_QUEUES_PER_SWEEP, MAX_ROUNDS_PER_INDEX, Shutdown, SweepReport,

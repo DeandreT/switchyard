@@ -17,8 +17,8 @@ use protocol_amqp::{
 };
 use rustls::ServerConfig;
 use server::{
-    Broker, DEFAULT_SWEEP_INTERVAL, LocalProposer, NodeState, Shutdown, StartupError,
-    StorageChoice, SystemClock, TimerWorker,
+    Broker, DEFAULT_SWEEP_INTERVAL, LocalProposer, NativeAdminListener, NativeAdminService,
+    NodeState, Shutdown, StartupError, StorageChoice, SystemClock, TimerWorker,
 };
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -50,6 +50,11 @@ struct Arguments {
     /// port 5672 for development plaintext.
     #[arg(long)]
     listen: Option<SocketAddr>,
+
+    /// Enable native HTTP/2 administration at this address. Uses the same TLS
+    /// identity and shared-access policy as AMQP when configured.
+    #[arg(long)]
+    admin_listen: Option<SocketAddr>,
 
     /// PEM certificate chain for AMQP over TLS.
     #[arg(long, value_name = "PATH")]
@@ -106,11 +111,17 @@ fn storage_choice(arguments: &Arguments) -> Result<StorageChoice, StartupError> 
     }
 }
 
+struct LoadedTls {
+    amqp: ServerConfig,
+    certificate_chain: Vec<u8>,
+    private_key: Vec<u8>,
+}
+
 fn load_tls_config(
     mode: DeploymentMode,
     certificate_path: Option<&Path>,
     private_key_path: Option<&Path>,
-) -> Result<Option<ServerConfig>, StartupError> {
+) -> Result<Option<LoadedTls>, StartupError> {
     let (certificate_path, private_key_path) = match (certificate_path, private_key_path) {
         (None, None) if mode == DeploymentMode::Production => {
             return Err(StartupError::TlsRequiredInProduction);
@@ -120,9 +131,13 @@ fn load_tls_config(
         _ => return Err(StartupError::IncompleteTlsConfiguration),
     };
 
-    let certificate = read_tls_file(certificate_path)?;
+    let certificate_chain = read_tls_file(certificate_path)?;
     let private_key = read_tls_file(private_key_path)?;
-    Ok(Some(tls_server_config(&certificate, &private_key)?))
+    Ok(Some(LoadedTls {
+        amqp: tls_server_config(&certificate_chain, &private_key)?,
+        certificate_chain,
+        private_key,
+    }))
 }
 
 fn read_tls_file(path: &Path) -> Result<Vec<u8>, StartupError> {
@@ -264,19 +279,52 @@ fn run() -> Result<(), StartupError> {
                 address: listen.to_string(),
                 detail: error.to_string(),
             })?;
-        info!(address = %listen, namespace = %namespace, tls = tls.is_some(), "accepting AMQP connections");
+        let native = if let Some(address) = arguments.admin_listen {
+            let socket = tokio::net::TcpListener::bind(address)
+                .await
+                .map_err(|error| StartupError::Listen {
+                    address: address.to_string(),
+                    detail: error.to_string(),
+                })?;
+            let mut service = NativeAdminService::new(broker.handle(), namespace.clone());
+            if let Some(authentication) = &shared_access_authentication {
+                service = service.with_shared_access_policy(
+                    authentication.policy().clone(),
+                    authentication.audience_host(),
+                )?;
+            }
+            let mut admin = NativeAdminListener::new(service);
+            if let Some(tls) = &tls {
+                admin = admin.with_tls(&tls.certificate_chain, &tls.private_key)?;
+            }
+            info!(address = %socket.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, namespace = %namespace, tls = tls.is_some(), "accepting native administration connections");
+            Some((admin, socket))
+        } else {
+            None
+        };
+        info!(address = %listener.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, namespace = %namespace, tls = tls.is_some(), "accepting AMQP connections");
         let amqp = AmqpListener::new(broker.handle(), namespace);
         let amqp = match tls {
-            Some(config) => amqp.with_tls(config),
+            Some(config) => amqp.with_tls(config.amqp),
             None => amqp,
         };
         let amqp = match shared_access_authentication {
             Some(authentication) => amqp.with_shared_access_authentication(authentication),
             None => amqp,
         };
-        amqp.serve(listener)
-            .await
-            .map_err(|error| StartupError::Runtime(error.to_string()))
+        match native {
+            Some((admin, socket)) => tokio::select! {
+                result = amqp.serve(listener) => {
+                    result.map_err(|error| StartupError::Runtime(error.to_string()))
+                }
+                result = admin.serve(socket) => {
+                    result.map_err(|error| StartupError::Runtime(error.to_string()))
+                }
+            },
+            None => amqp.serve(listener)
+                .await
+                .map_err(|error| StartupError::Runtime(error.to_string())),
+        }
     });
 
     shutdown.signal();
