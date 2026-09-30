@@ -5,6 +5,7 @@
 mod codec;
 mod server;
 mod types;
+mod value_codec;
 
 pub use crate::{
     codec::{
@@ -20,6 +21,8 @@ pub use crate::{
 };
 pub use serde_amqp::{
     Value,
+    described::Described,
+    descriptor::Descriptor,
     primitives::{Array, Binary, OrderedMap, Symbol, Uuid},
 };
 

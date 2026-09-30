@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceptedSession, Delivery, EntityPath, LockToken, NamespaceName, QueueConfig, ReceiveMode,
-    SequenceNumber, SessionHold, SessionId, Timestamp,
+    AcceptedSession, Delivery, EntityPath, LockToken, MessageEnvelope, NamespaceName, QueueConfig,
+    ReceiveMode, SequenceNumber, SessionHold, SessionId, Timestamp,
 };
 
 /// One replicated instruction for the broker state machine.
@@ -43,6 +43,18 @@ pub struct ScheduledMessage {
     pub time_to_live_millis: Option<u64>,
     pub session_id: Option<SessionId>,
     pub enqueue_at: Timestamp,
+}
+
+/// A scheduled message whose typed AMQP content is retained separately from
+/// the compatibility byte-body view.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScheduledEnvelope {
+    pub message_id: String,
+    pub body: Vec<u8>,
+    pub time_to_live_millis: Option<u64>,
+    pub session_id: Option<SessionId>,
+    pub enqueue_at: Timestamp,
+    pub envelope: MessageEnvelope,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -162,6 +174,16 @@ pub enum CommandKind {
     /// Proposed by the leader's timer worker. Discards message identifiers
     /// whose duplicate-detection history window has elapsed.
     ExpireDuplicateHistory,
+    SendEnvelope {
+        message_id: String,
+        body: Vec<u8>,
+        time_to_live_millis: Option<u64>,
+        session_id: Option<SessionId>,
+        envelope: Box<MessageEnvelope>,
+    },
+    ScheduleEnvelopes {
+        messages: Vec<ScheduledEnvelope>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

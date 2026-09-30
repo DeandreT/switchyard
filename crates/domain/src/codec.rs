@@ -30,7 +30,11 @@ pub const VALUE_FORMAT_V5: u8 = 5;
 /// records retain their version 5 shape.
 pub const VALUE_FORMAT_V6: u8 = 6;
 
-pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V6;
+/// Appends typed message content to message records. Queue configurations
+/// retain their version 6 shape.
+pub const VALUE_FORMAT_V7: u8 = 7;
+
+pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V7;
 
 /// Encodes a value into a versioned envelope.
 ///
@@ -65,7 +69,11 @@ pub fn split(envelope: &[u8]) -> Result<(u8, &[u8]), CodecError> {
 }
 
 pub fn decode_payload<T: DeserializeOwned>(payload: &[u8]) -> Result<T, CodecError> {
-    postcard::from_bytes(payload).map_err(|_| CodecError::Decode)
+    let (value, remaining) = postcard::take_from_bytes(payload).map_err(|_| CodecError::Decode)?;
+    if !remaining.is_empty() {
+        return Err(CodecError::Decode);
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -102,6 +110,18 @@ mod tests {
     }
 
     #[test]
+    fn trailing_bytes_cannot_be_ignored_by_a_shorter_record_shape() -> Result<(), CodecError> {
+        let mut envelope = encode(&(7_u64, String::from("orders")))?;
+        envelope.push(0);
+        assert_eq!(decode::<(u64, String)>(&envelope), Err(CodecError::Decode));
+        assert_eq!(
+            decode_payload::<(u64, String)>(&envelope[1..]),
+            Err(CodecError::Decode)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_record_that_never_changed_shape_reads_under_either_version() -> Result<(), CodecError> {
         let payload = postcard::to_stdvec(&(7_u64, String::from("orders"))).expect("encodes");
         for version in [
@@ -111,6 +131,7 @@ mod tests {
             VALUE_FORMAT_V4,
             VALUE_FORMAT_V5,
             VALUE_FORMAT_V6,
+            VALUE_FORMAT_V7,
         ] {
             let mut envelope = vec![version];
             envelope.extend_from_slice(&payload);

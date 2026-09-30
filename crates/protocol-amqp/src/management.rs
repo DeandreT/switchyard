@@ -6,7 +6,7 @@ use amqp::{
 };
 use auth::{Permission, ResourceScope};
 use domain::{
-    CommandKind, CommandOutcome, EntityPath, LockToken, NamespaceName, ScheduledMessage,
+    CommandKind, CommandOutcome, EntityPath, LockToken, NamespaceName, ScheduledEnvelope,
     SequenceNumber, SessionHold, SessionId,
 };
 use serde_amqp::{
@@ -288,6 +288,7 @@ impl ManagementResponse {
         let status_code = match condition {
             crate::MESSAGE_LOCK_LOST | crate::SESSION_LOCK_LOST => 410,
             crate::NOT_FOUND => 404,
+            crate::MESSAGE_SIZE_EXCEEDED => 403,
             crate::INVALID_FIELD | crate::NOT_ALLOWED | crate::PRECONDITION_FAILED => 400,
             crate::RESOURCE_LOCKED => 503,
             _ => 500,
@@ -596,14 +597,14 @@ async fn schedule_messages<B: Broker>(
     let messages = match scheduled_messages(&message.body) {
         Ok(messages) => messages,
         Err(description) => {
-            return ManagementResponse::bad_request(message_id, tracking_id, description);
+            return description.into_response(message_id, tracking_id);
         }
     };
     match broker
         .submit(
             namespace.clone(),
             entity.clone(),
-            CommandKind::Schedule { messages },
+            CommandKind::ScheduleEnvelopes { messages },
         )
         .await
     {
@@ -631,33 +632,80 @@ async fn schedule_messages<B: Broker>(
     }
 }
 
-fn scheduled_messages(body: &Body) -> Result<Vec<ScheduledMessage>, String> {
+#[derive(Debug, thiserror::Error)]
+enum ScheduleRequestError {
+    #[error("{0}")]
+    Malformed(String),
+    #[error(transparent)]
+    Message(#[from] crate::ProtocolError),
+}
+
+impl ScheduleRequestError {
+    fn into_response(
+        self,
+        correlation_id: MessageId,
+        tracking_id: Option<String>,
+    ) -> ManagementResponse {
+        match self {
+            Self::Message(error @ crate::ProtocolError::MessageTooLarge { .. }) => {
+                ManagementResponse {
+                    correlation_id,
+                    status_code: 403,
+                    status_description: error.to_string(),
+                    error_condition: Some(crate::MESSAGE_SIZE_EXCEEDED),
+                    tracking_id,
+                    body: Value::Null,
+                }
+            }
+            other => {
+                let mut response =
+                    ManagementResponse::bad_request(correlation_id, tracking_id, other.to_string());
+                response.error_condition = Some(crate::INVALID_FIELD);
+                response
+            }
+        }
+    }
+}
+
+fn scheduled_messages(body: &Body) -> Result<Vec<ScheduledEnvelope>, ScheduleRequestError> {
     let Some(Value::List(entries)) = map_value(body, MESSAGES) else {
-        return Err("messages must be an AMQP list of maps".to_owned());
+        return Err(ScheduleRequestError::Malformed(
+            "messages must be an AMQP list of maps".to_owned(),
+        ));
     };
     if entries.is_empty() {
-        return Err("at least one message is required".to_owned());
+        return Err(ScheduleRequestError::Malformed(
+            "at least one message is required".to_owned(),
+        ));
     }
     let mut messages = Vec::with_capacity(entries.len());
     for entry in entries {
         let Value::Map(entry) = entry else {
-            return Err("each scheduled message must be an AMQP map".to_owned());
+            return Err(ScheduleRequestError::Malformed(
+                "each scheduled message must be an AMQP map".to_owned(),
+            ));
         };
         let Some(Value::Binary(encoded)) = entry.get(&Value::String(MESSAGE.to_owned())) else {
-            return Err("each scheduled message must contain a binary message".to_owned());
+            return Err(ScheduleRequestError::Malformed(
+                "each scheduled message must contain a binary message".to_owned(),
+            ));
         };
-        crate::validate_standard_message_size(encoded.len()).map_err(|error| error.to_string())?;
-        let decoded = decode_message(encoded).map_err(|error| error.to_string())?;
-        let incoming = read_incoming(&decoded).map_err(|error| error.to_string())?;
+        crate::validate_standard_message_size(encoded.len())?;
+        let decoded = decode_message(encoded)
+            .map_err(|error| ScheduleRequestError::Malformed(error.to_string()))?;
+        let incoming = read_incoming(&decoded)?;
         let enqueue_at = incoming.scheduled_enqueue_time.ok_or_else(|| {
-            "each scheduled message must specify its enqueue timestamp".to_owned()
+            ScheduleRequestError::Malformed(
+                "each scheduled message must specify its enqueue timestamp".to_owned(),
+            )
         })?;
-        messages.push(ScheduledMessage {
+        messages.push(ScheduledEnvelope {
             message_id: incoming.message_id,
             body: incoming.body,
             time_to_live_millis: incoming.time_to_live_millis,
             session_id: incoming.session_id,
             enqueue_at,
+            envelope: incoming.envelope,
         });
     }
     Ok(messages)
@@ -1478,5 +1526,57 @@ mod tests {
                 AmqpTimestamp::from_milliseconds(12_345)
             )])))
         );
+    }
+
+    fn scheduled_request(encoded: Vec<u8>) -> Body {
+        let entry = [(
+            Value::String(MESSAGE.to_owned()),
+            Value::Binary(encoded.into()),
+        )]
+        .into_iter()
+        .collect();
+        Body::Value(map_body(MESSAGES, Value::List(vec![Value::Map(entry)])))
+    }
+
+    #[test]
+    fn a_scheduled_inner_message_size_failure_keeps_the_quota_condition() {
+        let error = scheduled_messages(&scheduled_request(vec![
+            0;
+            crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES
+                + 1
+        ]))
+        .expect_err("the inner message exceeds the quota");
+        assert!(matches!(
+            error,
+            ScheduleRequestError::Message(crate::ProtocolError::MessageTooLarge { .. })
+        ));
+        let response = error.into_response(MessageId::Ulong(1), Some("trace".to_owned()));
+        assert_eq!(response.status_code, 403);
+        assert_eq!(response.error_condition, Some(crate::MESSAGE_SIZE_EXCEEDED));
+        assert_eq!(response.tracking_id.as_deref(), Some("trace"));
+        assert_eq!(response.correlation_id, MessageId::Ulong(1));
+    }
+
+    #[test]
+    fn a_malformed_scheduled_message_remains_an_invalid_request() {
+        let error = scheduled_messages(&scheduled_request(vec![0]))
+            .expect_err("the inner message is not valid AMQP");
+        let response = error.into_response(MessageId::Ulong(1), None);
+        assert_eq!(response.status_code, 400);
+        assert_eq!(response.error_condition, Some(crate::INVALID_FIELD));
+    }
+
+    #[test]
+    fn a_domain_size_failure_uses_the_sdk_quota_status() {
+        let response = ManagementResponse::from_rejection(
+            MessageId::Ulong(1),
+            None,
+            &BrokerRejection::Refused(domain::BrokerError::MessageTooLarge {
+                body_bytes: 101,
+                maximum_bytes: 100,
+            }),
+        );
+        assert_eq!(response.status_code, 403);
+        assert_eq!(response.error_condition, Some(crate::MESSAGE_SIZE_EXCEEDED));
     }
 }

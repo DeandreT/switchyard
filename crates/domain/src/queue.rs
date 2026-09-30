@@ -80,7 +80,7 @@ impl QueueConfig {
             codec::VALUE_FORMAT_V1..=codec::VALUE_FORMAT_V5 => {
                 Ok(codec::decode_payload::<QueueConfigV5>(payload)?.into())
             }
-            codec::VALUE_FORMAT_V6 => codec::decode_payload(payload),
+            codec::VALUE_FORMAT_V6 | codec::VALUE_FORMAT_V7 => codec::decode_payload(payload),
             _ => unreachable!("split rejects unknown value formats"),
         }
     }
@@ -239,15 +239,18 @@ mod tests {
     }
 
     #[test]
-    fn configuration_round_trips_in_version_6() -> Result<(), CodecError> {
+    fn configuration_round_trips_in_versions_6_and_7() -> Result<(), CodecError> {
         let original = QueueConfig {
             requires_duplicate_detection: true,
             duplicate_detection_history_time_window_millis: MIN_DUPLICATE_DETECTION_WINDOW_MILLIS,
             ..QueueConfig::default()
         };
         let envelope = codec::encode(&original)?;
-        assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V6));
+        assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V7));
         assert_eq!(QueueConfig::decode(&envelope)?, original);
+        let mut old = envelope;
+        old[0] = codec::VALUE_FORMAT_V6;
+        assert_eq!(QueueConfig::decode(&old)?, original);
         Ok(())
     }
 

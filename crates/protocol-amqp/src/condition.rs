@@ -52,7 +52,9 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::DeadLetterQueueIsReserved => NOT_ALLOWED,
 
         BrokerError::MessageTooLarge { .. } => MESSAGE_SIZE_EXCEEDED,
-        BrokerError::MessageIdTooLong { .. } => INVALID_FIELD,
+        BrokerError::MessageIdTooLong { .. } | BrokerError::InvalidMessageContent { .. } => {
+            INVALID_FIELD
+        }
         BrokerError::QueueConfig(_) => PRECONDITION_FAILED,
 
         // The node's clock disagrees with what it already applied. A client
@@ -135,6 +137,15 @@ mod tests {
             }),
             INTERNAL_ERROR
         );
+    }
+
+    #[test]
+    fn invalid_message_content_is_a_non_retryable_client_error() {
+        let error = BrokerError::InvalidMessageContent {
+            reason: "an array has incompatible element types".to_owned(),
+        };
+        assert_eq!(condition_for(&error), INVALID_FIELD);
+        assert!(!is_retryable(&error));
     }
 
     #[test]

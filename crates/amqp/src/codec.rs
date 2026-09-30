@@ -9,6 +9,7 @@ use serde_amqp::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::types::*;
+use crate::value_codec::{ValueDecoder, decode_value};
 
 pub const AMQP_PROTOCOL_ID: u8 = 0;
 pub const SASL_PROTOCOL_ID: u8 = 3;
@@ -39,12 +40,14 @@ const SOURCE: u64 = 0x28;
 const TARGET: u64 = 0x29;
 
 const HEADER: u64 = 0x70;
+const DELIVERY_ANNOTATIONS: u64 = 0x71;
 const MESSAGE_ANNOTATIONS: u64 = 0x72;
 const PROPERTIES: u64 = 0x73;
 const APPLICATION_PROPERTIES: u64 = 0x74;
 const DATA: u64 = 0x75;
 const AMQP_SEQUENCE: u64 = 0x76;
 const AMQP_VALUE: u64 = 0x77;
+const FOOTER: u64 = 0x78;
 
 const SASL_MECHANISMS: u64 = 0x40;
 const SASL_INIT: u64 = 0x41;
@@ -163,9 +166,9 @@ pub fn encode_frame(frame: &Frame) -> io::Result<Vec<u8>> {
     };
 
     let encoded = performative
-        .map(|performative| serde_amqp::to_vec(&performative))
-        .transpose()
-        .map_err(amqp_codec_error)?
+        .as_ref()
+        .map(encode_value)
+        .transpose()?
         .unwrap_or_default();
     let size = FRAME_HEADER_SIZE
         .checked_add(encoded.len())
@@ -216,9 +219,7 @@ fn decode_frame(frame: &[u8]) -> io::Result<Frame> {
             payload: Vec::new(),
         }),
         AMQP_FRAME_TYPE => {
-            let performative_len = encoded_value_len(body)?;
-            let value =
-                serde_amqp::from_slice(&body[..performative_len]).map_err(amqp_codec_error)?;
+            let (value, performative_len) = decode_value(body)?;
             Ok(Frame::Amqp {
                 channel,
                 performative: Some(performative_from_value(value)?),
@@ -226,11 +227,10 @@ fn decode_frame(frame: &[u8]) -> io::Result<Frame> {
             })
         }
         SASL_FRAME_TYPE if channel == 0 && !body.is_empty() => {
-            let performative_len = encoded_value_len(body)?;
+            let (value, performative_len) = decode_value(body)?;
             if performative_len != body.len() {
                 return Err(invalid_data("SASL frame carries trailing payload"));
             }
-            let value = serde_amqp::from_slice(body).map_err(amqp_codec_error)?;
             Ok(Frame::Sasl(sasl_from_value(value)?))
         }
         SASL_FRAME_TYPE => Err(invalid_data("invalid SASL frame")),
@@ -245,13 +245,16 @@ pub fn encode_message(message: &Message) -> io::Result<Vec<u8>> {
     if let Some(header) = &message.header {
         append_value(&mut encoded, header_to_value(header))?;
     }
-    if message.message_annotations.is_some() {
+    if let Some(annotations) = &message.delivery_annotations {
         append_value(
             &mut encoded,
-            described(
-                MESSAGE_ANNOTATIONS,
-                fields_to_value(&message.message_annotations),
-            ),
+            described(DELIVERY_ANNOTATIONS, annotations_to_value(annotations)),
+        )?;
+    }
+    if let Some(annotations) = &message.message_annotations {
+        append_value(
+            &mut encoded,
+            described(MESSAGE_ANNOTATIONS, annotations_to_value(annotations)),
         )?;
     }
     if let Some(properties) = &message.properties {
@@ -282,23 +285,48 @@ pub fn encode_message(message: &Message) -> io::Result<Vec<u8>> {
         }
         Body::Empty => {}
     }
+    if let Some(footer) = &message.footer {
+        append_value(
+            &mut encoded,
+            described(FOOTER, annotations_to_value(footer)),
+        )?;
+    }
     Ok(encoded)
 }
 
 pub fn decode_message(encoded: &[u8]) -> io::Result<Message> {
     let mut message = Message::default();
+    let mut decoder = ValueDecoder::new(encoded);
     let mut offset = 0;
+    let mut previous_section = None;
     while offset < encoded.len() {
-        let len = encoded_value_len(&encoded[offset..])?;
-        let value =
-            serde_amqp::from_slice(&encoded[offset..offset + len]).map_err(amqp_codec_error)?;
+        let (value, len) = decoder.next_value()?;
         offset += len;
 
         let (descriptor, value) = take_described(value)?;
+        let section = match descriptor {
+            HEADER => 0,
+            DELIVERY_ANNOTATIONS => 1,
+            MESSAGE_ANNOTATIONS => 2,
+            PROPERTIES => 3,
+            APPLICATION_PROPERTIES => 4,
+            DATA | AMQP_SEQUENCE | AMQP_VALUE => 5,
+            FOOTER => 6,
+            _ => return Err(invalid_data("unknown message section")),
+        };
+        if previous_section
+            .is_some_and(|previous| section < previous || (section == previous && section != 5))
+        {
+            return Err(invalid_data("message sections repeat or are out of order"));
+        }
+        previous_section = Some(section);
         match descriptor {
             HEADER => message.header = Some(header_from_value(value)?),
+            DELIVERY_ANNOTATIONS => {
+                message.delivery_annotations = Some(annotations_from_value(value)?);
+            }
             MESSAGE_ANNOTATIONS => {
-                message.message_annotations = fields_from_value(value)?;
+                message.message_annotations = Some(annotations_from_value(value)?);
             }
             PROPERTIES => message.properties = Some(properties_from_value(value)?),
             APPLICATION_PROPERTIES => {
@@ -332,7 +360,8 @@ pub fn decode_message(encoded: &[u8]) -> io::Result<Message> {
                 }
                 message.body = Body::Value(value);
             }
-            _ => {}
+            FOOTER => message.footer = Some(annotations_from_value(value)?),
+            _ => unreachable!("message sections validated above"),
         }
     }
     Ok(message)
@@ -1096,6 +1125,37 @@ fn fields_to_value(fields: &Option<impl FieldKey>) -> Value {
     Value::Map(map)
 }
 
+fn annotations_to_value(annotations: &Annotations) -> Value {
+    Value::Map(
+        annotations
+            .iter()
+            .map(|(key, value)| {
+                let key = match key {
+                    AnnotationKey::Symbol(key) => Value::Symbol(key.clone()),
+                    AnnotationKey::Ulong(key) => Value::Ulong(*key),
+                };
+                (key, value.clone())
+            })
+            .collect(),
+    )
+}
+
+fn annotations_from_value(value: Value) -> io::Result<Annotations> {
+    let Value::Map(map) = value else {
+        return Err(invalid_data("annotations section is not a map"));
+    };
+    let mut annotations = Annotations::new();
+    for (key, value) in map {
+        let key = match key {
+            Value::Symbol(key) => AnnotationKey::Symbol(key),
+            Value::Ulong(key) => AnnotationKey::Ulong(key),
+            _ => return Err(invalid_data("annotation key is not a symbol or ulong")),
+        };
+        annotations.insert(key, value);
+    }
+    Ok(annotations)
+}
+
 trait FieldKey {
     fn entries(&self) -> impl Iterator<Item = (&Symbol, &Value)>;
 }
@@ -1129,11 +1189,14 @@ fn fields_from_value(value: Value) -> io::Result<Option<Fields>> {
 }
 
 fn symbol_array(array: &Option<Array<Symbol>>) -> Value {
-    array.as_ref().map_or(Value::Null, |array| {
-        Value::Array(Array::from(
-            array.iter().cloned().map(Value::Symbol).collect::<Vec<_>>(),
-        ))
-    })
+    array
+        .as_ref()
+        .filter(|array| !array.is_empty())
+        .map_or(Value::Null, |array| {
+            Value::Array(Array::from(
+                array.iter().cloned().map(Value::Symbol).collect::<Vec<_>>(),
+            ))
+        })
 }
 
 fn symbol_array_field(fields: &[Value], index: usize) -> io::Result<Option<Array<Symbol>>> {
@@ -1165,7 +1228,40 @@ fn take_described(value: Value) -> io::Result<(u64, Value)> {
     };
     let code = match value.descriptor {
         Descriptor::Code(code) => code,
-        Descriptor::Name(_) => return Err(invalid_data("symbolic descriptors are unsupported")),
+        Descriptor::Name(name) => match name.as_str() {
+            "amqp:open:list" => OPEN,
+            "amqp:begin:list" => BEGIN,
+            "amqp:attach:list" => ATTACH,
+            "amqp:flow:list" => FLOW,
+            "amqp:transfer:list" => TRANSFER,
+            "amqp:disposition:list" => DISPOSITION,
+            "amqp:detach:list" => DETACH,
+            "amqp:end:list" => END,
+            "amqp:close:list" => CLOSE,
+            "amqp:error:list" => ERROR,
+            "amqp:received:list" => RECEIVED,
+            "amqp:accepted:list" => ACCEPTED,
+            "amqp:rejected:list" => REJECTED,
+            "amqp:released:list" => RELEASED,
+            "amqp:modified:list" => MODIFIED,
+            "amqp:source:list" => SOURCE,
+            "amqp:target:list" => TARGET,
+            "amqp:header:list" => HEADER,
+            "amqp:delivery-annotations:map" => DELIVERY_ANNOTATIONS,
+            "amqp:message-annotations:map" => MESSAGE_ANNOTATIONS,
+            "amqp:properties:list" => PROPERTIES,
+            "amqp:application-properties:map" => APPLICATION_PROPERTIES,
+            "amqp:data:binary" => DATA,
+            "amqp:amqp-sequence:list" => AMQP_SEQUENCE,
+            "amqp:amqp-value:*" => AMQP_VALUE,
+            "amqp:footer:map" => FOOTER,
+            "amqp:sasl-mechanisms:list" => SASL_MECHANISMS,
+            "amqp:sasl-init:list" => SASL_INIT,
+            "amqp:sasl-challenge:list" => SASL_CHALLENGE,
+            "amqp:sasl-response:list" => SASL_RESPONSE,
+            "amqp:sasl-outcome:list" => SASL_OUTCOME,
+            _ => return Err(invalid_data("unknown symbolic descriptor")),
+        },
     };
     Ok((code, value.value))
 }
@@ -1292,77 +1388,210 @@ fn optional_u32(value: Option<u32>) -> Value {
 }
 
 fn append_value(buffer: &mut Vec<u8>, value: Value) -> io::Result<()> {
-    buffer.extend(serde_amqp::to_vec(&value).map_err(amqp_codec_error)?);
+    buffer.extend(encode_value(&value)?);
     Ok(())
 }
 
-fn encoded_value_len(bytes: &[u8]) -> io::Result<usize> {
-    let Some(code) = bytes.first().copied() else {
-        return Err(invalid_data("missing AMQP value"));
-    };
-    let len = match code {
-        0x00 => {
-            let descriptor = encoded_value_len(
-                bytes
-                    .get(1..)
-                    .ok_or_else(|| invalid_data("missing AMQP descriptor"))?,
-            )?;
-            let value_start = 1 + descriptor;
-            value_start
-                + encoded_value_len(
-                    bytes
-                        .get(value_start..)
-                        .ok_or_else(|| invalid_data("missing described AMQP value"))?,
-                )?
+fn encode_value(value: &Value) -> io::Result<Vec<u8>> {
+    match value {
+        Value::List(values) => encode_collection(values.iter(), values.len(), false),
+        Value::Map(entries) => encode_collection(
+            entries.iter().flat_map(|(key, value)| [key, value]),
+            entries
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| invalid_data("map size overflow"))?,
+            true,
+        ),
+        Value::Array(values) => {
+            let (constructor, payload) = array_parts(values)?;
+            let mut body = constructor;
+            body.extend(payload);
+            encode_counted(0xe0, 0xf0, values.len(), body)
         }
-        0x40..=0x45 => 1,
-        0x50..=0x56 => 2,
-        0x60..=0x61 => 3,
-        0x70..=0x74 => 5,
-        0x80..=0x84 => 9,
-        0x94 | 0x98 => 17,
-        0xa0 | 0xa1 | 0xa3 => {
-            2 + usize::from(
-                *bytes
-                    .get(1)
-                    .ok_or_else(|| invalid_data("missing AMQP value length"))?,
-            )
+        Value::Described(value) => {
+            let mut encoded = vec![0x00];
+            encoded.extend(encode_descriptor(&value.descriptor)?);
+            encoded.extend(encode_value(&value.value)?);
+            Ok(encoded)
         }
-        0xb0 | 0xb1 | 0xb3 => {
-            5 + u32::from_be_bytes(
-                bytes
-                    .get(1..5)
-                    .ok_or_else(|| invalid_data("missing AMQP value length"))?
-                    .try_into()
-                    .map_err(|_| invalid_data("invalid AMQP value length"))?,
-            ) as usize
+        Value::Null => Ok(vec![0x40]),
+        Value::Bool(value) => Ok(vec![if *value { 0x41 } else { 0x42 }]),
+        Value::Uint(0) => Ok(vec![0x43]),
+        Value::Ulong(0) => Ok(vec![0x44]),
+        Value::Uint(value) if *value <= u32::from(u8::MAX) => Ok(vec![0x52, *value as u8]),
+        Value::Ulong(value) if *value <= u64::from(u8::MAX) => Ok(vec![0x53, *value as u8]),
+        Value::Int(value) if i8::try_from(*value).is_ok() => Ok(vec![0x54, *value as u8]),
+        Value::Long(value) if i8::try_from(*value).is_ok() => Ok(vec![0x55, *value as u8]),
+        Value::Binary(value) => encode_variable(0xa0, 0xb0, value),
+        Value::String(value) => encode_variable(0xa1, 0xb1, value.as_bytes()),
+        Value::Symbol(value) => {
+            if !value.as_str().is_ascii() {
+                return Err(invalid_data("AMQP symbol contains non-ASCII characters"));
+            }
+            encode_variable(0xa3, 0xb3, value.as_str().as_bytes())
         }
-        0xc0 | 0xc1 | 0xe0 => {
-            2 + usize::from(
-                *bytes
-                    .get(1)
-                    .ok_or_else(|| invalid_data("missing AMQP compound length"))?,
-            )
+        // Scalars use the same fixed payload as an array element, but carry
+        // their own constructor when they are not inside an array.
+        _ => {
+            let (mut constructor, payload) = array_element(value)?;
+            constructor.extend(payload);
+            Ok(constructor)
         }
-        0xd0 | 0xd1 | 0xf0 => {
-            5 + u32::from_be_bytes(
-                bytes
-                    .get(1..5)
-                    .ok_or_else(|| invalid_data("missing AMQP compound length"))?
-                    .try_into()
-                    .map_err(|_| invalid_data("invalid AMQP compound length"))?,
-            ) as usize
-        }
-        _ => return Err(invalid_data(format!("unknown AMQP format code {code:#x}"))),
-    };
-    if len > bytes.len() {
-        return Err(invalid_data("AMQP value is truncated"));
     }
-    Ok(len)
 }
 
-fn amqp_codec_error(error: serde_amqp::Error) -> io::Error {
-    invalid_data(error.to_string())
+fn encode_descriptor(descriptor: &Descriptor) -> io::Result<Vec<u8>> {
+    match descriptor {
+        Descriptor::Code(code) => encode_value(&Value::Ulong(*code)),
+        Descriptor::Name(name) => encode_value(&Value::Symbol(name.clone())),
+    }
+}
+
+fn encode_collection<'a>(
+    values: impl Iterator<Item = &'a Value>,
+    count: usize,
+    map: bool,
+) -> io::Result<Vec<u8>> {
+    if !map && count == 0 {
+        return Ok(vec![0x45]);
+    }
+    let mut body = Vec::new();
+    for value in values {
+        body.extend(encode_value(value)?);
+    }
+    encode_counted(
+        if map { 0xc1 } else { 0xc0 },
+        if map { 0xd1 } else { 0xd0 },
+        count,
+        body,
+    )
+}
+
+fn encode_counted(short: u8, long: u8, count: usize, body: Vec<u8>) -> io::Result<Vec<u8>> {
+    if let (Ok(size), Ok(count)) = (
+        u8::try_from(body.len().saturating_add(1)),
+        u8::try_from(count),
+    ) {
+        let mut encoded = vec![short, size, count];
+        encoded.extend(body);
+        return Ok(encoded);
+    }
+    let mut encoded = vec![long];
+    encoded.extend(counted_payload(count, body)?);
+    Ok(encoded)
+}
+
+fn counted_payload(count: usize, body: Vec<u8>) -> io::Result<Vec<u8>> {
+    let size = u32::try_from(body.len().saturating_add(4))
+        .map_err(|_| invalid_data("collection size overflow"))?;
+    let count = u32::try_from(count).map_err(|_| invalid_data("collection count overflow"))?;
+    let mut payload = size.to_be_bytes().to_vec();
+    payload.extend_from_slice(&count.to_be_bytes());
+    payload.extend(body);
+    Ok(payload)
+}
+
+fn array_parts(values: &Array<Value>) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let Some(first) = values.first() else {
+        return Err(invalid_data(
+            "empty array has no retained element constructor",
+        ));
+    };
+    let (constructor, mut payload) = array_element(first)?;
+    for value in values.iter().skip(1) {
+        let (next_constructor, next_payload) = array_element(value)?;
+        if constructor != next_constructor {
+            return Err(invalid_data(
+                "array elements have incompatible constructors",
+            ));
+        }
+        payload.extend(next_payload);
+    }
+    Ok((constructor, payload))
+}
+
+// Array elements share one constructor. Fixed-width encodings and 32-bit
+// collection lengths keep that constructor independent of each element's value.
+fn array_element(value: &Value) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let (code, payload) = match value {
+        Value::Null => (0x40, Vec::new()),
+        Value::Bool(value) => (0x56, vec![u8::from(*value)]),
+        Value::Ubyte(value) => (0x50, vec![*value]),
+        Value::Ushort(value) => (0x60, value.to_be_bytes().to_vec()),
+        Value::Uint(value) => (0x70, value.to_be_bytes().to_vec()),
+        Value::Ulong(value) => (0x80, value.to_be_bytes().to_vec()),
+        Value::Byte(value) => (0x51, value.to_be_bytes().to_vec()),
+        Value::Short(value) => (0x61, value.to_be_bytes().to_vec()),
+        Value::Int(value) => (0x71, value.to_be_bytes().to_vec()),
+        Value::Long(value) => (0x81, value.to_be_bytes().to_vec()),
+        Value::Float(value) => (0x72, value.0.to_bits().to_be_bytes().to_vec()),
+        Value::Double(value) => (0x82, value.0.to_bits().to_be_bytes().to_vec()),
+        Value::Decimal32(value) => (0x74, value.clone().into_inner().to_vec()),
+        Value::Decimal64(value) => (0x84, value.clone().into_inner().to_vec()),
+        Value::Decimal128(value) => (0x94, value.clone().into_inner().to_vec()),
+        Value::Char(value) => (0x73, u32::from(*value).to_be_bytes().to_vec()),
+        Value::Timestamp(value) => (0x83, value.milliseconds().to_be_bytes().to_vec()),
+        Value::Uuid(value) => (0x98, value.as_ref().to_vec()),
+        Value::Binary(value) => (0xb0, variable_payload(value)?),
+        Value::String(value) => (0xb1, variable_payload(value.as_bytes())?),
+        Value::Symbol(value) => {
+            if !value.as_str().is_ascii() {
+                return Err(invalid_data("AMQP symbol contains non-ASCII characters"));
+            }
+            (0xb3, variable_payload(value.as_str().as_bytes())?)
+        }
+        Value::List(values) => {
+            let mut body = Vec::new();
+            for value in values {
+                body.extend(encode_value(value)?);
+            }
+            (0xd0, counted_payload(values.len(), body)?)
+        }
+        Value::Map(entries) => {
+            let mut body = Vec::new();
+            for (key, value) in entries {
+                body.extend(encode_value(key)?);
+                body.extend(encode_value(value)?);
+            }
+            let count = entries
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| invalid_data("map size overflow"))?;
+            (0xd1, counted_payload(count, body)?)
+        }
+        Value::Array(values) => {
+            let (mut body, payload) = array_parts(values)?;
+            body.extend(payload);
+            (0xf0, counted_payload(values.len(), body)?)
+        }
+        Value::Described(value) => {
+            let (base_constructor, payload) = array_element(&value.value)?;
+            let mut constructor = vec![0x00];
+            constructor.extend(encode_descriptor(&value.descriptor)?);
+            constructor.extend(base_constructor);
+            return Ok((constructor, payload));
+        }
+    };
+    Ok((vec![code], payload))
+}
+
+fn variable_payload(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    let size = u32::try_from(bytes.len()).map_err(|_| invalid_data("value size overflow"))?;
+    let mut payload = size.to_be_bytes().to_vec();
+    payload.extend_from_slice(bytes);
+    Ok(payload)
+}
+
+fn encode_variable(short: u8, long: u8, bytes: &[u8]) -> io::Result<Vec<u8>> {
+    if let Ok(size) = u8::try_from(bytes.len()) {
+        let mut encoded = vec![short, size];
+        encoded.extend_from_slice(bytes);
+        return Ok(encoded);
+    }
+    let mut encoded = vec![long];
+    encoded.extend(variable_payload(bytes)?);
+    Ok(encoded)
 }
 
 fn invalid_data(error: impl Into<String>) -> io::Error {
@@ -1447,10 +1676,160 @@ mod tests {
                 Binary::from(b"one".to_vec()),
                 Binary::from(b"two".to_vec()),
             ]),
+            ..Message::default()
         };
 
         let encoded = encode_message(&message).expect("message encodes");
         assert_eq!(decode_message(&encoded).expect("message decodes"), message);
+    }
+
+    #[test]
+    fn array_values_share_one_constructor_including_null_and_nested_arrays() {
+        let nulls = Message {
+            body: Body::Value(Value::Array(vec![Value::Null, Value::Null].into())),
+            ..Message::default()
+        };
+        let wire = [0x00, 0x53, 0x77, 0xe0, 0x02, 0x02, 0x40];
+        assert_eq!(encode_message(&nulls).expect("null array encodes"), wire);
+        assert_eq!(decode_message(&wire).expect("null array decodes"), nulls);
+        for (index, values) in [
+            vec![Value::Uint(0), Value::Uint(u32::MAX)],
+            vec![Value::Bool(true), Value::Bool(false)],
+            vec![Value::String(String::new()), Value::String("x".repeat(300))],
+            vec![Value::List(Vec::new()), Value::List(vec![Value::Null])],
+            vec![
+                Value::Array(vec![Value::Null, Value::Null].into()),
+                Value::Array(vec![Value::Int(3)].into()),
+            ],
+            vec![described(123, Value::Null), described(123, Value::Null)],
+            vec![
+                described(123, Value::Long(-1)),
+                described(123, Value::Long(i64::MAX)),
+            ],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let message = Message {
+                body: Body::Value(Value::List(vec![Value::Array(values.into())])),
+                ..Message::default()
+            };
+            assert_eq!(
+                decode_message(&encode_message(&message).expect("array encodes"))
+                    .unwrap_or_else(|error| panic!("array case {index} fails to decode: {error}")),
+                message
+            );
+        }
+        let mixed = Message {
+            body: Body::Value(Value::Array(
+                vec![Value::Int(1), Value::String("wrong".to_owned())].into(),
+            )),
+            ..Message::default()
+        };
+        assert!(encode_message(&mixed).is_err());
+    }
+
+    #[test]
+    fn annotations_and_footer_accept_symbol_and_ulong_keys() {
+        let mut annotations = Annotations::new();
+        annotations.insert(Symbol::from("producer"), Value::String(String::from("one")));
+        annotations.insert(7_u64, Value::Binary(Binary::from(vec![1, 2])));
+        let message = Message {
+            delivery_annotations: Some(annotations.clone()),
+            message_annotations: Some(annotations.clone()),
+            body: Body::Value(Value::Null),
+            footer: Some(annotations),
+            ..Message::default()
+        };
+        assert_eq!(
+            decode_message(&encode_message(&message).expect("message encodes"))
+                .expect("annotations decode"),
+            message,
+        );
+        // A ulong key (0x53) in a footer map is distinct from a symbol key.
+        let wire = [0x00, 0x53, 0x78, 0xc1, 0x04, 0x02, 0x53, 0x07, 0x40];
+        assert_eq!(
+            decode_message(&wire)
+                .expect("ulong annotation decodes")
+                .footer
+                .expect("footer")
+                .get(7_u64),
+            Some(&Value::Null),
+        );
+        for invalid_key in [Value::String(String::from("key")), Value::Uint(7)] {
+            let mut map = OrderedMap::new();
+            map.insert(invalid_key, Value::Null);
+            let wire = serde_amqp::to_vec(&described(FOOTER, Value::Map(map)))
+                .expect("invalid key fixture encodes");
+            assert_eq!(
+                decode_message(&wire)
+                    .expect_err("invalid annotation key")
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
+    fn allocation_budgets_cover_all_body_sections() {
+        let count = u32::try_from(crate::value_codec::MAX_VALUE_ELEMENTS / 2)
+            .expect("node count fits in u32");
+        let mut section = vec![0x00, 0x53, 0x76, 0xc0, 0x0b, 0x01, 0xf0];
+        section.extend(5_u32.to_be_bytes());
+        section.extend(count.to_be_bytes());
+        section.push(0x40);
+        assert!(decode_message(&section).is_ok());
+        assert!(decode_message(&[section.as_slice(), section.as_slice()].concat()).is_err());
+    }
+
+    #[test]
+    fn message_sections_reject_repetition_and_invalid_order() {
+        let header = [0x00, 0x53, 0x70, 0x45];
+        let properties = [0x00, 0x53, 0x73, 0x45];
+        let annotations = [0x00, 0x53, 0x72, 0xc1, 0x01, 0x00];
+        let application = [0x00, 0x53, 0x74, 0xc1, 0x01, 0x00];
+        let data = [0x00, 0x53, 0x75, 0xa0, 0x00];
+        let footer = [0x00, 0x53, 0x78, 0xc1, 0x01, 0x00];
+        for section in [
+            header.as_slice(),
+            properties.as_slice(),
+            annotations.as_slice(),
+            application.as_slice(),
+            footer.as_slice(),
+        ] {
+            let wire = [section, section].concat();
+            assert_eq!(
+                decode_message(&wire).expect_err("repeated section").kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        for (first, second) in [
+            (data.as_slice(), header.as_slice()),
+            (properties.as_slice(), annotations.as_slice()),
+            (application.as_slice(), properties.as_slice()),
+            (footer.as_slice(), data.as_slice()),
+        ] {
+            assert_eq!(
+                decode_message(&[first, second].concat())
+                    .expect_err("out of order section")
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        assert!(decode_message(&[0x00, 0x53, 0x79, 0x40]).is_err());
+    }
+
+    #[test]
+    fn known_symbolic_section_descriptors_decode() {
+        let wire = serde_amqp::to_vec(&Value::Described(Box::new(Described {
+            descriptor: Descriptor::Name(Symbol::from("amqp:data:binary")),
+            value: Value::Binary(Binary::from(vec![1, 2, 3])),
+        })))
+        .expect("named descriptor encodes");
+        assert_eq!(
+            decode_message(&wire).expect("named section decodes").body,
+            Body::Data(vec![Binary::from(vec![1, 2, 3])])
+        );
     }
 
     #[test]

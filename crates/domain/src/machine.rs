@@ -17,9 +17,9 @@ use storage::{StateStore, WriteBatch};
 use crate::{
     AcceptedSession, BrokerError, Command, CommandKind, CommandOutcome, DeadLetterInfo,
     DeadLetterReason, Delivery, DeliveryLock, EntityPath, LockToken, MAX_MESSAGE_ID_LENGTH,
-    MessageRecord, MessageState, MessageStatus, NamespaceName, QueueConfig, QueueCounters,
-    ReceiveMode, ScheduledMessage, SequenceNumber, SessionHold, SessionId, SessionLock,
-    SessionRecord, Timestamp, codec, keys,
+    MessageEnvelope, MessageRecord, MessageState, MessageStatus, NamespaceName, QueueConfig,
+    QueueCounters, ReceiveMode, SequenceNumber, SessionHold, SessionId, SessionLock, SessionRecord,
+    Timestamp, codec, keys,
 };
 
 /// Ready entries a single receive may walk past while discarding expired
@@ -40,6 +40,20 @@ pub const TIMER_SCAN_LIMIT: usize = 256;
 /// `MAX_SESSION_SCAN` sessions are all held reports none available rather than
 /// walking an unbounded number of them, and the receiver retries.
 const MAX_SESSION_SCAN: usize = 32;
+
+#[derive(Clone, Copy)]
+struct MessageInput<'a> {
+    message_id: &'a str,
+    body: &'a [u8],
+    time_to_live_millis: Option<u64>,
+    session_id: Option<&'a SessionId>,
+    envelope: Option<&'a MessageEnvelope>,
+}
+
+struct ScheduledInput<'a> {
+    message: MessageInput<'a>,
+    enqueue_at: Timestamp,
+}
 
 #[derive(Clone, Debug)]
 pub struct StateMachine<S> {
@@ -80,13 +94,60 @@ impl<S: StateStore> StateMachine<S> {
                 session_id,
             } => self.send(
                 command,
-                message_id,
-                body,
-                *time_to_live_millis,
-                session_id.as_ref(),
+                MessageInput {
+                    message_id,
+                    body,
+                    time_to_live_millis: *time_to_live_millis,
+                    session_id: session_id.as_ref(),
+                    envelope: None,
+                },
                 &mut batch,
             )?,
-            CommandKind::Schedule { messages } => self.schedule(command, messages, &mut batch)?,
+            CommandKind::SendEnvelope {
+                message_id,
+                body,
+                time_to_live_millis,
+                session_id,
+                envelope,
+            } => self.send(
+                command,
+                MessageInput {
+                    message_id,
+                    body,
+                    time_to_live_millis: *time_to_live_millis,
+                    session_id: session_id.as_ref(),
+                    envelope: Some(envelope.as_ref()),
+                },
+                &mut batch,
+            )?,
+            CommandKind::Schedule { messages } => self.schedule(
+                command,
+                messages.iter().map(|message| ScheduledInput {
+                    message: MessageInput {
+                        message_id: &message.message_id,
+                        body: &message.body,
+                        time_to_live_millis: message.time_to_live_millis,
+                        session_id: message.session_id.as_ref(),
+                        envelope: None,
+                    },
+                    enqueue_at: message.enqueue_at,
+                }),
+                &mut batch,
+            )?,
+            CommandKind::ScheduleEnvelopes { messages } => self.schedule(
+                command,
+                messages.iter().map(|message| ScheduledInput {
+                    message: MessageInput {
+                        message_id: &message.message_id,
+                        body: &message.body,
+                        time_to_live_millis: message.time_to_live_millis,
+                        session_id: message.session_id.as_ref(),
+                        envelope: Some(&message.envelope),
+                    },
+                    enqueue_at: message.enqueue_at,
+                }),
+                &mut batch,
+            )?,
             CommandKind::CancelScheduled { sequences } => {
                 self.cancel_scheduled(command, sequences, &mut batch)?
             }
@@ -413,24 +474,14 @@ impl<S: StateStore> StateMachine<S> {
     fn send(
         &self,
         command: &Command,
-        message_id: &str,
-        body: &[u8],
-        time_to_live_millis: Option<u64>,
-        session_id: Option<&SessionId>,
+        message: MessageInput<'_>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
         if command.entity.is_dead_letter_queue() {
             return Err(BrokerError::DeadLetterQueueIsReserved);
         }
         let config = self.load_config(command)?;
-        require_session_agreement(&config, session_id.is_some())?;
-        validate_message_id(message_id)?;
-        if body.len() > config.max_message_bytes {
-            return Err(BrokerError::MessageTooLarge {
-                body_bytes: body.len(),
-                maximum_bytes: config.max_message_bytes,
-            });
-        }
+        validate_message_input(&config, message)?;
 
         let mut counters = self.load_counters(command)?;
         let sequence = SequenceNumber::new(counters.next_sequence);
@@ -440,25 +491,33 @@ impl<S: StateStore> StateMachine<S> {
             keys::queue_counters(&command.namespace, &command.entity),
             codec::encode(&counters)?,
         );
-        if self.record_message_id(command, &config, message_id, &mut BTreeSet::new(), batch)? {
+        if self.record_message_id(
+            command,
+            &config,
+            message.message_id,
+            &mut BTreeSet::new(),
+            batch,
+        )? {
             return Ok(CommandOutcome::Sent { sequence });
         }
 
-        let expires_at = time_to_live_millis
+        let expires_at = message
+            .time_to_live_millis
             .or(config.default_time_to_live_millis)
             .map(|millis| command.issued_at.saturating_add_millis(millis));
 
         let record = MessageRecord {
             sequence,
-            message_id: message_id.to_owned(),
-            body: body.to_vec(),
+            message_id: message.message_id.to_owned(),
+            body: message.body.to_vec(),
             enqueued_at: command.issued_at,
             expires_at,
             delivery_count: 0,
             state: MessageState::Ready,
-            session_id: session_id.cloned(),
+            session_id: message.session_id.cloned(),
             dead_letter: None,
             scheduled_enqueue_time: None,
+            envelope: message.envelope.cloned().map(Box::new),
         };
 
         let namespace = &command.namespace;
@@ -477,10 +536,10 @@ impl<S: StateStore> StateMachine<S> {
         Ok(CommandOutcome::Sent { sequence })
     }
 
-    fn schedule(
+    fn schedule<'a>(
         &self,
         command: &Command,
-        messages: &[ScheduledMessage],
+        messages: impl ExactSizeIterator<Item = ScheduledInput<'a>>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
         if command.entity.is_dead_letter_queue() {
@@ -490,25 +549,20 @@ impl<S: StateStore> StateMachine<S> {
         let mut counters = self.load_counters(command)?;
         let namespace = &command.namespace;
         let entity = &command.entity;
-        let mut sequences = Vec::with_capacity(messages.len());
+        let message_count = messages.len();
+        let mut sequences = Vec::with_capacity(message_count);
         let mut staged_history = BTreeSet::new();
 
-        for message in messages {
-            require_session_agreement(&config, message.session_id.is_some())?;
-            validate_message_id(&message.message_id)?;
-            if message.body.len() > config.max_message_bytes {
-                return Err(BrokerError::MessageTooLarge {
-                    body_bytes: message.body.len(),
-                    maximum_bytes: config.max_message_bytes,
-                });
-            }
+        for scheduled in messages {
+            let message = scheduled.message;
+            validate_message_input(&config, message)?;
             let sequence = SequenceNumber::new(counters.next_sequence);
             counters.next_sequence = counters.next_sequence.saturating_add(1);
             sequences.push(sequence);
             if self.record_message_id(
                 command,
                 &config,
-                &message.message_id,
+                message.message_id,
                 &mut staged_history,
                 batch,
             )? {
@@ -517,11 +571,11 @@ impl<S: StateStore> StateMachine<S> {
             let time_to_live_millis = message
                 .time_to_live_millis
                 .or(config.default_time_to_live_millis);
-            let future = message.enqueue_at > command.issued_at;
+            let future = scheduled.enqueue_at > command.issued_at;
             let record = MessageRecord {
                 sequence,
-                message_id: message.message_id.clone(),
-                body: message.body.clone(),
+                message_id: message.message_id.to_owned(),
+                body: message.body.to_vec(),
                 enqueued_at: command.issued_at,
                 expires_at: if future {
                     None
@@ -532,15 +586,16 @@ impl<S: StateStore> StateMachine<S> {
                 delivery_count: 0,
                 state: if future {
                     MessageState::Scheduled {
-                        enqueue_at: message.enqueue_at,
+                        enqueue_at: scheduled.enqueue_at,
                         time_to_live_millis,
                     }
                 } else {
                     MessageState::Ready
                 },
-                session_id: message.session_id.clone(),
+                session_id: message.session_id.cloned(),
                 dead_letter: None,
-                scheduled_enqueue_time: Some(message.enqueue_at),
+                scheduled_enqueue_time: Some(scheduled.enqueue_at),
+                envelope: message.envelope.cloned().map(Box::new),
             };
             batch.push_put(
                 keys::message(namespace, entity, sequence),
@@ -548,7 +603,7 @@ impl<S: StateStore> StateMachine<S> {
             );
             if future {
                 batch.push_put(
-                    keys::scheduled(namespace, entity, message.enqueue_at, sequence),
+                    keys::scheduled(namespace, entity, scheduled.enqueue_at, sequence),
                     Vec::new(),
                 );
             } else {
@@ -561,7 +616,7 @@ impl<S: StateStore> StateMachine<S> {
                 }
             }
         }
-        if !messages.is_empty() {
+        if message_count != 0 {
             batch.push_put(
                 keys::queue_counters(namespace, entity),
                 codec::encode(&counters)?,
@@ -821,11 +876,15 @@ impl<S: StateStore> StateMachine<S> {
                 }
             };
 
+            let time_to_live_millis = record.time_to_live_millis();
             return Ok(CommandOutcome::Received(Some(Delivery {
                 sequence,
                 message_id: record.message_id,
                 body: record.body,
                 enqueued_at: record.enqueued_at,
+                expires_at: record.expires_at,
+                time_to_live_millis,
+                envelope: record.envelope,
                 delivery_count,
                 status: MessageStatus::Active,
                 scheduled_enqueue_time: record.scheduled_enqueue_time,
@@ -876,11 +935,15 @@ impl<S: StateStore> StateMachine<S> {
 
             let status = record.status();
             let scheduled_enqueue_time = record.scheduled_enqueue_time;
+            let time_to_live_millis = record.time_to_live_millis();
             deliveries.push(Delivery {
                 sequence,
                 message_id: record.message_id,
                 body: record.body,
                 enqueued_at: record.enqueued_at,
+                expires_at: record.expires_at,
+                time_to_live_millis,
+                envelope: record.envelope,
                 delivery_count: record.delivery_count,
                 status,
                 scheduled_enqueue_time,
@@ -1071,11 +1134,15 @@ impl<S: StateStore> StateMachine<S> {
                 }
             };
 
+            let time_to_live_millis = record.time_to_live_millis();
             deliveries.push(Delivery {
                 sequence: *sequence,
                 message_id: record.message_id,
                 body: record.body,
                 enqueued_at: record.enqueued_at,
+                expires_at: record.expires_at,
+                time_to_live_millis,
+                envelope: record.envelope,
                 delivery_count,
                 status: MessageStatus::Active,
                 scheduled_enqueue_time: record.scheduled_enqueue_time,
@@ -1613,6 +1680,44 @@ fn validate_message_id(message_id: &str) -> Result<(), BrokerError> {
         return Err(BrokerError::MessageIdTooLong {
             length,
             maximum: MAX_MESSAGE_ID_LENGTH,
+        });
+    }
+    Ok(())
+}
+
+fn validate_message_input(
+    config: &QueueConfig,
+    message: MessageInput<'_>,
+) -> Result<(), BrokerError> {
+    require_session_agreement(config, message.session_id.is_some())?;
+    validate_message_id(message.message_id)?;
+    if let Some(envelope) = message.envelope {
+        if let Some(crate::MessageIdentifier::String(message_id)) = &envelope.properties.message_id
+        {
+            validate_message_id(message_id)?;
+        }
+        envelope.validate()?;
+    }
+    let content_bytes = message.envelope.map_or(message.body.len(), |envelope| {
+        let mut size = envelope.content_size();
+        if envelope.properties.message_id.is_none() {
+            size = size
+                .saturating_add(5)
+                .saturating_add(message.message_id.len());
+        }
+        if let Some(session_id) = message.session_id {
+            size = size
+                .saturating_add(5)
+                .saturating_add(session_id.as_str().len());
+        }
+        // The byte body is only a compatibility view when typed content exists.
+        // Count the larger representation, not both copies of the same body.
+        size.max(message.body.len())
+    });
+    if content_bytes > config.max_message_bytes {
+        return Err(BrokerError::MessageTooLarge {
+            body_bytes: content_bytes,
+            maximum_bytes: config.max_message_bytes,
         });
     }
     Ok(())

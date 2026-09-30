@@ -35,10 +35,28 @@ await using var client = new ServiceBusClient(
 await using ServiceBusSender sender = client.CreateSender(queue);
 await using ServiceBusReceiver receiver = client.CreateReceiver(queue);
 
-await sender.SendMessageAsync(new ServiceBusMessage("official-dotnet-current"));
+var original = new ServiceBusMessage("official-dotnet-current")
+{
+    MessageId = "preserved-id",
+    CorrelationId = "preserved-correlation",
+    Subject = "checkout",
+    ContentType = "application/json",
+    To = "logical-destination",
+    ReplyTo = "replies",
+    ReplyToSessionId = "reply-session",
+    PartitionKey = "preserved-partition",
+    TimeToLive = TimeSpan.FromDays(60),
+};
+original.GetRawAmqpMessage().Properties.ContentEncoding = "utf-8";
+original.GetRawAmqpMessage().Footer["producer-checksum"] = "checksum-1";
+foreach (var pair in PreservedApplicationProperties())
+{
+    original.ApplicationProperties[pair.Key] = pair.Value;
+}
+await sender.SendMessageAsync(original);
 IReadOnlyList<ServiceBusReceivedMessage> peeked =
     await receiver.PeekMessagesAsync(maxMessages: 1);
-if (peeked.Count != 1 || peeked[0].Body.ToString() != "official-dotnet-current")
+if (peeked.Count != 1 || !HasPreservedContent(peeked[0]))
 {
     Console.Error.WriteLine(
         $"unexpected peek result: count={peeked.Count}, body={peeked.FirstOrDefault()?.Body}");
@@ -52,7 +70,7 @@ if (received is null)
     Console.Error.WriteLine("the official client did not receive its message");
     return 4;
 }
-if (received.Body.ToString() != "official-dotnet-current")
+if (!HasPreservedContent(received))
 {
     Console.Error.WriteLine($"unexpected body: {received.Body}");
     return 5;
@@ -65,6 +83,14 @@ if (received.LockedUntil < lockedUntilBeforeRenewal)
     Console.Error.WriteLine(
         $"renewal moved the lock backward: {lockedUntilBeforeRenewal:o} -> {received.LockedUntil:o}");
     return 6;
+}
+
+await receiver.AbandonMessageAsync(received);
+received = await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (received is null || !HasPreservedContent(received) || received.DeliveryCount < 2)
+{
+    Console.Error.WriteLine("message content did not survive redelivery");
+    return 26;
 }
 
 await receiver.CompleteMessageAsync(received);
@@ -362,3 +388,69 @@ if (await receiver.PeekMessageAsync(fromSequenceNumber: 1) is not null
 Console.WriteLine(
     "official .NET Service Bus client send/peek/receive/defer/renew/complete/schedule/cancel/duplicate and session renew/state passed");
 return 0;
+
+static Dictionary<string, object> PreservedApplicationProperties() => new()
+{
+    ["byte"] = (byte)7,
+    ["sbyte"] = (sbyte)-7,
+    ["char"] = 'Q',
+    ["short"] = (short)-300,
+    ["ushort"] = (ushort)300,
+    ["int"] = -70000,
+    ["uint"] = 70000U,
+    ["long"] = -5000000000L,
+    ["ulong"] = 5000000000UL,
+    ["float"] = -1.25F,
+    ["double"] = 1.125D,
+    ["decimal"] = 12.375M,
+    ["bool"] = true,
+    ["guid"] = Guid.Parse("00112233-4455-6677-8899-aabbccddeeff"),
+    ["string"] = "custom-value",
+    ["uri"] = new Uri("https://example.org/orders/1"),
+    ["date-time"] = new DateTime(2020, 1, 2, 3, 4, 5, DateTimeKind.Utc),
+    ["date-time-offset"] = new DateTimeOffset(2020, 1, 2, 3, 4, 5, TimeSpan.Zero),
+    ["time-span"] = TimeSpan.FromTicks(123456789),
+    ["binary"] = new byte[] { 1, 2, 3, 4 },
+};
+
+static bool HasPreservedContent(ServiceBusReceivedMessage message)
+{
+    if (message.Body.ToString() != "official-dotnet-current"
+        || message.MessageId != "preserved-id"
+        || message.CorrelationId != "preserved-correlation"
+        || message.Subject != "checkout"
+        || message.ContentType != "application/json"
+        || message.To != "logical-destination"
+        || message.ReplyTo != "replies"
+        || message.ReplyToSessionId != "reply-session"
+        || message.PartitionKey != "preserved-partition"
+        || message.TimeToLive != TimeSpan.FromDays(60)
+        || message.ExpiresAt != message.EnqueuedTime.AddDays(60)
+        || message.GetRawAmqpMessage().Properties.ContentEncoding != "utf-8"
+        || !message.GetRawAmqpMessage().Footer.TryGetValue("producer-checksum", out object? checksum)
+        || !Equals(checksum, "checksum-1"))
+    {
+        return false;
+    }
+    foreach (var pair in PreservedApplicationProperties())
+    {
+        if (!message.ApplicationProperties.TryGetValue(pair.Key, out object? actual)
+            || actual is null
+            || actual.GetType() != pair.Value.GetType())
+        {
+            return false;
+        }
+        if (pair.Value is byte[] expectedBytes)
+        {
+            if (!((byte[])actual).SequenceEqual(expectedBytes))
+            {
+                return false;
+            }
+        }
+        else if (!Equals(actual, pair.Value))
+        {
+            return false;
+        }
+    }
+    return true;
+}

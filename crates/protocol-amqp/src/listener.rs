@@ -739,20 +739,22 @@ async fn serve_sending_client<B: Broker>(
         };
 
         let kind = match incoming.scheduled_enqueue_time {
-            Some(enqueue_at) => CommandKind::Schedule {
-                messages: vec![domain::ScheduledMessage {
+            Some(enqueue_at) => CommandKind::ScheduleEnvelopes {
+                messages: vec![domain::ScheduledEnvelope {
                     message_id: incoming.message_id,
                     body: incoming.body,
                     time_to_live_millis: incoming.time_to_live_millis,
                     session_id: incoming.session_id,
                     enqueue_at,
+                    envelope: incoming.envelope,
                 }],
             },
-            None => CommandKind::Send {
+            None => CommandKind::SendEnvelope {
                 message_id: incoming.message_id,
                 body: incoming.body,
                 time_to_live_millis: incoming.time_to_live_millis,
                 session_id: incoming.session_id,
+                envelope: incoming.envelope.into(),
             },
         };
         let outcome = broker.submit(namespace.clone(), entity.clone(), kind).await;

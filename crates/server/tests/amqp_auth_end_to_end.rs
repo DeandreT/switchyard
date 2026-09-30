@@ -317,7 +317,7 @@ fn scheduling_body() -> Result<OrderedMap<Value, Value>, Box<dyn Error>> {
         Symbol::from(protocol_amqp::SCHEDULED_ENQUEUE_TIME_ANNOTATION),
         Value::Timestamp(2_000_i64.into()),
     );
-    message.message_annotations = Some(annotations);
+    message.message_annotations = Some(annotations.into());
     let mut entry = OrderedMap::new();
     entry.insert(
         Value::String(protocol_amqp::MESSAGE.to_owned()),

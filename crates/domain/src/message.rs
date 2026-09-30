@@ -2,7 +2,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CodecError, SessionId, Timestamp, codec};
+use crate::{CodecError, MessageEnvelope, SessionId, Timestamp, codec};
 
 /// Service Bus measures string message identifiers in UTF-16 code units.
 pub const MAX_MESSAGE_ID_LENGTH: usize = 128;
@@ -146,7 +146,7 @@ pub struct MessageRecord {
     ///
     /// Fields are appended in the order the record grew — `session_id` in
     /// version 2, `dead_letter` in version 3, `scheduled_enqueue_time` in
-    /// version 5 — so an older payload is a strict prefix of a newer one, and
+    /// version 5, `envelope` in version 7 — so an older payload is a strict prefix of a newer one, and
     /// reading it as the newer version runs off the end of the buffer instead
     /// of silently producing a different message.
     pub session_id: Option<SessionId>,
@@ -159,6 +159,9 @@ pub struct MessageRecord {
     pub dead_letter: Option<DeadLetterInfo>,
     /// The originally requested enqueue time, retained after activation.
     pub scheduled_enqueue_time: Option<Timestamp>,
+    /// Typed producer content. Absent on records written through the legacy
+    /// byte-body API or migrated from older store formats.
+    pub envelope: Option<Box<MessageEnvelope>>,
 }
 
 /// The state enum as versions 1 and 2 stored it, when dead-lettered was a
@@ -257,6 +260,39 @@ struct MessageRecordV4 {
     dead_letter: Option<DeadLetterInfo>,
 }
 
+/// Versions 5 and 6, before typed producer content was retained.
+#[derive(Deserialize)]
+struct MessageRecordV6 {
+    sequence: SequenceNumber,
+    message_id: String,
+    body: Vec<u8>,
+    enqueued_at: Timestamp,
+    expires_at: Option<Timestamp>,
+    delivery_count: u32,
+    state: MessageState,
+    session_id: Option<SessionId>,
+    dead_letter: Option<DeadLetterInfo>,
+    scheduled_enqueue_time: Option<Timestamp>,
+}
+
+impl From<MessageRecordV6> for MessageRecord {
+    fn from(record: MessageRecordV6) -> Self {
+        Self {
+            sequence: record.sequence,
+            message_id: record.message_id,
+            body: record.body,
+            enqueued_at: record.enqueued_at,
+            expires_at: record.expires_at,
+            delivery_count: record.delivery_count,
+            state: record.state,
+            session_id: record.session_id,
+            dead_letter: record.dead_letter,
+            scheduled_enqueue_time: record.scheduled_enqueue_time,
+            envelope: None,
+        }
+    }
+}
+
 impl From<MessageRecordV4> for MessageRecord {
     fn from(record: MessageRecordV4) -> Self {
         Self {
@@ -270,6 +306,7 @@ impl From<MessageRecordV4> for MessageRecord {
             session_id: record.session_id,
             dead_letter: record.dead_letter,
             scheduled_enqueue_time: None,
+            envelope: None,
         }
     }
 }
@@ -288,6 +325,7 @@ impl From<MessageRecordV2> for MessageRecord {
             session_id: record.session_id,
             dead_letter,
             scheduled_enqueue_time: None,
+            envelope: None,
         }
     }
 }
@@ -321,7 +359,10 @@ impl MessageRecord {
             codec::VALUE_FORMAT_V3 | codec::VALUE_FORMAT_V4 => {
                 Ok(codec::decode_payload::<MessageRecordV4>(payload)?.into())
             }
-            codec::VALUE_FORMAT_V5 | codec::VALUE_FORMAT_V6 => codec::decode_payload(payload),
+            codec::VALUE_FORMAT_V5 | codec::VALUE_FORMAT_V6 => {
+                Ok(codec::decode_payload::<MessageRecordV6>(payload)?.into())
+            }
+            codec::VALUE_FORMAT_V7 => codec::decode_payload(payload),
             _ => unreachable!("split rejects unknown value formats"),
         }
     }
@@ -343,6 +384,20 @@ impl MessageRecord {
             MessageState::Scheduled { .. } => MessageStatus::Scheduled,
         }
     }
+
+    pub fn time_to_live_millis(&self) -> Option<u64> {
+        match self.state {
+            MessageState::Scheduled {
+                time_to_live_millis,
+                ..
+            } => time_to_live_millis,
+            _ => self.expires_at.map(|expires_at| {
+                expires_at
+                    .as_millis()
+                    .saturating_sub(self.enqueued_at.as_millis())
+            }),
+        }
+    }
 }
 
 /// One message handed to a receiver.
@@ -352,6 +407,10 @@ pub struct Delivery {
     pub message_id: String,
     pub body: Vec<u8>,
     pub enqueued_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
+    /// Effective lifetime, including before a scheduled message activates.
+    pub time_to_live_millis: Option<u64>,
+    pub envelope: Option<Box<MessageEnvelope>>,
     pub delivery_count: u32,
     /// Active, deferred, or scheduled state observed by a browser.
     pub status: MessageStatus,
@@ -388,6 +447,7 @@ mod tests {
             session_id: None,
             dead_letter: None,
             scheduled_enqueue_time: None,
+            envelope: None,
         }
     }
 
@@ -437,7 +497,7 @@ mod tests {
             ..record(None)
         };
         let envelope = codec::encode(&original)?;
-        assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V6));
+        assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V7));
         assert_eq!(MessageRecord::decode(&envelope)?, original);
         Ok(())
     }
@@ -473,7 +533,8 @@ mod tests {
     }
 
     #[test]
-    fn a_version_5_scheduled_message_keeps_its_shape_in_version_6() -> Result<(), CodecError> {
+    fn version_5_and_6_scheduled_messages_migrate_without_typed_content() -> Result<(), CodecError>
+    {
         let original = MessageRecord {
             state: MessageState::Scheduled {
                 enqueue_at: Timestamp::from_millis(100),
@@ -482,10 +543,48 @@ mod tests {
             scheduled_enqueue_time: Some(Timestamp::from_millis(100)),
             ..record(None)
         };
-        let mut envelope = vec![codec::VALUE_FORMAT_V5];
-        envelope.extend_from_slice(&postcard::to_stdvec(&original).expect("message encodes"));
-        assert_eq!(MessageRecord::decode(&envelope)?, original);
+        let payload = version_6_payload(&original);
+        for version in [codec::VALUE_FORMAT_V5, codec::VALUE_FORMAT_V6] {
+            let mut envelope = vec![version];
+            envelope.extend_from_slice(&payload);
+            assert_eq!(MessageRecord::decode(&envelope)?, original);
+        }
         Ok(())
+    }
+
+    fn version_6_payload(record: &MessageRecord) -> Vec<u8> {
+        postcard::to_stdvec(&(
+            record.sequence,
+            &record.message_id,
+            &record.body,
+            record.enqueued_at,
+            record.expires_at,
+            record.delivery_count,
+            &record.state,
+            &record.session_id,
+            &record.dead_letter,
+            record.scheduled_enqueue_time,
+        ))
+        .expect("a version 6 message encodes")
+    }
+
+    #[test]
+    fn version_6_bytes_cannot_be_misread_as_a_version_7_record() {
+        assert_eq!(
+            codec::decode_payload::<MessageRecord>(&version_6_payload(&record(None))),
+            Err(CodecError::Decode)
+        );
+    }
+
+    #[test]
+    fn a_version_7_record_cannot_be_read_as_a_version_6_record() {
+        let original = MessageRecord {
+            envelope: Some(Box::new(MessageEnvelope::default())),
+            ..record(None)
+        };
+        let encoded = codec::encode(&original).expect("encodes");
+        assert!(codec::decode_payload::<MessageRecordV6>(&encoded[1..]).is_err());
+        assert_eq!(MessageRecord::decode(&encoded), Ok(original));
     }
 
     #[test]
@@ -502,7 +601,7 @@ mod tests {
             ..record(None)
         };
         let envelope = codec::encode(&original).expect("encodes");
-        assert_eq!(envelope[0], codec::VALUE_FORMAT_V6);
+        assert_eq!(envelope[0], codec::VALUE_FORMAT_V7);
         assert_eq!(MessageRecord::decode(&envelope), Ok(original));
     }
 

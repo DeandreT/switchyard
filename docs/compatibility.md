@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Send, peek, receive, defer, renew, complete, schedule, cancel and duplicate detection; session renew/state/scheduling | Planned | Experimental gate on 7.21.0 |
+| Official .NET SDK, current stable | Send, peek, receive, defer, renew, complete, schedule, cancel, duplicate detection and message properties; session renew/state/scheduling | Planned | Experimental gate on 7.21.0 |
 | Official .NET SDK, previous stable | Same gated workflows as current | Planned | Experimental gate on 7.20.2 |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -24,7 +24,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | AMQP over WebSockets | Pre-1.0 | Not implemented |
 | SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. JWT: not implemented |
 | Queue send, receive, and settlement | Pre-1.0 | State machine |
-| Message properties and AMQP body preservation | Pre-1.0 | Partial: data bytes, text-normalized identifier, session, TTL and scheduling metadata. Other properties and non-data bodies are not persisted |
+| Message properties and AMQP body preservation | Pre-1.0 | State machine and AMQP mapping; typed properties, application values, annotations, footer and all body kinds. Rust clients on both backends and official .NET property gate |
 | Peek without lock acquisition | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Receive-delete | Pre-1.0 | State machine, AMQP mapping |
 | Lock expiry and redelivery | Pre-1.0 | State machine |
@@ -160,9 +160,10 @@ complete protocol coverage uses a Rust AMQP 1.0 client. The current and previous
 stable official .NET SDKs also have opt-in gates for ordinary send, receive,
 peek, deferral, deferred receive, message-lock renewal, completion, scheduling,
 and cancellation, duplicate detection for ordinary and scheduled sends, plus
-session state, renewal, receive, completion, and
-scheduling; the rest of those client gates
-remains incomplete.
+session state, renewal, receive, completion, and scheduling. Both gates exercise
+message properties, application-property CLR types, footer data, a lifetime
+longer than the AMQP header can represent, and property-preserving redelivery;
+the rest of those client gates remains incomplete.
 
 The SDK gates build into separate temporary directories and run the resulting
 assemblies directly. Run them explicitly with
@@ -170,10 +171,57 @@ assemblies directly. Run them explicitly with
 each .NET build is limited to two jobs, and serial test execution preserves that
 limit across the two releases.
 
-The current value format is version 6 and durable store layout is version 4.
+### Message Content
+
+Stored content has a protocol-neutral typed representation. Message and
+correlation identifiers keep their AMQP types, including the distinction
+between a missing identifier and an explicitly empty string or binary value.
+Standard properties, application properties, message annotations and footer
+entries survive receive, redelivery, deferral, scheduling and dead-lettering.
+Data and sequence bodies retain every section, including empty sections; value
+bodies retain nested containers, symbolic descriptors and scalar types. Empty
+AMQP arrays are explicitly refused because the current value model cannot
+retain their element constructor; heterogeneous arrays and duplicate map keys
+are refused before storage. Application properties accept scalar values and
+scalar described extensions, not compound containers. Float
+and decimal values retain their raw bits. Delivery annotations are hop-local
+and are consumed rather than forwarded.
+
+Untrusted value parsing is bounded to 68 nesting levels, 132,096 value
+nodes, and 4 MiB of copied binary/string/symbol data across a message. Shared
+array descriptor names count once per expanded element, before allocation.
+Stored message content is bounded separately to 64 levels and 65,536
+nodes; the parser allowance covers envelope sections and metadata map keys.
+Malformed sizes/counts, duplicate map keys and invalid symbols are refused.
+
+Broker-owned sequence, enqueue time, state, lock and scheduling annotations
+override producer values. Delivery count is broker-owned, and `first-acquirer`
+is emitted as false rather than repeating an unverified producer assertion.
+Dead-letter reason and description override those
+application properties when draining the dead-letter queue, while the rest of
+the application bag remains intact. Reserved dead-letter properties are cleared
+from ordinary deliveries; exact Azure parity for that case is unverified.
+The broker strips lifetime and session
+from dead-letter deliveries. For active messages with finite lifetimes, the
+creation/absolute-expiry timestamp pair is emitted as broker enqueue/deadline:
+the official clients use that pair both to reconstruct long lifetimes and to
+expose expiration. Producer creation time is otherwise retained, including in
+dead letters. Pending schedules retain their effective lifetime before it
+starts at activation.
+
+These are semantic preservation guarantees, not byte-identical forwarding for
+signed AMQP envelopes: map order and optional empty sections may normalize.
+Duplicate detection still compares the text-normalized identifier, so distinct
+AMQP identifier types with the same normalized text share history; exact Azure
+behavior for that case is unverified. Rich messages enforce the configured
+size limit using a conservative content tally that includes metadata and body
+sections, rather than only flattened body bytes. Exact AMQP wire-size and
+per-property/header quota parity remains unfinished.
+
+The current value format is version 7 and durable store layout is version 5.
 Earlier message and queue-configuration shapes have tested decoders, but an
-earlier store directory is refused at open because its broker indexes have a different
-contract. There is no directory migration tooling yet; development directories
+earlier store directory is refused at open because its broker contract differs.
+There is no directory migration tooling yet; development directories
 from older builds must be recreated. A rollback likewise refuses a newer layout.
 
 All of it now runs on either backend. The Fjall backend fsyncs a command's batch
@@ -184,5 +232,6 @@ still needs replication.
 
 Switchyard intentionally does not reproduce Azure subscription, namespace
 capacity, or operations-per-second commercial quotas. It defaults to compatible
-wire validation, including the Standard 256 KiB message-size limit, while
-allowing operators to configure larger namespace storage quotas.
+message validation, including a default 256 KiB content-size limit, while
+allowing operators to configure larger limits. Full wire quota parity is not
+yet claimed.

@@ -202,7 +202,7 @@ async fn a_client_peeks_without_locking_or_consuming() -> Result<(), Box<dyn Err
         peeked
             .message_annotations
             .as_ref()
-            .and_then(|annotations| annotations.get(&Symbol::from("x-opt-sequence-number"))),
+            .and_then(|annotations| annotations.get(Symbol::from("x-opt-sequence-number"))),
         Some(&Value::Long(1))
     );
     responses.accept(&response).await?;
@@ -815,7 +815,7 @@ fn scheduled_wire_message(text: &str, enqueue_at: i64) -> Message {
         Symbol::from(protocol_amqp::SCHEDULED_ENQUEUE_TIME_ANNOTATION),
         Value::Timestamp(enqueue_at.into()),
     );
-    message.message_annotations = Some(annotations);
+    message.message_annotations = Some(annotations.into());
     message
 }
 
@@ -956,11 +956,11 @@ async fn a_client_schedules_peeks_cancels_and_receives_after_activation()
         .as_ref()
         .expect("peek annotations");
     assert_eq!(
-        annotations.get(&Symbol::from(protocol_amqp::MESSAGE_STATE_ANNOTATION)),
+        annotations.get(Symbol::from(protocol_amqp::MESSAGE_STATE_ANNOTATION)),
         Some(&Value::Int(2))
     );
     assert_eq!(
-        annotations.get(&Symbol::from(
+        annotations.get(Symbol::from(
             protocol_amqp::SCHEDULED_ENQUEUE_TIME_ANNOTATION
         )),
         Some(&Value::Timestamp(2_000_i64.into()))
@@ -987,15 +987,15 @@ async fn a_client_schedules_peeks_cancels_and_receives_after_activation()
         .as_ref()
         .expect("delivery annotations");
     assert_ne!(
-        annotations.get(&Symbol::from("x-opt-sequence-number")),
+        annotations.get(Symbol::from("x-opt-sequence-number")),
         Some(&scheduled_sequence)
     );
     assert_eq!(
-        annotations.get(&Symbol::from(protocol_amqp::MESSAGE_STATE_ANNOTATION)),
+        annotations.get(Symbol::from(protocol_amqp::MESSAGE_STATE_ANNOTATION)),
         Some(&Value::Int(0))
     );
     assert_eq!(
-        annotations.get(&Symbol::from(
+        annotations.get(Symbol::from(
             protocol_amqp::SCHEDULED_ENQUEUE_TIME_ANNOTATION
         )),
         Some(&Value::Timestamp(2_000_i64.into()))

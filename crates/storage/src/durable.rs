@@ -32,13 +32,17 @@ pub const STORE_FORMAT_V3: u32 = 3;
 /// enqueue contract. Earlier builds cannot enforce or prune that history.
 pub const STORE_FORMAT_V4: u32 = 4;
 
+/// Version 5: typed message sections are retained in message records. Earlier
+/// builds cannot read those records without losing producer content.
+pub const STORE_FORMAT_V5: u32 = 5;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V4;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V5;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
@@ -274,6 +278,20 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V3,
+                expected: ACTIVE_STORE_FORMAT,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_store_from_before_typed_message_content() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        stamp_format(directory.path(), &STORE_FORMAT_V4.to_be_bytes())?;
+        assert_eq!(
+            FjallStore::open(directory.path()).err(),
+            Some(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V4,
                 expected: ACTIVE_STORE_FORMAT,
             })
         );

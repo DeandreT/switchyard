@@ -9,6 +9,82 @@ pub type DeliveryTag = Binary;
 pub type Fields = OrderedMap<Symbol, Value>;
 pub type FilterSet = OrderedMap<Symbol, Value>;
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum AnnotationKey {
+    Symbol(Symbol),
+    Ulong(u64),
+}
+
+impl From<Symbol> for AnnotationKey {
+    fn from(value: Symbol) -> Self {
+        Self::Symbol(value)
+    }
+}
+
+impl From<&Symbol> for AnnotationKey {
+    fn from(value: &Symbol) -> Self {
+        Self::Symbol(value.clone())
+    }
+}
+
+impl From<u64> for AnnotationKey {
+    fn from(value: u64) -> Self {
+        Self::Ulong(value)
+    }
+}
+
+impl From<&AnnotationKey> for AnnotationKey {
+    fn from(value: &AnnotationKey) -> Self {
+        value.clone()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Annotations(pub OrderedMap<AnnotationKey, Value>);
+
+impl Default for Annotations {
+    fn default() -> Self {
+        Self(OrderedMap::new())
+    }
+}
+
+impl Annotations {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, key: impl Into<AnnotationKey>) -> Option<&Value> {
+        self.0.get(&key.into())
+    }
+
+    pub fn insert(&mut self, key: impl Into<AnnotationKey>, value: Value) {
+        self.0.insert(key.into(), value);
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&AnnotationKey, &Value)> {
+        self.0.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<Fields> for Annotations {
+    fn from(fields: Fields) -> Self {
+        Self(
+            fields
+                .into_iter()
+                .map(|(key, value)| (key.into(), value))
+                .collect(),
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Role {
     Sender,
@@ -576,10 +652,12 @@ pub enum Body {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Message {
     pub header: Option<Header>,
-    pub message_annotations: Option<Fields>,
+    pub delivery_annotations: Option<Annotations>,
+    pub message_annotations: Option<Annotations>,
     pub properties: Option<Properties>,
     pub application_properties: Option<ApplicationProperties>,
     pub body: Body,
+    pub footer: Option<Annotations>,
 }
 
 impl Message {
@@ -598,13 +676,23 @@ impl Message {
 pub struct MessageBuilder(Message);
 
 impl MessageBuilder {
+    pub fn header(mut self, header: Header) -> Self {
+        self.0.header = Some(header);
+        self
+    }
+
+    pub fn delivery_annotations(mut self, annotations: impl Into<Annotations>) -> Self {
+        self.0.delivery_annotations = Some(annotations.into());
+        self
+    }
+
     pub fn properties(mut self, properties: Properties) -> Self {
         self.0.properties = Some(properties);
         self
     }
 
-    pub fn message_annotations(mut self, annotations: Fields) -> Self {
-        self.0.message_annotations = Some(annotations);
+    pub fn message_annotations(mut self, annotations: impl Into<Annotations>) -> Self {
+        self.0.message_annotations = Some(annotations.into());
         self
     }
 
@@ -615,6 +703,11 @@ impl MessageBuilder {
 
     pub fn body(mut self, body: Body) -> Self {
         self.0.body = body;
+        self
+    }
+
+    pub fn footer(mut self, footer: impl Into<Annotations>) -> Self {
+        self.0.footer = Some(footer.into());
         self
     }
 

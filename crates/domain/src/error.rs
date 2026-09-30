@@ -28,13 +28,15 @@ pub enum BrokerError {
         sequence: SequenceNumber,
         locked_until: Timestamp,
     },
-    #[error("message body of {body_bytes} bytes exceeds the queue limit of {maximum_bytes}")]
+    #[error("message content of {body_bytes} bytes exceeds the queue limit of {maximum_bytes}")]
     MessageTooLarge {
         body_bytes: usize,
         maximum_bytes: usize,
     },
     #[error("message identifier length of {length} exceeds the {maximum}-character limit")]
     MessageIdTooLong { length: usize, maximum: usize },
+    #[error("invalid message content: {reason}")]
+    InvalidMessageContent { reason: String },
     #[error("command timestamp {proposed} precedes the applied timestamp {last_applied}")]
     ClockRegression {
         last_applied: Timestamp,
