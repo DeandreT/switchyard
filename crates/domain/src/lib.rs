@@ -22,8 +22,8 @@ mod time;
 
 pub use codec::CodecError;
 pub use command::{
-    Command, CommandKind, CommandOutcome, DeliveryBudget, ScheduledEnvelope, ScheduledMessage,
-    SettlementDisposition,
+    Command, CommandKind, CommandOutcome, DeliveryBudget, IngressBatchLimit, IngressEnvelope,
+    ScheduledEnvelope, ScheduledMessage, SettlementDisposition,
 };
 pub use error::BrokerError;
 pub use identifier::{
@@ -33,6 +33,7 @@ pub use identifier::{
 };
 pub use machine::{
     BROKER_HEADER_RESERVE_BYTES, CommandApplication, MAX_DEAD_LETTER_DETAIL_LENGTH,
+    MAX_INGRESS_BATCH_CONTENT_BYTES, MAX_INGRESS_BATCH_MESSAGES, MAX_INGRESS_BATCH_VALUE_ITEMS,
     MAX_QUEUE_PAGE_SIZE, QueueCursor, QueuePage, StateMachine, TIMER_SCAN_LIMIT,
 };
 pub use message::{

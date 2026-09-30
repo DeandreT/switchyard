@@ -6,7 +6,7 @@
 //! cosmetic: reporting a lost lock as a generic internal error turns a routine
 //! redelivery into an application failure.
 
-use domain::BrokerError;
+use domain::{BrokerError, IngressBatchLimit};
 
 pub const NOT_FOUND: &str = "amqp:not-found";
 pub const INVALID_FIELD: &str = "amqp:invalid-field";
@@ -34,6 +34,11 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         }
         BrokerError::QueueAlreadyExists => ENTITY_ALREADY_EXISTS,
         BrokerError::QueueCounterExhausted { .. } => RESOURCE_LIMIT_EXCEEDED,
+        BrokerError::IngressBatchLimitExceeded { limit, .. } => match limit {
+            IngressBatchLimit::ContentBytes => MESSAGE_SIZE_EXCEEDED,
+            IngressBatchLimit::Messages | IngressBatchLimit::ValueItems => RESOURCE_LIMIT_EXCEEDED,
+        },
+        BrokerError::BatchSessionMismatch => INVALID_FIELD,
 
         // The client's claim on the message is gone. Saying so precisely is what
         // lets an SDK stop trying to settle and wait for redelivery instead.
@@ -107,6 +112,28 @@ mod tests {
             assert_eq!(condition_for(&error), RESOURCE_LIMIT_EXCEEDED);
             assert!(!is_retryable(&error));
         }
+    }
+
+    #[test]
+    fn atomic_ingress_limits_and_session_mismatches_are_not_retryable() {
+        for (limit, condition) in [
+            (IngressBatchLimit::Messages, RESOURCE_LIMIT_EXCEEDED),
+            (IngressBatchLimit::ContentBytes, MESSAGE_SIZE_EXCEEDED),
+            (IngressBatchLimit::ValueItems, RESOURCE_LIMIT_EXCEEDED),
+        ] {
+            let error = BrokerError::IngressBatchLimitExceeded {
+                limit,
+                actual: 2,
+                maximum: 1,
+            };
+            assert_eq!(condition_for(&error), condition);
+            assert!(!is_retryable(&error));
+        }
+        assert_eq!(
+            condition_for(&BrokerError::BatchSessionMismatch),
+            INVALID_FIELD
+        );
+        assert!(!is_retryable(&BrokerError::BatchSessionMismatch));
     }
 
     #[test]

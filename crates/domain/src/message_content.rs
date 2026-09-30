@@ -522,7 +522,7 @@ impl MessageEnvelope {
         Ok(())
     }
 
-    fn validate_value_limits(&self) -> Result<(), BrokerError> {
+    pub(crate) fn validate_value_limits(&self) -> Result<usize, BrokerError> {
         let mut pending = Vec::new();
         let mut items = 0;
         push_value_nodes(
@@ -571,7 +571,7 @@ impl MessageEnvelope {
                 _ => {}
             }
         }
-        Ok(())
+        Ok(items)
     }
 
     /// Conservative retained header tally, not an exact wire calculation.

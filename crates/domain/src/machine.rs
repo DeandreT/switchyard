@@ -16,12 +16,12 @@ use storage::{Mutation, StateStore, WriteBatch};
 
 use crate::{
     AcceptedSession, BrokerError, Command, CommandKind, CommandOutcome, DeadLetterInfo,
-    DeadLetterReason, Delivery, DeliveryBudget, DeliveryLock, EntityPath, LockToken,
-    MAX_MESSAGE_HEADER_BYTES, MAX_MESSAGE_ID_LENGTH, MessageBody, MessageEnvelope,
-    MessageIdentifier, MessageProperties, MessageRecord, MessageState, MessageStatus, MessageValue,
-    NamespaceName, QueueConfig, QueueConfigUpdate, QueueCounters, ReceiveMode, SequenceNumber,
-    SessionHold, SessionId, SessionLock, SessionRecord, SettlementDisposition, Timestamp, codec,
-    keys,
+    DeadLetterReason, Delivery, DeliveryBudget, DeliveryLock, EntityPath, IngressBatchLimit,
+    IngressEnvelope, LockToken, MAX_MESSAGE_HEADER_BYTES, MAX_MESSAGE_ID_LENGTH,
+    MAX_MESSAGE_VALUE_ITEMS, MessageBody, MessageEnvelope, MessageIdentifier, MessageProperties,
+    MessageRecord, MessageState, MessageStatus, MessageValue, NamespaceName, QueueConfig,
+    QueueConfigUpdate, QueueCounters, ReceiveMode, SequenceNumber, SessionHold, SessionId,
+    SessionLock, SessionRecord, SettlementDisposition, Timestamp, codec, keys,
 };
 
 /// Ready entries a single receive may walk past while discarding expired
@@ -54,6 +54,12 @@ pub const MAX_DEAD_LETTER_DETAIL_LENGTH: usize = 4_096;
 
 /// Configurations inspected by one queue page, excluding its single lookahead.
 pub const MAX_QUEUE_PAGE_SIZE: usize = 1_024;
+
+pub const MAX_INGRESS_BATCH_MESSAGES: usize = 1_024;
+/// Sum of retained typed content, compatibility bodies, and normalized IDs.
+/// This bounds batch staging separately from each queue's message quota.
+pub const MAX_INGRESS_BATCH_CONTENT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_INGRESS_BATCH_VALUE_ITEMS: usize = MAX_MESSAGE_VALUE_ITEMS;
 
 /// Exclusive position in the queue-configuration key order. The named queue
 /// need not still exist when the next page is requested.
@@ -93,6 +99,18 @@ struct MessageInput<'a> {
     time_to_live_millis: Option<u64>,
     session_id: Option<&'a SessionId>,
     envelope: Option<&'a MessageEnvelope>,
+}
+
+impl<'a> From<&'a IngressEnvelope> for MessageInput<'a> {
+    fn from(message: &'a IngressEnvelope) -> Self {
+        Self {
+            message_id: &message.message_id,
+            body: &message.body,
+            time_to_live_millis: message.time_to_live_millis,
+            session_id: message.session_id.as_ref(),
+            envelope: Some(&message.envelope),
+        }
+    }
 }
 
 struct ScheduledInput<'a> {
@@ -208,6 +226,9 @@ impl<S: StateStore> StateMachine<S> {
                 },
                 &mut batch,
             )?,
+            CommandKind::SendBatch { messages } => {
+                self.send_batch(command, messages, &mut batch)?
+            }
             CommandKind::Schedule { messages } => self.schedule(
                 command,
                 messages.iter().map(|message| ScheduledInput {
@@ -782,32 +803,105 @@ impl<S: StateStore> StateMachine<S> {
             return Ok(CommandOutcome::Sent { sequence });
         }
 
-        let expires_at = effective_time_to_live_millis(&config, message.time_to_live_millis)
-            .map(|millis| command.issued_at.saturating_add_millis(millis));
+        self.enqueue_message(command, &config, message, sequence, None, batch)?;
+        Ok(CommandOutcome::Sent { sequence })
+    }
 
+    fn send_batch(
+        &self,
+        command: &Command,
+        messages: &[IngressEnvelope],
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        if command.entity.is_dead_letter_queue() {
+            return Err(BrokerError::DeadLetterQueueIsReserved);
+        }
+        let config = self.load_config(command)?;
+        validate_ingress_batch(&config, messages)?;
+        if messages.is_empty() {
+            return Ok(CommandOutcome::BatchSent {
+                sequences: Vec::new(),
+            });
+        }
+        let mut counters = self.load_counters(command)?;
+        let mut sequences = Vec::with_capacity(messages.len());
+        let mut staged_history = BTreeSet::new();
+        for message in messages {
+            let sequence = counters.allocate_sequence()?;
+            sequences.push(sequence);
+            if self.record_message_id(
+                command,
+                &config,
+                &message.message_id,
+                &mut staged_history,
+                batch,
+            )? {
+                continue;
+            }
+            self.enqueue_message(
+                command,
+                &config,
+                message.into(),
+                sequence,
+                message.scheduled_enqueue_time,
+                batch,
+            )?;
+        }
+        batch.push_put(
+            keys::queue_counters(&command.namespace, &command.entity),
+            codec::encode(&counters)?,
+        );
+        Ok(CommandOutcome::BatchSent { sequences })
+    }
+
+    fn enqueue_message(
+        &self,
+        command: &Command,
+        config: &QueueConfig,
+        message: MessageInput<'_>,
+        sequence: SequenceNumber,
+        scheduled_enqueue_time: Option<Timestamp>,
+        batch: &mut WriteBatch,
+    ) -> Result<(), BrokerError> {
+        let time_to_live_millis =
+            effective_time_to_live_millis(config, message.time_to_live_millis);
+        let future = scheduled_enqueue_time.filter(|enqueue_at| *enqueue_at > command.issued_at);
         let record = MessageRecord {
             sequence,
             message_id: message.message_id.to_owned(),
             body: message.body.to_vec(),
             enqueued_at: command.issued_at,
-            expires_at,
+            expires_at: if future.is_some() {
+                None
+            } else {
+                time_to_live_millis.map(|millis| command.issued_at.saturating_add_millis(millis))
+            },
             delivery_count: 0,
-            state: MessageState::Ready,
+            state: future.map_or(MessageState::Ready, |enqueue_at| MessageState::Scheduled {
+                enqueue_at,
+                time_to_live_millis,
+            }),
             session_id: message.session_id.cloned(),
             dead_letter: None,
-            scheduled_enqueue_time: None,
+            scheduled_enqueue_time,
             envelope: message.envelope.cloned().map(Box::new),
         };
-
         let namespace = &command.namespace;
         let entity = &command.entity;
         batch.push_put(
             keys::message(namespace, entity, sequence),
             codec::encode(&record)?,
         );
-        batch.push_put(self.ready_key(command, &record), Vec::new());
-        index_ready_expiry(command, &record, batch);
-        Ok(CommandOutcome::Sent { sequence })
+        if let Some(enqueue_at) = future {
+            batch.push_put(
+                keys::scheduled(namespace, entity, enqueue_at, sequence),
+                Vec::new(),
+            );
+        } else {
+            batch.push_put(self.ready_key(command, &record), Vec::new());
+            index_ready_expiry(command, &record, batch);
+        }
+        Ok(())
     }
 
     fn schedule<'a>(
@@ -841,47 +935,14 @@ impl<S: StateStore> StateMachine<S> {
             )? {
                 continue;
             }
-            let time_to_live_millis =
-                effective_time_to_live_millis(&config, message.time_to_live_millis);
-            let future = scheduled.enqueue_at > command.issued_at;
-            let record = MessageRecord {
+            self.enqueue_message(
+                command,
+                &config,
+                message,
                 sequence,
-                message_id: message.message_id.to_owned(),
-                body: message.body.to_vec(),
-                enqueued_at: command.issued_at,
-                expires_at: if future {
-                    None
-                } else {
-                    time_to_live_millis
-                        .map(|millis| command.issued_at.saturating_add_millis(millis))
-                },
-                delivery_count: 0,
-                state: if future {
-                    MessageState::Scheduled {
-                        enqueue_at: scheduled.enqueue_at,
-                        time_to_live_millis,
-                    }
-                } else {
-                    MessageState::Ready
-                },
-                session_id: message.session_id.cloned(),
-                dead_letter: None,
-                scheduled_enqueue_time: Some(scheduled.enqueue_at),
-                envelope: message.envelope.cloned().map(Box::new),
-            };
-            batch.push_put(
-                keys::message(namespace, entity, sequence),
-                codec::encode(&record)?,
-            );
-            if future {
-                batch.push_put(
-                    keys::scheduled(namespace, entity, scheduled.enqueue_at, sequence),
-                    Vec::new(),
-                );
-            } else {
-                batch.push_put(self.ready_key(command, &record), Vec::new());
-                index_ready_expiry(command, &record, batch);
-            }
+                Some(scheduled.enqueue_at),
+                batch,
+            )?;
         }
         if message_count != 0 {
             batch.push_put(
@@ -2227,6 +2288,73 @@ fn validate_message_input(
             body_bytes: content_bytes,
             maximum_bytes: config.max_message_bytes,
         });
+    }
+    Ok(())
+}
+
+fn validate_ingress_batch(
+    config: &QueueConfig,
+    messages: &[IngressEnvelope],
+) -> Result<(), BrokerError> {
+    let enforce = |limit, actual, maximum| {
+        if actual > maximum {
+            Err(BrokerError::IngressBatchLimitExceeded {
+                limit,
+                actual,
+                maximum,
+            })
+        } else {
+            Ok(())
+        }
+    };
+    enforce(
+        IngressBatchLimit::Messages,
+        messages.len(),
+        MAX_INGRESS_BATCH_MESSAGES,
+    )?;
+    for message in messages {
+        require_session_agreement(config, message.session_id.is_some())?;
+    }
+    if config.requires_session {
+        let session = messages
+            .first()
+            .and_then(|message| message.session_id.as_ref());
+        if messages
+            .iter()
+            .any(|message| message.session_id.as_ref() != session)
+        {
+            return Err(BrokerError::BatchSessionMismatch);
+        }
+    }
+    // Count borrowed nodes before shape validation can clone compound map keys
+    // or enqueueing can clone any retained message content.
+    let mut value_items = 0_usize;
+    let mut content_bytes = 0_usize;
+    for message in messages {
+        value_items = value_items.saturating_add(message.envelope.validate_value_limits()?);
+        enforce(
+            IngressBatchLimit::ValueItems,
+            value_items,
+            MAX_INGRESS_BATCH_VALUE_ITEMS,
+        )?;
+        content_bytes = content_bytes
+            .saturating_add(message.envelope.content_size())
+            .saturating_add(message.body.len())
+            .saturating_add(message.message_id.len())
+            .saturating_add(
+                message
+                    .session_id
+                    .as_ref()
+                    .map_or(0, |session| session.as_str().len()),
+            );
+        enforce(
+            IngressBatchLimit::ContentBytes,
+            content_bytes,
+            MAX_INGRESS_BATCH_CONTENT_BYTES,
+        )?;
+    }
+    for message in messages {
+        validate_message_input(config, message.into())?;
     }
     Ok(())
 }

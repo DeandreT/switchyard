@@ -171,6 +171,7 @@ impl Watchers {
 fn makes_deliverable(outcome: &CommandOutcome) -> bool {
     match outcome {
         CommandOutcome::Sent { .. } => true,
+        CommandOutcome::BatchSent { sequences } => !sequences.is_empty(),
         CommandOutcome::Scheduled { .. } => true,
         CommandOutcome::ScheduledActivated { activated } => *activated > 0,
         CommandOutcome::Abandoned {
@@ -576,6 +577,18 @@ mod tests {
     #[test]
     fn only_ready_transitions_wake_the_parent() {
         for (outcome, expected) in [
+            (
+                CommandOutcome::BatchSent {
+                    sequences: Vec::new(),
+                },
+                false,
+            ),
+            (
+                CommandOutcome::BatchSent {
+                    sequences: vec![SequenceNumber::new(1)],
+                },
+                true,
+            ),
             (CommandOutcome::DeadLettered, false),
             (
                 CommandOutcome::Abandoned {

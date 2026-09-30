@@ -2,8 +2,8 @@ use storage::StorageError;
 use thiserror::Error;
 
 use crate::{
-    CodecError, IdentifierError, NamespaceName, QueueConfigError, QueueCounterKind,
-    QueueImmutableProperty, SequenceNumber, SessionId, Timestamp,
+    CodecError, IdentifierError, IngressBatchLimit, NamespaceName, QueueConfigError,
+    QueueCounterKind, QueueImmutableProperty, SequenceNumber, SessionId, Timestamp,
 };
 
 /// Every rejection the state machine can produce.
@@ -20,6 +20,14 @@ pub enum BrokerError {
     QueuePropertyIsImmutable { property: QueueImmutableProperty },
     #[error("the queue's {counter} counter is exhausted")]
     QueueCounterExhausted { counter: QueueCounterKind },
+    #[error("ingress batch {limit} of {actual} exceeds the maximum of {maximum}")]
+    IngressBatchLimitExceeded {
+        limit: IngressBatchLimit,
+        actual: usize,
+        maximum: usize,
+    },
+    #[error("every message in a session queue batch must name the same session")]
+    BatchSessionMismatch,
     #[error("queue page limit {limit} exceeds the maximum of {maximum}")]
     QueuePageLimitExceeded { limit: usize, maximum: usize },
     #[error(

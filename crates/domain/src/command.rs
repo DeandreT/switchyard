@@ -61,6 +61,35 @@ pub struct ScheduledEnvelope {
     pub envelope: MessageEnvelope,
 }
 
+/// One independently described message in an atomic ingress batch. An absent
+/// scheduled timestamp is an ordinary send, not an immediate schedule.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IngressEnvelope {
+    pub message_id: String,
+    pub body: Vec<u8>,
+    pub time_to_live_millis: Option<u64>,
+    pub session_id: Option<SessionId>,
+    pub envelope: MessageEnvelope,
+    pub scheduled_enqueue_time: Option<Timestamp>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngressBatchLimit {
+    Messages,
+    ContentBytes,
+    ValueItems,
+}
+
+impl std::fmt::Display for IngressBatchLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Messages => "message count",
+            Self::ContentBytes => "retained content bytes",
+            Self::ValueItems => "message value items",
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SettlementDisposition {
@@ -245,6 +274,11 @@ pub enum CommandKind {
     UpdateQueue {
         update: QueueConfigUpdate,
     },
+    /// Enqueues every member atomically after validating the whole bounded
+    /// batch. Duplicate drops still consume their own acknowledged sequences.
+    SendBatch {
+        messages: Vec<IngressEnvelope>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -302,4 +336,7 @@ pub enum CommandOutcome {
         released: u32,
     },
     QueueUpdated,
+    BatchSent {
+        sequences: Vec<SequenceNumber>,
+    },
 }
