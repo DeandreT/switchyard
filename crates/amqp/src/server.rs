@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     sync::Arc,
+    time::Duration,
 };
 
 use serde_amqp::primitives::Symbol;
@@ -23,6 +24,7 @@ const LINK_CREDIT: u32 = 2_048;
 const SESSION_WINDOW: u32 = 2_048;
 const FRAME_OVERHEAD_RESERVE: usize = 512;
 const MAX_CLOSING_HANDLES: usize = 65_536;
+const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub trait SaslAuthenticator: Send + Sync + 'static {
     fn mechanisms(&self) -> Vec<Symbol>;
@@ -50,11 +52,84 @@ pub enum EngineError {
         message_bytes: u64,
         maximum_bytes: u64,
     },
+    #[error("AMQP {0} timed out")]
+    Timeout(&'static str),
 }
 
 pub struct ServerConnection {
     commands: mpsc::Sender<Command>,
     incoming_sessions: mpsc::Receiver<IncomingSession>,
+    lifecycle: ConnectionLifecycle,
+    close_timeout: Duration,
+}
+
+struct ConnectionLifecycle {
+    cancellation: watch::Sender<bool>,
+    terminated: watch::Receiver<bool>,
+}
+
+impl ConnectionLifecycle {
+    fn new() -> (Self, watch::Receiver<bool>, watch::Sender<bool>) {
+        let (cancellation, cancelled) = watch::channel(false);
+        let (terminated_tx, terminated) = watch::channel(false);
+        (
+            Self {
+                cancellation,
+                terminated,
+            },
+            cancelled,
+            terminated_tx,
+        )
+    }
+
+    async fn wait_terminated(&self) {
+        wait_for_detach(&mut self.terminated.clone()).await;
+    }
+
+    async fn shutdown(&self) {
+        let _ = self.cancellation.send(true);
+        self.wait_terminated().await;
+    }
+
+    fn close_guard(&self) -> CloseCancellation {
+        CloseCancellation(Some(self.cancellation.clone()))
+    }
+}
+
+impl Drop for ConnectionLifecycle {
+    fn drop(&mut self) {
+        let _ = self.cancellation.send(true);
+    }
+}
+
+struct CloseCancellation(Option<watch::Sender<bool>>);
+
+impl Drop for CloseCancellation {
+    fn drop(&mut self) {
+        if let Some(cancellation) = self.0.take() {
+            let _ = cancellation.send(true);
+        }
+    }
+}
+
+// A driver cancellation must not leave its independent socket reader alive.
+struct ConnectionReader(Option<tokio::task::JoinHandle<()>>);
+
+impl ConnectionReader {
+    async fn shutdown(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for ConnectionReader {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
 }
 
 pub struct IncomingSession {
@@ -211,16 +286,36 @@ impl ServerConnection {
 
         let (commands, command_rx) = mpsc::channel(256);
         let (incoming_session_tx, incoming_sessions) = mpsc::channel(32);
-        tokio::spawn(run_connection(
-            stream,
-            remote_open.max_frame_size,
-            command_rx,
-            incoming_session_tx,
-        ));
+        let (lifecycle, cancellation, terminated) = ConnectionLifecycle::new();
+        tokio::spawn(async move {
+            run_connection(
+                stream,
+                remote_open.max_frame_size,
+                command_rx,
+                incoming_session_tx,
+                cancellation,
+            )
+            .await;
+            let _ = terminated.send(true);
+        });
         Ok(Self {
             commands,
             incoming_sessions,
+            lifecycle,
+            close_timeout: DEFAULT_CLOSE_TIMEOUT,
         })
+    }
+
+    /// Bounds graceful Close, including time waiting to enqueue or write it.
+    /// A zero duration requests immediate cancellation.
+    pub fn with_close_timeout(mut self, timeout: Duration) -> Self {
+        self.close_timeout = timeout;
+        self
+    }
+
+    /// Cancels blocked driver work and waits until both socket tasks terminate.
+    pub async fn shutdown(&self) {
+        self.lifecycle.shutdown().await;
     }
 
     pub async fn next_incoming_session(&mut self) -> Option<IncomingSession> {
@@ -254,7 +349,29 @@ impl ServerConnection {
     }
 
     async fn close_inner(&self, error: Option<Error>) -> Result<(), EngineError> {
-        request(&self.commands, |reply| Command::Close { error, reply }).await
+        if self.close_timeout.is_zero() {
+            self.shutdown().await;
+            return Err(EngineError::Timeout("Close acknowledgment"));
+        }
+        let mut guard = self.lifecycle.close_guard();
+        let closing = async {
+            let result = request(&self.commands, |reply| Command::Close { error, reply }).await;
+            if result.is_ok() {
+                self.lifecycle.wait_terminated().await;
+            } else {
+                self.shutdown().await;
+            }
+            result
+        };
+        let result = match tokio::time::timeout(self.close_timeout, closing).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.shutdown().await;
+                Err(EngineError::Timeout("Close acknowledgment"))
+            }
+        };
+        let _ = guard.0.take();
+        result
     }
 }
 
@@ -549,6 +666,22 @@ enum Command {
     },
 }
 
+fn reject_closed_command(command: Command) {
+    match command {
+        Command::Send { reply, .. } => {
+            let _ = reply.send(Err(EngineError::RemoteClosed));
+        }
+        Command::AcceptSession { reply, .. }
+        | Command::AcceptLink { reply, .. }
+        | Command::Settle { reply, .. }
+        | Command::SettleOutgoing { reply, .. }
+        | Command::Detach { reply, .. }
+        | Command::Close { reply, .. } => {
+            let _ = reply.send(Err(EngineError::RemoteClosed));
+        }
+    }
+}
+
 struct SessionState {
     attach_tx: Option<mpsc::Sender<Attach>>,
     links: HashMap<u32, LinkState>,
@@ -603,12 +736,13 @@ async fn run_connection<Io>(
     remote_max_frame_size: u32,
     mut commands: mpsc::Receiver<Command>,
     incoming_sessions: mpsc::Sender<IncomingSession>,
+    mut cancellation: watch::Receiver<bool>,
 ) where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (frames_tx, mut frames) = mpsc::channel(256);
-    tokio::spawn(async move {
+    let mut reader_task = ConnectionReader(Some(tokio::spawn(async move {
         loop {
             let frame = read_frame(&mut reader).await;
             let done = frame.is_err();
@@ -616,54 +750,90 @@ async fn run_connection<Io>(
                 break;
             }
         }
-    });
+    })));
 
     let mut sessions = HashMap::<u16, SessionState>::new();
-    let mut closing_reply: Option<oneshot::Sender<Result<(), EngineError>>> = None;
-    loop {
-        tokio::select! {
-            frame = frames.recv() => {
-                let Some(frame) = frame else { break };
-                let Ok(frame) = frame else { break };
-                match handle_frame(
-                    frame,
-                    &mut writer,
-                    &incoming_sessions,
-                    &mut sessions,
-                    remote_max_frame_size,
-                ).await {
-                    Ok(FrameAction::Continue) => {}
-                    Ok(FrameAction::Closed) => {
-                        if let Some(reply) = closing_reply.take() {
-                            let _ = reply.send(Ok(()));
-                        }
-                        break;
+    let mut closing_replies = Vec::<oneshot::Sender<Result<(), EngineError>>>::new();
+    let processing = async {
+        loop {
+            tokio::select! {
+                frame = frames.recv() => {
+                    let Some(frame) = frame else { break };
+                    let Ok(frame) = frame else { break };
+                    if !closing_replies.is_empty()
+                        && !matches!(&frame, Frame::Amqp {
+                            performative: Some(Performative::Close(_)), ..
+                        })
+                    {
+                        continue;
                     }
-                    Err(_) => break,
+                    match handle_frame(
+                        frame,
+                        &mut writer,
+                        &incoming_sessions,
+                        &mut sessions,
+                        remote_max_frame_size,
+                        !closing_replies.is_empty(),
+                    ).await {
+                        Ok(FrameAction::Continue) => {}
+                        Ok(FrameAction::Closed) => {
+                            for reply in closing_replies.drain(..) {
+                                let _ = reply.send(Ok(()));
+                            }
+                            commands.close();
+                            while let Ok(command) = commands.try_recv() {
+                                if let Command::Close { reply, .. } = command {
+                                    let _ = reply.send(Ok(()));
+                                } else {
+                                    reject_closed_command(command);
+                                }
+                            }
+                            break;
+                        }
+                        Err(_) => break,
+                    }
                 }
-            }
-            command = commands.recv() => {
-                let Some(command) = command else { break };
-                match handle_command(
-                    command,
-                    &mut writer,
-                    &mut sessions,
-                    remote_max_frame_size,
-                ).await {
-                    Ok(CommandAction::Continue) => {}
-                    Ok(CommandAction::Closing(reply)) => closing_reply = Some(reply),
-                    Err(_) => break,
+                command = commands.recv() => {
+                    let Some(command) = command else { break };
+                    let command = match command {
+                        Command::Close { reply, .. } if !closing_replies.is_empty() => {
+                            closing_replies.push(reply);
+                            continue;
+                        }
+                        command if !closing_replies.is_empty() => {
+                            reject_closed_command(command);
+                            continue;
+                        }
+                        command => command,
+                    };
+                    match handle_command(
+                        command,
+                        &mut writer,
+                        &mut sessions,
+                        remote_max_frame_size,
+                    ).await {
+                        Ok(CommandAction::Continue) => {}
+                        Ok(CommandAction::Closing(reply)) => closing_replies.push(reply),
+                        Err(_) => break,
+                    }
                 }
             }
         }
+    };
+    tokio::select! {
+        biased;
+        () = wait_for_detach(&mut cancellation) => {}
+        () = processing => {}
     }
+
+    reader_task.shutdown().await;
 
     for session in sessions.values_mut() {
         for link in session.links.values_mut() {
             stop_link(link);
         }
     }
-    if let Some(reply) = closing_reply {
+    for reply in closing_replies {
         let _ = reply.send(Err(EngineError::RemoteClosed));
     }
 }
@@ -679,6 +849,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
     incoming_sessions: &mpsc::Sender<IncomingSession>,
     sessions: &mut HashMap<u16, SessionState>,
     remote_max_frame_size: u32,
+    locally_closing: bool,
 ) -> Result<FrameAction, EngineError> {
     let Frame::Amqp {
         channel,
@@ -756,7 +927,9 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
             .await?;
         }
         Performative::Close(_) => {
-            write_amqp(writer, 0, Performative::Close(Close::default()), Vec::new()).await?;
+            if !locally_closing {
+                write_amqp(writer, 0, Performative::Close(Close::default()), Vec::new()).await?;
+            }
             return Ok(FrameAction::Closed);
         }
         Performative::Open(_) => return Err(invalid_state("duplicate AMQP open")),
@@ -1522,3 +1695,6 @@ mod tests {
 
 #[cfg(test)]
 mod message_size_tests;
+
+#[cfg(test)]
+mod lifecycle_tests;

@@ -152,6 +152,17 @@ grants are scoped to a namespace or entity and to Send, Listen, or Manage; they
 authorize links connection-wide and close an open link when its token expires.
 A connection without a valid grant gets 20 seconds to complete CBS
 authorization. JWT, OIDC, and mTLS are not implemented.
+The listener has local defaults of 128 live connections, including unfinished
+security handshakes, and one 10-second deadline covering TLS, SASL, and AMQP Open.
+Excess sockets are refused; handshake progress does not restart that deadline.
+Listener builders can configure both limits, with a zero handshake timeout
+requesting immediate refusal. The CBS authorization deadline starts after Open.
+Graceful connection Close has a two-second default deadline. Timeout or
+cancellation of its caller cancels the driver and its socket reader, including
+when application dispatch or a socket write is blocked. Explicit shutdown waits
+for both tasks to terminate before releasing the listener's admission slot.
+These are Switchyard resource policies, not Azure quotas. Session flow windows
+and connection-wide message-allocation budgets are not yet enforced.
 The edge resolves a link's address to an entity, turns transfers into send
 commands and dispositions into settlements, and answers a rejection with the
 condition an SDK keys its behaviour off. A receiving link's settle mode selects

@@ -459,6 +459,7 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
         &incoming,
         &mut sessions,
         u32::MAX,
+        false,
     )
     .await
     .expect("the peer acknowledges the link detach");

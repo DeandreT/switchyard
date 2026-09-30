@@ -5,7 +5,7 @@
 //! holding one, the lock simply expires and the message is redelivered. That is
 //! what makes an abrupt disconnect safe.
 
-use std::{sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use amqp::{
     AmqpError, Attach, DeliveryTag, EngineError, Error as AmqpProtocolError, ErrorCondition,
@@ -21,6 +21,7 @@ use rustls::ServerConfig;
 use serde_amqp::{Value, primitives::Symbol};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
@@ -43,6 +44,8 @@ use crate::{
 /// lost when several links wait on one entity, so a waiter re-asks on a coarse
 /// interval rather than trusting the signal absolutely.
 const EMPTY_QUEUE_FALLBACK: Duration = Duration::from_secs(3);
+const DEFAULT_MAX_CONNECTIONS: usize = 128;
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const LOCKED_UNTIL_UTC_PROPERTY: &str = "com.microsoft:locked-until-utc";
 const DOTNET_UNIX_EPOCH_TICKS: u64 = 621_355_968_000_000_000;
@@ -54,6 +57,8 @@ pub struct AmqpListener<B> {
     container_id: String,
     tls_acceptor: Option<TlsAcceptor>,
     shared_access_authentication: Option<SharedAccessAuthentication>,
+    max_connections: NonZeroUsize,
+    handshake_timeout: Duration,
 }
 
 impl<B: Broker> AmqpListener<B> {
@@ -64,7 +69,24 @@ impl<B: Broker> AmqpListener<B> {
             container_id: String::from("switchyard"),
             tls_acceptor: None,
             shared_access_authentication: None,
+            max_connections: NonZeroUsize::new(DEFAULT_MAX_CONNECTIONS)
+                .expect("the default connection limit is positive"),
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         }
+    }
+
+    /// Limits live sockets, including connections still negotiating security.
+    /// Values above the semaphore's supported maximum are clamped to that maximum.
+    pub fn with_max_connections(mut self, maximum: NonZeroUsize) -> Self {
+        self.max_connections = maximum;
+        self
+    }
+
+    /// One absolute deadline covers TLS, SASL, and AMQP Open together.
+    /// A zero duration immediately expires the negotiation deadline.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
     }
 
     /// Secures accepted sockets before AMQP and SASL negotiation begin.
@@ -88,8 +110,23 @@ impl<B: Broker> AmqpListener<B> {
     /// A connection that fails takes only itself down: one client's protocol
     /// error is not the node's.
     pub async fn serve(self, listener: TcpListener) -> std::io::Result<()> {
+        let admission = Arc::new(Semaphore::new(
+            self.max_connections.get().min(Semaphore::MAX_PERMITS),
+        ));
         loop {
             let (stream, peer) = listener.accept().await?;
+            let Ok(permit) = Arc::clone(&admission).try_acquire_owned() else {
+                debug!(%peer, "connection refused: admission limit reached");
+                continue;
+            };
+            let deadline = tokio::time::Instant::now()
+                .checked_add(self.handshake_timeout)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "the configured handshake timeout cannot be represented",
+                    )
+                })?;
             debug!(%peer, "connection accepted");
 
             let broker = self.broker.clone();
@@ -98,21 +135,29 @@ impl<B: Broker> AmqpListener<B> {
             let tls_acceptor = self.tls_acceptor.clone();
             let shared_access_authentication = self.shared_access_authentication.clone();
             tokio::spawn(async move {
+                let _permit = permit;
+                if deadline <= tokio::time::Instant::now() {
+                    return;
+                }
                 let result = match tls_acceptor {
-                    Some(acceptor) => match acceptor.accept(stream).await {
-                        Ok(stream) => {
-                            debug!(%peer, "TLS established");
-                            serve_connection(
-                                stream,
-                                container_id,
-                                namespace,
-                                broker,
-                                shared_access_authentication,
-                            )
-                            .await
+                    Some(acceptor) => {
+                        match tokio::time::timeout_at(deadline, acceptor.accept(stream)).await {
+                            Ok(Ok(stream)) => {
+                                debug!(%peer, "TLS established");
+                                serve_connection(
+                                    stream,
+                                    container_id,
+                                    namespace,
+                                    broker,
+                                    shared_access_authentication,
+                                    deadline,
+                                )
+                                .await
+                            }
+                            Ok(Err(error)) => Err(error.into()),
+                            Err(_) => Err(handshake_timeout_error()),
                         }
-                        Err(error) => Err(error.into()),
-                    },
+                    }
                     None => {
                         serve_connection(
                             stream,
@@ -120,6 +165,7 @@ impl<B: Broker> AmqpListener<B> {
                             namespace,
                             broker,
                             shared_access_authentication,
+                            deadline,
                         )
                         .await
                     }
@@ -138,33 +184,59 @@ async fn serve_connection<Io, B>(
     namespace: NamespaceName,
     broker: B,
     shared_access_authentication: Option<SharedAccessAuthentication>,
+    deadline: tokio::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     B: Broker,
 {
-    let (connection, authorization) = match shared_access_authentication {
-        Some(config) => {
-            let sasl_acceptor = SharedAccessSaslAcceptor::new(&config);
-            let connection = ServerConnection::accept(
-                stream,
-                container_id,
-                Some(Arc::new(sasl_acceptor.clone())),
-            )
-            .await?;
-            let authorization = ConnectionAuthorization::new(config, sasl_acceptor.grant());
-            (connection, Some(authorization))
-        }
-        None => (
-            ServerConnection::accept(stream, container_id, None).await?,
-            None,
-        ),
+    if deadline <= tokio::time::Instant::now() {
+        return Err(handshake_timeout_error());
+    }
+    let opened = async {
+        let (connection, authorization) = match shared_access_authentication {
+            Some(config) => {
+                let sasl_acceptor = SharedAccessSaslAcceptor::new(&config);
+                let connection = ServerConnection::accept(
+                    stream,
+                    container_id,
+                    Some(Arc::new(sasl_acceptor.clone())),
+                )
+                .await?;
+                let authorization = ConnectionAuthorization::new(config, sasl_acceptor.grant());
+                (connection, Some(authorization))
+            }
+            None => (
+                ServerConnection::accept(stream, container_id, None).await?,
+                None,
+            ),
+        };
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((connection, authorization))
     };
-    serve_open_connection(connection, namespace, broker, authorization).await
+    let (mut connection, authorization) = tokio::time::timeout_at(deadline, opened)
+        .await
+        .map_err(|_| handshake_timeout_error())??;
+    if deadline <= tokio::time::Instant::now() {
+        connection.shutdown().await;
+        return Err(handshake_timeout_error());
+    }
+    let result = serve_open_connection(&mut connection, namespace, broker, authorization).await;
+    // Dropping a connection initiates cancellation, but admission is not freed
+    // until both engine tasks have relinquished their halves of the socket.
+    connection.shutdown().await;
+    result
+}
+
+fn handshake_timeout_error() -> Box<dyn std::error::Error + Send + Sync> {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "TLS/SASL/AMQP Open negotiation exceeded the handshake deadline",
+    )
+    .into()
 }
 
 async fn serve_open_connection<B: Broker>(
-    mut connection: ServerConnection,
+    connection: &mut ServerConnection,
     namespace: NamespaceName,
     broker: B,
     authorization: Option<Arc<ConnectionAuthorization>>,
@@ -444,13 +516,23 @@ async fn serve_session<B: Broker>(
             .ok()
             .and_then(|(_, accepted, _)| accepted.as_ref())
             .map(session_attach_properties);
-        let endpoint = session
+        let endpoint = match session
             .accept_attach_with_properties(
                 attach,
                 crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64,
                 response_properties,
             )
-            .await?;
+            .await
+        {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                if let Ok((entity, Some(accepted), _)) = &plan {
+                    let hold = accepted.hold();
+                    release_session(&broker, &namespace, entity, Some(&hold)).await;
+                }
+                return Err(error.into());
+            }
+        };
         let (entity, accepted, link_authorization) = match plan {
             Ok(plan) => plan,
             Err(error) => {

@@ -9,6 +9,8 @@ use crate::{Source, Target};
 pub struct ClientConnection {
     commands: mpsc::Sender<ClientCommand>,
     closed: watch::Receiver<bool>,
+    lifecycle: ConnectionLifecycle,
+    close_timeout: Duration,
 }
 
 pub struct ClientSession {
@@ -110,13 +112,24 @@ impl ClientConnection {
 
         let (commands, command_rx) = mpsc::channel(256);
         let (closed_tx, closed) = watch::channel(false);
-        tokio::spawn(run_client(
-            stream,
-            remote_open.max_frame_size,
-            command_rx,
-            closed_tx,
-        ));
-        Ok(Self { commands, closed })
+        let (lifecycle, cancellation, terminated) = ConnectionLifecycle::new();
+        tokio::spawn(async move {
+            let _ = run_client(
+                stream,
+                remote_open.max_frame_size,
+                command_rx,
+                closed_tx,
+                cancellation,
+            )
+            .await;
+            let _ = terminated.send(true);
+        });
+        Ok(Self {
+            commands,
+            closed,
+            lifecycle,
+            close_timeout: DEFAULT_CLOSE_TIMEOUT,
+        })
     }
 
     pub async fn begin(&mut self) -> Result<ClientSession, EngineError> {
@@ -132,8 +145,41 @@ impl ClientConnection {
         wait_for_detach(&mut self.closed).await;
     }
 
+    /// A zero duration requests immediate cancellation rather than waiting.
+    pub fn with_close_timeout(mut self, timeout: Duration) -> Self {
+        self.close_timeout = timeout;
+        self
+    }
+
+    pub async fn shutdown(&self) {
+        self.lifecycle.shutdown().await;
+    }
+
     pub async fn close(&self) -> Result<(), EngineError> {
-        client_request(&self.commands, |reply| ClientCommand::Close { reply }).await
+        if self.close_timeout.is_zero() {
+            self.shutdown().await;
+            return Err(EngineError::Timeout("Close acknowledgment"));
+        }
+        let mut guard = self.lifecycle.close_guard();
+        let closing = async {
+            let result =
+                client_request(&self.commands, |reply| ClientCommand::Close { reply }).await;
+            if result.is_ok() {
+                self.lifecycle.wait_terminated().await;
+            } else {
+                self.shutdown().await;
+            }
+            result
+        };
+        let result = match tokio::time::timeout(self.close_timeout, closing).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.shutdown().await;
+                Err(EngineError::Timeout("Close acknowledgment"))
+            }
+        };
+        let _ = guard.0.take();
+        result
     }
 }
 
@@ -514,6 +560,26 @@ enum ClientCommand {
     },
 }
 
+fn reject_closed_client_command(command: ClientCommand) {
+    match command {
+        ClientCommand::Begin { reply } => {
+            let _ = reply.send(Err(EngineError::RemoteClosed));
+        }
+        ClientCommand::Attach { reply, .. } => {
+            let _ = reply.send(Err(EngineError::RemoteClosed));
+        }
+        ClientCommand::Send { reply, .. } => {
+            let _ = reply.send(Err(EngineError::RemoteClosed));
+        }
+        ClientCommand::Settle { reply, .. }
+        | ClientCommand::Detach { reply, .. }
+        | ClientCommand::End { reply, .. }
+        | ClientCommand::Close { reply } => {
+            let _ = reply.send(Err(EngineError::RemoteClosed));
+        }
+    }
+}
+
 struct PendingAttach {
     handle: u32,
     reply: oneshot::Sender<Result<(u32, Attach), EngineError>>,
@@ -536,13 +602,14 @@ async fn run_client<Io>(
     remote_max_frame_size: u32,
     mut commands: mpsc::Receiver<ClientCommand>,
     closed: watch::Sender<bool>,
+    mut cancellation: watch::Receiver<bool>,
 ) -> Result<(), EngineError>
 where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (frames_tx, mut frames) = mpsc::channel(256);
-    tokio::spawn(async move {
+    let mut reader_task = ConnectionReader(Some(tokio::spawn(async move {
         loop {
             let frame = read_frame(&mut reader).await;
             let done = frame.is_err();
@@ -550,7 +617,7 @@ where
                 break;
             }
         }
-    });
+    })));
 
     let (unused_attach_tx, _) = mpsc::channel(1);
     let mut sessions = HashMap::<u16, SessionState>::new();
@@ -560,316 +627,352 @@ where
     let mut pending_attaches = HashMap::<String, PendingAttach>::new();
     let mut pending_detaches =
         HashMap::<(u16, u32), oneshot::Sender<Result<(), EngineError>>>::new();
-    let mut closing: Option<oneshot::Sender<Result<(), EngineError>>> = None;
+    let mut closing = Vec::<oneshot::Sender<Result<(), EngineError>>>::new();
 
-    loop {
-        tokio::select! {
-            frame = frames.recv() => {
-                let Some(Ok(frame)) = frame else { break };
+    let processing = async {
+        loop {
+            tokio::select! {
+                frame = frames.recv() => {
+                    let Some(Ok(frame)) = frame else { break };
                 let Frame::Amqp { channel, performative, payload } = frame else { break };
                 let Some(performative) = performative else { continue };
-                let result = match performative {
-                    Performative::Begin(_) => {
-                        if let Some(reply) = pending_begins.remove(&channel) {
-                            let _ = reply.send(Ok(channel));
-                        }
-                        Ok(false)
-                    }
-                    Performative::Attach(attach) => {
-                        let attach = *attach;
-                        if let Some(pending) = pending_attaches.remove(&attach.name) {
-                            if let Some(LinkState::Sending(link)) = sessions
-                                .get_mut(&channel)
-                                .and_then(|session| session.links.get_mut(&pending.handle))
-                            {
-                                link.max_message_size = normalized_message_size(attach.max_message_size);
+                if !closing.is_empty() && !matches!(&performative, Performative::Close(_)) {
+                    continue;
+                }
+                    let result = match performative {
+                        Performative::Begin(_) => {
+                            if let Some(reply) = pending_begins.remove(&channel) {
+                                let _ = reply.send(Ok(channel));
                             }
-                            if attach.role == Role::Sender {
+                            Ok(false)
+                        }
+                        Performative::Attach(attach) => {
+                            let attach = *attach;
+                            if let Some(pending) = pending_attaches.remove(&attach.name) {
+                                if let Some(LinkState::Sending(link)) = sessions
+                                    .get_mut(&channel)
+                                    .and_then(|session| session.links.get_mut(&pending.handle))
+                                {
+                                    link.max_message_size = normalized_message_size(attach.max_message_size);
+                                }
+                                if attach.role == Role::Sender {
+                                    write_amqp(
+                                        &mut writer,
+                                        channel,
+                                        Performative::Flow(Flow {
+                                            next_incoming_id: Some(0),
+                                            incoming_window: SESSION_WINDOW,
+                                            next_outgoing_id: 0,
+                                            outgoing_window: SESSION_WINDOW,
+                                            handle: Some(pending.handle),
+                                            delivery_count: Some(0),
+                                            link_credit: Some(LINK_CREDIT),
+                                            ..Flow::default()
+                                        }),
+                                        Vec::new(),
+                                    ).await?;
+                                }
+                                let _ = pending.reply.send(Ok((pending.handle, attach)));
+                            }
+                            Ok(false)
+                        }
+                        Performative::Flow(flow) => {
+                            apply_flow(
+                                channel,
+                                flow,
+                                &mut writer,
+                                &mut sessions,
+                                remote_max_frame_size,
+                            ).await?;
+                            Ok(false)
+                        }
+                        Performative::Transfer(transfer) => {
+                            receive_transfer(channel, transfer, payload, &mut sessions, &mut writer).await?;
+                            Ok(false)
+                        }
+                        Performative::Disposition(disposition) => {
+                            apply_disposition(channel, disposition, &mut writer, &mut sessions).await?;
+                            Ok(false)
+                        }
+                        Performative::Detach(detach) => {
+                            let local_reply = pending_detaches.remove(&(channel, detach.handle));
+                            let locally_closing = sessions
+                                .get_mut(&channel)
+                                .is_some_and(|session| session.closing_handles.remove(&detach.handle));
+                            if let Some(session) = sessions.get_mut(&channel)
+                                && let Some(mut link) = session.links.remove(&detach.handle)
+                            {
+                                stop_link(&mut link);
+                            }
+                            if let Some(reply) = local_reply {
+                                let _ = reply.send(Ok(()));
+                            } else if !locally_closing {
                                 write_amqp(
                                     &mut writer,
                                     channel,
-                                    Performative::Flow(Flow {
-                                        next_incoming_id: Some(0),
-                                        incoming_window: SESSION_WINDOW,
-                                        next_outgoing_id: 0,
-                                        outgoing_window: SESSION_WINDOW,
-                                        handle: Some(pending.handle),
-                                        delivery_count: Some(0),
-                                        link_credit: Some(LINK_CREDIT),
-                                        ..Flow::default()
+                                    Performative::Detach(Detach {
+                                        handle: detach.handle,
+                                        closed: true,
+                                        error: None,
                                     }),
                                     Vec::new(),
                                 ).await?;
                             }
-                            let _ = pending.reply.send(Ok((pending.handle, attach)));
+                            Ok(false)
                         }
-                        Ok(false)
+                        Performative::End(_) => {
+                            if let Some(mut session) = sessions.remove(&channel) {
+                                for link in session.links.values_mut() {
+                                    stop_link(link);
+                                }
+                            }
+                            Ok(false)
+                        }
+                    Performative::Close(_) => {
+                        if closing.is_empty() {
+                                write_amqp(
+                                    &mut writer,
+                                    0,
+                                    Performative::Close(Close::default()),
+                                    Vec::new(),
+                            ).await?;
+                        } else {
+                            for reply in closing.drain(..) {
+                                let _ = reply.send(Ok(()));
+                            }
+                        }
+                        commands.close();
+                        while let Ok(command) = commands.try_recv() {
+                            if let ClientCommand::Close { reply } = command {
+                                let _ = reply.send(Ok(()));
+                            } else {
+                                reject_closed_client_command(command);
+                            }
+                        }
+                        Ok(true)
+                        }
+                        Performative::Open(_) => Err(invalid_state("duplicate AMQP open")),
+                    };
+                    match result {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(_) => break,
                     }
-                    Performative::Flow(flow) => {
-                        apply_flow(
+                }
+            command = commands.recv() => {
+                let Some(command) = command else { break };
+                let command = match command {
+                    ClientCommand::Close { .. } => command,
+                    command if !closing.is_empty() => {
+                        reject_closed_client_command(command);
+                        continue;
+                    }
+                    command => command,
+                };
+                    let result = match command {
+                        ClientCommand::Begin { reply } => {
+                            let channel = next_channel;
+                            next_channel = next_channel.wrapping_add(1);
+                            sessions.insert(channel, SessionState {
+                                attach_tx: Some(unused_attach_tx.clone()),
+                                links: HashMap::new(),
+                                closing_handles: HashSet::new(),
+                                pending_flows: HashMap::new(),
+                                next_outgoing_id: 0,
+                            });
+                            next_handles.insert(channel, 0);
+                            pending_begins.insert(channel, reply);
+                            write_amqp(
+                                &mut writer,
+                                channel,
+                                Performative::Begin(Begin::default()),
+                                Vec::new(),
+                            ).await
+                        }
+                        ClientCommand::Attach {
                             channel,
-                            flow,
-                            &mut writer,
-                            &mut sessions,
-                            remote_max_frame_size,
-                        ).await?;
-                        Ok(false)
-                    }
-                    Performative::Transfer(transfer) => {
-                        receive_transfer(channel, transfer, payload, &mut sessions, &mut writer).await?;
-                        Ok(false)
-                    }
-                    Performative::Disposition(disposition) => {
-                        apply_disposition(channel, disposition, &mut writer, &mut sessions).await?;
-                        Ok(false)
-                    }
-                    Performative::Detach(detach) => {
-                        let local_reply = pending_detaches.remove(&(channel, detach.handle));
-                        let locally_closing = sessions
-                            .get_mut(&channel)
-                            .is_some_and(|session| session.closing_handles.remove(&detach.handle));
-                        if let Some(session) = sessions.get_mut(&channel)
-                            && let Some(mut link) = session.links.remove(&detach.handle)
-                        {
-                            stop_link(&mut link);
+                            request,
+                            deliveries_tx,
+                            detached_tx,
+                            reply,
+                        } => {
+                            let request = *request;
+                            let next_handle = next_handles
+                                .get_mut(&channel)
+                                .ok_or_else(|| invalid_state("attach on an unknown session"))?;
+                            let handle = *next_handle;
+                            *next_handle = next_handle.wrapping_add(1);
+                            let attach = Attach {
+                                name: request.name.clone(),
+                                handle,
+                                role: request.role.clone(),
+                                snd_settle_mode: request.sender_settle_mode.clone(),
+                                rcv_settle_mode: request.receiver_settle_mode.clone(),
+                                source: request.source,
+                                target: request.target,
+                                unsettled: None,
+                                incomplete_unsettled: false,
+                                initial_delivery_count: (request.role == Role::Sender).then_some(0),
+                                max_message_size: request.max_message_size,
+                                offered_capabilities: None,
+                                desired_capabilities: None,
+                                properties: None,
+                            };
+                            let session = sessions
+                                .get_mut(&channel)
+                                .ok_or_else(|| invalid_state("attach on an unknown session"))?;
+                            if session.links.contains_key(&handle) || session.closing_handles.contains(&handle) {
+                                let _ = reply.send(Err(invalid_state("link handle is attached or awaiting detach acknowledgement")));
+                                continue;
+                            }
+                            match request.role {
+                                Role::Sender => {
+                                    session.links.insert(handle, LinkState::Sending(SendingLink {
+                                        max_message_size: None,
+                                        receiver_settle_mode: request.receiver_settle_mode,
+                                        settle_mode: request.sender_settle_mode,
+                                        delivery_count: 0,
+                                        credit_limit: 0,
+                                        queued: VecDeque::new(),
+                                        unsettled: HashMap::new(),
+                                        pending_acknowledgements: HashSet::new(),
+                                        detached: detached_tx,
+                                    }));
+                                }
+                                Role::Receiver => {
+                                    session.links.insert(handle, LinkState::Receiving(ReceivingLink {
+                                        max_message_size: normalized_message_size(request.max_message_size)
+                                            .unwrap_or(u64::MAX),
+                                        deliveries: deliveries_tx,
+                                        partial: None,
+                                        detached: detached_tx,
+                                    }));
+                                }
+                            }
+                            pending_attaches.insert(request.name, PendingAttach { handle, reply });
+                            write_amqp(
+                                &mut writer,
+                                channel,
+                                Performative::Attach(Box::new(attach)),
+                                Vec::new(),
+                            ).await
                         }
-                        if let Some(reply) = local_reply {
-                            let _ = reply.send(Ok(()));
-                        } else if !locally_closing {
+                        ClientCommand::Send {
+                            channel,
+                            handle,
+                            message,
+                            delivery_tag,
+                            reply,
+                        } => {
+                            let session = sessions
+                                .get_mut(&channel)
+                                .ok_or_else(|| invalid_state("send on an unknown session"))?;
+                            queue_send(
+                                channel,
+                                handle,
+                                session,
+                                *message,
+                                delivery_tag,
+                                reply,
+                                &mut writer,
+                                remote_max_frame_size,
+                            ).await
+                        }
+                        ClientCommand::Settle {
+                            channel,
+                            handle,
+                            delivery_id,
+                            state,
+                            reply,
+                        } => {
+                            if !matches!(
+                                sessions.get(&channel).and_then(|session| session.links.get(&handle)),
+                                Some(LinkState::Receiving(_))
+                            ) {
+                                let _ = reply.send(Err(EngineError::RemoteDetached));
+                                continue;
+                            }
+                            let result = write_amqp(
+                                &mut writer,
+                                channel,
+                                Performative::Disposition(Disposition {
+                                    role: Role::Receiver,
+                                    first: delivery_id,
+                                    last: None,
+                                    settled: true,
+                                    state: Some(state),
+                                    batchable: false,
+                                }),
+                                Vec::new(),
+                            ).await;
+                            let _ = reply.send(result.as_ref().map(|_| ()).map_err(|error| {
+                                EngineError::InvalidState(error.to_string())
+                            }));
+                            result
+                        }
+                        ClientCommand::Detach { channel, handle, reply } => {
+                            if let Some(session) = sessions.get_mut(&channel) {
+                                remember_closing_handle(session, handle)?;
+                            }
+                            pending_detaches.insert((channel, handle), reply);
                             write_amqp(
                                 &mut writer,
                                 channel,
                                 Performative::Detach(Detach {
-                                    handle: detach.handle,
+                                    handle,
                                     closed: true,
                                     error: None,
                                 }),
                                 Vec::new(),
-                            ).await?;
+                            ).await
                         }
-                        Ok(false)
-                    }
-                    Performative::End(_) => {
-                        if let Some(mut session) = sessions.remove(&channel) {
-                            for link in session.links.values_mut() {
-                                stop_link(link);
+                        ClientCommand::End { channel, reply } => {
+                            let result = write_amqp(
+                                &mut writer,
+                                channel,
+                                Performative::End(End::default()),
+                                Vec::new(),
+                            ).await;
+                            if let Some(mut session) = sessions.remove(&channel) {
+                                for link in session.links.values_mut() {
+                                    stop_link(link);
+                                }
                             }
+                            let _ = reply.send(result.as_ref().map(|_| ()).map_err(|error| {
+                                EngineError::InvalidState(error.to_string())
+                            }));
+                            result
                         }
-                        Ok(false)
-                    }
-                    Performative::Close(_) => {
-                        if let Some(reply) = closing.take() {
-                            let _ = reply.send(Ok(()));
-                        } else {
+                    ClientCommand::Close { reply } => {
+                        let send_close = closing.is_empty();
+                        closing.push(reply);
+                        if send_close {
                             write_amqp(
                                 &mut writer,
                                 0,
                                 Performative::Close(Close::default()),
                                 Vec::new(),
-                            ).await?;
+                            ).await
+                        } else {
+                            Ok(())
                         }
-                        Ok(true)
-                    }
-                    Performative::Open(_) => Err(invalid_state("duplicate AMQP open")),
-                };
-                match result {
-                    Ok(true) => break,
-                    Ok(false) => {}
-                    Err(_) => break,
-                }
-            }
-            command = commands.recv() => {
-                let Some(command) = command else { break };
-                let result = match command {
-                    ClientCommand::Begin { reply } => {
-                        let channel = next_channel;
-                        next_channel = next_channel.wrapping_add(1);
-                        sessions.insert(channel, SessionState {
-                            attach_tx: Some(unused_attach_tx.clone()),
-                            links: HashMap::new(),
-                            closing_handles: HashSet::new(),
-                            pending_flows: HashMap::new(),
-                            next_outgoing_id: 0,
-                        });
-                        next_handles.insert(channel, 0);
-                        pending_begins.insert(channel, reply);
-                        write_amqp(
-                            &mut writer,
-                            channel,
-                            Performative::Begin(Begin::default()),
-                            Vec::new(),
-                        ).await
-                    }
-                    ClientCommand::Attach {
-                        channel,
-                        request,
-                        deliveries_tx,
-                        detached_tx,
-                        reply,
-                    } => {
-                        let request = *request;
-                        let next_handle = next_handles
-                            .get_mut(&channel)
-                            .ok_or_else(|| invalid_state("attach on an unknown session"))?;
-                        let handle = *next_handle;
-                        *next_handle = next_handle.wrapping_add(1);
-                        let attach = Attach {
-                            name: request.name.clone(),
-                            handle,
-                            role: request.role.clone(),
-                            snd_settle_mode: request.sender_settle_mode.clone(),
-                            rcv_settle_mode: request.receiver_settle_mode.clone(),
-                            source: request.source,
-                            target: request.target,
-                            unsettled: None,
-                            incomplete_unsettled: false,
-                            initial_delivery_count: (request.role == Role::Sender).then_some(0),
-                            max_message_size: request.max_message_size,
-                            offered_capabilities: None,
-                            desired_capabilities: None,
-                            properties: None,
-                        };
-                        let session = sessions
-                            .get_mut(&channel)
-                            .ok_or_else(|| invalid_state("attach on an unknown session"))?;
-                        if session.links.contains_key(&handle) || session.closing_handles.contains(&handle) {
-                            let _ = reply.send(Err(invalid_state("link handle is attached or awaiting detach acknowledgement")));
-                            continue;
                         }
-                        match request.role {
-                            Role::Sender => {
-                                session.links.insert(handle, LinkState::Sending(SendingLink {
-                                    max_message_size: None,
-                                    receiver_settle_mode: request.receiver_settle_mode,
-                                    settle_mode: request.sender_settle_mode,
-                                    delivery_count: 0,
-                                    credit_limit: 0,
-                                    queued: VecDeque::new(),
-                                    unsettled: HashMap::new(),
-                                    pending_acknowledgements: HashSet::new(),
-                                    detached: detached_tx,
-                                }));
-                            }
-                            Role::Receiver => {
-                                session.links.insert(handle, LinkState::Receiving(ReceivingLink {
-                                    max_message_size: normalized_message_size(request.max_message_size)
-                                        .unwrap_or(u64::MAX),
-                                    deliveries: deliveries_tx,
-                                    partial: None,
-                                    detached: detached_tx,
-                                }));
-                            }
-                        }
-                        pending_attaches.insert(request.name, PendingAttach { handle, reply });
-                        write_amqp(
-                            &mut writer,
-                            channel,
-                            Performative::Attach(Box::new(attach)),
-                            Vec::new(),
-                        ).await
+                    };
+                    if result.is_err() {
+                        break;
                     }
-                    ClientCommand::Send {
-                        channel,
-                        handle,
-                        message,
-                        delivery_tag,
-                        reply,
-                    } => {
-                        let session = sessions
-                            .get_mut(&channel)
-                            .ok_or_else(|| invalid_state("send on an unknown session"))?;
-                        queue_send(
-                            channel,
-                            handle,
-                            session,
-                            *message,
-                            delivery_tag,
-                            reply,
-                            &mut writer,
-                            remote_max_frame_size,
-                        ).await
-                    }
-                    ClientCommand::Settle {
-                        channel,
-                        handle,
-                        delivery_id,
-                        state,
-                        reply,
-                    } => {
-                        if !matches!(
-                            sessions.get(&channel).and_then(|session| session.links.get(&handle)),
-                            Some(LinkState::Receiving(_))
-                        ) {
-                            let _ = reply.send(Err(EngineError::RemoteDetached));
-                            continue;
-                        }
-                        let result = write_amqp(
-                            &mut writer,
-                            channel,
-                            Performative::Disposition(Disposition {
-                                role: Role::Receiver,
-                                first: delivery_id,
-                                last: None,
-                                settled: true,
-                                state: Some(state),
-                                batchable: false,
-                            }),
-                            Vec::new(),
-                        ).await;
-                        let _ = reply.send(result.as_ref().map(|_| ()).map_err(|error| {
-                            EngineError::InvalidState(error.to_string())
-                        }));
-                        result
-                    }
-                    ClientCommand::Detach { channel, handle, reply } => {
-                        if let Some(session) = sessions.get_mut(&channel) {
-                            remember_closing_handle(session, handle)?;
-                        }
-                        pending_detaches.insert((channel, handle), reply);
-                        write_amqp(
-                            &mut writer,
-                            channel,
-                            Performative::Detach(Detach {
-                                handle,
-                                closed: true,
-                                error: None,
-                            }),
-                            Vec::new(),
-                        ).await
-                    }
-                    ClientCommand::End { channel, reply } => {
-                        let result = write_amqp(
-                            &mut writer,
-                            channel,
-                            Performative::End(End::default()),
-                            Vec::new(),
-                        ).await;
-                        if let Some(mut session) = sessions.remove(&channel) {
-                            for link in session.links.values_mut() {
-                                stop_link(link);
-                            }
-                        }
-                        let _ = reply.send(result.as_ref().map(|_| ()).map_err(|error| {
-                            EngineError::InvalidState(error.to_string())
-                        }));
-                        result
-                    }
-                    ClientCommand::Close { reply } => {
-                        closing = Some(reply);
-                        write_amqp(
-                            &mut writer,
-                            0,
-                            Performative::Close(Close::default()),
-                            Vec::new(),
-                        ).await
-                    }
-                };
-                if result.is_err() {
-                    break;
                 }
             }
         }
-    }
+        Ok::<(), EngineError>(())
+    };
+    let result = tokio::select! {
+        biased;
+        () = wait_for_detach(&mut cancellation) => Ok(()),
+        result = processing => result,
+    };
+
+    reader_task.shutdown().await;
 
     for session in sessions.values_mut() {
         for link in session.links.values_mut() {
@@ -885,9 +988,9 @@ where
     for (_, reply) in pending_detaches {
         let _ = reply.send(Err(EngineError::Stopped));
     }
-    if let Some(reply) = closing {
+    for reply in closing {
         let _ = reply.send(Err(EngineError::RemoteClosed));
     }
     let _ = closed.send(true);
-    Ok(())
+    result
 }
