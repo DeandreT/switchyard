@@ -40,6 +40,7 @@ pub type ClientDelivery = Delivery;
 pub struct ClientConnectionBuilder {
     container_id: String,
     sasl: Option<SaslInit>,
+    max_frame_size: u32,
 }
 
 pub struct ClientReceiverBuilder {
@@ -55,24 +56,43 @@ impl ClientConnection {
         ClientConnectionBuilder {
             container_id: String::from("amqp-client"),
             sasl: None,
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
         }
     }
 
     pub async fn open<Io>(
-        mut stream: Io,
+        stream: Io,
         container_id: impl Into<String>,
         sasl: Option<SaslInit>,
     ) -> Result<Self, EngineError>
     where
         Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
+        Self::open_with_max_frame_size(stream, container_id, sasl, DEFAULT_MAX_FRAME_SIZE).await
+    }
+
+    async fn open_with_max_frame_size<Io>(
+        mut stream: Io,
+        container_id: impl Into<String>,
+        sasl: Option<SaslInit>,
+        maximum_frame_size: u32,
+    ) -> Result<Self, EngineError>
+    where
+        Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let local_max_frame_size = normalized_frame_size(maximum_frame_size)?;
+        let local_open = checked_open_frame(Open {
+            max_frame_size: local_max_frame_size,
+            ..Open::new(container_id)
+        })?;
         if let Some(init) = sasl {
             write_protocol_header(&mut stream, ProtocolHeader::SASL).await?;
             expect_header(&mut stream, ProtocolHeader::SASL).await?;
-            let mechanisms = match read_frame(&mut stream).await? {
-                Frame::Sasl(SaslPerformative::Mechanisms(mechanisms)) => mechanisms,
-                _ => return Err(invalid_state("expected SASL mechanisms")),
-            };
+            let mechanisms =
+                match read_frame_with_max_size(&mut stream, local_max_frame_size).await? {
+                    Frame::Sasl(SaslPerformative::Mechanisms(mechanisms)) => mechanisms,
+                    _ => return Err(invalid_state("expected SASL mechanisms")),
+                };
             if !mechanisms
                 .mechanisms
                 .iter()
@@ -83,7 +103,7 @@ impl ClientConnection {
                 ));
             }
             write_frame(&mut stream, &Frame::Sasl(SaslPerformative::Init(init))).await?;
-            let outcome = match read_frame(&mut stream).await? {
+            let outcome = match read_frame_with_max_size(&mut stream, local_max_frame_size).await? {
                 Frame::Sasl(SaslPerformative::Outcome(outcome)) => outcome,
                 _ => return Err(invalid_state("expected SASL outcome")),
             };
@@ -94,14 +114,8 @@ impl ClientConnection {
 
         write_protocol_header(&mut stream, ProtocolHeader::AMQP).await?;
         expect_header(&mut stream, ProtocolHeader::AMQP).await?;
-        write_amqp(
-            &mut stream,
-            0,
-            Performative::Open(Open::new(container_id)),
-            Vec::new(),
-        )
-        .await?;
-        let remote_open = match read_frame(&mut stream).await? {
+        write_frame(&mut stream, &local_open).await?;
+        let remote_open = match read_frame_with_max_size(&mut stream, MIN_MAX_FRAME_SIZE).await? {
             Frame::Amqp {
                 channel: 0,
                 performative: Some(Performative::Open(open)),
@@ -109,6 +123,7 @@ impl ClientConnection {
             } => open,
             _ => return Err(invalid_state("expected AMQP open")),
         };
+        let remote_max_frame_size = normalized_frame_size(remote_open.max_frame_size)?;
 
         let (commands, command_rx) = mpsc::channel(256);
         let (closed_tx, closed) = watch::channel(false);
@@ -116,7 +131,8 @@ impl ClientConnection {
         tokio::spawn(async move {
             let _ = run_client(
                 stream,
-                remote_open.max_frame_size,
+                remote_max_frame_size,
+                local_max_frame_size,
                 command_rx,
                 closed_tx,
                 cancellation,
@@ -194,7 +210,15 @@ impl ClientConnectionBuilder {
         self
     }
 
+    /// Advertises the incoming frame limit, capped by the codec's hard limit.
+    /// Values below the AMQP minimum of 512 bytes are refused before I/O.
+    pub fn max_frame_size(mut self, maximum: u32) -> Self {
+        self.max_frame_size = maximum;
+        self
+    }
+
     pub async fn open(self, url: &str) -> Result<ClientConnection, EngineError> {
+        let max_frame_size = normalized_frame_size(self.max_frame_size)?;
         let url =
             Url::parse(url).map_err(|error| invalid_state(format!("invalid AMQP URL: {error}")))?;
         let host = url
@@ -202,14 +226,26 @@ impl ClientConnectionBuilder {
             .ok_or_else(|| invalid_state("AMQP URL has no host"))?;
         let port = url.port().unwrap_or(5672);
         let stream = tokio::net::TcpStream::connect((host, port)).await?;
-        ClientConnection::open(stream, self.container_id, self.sasl).await
+        ClientConnection::open_with_max_frame_size(
+            stream,
+            self.container_id,
+            self.sasl,
+            max_frame_size,
+        )
+        .await
     }
 
     pub async fn open_with_stream<Io>(self, stream: Io) -> Result<ClientConnection, EngineError>
     where
         Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        ClientConnection::open(stream, self.container_id, self.sasl).await
+        ClientConnection::open_with_max_frame_size(
+            stream,
+            self.container_id,
+            self.sasl,
+            self.max_frame_size,
+        )
+        .await
     }
 }
 
@@ -600,6 +636,7 @@ async fn client_request<T>(
 async fn run_client<Io>(
     stream: Io,
     remote_max_frame_size: u32,
+    local_max_frame_size: u32,
     mut commands: mpsc::Receiver<ClientCommand>,
     closed: watch::Sender<bool>,
     mut cancellation: watch::Receiver<bool>,
@@ -611,7 +648,7 @@ where
     let (frames_tx, mut frames) = mpsc::channel(256);
     let mut reader_task = ConnectionReader(Some(tokio::spawn(async move {
         loop {
-            let frame = read_frame(&mut reader).await;
+            let frame = read_frame_with_max_size(&mut reader, local_max_frame_size).await;
             let done = frame.is_err();
             if frames_tx.send(frame).await.is_err() || done {
                 break;
@@ -633,7 +670,16 @@ where
         loop {
             tokio::select! {
                 frame = frames.recv() => {
-                    let Some(Ok(frame)) = frame else { break };
+                    let Some(frame) = frame else { break };
+                    let frame = match frame {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            if closing.is_empty() {
+                                notify_frame_size_error(&mut writer, &error).await;
+                            }
+                            break;
+                        }
+                    };
                 let Frame::Amqp { channel, performative, payload } = frame else { break };
                 let Some(performative) = performative else { continue };
                 if !closing.is_empty() && !matches!(&performative, Performative::Close(_)) {

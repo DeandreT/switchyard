@@ -163,6 +163,13 @@ when application dispatch or a socket write is blocked. Explicit shutdown waits
 for both tasks to terminate before releasing the listener's admission slot.
 These are Switchyard resource policies, not Azure quotas. Session flow windows
 and connection-wide message-allocation budgets are not yet enforced.
+AMQP Open frames are limited to the initial 512-byte transport maximum. After
+Open, the server advertises and enforces its own 262,144-byte receive maximum,
+independent of the peer's receive limit. Oversized frames are rejected from the
+four-byte size prefix before allocating or reading their bodies; an open
+connection returns the framing-error Close condition. The test client can
+configure its own receive maximum between 512 bytes and the codec's 4 MiB
+ceiling. SASL reads use the local receive maximum as a resource policy.
 The edge resolves a link's address to an entity, turns transfers into send
 commands and dispositions into settlements, and answers a rejection with the
 condition an SDK keys its behaviour off. A receiving link's settle mode selects

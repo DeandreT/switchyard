@@ -16,15 +16,68 @@ use crate::{
     Accepted, Attach, Begin, Close, DeliveryState, DeliveryTag, Detach, Disposition, End, Error,
     Fields, Flow, Frame, Message, Open, Outcome, Performative, ProtocolHeader, ReceiverSettleMode,
     Role, SaslCode, SaslInit, SaslMechanisms, SaslOutcome, SaslPerformative, SenderSettleMode,
-    Transfer, decode_message, encode_message, read_frame, read_protocol_header, write_frame,
-    write_protocol_header,
+    Transfer, decode_message, encode_message, read_frame_with_max_size, read_protocol_header,
+    write_frame, write_protocol_header,
 };
+
+#[cfg(test)]
+use crate::read_frame;
 
 const LINK_CREDIT: u32 = 2_048;
 const SESSION_WINDOW: u32 = 2_048;
 const FRAME_OVERHEAD_RESERVE: usize = 512;
 const MAX_CLOSING_HANDLES: usize = 65_536;
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_MAX_FRAME_SIZE: u32 = 262_144;
+const MIN_MAX_FRAME_SIZE: u32 = 512;
+
+fn normalized_frame_size(advertised: u32) -> Result<u32, EngineError> {
+    if advertised < MIN_MAX_FRAME_SIZE {
+        return Err(invalid_state(
+            "maximum frame size must be at least 512 bytes",
+        ));
+    }
+    Ok(advertised.min(crate::codec::MAX_FRAME_SIZE as u32))
+}
+
+fn checked_open_frame(open: Open) -> Result<Frame, EngineError> {
+    let frame = Frame::Amqp {
+        channel: 0,
+        performative: Some(Performative::Open(open)),
+        payload: Vec::new(),
+    };
+    if crate::encode_frame(&frame)?.len() > MIN_MAX_FRAME_SIZE as usize {
+        return Err(invalid_state(
+            "local AMQP Open exceeds the initial 512-byte frame limit",
+        ));
+    }
+    Ok(frame)
+}
+
+async fn notify_frame_size_error<W: AsyncWrite + Unpin>(writer: &mut W, error: &io::Error) {
+    let Some(error) = error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<crate::codec::FrameSizeError>())
+    else {
+        return;
+    };
+    let _ = tokio::time::timeout(
+        DEFAULT_CLOSE_TIMEOUT,
+        write_amqp(
+            writer,
+            0,
+            Performative::Close(Close {
+                error: Some(Error::new(
+                    crate::ErrorCondition::Custom(Symbol::from("amqp:connection:framing-error")),
+                    error.to_string(),
+                    None,
+                )),
+            }),
+            Vec::new(),
+        ),
+    )
+    .await;
+}
 
 pub trait SaslAuthenticator: Send + Sync + 'static {
     fn mechanisms(&self) -> Vec<Symbol>;
@@ -227,6 +280,12 @@ impl ServerConnection {
     where
         Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
+        let local_max_frame_size = normalized_frame_size(DEFAULT_MAX_FRAME_SIZE)?;
+        let mut local_open = Open {
+            max_frame_size: local_max_frame_size,
+            ..Open::new(container_id)
+        };
+        checked_open_frame(local_open.clone())?;
         if let Some(authenticator) = sasl {
             expect_header(&mut stream, ProtocolHeader::SASL).await?;
             write_protocol_header(&mut stream, ProtocolHeader::SASL).await?;
@@ -237,7 +296,7 @@ impl ServerConnection {
                 })),
             )
             .await?;
-            let init = match read_frame(&mut stream).await? {
+            let init = match read_frame_with_max_size(&mut stream, local_max_frame_size).await? {
                 Frame::Sasl(SaslPerformative::Init(init)) => init,
                 _ => return Err(invalid_state("expected SASL init")),
             };
@@ -261,7 +320,7 @@ impl ServerConnection {
 
         expect_header(&mut stream, ProtocolHeader::AMQP).await?;
         write_protocol_header(&mut stream, ProtocolHeader::AMQP).await?;
-        let remote_open = match read_frame(&mut stream).await? {
+        let remote_open = match read_frame_with_max_size(&mut stream, MIN_MAX_FRAME_SIZE).await? {
             Frame::Amqp {
                 channel: 0,
                 performative: Some(Performative::Open(open)),
@@ -269,20 +328,9 @@ impl ServerConnection {
             } => open,
             _ => return Err(invalid_state("expected AMQP open")),
         };
-        let local_open = Open {
-            max_frame_size: remote_open.max_frame_size.max(512),
-            channel_max: remote_open.channel_max,
-            ..Open::new(container_id)
-        };
-        write_frame(
-            &mut stream,
-            &Frame::Amqp {
-                channel: 0,
-                performative: Some(Performative::Open(local_open)),
-                payload: Vec::new(),
-            },
-        )
-        .await?;
+        let remote_max_frame_size = normalized_frame_size(remote_open.max_frame_size)?;
+        local_open.channel_max = remote_open.channel_max;
+        write_frame(&mut stream, &checked_open_frame(local_open)?).await?;
 
         let (commands, command_rx) = mpsc::channel(256);
         let (incoming_session_tx, incoming_sessions) = mpsc::channel(32);
@@ -290,7 +338,8 @@ impl ServerConnection {
         tokio::spawn(async move {
             run_connection(
                 stream,
-                remote_open.max_frame_size,
+                remote_max_frame_size,
+                local_max_frame_size,
                 command_rx,
                 incoming_session_tx,
                 cancellation,
@@ -734,6 +783,7 @@ struct PartialDelivery {
 async fn run_connection<Io>(
     stream: Io,
     remote_max_frame_size: u32,
+    local_max_frame_size: u32,
     mut commands: mpsc::Receiver<Command>,
     incoming_sessions: mpsc::Sender<IncomingSession>,
     mut cancellation: watch::Receiver<bool>,
@@ -744,7 +794,7 @@ async fn run_connection<Io>(
     let (frames_tx, mut frames) = mpsc::channel(256);
     let mut reader_task = ConnectionReader(Some(tokio::spawn(async move {
         loop {
-            let frame = read_frame(&mut reader).await;
+            let frame = read_frame_with_max_size(&mut reader, local_max_frame_size).await;
             let done = frame.is_err();
             if frames_tx.send(frame).await.is_err() || done {
                 break;
@@ -759,7 +809,15 @@ async fn run_connection<Io>(
             tokio::select! {
                 frame = frames.recv() => {
                     let Some(frame) = frame else { break };
-                    let Ok(frame) = frame else { break };
+                    let frame = match frame {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            if closing_replies.is_empty() {
+                                notify_frame_size_error(&mut writer, &error).await;
+                            }
+                            break;
+                        }
+                    };
                     if !closing_replies.is_empty()
                         && !matches!(&frame, Frame::Amqp {
                             performative: Some(Performative::Close(_)), ..
@@ -1698,3 +1756,6 @@ mod message_size_tests;
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod frame_limit_tests;

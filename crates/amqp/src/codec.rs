@@ -19,7 +19,14 @@ pub const SASL_HEADER: [u8; 8] = *b"AMQP\x03\x01\x00\x00";
 const AMQP_FRAME_TYPE: u8 = 0;
 const SASL_FRAME_TYPE: u8 = 1;
 const FRAME_HEADER_SIZE: usize = 8;
-const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_FRAME_SIZE: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid AMQP frame size {size}; receive maximum is {maximum}")]
+pub(crate) struct FrameSizeError {
+    pub size: u32,
+    pub maximum: u32,
+}
 
 const OPEN: u64 = 0x10;
 const BEGIN: u64 = 0x11;
@@ -125,11 +132,33 @@ pub async fn write_protocol_header<W: AsyncWrite + Unpin>(
 }
 
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Frame> {
+    read_frame_with_max_size(reader, MAX_FRAME_SIZE as u32).await
+}
+
+/// Enforces the local advertised receive limit before allocating a frame body.
+/// The codec's own maximum remains a ceiling even for larger advertised limits.
+pub async fn read_frame_with_max_size<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    maximum_bytes: u32,
+) -> io::Result<Frame> {
+    let maximum = (maximum_bytes as usize).min(MAX_FRAME_SIZE);
+    if maximum < FRAME_HEADER_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "AMQP frame receive limit is shorter than its header",
+        ));
+    }
     let mut size_bytes = [0_u8; 4];
     reader.read_exact(&mut size_bytes).await?;
     let size = u32::from_be_bytes(size_bytes) as usize;
-    if !(FRAME_HEADER_SIZE..=MAX_FRAME_SIZE).contains(&size) {
-        return Err(invalid_data(format!("invalid AMQP frame size {size}")));
+    if !(FRAME_HEADER_SIZE..=maximum).contains(&size) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            FrameSizeError {
+                size: size as u32,
+                maximum: maximum as u32,
+            },
+        ));
     }
 
     let mut frame = vec![0_u8; size];
@@ -1601,6 +1630,106 @@ fn invalid_data(error: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transfer_frame(payload: Vec<u8>) -> Frame {
+        Frame::Amqp {
+            channel: 0,
+            performative: Some(Performative::Transfer(Transfer {
+                handle: 0,
+                delivery_id: None,
+                delivery_tag: None,
+                message_format: None,
+                settled: None,
+                more: false,
+                rcv_settle_mode: None,
+                state: None,
+                resume: false,
+                aborted: false,
+                batchable: false,
+            })),
+            payload,
+        }
+    }
+
+    #[tokio::test]
+    async fn negotiated_frame_limit_accepts_the_exact_boundary() {
+        let frame = transfer_frame(Vec::new());
+        let overhead = encode_frame(&frame).expect("frame encodes").len();
+        let frame = transfer_frame(vec![0; 512 - overhead]);
+        let encoded = encode_frame(&frame).expect("frame encodes");
+        assert_eq!(encoded.len(), 512);
+        assert_eq!(
+            read_frame_with_max_size(&mut encoded.as_slice(), 512)
+                .await
+                .expect("exact limit is accepted"),
+            frame
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_frame_sizes_are_rejected_from_the_prefix_without_a_body() {
+        use tokio::io::AsyncWriteExt;
+
+        for (size, maximum) in [
+            (0, 512),
+            (7, 512),
+            (513, 512),
+            (MAX_FRAME_SIZE as u32 + 1, u32::MAX),
+            (u32::MAX, u32::MAX),
+        ] {
+            let (mut reader, mut writer) = tokio::io::duplex(4);
+            writer
+                .write_all(&u32::to_be_bytes(size))
+                .await
+                .expect("size prefix is written");
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                read_frame_with_max_size(&mut reader, maximum),
+            )
+            .await
+            .expect("rejection does not wait for a body")
+            .expect_err("size is refused");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            let detail = error
+                .get_ref()
+                .and_then(|cause| cause.downcast_ref::<FrameSizeError>())
+                .expect("frame size errors remain identifiable by the driver");
+            assert_eq!(detail.size, size);
+            assert_eq!(detail.maximum, maximum.min(MAX_FRAME_SIZE as u32));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_frame_limits_do_not_consume_the_input() {
+        for maximum in [0, 7] {
+            let bytes = [0, 0, 0, 8, 2, 0, 0, 0];
+            let mut input = bytes.as_slice();
+            let error = read_frame_with_max_size(&mut input, maximum)
+                .await
+                .expect_err("invalid limit is refused");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(input, bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_reader_keeps_its_global_limit() {
+        let frame = transfer_frame(vec![0; 1_024]);
+        let bytes = encode_frame(&frame).expect("frame encodes");
+        assert_eq!(
+            read_frame(&mut bytes.as_slice())
+                .await
+                .expect("legacy read"),
+            frame
+        );
+        assert_eq!(
+            read_frame_with_max_size(&mut bytes.as_slice(), 512)
+                .await
+                .expect_err("negotiated read refuses larger frames")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     fn round_trip(performative: Performative) {
         let frame = Frame::Amqp {
