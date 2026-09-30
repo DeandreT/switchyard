@@ -42,6 +42,15 @@ struct Node {
 
 impl Node {
     async fn start(tls: bool, sasl: bool, handshake_timeout: Duration) -> TestResult<Self> {
+        Self::start_with_idle(tls, sasl, handshake_timeout, 60_000).await
+    }
+
+    async fn start_with_idle(
+        tls: bool,
+        sasl: bool,
+        handshake_timeout: Duration,
+        idle_timeout_millis: u32,
+    ) -> TestResult<Self> {
         let broker = Broker::spawn(LocalProposer::new(
             StateMachine::new(MemoryStore::default()),
             ManualClock::at(1_000),
@@ -49,7 +58,8 @@ impl Node {
         let namespace = NamespaceName::new("tenant")?;
         let mut acceptor = protocol_amqp::AmqpListener::new(broker.handle(), namespace)
             .with_max_connections(NonZeroUsize::new(1).expect("positive admission limit"))
-            .with_handshake_timeout(handshake_timeout);
+            .with_handshake_timeout(handshake_timeout)
+            .with_idle_timeout_millis(idle_timeout_millis);
         let certificate = if tls {
             let CertifiedKey { cert, key_pair } =
                 generate_simple_self_signed(vec![String::from("localhost")])?;
@@ -186,25 +196,35 @@ async fn finish_sasl<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> TestR
 }
 
 async fn open_amqp<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> TestResult {
+    open_amqp_with_idle(stream, None).await?;
+    Ok(())
+}
+
+async fn open_amqp_with_idle<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    peer_idle: Option<u32>,
+) -> TestResult<Open> {
     write_protocol_header(stream, ProtocolHeader::AMQP).await?;
     assert_eq!(read_protocol_header(stream).await?, ProtocolHeader::AMQP);
     write_frame(
         stream,
         &Frame::Amqp {
             channel: 0,
-            performative: Some(Performative::Open(Open::new("raw-peer"))),
+            performative: Some(Performative::Open(Open {
+                idle_time_out: peer_idle,
+                ..Open::new("raw-peer")
+            })),
             payload: Vec::new(),
         },
     )
     .await?;
-    assert!(matches!(
-        read_frame(stream).await?,
+    match read_frame(stream).await? {
         Frame::Amqp {
-            performative: Some(Performative::Open(_)),
+            performative: Some(Performative::Open(open)),
             ..
-        }
-    ));
-    Ok(())
+        } => Ok(open),
+        other => panic!("expected Open, received {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -366,5 +386,169 @@ async fn zero_handshake_duration_is_an_immediate_deadline_not_an_unlimited_one()
     let node = Node::start(false, false, Duration::ZERO).await?;
     let mut peer = TcpStream::connect(node.address).await?;
     assert_transport_closed(&mut peer).await?;
+    Ok(())
+}
+
+async fn receive_idle_close<S: AsyncRead + Unpin>(stream: &mut S) -> TestResult {
+    let Frame::Amqp {
+        channel: 0,
+        performative: Some(Performative::Close(close)),
+        payload,
+    } = timeout(TEST_TIMEOUT, read_frame(stream)).await??
+    else {
+        panic!("receive silence must produce Close");
+    };
+    assert!(payload.is_empty());
+    assert_eq!(
+        close
+            .error
+            .expect("idle timeout error")
+            .condition
+            .as_symbol(),
+        Symbol::from("amqp:connection:forced")
+    );
+    Ok(())
+}
+
+async fn close_raw<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -> TestResult {
+    write_frame(
+        stream,
+        &Frame::Amqp {
+            channel: 0,
+            performative: Some(Performative::Close(amqp::Close::default())),
+            payload: Vec::new(),
+        },
+    )
+    .await?;
+    let Frame::Amqp {
+        performative: Some(Performative::Close(close)),
+        ..
+    } = timeout(TEST_TIMEOUT, read_frame(stream)).await??
+    else {
+        panic!("expected graceful Close acknowledgment");
+    };
+    assert!(close.error.is_none(), "connection must still be live");
+    assert!(assert_transport_closed(stream).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn receive_idle_timeout_and_ignored_close_release_admission_over_tcp_and_tls() -> TestResult {
+    for tls in [false, true] {
+        let node = Node::start_with_idle(tls, false, HANDSHAKE_TIMEOUT, 1_000).await?;
+        if tls {
+            let mut peer = node.tls_connect().await?;
+            assert_eq!(
+                open_amqp_with_idle(&mut peer, Some(0)).await?.idle_time_out,
+                Some(1_000)
+            );
+            receive_idle_close(&mut peer).await?;
+            assert!(assert_transport_closed(&mut peer).await?.is_empty());
+            node.assert_permit_reusable().await?;
+        } else {
+            let mut peer = TcpStream::connect(node.address).await?;
+            assert_eq!(
+                open_amqp_with_idle(&mut peer, Some(0)).await?.idle_time_out,
+                Some(1_000)
+            );
+            receive_idle_close(&mut peer).await?;
+            assert!(assert_transport_closed(&mut peer).await?.is_empty());
+            node.assert_permit_reusable().await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbound_keepalives_survive_disabled_local_receive_timeout() -> TestResult {
+    let node = Node::start_with_idle(false, false, HANDSHAKE_TIMEOUT, 0).await?;
+    let mut peer = TcpStream::connect(node.address).await?;
+    assert_eq!(
+        open_amqp_with_idle(&mut peer, Some(1_000))
+            .await?
+            .idle_time_out,
+        Some(0)
+    );
+    let started = Instant::now();
+    for _ in 0..5 {
+        assert!(matches!(
+            timeout(Duration::from_millis(900), read_frame(&mut peer)).await??,
+            Frame::Amqp { channel: 0, performative: None, payload } if payload.is_empty()
+        ));
+    }
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    close_raw(&mut peer).await?;
+    node.assert_permit_reusable().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn partial_frame_progress_does_not_restart_receive_idle_timeout() -> TestResult {
+    let node = Node::start_with_idle(false, false, HANDSHAKE_TIMEOUT, 1_000).await?;
+    let mut peer = TcpStream::connect(node.address).await?;
+    open_amqp_with_idle(&mut peer, Some(0)).await?;
+    let heartbeat = encode_frame(&Frame::Amqp {
+        channel: 0,
+        performative: None,
+        payload: Vec::new(),
+    })?;
+    peer.write_all(&heartbeat[..4]).await?;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    peer.write_all(&heartbeat[4..7]).await?;
+    timeout(Duration::from_millis(1_500), receive_idle_close(&mut peer)).await??;
+    assert!(assert_transport_closed(&mut peer).await?.is_empty());
+    node.assert_permit_reusable().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn complete_heartbeats_on_an_unbound_valid_channel_keep_a_connection_alive() -> TestResult {
+    let node = Node::start_with_idle(false, false, HANDSHAKE_TIMEOUT, 1_000).await?;
+    let mut peer = TcpStream::connect(node.address).await?;
+    let open = open_amqp_with_idle(&mut peer, Some(0)).await?;
+    assert!(open.channel_max >= 7);
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        write_frame(
+            &mut peer,
+            &Frame::Amqp {
+                channel: 7,
+                performative: None,
+                payload: Vec::new(),
+            },
+        )
+        .await?;
+    }
+    close_raw(&mut peer).await?;
+    node.assert_permit_reusable().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_idle_or_write_limits_are_refused_before_listener_admission() -> TestResult {
+    let broker = Broker::spawn(LocalProposer::new(
+        StateMachine::new(MemoryStore::default()),
+        ManualClock::at(1_000),
+    ));
+    for idle in [1, 999] {
+        let acceptor =
+            protocol_amqp::AmqpListener::new(broker.handle(), NamespaceName::new("tenant")?)
+                .with_idle_timeout_millis(idle);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let error = timeout(TEST_TIMEOUT, acceptor.serve(listener))
+            .await?
+            .expect_err("invalid idle limit");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+    for duration in [Duration::ZERO, Duration::MAX] {
+        let acceptor =
+            protocol_amqp::AmqpListener::new(broker.handle(), NamespaceName::new("tenant")?)
+                .with_write_timeout(duration);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let error = timeout(TEST_TIMEOUT, acceptor.serve(listener))
+            .await?
+            .expect_err("invalid write limit");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
     Ok(())
 }

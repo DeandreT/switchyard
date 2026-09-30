@@ -7,7 +7,7 @@ use std::{
 
 use serde_amqp::primitives::Symbol;
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     sync::{Notify, mpsc, oneshot, watch},
 };
 
@@ -24,10 +24,13 @@ use crate::read_frame;
 
 mod flow_control;
 mod frame_writer;
+mod idle;
 mod receive_credit;
 
 use flow_control::{LinkCredit, LinkSnapshot, SessionWindow};
 use frame_writer::FrameWriter;
+pub use idle::ConnectionOptions;
+use idle::{Activity, ActivityTimeout, validate_idle_timeout};
 use receive_credit::{Consumption, ReceiveCredit};
 
 const LINK_CREDIT: u32 = 32;
@@ -62,6 +65,107 @@ fn checked_open_frame(open: Open) -> Result<Frame, EngineError> {
         ));
     }
     Ok(frame)
+}
+
+async fn negotiation_header<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    header: ProtocolHeader,
+    options: ConnectionOptions,
+) -> Result<(), EngineError> {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(options.write_limit())
+        .ok_or_else(|| invalid_state("write timeout cannot be represented by the clock"))?;
+    tokio::time::timeout_at(deadline, async {
+        write_protocol_header(writer, header).await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| EngineError::Timeout("write"))??;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(EngineError::Timeout("write"));
+    }
+    Ok(())
+}
+
+async fn negotiation_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &Frame,
+    options: ConnectionOptions,
+) -> Result<(), EngineError> {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(options.write_limit())
+        .ok_or_else(|| invalid_state("write timeout cannot be represented by the clock"))?;
+    tokio::time::timeout_at(deadline, async {
+        write_frame(writer, frame).await?;
+        writer.flush().await
+    })
+    .await
+    .map_err(|_| EngineError::Timeout("write"))??;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(EngineError::Timeout("write"));
+    }
+    Ok(())
+}
+
+async fn peer_idle_timeout<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    advertised: Option<u32>,
+    maximum_frame_size: u32,
+    options: ConnectionOptions,
+) -> Result<u32, EngineError> {
+    let millis = advertised.unwrap_or(0);
+    if let Err(error) = validate_idle_timeout(millis) {
+        let mut writer = FrameWriter::new(writer, maximum_frame_size)?;
+        writer.configure_activity(options, 0, Activity::new());
+        let _ = writer
+            .write_amqp(
+                0,
+                Performative::Close(Close {
+                    error: Some(Error::new(
+                        crate::AmqpError::InvalidField,
+                        "positive idle-time-out below 1000 milliseconds is unsupported",
+                        None,
+                    )),
+                }),
+                Vec::new(),
+            )
+            .await;
+        return Err(error);
+    }
+    Ok(millis)
+}
+
+fn validate_activity_frame(frame: &Frame, channel_max: u16) -> io::Result<()> {
+    match frame {
+        Frame::Amqp {
+            channel,
+            performative,
+            payload,
+        } if *channel <= channel_max && (performative.is_some() || payload.is_empty()) => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid post-Open AMQP frame or channel",
+        )),
+    }
+}
+
+async fn idle_close<W: AsyncWrite + Unpin>(
+    writer: &mut FrameWriter<W>,
+    reason: ActivityTimeout,
+) -> io::Result<()> {
+    writer
+        .write_amqp(
+            0,
+            Performative::Close(Close {
+                error: Some(Error::new(
+                    crate::ErrorCondition::Custom(Symbol::from("amqp:connection:forced")),
+                    reason.description(),
+                    None,
+                )),
+            }),
+            Vec::new(),
+        )
+        .await
 }
 
 async fn notify_frame_size_error<W: AsyncWrite + Unpin>(
@@ -127,6 +231,15 @@ pub struct ServerConnection {
     lifecycle: ConnectionLifecycle,
     close_timeout: Duration,
     consumed: Arc<Notify>,
+}
+
+#[derive(Clone, Copy)]
+struct ConnectionSettings {
+    remote_max_frame_size: u32,
+    local_max_frame_size: u32,
+    channel_max: u16,
+    options: ConnectionOptions,
+    peer_idle_millis: u32,
 }
 
 struct ConnectionLifecycle {
@@ -288,27 +401,42 @@ impl Delivery {
 
 impl ServerConnection {
     pub async fn accept<Io>(
-        mut stream: Io,
+        stream: Io,
         container_id: impl Into<String>,
         sasl: Option<Arc<dyn SaslAuthenticator>>,
     ) -> Result<Self, EngineError>
     where
         Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
+        Self::accept_with_options(stream, container_id, sasl, ConnectionOptions::default()).await
+    }
+
+    pub async fn accept_with_options<Io>(
+        mut stream: Io,
+        container_id: impl Into<String>,
+        sasl: Option<Arc<dyn SaslAuthenticator>>,
+        options: ConnectionOptions,
+    ) -> Result<Self, EngineError>
+    where
+        Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        options.validate()?;
         let local_max_frame_size = normalized_frame_size(DEFAULT_MAX_FRAME_SIZE)?;
         let mut local_open = Open {
             max_frame_size: local_max_frame_size,
+            idle_time_out: Some(options.advertised_idle_timeout()),
             ..Open::new(container_id)
         };
         checked_open_frame(local_open.clone())?;
         if let Some(authenticator) = sasl {
             expect_header(&mut stream, ProtocolHeader::SASL).await?;
-            write_protocol_header(&mut stream, ProtocolHeader::SASL).await?;
-            write_frame(
+            negotiation_header(&mut stream, ProtocolHeader::SASL, options).await?;
+            negotiation_frame(
                 &mut stream,
                 &Frame::Sasl(SaslPerformative::Mechanisms(SaslMechanisms {
                     mechanisms: authenticator.mechanisms(),
                 })),
+                options,
             )
             .await?;
             let init = match read_frame_with_max_size(&mut stream, local_max_frame_size).await? {
@@ -316,12 +444,13 @@ impl ServerConnection {
                 _ => return Err(invalid_state("expected SASL init")),
             };
             let code = authenticator.authenticate(&init);
-            write_frame(
+            negotiation_frame(
                 &mut stream,
                 &Frame::Sasl(SaslPerformative::Outcome(SaslOutcome {
                     code: code.clone(),
                     additional_data: None,
                 })),
+                options,
             )
             .await?;
             if code != SaslCode::Ok {
@@ -334,7 +463,7 @@ impl ServerConnection {
         }
 
         expect_header(&mut stream, ProtocolHeader::AMQP).await?;
-        write_protocol_header(&mut stream, ProtocolHeader::AMQP).await?;
+        negotiation_header(&mut stream, ProtocolHeader::AMQP, options).await?;
         let remote_open = match read_frame_with_max_size(&mut stream, MIN_MAX_FRAME_SIZE).await? {
             Frame::Amqp {
                 channel: 0,
@@ -345,7 +474,15 @@ impl ServerConnection {
         };
         let remote_max_frame_size = normalized_frame_size(remote_open.max_frame_size)?;
         local_open.channel_max = remote_open.channel_max;
-        write_frame(&mut stream, &checked_open_frame(local_open)?).await?;
+        let channel_max = local_open.channel_max;
+        negotiation_frame(&mut stream, &checked_open_frame(local_open)?, options).await?;
+        let peer_idle_millis = peer_idle_timeout(
+            &mut stream,
+            remote_open.idle_time_out,
+            remote_max_frame_size,
+            options,
+        )
+        .await?;
 
         let (commands, command_rx) = mpsc::channel(256);
         let (incoming_session_tx, incoming_sessions) = mpsc::channel(32);
@@ -355,8 +492,13 @@ impl ServerConnection {
         tokio::spawn(async move {
             run_connection(
                 stream,
-                remote_max_frame_size,
-                local_max_frame_size,
+                ConnectionSettings {
+                    remote_max_frame_size,
+                    local_max_frame_size,
+                    channel_max,
+                    options,
+                    peer_idle_millis,
+                },
                 command_rx,
                 incoming_session_tx,
                 driver_consumed,
@@ -897,8 +1039,7 @@ struct PartialDelivery {
 
 async fn run_connection<Io>(
     stream: Io,
-    remote_max_frame_size: u32,
-    local_max_frame_size: u32,
+    settings: ConnectionSettings,
     mut commands: mpsc::Receiver<Command>,
     incoming_sessions: mpsc::Sender<IncomingSession>,
     consumed: Arc<Notify>,
@@ -906,14 +1047,33 @@ async fn run_connection<Io>(
 ) where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    let remote_max_frame_size = settings.remote_max_frame_size;
+    let activity = Activity::configured(settings.options);
     let (mut reader, writer) = tokio::io::split(stream);
     let Ok(mut writer) = FrameWriter::new(writer, remote_max_frame_size) else {
         return;
     };
+    writer.configure_activity(
+        settings.options,
+        settings.peer_idle_millis,
+        activity.clone(),
+    );
     let (frames_tx, mut frames) = mpsc::channel(256);
+    let reader_activity = activity.clone();
     let mut reader_task = ConnectionReader(Some(tokio::spawn(async move {
         loop {
-            let frame = read_frame_with_max_size(&mut reader, local_max_frame_size).await;
+            let frame = read_frame_with_max_size(&mut reader, settings.local_max_frame_size)
+                .await
+                .and_then(|frame| {
+                    validate_activity_frame(&frame, settings.channel_max)?;
+                    if !reader_activity.received_frame() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "receive idle deadline expired before the complete frame",
+                        ));
+                    }
+                    Ok(frame)
+                });
             let done = frame.is_err();
             if frames_tx.send(frame).await.is_err() || done {
                 break;
@@ -925,99 +1085,140 @@ async fn run_connection<Io>(
     let mut closing_replies = Vec::<oneshot::Sender<Result<(), EngineError>>>::new();
     let mut pump_ready = false;
     let mut pump_cursor = 0;
-    let processing = async {
-        loop {
-            tokio::select! {
-                frame = frames.recv() => {
-                    let Some(frame) = frame else { break };
-                    let frame = match frame {
-                        Ok(frame) => frame,
-                        Err(error) => {
-                            if closing_replies.is_empty() {
-                                notify_frame_size_error(&mut writer, &error).await;
-                            }
-                            break;
-                        }
-                    };
-                    if !closing_replies.is_empty()
-                        && !matches!(&frame, Frame::Amqp {
-                            performative: Some(Performative::Close(_)), ..
-                        })
+    loop {
+        let stopped = {
+            let processing = async {
+                loop {
+                    if activity.heartbeat_is_due(settings.peer_idle_millis)
+                        && writer
+                            .write_frame(&Frame::Amqp {
+                                channel: 0,
+                                performative: None,
+                                payload: Vec::new(),
+                            })
+                            .await
+                            .is_err()
                     {
-                        continue;
-                    }
-                    match handle_frame(
-                        frame,
-                        &mut writer,
-                        &incoming_sessions,
-                        &mut sessions,
-                        remote_max_frame_size,
-                        !closing_replies.is_empty(),
-                    ).await {
-                        Ok(FrameAction::Continue) => pump_ready = true,
-                        Ok(FrameAction::Closed) => {
-                            for reply in closing_replies.drain(..) {
-                                let _ = reply.send(Ok(()));
-                            }
-                            commands.close();
-                            while let Ok(command) = commands.try_recv() {
-                                if let Command::Close { reply, .. } = command {
-                                    let _ = reply.send(Ok(()));
-                                } else {
-                                    reject_closed_command(command);
-                                }
-                            }
-                            break;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                command = commands.recv() => {
-                    let Some(command) = command else { break };
-                    let command = match command {
-                        Command::Close { reply, .. } if !closing_replies.is_empty() => {
-                            closing_replies.push(reply);
-                            continue;
-                        }
-                        command if !closing_replies.is_empty() => {
-                            reject_closed_command(command);
-                            continue;
-                        }
-                        command => command,
-                    };
-                    match handle_command(
-                        command,
-                        &mut writer,
-                        &mut sessions,
-                        remote_max_frame_size,
-                    ).await {
-                        Ok(CommandAction::Continue) => pump_ready = true,
-                        Ok(CommandAction::Closing(reply)) => {
-                            pump_ready = false;
-                            closing_replies.push(reply);
-                        }
-                        Err(_) => break,
-                    }
-                }
-                () = consumed.notified(), if closing_replies.is_empty() => {
-                    if refresh_consumed(&mut writer, &mut sessions).await.is_err() {
                         break;
                     }
-                    pump_ready = true;
-                }
-                () = tokio::task::yield_now(), if pump_ready && closing_replies.is_empty() => {
-                    match pump_connection(&mut writer, &mut sessions, &mut pump_cursor).await {
-                        Ok(ready) => pump_ready = ready,
-                        Err(_) => break,
+                    tokio::select! {
+                        () = activity.heartbeat_due(settings.peer_idle_millis), if !activity.is_closing() => {
+                            if writer.write_frame(&Frame::Amqp {
+                                channel: 0,
+                                performative: None,
+                                payload: Vec::new(),
+                            }).await.is_err() {
+                                break;
+                            }
+                        }
+                        frame = frames.recv() => {
+                            let Some(frame) = frame else { break };
+                            let frame = match frame {
+                                Ok(frame) => frame,
+                                Err(error) => {
+                                    if !activity.is_closing() {
+                                        notify_frame_size_error(&mut writer, &error).await;
+                                    }
+                                    break;
+                                }
+                            };
+                            if activity.is_closing()
+                                && !matches!(&frame, Frame::Amqp {
+                                    performative: Some(Performative::Close(_)), ..
+                                })
+                            {
+                                continue;
+                            }
+                            match handle_frame(
+                                frame,
+                                &mut writer,
+                                &incoming_sessions,
+                                &mut sessions,
+                                remote_max_frame_size,
+                                activity.is_closing(),
+                            ).await {
+                                Ok(FrameAction::Continue) => pump_ready = true,
+                                Ok(FrameAction::Closed) => {
+                                    for reply in closing_replies.drain(..) {
+                                        let _ = reply.send(Ok(()));
+                                    }
+                                    commands.close();
+                                    while let Ok(command) = commands.try_recv() {
+                                        if let Command::Close { reply, .. } = command {
+                                            let _ = reply.send(Ok(()));
+                                        } else {
+                                            reject_closed_command(command);
+                                        }
+                                    }
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        command = commands.recv() => {
+                            let Some(command) = command else { break };
+                            let command = match command {
+                                Command::Close { reply, .. } if activity.is_closing() => {
+                                    closing_replies.push(reply);
+                                    continue;
+                                }
+                                command if activity.is_closing() => {
+                                    reject_closed_command(command);
+                                    continue;
+                                }
+                                command => command,
+                            };
+                            match handle_command(
+                                command,
+                                &mut writer,
+                                &mut sessions,
+                                remote_max_frame_size,
+                            ).await {
+                                Ok(CommandAction::Continue) => pump_ready = true,
+                                Ok(CommandAction::Closing(reply)) => {
+                                    pump_ready = false;
+                                    closing_replies.push(reply);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        () = consumed.notified(), if !activity.is_closing() => {
+                            if refresh_consumed(&mut writer, &mut sessions).await.is_err() {
+                                break;
+                            }
+                            pump_ready = true;
+                        }
+                        () = tokio::task::yield_now(), if pump_ready && !activity.is_closing() => {
+                            match pump_connection(&mut writer, &mut sessions, &mut pump_cursor).await {
+                                Ok(ready) => pump_ready = ready,
+                                Err(_) => break,
+                            }
+                        }
                     }
                 }
+            };
+            tokio::select! {
+                biased;
+                () = wait_for_detach(&mut cancellation) => None,
+                reason = activity.timeout(settings.options, settings.peer_idle_millis) => Some(reason),
+                () = processing => None,
+            }
+        };
+        if let Some(reason @ (ActivityTimeout::Receive | ActivityTimeout::Peer)) = stopped
+            && !activity.is_tainted()
+            && !activity.is_closing()
+        {
+            let closed = tokio::select! {
+                biased;
+                () = wait_for_detach(&mut cancellation) => false,
+                result = idle_close(&mut writer, reason) => result.is_ok(),
+            };
+            if closed {
+                pump_ready = false;
+                continue;
             }
         }
-    };
-    tokio::select! {
-        biased;
-        () = wait_for_detach(&mut cancellation) => {}
-        () = processing => {}
+        break;
     }
 
     reader_task.shutdown().await;
@@ -2636,3 +2837,6 @@ mod flow_tests;
 
 #[cfg(test)]
 mod transfer_identity_tests;
+
+#[cfg(test)]
+mod idle_tests;

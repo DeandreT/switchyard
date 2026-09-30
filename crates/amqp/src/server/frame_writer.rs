@@ -6,6 +6,8 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::{Frame, Performative, codec};
 
+use super::{ConnectionOptions, idle::Activity};
+
 const MIN_FRAME_SIZE: u32 = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -18,6 +20,9 @@ pub(super) struct FrameWriteError {
 pub(super) struct FrameWriter<W> {
     inner: W,
     maximum: u32,
+    options: ConnectionOptions,
+    peer_idle_millis: u32,
+    activity: Activity,
 }
 
 impl<W> FrameWriter<W> {
@@ -31,7 +36,21 @@ impl<W> FrameWriter<W> {
         Ok(Self {
             inner,
             maximum: maximum.min(codec::MAX_FRAME_SIZE as u32),
+            options: ConnectionOptions::default(),
+            peer_idle_millis: 0,
+            activity: Activity::new(),
         })
+    }
+
+    pub fn configure_activity(
+        &mut self,
+        options: ConnectionOptions,
+        peer_idle_millis: u32,
+        activity: Activity,
+    ) {
+        self.options = options;
+        self.peer_idle_millis = peer_idle_millis;
+        self.activity = activity;
     }
 
     pub fn maximum_frame_size(&self) -> u32 {
@@ -58,8 +77,47 @@ impl<W> FrameWriter<W> {
 
 impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     pub async fn write_frame(&mut self, frame: &Frame) -> io::Result<()> {
+        if self.activity.is_tainted() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "an incomplete AMQP frame has tainted the transport",
+            ));
+        }
         let encoded = self.encoded_frame(frame)?;
-        self.inner.write_all(&encoded).await
+        let close = matches!(
+            frame,
+            Frame::Amqp {
+                performative: Some(Performative::Close(_)),
+                ..
+            }
+        );
+        let deadline = self
+            .activity
+            .write_deadline(self.options, self.peer_idle_millis, close)?;
+        self.activity.begin_write(close);
+        let mut result = tokio::time::timeout_at(deadline, async {
+            self.inner.write_all(&encoded).await?;
+            self.inner.flush().await
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "AMQP frame write or flush timed out",
+            ))
+        });
+        if result.is_ok() && tokio::time::Instant::now() >= deadline {
+            result = Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "AMQP frame write or flush completed after its deadline",
+            ));
+        }
+        if result.is_ok() {
+            self.activity.completed_write();
+        } else {
+            self.activity.failed_write();
+        }
+        result
     }
 
     pub async fn write_amqp(

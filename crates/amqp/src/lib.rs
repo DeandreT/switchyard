@@ -14,8 +14,8 @@ pub use crate::{
         read_protocol_header, write_frame, write_protocol_header,
     },
     server::{
-        Delivery, EngineError, IncomingSession, LinkEndpoint, PendingSettlement, Receiver,
-        SaslAuthenticator, Sender, ServerConnection, ServerSession,
+        ConnectionOptions, Delivery, EngineError, IncomingSession, LinkEndpoint, PendingSettlement,
+        Receiver, SaslAuthenticator, Sender, ServerConnection, ServerSession,
     },
     types::*,
 };

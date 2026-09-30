@@ -59,6 +59,7 @@ pub struct AmqpListener<B> {
     shared_access_authentication: Option<SharedAccessAuthentication>,
     max_connections: NonZeroUsize,
     handshake_timeout: Duration,
+    connection_options: amqp::ConnectionOptions,
 }
 
 impl<B: Broker> AmqpListener<B> {
@@ -72,6 +73,7 @@ impl<B: Broker> AmqpListener<B> {
             max_connections: NonZeroUsize::new(DEFAULT_MAX_CONNECTIONS)
                 .expect("the default connection limit is positive"),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            connection_options: amqp::ConnectionOptions::default(),
         }
     }
 
@@ -86,6 +88,19 @@ impl<B: Broker> AmqpListener<B> {
     /// A zero duration immediately expires the negotiation deadline.
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Advertises half the receive-silence deadline. Zero disables that check.
+    /// Positive values below one second are refused before accepting sockets.
+    pub fn with_idle_timeout_millis(mut self, millis: u32) -> Self {
+        self.connection_options = self.connection_options.idle_timeout_millis(millis);
+        self
+    }
+
+    /// Bounds each running frame's write and flush. Zero refuses writes immediately.
+    pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
+        self.connection_options = self.connection_options.write_timeout(timeout);
         self
     }
 
@@ -110,6 +125,9 @@ impl<B: Broker> AmqpListener<B> {
     /// A connection that fails takes only itself down: one client's protocol
     /// error is not the node's.
     pub async fn serve(self, listener: TcpListener) -> std::io::Result<()> {
+        self.connection_options
+            .validate()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
         let admission = Arc::new(Semaphore::new(
             self.max_connections.get().min(Semaphore::MAX_PERMITS),
         ));
@@ -138,6 +156,7 @@ impl<B: Broker> AmqpListener<B> {
             let container_id = self.container_id.clone();
             let tls_acceptor = self.tls_acceptor.clone();
             let shared_access_authentication = self.shared_access_authentication.clone();
+            let connection_options = self.connection_options;
             tokio::spawn(async move {
                 let _permit = permit;
                 if deadline <= tokio::time::Instant::now() {
@@ -154,6 +173,7 @@ impl<B: Broker> AmqpListener<B> {
                                     namespace,
                                     broker,
                                     shared_access_authentication,
+                                    connection_options,
                                     deadline,
                                 )
                                 .await
@@ -169,6 +189,7 @@ impl<B: Broker> AmqpListener<B> {
                             namespace,
                             broker,
                             shared_access_authentication,
+                            connection_options,
                             deadline,
                         )
                         .await
@@ -188,6 +209,7 @@ async fn serve_connection<Io, B>(
     namespace: NamespaceName,
     broker: B,
     shared_access_authentication: Option<SharedAccessAuthentication>,
+    connection_options: amqp::ConnectionOptions,
     deadline: tokio::time::Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
@@ -201,17 +223,24 @@ where
         let (connection, authorization) = match shared_access_authentication {
             Some(config) => {
                 let sasl_acceptor = SharedAccessSaslAcceptor::new(&config);
-                let connection = ServerConnection::accept(
+                let connection = ServerConnection::accept_with_options(
                     stream,
                     container_id,
                     Some(Arc::new(sasl_acceptor.clone())),
+                    connection_options,
                 )
                 .await?;
                 let authorization = ConnectionAuthorization::new(config, sasl_acceptor.grant());
                 (connection, Some(authorization))
             }
             None => (
-                ServerConnection::accept(stream, container_id, None).await?,
+                ServerConnection::accept_with_options(
+                    stream,
+                    container_id,
+                    None,
+                    connection_options,
+                )
+                .await?,
                 None,
             ),
         };
