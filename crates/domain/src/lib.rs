@@ -47,8 +47,9 @@ pub use message_content::{
 pub use queue::{
     DEFAULT_DUPLICATE_DETECTION_WINDOW_MILLIS, DEFAULT_LOCK_DURATION_MILLIS,
     DEFAULT_MAX_DELIVERY_COUNT, DEFAULT_MAX_MESSAGE_BYTES, MAX_DUPLICATE_DETECTION_WINDOW_MILLIS,
-    MAX_LOCK_DURATION_MILLIS, MIN_DUPLICATE_DETECTION_WINDOW_MILLIS, QueueConfig, QueueConfigError,
-    QueueConfigUpdate, QueueCounters, QueueImmutableProperty, QueueTimeToLiveUpdate,
+    MAX_LOCK_DURATION_MILLIS, MAX_SEQUENCE_NUMBER, MIN_DUPLICATE_DETECTION_WINDOW_MILLIS,
+    QueueConfig, QueueConfigError, QueueConfigUpdate, QueueCounterKind, QueueCounters,
+    QueueImmutableProperty, QueueTimeToLiveUpdate,
 };
 pub use session::{AcceptedSession, SessionHold, SessionLock, SessionRecord};
 pub use time::Timestamp;

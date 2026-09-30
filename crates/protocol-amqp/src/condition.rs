@@ -14,6 +14,7 @@ pub const NOT_ALLOWED: &str = "amqp:not-allowed";
 pub const INTERNAL_ERROR: &str = "amqp:internal-error";
 pub const PRECONDITION_FAILED: &str = "amqp:precondition-failed";
 pub const RESOURCE_LOCKED: &str = "amqp:resource-locked";
+pub const RESOURCE_LIMIT_EXCEEDED: &str = "amqp:resource-limit-exceeded";
 pub const MESSAGE_SIZE_EXCEEDED: &str = "amqp:link:message-size-exceeded";
 
 pub const MESSAGE_LOCK_LOST: &str = "com.microsoft:message-lock-lost";
@@ -32,6 +33,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
             MESSAGE_NOT_FOUND
         }
         BrokerError::QueueAlreadyExists => ENTITY_ALREADY_EXISTS,
+        BrokerError::QueueCounterExhausted { .. } => RESOURCE_LIMIT_EXCEEDED,
 
         // The client's claim on the message is gone. Saying so precisely is what
         // lets an SDK stop trying to settle and wait for redelivery instead.
@@ -90,12 +92,21 @@ pub fn is_retryable(error: &BrokerError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use domain::{QueueImmutableProperty, SequenceNumber, SessionId, Timestamp};
+    use domain::{QueueCounterKind, QueueImmutableProperty, SequenceNumber, SessionId, Timestamp};
 
     use super::*;
 
     fn session() -> SessionId {
         SessionId::new("cart-1").expect("a valid session id")
+    }
+
+    #[test]
+    fn exhausted_identifiers_report_a_non_retryable_resource_limit() {
+        for counter in [QueueCounterKind::Sequence, QueueCounterKind::LockToken] {
+            let error = BrokerError::QueueCounterExhausted { counter };
+            assert_eq!(condition_for(&error), RESOURCE_LIMIT_EXCEEDED);
+            assert!(!is_retryable(&error));
+        }
     }
 
     #[test]

@@ -2,8 +2,8 @@ use storage::StorageError;
 use thiserror::Error;
 
 use crate::{
-    CodecError, IdentifierError, NamespaceName, QueueConfigError, QueueImmutableProperty,
-    SequenceNumber, SessionId, Timestamp,
+    CodecError, IdentifierError, NamespaceName, QueueConfigError, QueueCounterKind,
+    QueueImmutableProperty, SequenceNumber, SessionId, Timestamp,
 };
 
 /// Every rejection the state machine can produce.
@@ -18,6 +18,8 @@ pub enum BrokerError {
     QueueAlreadyExists,
     #[error("queue property {property} cannot be changed after creation")]
     QueuePropertyIsImmutable { property: QueueImmutableProperty },
+    #[error("the queue's {counter} counter is exhausted")]
+    QueueCounterExhausted { counter: QueueCounterKind },
     #[error("queue page limit {limit} exceeds the maximum of {maximum}")]
     QueuePageLimitExceeded { limit: usize, maximum: usize },
     #[error(

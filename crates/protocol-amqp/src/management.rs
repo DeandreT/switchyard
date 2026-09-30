@@ -317,7 +317,7 @@ impl ManagementResponse {
         let status_code = match condition {
             crate::MESSAGE_LOCK_LOST | crate::SESSION_LOCK_LOST => 410,
             crate::NOT_FOUND | crate::condition::MESSAGE_NOT_FOUND => 404,
-            crate::MESSAGE_SIZE_EXCEEDED => 403,
+            crate::MESSAGE_SIZE_EXCEEDED | crate::RESOURCE_LIMIT_EXCEEDED => 403,
             crate::INVALID_FIELD | crate::NOT_ALLOWED | crate::PRECONDITION_FAILED => 400,
             crate::RESOURCE_LOCKED => 503,
             _ => 500,
@@ -1826,5 +1826,27 @@ mod tests {
         );
         assert_eq!(response.status_code, 403);
         assert_eq!(response.error_condition, Some(crate::MESSAGE_SIZE_EXCEEDED));
+    }
+
+    #[test]
+    fn exhausted_identifiers_use_the_quota_status_and_preserve_correlation() {
+        for counter in [
+            domain::QueueCounterKind::Sequence,
+            domain::QueueCounterKind::LockToken,
+        ] {
+            let response = ManagementResponse::from_rejection(
+                MessageId::Ulong(7),
+                Some("trace".to_owned()),
+                &BrokerRejection::Refused(domain::BrokerError::QueueCounterExhausted { counter }),
+            );
+            assert_eq!(response.status_code, 403);
+            assert_eq!(
+                response.error_condition,
+                Some(crate::RESOURCE_LIMIT_EXCEEDED)
+            );
+            assert_eq!(response.correlation_id, MessageId::Ulong(7));
+            assert_eq!(response.tracking_id.as_deref(), Some("trace"));
+            assert_eq!(response.body, Value::Null);
+        }
     }
 }

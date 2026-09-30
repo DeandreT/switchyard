@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{BrokerError, CodecError, codec};
+use crate::{BrokerError, CodecError, LockToken, SequenceNumber, codec};
 
 /// Longest lock Service Bus accepts, and the value Switchyard enforces so that
 /// a client cannot pin a message indefinitely.
@@ -12,6 +12,9 @@ pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 256 * 1024;
 pub const MIN_DUPLICATE_DETECTION_WINDOW_MILLIS: u64 = 20 * 1_000;
 pub const DEFAULT_DUPLICATE_DETECTION_WINDOW_MILLIS: u64 = 10 * 60 * 1_000;
 pub const MAX_DUPLICATE_DETECTION_WINDOW_MILLIS: u64 = 7 * 24 * 60 * 60 * 1_000;
+/// Largest allocatable sequence, preserving its exact nonnegative Int64 wire
+/// representation. Exhaustion refuses new allocations rather than rolling over.
+pub const MAX_SEQUENCE_NUMBER: u64 = i64::MAX as u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueueConfig {
@@ -262,6 +265,46 @@ pub struct QueueCounters {
     pub next_lock_token: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueCounterKind {
+    Sequence,
+    LockToken,
+}
+
+impl std::fmt::Display for QueueCounterKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Sequence => "sequence number",
+            Self::LockToken => "lock token",
+        })
+    }
+}
+
+impl QueueCounters {
+    pub(crate) fn allocate_sequence(&mut self) -> Result<SequenceNumber, BrokerError> {
+        if self.next_sequence > MAX_SEQUENCE_NUMBER {
+            return Err(BrokerError::QueueCounterExhausted {
+                counter: QueueCounterKind::Sequence,
+            });
+        }
+        let sequence = SequenceNumber::new(self.next_sequence);
+        self.next_sequence += 1;
+        Ok(sequence)
+    }
+
+    pub(crate) fn allocate_lock_token(&mut self) -> Result<LockToken, BrokerError> {
+        let next =
+            self.next_lock_token
+                .checked_add(1)
+                .ok_or(BrokerError::QueueCounterExhausted {
+                    counter: QueueCounterKind::LockToken,
+                })?;
+        let token = LockToken::new(self.next_lock_token);
+        self.next_lock_token = next;
+        Ok(token)
+    }
+}
+
 impl Default for QueueCounters {
     fn default() -> Self {
         Self {
@@ -467,5 +510,86 @@ mod tests {
         let counters = QueueCounters::default();
         assert_eq!(counters.next_sequence, 1);
         assert_eq!(counters.next_lock_token, 1);
+    }
+
+    #[test]
+    fn sequence_allocation_preserves_the_last_signed_value_then_refuses() {
+        let mut counters = QueueCounters {
+            next_sequence: MAX_SEQUENCE_NUMBER,
+            next_lock_token: 42,
+        };
+        assert_eq!(
+            counters.allocate_sequence(),
+            Ok(SequenceNumber::new(MAX_SEQUENCE_NUMBER))
+        );
+        assert_eq!(counters.next_sequence, MAX_SEQUENCE_NUMBER + 1);
+        assert_eq!(counters.next_lock_token, 42);
+        let exhausted = counters;
+        for _ in 0..2 {
+            assert_eq!(
+                counters.allocate_sequence(),
+                Err(BrokerError::QueueCounterExhausted {
+                    counter: QueueCounterKind::Sequence,
+                })
+            );
+            assert_eq!(counters, exhausted);
+        }
+    }
+
+    #[test]
+    fn legacy_unsigned_sequence_counters_are_refused_without_mutation() {
+        for next_sequence in [MAX_SEQUENCE_NUMBER + 1, u64::MAX] {
+            let mut counters = QueueCounters {
+                next_sequence,
+                next_lock_token: 9,
+            };
+            let before = counters;
+            assert_eq!(
+                counters.allocate_sequence(),
+                Err(BrokerError::QueueCounterExhausted {
+                    counter: QueueCounterKind::Sequence,
+                })
+            );
+            assert_eq!(counters, before);
+        }
+    }
+
+    #[test]
+    fn lock_allocation_reserves_an_exhausted_sentinel_without_aliasing() {
+        let mut counters = QueueCounters {
+            next_sequence: 123,
+            next_lock_token: u64::MAX - 1,
+        };
+        assert_eq!(
+            counters.allocate_lock_token(),
+            Ok(LockToken::new(u64::MAX - 1))
+        );
+        assert_eq!(counters.next_lock_token, u64::MAX);
+        assert_eq!(counters.next_sequence, 123);
+        let exhausted = counters;
+        for _ in 0..2 {
+            assert_eq!(
+                counters.allocate_lock_token(),
+                Err(BrokerError::QueueCounterExhausted {
+                    counter: QueueCounterKind::LockToken,
+                })
+            );
+            assert_eq!(counters, exhausted);
+        }
+    }
+
+    #[test]
+    fn counter_storage_shape_remains_two_unsigned_fields() -> Result<(), CodecError> {
+        let counters = QueueCounters {
+            next_sequence: 1,
+            next_lock_token: 2,
+        };
+        let mut encoded = codec::encode(&counters)?;
+        assert_eq!(encoded, vec![codec::VALUE_FORMAT_V8, 1, 2]);
+        for version in codec::VALUE_FORMAT_V1..=codec::ACTIVE_VALUE_FORMAT {
+            encoded[0] = version;
+            assert_eq!(codec::decode::<QueueCounters>(&encoded)?, counters);
+        }
+        Ok(())
     }
 }

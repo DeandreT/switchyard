@@ -766,8 +766,7 @@ impl<S: StateStore> StateMachine<S> {
         validate_message_input(&config, message)?;
 
         let mut counters = self.load_counters(command)?;
-        let sequence = SequenceNumber::new(counters.next_sequence);
-        counters.next_sequence = counters.next_sequence.saturating_add(1);
+        let sequence = counters.allocate_sequence()?;
 
         batch.push_put(
             keys::queue_counters(&command.namespace, &command.entity),
@@ -831,8 +830,7 @@ impl<S: StateStore> StateMachine<S> {
         for scheduled in messages {
             let message = scheduled.message;
             validate_message_input(&config, message)?;
-            let sequence = SequenceNumber::new(counters.next_sequence);
-            counters.next_sequence = counters.next_sequence.saturating_add(1);
+            let sequence = counters.allocate_sequence()?;
             sequences.push(sequence);
             if self.record_message_id(
                 command,
@@ -1024,8 +1022,7 @@ impl<S: StateStore> StateMachine<S> {
             // The scheduling sequence is only a cancellation handle. Activation
             // gets a new queue position so older scheduled work cannot jump
             // ahead of messages that became active first.
-            record.sequence = SequenceNumber::new(counters.next_sequence);
-            counters.next_sequence = counters.next_sequence.saturating_add(1);
+            record.sequence = counters.allocate_sequence()?;
             record.state = MessageState::Ready;
             record.enqueued_at = command.issued_at;
             record.expires_at =
@@ -1093,8 +1090,7 @@ impl<S: StateStore> StateMachine<S> {
             let lock = match mode {
                 ReceiveMode::PeekLock => {
                     let mut counters = self.load_counters(command)?;
-                    let token = LockToken::new(counters.next_lock_token);
-                    counters.next_lock_token = counters.next_lock_token.saturating_add(1);
+                    let token = counters.allocate_lock_token()?;
 
                     let locked_until = command.issued_at.saturating_add_millis(
                         lock_duration_millis.unwrap_or(config.lock_duration_millis),
@@ -1411,8 +1407,7 @@ impl<S: StateStore> StateMachine<S> {
             let lock = match mode {
                 ReceiveMode::PeekLock => {
                     let counters = counters.get_or_insert(self.load_counters(command)?);
-                    let token = LockToken::new(counters.next_lock_token);
-                    counters.next_lock_token = counters.next_lock_token.saturating_add(1);
+                    let token = counters.allocate_lock_token()?;
                     let locked_until = command.issued_at.saturating_add_millis(
                         lock_duration_millis.unwrap_or(config.lock_duration_millis),
                     );
@@ -1663,8 +1658,7 @@ impl<S: StateStore> StateMachine<S> {
         let namespace = &command.namespace;
         let entity = &command.entity;
         let mut counters = self.load_counters(command)?;
-        let token = LockToken::new(counters.next_lock_token);
-        counters.next_lock_token = counters.next_lock_token.saturating_add(1);
+        let token = counters.allocate_lock_token()?;
 
         // An elapsed lock still owns an index entry, which the sweep may not
         // have reached yet.
