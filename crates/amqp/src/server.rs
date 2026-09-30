@@ -47,6 +47,7 @@ const DELIVERY_QUEUE_CAPACITY: usize = LINK_CREDIT as usize;
 const MAX_PENDING_ATTACHES: usize = 32;
 const SEND_FRAME_QUANTUM: usize = 16;
 const MAX_DELIVERY_TAG_BYTES: usize = 32;
+const RECOVERY_NOT_IMPLEMENTED: &str = "link recovery is not implemented";
 const MAX_CLOSING_HANDLES: usize = 65_536;
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_FRAME_SIZE: u32 = 262_144;
@@ -657,6 +658,9 @@ impl ServerSession {
         properties: Option<Fields>,
         decoders: MessageFormatDecoders,
     ) -> Result<LinkEndpoint, EngineError> {
+        if has_recovery_state(&attach) {
+            return Err(invalid_state(RECOVERY_NOT_IMPLEMENTED));
+        }
         if attach.role == Role::Receiver && !decoders.is_default() {
             return Err(invalid_state(
                 "custom message-format decoders require a local receiving endpoint",
@@ -981,6 +985,7 @@ struct PendingLinkFlow {
     initial_sender_count: Option<u32>,
     credit: LinkCredit,
     latest: Option<Flow>,
+    recovery_refusal: bool,
 }
 
 impl PendingLinkFlow {
@@ -990,6 +995,7 @@ impl PendingLinkFlow {
             initial_sender_count,
             credit: LinkCredit::new(0),
             latest: None,
+            recovery_refusal: false,
         }
     }
 
@@ -1397,6 +1403,16 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                     sessions,
                 )
                 .await?;
+            } else if has_recovery_state(&attach) {
+                if session.attach_tx.is_some() {
+                    refuse_recovery_attach(channel, &attach, session, writer).await?;
+                } else {
+                    let mut pending =
+                        PendingLinkFlow::new(attach.role.clone(), attach.initial_delivery_count);
+                    pending.recovery_refusal = true;
+                    session.pending_attaches.insert(handle, pending);
+                    session.pending_attach_events.push_back(*attach);
+                }
             } else {
                 session.pending_attaches.insert(
                     handle,
@@ -1534,10 +1550,14 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                     Vec::new(),
                 )
                 .await?;
-            for attach in session.pending_attach_events.drain(..) {
-                attach_tx
-                    .try_send(attach)
-                    .map_err(|_| invalid_state("pending attach queue is full"))?;
+            for attach in std::mem::take(&mut session.pending_attach_events) {
+                if has_recovery_state(&attach) {
+                    refuse_recovery_attach(channel, &attach, session, writer).await?;
+                } else {
+                    attach_tx
+                        .try_send(attach)
+                        .map_err(|_| invalid_state("pending attach queue is full"))?;
+                }
             }
             session.attach_tx = Some(attach_tx);
             let _ = reply.send(Ok(()));
@@ -1555,6 +1575,10 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             reply,
         } => {
             let attach = *attach;
+            if has_recovery_state(&attach) {
+                let _ = reply.send(Err(invalid_state(RECOVERY_NOT_IMPLEMENTED)));
+                return Ok(CommandAction::Continue);
+            }
             if attach.role == Role::Receiver && !decoders.is_default() {
                 let _ = reply.send(Err(invalid_state(
                     "custom message-format decoders require a local receiving endpoint",
@@ -1570,6 +1594,10 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 || !session.pending_attaches.contains_key(&handle)
             {
                 let _ = reply.send(Err(EngineError::RemoteDetached));
+                return Ok(CommandAction::Continue);
+            }
+            if session.pending_attaches[&handle].recovery_refusal {
+                let _ = reply.send(Err(invalid_state(RECOVERY_NOT_IMPLEMENTED)));
                 return Ok(CommandAction::Continue);
             }
             if session.ending
@@ -1887,6 +1915,19 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         )
         .await;
     };
+
+    if transfer.resume {
+        detach_link_error(
+            channel,
+            transfer.handle,
+            session,
+            writer,
+            "amqp:not-implemented",
+            RECOVERY_NOT_IMPLEMENTED,
+        )
+        .await?;
+        return refill_link(channel, transfer.handle, session, writer).await;
+    }
 
     let identity_error = if transfer
         .delivery_tag
@@ -2439,6 +2480,46 @@ async fn apply_link_flow<W: AsyncWrite + Unpin>(
 
 fn normalized_message_size(maximum: Option<u64>) -> Option<u64> {
     maximum.filter(|maximum| *maximum != 0)
+}
+
+fn has_recovery_state(attach: &Attach) -> bool {
+    attach.incomplete_unsettled
+        || attach
+            .unsettled
+            .as_ref()
+            .is_some_and(|unsettled| !unsettled.is_empty())
+}
+
+async fn refuse_recovery_attach<W: AsyncWrite + Unpin>(
+    channel: u16,
+    attach: &Attach,
+    session: &mut SessionState,
+    writer: &mut FrameWriter<W>,
+) -> Result<(), EngineError> {
+    let response = Frame::Amqp {
+        channel,
+        performative: Some(Performative::Attach(Box::new(attach.response(None, None)))),
+        payload: Vec::new(),
+    };
+    let refusal = Frame::Amqp {
+        channel,
+        performative: Some(Performative::Detach(Detach {
+            handle: attach.handle,
+            closed: true,
+            error: Some(Error::new(
+                crate::AmqpError::NotImplemented,
+                RECOVERY_NOT_IMPLEMENTED,
+                None,
+            )),
+        })),
+        payload: Vec::new(),
+    };
+    writer.encoded_frame(&response)?;
+    writer.encoded_frame(&refusal)?;
+    remember_closing_handle(session, attach.handle)?;
+    writer.write_frame(&response).await?;
+    writer.write_frame(&refusal).await?;
+    Ok(())
 }
 
 fn remember_closing_handle(session: &mut SessionState, handle: u32) -> Result<(), EngineError> {
@@ -3097,3 +3178,6 @@ mod format_registry_tests;
 
 #[cfg(test)]
 mod incoming_settlement_tests;
+
+#[cfg(test)]
+mod recovery_tests;

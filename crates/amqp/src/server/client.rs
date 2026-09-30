@@ -882,6 +882,21 @@ where
                                             .get_mut(&channel)
                                             .and_then(|session| session.pending_attaches.remove(&pending.handle));
                                         let mut link = pending.link;
+                                        if has_recovery_state(&attach) {
+                                            stop_link(&mut link);
+                                            let session = sessions.get_mut(&channel).ok_or_else(|| invalid_state("attach on an unknown session"))?;
+                                            remember_closing_handle(session, pending.handle)?;
+                                            writer.write_amqp(channel,
+                                                Performative::Detach(Detach {
+                                                    handle: pending.handle,
+                                                    closed: true,
+                                                    error: Some(Error::new(crate::AmqpError::NotImplemented, RECOVERY_NOT_IMPLEMENTED, None)),
+                                                }),
+                                                Vec::new(),
+                                            ).await?;
+                                            let _ = pending.reply.send(Err(EngineError::RemoteDetached));
+                                            continue;
+                                        }
                                         match &mut link {
                                             LinkState::Sending(link) if attach.role == Role::Receiver => {
                                                 link.max_message_size = normalized_message_size(attach.max_message_size);
