@@ -38,9 +38,10 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Dead-letter receive and resubmit | Pre-1.0 | Receive: state machine, AMQP mapping. Resubmit: not implemented |
 | Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Duplicate detection | Pre-1.0 | State machine, AMQP send/scheduling mappings, Rust and current .NET clients end to end |
+| Queue configuration updates | Pre-1.0 | Atomic state-machine patches; native queue API |
 | Same-placement-group transactions | Pre-1.0 | Not implemented |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
-| Native gRPC administration | Pre-1.0 | Contract scaffolded |
+| Native gRPC administration | Pre-1.0 | Queue create/get/list/update over HTTP/2 and authenticated TLS; other services and deletion not implemented |
 | Partitioned entities | Later | Out of initial scope |
 | Cross-placement-group transactions | Later | Out of initial scope |
 | Geo-replication | Later | Out of initial scope |
@@ -134,6 +135,16 @@ a rejection or a bound rather than a silent difference:
   reports none available if they are all held, rather than walking the entity.
   The receiver retries.
 
+Queue settings can be patched atomically with the parent and its dead-letter
+shadow in the same batch. An omitted setting is unchanged; an explicit unlimited
+TTL clears a finite default. Session and duplicate-detection enablement are
+creation-only properties. Updates retain all existing messages, deadlines,
+locks, counters, and duplicate-history entries; the new size/TTL/lock/history
+limits govern new ingress or newly allocated deadlines. Expiration disposition
+and maximum delivery count use the current queue policy. A no-op patch does not
+write storage or advance the applied clock. The adjustable per-message size cap
+is a Switchyard policy, not a verified Azure queue-update property.
+
 The `server` crate's timer worker proposes scheduled activation, lock,
 time-to-live, session-lock, and duplicate-history sweeps on an interval, so a
 running node activates what is due and releases or prunes what has elapsed.
@@ -161,8 +172,8 @@ Graceful connection Close has a two-second default deadline. Timeout or
 cancellation of its caller cancels the driver and its socket reader, including
 when application dispatch or a socket write is blocked. Explicit shutdown waits
 for both tasks to terminate before releasing the listener's admission slot.
-These are Switchyard resource policies, not Azure quotas. Session flow windows
-and connection-wide message-allocation budgets are not yet enforced.
+These are Switchyard resource policies, not Azure quotas. Connection-wide
+message-allocation budgets are not yet enforced.
 AMQP Open frames are limited to the initial 512-byte transport maximum. After
 Open, the server advertises and enforces its own 262,144-byte receive maximum,
 independent of the peer's receive limit. Oversized frames are rejected from the
@@ -170,6 +181,21 @@ four-byte size prefix before allocating or reading their bodies; an open
 connection returns the framing-error Close condition. The test client can
 configure its own receive maximum between 512 bytes and the codec's 4 MiB
 ceiling. SASL reads use the local receive maximum as a resource policy.
+Session windows count Transfer frames independently of link delivery counts.
+Incoming windows replenish after bounded frame processing; receive links grant
+32 message slots and return credit only as the application consumes a delivery
+or a partial delivery is aborted. A paused receiver cannot block the connection's
+other links. Fragmented sends yield when their session window closes, resume on
+session Flow, and consume only one link credit per message. Flow echo, drain,
+optional credit, wrapping counts, and early second-mode dispositions have raw
+transport regressions. Every outgoing frame is checked against the peer's frame
+cap before writing bytes. Connection-wide outbound byte budgets, asymmetric
+channel/handle routing, and idle heartbeat negotiation remain unfinished.
+If a peer detaches a link while application approval is outstanding, a bounded
+canceled-approval tombstone refuses early handle reuse until that approval returns
+an error. Canceled approvals count toward the 32 pending link approvals allowed
+per session. A stale approval cannot reopen the canceled link. This is a local
+admission policy, not a restriction imposed by AMQP.
 The edge resolves a link's address to an entity, turns transfers into send
 commands and dispositions into settlements, and answers a rejection with the
 condition an SDK keys its behaviour off. A receiving link's settle mode selects
@@ -311,6 +337,35 @@ limit, not the header limit. Settlement checks the merged property bag and
 projected canonical dead-letter fields. These bounds implement the documented
 quota sizes conservatively; exact Azure byte accounting and AMQP wire-size
 parity remain unverified.
+
+## Native Administration
+
+The optional `--admin-listen` endpoint serves native queue create/get/list/update
+through the broker owner. It is a separate HTTP/2 listener and reuses the AMQP
+TLS identity and shared-access policy when configured. Authenticated requests
+require TLS and a SAS token in `authorization` metadata with Manage permission
+for the requested entity; listing needs namespace scope. The configured namespace
+is the only namespace accessible through that endpoint. Dead-letter shadows are
+hidden and cannot be administered independently. Entity capacity and usage fields
+are absent because quota accounting is not implemented; they are not reported as
+zero-byte measurements.
+
+Pages are ordered, exclusive, namespace-bound, and limited to 1,024 parent queues.
+Local defaults admit 128 sockets and 128 concurrent requests across service clones,
+with at most 32 HTTP/2 streams per connection, a 10-second TLS handshake deadline,
+30-second request deadlines, 64 KiB decoded requests, and 1 MiB encoded replies.
+HTTP/2 connections send keepalive pings after 30 seconds, allow 10 seconds for an
+acknowledgment, and retire after five minutes with a 30-second graceful deadline.
+These are local resource policies. Queue deletion and the cluster, namespace,
+backup, and audit services return unimplemented rather than simulated success.
+This endpoint is not Azure Atom/XML administration compatibility.
+`switchyardctl queue create|get|list|update` exposes these operations with JSON
+responses and nonzero errors. It reads SAS tokens only from bounded regular
+files, marks their metadata sensitive, and verifies TLS against explicitly
+supplied CA certificates. Plaintext is opt-in, loopback-only, and cannot carry a
+token. Command-line settings preserve omitted, false, zero, and unlimited TTL.
+
+## Durable Format
 
 The current value format is version 8 and durable store layout is version 7.
 Earlier message and queue-configuration shapes have tested decoders, but an
