@@ -183,6 +183,10 @@ touching message records or expiry cleanup; naming a session or replaying an old
 hold cannot bypass another receiver's ownership. The old identifier-only core
 commands retain their serialized shape for trusted callers, but are not used
 by the management edge.
+Dead-letter waiters are notified from committed ready-index enqueues, including
+lazy expiry during ordinary or deferred receive. Staged writes that are later
+rejected, failed storage commits, and drop-on-expiry cleanup do not wake them.
+This notification metadata adds no persisted or serialized command fields.
 Retrieving only expired deferred messages commits their cleanup before
 returning `com.microsoft:message-not-found`; missing messages are distinguished
 from a missing queue. Dead-letter management paths normalize the reserved

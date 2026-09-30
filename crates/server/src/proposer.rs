@@ -7,8 +7,8 @@
 //! replication rather than after it.
 
 use domain::{
-    BrokerError, Command, CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueCursor,
-    QueuePage, StateMachine, Timestamp,
+    BrokerError, Command, CommandApplication, CommandKind, CommandOutcome, EntityPath,
+    NamespaceName, QueueCursor, QueuePage, StateMachine, Timestamp,
 };
 use storage::StateStore;
 use thiserror::Error;
@@ -63,9 +63,19 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
         entity: &EntityPath,
         kind: CommandKind,
     ) -> Result<CommandOutcome, ProposeError> {
+        Ok(self.propose_with_effects(namespace, entity, kind)?.outcome)
+    }
+
+    /// Stamps once and reports only effects whose storage batch committed.
+    pub fn propose_with_effects(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+        kind: CommandKind,
+    ) -> Result<CommandApplication, ProposeError> {
         let issued_at = self.stamp()?;
         let command = Command::new(namespace.clone(), entity.clone(), issued_at, kind);
-        Ok(self.machine.apply(&command)?)
+        Ok(self.machine.apply_with_effects(&command)?)
     }
 
     /// The timestamp to put on the next command.

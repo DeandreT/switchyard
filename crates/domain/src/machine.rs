@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::de::DeserializeOwned;
-use storage::{StateStore, WriteBatch};
+use storage::{Mutation, StateStore, WriteBatch};
 
 use crate::{
     AcceptedSession, BrokerError, Command, CommandKind, CommandOutcome, DeadLetterInfo,
@@ -67,6 +67,16 @@ pub struct QueuePage {
     pub queues: Vec<(NamespaceName, EntityPath)>,
     /// The last returned queue, only when the page has more entries after it.
     pub continuation: Option<QueueCursor>,
+}
+
+/// A command's ordinary result and effects observed from its committed batch.
+/// This is application metadata, not part of the replicated or stored format.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandApplication {
+    pub outcome: CommandOutcome,
+    /// The final batch retained a ready-index Put in this entity's canonical
+    /// dead-letter queue. Only a successful commit can publish this effect.
+    pub dead_letters_enqueued: bool,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -142,6 +152,12 @@ impl<S: StateStore> StateMachine<S> {
     /// On error nothing is written, so a rejection leaves state untouched on
     /// every replica.
     pub fn apply(&self, command: &Command) -> Result<CommandOutcome, BrokerError> {
+        Ok(self.apply_with_effects(command)?.outcome)
+    }
+
+    /// Applies one command and reports its committed dead-letter enqueue
+    /// effect without additional store reads or changes to ordinary outcomes.
+    pub fn apply_with_effects(&self, command: &Command) -> Result<CommandApplication, BrokerError> {
         let last_applied = self.last_applied_time()?;
         if command.issued_at < last_applied {
             return Err(BrokerError::ClockRegression {
@@ -418,13 +434,17 @@ impl<S: StateStore> StateMachine<S> {
         // durable write — an fsync apiece on the durable backend. Skipping is
         // deterministic: every replica computes the same empty batch, so every
         // replica skips the same commands.
+        let dead_letters_enqueued = committed_dead_letter_put(command, &batch);
         if !batch.is_empty() {
             // Advancing the clock in the same batch keeps the applied timestamp
             // and the state it produced consistent under a crash.
             batch.push_put(keys::clock(), codec::encode(&command.issued_at)?);
             self.store.apply(batch)?;
         }
-        Ok(outcome)
+        Ok(CommandApplication {
+            outcome,
+            dead_letters_enqueued,
+        })
     }
 
     // ---- reads -------------------------------------------------------------
@@ -1963,6 +1983,28 @@ impl<S: StateStore> StateMachine<S> {
     }
 }
 
+fn committed_dead_letter_put(command: &Command, batch: &WriteBatch) -> bool {
+    if batch.is_empty() || command.entity.is_dead_letter_queue() {
+        return false;
+    }
+    let Ok(shadow) = command.entity.dead_letter_queue() else {
+        return false;
+    };
+    let prefix = keys::ready_prefix(&command.namespace, &shadow);
+    let mut seen = BTreeSet::new();
+    // Backends apply in batch order. A later Delete must suppress an earlier
+    // Put; unrelated mutations do not contribute an enqueue effect.
+    batch.mutations().iter().rev().any(|mutation| {
+        let key = match mutation {
+            Mutation::Put { key, .. } | Mutation::Delete { key } => key,
+        };
+        key.len() == prefix.len() + 8
+            && key.starts_with(&prefix)
+            && seen.insert(key.as_slice())
+            && matches!(mutation, Mutation::Put { .. })
+    })
+}
+
 fn effective_time_to_live_millis(config: &QueueConfig, requested: Option<u64>) -> Option<u64> {
     match (requested, config.default_time_to_live_millis) {
         (Some(requested), Some(ceiling)) => Some(requested.min(ceiling)),
@@ -2170,4 +2212,164 @@ fn validate_message_input(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod effect_tests {
+    use super::*;
+
+    #[test]
+    fn dead_letter_effect_uses_final_exact_shadow_ready_mutations() {
+        let namespace = NamespaceName::new("tenant").expect("namespace");
+        let entity = EntityPath::new("orders").expect("entity");
+        let shadow = entity.dead_letter_queue().expect("shadow");
+        let command = Command::new(
+            namespace.clone(),
+            entity.clone(),
+            Timestamp::UNIX_EPOCH,
+            CommandKind::ExpireMessages,
+        );
+        let first = keys::ready(&namespace, &shadow, SequenceNumber::new(1));
+        let second = keys::ready(&namespace, &shadow, SequenceNumber::new(2));
+        let mut short = first.clone();
+        short.pop();
+        let mut extended = first.clone();
+        extended.push(0);
+        for (name, batch, expected) in [
+            ("empty", WriteBatch::default(), false),
+            (
+                "shadow config",
+                WriteBatch::default().put(keys::queue_config(&namespace, &shadow), Vec::new()),
+                false,
+            ),
+            (
+                "shadow message",
+                WriteBatch::default().put(
+                    keys::message(&namespace, &shadow, SequenceNumber::new(1)),
+                    Vec::new(),
+                ),
+                false,
+            ),
+            (
+                "source ready",
+                WriteBatch::default().put(
+                    keys::ready(&namespace, &entity, SequenceNumber::new(1)),
+                    Vec::new(),
+                ),
+                false,
+            ),
+            (
+                "other namespace",
+                WriteBatch::default().put(
+                    keys::ready(
+                        &NamespaceName::new("tenant-two").expect("namespace"),
+                        &shadow,
+                        SequenceNumber::new(1),
+                    ),
+                    Vec::new(),
+                ),
+                false,
+            ),
+            (
+                "other entity",
+                WriteBatch::default().put(
+                    keys::ready(
+                        &namespace,
+                        &EntityPath::new("other/$deadletterqueue").expect("entity"),
+                        SequenceNumber::new(1),
+                    ),
+                    Vec::new(),
+                ),
+                false,
+            ),
+            (
+                "shadow of shadow",
+                WriteBatch::default().put(
+                    keys::ready(
+                        &namespace,
+                        &shadow.dead_letter_queue().expect("nested shadow"),
+                        SequenceNumber::new(1),
+                    ),
+                    Vec::new(),
+                ),
+                false,
+            ),
+            (
+                "short key",
+                WriteBatch::default().put(short, Vec::new()),
+                false,
+            ),
+            (
+                "extended key",
+                WriteBatch::default().put(extended, Vec::new()),
+                false,
+            ),
+            (
+                "surviving put",
+                WriteBatch::default().put(first.clone(), Vec::new()),
+                true,
+            ),
+            (
+                "put then delete",
+                WriteBatch::default()
+                    .put(first.clone(), Vec::new())
+                    .delete(first.clone()),
+                false,
+            ),
+            (
+                "delete then put",
+                WriteBatch::default()
+                    .delete(first.clone())
+                    .put(first.clone(), Vec::new()),
+                true,
+            ),
+            (
+                "put overwritten",
+                WriteBatch::default()
+                    .put(first.clone(), vec![1])
+                    .put(first.clone(), vec![2]),
+                true,
+            ),
+            (
+                "all puts deleted",
+                WriteBatch::default()
+                    .put(first.clone(), Vec::new())
+                    .put(second.clone(), Vec::new())
+                    .delete(first.clone())
+                    .delete(second.clone()),
+                false,
+            ),
+            (
+                "another put remains",
+                WriteBatch::default()
+                    .put(first.clone(), Vec::new())
+                    .delete(first.clone())
+                    .put(second, Vec::new()),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                committed_dead_letter_put(&command, &batch),
+                expected,
+                "{name}"
+            );
+        }
+        let mut shadow_command = command;
+        shadow_command.entity = shadow.clone();
+        assert!(!committed_dead_letter_put(
+            &shadow_command,
+            &WriteBatch::default().put(first, Vec::new())
+        ));
+        assert!(!committed_dead_letter_put(
+            &shadow_command,
+            &WriteBatch::default().put(
+                keys::ready(
+                    &namespace,
+                    &shadow.dead_letter_queue().expect("nested shadow"),
+                    SequenceNumber::new(1)
+                ),
+                Vec::new(),
+            )
+        ));
+    }
 }

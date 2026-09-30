@@ -180,16 +180,6 @@ fn makes_deliverable(outcome: &CommandOutcome) -> bool {
     }
 }
 
-fn makes_dead_letters_deliverable(outcome: &CommandOutcome) -> bool {
-    match outcome {
-        CommandOutcome::DeadLettered => true,
-        CommandOutcome::Abandoned { dead_lettered, .. } => *dead_lettered,
-        CommandOutcome::LocksExpired { dead_lettered, .. }
-        | CommandOutcome::MessagesExpired { dead_lettered, .. } => *dead_lettered > 0,
-        _ => false,
-    }
-}
-
 /// A cheap, shared way to reach the broker.
 ///
 /// Cloning is how every connection, link, and timer gets one; they all queue
@@ -349,19 +339,25 @@ impl Broker {
                             kind,
                             reply,
                         } => {
-                            let outcome = proposer.propose(&namespace, &entity, kind);
-                            if outcome.as_ref().is_ok_and(makes_deliverable) {
+                            let application =
+                                proposer.propose_with_effects(&namespace, &entity, kind);
+                            if application
+                                .as_ref()
+                                .is_ok_and(|applied| makes_deliverable(&applied.outcome))
+                            {
                                 watching.notify(&namespace, &entity);
                             }
                             if !entity.is_dead_letter_queue()
-                                && outcome.as_ref().is_ok_and(makes_dead_letters_deliverable)
+                                && application
+                                    .as_ref()
+                                    .is_ok_and(|applied| applied.dead_letters_enqueued)
                                 && let Ok(shadow) = entity.dead_letter_queue()
                             {
                                 watching.notify(&namespace, &shadow);
                             }
                             // A caller that stopped waiting is not an error: the
                             // command still applied, and it gave up, not us.
-                            let _ = reply.send(outcome);
+                            let _ = reply.send(application.map(|applied| applied.outcome));
                         }
                         Request::ListQueues { limit, reply } => {
                             let _ = reply
@@ -523,22 +519,22 @@ mod tests {
     }
 
     #[test]
-    fn only_dead_letter_transitions_wake_the_shadow() {
+    fn only_ready_transitions_wake_the_parent() {
         for (outcome, expected) in [
-            (CommandOutcome::DeadLettered, true),
+            (CommandOutcome::DeadLettered, false),
             (
                 CommandOutcome::Abandoned {
                     dead_lettered: true,
                     dropped: false,
                 },
-                true,
+                false,
             ),
             (
                 CommandOutcome::Abandoned {
                     dead_lettered: false,
                     dropped: false,
                 },
-                false,
+                true,
             ),
             (
                 CommandOutcome::MessagesExpired {
@@ -546,7 +542,7 @@ mod tests {
                     dropped: 0,
                     processed: 1,
                 },
-                true,
+                false,
             ),
             (
                 CommandOutcome::MessagesExpired {
@@ -562,7 +558,7 @@ mod tests {
                     dead_lettered: 1,
                     dropped: 0,
                 },
-                true,
+                false,
             ),
             (
                 CommandOutcome::LocksExpired {
@@ -570,11 +566,11 @@ mod tests {
                     dead_lettered: 0,
                     dropped: 0,
                 },
-                false,
+                true,
             ),
             (CommandOutcome::Received(None), false),
         ] {
-            assert_eq!(makes_dead_letters_deliverable(&outcome), expected);
+            assert_eq!(makes_deliverable(&outcome), expected);
         }
     }
 
@@ -585,7 +581,6 @@ mod tests {
             dropped: true,
         };
         assert!(!makes_deliverable(&outcome));
-        assert!(!makes_dead_letters_deliverable(&outcome));
     }
 
     #[tokio::test]
