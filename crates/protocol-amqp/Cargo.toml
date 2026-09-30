@@ -17,3 +17,6 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+amqp = { workspace = true, features = ["test-client"] }
