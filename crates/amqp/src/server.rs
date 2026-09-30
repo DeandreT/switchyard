@@ -35,6 +35,7 @@ const SESSION_WINDOW: u32 = 2_048;
 const DELIVERY_QUEUE_CAPACITY: usize = LINK_CREDIT as usize;
 const MAX_PENDING_ATTACHES: usize = 32;
 const SEND_FRAME_QUANTUM: usize = 16;
+const MAX_DELIVERY_TAG_BYTES: usize = 32;
 const MAX_CLOSING_HANDLES: usize = 65_536;
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_FRAME_SIZE: u32 = 262_144;
@@ -888,6 +889,8 @@ struct ReceivingLink {
 
 struct PartialDelivery {
     id: u32,
+    tag: DeliveryTag,
+    message_format: u32,
     settled: bool,
     bytes: Vec<u8>,
 }
@@ -1562,40 +1565,65 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         .await;
     };
 
-    if let Some(partial) = &link.partial {
+    let identity_error = if transfer
+        .delivery_tag
+        .as_ref()
+        .is_some_and(|tag| tag.len() > MAX_DELIVERY_TAG_BYTES)
+    {
+        Some(("amqp:invalid-field", "delivery tag exceeds 32 bytes"))
+    } else if let Some(partial) = &link.partial {
         if transfer.delivery_id.is_some_and(|id| id != partial.id) {
-            return refuse_session(
-                channel,
-                "amqp:invalid-field",
-                "interleaved deliveries on one link",
-                writer,
-                sessions,
-            )
-            .await;
+            Some(("amqp:invalid-field", "continuation delivery id changed"))
+        } else if transfer
+            .delivery_tag
+            .as_ref()
+            .is_some_and(|tag| tag != &partial.tag)
+        {
+            Some(("amqp:invalid-field", "continuation delivery tag changed"))
+        } else if transfer
+            .message_format
+            .is_some_and(|format| format != partial.message_format)
+        {
+            Some(("amqp:invalid-field", "continuation message format changed"))
+        } else {
+            None
         }
+    } else if transfer.delivery_id.is_none() {
+        Some(("amqp:invalid-field", "first transfer has no delivery id"))
+    } else if transfer.delivery_tag.is_none() {
+        Some(("amqp:invalid-field", "first transfer has no delivery tag"))
+    } else if transfer.message_format.is_none() {
+        Some(("amqp:invalid-field", "first transfer has no message format"))
+    } else if transfer.message_format != Some(0) {
+        Some(("amqp:not-implemented", "message format is not supported"))
     } else {
-        if transfer.delivery_id.is_none() {
-            return refuse_session(
-                channel,
-                "amqp:invalid-field",
-                "first transfer has no delivery id",
-                writer,
-                sessions,
-            )
-            .await;
-        }
-        if let Err(error) = link.credit.try_begin_delivery() {
-            detach_link_error(
-                channel,
-                transfer.handle,
-                session,
-                writer,
-                "amqp:link:transfer-limit-exceeded",
-                error.to_string(),
-            )
-            .await?;
-            return refill_link(channel, transfer.handle, session, writer).await;
-        }
+        None
+    };
+    if let Some((condition, description)) = identity_error {
+        detach_link_error(
+            channel,
+            transfer.handle,
+            session,
+            writer,
+            condition,
+            description,
+        )
+        .await?;
+        return refill_link(channel, transfer.handle, session, writer).await;
+    }
+    if link.partial.is_none()
+        && let Err(error) = link.credit.try_begin_delivery()
+    {
+        detach_link_error(
+            channel,
+            transfer.handle,
+            session,
+            writer,
+            "amqp:link:transfer-limit-exceeded",
+            error.to_string(),
+        )
+        .await?;
+        return refill_link(channel, transfer.handle, session, writer).await;
     }
     if transfer.aborted {
         link.partial = None;
@@ -1635,6 +1663,12 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
             id: transfer
                 .delivery_id
                 .ok_or_else(|| invalid_state("first transfer has no delivery id"))?,
+            tag: transfer
+                .delivery_tag
+                .expect("first transfer tag was validated"),
+            message_format: transfer
+                .message_format
+                .expect("first transfer format was validated"),
             settled: transfer.settled.unwrap_or(false),
             bytes: payload,
         },
@@ -2007,6 +2041,10 @@ async fn queue_send<W: AsyncWrite + Unpin>(
         let _ = reply.send(Err(EngineError::RemoteDetached));
         return Ok(());
     };
+    if delivery_tag.len() > MAX_DELIVERY_TAG_BYTES {
+        let _ = reply.send(Err(invalid_state("delivery tag exceeds 32 bytes")));
+        return Ok(());
+    }
     let payload = match encode_message(&message) {
         Ok(payload) => payload,
         Err(error) => {
@@ -2595,3 +2633,6 @@ mod frame_limit_tests;
 
 #[cfg(test)]
 mod flow_tests;
+
+#[cfg(test)]
+mod transfer_identity_tests;

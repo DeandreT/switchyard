@@ -167,8 +167,8 @@ fn transfer() -> Transfer {
     Transfer {
         handle: 0,
         delivery_id: None,
-        delivery_tag: None,
-        message_format: None,
+        delivery_tag: Some(Vec::new().into()),
+        message_format: Some(0),
         settled: None,
         more: false,
         rcv_settle_mode: None,
