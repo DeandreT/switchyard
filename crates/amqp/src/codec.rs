@@ -9,7 +9,7 @@ use serde_amqp::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::types::*;
-use crate::value_codec::{ValueDecoder, decode_value};
+use crate::value_codec::{MessageDecodeBudget, ValueDecoder, decode_value};
 
 pub const AMQP_PROTOCOL_ID: u8 = 0;
 pub const SASL_PROTOCOL_ID: u8 = 3;
@@ -324,8 +324,17 @@ pub fn encode_message(message: &Message) -> io::Result<Vec<u8>> {
 }
 
 pub fn decode_message(encoded: &[u8]) -> io::Result<Message> {
+    decode_message_with_budget(encoded, &mut MessageDecodeBudget::default())
+}
+
+/// Decodes a message without resetting the caller's cumulative allocation budget.
+/// Failed decoding does not refund charges already made.
+pub fn decode_message_with_budget(
+    encoded: &[u8],
+    budget: &mut MessageDecodeBudget,
+) -> io::Result<Message> {
     let mut message = Message::default();
-    let mut decoder = ValueDecoder::new(encoded);
+    let mut decoder = ValueDecoder::new(encoded, budget);
     let mut offset = 0;
     let mut previous_section = None;
     while offset < encoded.len() {
@@ -1626,6 +1635,9 @@ fn encode_variable(short: u8, long: u8, bytes: &[u8]) -> io::Result<Vec<u8>> {
 fn invalid_data(error: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.into())
 }
+
+#[cfg(test)]
+mod decode_budget_tests;
 
 #[cfg(test)]
 mod tests {

@@ -13,9 +13,50 @@ pub(crate) const MAX_VALUE_NESTING: usize = 68;
 pub(crate) const MAX_VALUE_ELEMENTS: usize = 132_096;
 pub(crate) const MAX_EXPANDED_VALUE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Cumulative allocation limits shared by independently encoded messages.
+/// Charges already made are retained when decoding fails.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageDecodeBudget {
+    remaining_values: usize,
+    remaining_copied_bytes: usize,
+}
+
+impl MessageDecodeBudget {
+    /// Creates a smaller budget without permitting either hard limit to grow.
+    pub fn new(max_values: usize, max_copied_bytes: usize) -> io::Result<Self> {
+        if max_values > MAX_VALUE_ELEMENTS || max_copied_bytes > MAX_EXPANDED_VALUE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "message decode budget exceeds the hard allocation limits",
+            ));
+        }
+        Ok(Self {
+            remaining_values: max_values,
+            remaining_copied_bytes: max_copied_bytes,
+        })
+    }
+
+    pub fn remaining_values(&self) -> usize {
+        self.remaining_values
+    }
+
+    pub fn remaining_copied_bytes(&self) -> usize {
+        self.remaining_copied_bytes
+    }
+}
+
+impl Default for MessageDecodeBudget {
+    fn default() -> Self {
+        Self {
+            remaining_values: MAX_VALUE_ELEMENTS,
+            remaining_copied_bytes: MAX_EXPANDED_VALUE_BYTES,
+        }
+    }
+}
+
 /// Decodes one value and reports its consumed wire length.
 pub(crate) fn decode_value(bytes: &[u8]) -> io::Result<(Value, usize)> {
-    ValueDecoder::new(bytes).next_value()
+    ValueDecoder::new(bytes, &mut MessageDecodeBudget::default()).next_value()
 }
 
 enum Constructor {
@@ -41,22 +82,20 @@ impl Constructor {
 }
 
 /// Shares allocation budgets across consecutive values in one wire message.
-pub(crate) struct ValueDecoder<'a> {
+pub(crate) struct ValueDecoder<'a, 'budget> {
     bytes: &'a [u8],
     position: usize,
     limit: usize,
-    remaining_values: usize,
-    remaining_bytes: usize,
+    budget: &'budget mut MessageDecodeBudget,
 }
 
-impl<'a> ValueDecoder<'a> {
-    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+impl<'a, 'budget> ValueDecoder<'a, 'budget> {
+    pub(crate) fn new(bytes: &'a [u8], budget: &'budget mut MessageDecodeBudget) -> Self {
         Self {
             bytes,
             position: 0,
             limit: bytes.len(),
-            remaining_values: MAX_VALUE_ELEMENTS,
-            remaining_bytes: MAX_EXPANDED_VALUE_BYTES,
+            budget,
         }
     }
 
@@ -105,7 +144,8 @@ impl<'a> ValueDecoder<'a> {
     }
 
     fn spend_value(&mut self) -> io::Result<()> {
-        self.remaining_values = self
+        self.budget.remaining_values = self
+            .budget
             .remaining_values
             .checked_sub(1)
             .ok_or_else(|| invalid("AMQP value element limit exceeded"))?;
@@ -113,8 +153,9 @@ impl<'a> ValueDecoder<'a> {
     }
 
     fn spend_bytes(&mut self, bytes: usize) -> io::Result<()> {
-        self.remaining_bytes = self
-            .remaining_bytes
+        self.budget.remaining_copied_bytes = self
+            .budget
+            .remaining_copied_bytes
             .checked_sub(bytes)
             .ok_or_else(|| invalid("AMQP expanded value byte limit exceeded"))?;
         Ok(())
@@ -271,7 +312,7 @@ impl<'a> ValueDecoder<'a> {
         let old_limit = self.limit;
         self.limit = end;
         let count = self.length(width)?;
-        if count > self.remaining_values {
+        if count > self.budget.remaining_values {
             return Err(invalid("AMQP value element limit exceeded"));
         }
         Ok((count, end, old_limit))
@@ -320,7 +361,7 @@ impl<'a> ValueDecoder<'a> {
             .descriptor_bytes()?
             .checked_mul(count)
             .ok_or_else(|| invalid("AMQP descriptor expansion size overflow"))?;
-        if repeated_descriptor_bytes > self.remaining_bytes {
+        if repeated_descriptor_bytes > self.budget.remaining_copied_bytes {
             return Err(invalid("AMQP expanded value byte limit exceeded"));
         }
         let mut values = Vec::with_capacity(count);
@@ -636,14 +677,10 @@ mod tests {
         assert!(error.to_string().contains("expanded value byte limit"));
 
         let wire = named_null_array("abcdefgh", 2);
-        for (budget, accepted) in [(24, true), (23, false)] {
-            let mut decoder = ValueDecoder {
-                bytes: &wire,
-                position: 0,
-                limit: wire.len(),
-                remaining_values: MAX_VALUE_ELEMENTS,
-                remaining_bytes: budget,
-            };
+        for (bytes, accepted) in [(24, true), (23, false)] {
+            let mut budget =
+                MessageDecodeBudget::new(MAX_VALUE_ELEMENTS, bytes).expect("bounded budget");
+            let mut decoder = ValueDecoder::new(&wire, &mut budget);
             assert_eq!(decoder.value(0).is_ok(), accepted);
         }
     }
@@ -651,8 +688,9 @@ mod tests {
     #[test]
     fn consecutive_values_share_the_element_budget_and_report_per_value_lengths() {
         let wire = [0xe0, 2, 2, 0x40, 0x52, 7, 0x40, 0x40];
-        let mut decoder = ValueDecoder::new(&wire);
-        decoder.remaining_values = 5;
+        let mut budget =
+            MessageDecodeBudget::new(5, MAX_EXPANDED_VALUE_BYTES).expect("bounded budget");
+        let mut decoder = ValueDecoder::new(&wire, &mut budget);
         assert_eq!(
             decoder.next_value().expect("first array"),
             (Value::Array(vec![Value::Null, Value::Null].into()), 4)
@@ -669,8 +707,9 @@ mod tests {
         assert!(error.to_string().contains("element limit"));
 
         let wire = [0xe0, 2, 2, 0x40, 0xe0, 2, 2, 0x40];
-        let mut decoder = ValueDecoder::new(&wire);
-        decoder.remaining_values = 5;
+        let mut budget =
+            MessageDecodeBudget::new(5, MAX_EXPANDED_VALUE_BYTES).expect("bounded budget");
+        let mut decoder = ValueDecoder::new(&wire, &mut budget);
         decoder.next_value().expect("first array uses three nodes");
         assert!(
             decoder.next_value().is_err(),
@@ -681,8 +720,8 @@ mod tests {
     #[test]
     fn consecutive_values_share_the_expanded_byte_budget() {
         let wire = [0xa1, 2, b'a', b'b', 0xa0, 2, 1, 2, 0xa3, 1, b'x'];
-        let mut decoder = ValueDecoder::new(&wire);
-        decoder.remaining_bytes = 4;
+        let mut budget = MessageDecodeBudget::new(MAX_VALUE_ELEMENTS, 4).expect("bounded budget");
+        let mut decoder = ValueDecoder::new(&wire, &mut budget);
         assert_eq!(
             decoder.next_value().expect("string consumes two bytes"),
             (Value::String("ab".to_owned()), 4)
@@ -698,8 +737,8 @@ mod tests {
 
         let array = named_null_array("abcdefgh", 2);
         let wire = [array.as_slice(), array.as_slice()].concat();
-        let mut decoder = ValueDecoder::new(&wire);
-        decoder.remaining_bytes = 47;
+        let mut budget = MessageDecodeBudget::new(MAX_VALUE_ELEMENTS, 47).expect("bounded budget");
+        let mut decoder = ValueDecoder::new(&wire, &mut budget);
         decoder.next_value().expect("first array consumes 24 bytes");
         assert!(
             decoder.next_value().is_err(),
