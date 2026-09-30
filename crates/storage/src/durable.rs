@@ -36,13 +36,17 @@ pub const STORE_FORMAT_V4: u32 = 4;
 /// builds cannot read those records without losing producer content.
 pub const STORE_FORMAT_V5: u32 = 5;
 
+/// Version 6: only ready messages have TTL expiry entries. Locked messages
+/// are protected until release, and deferred messages expire on retrieval.
+pub const STORE_FORMAT_V6: u32 = 6;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V5;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V6;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
@@ -292,6 +296,20 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V4,
+                expected: ACTIVE_STORE_FORMAT,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_store_with_the_previous_expiry_index_contract() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        stamp_format(directory.path(), &STORE_FORMAT_V5.to_be_bytes())?;
+        assert_eq!(
+            FjallStore::open(directory.path()).err(),
+            Some(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V5,
                 expected: ACTIVE_STORE_FORMAT,
             })
         );

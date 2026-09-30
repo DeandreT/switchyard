@@ -751,7 +751,9 @@ fn a_deferred_message_can_be_received_and_deleted_by_sequence<P: StoreProvider>(
     Ok(())
 }
 
-fn a_deferred_message_still_expires<P: StoreProvider>(provider: P) -> Result<(), Box<dyn Error>> {
+fn a_deferred_message_expires_only_when_requested<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
     let fixture = queue(provider)?;
     let sequence = match fixture.at(
         10,
@@ -776,7 +778,19 @@ fn a_deferred_message_still_expires<P: StoreProvider>(provider: P) -> Result<(),
 
     assert_eq!(
         fixture.at(110, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+    );
+    assert_eq!(
+        fixture.at(
+            111,
+            CommandKind::ReceiveDeferred {
+                sequences: vec![sequence],
+                mode: ReceiveMode::ReceiveAndDelete,
+                lock_duration_millis: None,
+                session_id: None,
+            }
+        )?,
+        CommandOutcome::DeferredReceived(Vec::new())
     );
     assert_eq!(
         fixture
@@ -1063,7 +1077,7 @@ for_each_backend! {
     an_application_can_dead_letter_a_locked_message,
     a_locked_message_can_be_deferred_and_received_by_sequence,
     a_deferred_message_can_be_received_and_deleted_by_sequence,
-    a_deferred_message_still_expires,
+    a_deferred_message_expires_only_when_requested,
     a_command_that_moves_time_backward_is_rejected,
     a_send_larger_than_the_queue_limit_is_rejected,
     commands_against_a_missing_queue_are_rejected,

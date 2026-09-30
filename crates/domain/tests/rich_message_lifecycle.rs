@@ -360,8 +360,15 @@ fn lock_and_message_expiry_preserve_content<P: StoreProvider>(
     assert_eq!(delivery.envelope.as_deref(), Some(&envelope));
     assert_eq!(delivery.delivery_count, 2);
     assert_eq!(
+        fixture.at(110, CommandKind::ExpireLocks)?,
+        CommandOutcome::LocksExpired {
+            returned_to_ready: 0,
+            dead_lettered: 1
+        }
+    );
+    assert_eq!(
         fixture.at(110, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired { dead_lettered: 0 }
     );
     let delivery = receive(&fixture, 111, ReceiveMode::ReceiveAndDelete, None, true)?
         .expect("expired message dead-lettered");

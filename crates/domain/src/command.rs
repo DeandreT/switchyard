@@ -40,6 +40,7 @@ impl Command {
 pub struct ScheduledMessage {
     pub message_id: String,
     pub body: Vec<u8>,
+    /// Requests a lifetime, capped by the queue default when it is finite.
     pub time_to_live_millis: Option<u64>,
     pub session_id: Option<SessionId>,
     pub enqueue_at: Timestamp,
@@ -51,6 +52,7 @@ pub struct ScheduledMessage {
 pub struct ScheduledEnvelope {
     pub message_id: String,
     pub body: Vec<u8>,
+    /// Requests a lifetime, capped by the queue default when it is finite.
     pub time_to_live_millis: Option<u64>,
     pub session_id: Option<SessionId>,
     pub enqueue_at: Timestamp,
@@ -66,7 +68,7 @@ pub enum CommandKind {
     Send {
         message_id: String,
         body: Vec<u8>,
-        /// Overrides the queue default when set.
+        /// Requests a lifetime, capped by the queue default when it is finite.
         time_to_live_millis: Option<u64>,
         /// Required on a queue that requires sessions, and refused on one that
         /// does not.
@@ -162,8 +164,8 @@ pub enum CommandKind {
     /// Proposed by the leader's timer worker. Returns messages whose lock has
     /// elapsed, or dead-letters them once they reach the delivery limit.
     ExpireLocks,
-    /// Proposed by the leader's timer worker. Dead-letters messages whose time
-    /// to live has elapsed.
+    /// Proposed by the leader's timer worker. Expires ready messages whose time
+    /// to live has elapsed. Live locks and deferred messages are not swept.
     ExpireMessages,
     /// Proposed by the leader's timer worker. Releases sessions whose lock has
     /// elapsed.
@@ -177,6 +179,7 @@ pub enum CommandKind {
     SendEnvelope {
         message_id: String,
         body: Vec<u8>,
+        /// Requests a lifetime, capped by the queue default when it is finite.
         time_to_live_millis: Option<u64>,
         session_id: Option<SessionId>,
         envelope: Box<MessageEnvelope>,

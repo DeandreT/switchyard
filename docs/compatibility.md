@@ -60,7 +60,8 @@ behavior it currently enforces:
   counts, acquiring locks, or consuming from the queue.
 - Deferral removes a locked message from the ready path while keeping its
   sequence number. A deferred receive by sequence can lock it again or consume
-  it in receive-delete mode, and deferred messages still expire.
+  it in receive-delete mode. A deferred message remains discoverable by peek
+  after its lifetime ends; expiry is applied when a deferred receive reaches it.
 - Scheduling keeps messages visible to peek but out of the ready path until
   their requested time. The timer atomically activates each due message under
   a new sequence number, appending it to the queue, and starts its lifetime at
@@ -89,8 +90,13 @@ behavior it currently enforces:
 - Abandoning a message, or letting its lock elapse, returns it to the queue
   until it reaches the queue's maximum delivery count, after which it is
   dead-lettered as `MaxDeliveryCountExceeded`.
-- Messages past their time to live are dead-lettered as `TTLExpiredException`,
-  both by the timer sweep and by any receive that reaches one first.
+- A queue's default time to live is also a ceiling for an explicit message
+  lifetime, including scheduled messages. Lifetime starts at enqueue/activation.
+  A live message lock protects an expired message: completion and renewal
+  remain valid. Abandonment or lock expiry applies the elapsed lifetime
+  immediately, ahead of the delivery-count limit. Unlocked expired messages are
+  dead-lettered as `TTLExpiredException` by the timer or a receive that reaches
+  one first. Configurable drop-versus-dead-letter on expiry remains unfinished.
 - The dead-letter queue is a queue: `entity/$deadletterqueue` is drained with
   the same receive and settlement machinery as its parent. Messages arrive
   there stripped of lifetime and session, keep their sequence numbers and the
@@ -218,7 +224,7 @@ size limit using a conservative content tally that includes metadata and body
 sections, rather than only flattened body bytes. Exact AMQP wire-size and
 per-property/header quota parity remains unfinished.
 
-The current value format is version 7 and durable store layout is version 5.
+The current value format is version 7 and durable store layout is version 6.
 Earlier message and queue-configuration shapes have tested decoders, but an
 earlier store directory is refused at open because its broker contract differs.
 There is no directory migration tooling yet; development directories

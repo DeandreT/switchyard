@@ -294,8 +294,8 @@ fn lifetime_starts_at_activation_not_scheduling<P: StoreProvider>(
         vec![
             message("default", 100),
             ScheduledMessage {
-                time_to_live_millis: Some(75),
-                ..message("override", 100)
+                time_to_live_millis: Some(25),
+                ..message("shorter", 100)
             },
         ],
     )?;
@@ -318,28 +318,28 @@ fn lifetime_starts_at_activation_not_scheduling<P: StoreProvider>(
         .expect("activated default lifetime");
     assert_eq!(default.enqueued_at, Timestamp::from_millis(200));
     assert_eq!(default.expires_at, Some(Timestamp::from_millis(250)));
-    let overridden = fixture
+    let shorter = fixture
         .machine
         .message(&fixture.namespace, &fixture.entity, SequenceNumber::new(4))?
-        .expect("activated override lifetime");
-    assert_eq!(overridden.expires_at, Some(Timestamp::from_millis(275)));
+        .expect("activated shorter lifetime");
+    assert_eq!(shorter.expires_at, Some(Timestamp::from_millis(225)));
     assert_eq!(
-        fixture.at(250, CommandKind::ExpireMessages)?,
+        fixture.at(225, CommandKind::ExpireMessages)?,
         CommandOutcome::MessagesExpired { dead_lettered: 1 }
     );
     let dead = fixture
         .machine
-        .dead_lettered_message(&fixture.namespace, &fixture.entity, default.sequence)?
-        .expect("default TTL expired");
+        .dead_lettered_message(&fixture.namespace, &fixture.entity, shorter.sequence)?
+        .expect("shorter TTL expired");
     assert_eq!(
         dead.dead_letter_info().expect("reason preserved").reason,
         DeadLetterReason::TimeToLiveExpired
     );
     assert_eq!(
-        receive(&fixture, 251)?
-            .expect("override still live")
+        receive(&fixture, 226)?
+            .expect("default still live")
             .message_id,
-        "override"
+        "default"
     );
     Ok(())
 }
