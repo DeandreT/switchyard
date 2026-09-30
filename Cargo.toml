@@ -39,16 +39,24 @@ flume = "0.12"
 hmac = "0.12"
 percent-encoding = "2.3"
 postcard = { version = "1.1", features = ["use-std"] }
+prost = "0.14.4"
+prost-types = "0.14.4"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2.2"
+rustix = { version = "1.1", features = ["fs"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 serde_amqp = "0.14.1"
 sha2 = "0.10"
 tempfile = "3.27"
 thiserror = "2.0"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14.6", default-features = false, features = ["router", "transport", "codegen", "tls-ring"] }
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2.5"

@@ -6,7 +6,9 @@ formats, consensus, security boundaries, or public APIs.
 
 ## Development
 
-Use the pinned Rust toolchain and run:
+Use the pinned Rust toolchain and install `protoc` 3.15 or newer (or set
+`PROTOC` to its executable). Native administration bindings are generated from
+the checked-in schema during builds; no compiler binary is bundled. Run:
 
 ```sh
 cargo fmt --all --check

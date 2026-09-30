@@ -18,6 +18,7 @@ service EntityService {
   rpc CreateEntity(CreateEntityRequest) returns (Entity);
   rpc GetEntity(GetEntityRequest) returns (Entity);
   rpc ListEntities(ListEntitiesRequest) returns (ListEntitiesResponse);
+  rpc UpdateEntity(UpdateEntityRequest) returns (Entity);
   rpc DeleteEntity(DeleteEntityRequest) returns (Operation);
 }
 
@@ -95,11 +96,38 @@ message CreateEntityRequest {
   string path = 2;
   EntityKind kind = 3;
   string placement_group_id = 4;
+  // Entity storage capacity, not an individual message size limit.
   uint64 max_size_bytes = 5;
   uint64 default_ttl_millis = 6;
   uint64 lock_duration_millis = 7;
   uint32 max_delivery_count = 8;
   bool requires_session = 9;
+  QueueConfiguration queue_config = 10;
+}
+
+message UnlimitedTimeToLive {}
+
+// Presence distinguishes an omitted setting from a requested false/zero value.
+// In updates an absent TTL is unchanged; unlimited is an explicit reset.
+message QueueConfiguration {
+  optional uint64 lock_duration_millis = 1;
+  optional uint32 max_delivery_count = 2;
+  oneof default_time_to_live {
+    uint64 default_ttl_millis = 3;
+    UnlimitedTimeToLive default_ttl_unlimited = 9;
+  }
+  // Per-message limit, independent of entity storage capacity.
+  optional uint64 max_message_bytes = 4;
+  optional bool requires_session = 5;
+  optional bool requires_duplicate_detection = 6;
+  optional uint64 duplicate_detection_history_time_window_millis = 7;
+  optional bool dead_lettering_on_message_expiration = 8;
+}
+
+message UpdateEntityRequest {
+  string namespace = 1;
+  string path = 2;
+  QueueConfiguration queue_config = 3;
 }
 
 message GetEntityRequest {
@@ -123,8 +151,10 @@ message Entity {
   string path = 2;
   EntityKind kind = 3;
   string placement_group_id = 4;
-  uint64 max_size_bytes = 5;
-  uint64 used_logical_bytes = 6;
+  // Absent while entity capacity and logical usage accounting are unsupported.
+  optional uint64 max_size_bytes = 5;
+  optional uint64 used_logical_bytes = 6;
+  QueueConfiguration queue_config = 7;
 }
 
 message ListEntitiesResponse {
@@ -162,4 +192,3 @@ message AuditRecord {
   bytes previous_hash = 8;
   bytes record_hash = 9;
 }
-

@@ -6,6 +6,12 @@ use serde::{Deserialize, Serialize};
 pub const PROTOBUF_PACKAGE: &str = "switchyard.admin.v1";
 pub const ADMIN_TLS_PORT: u16 = 9443;
 
+pub mod v1 {
+    tonic::include_proto!("switchyard.admin.v1");
+}
+
+pub const FILE_DESCRIPTOR_SET: &[u8] = tonic::include_file_descriptor_set!("switchyard.admin.v1");
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {

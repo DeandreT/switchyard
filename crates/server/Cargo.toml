@@ -11,22 +11,26 @@ name = "switchyard"
 path = "src/main.rs"
 
 [dependencies]
+admin-api.workspace = true
 auth.workspace = true
+base64.workspace = true
 clap.workspace = true
 cluster.workspace = true
 domain.workspace = true
 flume.workspace = true
 protocol-amqp.workspace = true
+prost.workspace = true
 rustls.workspace = true
 storage.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 amqp = { workspace = true, features = ["test-client"] }
-base64.workspace = true
 hmac.workspace = true
 rcgen.workspace = true
 rustls.workspace = true

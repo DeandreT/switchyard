@@ -8,5 +8,13 @@ repository.workspace = true
 
 [dependencies]
 domain.workspace = true
+prost.workspace = true
 serde.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
 
+[build-dependencies]
+tonic-prost-build.workspace = true
+
+[dev-dependencies]
+prost-types.workspace = true
