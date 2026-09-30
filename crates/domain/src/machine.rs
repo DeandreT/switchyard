@@ -51,6 +51,12 @@ const BROKER_BASE_HEADER_RESERVE_BYTES: usize = 256;
 /// SDK dead-letter reason and description limits, measured in UTF-16 units.
 pub const MAX_DEAD_LETTER_DETAIL_LENGTH: usize = 4_096;
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ExpirationOutcome {
+    Dropped,
+    DeadLettered,
+}
+
 #[derive(Clone, Copy)]
 struct MessageInput<'a> {
     message_id: &'a str,
@@ -508,6 +514,7 @@ impl<S: StateStore> StateMachine<S> {
             default_time_to_live_millis: None,
             requires_session: false,
             requires_duplicate_detection: false,
+            dead_lettering_on_message_expiration: false,
             ..config
         };
         batch.push_put(key, codec::encode(&config)?);
@@ -847,7 +854,7 @@ impl<S: StateStore> StateMachine<S> {
             // A timer sweep normally reaps these, but a receive must never hand
             // out a message whose lifetime has already elapsed.
             if record.is_expired_at(command.issued_at) {
-                self.expire_message(command, record, batch)?;
+                self.expire_message(command, &config, record, batch)?;
                 continue;
             }
 
@@ -1030,16 +1037,15 @@ impl<S: StateStore> StateMachine<S> {
         let entity = &command.entity;
         match disposition {
             SettlementDisposition::Complete => {
-                batch.push_delete(keys::message(namespace, entity, sequence));
-                batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
-                remove_expiry_index(command, &record, batch);
+                self.remove_message(command, &record, batch);
                 Ok(CommandOutcome::Completed)
             }
             SettlementDisposition::Abandon => {
                 if record.is_expired_at(command.issued_at) {
-                    self.expire_message(command, record, batch)?;
+                    let expiration = self.expire_message(command, &config, record, batch)?;
                     return Ok(CommandOutcome::Abandoned {
-                        dead_lettered: true,
+                        dead_lettered: expiration == ExpirationOutcome::DeadLettered,
+                        dropped: expiration == ExpirationOutcome::Dropped,
                     });
                 }
                 if exceeded_delivery_limit(command, &config, &record) {
@@ -1052,6 +1058,7 @@ impl<S: StateStore> StateMachine<S> {
                     )?;
                     return Ok(CommandOutcome::Abandoned {
                         dead_lettered: true,
+                        dropped: false,
                     });
                 }
                 record.state = MessageState::Ready;
@@ -1064,6 +1071,7 @@ impl<S: StateStore> StateMachine<S> {
                 index_ready_expiry(command, &record, batch);
                 Ok(CommandOutcome::Abandoned {
                     dead_lettered: false,
+                    dropped: false,
                 })
             }
             SettlementDisposition::Defer => {
@@ -1123,7 +1131,7 @@ impl<S: StateStore> StateMachine<S> {
                 });
             }
             if record.is_expired_at(command.issued_at) {
-                self.expire_message(command, record, batch)?;
+                self.expire_message(command, &config, record, batch)?;
                 continue;
             }
 
@@ -1205,6 +1213,7 @@ impl<S: StateStore> StateMachine<S> {
 
         let mut returned_to_ready = 0;
         let mut dead_lettered = 0;
+        let mut dropped = 0;
         for (key, _) in locks {
             let (locked_until, sequence) =
                 keys::trailing_deadline(&key).ok_or(BrokerError::MalformedIndexKey)?;
@@ -1219,8 +1228,10 @@ impl<S: StateStore> StateMachine<S> {
                 .ok_or(BrokerError::DanglingIndexEntry { sequence })?;
 
             if record.is_expired_at(command.issued_at) {
-                self.expire_message(command, record, batch)?;
-                dead_lettered += 1;
+                match self.expire_message(command, &config, record, batch)? {
+                    ExpirationOutcome::DeadLettered => dead_lettered += 1,
+                    ExpirationOutcome::Dropped => dropped += 1,
+                }
             } else if exceeded_delivery_limit(command, &config, &record) {
                 self.move_to_dead_letter(
                     command,
@@ -1246,6 +1257,7 @@ impl<S: StateStore> StateMachine<S> {
         Ok(CommandOutcome::LocksExpired {
             returned_to_ready,
             dead_lettered,
+            dropped,
         })
     }
 
@@ -1254,6 +1266,7 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
+        let config = self.load_config(command)?;
         let namespace = &command.namespace;
         let entity = &command.entity;
         let expiring = self
@@ -1261,6 +1274,8 @@ impl<S: StateStore> StateMachine<S> {
             .scan_prefix(&keys::expiry_prefix(namespace, entity), TIMER_SCAN_LIMIT)?;
 
         let mut dead_lettered = 0;
+        let mut dropped = 0;
+        let mut processed = 0;
         for (key, _) in expiring {
             let (expires_at, sequence) =
                 keys::trailing_deadline(&key).ok_or(BrokerError::MalformedIndexKey)?;
@@ -1276,17 +1291,24 @@ impl<S: StateStore> StateMachine<S> {
             }
             match record.state {
                 MessageState::Ready => {
-                    self.expire_message(command, record, batch)?;
-                    dead_lettered += 1;
+                    match self.expire_message(command, &config, record, batch)? {
+                        ExpirationOutcome::DeadLettered => dead_lettered += 1,
+                        ExpirationOutcome::Dropped => dropped += 1,
+                    }
                 }
                 // Older snapshots indexed every finite lifetime. Suspend those
                 // entries without letting protected locks pin later expirations.
                 MessageState::Locked { .. } | MessageState::Deferred => batch.push_delete(key),
                 MessageState::Scheduled { .. } => return Err(BrokerError::MalformedIndexKey),
             }
+            processed += 1;
         }
 
-        Ok(CommandOutcome::MessagesExpired { dead_lettered })
+        Ok(CommandOutcome::MessagesExpired {
+            dead_lettered,
+            dropped,
+            processed,
+        })
     }
 
     // ---- sessions ----------------------------------------------------------
@@ -1634,16 +1656,41 @@ impl<S: StateStore> StateMachine<S> {
     fn expire_message(
         &self,
         command: &Command,
+        config: &QueueConfig,
         record: MessageRecord,
         batch: &mut WriteBatch,
-    ) -> Result<(), BrokerError> {
-        self.move_to_dead_letter(
-            command,
-            record,
-            DeadLetterReason::TimeToLiveExpired,
-            String::from("the message exceeded its time to live"),
-            batch,
-        )
+    ) -> Result<ExpirationOutcome, BrokerError> {
+        if config.dead_lettering_on_message_expiration {
+            self.move_to_dead_letter(
+                command,
+                record,
+                DeadLetterReason::TimeToLiveExpired,
+                String::from("the message exceeded its time to live"),
+                batch,
+            )?;
+            Ok(ExpirationOutcome::DeadLettered)
+        } else {
+            self.remove_message(command, &record, batch);
+            Ok(ExpirationOutcome::Dropped)
+        }
+    }
+
+    fn remove_message(&self, command: &Command, record: &MessageRecord, batch: &mut WriteBatch) {
+        let namespace = &command.namespace;
+        let entity = &command.entity;
+        let sequence = record.sequence;
+        match record.state {
+            MessageState::Ready => batch.push_delete(self.ready_key(command, record)),
+            MessageState::Locked { locked_until, .. } => {
+                batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
+            }
+            MessageState::Deferred => {}
+            MessageState::Scheduled { enqueue_at, .. } => {
+                batch.push_delete(keys::scheduled(namespace, entity, enqueue_at, sequence));
+            }
+        }
+        batch.push_delete(keys::message(namespace, entity, sequence));
+        remove_expiry_index(command, record, batch);
     }
 
     /// Moves a message out of the active keyspace and into the dead-letter
@@ -1661,22 +1708,7 @@ impl<S: StateStore> StateMachine<S> {
         let entity = &command.entity;
         let sequence = record.sequence;
 
-        match record.state {
-            MessageState::Ready => {
-                batch.push_delete(self.ready_key(command, &record));
-            }
-            MessageState::Locked { locked_until, .. } => {
-                batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
-            }
-            MessageState::Deferred => {}
-            MessageState::Scheduled { enqueue_at, .. } => {
-                batch.push_delete(keys::scheduled(namespace, entity, enqueue_at, sequence));
-            }
-        }
-        batch.push_delete(keys::message(namespace, entity, sequence));
-        if let Some(expires_at) = record.expires_at {
-            batch.push_delete(keys::expiry(namespace, entity, expires_at, sequence));
-        }
+        self.remove_message(command, &record, batch);
 
         // Into the shadow queue as an ordinary ready message under its original
         // sequence — the same receive and settlement machinery drains it.

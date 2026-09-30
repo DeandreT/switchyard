@@ -344,7 +344,15 @@ fn dead_lettering_preserves_content_but_clears_authoritative_session_and_lifetim
 fn lock_and_message_expiry_preserve_content<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
-    let fixture = QueueFixture::with_defaults(provider, "tenant", "orders")?;
+    let fixture = QueueFixture::new(
+        provider,
+        "tenant",
+        "orders",
+        QueueConfig {
+            dead_lettering_on_message_expiration: true,
+            ..QueueConfig::default()
+        },
+    )?;
     let envelope = rich(MessageBody::Sequence(vec![vec![MessageValue::Ulong(7)]]));
     send(&fixture, 10, "timers", Some(100), None, envelope.clone())?;
     receive(&fixture, 11, ReceiveMode::PeekLock, None, false)?.expect("ready message");
@@ -352,7 +360,8 @@ fn lock_and_message_expiry_preserve_content<P: StoreProvider>(
         fixture.at(16, CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 1,
-            dead_lettered: 0
+            dead_lettered: 0,
+            dropped: 0,
         }
     );
     let delivery =
@@ -363,12 +372,17 @@ fn lock_and_message_expiry_preserve_content<P: StoreProvider>(
         fixture.at(110, CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 0,
-            dead_lettered: 1
+            dead_lettered: 1,
+            dropped: 0,
         }
     );
     assert_eq!(
         fixture.at(110, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            dropped: 0,
+            processed: 0,
+        }
     );
     let delivery = receive(&fixture, 111, ReceiveMode::ReceiveAndDelete, None, true)?
         .expect("expired message dead-lettered");
@@ -653,7 +667,7 @@ fn genuine_version_6_messages_read_and_transition_through_the_machine<P: StorePr
             sequence,
         ))?
         .expect("stored record");
-    assert_eq!(stored[0], codec::VALUE_FORMAT_V7);
+    assert_eq!(stored[0], codec::ACTIVE_VALUE_FORMAT);
     Ok(())
 }
 

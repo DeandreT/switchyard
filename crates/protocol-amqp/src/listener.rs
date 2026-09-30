@@ -674,12 +674,7 @@ fn address_for_role<'a>(role: &Role, source: &'a str, target: &'a str) -> &'a st
 
 fn management_entity(address: &str) -> Option<Result<EntityPath, ProtocolError>> {
     let entity = address.strip_suffix("/$management")?;
-    Some(
-        EntityPath::new(entity).map_err(|error| ProtocolError::InvalidAddress {
-            address: address.to_owned(),
-            detail: error.to_string(),
-        }),
-    )
+    Some(resolve_entity(entity, Role::Receiver))
 }
 
 /// Drives a link the client sends on: every transfer becomes one send command.
@@ -1101,6 +1096,30 @@ mod tests {
             address_for_role(&Role::Receiver, "orders", "generated-target"),
             "orders"
         );
+    }
+
+    #[test]
+    fn management_dead_letter_paths_use_the_same_canonical_queue_as_receivers() {
+        for address in [
+            "Orders/$deadletterqueue/$management",
+            "Orders/$DeadLetterQueue/$management",
+        ] {
+            assert_eq!(
+                management_entity(address)
+                    .expect("a management address")
+                    .expect("a valid dead-letter address")
+                    .as_str(),
+                "Orders/$deadletterqueue"
+            );
+        }
+        assert_eq!(
+            management_entity("Orders/$management")
+                .expect("a management address")
+                .expect("a valid queue")
+                .as_str(),
+            "Orders"
+        );
+        assert!(management_entity("Orders").is_none());
     }
 
     #[test]

@@ -21,6 +21,7 @@ fn queue<P: StoreProvider>(
         "orders",
         QueueConfig {
             default_time_to_live_millis: ttl,
+            dead_lettering_on_message_expiration: true,
             ..QueueConfig::default()
         },
     )?)
@@ -178,7 +179,11 @@ fn ordinary_and_rich_messages_use_the_entity_ttl_ceiling<P: StoreProvider>(
     let fixture = fixture.restart()?;
     assert_eq!(
         fixture.at(10, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 2 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 2,
+            dropped: 0,
+            processed: 2,
+        }
     );
     let browsed = peek(&fixture, 11)?;
     assert_eq!(browsed.len(), 8);
@@ -280,7 +285,11 @@ fn scheduled_and_rich_pending_messages_expose_the_capped_effective_ttl<P: StoreP
     }
     assert_eq!(
         fixture.at(200, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 2 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 2,
+            dropped: 0,
+            processed: 2,
+        }
     );
     Ok(())
 }
@@ -338,7 +347,11 @@ fn live_locks_suspend_expiry_and_allow_renewal_then_completion<P: StoreProvider>
     let fixture = fixture.restart()?;
     assert_eq!(
         fixture.at(20, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            dropped: 0,
+            processed: 0,
+        }
     );
     let browsed = peek(&fixture, 21)?;
     assert_eq!(browsed.len(), 1);
@@ -391,7 +404,11 @@ fn abandoning_a_live_lock_after_ttl_immediately_dead_letters<P: StoreProvider>(
         receive(&fixture, 11, ReceiveMode::PeekLock, 100, false)?.expect("message locked");
     assert_eq!(
         fixture.at(20, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            dropped: 0,
+            processed: 0,
+        }
     );
     assert_eq!(
         fixture.at(
@@ -402,7 +419,8 @@ fn abandoning_a_live_lock_after_ttl_immediately_dead_letters<P: StoreProvider>(
             }
         )?,
         CommandOutcome::Abandoned {
-            dead_lettered: true
+            dead_lettered: true,
+            dropped: false,
         }
     );
     assert_eq!(
@@ -427,14 +445,19 @@ fn lock_expiry_after_ttl_dead_letters_without_a_second_message_sweep<P: StorePro
     receive(&fixture, 11, ReceiveMode::PeekLock, 100, false)?.expect("message locked");
     assert_eq!(
         fixture.at(20, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            dropped: 0,
+            processed: 0,
+        }
     );
     let fixture = fixture.restart()?;
     assert_eq!(
         fixture.at(111, CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 0,
-            dead_lettered: 1
+            dead_lettered: 1,
+            dropped: 0,
         }
     );
     assert_eq!(
@@ -464,7 +487,11 @@ fn abandoning_before_ttl_restores_the_expiry_index<P: StoreProvider>(
     let fixture = fixture.restart()?;
     assert_eq!(
         fixture.at(20, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            dropped: 0,
+            processed: 1,
+        }
     );
     assert_eq!(
         expiry_reason(&fixture, sequence)?,
@@ -484,14 +511,19 @@ fn lock_expiry_before_ttl_restores_the_expiry_index<P: StoreProvider>(
         fixture.at(21, CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 1,
-            dead_lettered: 0
+            dead_lettered: 0,
+            dropped: 0,
         }
     );
     assert!(has_expiry_index(&fixture, sequence)?);
     let fixture = fixture.restart()?;
     assert_eq!(
         fixture.at(110, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            dropped: 0,
+            processed: 1,
+        }
     );
     assert_eq!(
         expiry_reason(&fixture, sequence)?,
@@ -518,7 +550,11 @@ fn deferred_expiry_is_lazy_and_peekable_until_explicit_receive<P: StoreProvider>
     let fixture = fixture.restart()?;
     assert_eq!(
         fixture.at(21, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            dropped: 0,
+            processed: 0,
+        }
     );
     let browsed = peek(&fixture, 21)?;
     assert_eq!(browsed.len(), 1);
@@ -559,7 +595,11 @@ fn a_live_expired_lock_can_be_successfully_deferred<P: StoreProvider>(
     )?;
     assert_eq!(
         fixture.at(22, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            dropped: 0,
+            processed: 0,
+        }
     );
     assert_eq!(peek(&fixture, 23)?[0].status, MessageStatus::Deferred);
     assert!(!has_expiry_index(&fixture, sequence)?);
@@ -595,7 +635,11 @@ fn deferred_receive_locks_also_suspend_expiry<P: StoreProvider>(
     assert!(!has_expiry_index(&fixture, sequence)?);
     assert_eq!(
         fixture.at(110, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            dropped: 0,
+            processed: 0,
+        }
     );
     assert_eq!(
         fixture.at(
@@ -629,7 +673,11 @@ fn legacy_protected_expiry_entries_are_repaired_without_reaping_live_locks<P: St
     fixture.machine.store().apply(legacy)?;
     assert_eq!(
         fixture.at(22, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            dropped: 0,
+            processed: 2,
+        }
     );
     assert_eq!(fixture.machine.store().get(&stale_key)?, None);
     assert_eq!(
@@ -662,7 +710,11 @@ fn protected_locks_do_not_pin_the_bounded_expiry_sweep<P: StoreProvider>(
     let expired = send(&fixture, 12, "ready-expired", Some(10), false)?;
     assert_eq!(
         fixture.at(22, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            dropped: 0,
+            processed: 1,
+        }
     );
     assert_eq!(
         expiry_reason(&fixture, expired)?,
@@ -691,6 +743,7 @@ fn expired_ttl_takes_precedence_over_delivery_limit_on_release<P: StoreProvider>
         "orders",
         QueueConfig {
             max_delivery_count: 1,
+            dead_lettering_on_message_expiration: true,
             ..QueueConfig::default()
         },
     )?;
@@ -710,7 +763,8 @@ fn expired_ttl_takes_precedence_over_delivery_limit_on_release<P: StoreProvider>
             }
         )?,
         CommandOutcome::Abandoned {
-            dead_lettered: true
+            dead_lettered: true,
+            dropped: false,
         }
     );
     assert_eq!(
@@ -721,7 +775,8 @@ fn expired_ttl_takes_precedence_over_delivery_limit_on_release<P: StoreProvider>
         fixture.at(111, CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 0,
-            dead_lettered: 1
+            dead_lettered: 1,
+            dropped: 0,
         }
     );
     assert_eq!(
@@ -758,7 +813,11 @@ fn legacy_deferred_expiry_entries_are_repaired_without_eager_expiration<P: Store
     let fixture = fixture.restart()?;
     assert_eq!(
         fixture.at(23, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            dropped: 0,
+            processed: 2,
+        }
     );
     assert_eq!(fixture.machine.store().get(&stale_key)?, None);
     assert_eq!(

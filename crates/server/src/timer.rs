@@ -37,6 +37,7 @@ pub struct SweepReport {
     pub queues_swept: usize,
     pub locks_returned_to_ready: u32,
     pub messages_dead_lettered: u32,
+    pub messages_dropped: u32,
     pub sessions_released: u32,
     pub messages_activated: u32,
     pub duplicate_history_expired: u32,
@@ -47,6 +48,7 @@ impl SweepReport {
     pub fn is_idle(&self) -> bool {
         self.locks_returned_to_ready == 0
             && self.messages_dead_lettered == 0
+            && self.messages_dropped == 0
             && self.sessions_released == 0
             && self.messages_activated == 0
             && self.duplicate_history_expired == 0
@@ -121,14 +123,16 @@ impl<'a> TimerWorker<'a> {
             let CommandOutcome::LocksExpired {
                 returned_to_ready,
                 dead_lettered,
+                dropped,
             } = outcome
             else {
                 return Err(unexpected(outcome));
             };
             report.locks_returned_to_ready += returned_to_ready;
             report.messages_dead_lettered += dead_lettered;
+            report.messages_dropped += dropped;
 
-            if ((returned_to_ready + dead_lettered) as usize) < TIMER_SCAN_LIMIT {
+            if ((returned_to_ready + dead_lettered + dropped) as usize) < TIMER_SCAN_LIMIT {
                 break;
             }
         }
@@ -147,12 +151,18 @@ impl<'a> TimerWorker<'a> {
                 entity.clone(),
                 CommandKind::ExpireMessages,
             )?;
-            let CommandOutcome::MessagesExpired { dead_lettered } = outcome else {
+            let CommandOutcome::MessagesExpired {
+                dead_lettered,
+                dropped,
+                processed,
+            } = outcome
+            else {
                 return Err(unexpected(outcome));
             };
             report.messages_dead_lettered += dead_lettered;
+            report.messages_dropped += dropped;
 
-            if (dead_lettered as usize) < TIMER_SCAN_LIMIT {
+            if (processed as usize) < TIMER_SCAN_LIMIT {
                 break;
             }
         }
@@ -225,6 +235,7 @@ impl<'a> TimerWorker<'a> {
                         queues = report.queues_swept,
                         locks_returned_to_ready = report.locks_returned_to_ready,
                         messages_dead_lettered = report.messages_dead_lettered,
+                        messages_dropped = report.messages_dropped,
                         sessions_released = report.sessions_released,
                         messages_activated = report.messages_activated,
                         duplicate_history_expired = report.duplicate_history_expired,

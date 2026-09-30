@@ -299,7 +299,7 @@ impl ManagementResponse {
         let condition = rejection.condition();
         let status_code = match condition {
             crate::MESSAGE_LOCK_LOST | crate::SESSION_LOCK_LOST => 410,
-            crate::NOT_FOUND => 404,
+            crate::NOT_FOUND | crate::condition::MESSAGE_NOT_FOUND => 404,
             crate::MESSAGE_SIZE_EXCEEDED => 403,
             crate::INVALID_FIELD | crate::NOT_ALLOWED | crate::PRECONDITION_FAILED => 400,
             crate::RESOURCE_LOCKED => 503,
@@ -325,6 +325,17 @@ impl ManagementResponse {
             status_code: 410,
             status_description: description.into(),
             error_condition: Some(crate::MESSAGE_LOCK_LOST),
+            tracking_id,
+            body: Value::Null,
+        }
+    }
+
+    fn message_not_found(correlation_id: MessageId, tracking_id: Option<String>) -> Self {
+        Self {
+            correlation_id,
+            status_code: 404,
+            status_description: "the requested deferred messages were not found".to_owned(),
+            error_condition: Some(crate::condition::MESSAGE_NOT_FOUND),
             tracking_id,
             body: Value::Null,
         }
@@ -816,6 +827,11 @@ async fn receive_by_sequence_number<B: Broker>(
         .await
     {
         Ok(CommandOutcome::DeferredReceived(deliveries)) => {
+            // The successful command may have removed expired deferred records.
+            // Report absence only after that cleanup has committed.
+            if deliveries.is_empty() {
+                return ManagementResponse::message_not_found(message_id, tracking_id);
+            }
             let mut messages = Vec::with_capacity(deliveries.len());
             for delivery in deliveries {
                 let encoded = match encode_message(&write_delivery(&delivery)) {

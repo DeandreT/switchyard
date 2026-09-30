@@ -31,6 +31,9 @@ pub struct QueueConfig {
     /// History lifetime measured from the original accepted submission, not
     /// from the latest duplicate or a scheduled message's activation.
     pub duplicate_detection_history_time_window_millis: u64,
+    /// Expired messages are dropped by default. Enabling this moves them to
+    /// the dead-letter queue with the TTLExpiredException reason instead.
+    pub dead_lettering_on_message_expiration: bool,
 }
 
 /// Versions 1 through 5, before queues could retain duplicate-detection history.
@@ -51,7 +54,36 @@ impl From<QueueConfigV5> for QueueConfig {
             default_time_to_live_millis: config.default_time_to_live_millis,
             max_message_bytes: config.max_message_bytes,
             requires_session: config.requires_session,
+            dead_lettering_on_message_expiration: true,
             ..Self::default()
+        }
+    }
+}
+
+/// Versions 6 and 7, which always dead-lettered expired messages.
+#[derive(Deserialize)]
+struct QueueConfigV7 {
+    lock_duration_millis: u64,
+    max_delivery_count: u32,
+    default_time_to_live_millis: Option<u64>,
+    max_message_bytes: usize,
+    requires_session: bool,
+    requires_duplicate_detection: bool,
+    duplicate_detection_history_time_window_millis: u64,
+}
+
+impl From<QueueConfigV7> for QueueConfig {
+    fn from(config: QueueConfigV7) -> Self {
+        Self {
+            lock_duration_millis: config.lock_duration_millis,
+            max_delivery_count: config.max_delivery_count,
+            default_time_to_live_millis: config.default_time_to_live_millis,
+            max_message_bytes: config.max_message_bytes,
+            requires_session: config.requires_session,
+            requires_duplicate_detection: config.requires_duplicate_detection,
+            duplicate_detection_history_time_window_millis: config
+                .duplicate_detection_history_time_window_millis,
+            dead_lettering_on_message_expiration: true,
         }
     }
 }
@@ -67,20 +99,25 @@ impl Default for QueueConfig {
             requires_duplicate_detection: false,
             duplicate_detection_history_time_window_millis:
                 DEFAULT_DUPLICATE_DETECTION_WINDOW_MILLIS,
+            dead_lettering_on_message_expiration: false,
         }
     }
 }
 
 impl QueueConfig {
     /// Decodes a stored configuration, preserving older settings and keeping
-    /// duplicate detection disabled on queues that predate the feature.
+    /// duplicate detection disabled on queues that predate the feature. Legacy
+    /// queues retain their always-dead-letter expiration policy.
     pub fn decode(envelope: &[u8]) -> Result<Self, CodecError> {
         let (version, payload) = codec::split(envelope)?;
         match version {
             codec::VALUE_FORMAT_V1..=codec::VALUE_FORMAT_V5 => {
                 Ok(codec::decode_payload::<QueueConfigV5>(payload)?.into())
             }
-            codec::VALUE_FORMAT_V6 | codec::VALUE_FORMAT_V7 => codec::decode_payload(payload),
+            codec::VALUE_FORMAT_V6 | codec::VALUE_FORMAT_V7 => {
+                Ok(codec::decode_payload::<QueueConfigV7>(payload)?.into())
+            }
+            codec::VALUE_FORMAT_V8 => codec::decode_payload(payload),
             _ => unreachable!("split rejects unknown value formats"),
         }
     }
@@ -165,6 +202,7 @@ mod tests {
 
     #[test]
     fn the_default_configuration_is_valid() {
+        assert!(!QueueConfig::default().dead_lettering_on_message_expiration);
         assert_eq!(
             QueueConfig::default().validate(),
             Ok(QueueConfig::default())
@@ -228,6 +266,7 @@ mod tests {
             default_time_to_live_millis: Some(500),
             max_message_bytes: 512,
             requires_session: true,
+            dead_lettering_on_message_expiration: true,
             ..QueueConfig::default()
         };
         for version in codec::VALUE_FORMAT_V1..=codec::VALUE_FORMAT_V5 {
@@ -239,18 +278,60 @@ mod tests {
     }
 
     #[test]
-    fn configuration_round_trips_in_versions_6_and_7() -> Result<(), CodecError> {
+    fn configurations_from_versions_6_and_7_preserve_expiry_behavior() -> Result<(), CodecError> {
         let original = QueueConfig {
             requires_duplicate_detection: true,
             duplicate_detection_history_time_window_millis: MIN_DUPLICATE_DETECTION_WINDOW_MILLIS,
+            dead_lettering_on_message_expiration: true,
             ..QueueConfig::default()
         };
-        let envelope = codec::encode(&original)?;
-        assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V7));
-        assert_eq!(QueueConfig::decode(&envelope)?, original);
-        let mut old = envelope;
-        old[0] = codec::VALUE_FORMAT_V6;
-        assert_eq!(QueueConfig::decode(&old)?, original);
+        let payload = version_7_payload(&original);
+        for version in [codec::VALUE_FORMAT_V6, codec::VALUE_FORMAT_V7] {
+            let mut envelope = vec![version];
+            envelope.extend_from_slice(&payload);
+            assert_eq!(QueueConfig::decode(&envelope)?, original);
+        }
+        Ok(())
+    }
+
+    fn version_7_payload(config: &QueueConfig) -> Vec<u8> {
+        postcard::to_stdvec(&(
+            config.lock_duration_millis,
+            config.max_delivery_count,
+            config.default_time_to_live_millis,
+            config.max_message_bytes,
+            config.requires_session,
+            config.requires_duplicate_detection,
+            config.duplicate_detection_history_time_window_millis,
+        ))
+        .expect("configuration encodes")
+    }
+
+    #[test]
+    fn current_configurations_round_trip_both_expiry_policies() -> Result<(), CodecError> {
+        for policy in [false, true] {
+            let config = QueueConfig {
+                dead_lettering_on_message_expiration: policy,
+                ..QueueConfig::default()
+            };
+            let envelope = codec::encode(&config)?;
+            assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V8));
+            assert_eq!(QueueConfig::decode(&envelope)?, config);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn expiry_policy_cannot_be_silently_misread_on_rollback() -> Result<(), CodecError> {
+        let config = QueueConfig::default();
+        let mut current = codec::encode(&config)?;
+        for version in [codec::VALUE_FORMAT_V6, codec::VALUE_FORMAT_V7] {
+            current[0] = version;
+            assert_eq!(QueueConfig::decode(&current), Err(CodecError::Decode));
+        }
+        let mut old = vec![codec::VALUE_FORMAT_V8];
+        old.extend_from_slice(&version_7_payload(&config));
+        assert_eq!(QueueConfig::decode(&old), Err(CodecError::Decode));
         Ok(())
     }
 

@@ -28,6 +28,20 @@ fn queue<P: StoreProvider>(provider: P) -> Result<QueueFixture<P>, Box<dyn Error
     )?)
 }
 
+fn expiry_queue<P: StoreProvider>(provider: P) -> Result<QueueFixture<P>, Box<dyn Error>> {
+    Ok(QueueFixture::new(
+        provider,
+        "tenant",
+        "orders",
+        QueueConfig {
+            lock_duration_millis: LOCK_MILLIS,
+            max_delivery_count: 2,
+            dead_lettering_on_message_expiration: true,
+            ..QueueConfig::default()
+        },
+    )?)
+}
+
 fn send<P: StoreProvider>(
     fixture: &QueueFixture<P>,
     millis: u64,
@@ -296,6 +310,7 @@ fn renewing_a_lock_moves_its_deadline_without_changing_its_token<P: StoreProvide
         CommandOutcome::LocksExpired {
             returned_to_ready: 0,
             dead_lettered: 0,
+            dropped: 0,
         }
     );
     assert_eq!(
@@ -408,7 +423,8 @@ fn abandoning_returns_the_message_and_keeps_its_delivery_count<P: StoreProvider>
             }
         )?,
         CommandOutcome::Abandoned {
-            dead_lettered: false
+            dead_lettered: false,
+            dropped: false,
         }
     );
 
@@ -445,7 +461,8 @@ fn abandoning_at_the_delivery_limit_dead_letters_the_message<P: StoreProvider>(
             }
         )?,
         CommandOutcome::Abandoned {
-            dead_lettered: true
+            dead_lettered: true,
+            dropped: false,
         }
     );
 
@@ -478,7 +495,8 @@ fn an_elapsed_lock_returns_the_message_to_the_queue<P: StoreProvider>(
         fixture.at(locked_until.as_millis() - 1, CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 0,
-            dead_lettered: 0
+            dead_lettered: 0,
+            dropped: 0,
         }
     );
     assert_eq!(receive(&fixture, locked_until.as_millis() - 1)?, None);
@@ -487,7 +505,8 @@ fn an_elapsed_lock_returns_the_message_to_the_queue<P: StoreProvider>(
         fixture.at(locked_until.as_millis(), CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 1,
-            dead_lettered: 0
+            dead_lettered: 0,
+            dropped: 0,
         }
     );
     let redelivered = receive(&fixture, locked_until.as_millis() + 1)?
@@ -515,7 +534,8 @@ fn an_elapsed_lock_dead_letters_at_the_delivery_limit<P: StoreProvider>(
         fixture.at(second_deadline, CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 0,
-            dead_lettered: 1
+            dead_lettered: 1,
+            dropped: 0,
         }
     );
     assert_eq!(
@@ -562,7 +582,7 @@ fn receive_and_delete_removes_the_message_before_returning_it<P: StoreProvider>(
 fn the_time_to_live_sweep_dead_letters_expired_messages<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
-    let fixture = queue(provider)?;
+    let fixture = expiry_queue(provider)?;
     let sequence = fixture.at(
         10,
         CommandKind::Send {
@@ -578,11 +598,19 @@ fn the_time_to_live_sweep_dead_letters_expired_messages<P: StoreProvider>(
 
     assert_eq!(
         fixture.at(109, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            dropped: 0,
+            processed: 0,
+        }
     );
     assert_eq!(
         fixture.at(110, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            dropped: 0,
+            processed: 1,
+        }
     );
 
     let dead = fixture
@@ -600,7 +628,7 @@ fn the_time_to_live_sweep_dead_letters_expired_messages<P: StoreProvider>(
 fn a_receive_never_hands_out_an_expired_message<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
-    let fixture = queue(provider)?;
+    let fixture = expiry_queue(provider)?;
     fixture.at(
         10,
         CommandKind::Send {
@@ -754,7 +782,7 @@ fn a_deferred_message_can_be_received_and_deleted_by_sequence<P: StoreProvider>(
 fn a_deferred_message_expires_only_when_requested<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
-    let fixture = queue(provider)?;
+    let fixture = expiry_queue(provider)?;
     let sequence = match fixture.at(
         10,
         CommandKind::Send {
@@ -778,7 +806,11 @@ fn a_deferred_message_expires_only_when_requested<P: StoreProvider>(
 
     assert_eq!(
         fixture.at(110, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            dropped: 0,
+            processed: 0,
+        }
     );
     assert_eq!(
         fixture.at(

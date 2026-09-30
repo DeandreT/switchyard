@@ -600,7 +600,18 @@ fn an_abandoned_message_returns_to_its_own_session_order<P: StoreProvider>(
 fn an_expired_session_message_is_dead_lettered_out_of_its_session<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
-    let fixture = session_queue(provider)?;
+    let fixture = QueueFixture::new(
+        provider,
+        "tenant",
+        "orders",
+        QueueConfig {
+            lock_duration_millis: LOCK_MILLIS,
+            max_delivery_count: 2,
+            requires_session: true,
+            dead_lettering_on_message_expiration: true,
+            ..QueueConfig::default()
+        },
+    )?;
     fixture.at(
         10,
         CommandKind::Send {
@@ -613,7 +624,11 @@ fn an_expired_session_message_is_dead_lettered_out_of_its_session<P: StoreProvid
 
     assert_eq!(
         fixture.at(110, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            dropped: 0,
+            processed: 1,
+        }
     );
     // The sweep cleared the session's index entry, not the entity-wide one.
     assert_eq!(

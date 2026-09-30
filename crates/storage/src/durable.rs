@@ -40,13 +40,17 @@ pub const STORE_FORMAT_V5: u32 = 5;
 /// are protected until release, and deferred messages expire on retrieval.
 pub const STORE_FORMAT_V6: u32 = 6;
 
+/// Version 7: queue configurations select drop or dead-letter on expiration.
+/// Earlier builds cannot read the appended policy or enforce it.
+pub const STORE_FORMAT_V7: u32 = 7;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V6;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V7;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
@@ -325,6 +329,20 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::CorruptMetadata {
                 detail: String::from("format version record is 1 bytes, expected 4"),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_store_without_an_expiration_policy() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        stamp_format(directory.path(), &STORE_FORMAT_V6.to_be_bytes())?;
+        assert_eq!(
+            FjallStore::open(directory.path()).err(),
+            Some(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V6,
+                expected: ACTIVE_STORE_FORMAT,
             })
         );
         Ok(())

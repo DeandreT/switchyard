@@ -29,7 +29,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Receive-delete | Pre-1.0 | State machine, AMQP mapping |
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
-| Time-to-live expiry | Pre-1.0 | State machine |
+| Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
 | Topics and subscriptions | Pre-1.0 | Not implemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
@@ -100,9 +100,12 @@ behavior it currently enforces:
   lifetime, including scheduled messages. Lifetime starts at enqueue/activation.
   A live message lock protects an expired message: completion and renewal
   remain valid. Abandonment or lock expiry applies the elapsed lifetime
-  immediately, ahead of the delivery-count limit. Unlocked expired messages are
-  dead-lettered as `TTLExpiredException` by the timer or a receive that reaches
-  one first. Configurable drop-versus-dead-letter on expiry remains unfinished.
+  immediately, ahead of the delivery-count limit. Expired messages are dropped
+  by default. `dead_lettering_on_message_expiration` instead moves them to the
+  dead-letter queue as `TTLExpiredException`, whether reached by a timer,
+  receive, abandonment, or lock expiry. The flag does not affect explicit
+  dead-lettering or the delivery-count limit. Logical legacy configurations
+  retain their former always-dead-letter behavior when decoded.
 - The dead-letter queue is a queue: `entity/$deadletterqueue` is drained with
   the same receive and settlement machinery as its parent. Messages arrive
   there stripped of lifetime and session, keep their sequence numbers and the
@@ -152,6 +155,10 @@ Peeking is served through the entity's `$management` request/reply links and
 returns encoded AMQP messages without touching their broker state.
 Deferred receive is also served through `$management`, and locks returned that
 way are settled through the management `update-disposition` operation.
+Retrieving only expired deferred messages commits their cleanup before
+returning `com.microsoft:message-not-found`; missing messages are distinguished
+from a missing queue. Dead-letter management paths normalize the reserved
+suffix in the same way as receiving links, including the SDK's mixed-case form.
 Modified outcomes carry application-property updates; SDK dead-letter outcomes
 carry the reason, description and updates in their error information. Management
 settlement accepts `properties-to-modify` and promotes reserved dead-letter
@@ -251,7 +258,7 @@ projected canonical dead-letter fields. These bounds implement the documented
 quota sizes conservatively; exact Azure byte accounting and AMQP wire-size
 parity remain unverified.
 
-The current value format is version 7 and durable store layout is version 6.
+The current value format is version 8 and durable store layout is version 7.
 Earlier message and queue-configuration shapes have tested decoders, but an
 earlier store directory is refused at open because its broker contract differs.
 There is no directory migration tooling yet; development directories

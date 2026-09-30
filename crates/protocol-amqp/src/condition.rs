@@ -17,6 +17,7 @@ pub const RESOURCE_LOCKED: &str = "amqp:resource-locked";
 pub const MESSAGE_SIZE_EXCEEDED: &str = "amqp:link:message-size-exceeded";
 
 pub const MESSAGE_LOCK_LOST: &str = "com.microsoft:message-lock-lost";
+pub const MESSAGE_NOT_FOUND: &str = "com.microsoft:message-not-found";
 pub const SESSION_LOCK_LOST: &str = "com.microsoft:session-lock-lost";
 pub const SESSION_CANNOT_BE_LOCKED: &str = "com.microsoft:session-cannot-be-locked";
 pub const ENTITY_ALREADY_EXISTS: &str = "com.microsoft:entity-already-exists";
@@ -26,10 +27,10 @@ pub const TIMEOUT: &str = "com.microsoft:timeout";
 /// The condition symbol to report `error` as.
 pub fn condition_for(error: &BrokerError) -> &'static str {
     match error {
-        BrokerError::QueueNotFound
-        | BrokerError::MessageNotFound { .. }
-        | BrokerError::MessageNotDeferred { .. }
-        | BrokerError::MessageNotScheduled { .. } => NOT_FOUND,
+        BrokerError::QueueNotFound | BrokerError::MessageNotScheduled { .. } => NOT_FOUND,
+        BrokerError::MessageNotFound { .. } | BrokerError::MessageNotDeferred { .. } => {
+            MESSAGE_NOT_FOUND
+        }
         BrokerError::QueueAlreadyExists => ENTITY_ALREADY_EXISTS,
 
         // The client's claim on the message is gone. Saying so precisely is what
@@ -107,6 +108,23 @@ mod tests {
         ] {
             assert_eq!(condition_for(&error), MESSAGE_LOCK_LOST, "{error}");
         }
+    }
+
+    #[test]
+    fn missing_messages_are_distinct_from_missing_entities() {
+        let sequence = SequenceNumber::new(1);
+        for error in [
+            BrokerError::MessageNotFound { sequence },
+            BrokerError::MessageNotDeferred { sequence },
+        ] {
+            assert_eq!(condition_for(&error), MESSAGE_NOT_FOUND, "{error}");
+            assert!(!is_retryable(&error));
+        }
+        assert_eq!(condition_for(&BrokerError::QueueNotFound), NOT_FOUND);
+        assert_eq!(
+            condition_for(&BrokerError::MessageNotScheduled { sequence }),
+            NOT_FOUND
+        );
     }
 
     #[test]

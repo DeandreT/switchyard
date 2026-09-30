@@ -349,7 +349,7 @@ impl From<MessageRecordV1> for MessageRecord {
 impl MessageRecord {
     /// Decodes a stored message, migrating an older record on the way.
     ///
-    /// Messages are the one record whose shape has changed, so they decode
+    /// Message records gained fields across several formats, so they decode
     /// through here rather than through the shape-stable [`codec::decode`].
     pub fn decode(envelope: &[u8]) -> Result<Self, CodecError> {
         let (version, payload) = codec::split(envelope)?;
@@ -362,7 +362,7 @@ impl MessageRecord {
             codec::VALUE_FORMAT_V5 | codec::VALUE_FORMAT_V6 => {
                 Ok(codec::decode_payload::<MessageRecordV6>(payload)?.into())
             }
-            codec::VALUE_FORMAT_V7 => codec::decode_payload(payload),
+            codec::VALUE_FORMAT_V7 | codec::VALUE_FORMAT_V8 => codec::decode_payload(payload),
             _ => unreachable!("split rejects unknown value formats"),
         }
     }
@@ -497,8 +497,11 @@ mod tests {
             ..record(None)
         };
         let envelope = codec::encode(&original)?;
-        assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V7));
+        assert_eq!(envelope.first(), Some(&codec::ACTIVE_VALUE_FORMAT));
         assert_eq!(MessageRecord::decode(&envelope)?, original);
+        let mut previous = envelope;
+        previous[0] = codec::VALUE_FORMAT_V7;
+        assert_eq!(MessageRecord::decode(&previous)?, original);
         Ok(())
     }
 
@@ -601,7 +604,7 @@ mod tests {
             ..record(None)
         };
         let envelope = codec::encode(&original).expect("encodes");
-        assert_eq!(envelope[0], codec::VALUE_FORMAT_V7);
+        assert_eq!(envelope[0], codec::ACTIVE_VALUE_FORMAT);
         assert_eq!(MessageRecord::decode(&envelope), Ok(original));
     }
 

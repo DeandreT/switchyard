@@ -122,7 +122,13 @@ fn a_sweep_returns_a_message_whose_lock_elapsed<P: StoreProvider>(
 fn a_sweep_dead_letters_a_message_past_its_time_to_live<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
-    let runtime = Runtime::new(provider, queue_config())?;
+    let runtime = Runtime::new(
+        provider,
+        QueueConfig {
+            dead_lettering_on_message_expiration: true,
+            ..queue_config()
+        },
+    )?;
     runtime.send("perishable", Some(100))?;
 
     runtime.clock.advance(99);
@@ -237,7 +243,13 @@ fn a_sweep_never_moves_the_applied_clock_backward<P: StoreProvider>(
 fn a_sweep_activates_scheduled_messages_and_starts_their_ttl<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
-    let runtime = Runtime::new(provider, queue_config())?;
+    let runtime = Runtime::new(
+        provider,
+        QueueConfig {
+            dead_lettering_on_message_expiration: true,
+            ..queue_config()
+        },
+    )?;
     runtime.propose(CommandKind::Schedule {
         messages: vec![ScheduledMessage {
             message_id: String::from("scheduled"),
@@ -345,6 +357,128 @@ fn a_sweep_prunes_duplicate_history_without_consuming_messages<P: StoreProvider>
     Ok(())
 }
 
+fn one_sweep_drops_a_ready_backlog_larger_than_a_single_command<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let runtime = Runtime::new(provider, queue_config())?;
+    assert!(!queue_config().dead_lettering_on_message_expiration);
+    let backlog = TIMER_SCAN_LIMIT + 1;
+    for index in 0..backlog {
+        runtime.send(&format!("drop-{index}"), Some(100))?;
+    }
+    runtime.clock.advance(100);
+    assert_eq!(
+        runtime.sweep()?,
+        SweepReport {
+            queues_swept: 2,
+            messages_dropped: backlog as u32,
+            ..SweepReport::default()
+        }
+    );
+    assert!(runtime.sweep()?.is_idle());
+    assert_eq!(runtime.receive()?, None);
+    assert_eq!(
+        runtime.handle.submit_blocking(
+            runtime.namespace.clone(),
+            runtime.entity.dead_letter_queue()?,
+            CommandKind::Receive {
+                mode: ReceiveMode::ReceiveAndDelete,
+                lock_duration_millis: None,
+                session: None,
+            },
+        )?,
+        CommandOutcome::Received(None)
+    );
+    Ok(())
+}
+
+fn one_sweep_counts_ready_and_lock_expiry_drops_without_reaping_live_locks<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let runtime = Runtime::new(provider, queue_config())?;
+    runtime.send("expired-held", Some(100))?;
+    let expired = runtime.receive()?.expect("locked perishable message");
+    runtime.send("live-held", None)?;
+    let live = runtime.receive()?.expect("locked unbounded message");
+    runtime.send("expired-ready", Some(100))?;
+    runtime.clock.advance(100);
+    assert_eq!(
+        runtime.sweep()?,
+        SweepReport {
+            queues_swept: 2,
+            messages_dropped: 1,
+            ..SweepReport::default()
+        }
+    );
+    assert_eq!(runtime.receive()?, None);
+    let deadline = expired.lock.expect("perishable lock").locked_until;
+    assert_eq!(live.lock.expect("unbounded lock").locked_until, deadline);
+    runtime.clock.set(deadline.as_millis());
+    assert_eq!(
+        runtime.sweep()?,
+        SweepReport {
+            queues_swept: 2,
+            locks_returned_to_ready: 1,
+            messages_dropped: 1,
+            ..SweepReport::default()
+        }
+    );
+    let redelivered = runtime
+        .receive()?
+        .expect("only the unbounded message returns");
+    assert_eq!(redelivered.sequence, live.sequence);
+    assert_eq!(redelivered.message_id, "live-held");
+    assert_eq!(redelivered.delivery_count, 2);
+    assert_eq!(runtime.receive()?, None);
+    Ok(())
+}
+
+fn one_sweep_drops_a_lock_backlog_larger_than_a_single_command<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let runtime = Runtime::new(provider, queue_config())?;
+    let backlog = TIMER_SCAN_LIMIT + 1;
+    let mut deadline = None;
+    for index in 0..backlog {
+        runtime.send(&format!("locked-drop-{index}"), Some(100))?;
+        let delivery = runtime.receive()?.expect("a perishable message is ready");
+        let locked_until = delivery
+            .lock
+            .expect("the receive was peek-lock")
+            .locked_until;
+        if let Some(previous) = deadline {
+            assert_eq!(locked_until, previous);
+        }
+        deadline = Some(locked_until);
+    }
+    runtime
+        .clock
+        .set(deadline.expect("the backlog is nonempty").as_millis());
+    assert_eq!(
+        runtime.sweep()?,
+        SweepReport {
+            queues_swept: 2,
+            messages_dropped: backlog as u32,
+            ..SweepReport::default()
+        }
+    );
+    assert!(runtime.sweep()?.is_idle());
+    assert_eq!(runtime.receive()?, None);
+    assert_eq!(
+        runtime.handle.submit_blocking(
+            runtime.namespace.clone(),
+            runtime.entity.dead_letter_queue()?,
+            CommandKind::Receive {
+                mode: ReceiveMode::ReceiveAndDelete,
+                lock_duration_millis: None,
+                session: None,
+            },
+        )?,
+        CommandOutcome::Received(None)
+    );
+    Ok(())
+}
+
 // ---- instantiation ---------------------------------------------------------
 
 macro_rules! for_each_backend {
@@ -378,4 +512,7 @@ for_each_backend! {
     a_sweep_activates_scheduled_messages_and_starts_their_ttl,
     a_sweep_drains_a_scheduled_backlog_in_bounded_batches,
     a_sweep_prunes_duplicate_history_without_consuming_messages,
+    one_sweep_drops_a_ready_backlog_larger_than_a_single_command,
+    one_sweep_counts_ready_and_lock_expiry_drops_without_reaping_live_locks,
+    one_sweep_drops_a_lock_backlog_larger_than_a_single_command,
 }

@@ -195,6 +195,45 @@ if (deadLetter?.Body.ToString() != "official-direct-dead-letter-current"
 }
 await deadLetterReceiver.CompleteMessageAsync(deadLetter);
 
+await sender.SendMessageAsync(new ServiceBusMessage("official-expired-deferred-current")
+{
+    TimeToLive = TimeSpan.FromSeconds(5),
+});
+ServiceBusReceivedMessage? expiringDeferred =
+    await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(5));
+if (expiringDeferred?.Body.ToString() != "official-expired-deferred-current")
+{
+    Console.Error.WriteLine("the expiring deferred source was not received");
+    return 32;
+}
+await receiver.DeferMessageAsync(expiringDeferred);
+TimeSpan untilExpired = expiringDeferred.ExpiresAt.AddMilliseconds(250) - DateTimeOffset.UtcNow;
+if (untilExpired > TimeSpan.Zero)
+{
+    await Task.Delay(untilExpired);
+}
+if ((await receiver.PeekMessageAsync(expiringDeferred.SequenceNumber))?.State
+    != ServiceBusMessageState.Deferred)
+{
+    Console.Error.WriteLine("an expired deferred message disappeared before retrieval");
+    return 33;
+}
+try
+{
+    await receiver.ReceiveDeferredMessageAsync(expiringDeferred.SequenceNumber);
+    Console.Error.WriteLine("an expired deferred message was delivered");
+    return 34;
+}
+catch (ServiceBusException error) when (error.Reason == ServiceBusFailureReason.MessageNotFound)
+{
+}
+if (await receiver.PeekMessageAsync(expiringDeferred.SequenceNumber) is not null
+    || await deadLetterReceiver.PeekMessageAsync(expiringDeferred.SequenceNumber) is not null)
+{
+    Console.Error.WriteLine("default expiration did not remove the deferred message");
+    return 35;
+}
+
 DateTimeOffset cancelEnqueueTime = DateTimeOffset.UtcNow.AddMinutes(1);
 long cancelledSequence = await sender.ScheduleMessageAsync(
     new ServiceBusMessage("official-cancelled-current"), cancelEnqueueTime);
@@ -468,7 +507,7 @@ if (await receiver.PeekMessageAsync(fromSequenceNumber: 1) is not null
 }
 
 Console.WriteLine(
-    "official .NET Service Bus client send/peek/receive/settlement updates/defer/dead-letter/renew/complete/schedule/cancel/duplicate and session renew/state passed");
+    "official .NET Service Bus client send/peek/receive/settlement updates/defer/dead-letter/expiry/renew/complete/schedule/cancel/duplicate and session renew/state passed");
 return 0;
 
 static Dictionary<string, object> PreservedApplicationProperties() => new()

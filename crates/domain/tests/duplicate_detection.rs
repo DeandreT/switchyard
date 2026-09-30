@@ -215,7 +215,15 @@ fn consuming_a_message_does_not_forget_its_history<P: StoreProvider>(
 fn expired_messages_leave_duplicate_history_in_the_parent_only<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
-    let fixture = queue(provider)?;
+    let fixture = QueueFixture::new(
+        provider,
+        "tenant",
+        "orders",
+        QueueConfig {
+            dead_lettering_on_message_expiration: true,
+            ..config()
+        },
+    )?;
     let CommandOutcome::Sent { sequence } = fixture.at(
         10,
         CommandKind::Send {
@@ -230,7 +238,11 @@ fn expired_messages_leave_duplicate_history_in_the_parent_only<P: StoreProvider>
     };
     assert_eq!(
         fixture.at(11, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            dropped: 0,
+            processed: 1,
+        }
     );
     send(&fixture, 12, "same-id", b"dropped")?;
     assert_eq!(receive(&fixture, 13)?, None);
@@ -860,6 +872,7 @@ fn stored_legacy_configurations_are_migrated_on_the_machine_read_path<P: StorePr
         lock_duration_millis: 20_000,
         max_delivery_count: 3,
         default_time_to_live_millis: Some(500),
+        dead_lettering_on_message_expiration: true,
         max_message_bytes: 512,
         requires_session: true,
         ..QueueConfig::default()

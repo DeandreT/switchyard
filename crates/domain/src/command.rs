@@ -232,6 +232,7 @@ pub enum CommandOutcome {
     Completed,
     Abandoned {
         dead_lettered: bool,
+        dropped: bool,
     },
     DeadLettered,
     Deferred,
@@ -242,9 +243,13 @@ pub enum CommandOutcome {
     LocksExpired {
         returned_to_ready: u32,
         dead_lettered: u32,
+        dropped: u32,
     },
     MessagesExpired {
         dead_lettered: u32,
+        dropped: u32,
+        /// Due index entries consumed, including repairs of legacy entries.
+        processed: u32,
     },
     /// `None` when no session was available to accept.
     SessionAccepted(Option<AcceptedSession>),

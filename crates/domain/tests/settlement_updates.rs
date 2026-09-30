@@ -147,7 +147,8 @@ fn rich_updates_survive_abandon_defer_and_restart_without_changing_other_content
     assert_eq!(
         settle(&fixture, 12, &first, SettlementDisposition::Abandon, patch)?,
         CommandOutcome::Abandoned {
-            dead_lettered: false
+            dead_lettered: false,
+            dropped: false,
         }
     );
     let fixture = fixture.restart()?;
@@ -496,6 +497,7 @@ fn updates_are_applied_before_automatic_ttl_and_delivery_limit_dead_lettering<P:
         "orders",
         QueueConfig {
             max_delivery_count: 1,
+            dead_lettering_on_message_expiration: true,
             ..QueueConfig::default()
         },
     )?;
@@ -518,7 +520,8 @@ fn updates_are_applied_before_automatic_ttl_and_delivery_limit_dead_lettering<P:
                 patch
             )?,
             CommandOutcome::Abandoned {
-                dead_lettered: true
+                dead_lettered: true,
+                dropped: false,
             }
         );
         let dead = receive(&fixture, start + 7, true)?;
@@ -584,6 +587,7 @@ fn broker_dead_letter_metadata_does_not_spend_the_retained_value_node_budget<P: 
         "orders",
         QueueConfig {
             max_delivery_count: 1,
+            dead_lettering_on_message_expiration: true,
             ..QueueConfig::default()
         },
     )?;
@@ -603,7 +607,11 @@ fn broker_dead_letter_metadata_does_not_spend_the_retained_value_node_budget<P: 
         if ttl.is_some() {
             assert_eq!(
                 fixture.at(start + 6, CommandKind::ExpireMessages)?,
-                CommandOutcome::MessagesExpired { dead_lettered: 1 }
+                CommandOutcome::MessagesExpired {
+                    dead_lettered: 1,
+                    dropped: 0,
+                    processed: 1,
+                }
             );
         } else {
             let delivery = receive(&fixture, start + 1, false)?;
@@ -616,7 +624,8 @@ fn broker_dead_letter_metadata_does_not_spend_the_retained_value_node_budget<P: 
                     Updates::new(),
                 )?,
                 CommandOutcome::Abandoned {
-                    dead_lettered: true
+                    dead_lettered: true,
+                    dropped: false,
                 }
             );
         }
@@ -719,6 +728,7 @@ fn maximum_ingress_header_reserve_already_covers_automatic_dead_letter_propertie
         "orders",
         QueueConfig {
             max_delivery_count: 1,
+            dead_lettering_on_message_expiration: true,
             ..QueueConfig::default()
         },
     )?;
@@ -754,7 +764,11 @@ fn maximum_ingress_header_reserve_already_covers_automatic_dead_letter_propertie
         if ttl.is_some() {
             assert_eq!(
                 fixture.at(start + 6, CommandKind::ExpireMessages)?,
-                CommandOutcome::MessagesExpired { dead_lettered: 1 }
+                CommandOutcome::MessagesExpired {
+                    dead_lettered: 1,
+                    dropped: 0,
+                    processed: 1,
+                }
             );
         } else {
             let delivery = receive(&fixture, start + 1, false)?;
@@ -767,7 +781,8 @@ fn maximum_ingress_header_reserve_already_covers_automatic_dead_letter_propertie
                     Updates::new(),
                 )?,
                 CommandOutcome::Abandoned {
-                    dead_lettered: true
+                    dead_lettered: true,
+                    dropped: false,
                 }
             );
         }

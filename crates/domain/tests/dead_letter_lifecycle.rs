@@ -19,6 +19,7 @@ fn queue<P: StoreProvider>(provider: P) -> Result<QueueFixture<P>, Box<dyn Error
         QueueConfig {
             lock_duration_millis: LOCK_MILLIS,
             max_delivery_count: 1,
+            dead_lettering_on_message_expiration: true,
             ..QueueConfig::default()
         },
     )?)
@@ -164,7 +165,8 @@ fn abandoning_in_the_dead_letter_queue_never_cascades<P: StoreProvider>(
                 }
             )?,
             CommandOutcome::Abandoned {
-                dead_lettered: false
+                dead_lettered: false,
+                dropped: false,
             }
         );
     }
@@ -189,7 +191,8 @@ fn an_elapsed_lock_in_the_dead_letter_queue_returns_the_message<P: StoreProvider
         at_dlq(&fixture, deadline, CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 1,
-            dead_lettered: 0
+            dead_lettered: 0,
+            dropped: 0,
         }
     );
     assert!(receive_dlq(&fixture, deadline + 1)?.is_some());
@@ -214,11 +217,19 @@ fn the_dead_letter_queue_ignores_time_to_live<P: StoreProvider>(
     // however far time runs on.
     assert_eq!(
         fixture.at(110, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            dropped: 0,
+            processed: 1,
+        }
     );
     assert_eq!(
         at_dlq(&fixture, u64::MAX / 2, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            dropped: 0,
+            processed: 0,
+        }
     );
     let delivery = receive_dlq(&fixture, u64::MAX / 2 + 1)?.expect("still deliverable");
     assert_eq!(
@@ -240,6 +251,7 @@ fn a_session_message_dead_letters_out_of_its_session<P: StoreProvider>(
         "orders",
         QueueConfig {
             requires_session: true,
+            dead_lettering_on_message_expiration: true,
             ..QueueConfig::default()
         },
     )?;

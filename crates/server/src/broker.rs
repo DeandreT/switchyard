@@ -103,7 +103,10 @@ fn makes_deliverable(outcome: &CommandOutcome) -> bool {
         CommandOutcome::Sent { .. } => true,
         CommandOutcome::Scheduled { .. } => true,
         CommandOutcome::ScheduledActivated { activated } => *activated > 0,
-        CommandOutcome::Abandoned { dead_lettered } => !dead_lettered,
+        CommandOutcome::Abandoned {
+            dead_lettered,
+            dropped,
+        } => !dead_lettered && !dropped,
         CommandOutcome::LocksExpired {
             returned_to_ready, ..
         } => *returned_to_ready > 0,
@@ -116,9 +119,9 @@ fn makes_deliverable(outcome: &CommandOutcome) -> bool {
 fn makes_dead_letters_deliverable(outcome: &CommandOutcome) -> bool {
     match outcome {
         CommandOutcome::DeadLettered => true,
-        CommandOutcome::Abandoned { dead_lettered } => *dead_lettered,
+        CommandOutcome::Abandoned { dead_lettered, .. } => *dead_lettered,
         CommandOutcome::LocksExpired { dead_lettered, .. }
-        | CommandOutcome::MessagesExpired { dead_lettered } => *dead_lettered > 0,
+        | CommandOutcome::MessagesExpired { dead_lettered, .. } => *dead_lettered > 0,
         _ => false,
     }
 }
@@ -405,21 +408,38 @@ mod tests {
             (
                 CommandOutcome::Abandoned {
                     dead_lettered: true,
+                    dropped: false,
                 },
                 true,
             ),
             (
                 CommandOutcome::Abandoned {
                     dead_lettered: false,
+                    dropped: false,
                 },
                 false,
             ),
-            (CommandOutcome::MessagesExpired { dead_lettered: 1 }, true),
-            (CommandOutcome::MessagesExpired { dead_lettered: 0 }, false),
+            (
+                CommandOutcome::MessagesExpired {
+                    dead_lettered: 1,
+                    dropped: 0,
+                    processed: 1,
+                },
+                true,
+            ),
+            (
+                CommandOutcome::MessagesExpired {
+                    dead_lettered: 0,
+                    dropped: 1,
+                    processed: 1,
+                },
+                false,
+            ),
             (
                 CommandOutcome::LocksExpired {
                     returned_to_ready: 0,
                     dead_lettered: 1,
+                    dropped: 0,
                 },
                 true,
             ),
@@ -427,6 +447,7 @@ mod tests {
                 CommandOutcome::LocksExpired {
                     returned_to_ready: 1,
                     dead_lettered: 0,
+                    dropped: 0,
                 },
                 false,
             ),
@@ -434,6 +455,16 @@ mod tests {
         ] {
             assert_eq!(makes_dead_letters_deliverable(&outcome), expected);
         }
+    }
+
+    #[test]
+    fn dropping_an_expired_message_does_not_wake_a_receiver() {
+        let outcome = CommandOutcome::Abandoned {
+            dead_lettered: false,
+            dropped: true,
+        };
+        assert!(!makes_deliverable(&outcome));
+        assert!(!makes_dead_letters_deliverable(&outcome));
     }
 
     #[tokio::test]

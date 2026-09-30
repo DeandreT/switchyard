@@ -285,6 +285,7 @@ fn lifetime_starts_at_activation_not_scheduling<P: StoreProvider>(
         "orders",
         QueueConfig {
             default_time_to_live_millis: Some(50),
+            dead_lettering_on_message_expiration: true,
             ..QueueConfig::default()
         },
     )?;
@@ -301,7 +302,11 @@ fn lifetime_starts_at_activation_not_scheduling<P: StoreProvider>(
     )?;
     assert_eq!(
         fixture.at(200, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            dropped: 0,
+            processed: 0,
+        }
     );
     for handle in handles {
         let record = fixture
@@ -325,7 +330,11 @@ fn lifetime_starts_at_activation_not_scheduling<P: StoreProvider>(
     assert_eq!(shorter.expires_at, Some(Timestamp::from_millis(225)));
     assert_eq!(
         fixture.at(225, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            dropped: 0,
+            processed: 1,
+        }
     );
     let dead = fixture
         .machine

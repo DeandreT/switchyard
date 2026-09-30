@@ -34,7 +34,11 @@ pub const VALUE_FORMAT_V6: u8 = 6;
 /// retain their version 6 shape.
 pub const VALUE_FORMAT_V7: u8 = 7;
 
-pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V7;
+/// Appends the expired-message dead-letter policy to queue configurations.
+/// Message records retain their version 7 shape.
+pub const VALUE_FORMAT_V8: u8 = 8;
+
+pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V8;
 
 /// Encodes a value into a versioned envelope.
 ///
@@ -132,6 +136,7 @@ mod tests {
             VALUE_FORMAT_V5,
             VALUE_FORMAT_V6,
             VALUE_FORMAT_V7,
+            VALUE_FORMAT_V8,
         ] {
             let mut envelope = vec![version];
             envelope.extend_from_slice(&payload);
