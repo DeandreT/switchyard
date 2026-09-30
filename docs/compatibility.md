@@ -137,6 +137,11 @@ a rejection or a bound rather than a silent difference:
 The `server` crate's timer worker proposes scheduled activation, lock,
 time-to-live, session-lock, and duplicate-history sweeps on an interval, so a
 running node activates what is due and releases or prunes what has elapsed.
+Queue discovery uses exclusive keyset pages of at most 1,024 configurations,
+including dead-letter shadows. A retained cursor visits later pages on later
+sweeps and wraps at the end; one queue's failed command does not permanently
+pin the worker ahead of all following queues. Each queue index gets at most
+eight bounded command rounds per sweep.
 
 An AMQP 1.0 client can reach a queue. The node accepts AMQP over TLS with the
 socket secured before the protocol handshake, as Service Bus port 5671

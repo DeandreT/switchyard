@@ -211,9 +211,13 @@ pause timers and fail readiness until an operator resolves the condition.
 The worker that exists today sweeps scheduled activation, lock-expiry, TTL,
 session-lock, and duplicate-history indexes. Activation gives a scheduled
 message a new active sequence, records the actual enqueue time, and starts its TTL at that time.
-One sweep command processes a
-bounded number of entries, so the worker re-proposes until an index reports less
-than a full batch, and a backlog on one queue cannot starve the rest of the tick.
+Each sweep visits at most 1,024 queue configurations, including dead-letter
+shadows, in exclusive key order. The worker retains its cursor between sweeps
+and wraps after the final page, so later queues are not starved by earlier ones.
+One sweep command processes a bounded number of entries, and the worker
+re-proposes at most eight times per index before moving on. It advances past a
+queue before attempting its commands; a failed queue is revisited after the
+cursor wraps rather than preventing every later queue from being swept.
 Time reaches the state machine only through the proposer, which stamps each
 command: a host clock that steps back a little holds the applied timestamp still
 rather than regressing it, and one that steps back further has the command

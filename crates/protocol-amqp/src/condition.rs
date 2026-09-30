@@ -55,9 +55,10 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         BrokerError::MessageTooLarge { .. }
         | BrokerError::MessagePropertyTooLarge { .. }
         | BrokerError::MessageHeaderTooLarge { .. } => MESSAGE_SIZE_EXCEEDED,
-        BrokerError::MessageIdTooLong { .. } | BrokerError::InvalidMessageContent { .. } => {
-            INVALID_FIELD
-        }
+        BrokerError::MessageIdTooLong { .. }
+        | BrokerError::InvalidMessageContent { .. }
+        | BrokerError::QueuePageLimitExceeded { .. }
+        | BrokerError::QueueCursorNamespaceMismatch { .. } => INVALID_FIELD,
         BrokerError::QueueConfig(_) => PRECONDITION_FAILED,
 
         // The node's clock disagrees with what it already applied. A client
@@ -166,6 +167,23 @@ mod tests {
         };
         assert_eq!(condition_for(&error), INVALID_FIELD);
         assert!(!is_retryable(&error));
+    }
+
+    #[test]
+    fn invalid_queue_page_queries_are_non_retryable_client_errors() {
+        for error in [
+            BrokerError::QueuePageLimitExceeded {
+                limit: 1_025,
+                maximum: 1_024,
+            },
+            BrokerError::QueueCursorNamespaceMismatch {
+                namespace: domain::NamespaceName::new("tenant").expect("namespace"),
+                cursor_namespace: domain::NamespaceName::new("other").expect("namespace"),
+            },
+        ] {
+            assert_eq!(condition_for(&error), INVALID_FIELD);
+            assert!(!is_retryable(&error));
+        }
     }
 
     #[test]

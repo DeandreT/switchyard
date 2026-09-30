@@ -32,7 +32,8 @@ pub use identifier::{
     PlacementGroupId, SessionId,
 };
 pub use machine::{
-    BROKER_HEADER_RESERVE_BYTES, MAX_DEAD_LETTER_DETAIL_LENGTH, StateMachine, TIMER_SCAN_LIMIT,
+    BROKER_HEADER_RESERVE_BYTES, MAX_DEAD_LETTER_DETAIL_LENGTH, MAX_QUEUE_PAGE_SIZE, QueueCursor,
+    QueuePage, StateMachine, TIMER_SCAN_LIMIT,
 };
 pub use message::{
     DeadLetterInfo, DeadLetterReason, Delivery, DeliveryGuarantee, DeliveryLock, LockToken,

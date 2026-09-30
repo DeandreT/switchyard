@@ -51,6 +51,24 @@ const BROKER_BASE_HEADER_RESERVE_BYTES: usize = 256;
 /// SDK dead-letter reason and description limits, measured in UTF-16 units.
 pub const MAX_DEAD_LETTER_DETAIL_LENGTH: usize = 4_096;
 
+/// Configurations inspected by one queue page, excluding its single lookahead.
+pub const MAX_QUEUE_PAGE_SIZE: usize = 1_024;
+
+/// Exclusive position in the queue-configuration key order. The named queue
+/// need not still exist when the next page is requested.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueCursor {
+    pub namespace: NamespaceName,
+    pub entity: EntityPath,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuePage {
+    pub queues: Vec<(NamespaceName, EntityPath)>,
+    /// The last returned queue, only when the page has more entries after it.
+    pub continuation: Option<QueueCursor>,
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ExpirationOutcome {
     Dropped,
@@ -438,6 +456,77 @@ impl<S: StateStore> StateMachine<S> {
                 Ok((NamespaceName::new(namespace)?, EntityPath::new(entity)?))
             })
             .collect()
+    }
+
+    /// One bounded keyset page of queue configurations, including DLQ shadows.
+    /// Pages reflect their individual reads, not a frozen cross-page snapshot.
+    pub fn queues_page(
+        &self,
+        namespace: Option<&NamespaceName>,
+        after: Option<&QueueCursor>,
+        limit: usize,
+    ) -> Result<QueuePage, BrokerError> {
+        if limit > MAX_QUEUE_PAGE_SIZE {
+            return Err(BrokerError::QueuePageLimitExceeded {
+                limit,
+                maximum: MAX_QUEUE_PAGE_SIZE,
+            });
+        }
+        if let (Some(namespace), Some(after)) = (namespace, after)
+            && namespace != &after.namespace
+        {
+            return Err(BrokerError::QueueCursorNamespaceMismatch {
+                namespace: namespace.clone(),
+                cursor_namespace: after.namespace.clone(),
+            });
+        }
+        if limit == 0 {
+            return Ok(QueuePage {
+                queues: Vec::new(),
+                continuation: None,
+            });
+        }
+
+        let prefix = namespace.map_or_else(
+            keys::queue_config_prefix,
+            keys::namespace_queue_config_prefix,
+        );
+        let start = after.map_or_else(
+            || prefix.clone(),
+            |after| {
+                let mut start = keys::queue_config(&after.namespace, &after.entity);
+                start.push(0);
+                start
+            },
+        );
+        let records = self.store.scan_from(&prefix, &start, limit + 1)?;
+        let has_more = records.len() > limit;
+        let queues = records
+            .into_iter()
+            .take(limit)
+            .map(|(key, _)| {
+                let (namespace, entity) =
+                    keys::entity_scope_parts(&key).ok_or(BrokerError::MalformedIndexKey)?;
+                let namespace = NamespaceName::new(namespace)?;
+                let entity = EntityPath::new(entity)?;
+                if keys::queue_config(&namespace, &entity) != key {
+                    return Err(BrokerError::MalformedIndexKey);
+                }
+                Ok((namespace, entity))
+            })
+            .collect::<Result<Vec<_>, BrokerError>>()?;
+        let continuation = if has_more {
+            queues.last().map(|(namespace, entity)| QueueCursor {
+                namespace: namespace.clone(),
+                entity: entity.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(QueuePage {
+            queues,
+            continuation,
+        })
     }
 
     pub fn message(

@@ -84,6 +84,14 @@ pub fn queue_config_prefix() -> Vec<u8> {
     vec![TAG_QUEUE_CONFIG]
 }
 
+/// Queue configurations in exactly one namespace, without neighboring names.
+pub fn namespace_queue_config_prefix(namespace: &NamespaceName) -> Vec<u8> {
+    let mut prefix = queue_config_prefix();
+    prefix.extend_from_slice(namespace.as_str().as_bytes());
+    prefix.push(SEPARATOR);
+    prefix
+}
+
 /// Reads the namespace and entity path back out of an entity-scoped key.
 pub fn entity_scope_parts(key: &[u8]) -> Option<(&str, &str)> {
     let rest = key.get(1..)?;

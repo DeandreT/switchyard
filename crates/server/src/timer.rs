@@ -13,14 +13,16 @@ use std::{
     time::Duration,
 };
 
-use domain::{CommandKind, CommandOutcome, EntityPath, NamespaceName, TIMER_SCAN_LIMIT};
+use domain::{
+    CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueCursor, TIMER_SCAN_LIMIT,
+};
 use tracing::{debug, warn};
 
 use crate::{BrokerHandle, ProposeError, SubmitError};
 
-/// Queues one sweep will visit. A store with more than this is swept in the
-/// order its keys sort, and the rest wait for the next tick.
-pub const MAX_QUEUES_PER_SWEEP: usize = 1_024;
+/// Queues one sweep will visit. Successive sweeps page through key order and
+/// wrap at the end, so every queue gets a turn.
+pub const MAX_QUEUES_PER_SWEEP: usize = domain::MAX_QUEUE_PAGE_SIZE;
 
 /// Times one sweep will re-propose against a single index before moving on.
 ///
@@ -57,31 +59,50 @@ impl SweepReport {
 
 pub struct TimerWorker<'a> {
     broker: &'a BrokerHandle,
+    cursor: Mutex<Option<QueueCursor>>,
 }
 
 impl<'a> TimerWorker<'a> {
     pub fn new(broker: &'a BrokerHandle) -> Self {
-        Self { broker }
+        Self {
+            broker,
+            cursor: Mutex::new(None),
+        }
     }
 
-    /// Proposes deadline commands for every queue in the store.
+    /// Proposes deadline commands for the next bounded page of queues.
     ///
     /// An error abandons the rest of the sweep. Each command was atomic, so what
     /// already applied stands and the next tick resumes from there.
     pub fn sweep_once(&self) -> Result<SweepReport, SubmitError> {
-        let queues = self.broker.queues_blocking(MAX_QUEUES_PER_SWEEP)?;
-        let mut report = SweepReport {
-            queues_swept: queues.len(),
-            ..SweepReport::default()
-        };
+        let mut cursor = self
+            .cursor
+            .lock()
+            .expect("the timer cursor lock is not poisoned");
+        let mut page =
+            self.broker
+                .queues_page_blocking(None, cursor.clone(), MAX_QUEUES_PER_SWEEP)?;
+        if page.queues.is_empty() && cursor.is_some() {
+            page = self
+                .broker
+                .queues_page_blocking(None, None, MAX_QUEUES_PER_SWEEP)?;
+        }
+        let mut report = SweepReport::default();
 
-        for (namespace, entity) in queues {
+        for (namespace, entity) in page.queues {
+            // A failed queue must not pin discovery to this page forever.
+            *cursor = Some(QueueCursor {
+                namespace: namespace.clone(),
+                entity: entity.clone(),
+            });
+            report.queues_swept += 1;
             self.activate_scheduled(&namespace, &entity, &mut report)?;
             self.expire_locks(&namespace, &entity, &mut report)?;
             self.expire_messages(&namespace, &entity, &mut report)?;
             self.expire_session_locks(&namespace, &entity, &mut report)?;
             self.expire_duplicate_history(&namespace, &entity, &mut report)?;
         }
+        *cursor = page.continuation;
         Ok(report)
     }
 

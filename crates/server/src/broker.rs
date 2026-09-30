@@ -21,7 +21,9 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use domain::{CommandKind, CommandOutcome, EntityPath, NamespaceName, Timestamp};
+use domain::{
+    CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueCursor, QueuePage, Timestamp,
+};
 use storage::StateStore;
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -49,6 +51,12 @@ enum Request {
     ListQueues {
         limit: usize,
         reply: flume::Sender<Result<Vec<(NamespaceName, EntityPath)>, ProposeError>>,
+    },
+    ListQueuesPage {
+        namespace: Option<NamespaceName>,
+        after: Option<QueueCursor>,
+        limit: usize,
+        reply: flume::Sender<Result<QueuePage, ProposeError>>,
     },
     /// The highest timestamp the machine has applied. Readiness and
     /// diagnostics need it, and it is what a caller compares its own clock
@@ -213,6 +221,52 @@ impl BrokerHandle {
             .map_err(|_| SubmitError::BrokerStopped)?
             .map_err(SubmitError::Propose)
     }
+
+    /// One exclusive page of queues, optionally scoped to a namespace.
+    pub fn queues_page_blocking(
+        &self,
+        namespace: Option<NamespaceName>,
+        after: Option<QueueCursor>,
+        limit: usize,
+    ) -> Result<QueuePage, SubmitError> {
+        let (reply, queues) = flume::bounded(1);
+        self.requests
+            .send(Request::ListQueuesPage {
+                namespace,
+                after,
+                limit,
+                reply,
+            })
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        queues
+            .recv()
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
+
+    /// Discovers a queue page without blocking the caller's executor.
+    pub async fn queues_page(
+        &self,
+        namespace: Option<NamespaceName>,
+        after: Option<QueueCursor>,
+        limit: usize,
+    ) -> Result<QueuePage, SubmitError> {
+        let (reply, queues) = flume::bounded(1);
+        self.requests
+            .send_async(Request::ListQueuesPage {
+                namespace,
+                after,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        queues
+            .recv_async()
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
 }
 
 /// The owner thread, and the handle onto it.
@@ -256,6 +310,18 @@ impl Broker {
                         Request::ListQueues { limit, reply } => {
                             let _ = reply
                                 .send(proposer.machine().queues(limit).map_err(ProposeError::from));
+                        }
+                        Request::ListQueuesPage {
+                            namespace,
+                            after,
+                            limit,
+                            reply,
+                        } => {
+                            let _ = reply.send(proposer.queues_page(
+                                namespace.as_ref(),
+                                after.as_ref(),
+                                limit,
+                            ));
                         }
                         Request::LastApplied { reply } => {
                             let _ = reply.send(

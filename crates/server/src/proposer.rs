@@ -7,8 +7,8 @@
 //! replication rather than after it.
 
 use domain::{
-    BrokerError, Command, CommandKind, CommandOutcome, EntityPath, NamespaceName, StateMachine,
-    Timestamp,
+    BrokerError, Command, CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueCursor,
+    QueuePage, StateMachine, Timestamp,
 };
 use storage::StateStore;
 use thiserror::Error;
@@ -44,6 +44,16 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
 
     pub fn machine(&self) -> &StateMachine<S> {
         &self.machine
+    }
+
+    /// Reads one queue page without stamping a replicated command.
+    pub fn queues_page(
+        &self,
+        namespace: Option<&NamespaceName>,
+        after: Option<&QueueCursor>,
+        limit: usize,
+    ) -> Result<QueuePage, ProposeError> {
+        Ok(self.machine.queues_page(namespace, after, limit)?)
     }
 
     /// Stamps `kind` with the current time and applies it.

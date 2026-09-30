@@ -1,7 +1,10 @@
 use storage::StorageError;
 use thiserror::Error;
 
-use crate::{CodecError, IdentifierError, QueueConfigError, SequenceNumber, SessionId, Timestamp};
+use crate::{
+    CodecError, IdentifierError, NamespaceName, QueueConfigError, SequenceNumber, SessionId,
+    Timestamp,
+};
 
 /// Every rejection the state machine can produce.
 ///
@@ -13,6 +16,15 @@ pub enum BrokerError {
     QueueNotFound,
     #[error("queue already exists")]
     QueueAlreadyExists,
+    #[error("queue page limit {limit} exceeds the maximum of {maximum}")]
+    QueuePageLimitExceeded { limit: usize, maximum: usize },
+    #[error(
+        "queue cursor namespace {cursor_namespace} does not match requested namespace {namespace}"
+    )]
+    QueueCursorNamespaceMismatch {
+        namespace: NamespaceName,
+        cursor_namespace: NamespaceName,
+    },
     #[error("message {sequence} does not exist")]
     MessageNotFound { sequence: SequenceNumber },
     #[error("message {sequence} is not locked")]
