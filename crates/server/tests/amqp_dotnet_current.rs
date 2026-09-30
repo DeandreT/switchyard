@@ -98,6 +98,30 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
             },
         },
     )?;
+    for (path, config) in [
+        ("orders-batches", QueueConfig::default()),
+        (
+            "sessions-batches",
+            QueueConfig {
+                requires_session: true,
+                ..QueueConfig::default()
+            },
+        ),
+        (
+            "duplicates-batches",
+            QueueConfig {
+                requires_duplicate_detection: true,
+                duplicate_detection_history_time_window_millis: 300_000,
+                ..QueueConfig::default()
+            },
+        ),
+    ] {
+        broker.handle().submit_blocking(
+            namespace.clone(),
+            domain::EntityPath::new(path)?,
+            CommandKind::CreateQueue { config },
+        )?;
+    }
     let _timer = TestTimer::start(broker.handle());
 
     let rule = SharedAccessRule::new(
