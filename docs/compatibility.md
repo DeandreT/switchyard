@@ -71,6 +71,16 @@ behavior it currently enforces:
   removes the scheduled record and deadline entry atomically; it rejects a
   missing or already-active handle. Exact Azure behavior for those rejected
   cancellation cases has not yet been verified.
+- The core has a separate atomic ingress-batch command. Every member retains
+  its own properties, identifier, session, lifetime, and optional scheduling
+  timestamp. The complete batch is validated before staging content, shares
+  duplicate history across its members, and commits counters and records once.
+  A later validation, allocation, or storage failure leaves no partial batch.
+  It accepts at most 1,024 messages, 65,536 retained value items, and 4 MiB of
+  retained content, including the compatibility body and normalized identifiers.
+  Session queues require every member to name the same session. An empty batch
+  validates its target but writes nothing. These are local resource bounds;
+  the SDK batch-send wire format is not supported yet.
 - A queue can enable duplicate detection by message ID, with a 10-minute
   default history window bounded to 20 seconds through 7 days. A duplicate
   send is accepted and dropped, and history survives completion, dead-lettering,
@@ -189,6 +199,22 @@ when application dispatch or a socket write is blocked. Explicit shutdown waits
 for both tasks to terminate before releasing the listener's admission slot.
 These are Switchyard resource policies, not Azure quotas. Connection-wide
 message-allocation budgets are not yet enforced.
+Open advertises a 60-second receive-idle interval by default, with an actual
+120-second complete-frame silence deadline, following the
+[AMQP idle-timeout recommendation](https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html#doc-idle-timeout).
+The peer's independent interval drives outgoing heartbeats at half its value;
+ordinary complete writes also satisfy that direction. An omitted or zero peer
+interval disables those heartbeats, while zero in the local configuration
+disables only the local receive-silence check. Positive intervals below one
+second are refused. Complete valid frames, including empty frames on unbound
+valid channels, refresh receive activity; partial prefixes or bodies do not.
+Each frame's complete write and flush has a separate five-second local limit,
+shortened by the peer's remaining interval. Local options can configure both
+limits; zero write duration is immediate refusal, not unlimited. Independent
+watchdogs enforce silence and Close deadlines even when dispatch or transport
+writes are blocked. A partial or interrupted write drops the transport without
+appending Close or retrying the partially emitted frame. No heartbeat is sent
+before Open or after Close.
 AMQP Open frames are limited to the initial 512-byte transport maximum. After
 Open, the server advertises and enforces its own 262,144-byte receive maximum,
 independent of the peer's receive limit. Oversized frames are rejected from the
@@ -205,7 +231,8 @@ session Flow, and consume only one link credit per message. Flow echo, drain,
 optional credit, wrapping counts, and early second-mode dispositions have raw
 transport regressions. Every outgoing frame is checked against the peer's frame
 cap before writing bytes. Connection-wide outbound byte budgets, asymmetric
-channel/handle routing, and idle heartbeat negotiation remain unfinished.
+channel/handle routing, and incoming unsettled identity collision checks remain
+unfinished.
 First transfers require an explicit delivery ID, binary tag, and message format.
 Tags may be empty but cannot exceed 32 bytes. Continuations may omit identity
 fields, but repeated ID, tag, and format values must match the first fragment;
@@ -215,6 +242,13 @@ explicitly refused with `amqp:not-implemented`, not stored as ordinary message
 content. SDK batch sending remains a separate gap. Incoming unsettled identity
 collision checks and link resumption are not implemented by these fragment
 consistency checks.
+Message decoding can share one cumulative allocation allowance across embedded
+messages: at most 132,096 parsed values and 4 MiB of copied string, symbol, and
+binary content, with depth bounded independently for each value. Array members
+and repeated named descriptors are charged before allocation. Scheduling
+management requests share that inner allowance and reject more than 1,024
+members before decoding them. These bounds do not provide a connection-wide
+memory limit and are not Azure batch quotas.
 If a peer detaches a link while application approval is outstanding, a bounded
 canceled-approval tombstone refuses early handle reuse until that approval returns
 an error. Canceled approvals count toward the 32 pending link approvals allowed
