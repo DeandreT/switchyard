@@ -24,13 +24,13 @@ fn transfer(handle: u32, id: Option<u32>, more: bool) -> Transfer {
 }
 
 fn session_state() -> SessionState {
-    SessionState {
-        attach_tx: None,
-        links: HashMap::new(),
-        closing_handles: HashSet::new(),
-        pending_flows: HashMap::new(),
-        next_outgoing_id: 0,
-    }
+    SessionState::new(&Begin::default())
+}
+
+fn receiving_credit() -> ReceiveCredit {
+    let mut credit = ReceiveCredit::new(0, 1, Arc::new(Consumption::new(Arc::new(Notify::new()))));
+    credit.take_refill();
+    credit
 }
 
 fn receiver_attach(handle: u32, maximum: Option<u64>, mode: SenderSettleMode) -> Attach {
@@ -61,7 +61,7 @@ async fn next_frame(peer: &mut DuplexStream) -> Frame {
 
 async fn accept_sender(
     sessions: &mut HashMap<u16, SessionState>,
-    wire: &mut DuplexStream,
+    wire: &mut FrameWriter<DuplexStream>,
     peer: &mut DuplexStream,
     handle: u32,
     maximum: Option<u64>,
@@ -73,8 +73,18 @@ async fn accept_sender(
         channel: CHANNEL,
         commands,
         incoming_attaches,
+        consumed: Arc::new(Notify::new()),
     };
-    let accepting = session.accept_attach(receiver_attach(handle, maximum, mode), 1_024);
+    let requested = receiver_attach(handle, maximum, mode);
+    sessions
+        .get_mut(&CHANNEL)
+        .expect("session fixture")
+        .pending_attaches
+        .insert(
+            handle,
+            PendingLinkFlow::new(requested.role.clone(), requested.initial_delivery_count),
+        );
+    let accepting = session.accept_attach(requested, 1_024);
     let applying = async {
         let command = command_rx.recv().await.expect("accept command");
         handle_command(command, wire, sessions, u32::MAX)
@@ -97,7 +107,7 @@ async fn accept_sender(
 
 async fn send(
     sessions: &mut HashMap<u16, SessionState>,
-    wire: &mut DuplexStream,
+    wire: &mut FrameWriter<DuplexStream>,
     handle: u32,
     message: Message,
 ) -> oneshot::Receiver<Result<SendOutcome, EngineError>> {
@@ -106,7 +116,7 @@ async fn send(
 
 async fn send_with_frame_limit(
     sessions: &mut HashMap<u16, SessionState>,
-    wire: &mut DuplexStream,
+    wire: &mut FrameWriter<DuplexStream>,
     handle: u32,
     message: Message,
     maximum_frame_size: u32,
@@ -126,17 +136,23 @@ async fn send_with_frame_limit(
     )
     .await
     .expect("a rejected send does not stop the connection");
+    let mut cursor = 0;
+    while pump_connection(wire, sessions, &mut cursor)
+        .await
+        .expect("bounded send pump")
+    {}
     response
 }
 
 #[tokio::test]
 async fn peer_limit_applies_to_the_whole_encoded_message_across_smaller_transfer_frames() {
-    let message = Message::data(vec![8; 80]);
+    let message = Message::data(vec![8; 1_024]);
     let encoded = encode_message(&message).expect("valid message");
     let length = encoded.len() as u64;
-    let maximum_frame_size = FRAME_OVERHEAD_RESERVE as u32 + 8;
+    let maximum_frame_size = 512;
     for maximum in [length, length - 1] {
-        let (mut wire, mut peer) = tokio::io::duplex(64 * 1_024);
+        let (wire, mut peer) = tokio::io::duplex(64 * 1_024);
+        let mut wire = FrameWriter::new(wire, maximum_frame_size).expect("frame writer");
         let mut sessions = HashMap::from([(CHANNEL, session_state())]);
         let _sender = accept_sender(
             &mut sessions,
@@ -162,7 +178,7 @@ async fn peer_limit_applies_to_the_whole_encoded_message_across_smaller_transfer
                 response.await.expect("oversize response"),
                 Err(EngineError::MessageSizeExceeded { .. })
             ));
-            assert_eq!(sessions[&CHANNEL].next_outgoing_id, 0);
+            assert_eq!(sessions[&CHANNEL].next_delivery_id, 0);
             continue;
         }
         let mut assembled = Vec::new();
@@ -177,7 +193,16 @@ async fn peer_limit_applies_to_the_whole_encoded_message_across_smaller_transfer
                 panic!("a fitting message emits transfer fragments");
             };
             assert_eq!(transfer.delivery_id, (frame_count == 0).then_some(0));
-            assert!(payload.len() <= 8);
+            assert!(
+                crate::encode_frame(&Frame::Amqp {
+                    channel: CHANNEL,
+                    performative: Some(Performative::Transfer(transfer.clone())),
+                    payload: payload.clone()
+                })
+                .expect("frame encoding")
+                .len()
+                    <= maximum_frame_size as usize
+            );
             assembled.extend_from_slice(&payload);
             frame_count += 1;
             if !transfer.more {
@@ -199,12 +224,16 @@ async fn peer_limit_applies_to_the_whole_encoded_message_across_smaller_transfer
 
 async fn grant_credit(
     sessions: &mut HashMap<u16, SessionState>,
-    wire: &mut DuplexStream,
+    wire: &mut FrameWriter<DuplexStream>,
     handle: u32,
 ) {
     apply_flow(
         CHANNEL,
         Flow {
+            next_incoming_id: Some(sessions[&CHANNEL].flow.snapshot().next_outgoing_id),
+            incoming_window: SESSION_WINDOW,
+            next_outgoing_id: sessions[&CHANNEL].flow.snapshot().next_incoming_id,
+            outgoing_window: SESSION_WINDOW,
             handle: Some(handle),
             delivery_count: Some(0),
             link_credit: Some(1),
@@ -246,7 +275,8 @@ async fn advertised_none_and_zero_are_unlimited_and_exact_encoded_size_is_accept
     let encoded = encode_message(&message).expect("valid message");
     let length = encoded.len() as u64;
     for maximum in [None, Some(0), Some(length)] {
-        let (mut wire, mut peer) = tokio::io::duplex(64 * 1_024);
+        let (wire, mut peer) = tokio::io::duplex(64 * 1_024);
+        let mut wire = FrameWriter::new(wire, u32::MAX).expect("frame writer");
         let mut sessions = HashMap::from([(CHANNEL, session_state())]);
         let sender = accept_sender(
             &mut sessions,
@@ -291,7 +321,8 @@ async fn oversized_sends_detach_only_the_link_before_credit_or_delivery_ids_are_
     let length = encode_message(&message).expect("valid message").len() as u64;
     for mode in [SenderSettleMode::Unsettled, SenderSettleMode::Settled] {
         for credit_available in [false, true] {
-            let (mut wire, mut peer) = tokio::io::duplex(64 * 1_024);
+            let (wire, mut peer) = tokio::io::duplex(64 * 1_024);
+            let mut wire = FrameWriter::new(wire, u32::MAX).expect("frame writer");
             let mut sessions = HashMap::from([(CHANNEL, session_state())]);
             let mut oversized = accept_sender(
                 &mut sessions,
@@ -326,7 +357,7 @@ async fn oversized_sends_detach_only_the_link_before_credit_or_delivery_ids_are_
             timeout(Duration::from_secs(2), oversized.on_detach())
                 .await
                 .expect("the sender observes its link detach");
-            assert_eq!(sessions[&CHANNEL].next_outgoing_id, 0);
+            assert_eq!(sessions[&CHANNEL].next_delivery_id, 0);
             assert!(!sessions[&CHANNEL].links.contains_key(&0));
             assert!(sessions[&CHANNEL].links.contains_key(&1));
 
@@ -357,7 +388,8 @@ async fn oversized_sends_detach_only_the_link_before_credit_or_delivery_ids_are_
 
 #[tokio::test]
 async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stopping_other_links() {
-    let (mut wire, mut peer) = tokio::io::duplex(64 * 1_024);
+    let (wire, mut peer) = tokio::io::duplex(64 * 1_024);
+    let mut wire = FrameWriter::new(wire, u32::MAX).expect("frame writer");
     let (deliveries, mut received) = mpsc::channel(1);
     let (detached, mut detached_rx) = watch::channel(false);
     let mut session = session_state();
@@ -368,6 +400,7 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
             deliveries,
             partial: None,
             detached,
+            credit: receiving_credit(),
         }),
     );
     let (healthy_tx, mut healthy_rx) = mpsc::channel(1);
@@ -379,6 +412,7 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
             deliveries: healthy_tx,
             partial: None,
             detached: healthy_detached,
+            credit: receiving_credit(),
         }),
     );
     let mut sessions = HashMap::from([(CHANNEL, session)]);
@@ -412,18 +446,6 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
     )
     .await
     .expect("a continuation can cross the link detach");
-    assert!(
-        receive_transfer(
-            CHANNEL,
-            transfer(77, Some(2), false),
-            Vec::new(),
-            &mut sessions,
-            &mut wire,
-        )
-        .await
-        .is_err(),
-        "a never-attached handle is not mistaken for a crossing transfer"
-    );
     let (deliveries_tx, _) = mpsc::channel(1);
     let (detached_tx, _) = watch::channel(false);
     let (reply, response) = oneshot::channel();
@@ -435,6 +457,7 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
             properties: None,
             deliveries_tx,
             detached_tx,
+            consumption: Arc::new(Consumption::new(Arc::new(Notify::new()))),
             reply,
         },
         &mut wire,
@@ -486,6 +509,26 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
     assert_eq!(
         healthy_rx.recv().await.expect("healthy delivery").message,
         message
+    );
+    receive_transfer(
+        CHANNEL,
+        transfer(77, Some(2), false),
+        Vec::new(),
+        &mut sessions,
+        &mut wire,
+    )
+    .await
+    .expect("unknown handle refuses its session");
+    assert!(matches!(
+        next_frame(&mut peer).await,
+        Frame::Amqp {
+            performative: Some(Performative::End(_)),
+            ..
+        }
+    ));
+    assert!(
+        sessions[&CHANNEL].ending,
+        "unknown handles are not treated as crossing transfers"
     );
 }
 
@@ -663,13 +706,19 @@ mod client_tests {
     async fn close_client(connection: &ClientConnection, peer: &mut DuplexStream) {
         let closing = connection.close();
         let responding = async {
-            assert!(matches!(
-                next_frame(peer).await,
-                Frame::Amqp {
-                    performative: Some(Performative::Close(_)),
-                    ..
+            loop {
+                match next_frame(peer).await {
+                    Frame::Amqp {
+                        performative: Some(Performative::Close(_)),
+                        ..
+                    } => break,
+                    Frame::Amqp {
+                        performative: Some(Performative::Flow(_)),
+                        ..
+                    } => {}
+                    frame => panic!("expected close or consumption refill, got {frame:?}"),
                 }
-            ));
+            }
             write_amqp(peer, 0, Performative::Close(Close::default()), Vec::new())
                 .await
                 .expect("peer close");
@@ -700,13 +749,18 @@ mod client_tests {
         );
         raw_transfer(&mut peer, handle, 1, vec![0; 3], true).await;
         raw_transfer(&mut peer, handle, 1, vec![0; encoded.len() - 2], false).await;
-        let frame = next_frame(&mut peer).await;
-        let Frame::Amqp {
-            performative: Some(Performative::Detach(detach)),
-            ..
-        } = frame
-        else {
-            panic!("bounded link detach");
+        let detach = loop {
+            match next_frame(&mut peer).await {
+                Frame::Amqp {
+                    performative: Some(Performative::Detach(detach)),
+                    ..
+                } => break detach,
+                Frame::Amqp {
+                    performative: Some(Performative::Flow(_)),
+                    ..
+                } => {}
+                frame => panic!("expected bounded detach or consumption refill, got {frame:?}"),
+            }
         };
         assert_eq!(detach.handle, handle);
         assert_eq!(
@@ -810,6 +864,9 @@ mod client_tests {
             &mut peer,
             0,
             Performative::Flow(Flow {
+                next_incoming_id: Some(0),
+                incoming_window: SESSION_WINDOW,
+                outgoing_window: SESSION_WINDOW,
                 handle: Some(handle),
                 delivery_count: Some(0),
                 link_credit: Some(1),

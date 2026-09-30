@@ -119,6 +119,10 @@ impl<B: Broker> AmqpListener<B> {
                 debug!(%peer, "connection refused: admission limit reached");
                 continue;
             };
+            if let Err(error) = stream.set_nodelay(true) {
+                warn!(%peer, %error, "connection refused: could not configure TCP");
+                continue;
+            }
             let deadline = tokio::time::Instant::now()
                 .checked_add(self.handshake_timeout)
                 .ok_or_else(|| {
