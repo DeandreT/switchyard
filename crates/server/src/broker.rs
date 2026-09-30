@@ -70,37 +70,93 @@ enum Request {
 /// Wakes the links waiting on an entity when a command makes it worth asking
 /// again.
 ///
-/// One notify per entity, permit-style: a notification with nobody waiting is
-/// kept and satisfies the next waiter immediately, which is what closes the gap
-/// between a receive that found nothing and the wait that follows it.
+/// One notify per registered entity, permit-style. Registration precedes the
+/// receive, so a notification before polling the wait remains available. The
+/// last waiting future removes the entry when it completes or is canceled.
 #[derive(Debug, Default)]
 struct Watchers {
-    entities: Mutex<HashMap<(NamespaceName, EntityPath), Arc<Notify>>>,
+    entities: Mutex<HashMap<(NamespaceName, EntityPath), EntityWaiters>>,
+}
+
+#[derive(Debug, Default)]
+struct EntityWaiters {
+    notify: Arc<Notify>,
+    waiter_count: usize,
+}
+
+struct EntityWatch {
+    watchers: Arc<Watchers>,
+    key: (NamespaceName, EntityPath),
+    notify: Arc<Notify>,
+}
+
+impl EntityWatch {
+    async fn wait(self) {
+        self.notify.notified().await;
+    }
+}
+
+impl Drop for EntityWatch {
+    fn drop(&mut self) {
+        let mut entities = self
+            .watchers
+            .entities
+            .lock()
+            .expect("the watcher lock is not poisoned");
+        let entry = entities
+            .get_mut(&self.key)
+            .expect("a live watch has an entity registration");
+        entry.waiter_count -= 1;
+        if entry.waiter_count == 0 {
+            entities.remove(&self.key);
+        }
+    }
 }
 
 impl Watchers {
-    fn watch(&self, namespace: &NamespaceName, entity: &EntityPath) -> Arc<Notify> {
+    fn watch(self: &Arc<Self>, namespace: &NamespaceName, entity: &EntityPath) -> EntityWatch {
+        let key = (namespace.clone(), entity.clone());
         let mut entities = self
             .entities
             .lock()
             .expect("the watcher lock is not poisoned");
-        Arc::clone(
-            entities
-                .entry((namespace.clone(), entity.clone()))
-                .or_default(),
-        )
+        let entry = entities.entry(key.clone()).or_default();
+        entry.waiter_count += 1;
+        EntityWatch {
+            watchers: Arc::clone(self),
+            key,
+            notify: Arc::clone(&entry.notify),
+        }
     }
 
     fn notify(&self, namespace: &NamespaceName, entity: &EntityPath) {
-        let entities = self
+        let notify = self
             .entities
             .lock()
-            .expect("the watcher lock is not poisoned");
-        // Nothing is created here: an entity nobody has ever waited on needs no
-        // notification.
-        if let Some(notify) = entities.get(&(namespace.clone(), entity.clone())) {
+            .expect("the watcher lock is not poisoned")
+            .get(&(namespace.clone(), entity.clone()))
+            .map(|entry| Arc::clone(&entry.notify));
+        // Waking a waiter can drop its registration, which takes the map lock.
+        if let Some(notify) = notify {
             notify.notify_one();
         }
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.entities
+            .lock()
+            .expect("the watcher lock is not poisoned")
+            .len()
+    }
+
+    #[cfg(test)]
+    fn waiter_count(&self, namespace: &NamespaceName, entity: &EntityPath) -> usize {
+        self.entities
+            .lock()
+            .expect("the watcher lock is not poisoned")
+            .get(&(namespace.clone(), entity.clone()))
+            .map_or(0, |entry| entry.waiter_count)
     }
 }
 
@@ -376,8 +432,7 @@ impl protocol_amqp::Broker for BrokerHandle {
         namespace: &NamespaceName,
         entity: &EntityPath,
     ) -> impl std::future::Future<Output = ()> + Send {
-        let notify = self.watchers.watch(namespace, entity);
-        async move { notify.notified().await }
+        self.watchers.watch(namespace, entity).wait()
     }
 
     async fn submit(
@@ -407,7 +462,7 @@ pub enum SubmitError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, future::Future, task::Poll, time::Duration};
 
     use domain::{QueueConfig, SequenceNumber, StateMachine};
     use protocol_amqp::Broker as _;
@@ -682,5 +737,173 @@ mod tests {
             }
         );
         Ok(())
+    }
+
+    #[test]
+    fn dropping_thousands_of_unpolled_entity_waits_removes_every_entry() {
+        let broker = broker();
+        let handle = broker.handle();
+        let namespace = NamespaceName::new("tenant").expect("namespace");
+        let entities = (0..4_096)
+            .map(|index| EntityPath::new(format!("missing-{index}")).expect("entity"))
+            .collect::<Vec<_>>();
+        let waiting = entities
+            .iter()
+            .map(|entity| handle.deliverable(&namespace, entity))
+            .collect::<Vec<_>>();
+        assert_eq!(handle.watchers.entry_count(), 4_096);
+        assert_eq!(handle.watchers.waiter_count(&namespace, &entities[0]), 1);
+        drop(waiting);
+        assert_eq!(handle.watchers.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn shared_entity_waits_keep_the_entry_and_its_notification() {
+        let watchers = Arc::new(Watchers::default());
+        let (namespace, entity) = names();
+        let first = watchers.watch(&namespace, &entity);
+        let second = watchers.watch(&namespace, &entity);
+        assert!(Arc::ptr_eq(&first.notify, &second.notify));
+        assert_eq!(watchers.entry_count(), 1);
+        assert_eq!(watchers.waiter_count(&namespace, &entity), 2);
+        drop(first);
+        assert_eq!(watchers.entry_count(), 1);
+        assert_eq!(watchers.waiter_count(&namespace, &entity), 1);
+        watchers.notify(&namespace, &entity);
+        tokio::time::timeout(Duration::from_millis(250), second.wait())
+            .await
+            .expect("the remaining registration retains the permit");
+        assert_eq!(watchers.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_fulfilled_protocol_wait_removes_its_registration() -> Result<(), SubmitError> {
+        let broker = broker();
+        let handle = broker.handle();
+        let (namespace, entity) = names();
+        let waiting = handle.deliverable(&namespace, &entity);
+        assert_eq!(handle.watchers.entry_count(), 1);
+        send(&handle, "ready-before-poll")?;
+        tokio::time::timeout(Duration::from_millis(250), waiting)
+            .await
+            .expect("registration precedes the receive and the first poll");
+        assert_eq!(handle.watchers.entry_count(), 0);
+        send(&handle, "no-current-waiter")?;
+        assert_eq!(handle.watchers.entry_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canceling_a_polled_wait_removes_only_its_registration() {
+        let broker = broker();
+        let handle = broker.handle();
+        let (namespace, entity) = names();
+        let retained = handle.deliverable(&namespace, &entity);
+        let mut canceled = Box::pin(handle.deliverable(&namespace, &entity));
+        std::future::poll_fn(|context| {
+            assert!(canceled.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(handle.watchers.waiter_count(&namespace, &entity), 2);
+        drop(canceled);
+        assert_eq!(handle.watchers.entry_count(), 1);
+        assert_eq!(handle.watchers.waiter_count(&namespace, &entity), 1);
+        handle.watchers.notify(&namespace, &entity);
+        tokio::time::timeout(Duration::from_millis(250), retained)
+            .await
+            .expect("canceling one wait does not discard the other wait's notification");
+        assert_eq!(handle.watchers.entry_count(), 0);
+    }
+
+    #[test]
+    fn a_failed_receive_can_drop_its_unpolled_registration() {
+        let broker = broker();
+        let handle = broker.handle();
+        let namespace = NamespaceName::new("tenant").expect("namespace");
+        let entity = EntityPath::new("missing").expect("entity");
+        let waiting = handle.deliverable(&namespace, &entity);
+        assert_eq!(handle.watchers.entry_count(), 1);
+        assert_eq!(
+            handle.submit_blocking(
+                namespace.clone(),
+                entity.clone(),
+                CommandKind::Receive {
+                    mode: domain::ReceiveMode::PeekLock,
+                    lock_duration_millis: None,
+                    session: None,
+                },
+            ),
+            Err(SubmitError::Propose(ProposeError::Broker(
+                domain::BrokerError::QueueNotFound
+            )))
+        );
+        drop(waiting);
+        assert_eq!(handle.watchers.entry_count(), 0);
+    }
+
+    #[test]
+    fn notifications_without_registrations_never_create_entries() {
+        let watchers = Arc::new(Watchers::default());
+        let namespace = NamespaceName::new("tenant").expect("namespace");
+        for index in 0..4_096 {
+            let entity = EntityPath::new(format!("missing-{index}")).expect("entity");
+            watchers.notify(&namespace, &entity);
+        }
+        assert_eq!(watchers.entry_count(), 0);
+    }
+
+    #[test]
+    fn a_reentrant_wake_can_drop_another_registration() {
+        use std::task::{Context, Wake, Waker};
+
+        struct CancelOnWake(Mutex<Option<EntityWatch>>);
+
+        impl Wake for CancelOnWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                drop(self.0.lock().expect("registration").take());
+            }
+        }
+
+        let watchers = Arc::new(Watchers::default());
+        let (namespace, entity) = names();
+        let mut waiting = Box::pin(watchers.watch(&namespace, &entity).wait());
+        let wake = Arc::new(CancelOnWake(Mutex::new(Some(
+            watchers.watch(&namespace, &entity),
+        ))));
+        let waker = Waker::from(wake);
+        let mut context = Context::from_waker(&waker);
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        assert_eq!(watchers.waiter_count(&namespace, &entity), 2);
+        watchers.notify(&namespace, &entity);
+        assert_eq!(watchers.waiter_count(&namespace, &entity), 1);
+        assert!(waiting.as_mut().poll(&mut context).is_ready());
+        drop(waiting);
+        assert_eq!(watchers.entry_count(), 0);
+    }
+
+    #[test]
+    fn concurrent_registration_and_cancellation_leave_no_entries() {
+        let watchers = Arc::new(Watchers::default());
+        let (namespace, entity) = names();
+        thread::scope(|scope| {
+            for _ in 0..8 {
+                let watchers = Arc::clone(&watchers);
+                let namespace = &namespace;
+                let entity = &entity;
+                scope.spawn(move || {
+                    for _ in 0..256 {
+                        let waiting = watchers.watch(namespace, entity).wait();
+                        watchers.notify(namespace, entity);
+                        drop(waiting);
+                    }
+                });
+            }
+        });
+        assert_eq!(watchers.entry_count(), 0);
     }
 }
