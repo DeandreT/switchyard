@@ -70,6 +70,14 @@ pub enum SettlementDisposition {
     DeadLetter { reason: String, description: String },
 }
 
+/// Conservative content budget for a batch delivery. The protocol edge
+/// reserves its response wrapper separately and supplies each entry's overhead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeliveryBudget {
+    pub max_bytes: u64,
+    pub per_message_overhead_bytes: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandKind {
@@ -205,6 +213,23 @@ pub enum CommandKind {
         lock_token: LockToken,
         disposition: SettlementDisposition,
         properties_to_modify: BTreeMap<String, MessageValue>,
+    },
+    /// Retrieves an atomic batch only when all inspected messages, including
+    /// expired messages cleaned up by the receive, fit the delivery budget.
+    ReceiveDeferredBounded {
+        sequences: Vec<SequenceNumber>,
+        mode: ReceiveMode,
+        lock_duration_millis: Option<u64>,
+        session_id: Option<SessionId>,
+        budget: DeliveryBudget,
+    },
+    /// Browses a fitting prefix while reading at most one stored message at
+    /// a time. An oversized first result is rejected rather than omitted.
+    PeekBounded {
+        from_sequence: SequenceNumber,
+        max_messages: u32,
+        session_id: Option<SessionId>,
+        budget: DeliveryBudget,
     },
 }
 

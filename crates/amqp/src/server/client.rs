@@ -45,6 +45,7 @@ pub struct ClientReceiverBuilder {
     source: Option<Source>,
     target: Option<Target>,
     sender_settle_mode: SenderSettleMode,
+    max_message_size: Option<u64>,
 }
 
 impl ClientConnection {
@@ -196,6 +197,7 @@ impl ClientSession {
                 receiver_settle_mode: ReceiverSettleMode::First,
                 source: None,
                 target: Some(target),
+                max_message_size: None,
             }),
             deliveries_tx,
             detached_tx,
@@ -232,6 +234,18 @@ impl ClientSession {
         target: Option<Target>,
         sender_settle_mode: SenderSettleMode,
     ) -> Result<ClientReceiver, EngineError> {
+        self.attach_receiver_with_limit(name, source, target, sender_settle_mode, None)
+            .await
+    }
+
+    async fn attach_receiver_with_limit(
+        &mut self,
+        name: impl Into<String>,
+        source: Source,
+        target: Option<Target>,
+        sender_settle_mode: SenderSettleMode,
+        max_message_size: Option<u64>,
+    ) -> Result<ClientReceiver, EngineError> {
         let name = name.into();
         let (deliveries_tx, deliveries) = mpsc::channel(32);
         let (detached_tx, detached) = watch::channel(false);
@@ -244,6 +258,7 @@ impl ClientSession {
                 receiver_settle_mode: ReceiverSettleMode::First,
                 source: Some(source),
                 target,
+                max_message_size,
             }),
             deliveries_tx,
             detached_tx,
@@ -316,6 +331,7 @@ impl ClientReceiver {
             source: None,
             target: None,
             sender_settle_mode: SenderSettleMode::Unsettled,
+            max_message_size: None,
         }
     }
 
@@ -418,13 +434,20 @@ impl ClientReceiverBuilder {
         self
     }
 
+    /// Advertises the encoded-message limit; zero leaves the link unlimited.
+    pub fn max_message_size(mut self, maximum: u64) -> Self {
+        self.max_message_size = Some(maximum);
+        self
+    }
+
     pub async fn attach(self, session: &mut ClientSession) -> Result<ClientReceiver, EngineError> {
         session
-            .attach_receiver_with(
+            .attach_receiver_with_limit(
                 self.name.unwrap_or_else(|| String::from("receiver")),
                 self.source.unwrap_or_default(),
                 self.target,
                 self.sender_settle_mode,
+                self.max_message_size,
             )
             .await
     }
@@ -449,6 +472,7 @@ struct AttachRequest {
     receiver_settle_mode: ReceiverSettleMode,
     source: Option<Source>,
     target: Option<Target>,
+    max_message_size: Option<u64>,
 }
 
 enum ClientCommand {
@@ -554,6 +578,12 @@ where
                     Performative::Attach(attach) => {
                         let attach = *attach;
                         if let Some(pending) = pending_attaches.remove(&attach.name) {
+                            if let Some(LinkState::Sending(link)) = sessions
+                                .get_mut(&channel)
+                                .and_then(|session| session.links.get_mut(&pending.handle))
+                            {
+                                link.max_message_size = normalized_message_size(attach.max_message_size);
+                            }
                             if attach.role == Role::Sender {
                                 write_amqp(
                                     &mut writer,
@@ -586,7 +616,7 @@ where
                         Ok(false)
                     }
                     Performative::Transfer(transfer) => {
-                        receive_transfer(channel, transfer, payload, &mut sessions).await?;
+                        receive_transfer(channel, transfer, payload, &mut sessions, &mut writer).await?;
                         Ok(false)
                     }
                     Performative::Disposition(disposition) => {
@@ -594,15 +624,18 @@ where
                         Ok(false)
                     }
                     Performative::Detach(detach) => {
-                        let locally_initiated = pending_detaches.remove(&(channel, detach.handle));
+                        let local_reply = pending_detaches.remove(&(channel, detach.handle));
+                        let locally_closing = sessions
+                            .get_mut(&channel)
+                            .is_some_and(|session| session.closing_handles.remove(&detach.handle));
                         if let Some(session) = sessions.get_mut(&channel)
                             && let Some(mut link) = session.links.remove(&detach.handle)
                         {
                             stop_link(&mut link);
                         }
-                        if let Some(reply) = locally_initiated {
+                        if let Some(reply) = local_reply {
                             let _ = reply.send(Ok(()));
-                        } else {
+                        } else if !locally_closing {
                             write_amqp(
                                 &mut writer,
                                 channel,
@@ -654,6 +687,7 @@ where
                         sessions.insert(channel, SessionState {
                             attach_tx: Some(unused_attach_tx.clone()),
                             links: HashMap::new(),
+                            closing_handles: HashSet::new(),
                             pending_flows: HashMap::new(),
                             next_outgoing_id: 0,
                         });
@@ -690,7 +724,7 @@ where
                             unsettled: None,
                             incomplete_unsettled: false,
                             initial_delivery_count: (request.role == Role::Sender).then_some(0),
-                            max_message_size: Some(usize::MAX as u64),
+                            max_message_size: request.max_message_size,
                             offered_capabilities: None,
                             desired_capabilities: None,
                             properties: None,
@@ -698,9 +732,14 @@ where
                         let session = sessions
                             .get_mut(&channel)
                             .ok_or_else(|| invalid_state("attach on an unknown session"))?;
+                        if session.links.contains_key(&handle) || session.closing_handles.contains(&handle) {
+                            let _ = reply.send(Err(invalid_state("link handle is attached or awaiting detach acknowledgement")));
+                            continue;
+                        }
                         match request.role {
                             Role::Sender => {
                                 session.links.insert(handle, LinkState::Sending(SendingLink {
+                                    max_message_size: None,
                                     receiver_settle_mode: request.receiver_settle_mode,
                                     settle_mode: request.sender_settle_mode,
                                     delivery_count: 0,
@@ -713,7 +752,8 @@ where
                             }
                             Role::Receiver => {
                                 session.links.insert(handle, LinkState::Receiving(ReceivingLink {
-                                    max_message_size: usize::MAX as u64,
+                                    max_message_size: normalized_message_size(request.max_message_size)
+                                        .unwrap_or(u64::MAX),
                                     deliveries: deliveries_tx,
                                     partial: None,
                                     detached: detached_tx,
@@ -738,19 +778,13 @@ where
                         let session = sessions
                             .get_mut(&channel)
                             .ok_or_else(|| invalid_state("send on an unknown session"))?;
-                        let Some(LinkState::Sending(link)) = session.links.get_mut(&handle) else {
-                            let _ = reply.send(Err(EngineError::RemoteDetached));
-                            continue;
-                        };
-                        link.queued.push_back(QueuedSend {
-                            message: *message,
-                            delivery_tag,
-                            reply,
-                        });
-                        flush_sends(
+                        queue_send(
                             channel,
                             handle,
                             session,
+                            *message,
+                            delivery_tag,
+                            reply,
                             &mut writer,
                             remote_max_frame_size,
                         ).await
@@ -788,6 +822,9 @@ where
                         result
                     }
                     ClientCommand::Detach { channel, handle, reply } => {
+                        if let Some(session) = sessions.get_mut(&channel) {
+                            remember_closing_handle(session, handle)?;
+                        }
                         pending_detaches.insert((channel, handle), reply);
                         write_amqp(
                             &mut writer,

@@ -379,7 +379,7 @@ async fn serve_session<B: Broker>(
                     if source == address && !target_address.is_empty() =>
                 {
                     let (route, responses) = management
-                        .register_reply_route(target_address.clone())
+                        .register_reply_route(target_address.clone(), sender.max_message_size())
                         .await;
                     let management = Arc::clone(&management);
                     tokio::spawn(async move {

@@ -2,7 +2,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CodecError, MessageEnvelope, SessionId, Timestamp, codec};
+use crate::{
+    BROKER_HEADER_RESERVE_BYTES, CodecError, MessageEnvelope, SessionId, Timestamp, codec,
+};
 
 /// Service Bus measures string message identifiers in UTF-16 code units.
 pub const MAX_MESSAGE_ID_LENGTH: usize = 128;
@@ -375,6 +377,38 @@ impl MessageRecord {
 
     pub fn dead_letter_info(&self) -> Option<&DeadLetterInfo> {
         self.dead_letter.as_ref()
+    }
+
+    /// Conservative encoded delivery size, including broker-owned metadata.
+    /// Rich content is authoritative; its compatibility body is not counted
+    /// twice. The response's enclosing entry and wrapper are not included.
+    pub fn delivery_size_upper_bound(&self) -> u64 {
+        let mut size = self.envelope.as_deref().map_or_else(
+            || {
+                self.body
+                    .len()
+                    .saturating_add(self.message_id.len())
+                    .saturating_add(5)
+            },
+            MessageEnvelope::content_size,
+        );
+        size = size.saturating_add(BROKER_HEADER_RESERVE_BYTES);
+        if let Some(session_id) = &self.session_id {
+            size = size
+                .saturating_add(5)
+                .saturating_add(session_id.as_str().len());
+        }
+        if let Some(info) = &self.dead_letter {
+            // A described application-properties map plus two string entries.
+            // Count canonical additions even if a producer used the same keys.
+            size = size
+                .saturating_add(19)
+                .saturating_add(10 + "DeadLetterReason".len())
+                .saturating_add(info.reason.as_str().len())
+                .saturating_add(10 + "DeadLetterErrorDescription".len())
+                .saturating_add(info.description.len());
+        }
+        u64::try_from(size).unwrap_or(u64::MAX)
     }
 
     pub fn status(&self) -> MessageStatus {

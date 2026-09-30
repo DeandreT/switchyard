@@ -22,7 +22,7 @@ mod time;
 
 pub use codec::CodecError;
 pub use command::{
-    Command, CommandKind, CommandOutcome, ScheduledEnvelope, ScheduledMessage,
+    Command, CommandKind, CommandOutcome, DeliveryBudget, ScheduledEnvelope, ScheduledMessage,
     SettlementDisposition,
 };
 pub use error::BrokerError;

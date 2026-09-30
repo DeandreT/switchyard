@@ -6,8 +6,8 @@ use amqp::{
 };
 use auth::{Permission, ResourceScope};
 use domain::{
-    CommandKind, CommandOutcome, EntityPath, LockToken, NamespaceName, ScheduledEnvelope,
-    SequenceNumber, SessionHold, SessionId, SettlementDisposition,
+    CommandKind, CommandOutcome, DeliveryBudget, EntityPath, LockToken, NamespaceName,
+    ScheduledEnvelope, SequenceNumber, SessionHold, SessionId, SettlementDisposition,
 };
 use serde_amqp::{
     Value,
@@ -57,6 +57,10 @@ pub const SESSION_STATE: &str = "session-state";
 
 const REPLY_ROUTE_TIMEOUT: Duration = Duration::from_secs(2);
 const REPLY_BUFFER: usize = 16;
+const MAX_MANAGEMENT_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+const RESPONSE_ENTRY_OVERHEAD_BYTES: u64 = 64;
+const RESPONSE_WRAPPER_RESERVE_BYTES: u64 = 256;
+const RESPONSE_SIZE_DESCRIPTION: &str = "the requested response exceeds the reply capacity";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct DeliveryKey {
@@ -78,7 +82,13 @@ struct ManagedSession {
 
 #[derive(Debug, Default)]
 struct ReplyRoutes {
-    senders: HashMap<String, mpsc::Sender<ManagementResponse>>,
+    senders: HashMap<String, ReplyRoute>,
+}
+
+#[derive(Clone, Debug)]
+struct ReplyRoute {
+    sender: mpsc::Sender<ManagementResponse>,
+    max_message_size: u64,
 }
 
 /// Protocol-only state shared by every session on one AMQP connection.
@@ -161,16 +171,22 @@ impl ConnectionManagement {
     pub(crate) async fn register_reply_route(
         &self,
         address: String,
+        max_message_size: Option<u64>,
     ) -> (
         mpsc::Sender<ManagementResponse>,
         mpsc::Receiver<ManagementResponse>,
     ) {
         let (sender, receiver) = mpsc::channel(REPLY_BUFFER);
-        self.routes
-            .lock()
-            .await
-            .senders
-            .insert(address, sender.clone());
+        self.routes.lock().await.senders.insert(
+            address,
+            ReplyRoute {
+                sender: sender.clone(),
+                max_message_size: max_message_size
+                    .filter(|limit| *limit != 0)
+                    .unwrap_or(u64::MAX)
+                    .min(MAX_MANAGEMENT_RESPONSE_BYTES),
+            },
+        );
         self.route_changed.notify_waiters();
         (sender, receiver)
     }
@@ -184,23 +200,24 @@ impl ConnectionManagement {
         if routes
             .senders
             .get(address)
-            .is_some_and(|current| current.same_channel(sender))
+            .is_some_and(|current| current.sender.same_channel(sender))
         {
             routes.senders.remove(address);
         }
     }
 
-    async fn route_response(
-        &self,
-        address: &str,
-        response: ManagementResponse,
-    ) -> Result<(), RouteError> {
+    async fn reply_route(&self, address: &str) -> Result<ReplyRoute, RouteError> {
         let deadline = tokio::time::Instant::now() + REPLY_ROUTE_TIMEOUT;
         loop {
             let changed = self.route_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             let route = self.routes.lock().await.senders.get(address).cloned();
             if let Some(route) = route {
-                return route.send(response).await.map_err(|_| RouteError);
+                if !route.sender.is_closed() {
+                    return Ok(route);
+                }
+                self.unregister_reply_route(address, &route.sender).await;
             }
             tokio::time::timeout_at(deadline, changed)
                 .await
@@ -330,6 +347,17 @@ impl ManagementResponse {
         }
     }
 
+    fn too_large(correlation_id: MessageId, tracking_id: Option<String>) -> Self {
+        Self {
+            correlation_id,
+            status_code: 403,
+            status_description: RESPONSE_SIZE_DESCRIPTION.to_owned(),
+            error_condition: Some(crate::MESSAGE_SIZE_EXCEEDED),
+            tracking_id,
+            body: Value::Null,
+        }
+    }
+
     fn message_not_found(correlation_id: MessageId, tracking_id: Option<String>) -> Self {
         Self {
             correlation_id,
@@ -405,6 +433,31 @@ impl ManagementResponse {
     }
 }
 
+fn response_budget(
+    correlation_id: &MessageId,
+    tracking_id: Option<&str>,
+    max_message_size: u64,
+) -> Result<Option<DeliveryBudget>, std::io::Error> {
+    let success = ManagementResponse::accepted(
+        correlation_id.clone(),
+        tracking_id.map(str::to_owned),
+        map_body(MESSAGES, Value::List(Vec::new())),
+    );
+    let refusal =
+        ManagementResponse::too_large(correlation_id.clone(), tracking_id.map(str::to_owned));
+    // Reserve the actual correlation/tracking fields and enough additional
+    // wrapper space for the other response body shapes and diagnostic fields.
+    let wrapper_bytes = (encode_message(&success.into_message())?.len() as u64)
+        .max(encode_message(&refusal.into_message())?.len() as u64)
+        .saturating_add(RESPONSE_WRAPPER_RESERVE_BYTES);
+    Ok(max_message_size
+        .checked_sub(wrapper_bytes)
+        .map(|max_bytes| DeliveryBudget {
+            max_bytes,
+            per_message_overhead_bytes: RESPONSE_ENTRY_OVERHEAD_BYTES,
+        }))
+}
+
 pub(crate) async fn serve_management_requests<B: Broker>(
     mut receiver: Receiver,
     namespace: NamespaceName,
@@ -461,7 +514,42 @@ pub(crate) async fn serve_management_requests<B: Broker>(
             continue;
         };
 
-        let response = process_request(
+        let route = match management.reply_route(&reply_to).await {
+            Ok(route) => route,
+            Err(_) => {
+                receiver
+                    .reject(
+                        &delivery,
+                        Some(AmqpProtocolError::new(
+                            AmqpError::PreconditionFailed,
+                            "the management reply link is not attached",
+                            None,
+                        )),
+                    )
+                    .await?;
+                continue;
+            }
+        };
+        let tracking_id = delivery
+            .message()
+            .application_properties
+            .as_ref()
+            .and_then(|properties| string_property(properties, TRACKING_ID_PROPERTY));
+        let Some(budget) = response_budget(&message_id, tracking_id, route.max_message_size)?
+        else {
+            receiver
+                .reject(
+                    &delivery,
+                    Some(AmqpProtocolError::new(
+                        amqp::ErrorCondition::Custom(Symbol::from(crate::MESSAGE_SIZE_EXCEEDED)),
+                        RESPONSE_SIZE_DESCRIPTION,
+                        None,
+                    )),
+                )
+                .await?;
+            continue;
+        };
+        let mut response = process_request(
             delivery.message(),
             message_id,
             &namespace,
@@ -469,15 +557,15 @@ pub(crate) async fn serve_management_requests<B: Broker>(
             &broker,
             &management,
             authorization.as_ref(),
+            budget,
         )
         .await;
+        if encode_message(&response.clone().into_message())?.len() as u64 > route.max_message_size {
+            response = ManagementResponse::too_large(response.correlation_id, response.tracking_id);
+        }
         debug!(correlation_id = ?response.correlation_id, %reply_to, status_code = response.status_code, "management request processed");
         receiver.accept(&delivery).await?;
-        if management
-            .route_response(&reply_to, response)
-            .await
-            .is_err()
-        {
+        if route.sender.send(response).await.is_err() {
             debug!(%reply_to, "management reply route disappeared");
         } else {
             debug!(%reply_to, "management response routed");
@@ -485,6 +573,7 @@ pub(crate) async fn serve_management_requests<B: Broker>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_request<B: Broker>(
     message: &Message,
     message_id: MessageId,
@@ -493,6 +582,7 @@ async fn process_request<B: Broker>(
     broker: &B,
     management: &ConnectionManagement,
     authorization: Option<&ManagementAuthorization>,
+    budget: DeliveryBudget,
 ) -> ManagementResponse {
     let tracking_id = message
         .application_properties
@@ -520,14 +610,32 @@ async fn process_request<B: Broker>(
     }
     match operation {
         SCHEDULE_MESSAGE_OPERATION => {
-            schedule_messages(message, message_id, tracking_id, namespace, entity, broker).await
+            schedule_messages(
+                message,
+                message_id,
+                tracking_id,
+                namespace,
+                entity,
+                broker,
+                budget,
+            )
+            .await
         }
         CANCEL_SCHEDULED_MESSAGE_OPERATION => {
             cancel_scheduled_messages(message, message_id, tracking_id, namespace, entity, broker)
                 .await
         }
         PEEK_MESSAGE_OPERATION => {
-            peek_messages(message, message_id, tracking_id, namespace, entity, broker).await
+            peek_messages(
+                message,
+                message_id,
+                tracking_id,
+                namespace,
+                entity,
+                broker,
+                budget,
+            )
+            .await
         }
         RECEIVE_BY_SEQUENCE_NUMBER_OPERATION => {
             receive_by_sequence_number(
@@ -538,6 +646,7 @@ async fn process_request<B: Broker>(
                 entity,
                 broker,
                 management,
+                budget,
             )
             .await
         }
@@ -550,6 +659,7 @@ async fn process_request<B: Broker>(
                 entity,
                 broker,
                 management,
+                budget,
             )
             .await
         }
@@ -609,6 +719,7 @@ async fn process_request<B: Broker>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn schedule_messages<B: Broker>(
     message: &Message,
     message_id: MessageId,
@@ -616,6 +727,7 @@ async fn schedule_messages<B: Broker>(
     namespace: &NamespaceName,
     entity: &EntityPath,
     broker: &B,
+    budget: DeliveryBudget,
 ) -> ManagementResponse {
     let messages = match scheduled_messages(&message.body) {
         Ok(messages) => messages,
@@ -623,6 +735,9 @@ async fn schedule_messages<B: Broker>(
             return description.into_response(message_id, tracking_id);
         }
     };
+    if (messages.len() as u64).saturating_mul(9) > budget.max_bytes {
+        return ManagementResponse::too_large(message_id, tracking_id);
+    }
     match broker
         .submit(
             namespace.clone(),
@@ -776,6 +891,7 @@ async fn receive_by_sequence_number<B: Broker>(
     entity: &EntityPath,
     broker: &B,
     management: &ConnectionManagement,
+    budget: DeliveryBudget,
 ) -> ManagementResponse {
     let link_name = message
         .application_properties
@@ -817,11 +933,12 @@ async fn receive_by_sequence_number<B: Broker>(
         .submit(
             namespace.clone(),
             entity.clone(),
-            CommandKind::ReceiveDeferred {
+            CommandKind::ReceiveDeferredBounded {
                 sequences,
                 mode,
                 lock_duration_millis: None,
                 session_id,
+                budget,
             },
         )
         .await
@@ -1027,6 +1144,7 @@ async fn peek_messages<B: Broker>(
     namespace: &NamespaceName,
     entity: &EntityPath,
     broker: &B,
+    budget: DeliveryBudget,
 ) -> ManagementResponse {
     let Some(from_sequence) = unsigned_map_value(&message.body, FROM_SEQUENCE_NUMBER) else {
         return ManagementResponse::bad_request(
@@ -1067,10 +1185,11 @@ async fn peek_messages<B: Broker>(
         .submit(
             namespace.clone(),
             entity.clone(),
-            CommandKind::Peek {
+            CommandKind::PeekBounded {
                 from_sequence: SequenceNumber::new(from_sequence),
                 max_messages: message_count,
                 session_id,
+                budget,
             },
         )
         .await
@@ -1119,6 +1238,7 @@ async fn renew_message_lock<B: Broker>(
     entity: &EntityPath,
     broker: &B,
     management: &ConnectionManagement,
+    budget: DeliveryBudget,
 ) -> ManagementResponse {
     let Some(properties) = message.application_properties.as_ref() else {
         return ManagementResponse::bad_request(
@@ -1147,6 +1267,9 @@ async fn renew_message_lock<B: Broker>(
             tracking_id,
             "exactly one lock token is required",
         );
+    }
+    if budget.max_bytes < 9 {
+        return ManagementResponse::too_large(message_id, tracking_id);
     }
 
     let lock_token = tokens[0];
@@ -1483,6 +1606,7 @@ pub(crate) async fn serve_management_replies(
     management: Arc<ConnectionManagement>,
     authorization: Option<ManagementAuthorization>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut next_delivery_tag = 0_u64;
     loop {
         tokio::select! {
             _ = sender.on_detach() => {
@@ -1499,9 +1623,13 @@ pub(crate) async fn serve_management_replies(
             }
             response = responses.recv() => {
                 let Some(response) = response else { return Ok(()) };
-                let tag = response_delivery_tag(&response.correlation_id);
+                let tag = Binary::from(next_delivery_tag.to_be_bytes().to_vec());
+                next_delivery_tag = next_delivery_tag.wrapping_add(1);
                 debug!(?response.correlation_id, status_code = response.status_code, "sending management response");
-                sender.send(response.into_message(), tag).await?;
+                if let Err(error) = sender.send(response.into_message(), tag).await {
+                    management.unregister_reply_route(&address, &route).await;
+                    return Err(error.into());
+                }
                 debug!("management response sent");
             }
         }
@@ -1515,10 +1643,6 @@ async fn wait_until_unauthorized(authorization: Option<&ManagementAuthorization>
     }
 }
 
-fn response_delivery_tag(message_id: &MessageId) -> Binary {
-    Binary::from(format!("{message_id:?}").into_bytes())
-}
-
 fn unauthorized_error(description: impl Into<String>) -> AmqpProtocolError {
     AmqpProtocolError::new(AmqpError::UnauthorizedAccess, description.into(), None)
 }
@@ -1529,6 +1653,68 @@ struct RouteError;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reply_budgets_reserve_typed_correlation_and_tracking_fields() {
+        let ids = [
+            MessageId::Ulong(u64::MAX),
+            MessageId::Uuid(Uuid::from([7; 16])),
+            MessageId::String("correlation".repeat(60)),
+            MessageId::Binary(Binary::from(vec![8; 700])),
+        ];
+        for id in ids {
+            let limit = 4_096;
+            let tracking = "tracking".repeat(80);
+            let plain = response_budget(&id, None, limit)
+                .expect("valid wrapper")
+                .expect("fits");
+            let budget = response_budget(&id, Some(&tracking), limit)
+                .expect("valid wrapper")
+                .expect("fits");
+            assert!(budget.max_bytes < plain.max_bytes);
+            assert_eq!(
+                budget.per_message_overhead_bytes,
+                RESPONSE_ENTRY_OVERHEAD_BYTES
+            );
+            let payload_bytes = budget.max_bytes - budget.per_message_overhead_bytes;
+            let mut entry = OrderedMap::new();
+            entry.insert(
+                Value::String(MESSAGE.to_owned()),
+                Value::Binary(Binary::from(vec![0; payload_bytes as usize])),
+            );
+            entry.insert(
+                Value::String(LOCK_TOKEN.to_owned()),
+                Value::Uuid(Uuid::from([1; 16])),
+            );
+            let response = ManagementResponse::accepted(
+                id.clone(),
+                Some(tracking.clone()),
+                map_body(MESSAGES, Value::List(vec![Value::Map(entry)])),
+            );
+            assert!(
+                encode_message(&response.into_message())
+                    .expect("valid response")
+                    .len() as u64
+                    <= limit
+            );
+            let refusal = ManagementResponse::too_large(id, Some(tracking));
+            assert!(
+                encode_message(&refusal.into_message())
+                    .expect("valid refusal")
+                    .len() as u64
+                    <= limit
+            );
+        }
+    }
+
+    #[test]
+    fn a_reply_too_small_for_its_wrapper_has_no_delivery_budget() {
+        let id = MessageId::String("large correlation".repeat(100));
+        assert_eq!(
+            response_budget(&id, Some("tracking"), 128).expect("valid wrapper"),
+            None
+        );
+    }
 
     #[test]
     fn lock_tokens_are_read_from_guid_sized_delivery_tags() {

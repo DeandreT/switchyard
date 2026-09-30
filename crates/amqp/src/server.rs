@@ -22,6 +22,7 @@ use crate::{
 const LINK_CREDIT: u32 = 2_048;
 const SESSION_WINDOW: u32 = 2_048;
 const FRAME_OVERHEAD_RESERVE: usize = 512;
+const MAX_CLOSING_HANDLES: usize = 65_536;
 
 pub trait SaslAuthenticator: Send + Sync + 'static {
     fn mechanisms(&self) -> Vec<Symbol>;
@@ -42,6 +43,13 @@ pub enum EngineError {
     InvalidState(String),
     #[error("SASL authentication failed with {0:?}")]
     SaslAuthentication(SaslCode),
+    #[error(
+        "the encoded message has {message_bytes} bytes, exceeding the link maximum of {maximum_bytes}"
+    )]
+    MessageSizeExceeded {
+        message_bytes: u64,
+        maximum_bytes: u64,
+    },
 }
 
 pub struct ServerConnection {
@@ -67,6 +75,7 @@ pub enum LinkEndpoint {
 
 pub struct Sender {
     name: String,
+    max_message_size: Option<u64>,
     channel: u16,
     handle: u32,
     commands: mpsc::Sender<Command>,
@@ -273,6 +282,7 @@ impl ServerSession {
         let (detached_tx, detached) = watch::channel(false);
         let role = attach.role.clone();
         let name = attach.name.clone();
+        let max_message_size_for_sender = normalized_message_size(attach.max_message_size);
         let handle = attach.handle;
         request(&self.commands, |reply| Command::AcceptLink {
             channel: self.channel,
@@ -295,6 +305,7 @@ impl ServerSession {
             }),
             Role::Receiver => LinkEndpoint::Sender(Sender {
                 name,
+                max_message_size: max_message_size_for_sender,
                 channel: self.channel,
                 handle,
                 commands: self.commands.clone(),
@@ -307,6 +318,11 @@ impl ServerSession {
 impl Sender {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The peer receiver's encoded-message limit, or no advertised limit.
+    pub fn max_message_size(&self) -> Option<u64> {
+        self.max_message_size
     }
 
     pub async fn send(
@@ -536,6 +552,7 @@ enum Command {
 struct SessionState {
     attach_tx: Option<mpsc::Sender<Attach>>,
     links: HashMap<u32, LinkState>,
+    closing_handles: HashSet<u32>,
     pending_flows: HashMap<u32, Flow>,
     next_outgoing_id: u32,
 }
@@ -546,6 +563,7 @@ enum LinkState {
 }
 
 struct SendingLink {
+    max_message_size: Option<u64>,
     receiver_settle_mode: ReceiverSettleMode,
     settle_mode: SenderSettleMode,
     delivery_count: u32,
@@ -557,7 +575,7 @@ struct SendingLink {
 }
 
 struct QueuedSend {
-    message: Message,
+    payload: Vec<u8>,
     delivery_tag: DeliveryTag,
     reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
 }
@@ -697,27 +715,30 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
             apply_flow(channel, flow, writer, sessions, remote_max_frame_size).await?;
         }
         Performative::Transfer(transfer) => {
-            receive_transfer(channel, transfer, payload, sessions).await?;
+            receive_transfer(channel, transfer, payload, sessions, writer).await?;
         }
         Performative::Disposition(disposition) => {
             apply_disposition(channel, disposition, writer, sessions).await?;
         }
         Performative::Detach(detach) => {
-            if let Some(session) = sessions.get_mut(&channel)
-                && let Some(mut link) = session.links.remove(&detach.handle)
-            {
-                stop_link(&mut link);
-                write_amqp(
-                    writer,
-                    channel,
-                    Performative::Detach(Detach {
-                        handle: detach.handle,
-                        closed: true,
-                        error: None,
-                    }),
-                    Vec::new(),
-                )
-                .await?;
+            if let Some(session) = sessions.get_mut(&channel) {
+                let locally_closing = session.closing_handles.remove(&detach.handle);
+                if let Some(mut link) = session.links.remove(&detach.handle) {
+                    stop_link(&mut link);
+                    if !locally_closing {
+                        write_amqp(
+                            writer,
+                            channel,
+                            Performative::Detach(Detach {
+                                handle: detach.handle,
+                                closed: true,
+                                error: None,
+                            }),
+                            Vec::new(),
+                        )
+                        .await?;
+                    }
+                }
             }
         }
         Performative::End(_) => {
@@ -779,6 +800,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 SessionState {
                     attach_tx: Some(attach_tx),
                     links: HashMap::new(),
+                    closing_handles: HashSet::new(),
                     pending_flows: HashMap::new(),
                     next_outgoing_id: 0,
                 },
@@ -799,8 +821,10 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 .get_mut(&channel)
                 .ok_or_else(|| invalid_state("link accepted on an unknown session"))?;
             let handle = attach.handle;
-            if session.links.contains_key(&handle) {
-                let _ = reply.send(Err(invalid_state("link handle is already attached")));
+            if session.links.contains_key(&handle) || session.closing_handles.contains(&handle) {
+                let _ = reply.send(Err(invalid_state(
+                    "link handle is attached or awaiting detach acknowledgement",
+                )));
                 return Ok(CommandAction::Continue);
             }
             let mut response = attach.response(attach.source.clone(), attach.target.clone());
@@ -819,7 +843,8 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                     session.links.insert(
                         handle,
                         LinkState::Receiving(ReceivingLink {
-                            max_message_size,
+                            max_message_size: normalized_message_size(Some(max_message_size))
+                                .unwrap_or(u64::MAX),
                             deliveries: deliveries_tx,
                             partial: None,
                             detached: detached_tx,
@@ -846,6 +871,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                     session.links.insert(
                         handle,
                         LinkState::Sending(SendingLink {
+                            max_message_size: normalized_message_size(attach.max_message_size),
                             settle_mode: attach.snd_settle_mode,
                             receiver_settle_mode: attach.rcv_settle_mode,
                             delivery_count: 0,
@@ -874,20 +900,17 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             let session = sessions
                 .get_mut(&channel)
                 .ok_or_else(|| invalid_state("send on an unknown session"))?;
-            let LinkState::Sending(link) = session
-                .links
-                .get_mut(&handle)
-                .ok_or_else(|| invalid_state("send on an unknown link"))?
-            else {
-                let _ = reply.send(Err(invalid_state("send on a receiving link")));
-                return Ok(CommandAction::Continue);
-            };
-            link.queued.push_back(QueuedSend {
-                message: *message,
+            queue_send(
+                channel,
+                handle,
+                session,
+                *message,
                 delivery_tag,
                 reply,
-            });
-            flush_sends(channel, handle, session, writer, remote_max_frame_size).await?;
+                writer,
+                remote_max_frame_size,
+            )
+            .await?;
         }
         Command::Settle {
             channel,
@@ -962,6 +985,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             if let Some(session) = sessions.get_mut(&channel)
                 && let Some(mut link) = session.links.remove(&handle)
             {
+                remember_closing_handle(session, handle)?;
                 write_amqp(
                     writer,
                     channel,
@@ -985,26 +1009,51 @@ async fn handle_command<W: AsyncWrite + Unpin>(
     Ok(CommandAction::Continue)
 }
 
-async fn receive_transfer(
+async fn receive_transfer<W: AsyncWrite + Unpin>(
     channel: u16,
     transfer: Transfer,
     payload: Vec<u8>,
     sessions: &mut HashMap<u16, SessionState>,
+    writer: &mut W,
 ) -> Result<(), EngineError> {
     let session = sessions
         .get_mut(&channel)
         .ok_or_else(|| invalid_state("transfer on an unknown session"))?;
-    let Some(link) = session.links.get_mut(&transfer.handle) else {
-        // A transfer can cross a link-scoped refusal on the wire. The detach is
-        // authoritative; a late transfer must not escalate it to the connection.
+    if session.closing_handles.contains(&transfer.handle) {
+        // Transfers already in flight can cross a link-scoped refusal.
         return Ok(());
-    };
+    }
+    let link = session
+        .links
+        .get_mut(&transfer.handle)
+        .ok_or_else(|| invalid_state("transfer on an unknown link"))?;
     let LinkState::Receiving(link) = link else {
         return Err(invalid_state("transfer sent to a sending link"));
     };
 
     if transfer.aborted {
         link.partial = None;
+        return Ok(());
+    }
+    let message_bytes = u64::try_from(payload.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(
+            link.partial
+                .as_ref()
+                .map(|partial| u64::try_from(partial.bytes.len()).unwrap_or(u64::MAX))
+                .unwrap_or(0),
+        );
+    if message_bytes > link.max_message_size {
+        let maximum_bytes = link.max_message_size;
+        detach_oversized_link(
+            channel,
+            transfer.handle,
+            session,
+            writer,
+            message_bytes,
+            maximum_bytes,
+        )
+        .await?;
         return Ok(());
     }
     let partial = match link.partial.take() {
@@ -1020,9 +1069,6 @@ async fn receive_transfer(
             bytes: payload,
         },
     };
-    if partial.bytes.len() as u64 > link.max_message_size {
-        return Err(invalid_state("message exceeds the link's maximum size"));
-    }
     if transfer.more {
         link.partial = Some(partial);
         return Ok(());
@@ -1053,6 +1099,9 @@ async fn apply_flow<W: AsyncWrite + Unpin>(
         trace!(channel, handle, "ignoring flow for an unknown session");
         return Ok(());
     };
+    if session.closing_handles.contains(&handle) {
+        return Ok(());
+    }
     let link = match session.links.get_mut(&handle) {
         Some(LinkState::Sending(link)) => link,
         Some(LinkState::Receiving(_)) => {
@@ -1079,6 +1128,104 @@ async fn apply_flow<W: AsyncWrite + Unpin>(
         );
     }
     flush_sends(channel, handle, session, writer, remote_max_frame_size).await
+}
+
+fn normalized_message_size(maximum: Option<u64>) -> Option<u64> {
+    maximum.filter(|maximum| *maximum != 0)
+}
+
+fn remember_closing_handle(session: &mut SessionState, handle: u32) -> Result<(), EngineError> {
+    if session.closing_handles.len() >= MAX_CLOSING_HANDLES
+        && !session.closing_handles.contains(&handle)
+    {
+        return Err(invalid_state(
+            "too many links awaiting detach acknowledgement",
+        ));
+    }
+    session.closing_handles.insert(handle);
+    session.pending_flows.remove(&handle);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn queue_send<W: AsyncWrite + Unpin>(
+    channel: u16,
+    handle: u32,
+    session: &mut SessionState,
+    message: Message,
+    delivery_tag: DeliveryTag,
+    reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
+    writer: &mut W,
+    remote_max_frame_size: u32,
+) -> Result<(), EngineError> {
+    let Some(LinkState::Sending(link)) = session.links.get(&handle) else {
+        let _ = reply.send(Err(EngineError::RemoteDetached));
+        return Ok(());
+    };
+    let payload = match encode_message(&message) {
+        Ok(payload) => payload,
+        Err(error) => {
+            let _ = reply.send(Err(error.into()));
+            return Ok(());
+        }
+    };
+    let message_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    if let Some(maximum_bytes) = link.max_message_size
+        && message_bytes > maximum_bytes
+    {
+        detach_oversized_link(
+            channel,
+            handle,
+            session,
+            writer,
+            message_bytes,
+            maximum_bytes,
+        )
+        .await?;
+        let _ = reply.send(Err(EngineError::MessageSizeExceeded {
+            message_bytes,
+            maximum_bytes,
+        }));
+        return Ok(());
+    }
+    let Some(LinkState::Sending(link)) = session.links.get_mut(&handle) else {
+        unreachable!("the validated sending link has not changed");
+    };
+    link.queued.push_back(QueuedSend {
+        payload,
+        delivery_tag,
+        reply,
+    });
+    flush_sends(channel, handle, session, writer, remote_max_frame_size).await
+}
+
+async fn detach_oversized_link<W: AsyncWrite + Unpin>(
+    channel: u16,
+    handle: u32,
+    session: &mut SessionState,
+    writer: &mut W,
+    message_bytes: u64,
+    maximum_bytes: u64,
+) -> Result<(), EngineError> {
+    remember_closing_handle(session, handle)?;
+    if let Some(mut link) = session.links.remove(&handle) {
+        stop_link(&mut link);
+    }
+    write_amqp(
+        writer,
+        channel,
+        Performative::Detach(Detach {
+            handle,
+            closed: true,
+            error: Some(Error::new(
+                crate::ErrorCondition::Custom(Symbol::from("amqp:link:message-size-exceeded")),
+                format!("the encoded message has {message_bytes} bytes, exceeding the link maximum of {maximum_bytes}"),
+                None,
+            )),
+        }),
+        Vec::new(),
+    )
+    .await
 }
 
 async fn flush_sends<W: AsyncWrite + Unpin>(
@@ -1110,7 +1257,6 @@ async fn flush_sends<W: AsyncWrite + Unpin>(
         session.next_outgoing_id = session.next_outgoing_id.wrapping_add(1);
         link.delivery_count = link.delivery_count.wrapping_add(1);
         let settled = link.settle_mode == SenderSettleMode::Settled;
-        let payload = encode_message(&queued.message)?;
         write_transfer(
             writer,
             channel,
@@ -1118,7 +1264,7 @@ async fn flush_sends<W: AsyncWrite + Unpin>(
             delivery_id,
             queued.delivery_tag,
             settled,
-            payload,
+            queued.payload,
             remote_max_frame_size,
         )
         .await?;
@@ -1304,6 +1450,7 @@ mod tests {
             SessionState {
                 attach_tx: Some(attach_tx),
                 links: HashMap::new(),
+                closing_handles: HashSet::new(),
                 pending_flows: HashMap::new(),
                 next_outgoing_id: 0,
             },
@@ -1372,3 +1519,6 @@ mod tests {
         assert_eq!(link.credit_limit, 50);
     }
 }
+
+#[cfg(test)]
+mod message_size_tests;

@@ -167,6 +167,19 @@ from a missing queue. Dead-letter management paths normalize the reserved
 suffix in the same way as receiving links, including the SDK's mixed-case form.
 Deferred receive rejects duplicate sequence numbers before acquiring locks or
 removing expired messages, so one message cannot be returned twice by a batch.
+Management replies have a local 4 MiB ceiling and honor the reply receiver's
+advertised maximum message size. Deferred batches must fit a conservative
+content budget, including broker metadata and response fields, before any
+locks, deletions, or expired-message cleanup commit. An oversized batch is
+refused atomically with `amqp:link:message-size-exceeded`; a smaller retry can
+still retrieve its messages. Peek returns a fitting prefix, or a size refusal
+if its first eligible message cannot fit. These are local resource policies,
+not Azure batch-count limits; the estimate may refuse a compact encoding that
+would fit on the wire. It bounds content and staging work, not exact heap usage.
+A reply link must be attached before a management
+command is submitted. If it cannot be found within two seconds, the request is
+rejected without changing broker state. Outgoing oversized messages detach
+only their affected link and are never transferred.
 Modified outcomes carry application-property updates; SDK dead-letter outcomes
 carry the reason, description and updates in their error information. Management
 settlement accepts `properties-to-modify` and promotes reserved dead-letter

@@ -16,11 +16,11 @@ use storage::{StateStore, WriteBatch};
 
 use crate::{
     AcceptedSession, BrokerError, Command, CommandKind, CommandOutcome, DeadLetterInfo,
-    DeadLetterReason, Delivery, DeliveryLock, EntityPath, LockToken, MAX_MESSAGE_HEADER_BYTES,
-    MAX_MESSAGE_ID_LENGTH, MessageBody, MessageEnvelope, MessageIdentifier, MessageProperties,
-    MessageRecord, MessageState, MessageStatus, MessageValue, NamespaceName, QueueConfig,
-    QueueCounters, ReceiveMode, SequenceNumber, SessionHold, SessionId, SessionLock, SessionRecord,
-    SettlementDisposition, Timestamp, codec, keys,
+    DeadLetterReason, Delivery, DeliveryBudget, DeliveryLock, EntityPath, LockToken,
+    MAX_MESSAGE_HEADER_BYTES, MAX_MESSAGE_ID_LENGTH, MessageBody, MessageEnvelope,
+    MessageIdentifier, MessageProperties, MessageRecord, MessageState, MessageStatus, MessageValue,
+    NamespaceName, QueueConfig, QueueCounters, ReceiveMode, SequenceNumber, SessionHold, SessionId,
+    SessionLock, SessionRecord, SettlementDisposition, Timestamp, codec, keys,
 };
 
 /// Ready entries a single receive may walk past while discarding expired
@@ -69,6 +69,40 @@ struct MessageInput<'a> {
 struct ScheduledInput<'a> {
     message: MessageInput<'a>,
     enqueue_at: Timestamp,
+}
+
+struct DeferredReceiveInput<'a> {
+    sequences: &'a [SequenceNumber],
+    mode: ReceiveMode,
+    lock_duration_millis: Option<u64>,
+    session_id: Option<&'a SessionId>,
+    budget: Option<DeliveryBudget>,
+}
+
+struct ResponseBudget {
+    limits: DeliveryBudget,
+    used: u64,
+}
+
+impl ResponseBudget {
+    fn new(limits: DeliveryBudget) -> Self {
+        Self { limits, used: 0 }
+    }
+
+    fn charge(&mut self, record: &MessageRecord) -> Result<(), BrokerError> {
+        let estimate = record.delivery_size_upper_bound();
+        let total = estimate
+            .checked_add(self.limits.per_message_overhead_bytes)
+            .and_then(|bytes| self.used.checked_add(bytes));
+        if estimate == u64::MAX || total.is_none_or(|bytes| bytes > self.limits.max_bytes) {
+            return Err(BrokerError::MessageTooLarge {
+                body_bytes: usize::try_from(total.unwrap_or(u64::MAX)).unwrap_or(usize::MAX),
+                maximum_bytes: usize::try_from(self.limits.max_bytes).unwrap_or(usize::MAX),
+            });
+        }
+        self.used = total.expect("the delivery budget total was checked");
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -182,7 +216,25 @@ impl<S: StateStore> StateMachine<S> {
                 from_sequence,
                 max_messages,
                 session_id,
-            } => self.peek(command, *from_sequence, *max_messages, session_id.as_ref())?,
+            } => self.peek(
+                command,
+                *from_sequence,
+                *max_messages,
+                session_id.as_ref(),
+                None,
+            )?,
+            CommandKind::PeekBounded {
+                from_sequence,
+                max_messages,
+                session_id,
+                budget,
+            } => self.peek(
+                command,
+                *from_sequence,
+                *max_messages,
+                session_id.as_ref(),
+                Some(*budget),
+            )?,
             CommandKind::Complete {
                 sequence,
                 lock_token,
@@ -263,10 +315,30 @@ impl<S: StateStore> StateMachine<S> {
                 session_id,
             } => self.receive_deferred(
                 command,
+                DeferredReceiveInput {
+                    sequences,
+                    mode: *mode,
+                    lock_duration_millis: *lock_duration_millis,
+                    session_id: session_id.as_ref(),
+                    budget: None,
+                },
+                &mut batch,
+            )?,
+            CommandKind::ReceiveDeferredBounded {
                 sequences,
-                *mode,
-                *lock_duration_millis,
-                session_id.as_ref(),
+                mode,
+                lock_duration_millis,
+                session_id,
+                budget,
+            } => self.receive_deferred(
+                command,
+                DeferredReceiveInput {
+                    sequences,
+                    mode: *mode,
+                    lock_duration_millis: *lock_duration_millis,
+                    session_id: session_id.as_ref(),
+                    budget: Some(*budget),
+                },
                 &mut batch,
             )?,
             CommandKind::AcceptSession {
@@ -934,6 +1006,7 @@ impl<S: StateStore> StateMachine<S> {
         from_sequence: SequenceNumber,
         max_messages: u32,
         session_id: Option<&SessionId>,
+        budget: Option<DeliveryBudget>,
     ) -> Result<CommandOutcome, BrokerError> {
         let config = self.load_config(command)?;
         require_session_agreement(&config, session_id.is_some())?;
@@ -947,48 +1020,72 @@ impl<S: StateStore> StateMachine<S> {
             .unwrap_or(usize::MAX)
             .min(MAX_PEEK_SCAN);
         let prefix = keys::message_prefix(namespace, entity);
-        let start = keys::message(namespace, entity, from_sequence);
-        let records = self.store.scan_from(&prefix, &start, MAX_PEEK_SCAN)?;
+        let mut start = keys::message(namespace, entity, from_sequence);
         let mut deliveries = Vec::with_capacity(limit);
+        let mut response_budget = budget.map(ResponseBudget::new);
+        let mut inspected = 0;
 
-        for (key, _) in records {
-            let sequence = keys::trailing_sequence(&key).ok_or(BrokerError::MalformedIndexKey)?;
-            let record = self
-                .message(namespace, entity, sequence)?
-                .ok_or(BrokerError::DanglingIndexEntry { sequence })?;
-
-            let protected_from_expiry = match record.state {
-                MessageState::Deferred => true,
-                MessageState::Locked { locked_until, .. } => locked_until > command.issued_at,
-                _ => false,
-            };
-            if record.is_expired_at(command.issued_at) && !protected_from_expiry {
-                continue;
-            }
-            if session_id.is_some_and(|session_id| record.session_id.as_ref() != Some(session_id)) {
-                continue;
-            }
-
-            let status = record.status();
-            let scheduled_enqueue_time = record.scheduled_enqueue_time;
-            let time_to_live_millis = record.time_to_live_millis();
-            deliveries.push(Delivery {
-                sequence,
-                message_id: record.message_id,
-                body: record.body,
-                enqueued_at: record.enqueued_at,
-                expires_at: record.expires_at,
-                time_to_live_millis,
-                envelope: record.envelope,
-                delivery_count: record.delivery_count,
-                status,
-                scheduled_enqueue_time,
-                lock: None,
-                session_id: record.session_id,
-                dead_letter: record.dead_letter,
-            });
-            if deliveries.len() == limit {
+        while inspected < MAX_PEEK_SCAN && deliveries.len() < limit {
+            // Bounded browsing must not materialize an entire page of large
+            // records before discovering that only its first entry fits.
+            let scan_limit = if budget.is_some() { 1 } else { MAX_PEEK_SCAN };
+            let records =
+                self.store
+                    .scan_from(&prefix, &start, scan_limit.min(MAX_PEEK_SCAN - inspected))?;
+            if records.is_empty() {
                 break;
+            }
+            for (key, value) in records {
+                inspected += 1;
+                start = key.clone();
+                start.push(0);
+                let sequence =
+                    keys::trailing_sequence(&key).ok_or(BrokerError::MalformedIndexKey)?;
+                let record = MessageRecord::decode(&value)?;
+
+                let protected_from_expiry = match record.state {
+                    MessageState::Deferred => true,
+                    MessageState::Locked { locked_until, .. } => locked_until > command.issued_at,
+                    _ => false,
+                };
+                if record.is_expired_at(command.issued_at) && !protected_from_expiry {
+                    continue;
+                }
+                if session_id
+                    .is_some_and(|session_id| record.session_id.as_ref() != Some(session_id))
+                {
+                    continue;
+                }
+                if let Some(budget) = &mut response_budget
+                    && let Err(error) = budget.charge(&record)
+                {
+                    if deliveries.is_empty() {
+                        return Err(error);
+                    }
+                    return Ok(CommandOutcome::Peeked(deliveries));
+                }
+
+                let status = record.status();
+                let scheduled_enqueue_time = record.scheduled_enqueue_time;
+                let time_to_live_millis = record.time_to_live_millis();
+                deliveries.push(Delivery {
+                    sequence,
+                    message_id: record.message_id,
+                    body: record.body,
+                    enqueued_at: record.enqueued_at,
+                    expires_at: record.expires_at,
+                    time_to_live_millis,
+                    envelope: record.envelope,
+                    delivery_count: record.delivery_count,
+                    status,
+                    scheduled_enqueue_time,
+                    lock: None,
+                    session_id: record.session_id,
+                    dead_letter: record.dead_letter,
+                });
+                if deliveries.len() == limit {
+                    break;
+                }
             }
         }
 
@@ -1105,12 +1202,16 @@ impl<S: StateStore> StateMachine<S> {
     fn receive_deferred(
         &self,
         command: &Command,
-        sequences: &[SequenceNumber],
-        mode: ReceiveMode,
-        lock_duration_millis: Option<u64>,
-        session_id: Option<&SessionId>,
+        input: DeferredReceiveInput<'_>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
+        let DeferredReceiveInput {
+            sequences,
+            mode,
+            lock_duration_millis,
+            session_id,
+            budget,
+        } = input;
         let mut unique = BTreeSet::new();
         if sequences.iter().any(|sequence| !unique.insert(*sequence)) {
             return Err(BrokerError::InvalidMessageContent {
@@ -1121,8 +1222,13 @@ impl<S: StateStore> StateMachine<S> {
         require_session_agreement(&config, session_id.is_some())?;
         let namespace = &command.namespace;
         let entity = &command.entity;
-        let mut deliveries = Vec::with_capacity(sequences.len());
+        let mut deliveries = if budget.is_some() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(sequences.len())
+        };
         let mut counters = None;
+        let mut response_budget = budget.map(ResponseBudget::new);
 
         for sequence in sequences {
             let mut record = self.load_message(command, *sequence)?;
@@ -1135,6 +1241,9 @@ impl<S: StateStore> StateMachine<S> {
                 return Err(BrokerError::MessageNotDeferred {
                     sequence: *sequence,
                 });
+            }
+            if let Some(budget) = &mut response_budget {
+                budget.charge(&record)?;
             }
             if record.is_expired_at(command.issued_at) {
                 self.expire_message(command, &config, record, batch)?;
