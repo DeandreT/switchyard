@@ -496,13 +496,25 @@ impl From<&str> for MessageId {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Header {
     pub durable: bool,
     pub priority: u8,
     pub ttl: Option<u32>,
     pub first_acquirer: bool,
     pub delivery_count: u32,
+}
+
+impl Default for Header {
+    fn default() -> Self {
+        Self {
+            durable: false,
+            priority: 4,
+            ttl: None,
+            first_acquirer: false,
+            delivery_count: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -555,7 +567,7 @@ impl ApplicationPropertiesBuilder {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Body {
     Data(Vec<Binary>),
-    Sequence(Vec<Value>),
+    Sequence(Vec<Vec<Value>>),
     Value(Value),
     #[default]
     Empty,

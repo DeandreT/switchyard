@@ -24,7 +24,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | AMQP over WebSockets | Pre-1.0 | Not implemented |
 | SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. JWT: not implemented |
 | Queue send, receive, and settlement | Pre-1.0 | State machine |
-| Message properties and AMQP body preservation | Pre-1.0 | Partial: data bytes, identifier, session, TTL and scheduling metadata. Other properties and non-data bodies are not persisted |
+| Message properties and AMQP body preservation | Pre-1.0 | Partial: data bytes, text-normalized identifier, session, TTL and scheduling metadata. Other properties and non-data bodies are not persisted |
 | Peek without lock acquisition | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Receive-delete | Pre-1.0 | State machine, AMQP mapping |
 | Lock expiry and redelivery | Pre-1.0 | State machine |

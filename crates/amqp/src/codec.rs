@@ -4,7 +4,7 @@ use serde_amqp::{
     Value,
     described::Described,
     descriptor::Descriptor,
-    primitives::{Array, Binary, OrderedMap, Symbol},
+    primitives::{Array, Binary, OrderedMap, Symbol, Timestamp},
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -269,11 +269,13 @@ pub fn encode_message(message: &Message) -> io::Result<Vec<u8>> {
                 )?;
             }
         }
-        Body::Sequence(sequence) => {
-            append_value(
-                &mut encoded,
-                described(AMQP_SEQUENCE, Value::List(sequence.clone())),
-            )?;
+        Body::Sequence(sections) => {
+            for section in sections {
+                append_value(
+                    &mut encoded,
+                    described(AMQP_SEQUENCE, Value::List(section.clone())),
+                )?;
+            }
         }
         Body::Value(value) => {
             append_value(&mut encoded, described(AMQP_VALUE, value.clone()))?;
@@ -286,7 +288,6 @@ pub fn encode_message(message: &Message) -> io::Result<Vec<u8>> {
 pub fn decode_message(encoded: &[u8]) -> io::Result<Message> {
     let mut message = Message::default();
     let mut offset = 0;
-    let mut data = Vec::new();
     while offset < encoded.len() {
         let len = encoded_value_len(&encoded[offset..])?;
         let value =
@@ -303,22 +304,36 @@ pub fn decode_message(encoded: &[u8]) -> io::Result<Message> {
             APPLICATION_PROPERTIES => {
                 message.application_properties = Some(application_properties_from_value(value)?);
             }
-            DATA => match value {
-                Value::Binary(section) => data.push(section),
-                _ => return Err(invalid_data("data section is not binary")),
-            },
+            DATA => {
+                let Value::Binary(section) = value else {
+                    return Err(invalid_data("data section is not binary"));
+                };
+                match &mut message.body {
+                    Body::Empty => message.body = Body::Data(vec![section]),
+                    Body::Data(sections) => sections.push(section),
+                    _ => return Err(invalid_data("message mixes body section types")),
+                }
+            }
             AMQP_SEQUENCE => {
                 let Value::List(sequence) = value else {
                     return Err(invalid_data("AMQP sequence body is not a list"));
                 };
-                message.body = Body::Sequence(sequence);
+                match &mut message.body {
+                    Body::Empty => message.body = Body::Sequence(vec![sequence]),
+                    Body::Sequence(sections) => sections.push(sequence),
+                    _ => return Err(invalid_data("message mixes body section types")),
+                }
             }
-            AMQP_VALUE => message.body = Body::Value(value),
+            AMQP_VALUE => {
+                if !matches!(message.body, Body::Empty) {
+                    return Err(invalid_data(
+                        "message has multiple or mixed value body sections",
+                    ));
+                }
+                message.body = Body::Value(value);
+            }
             _ => {}
         }
-    }
-    if !data.is_empty() {
-        message.body = Body::Data(data);
     }
     Ok(message)
 }
@@ -951,11 +966,11 @@ fn properties_to_value(properties: &Properties) -> Value {
                 .unwrap_or(Value::Null),
             properties
                 .absolute_expiry_time
-                .map(Value::Long)
+                .map(|value| Value::Timestamp(Timestamp::from_milliseconds(value)))
                 .unwrap_or(Value::Null),
             properties
                 .creation_time
-                .map(Value::Long)
+                .map(|value| Value::Timestamp(Timestamp::from_milliseconds(value)))
                 .unwrap_or(Value::Null),
             optional_string(&properties.group_id),
             optional_u32(properties.group_sequence),
@@ -1436,6 +1451,120 @@ mod tests {
 
         let encoded = encode_message(&message).expect("message encodes");
         assert_eq!(decode_message(&encoded).expect("message decodes"), message);
+    }
+
+    #[test]
+    fn property_times_use_timestamp_wire_values() {
+        let message = Message {
+            properties: Some(Properties {
+                absolute_expiry_time: Some(1000),
+                creation_time: Some(-1),
+                ..Properties::default()
+            }),
+            ..Message::default()
+        };
+        // Property slots eight and nine use timestamp (0x83), not long (0x81).
+        let wire = [
+            0x00, 0x53, 0x73, 0xc0, 0x1b, 0x0a, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
+            0x83, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xe8, 0x83, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+        ];
+
+        assert_eq!(encode_message(&message).expect("message encodes"), wire);
+        assert_eq!(
+            decode_message(&wire).expect("wire timestamps decode"),
+            message
+        );
+    }
+
+    #[test]
+    fn default_header_priority_matches_an_omitted_wire_priority() {
+        let omitted_priority = [0x00, 0x53, 0x70, 0x45];
+        let decoded = decode_message(&omitted_priority).expect("empty header decodes");
+        assert_eq!(decoded.header, Some(Header::default()));
+        assert_eq!(Header::default().priority, 4);
+
+        let message = Message {
+            header: Some(Header::default()),
+            ..Message::default()
+        };
+        let explicit_priority = [
+            0x00, 0x53, 0x70, 0xc0, 0x07, 0x05, 0x42, 0x50, 0x04, 0x40, 0x42, 0x43,
+        ];
+        assert_eq!(
+            encode_message(&message).expect("default header encodes"),
+            explicit_priority,
+        );
+    }
+
+    #[test]
+    fn sequence_body_preserves_each_wire_section_including_empty_sections() {
+        let message = Message {
+            body: Body::Sequence(vec![
+                vec![Value::Int(7)],
+                Vec::new(),
+                vec![Value::String(String::from("last"))],
+            ]),
+            ..Message::default()
+        };
+        let wire = [
+            0x00, 0x53, 0x76, 0xc0, 0x03, 0x01, 0x54, 0x07, 0x00, 0x53, 0x76, 0x45, 0x00, 0x53,
+            0x76, 0xc0, 0x07, 0x01, 0xa1, 0x04, b'l', b'a', b's', b't',
+        ];
+
+        assert_eq!(
+            decode_message(&wire).expect("sequence sections decode"),
+            message
+        );
+        assert_eq!(
+            encode_message(&message).expect("sequence sections encode"),
+            wire
+        );
+
+        let empty_sections = [0x00, 0x53, 0x76, 0x45, 0x00, 0x53, 0x76, 0x45];
+        assert_eq!(
+            decode_message(&empty_sections)
+                .expect("empty sequence sections decode")
+                .body,
+            Body::Sequence(vec![Vec::new(), Vec::new()]),
+        );
+    }
+
+    #[test]
+    fn wire_body_sections_cannot_mix_types_or_repeat_a_value() {
+        let data = [0x00, 0x53, 0x75, 0xa0, 0x00];
+        let sequence = [0x00, 0x53, 0x76, 0x45];
+        let value = [0x00, 0x53, 0x77, 0x40];
+        for (first, second) in [
+            (data.as_slice(), sequence.as_slice()),
+            (data.as_slice(), value.as_slice()),
+            (sequence.as_slice(), data.as_slice()),
+            (sequence.as_slice(), value.as_slice()),
+            (value.as_slice(), data.as_slice()),
+            (value.as_slice(), sequence.as_slice()),
+            (value.as_slice(), value.as_slice()),
+        ] {
+            let wire = [first, second].concat();
+            assert_eq!(
+                decode_message(&wire)
+                    .expect_err("mixed or repeated value bodies must fail")
+                    .kind(),
+                io::ErrorKind::InvalidData,
+            );
+        }
+
+        assert_eq!(
+            decode_message(&value)
+                .expect("one null value body decodes")
+                .body,
+            Body::Value(Value::Null),
+        );
+        assert_eq!(
+            decode_message(&[data.as_slice(), data.as_slice()].concat())
+                .expect("repeated data sections decode")
+                .body,
+            Body::Data(vec![Binary::from(Vec::new()), Binary::from(Vec::new())]),
+        );
     }
 
     #[test]
