@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Send, peek, receive, defer, renew, complete, schedule and cancel; session renew/state/scheduling | Planned | Experimental gate on 7.20.2 |
+| Official .NET SDK, current stable | Send, peek, receive, defer, renew, complete, schedule, cancel and duplicate detection; session renew/state/scheduling | Planned | Experimental gate on 7.20.2 |
 | Official .NET SDK, previous stable | Planned | Planned | Not implemented |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -24,6 +24,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | AMQP over WebSockets | Pre-1.0 | Not implemented |
 | SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. JWT: not implemented |
 | Queue send, receive, and settlement | Pre-1.0 | State machine |
+| Message properties and AMQP body preservation | Pre-1.0 | Partial: data bytes, identifier, session, TTL and scheduling metadata. Other properties and non-data bodies are not persisted |
 | Peek without lock acquisition | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Receive-delete | Pre-1.0 | State machine, AMQP mapping |
 | Lock expiry and redelivery | Pre-1.0 | State machine |
@@ -36,7 +37,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Dead-letter | Pre-1.0 | State machine, AMQP mapping |
 | Dead-letter receive and resubmit | Pre-1.0 | Receive: state machine, AMQP mapping. Resubmit: not implemented |
 | Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
-| Duplicate detection | Pre-1.0 | Not implemented |
+| Duplicate detection | Pre-1.0 | State machine, AMQP send/scheduling mappings, Rust and current .NET clients end to end |
 | Same-placement-group transactions | Pre-1.0 | Not implemented |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
 | Native gRPC administration | Pre-1.0 | Contract scaffolded |
@@ -68,6 +69,19 @@ behavior it currently enforces:
   removes the scheduled record and deadline entry atomically; it rejects a
   missing or already-active handle. Exact Azure behavior for those rejected
   cancellation cases has not yet been verified.
+- A queue can enable duplicate detection by message ID, with a 10-minute
+  default history window bounded to 20 seconds through 7 days. A duplicate
+  send is accepted and dropped, and history survives completion, dead-lettering,
+  and schedule cancellation. Ordinary and scheduled sends share history;
+  activation does not check it again. History is scoped to the namespace and
+  entity, independent of the session. Anonymous messages bypass detection,
+  and dropped retries do not extend the original deadline; exact Azure parity
+  for these two edge cases remains unverified. A duplicate scheduling request
+  receives a fresh sequence handle but stores no message, so that handle has
+  nothing to cancel.
+- Message identifiers are bounded to 128 UTF-16 code units, matching the
+  official .NET client. Overlong identifiers are rejected before enqueue or
+  duplicate-history changes, including within an atomic scheduled batch.
 - A settlement is rejected unless it presents the live lock token, and rejected
   again once the lock deadline has passed.
 - A live message lock can be renewed without changing its token. Renewal moves
@@ -106,8 +120,8 @@ a rejection or a bound rather than a silent difference:
   The receiver retries.
 
 The `server` crate's timer worker proposes scheduled activation, lock,
-time-to-live, and session-lock sweeps on an interval, so a running node
-activates what is due and releases what has elapsed.
+time-to-live, session-lock, and duplicate-history sweeps on an interval, so a
+running node activates what is due and releases or prunes what has elapsed.
 
 An AMQP 1.0 client can reach a queue. The node accepts AMQP over TLS with the
 socket secured before the protocol handshake, as Service Bus port 5671
@@ -145,13 +159,14 @@ drained from a dead-letter queue carries its reason and description in the
 complete protocol coverage uses a Rust AMQP 1.0 client. The current stable
 official .NET SDK also has an opt-in gate for ordinary send, receive,
 peek, deferral, deferred receive, message-lock renewal, completion, scheduling,
-and cancellation plus session state, renewal, receive, completion, and
+and cancellation, duplicate detection for ordinary and scheduled sends, plus
+session state, renewal, receive, completion, and
 scheduling; the rest of that client gate
 remains incomplete.
 
-The current message-record format is version 5 and durable store layout is
-version 3. Earlier record shapes have tested decoders, but an earlier store
-directory is refused at open because its broker indexes have a different
+The current value format is version 6 and durable store layout is version 4.
+Earlier message and queue-configuration shapes have tested decoders, but an
+earlier store directory is refused at open because its broker indexes have a different
 contract. There is no directory migration tooling yet; development directories
 from older builds must be recreated. A rollback likewise refuses a newer layout.
 

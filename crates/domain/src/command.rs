@@ -159,6 +159,9 @@ pub enum CommandKind {
     /// Proposed by the leader's timer worker. Enqueues scheduled messages
     /// whose requested enqueue time has arrived.
     ActivateScheduled,
+    /// Proposed by the leader's timer worker. Discards message identifiers
+    /// whose duplicate-detection history window has elapsed.
+    ExpireDuplicateHistory,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,6 +178,9 @@ pub enum CommandOutcome {
     },
     ScheduledActivated {
         activated: u32,
+    },
+    DuplicateHistoryExpired {
+        expired: u32,
     },
     /// `None` when the queue held no deliverable message.
     Received(Option<Delivery>),

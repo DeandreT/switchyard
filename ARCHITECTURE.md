@@ -5,8 +5,8 @@
 This document is the implementation contract for Switchyard. The repository is
 currently pre-alpha. A deterministic state machine covers queue send and
 receive, peek, both settlement modes, lock renewal and expiry, time-to-live
-expiry, scheduling and cancellation, deferral, dead-lettering and dead-letter
-receive, and the session ownership and session state described under
+expiry, scheduling and cancellation, deferral, duplicate detection,
+dead-lettering and dead-letter receive, and the session ownership and session state described under
 [Message Semantics](#message-semantics). It runs over
 either the Fjall backend or the memory backend, so a single node survives a
 restart.
@@ -14,10 +14,11 @@ restart.
 The `switchyard` binary accepts AMQP connections over development plaintext or
 TLS, authenticates a configured shared-access policy through SASL PLAIN or CBS
 SAS, carries messages and sessions across that edge, and sweeps scheduled
-activation, lock, time-to-live, and session-lock expiry. JWT/OIDC, mTLS, policy administration,
+activation, lock, time-to-live, session-lock, and duplicate-history expiry.
+JWT/OIDC, mTLS, policy administration,
 Raft, and compliance implementations remain to be built. Within the semantics
-below, duplicate detection and topics are not implemented, the timer worker
-covers scheduled activation and the three expiry indexes that exist,
+below, topics are not implemented, the timer worker covers scheduled
+activation and the four expiry indexes that exist,
 and the storage keyspace layout under [Storage](#storage) is still a single
 record keyspace rather than the split listed there.
 
@@ -207,9 +208,9 @@ clock never mutates state directly. An injected hybrid logical clock prevents
 time from moving backward. Clock jumps beyond the configured safety threshold
 pause timers and fail readiness until an operator resolves the condition.
 
-The worker that exists today sweeps scheduled activation, lock-expiry, TTL, and
-session-lock indexes. Activation gives a scheduled message a new active
-sequence, records the actual enqueue time, and starts its TTL at that time.
+The worker that exists today sweeps scheduled activation, lock-expiry, TTL,
+session-lock, and duplicate-history indexes. Activation gives a scheduled
+message a new active sequence, records the actual enqueue time, and starts its TTL at that time.
 One sweep command processes a
 bounded number of entries, so the worker re-proposes until an index reports less
 than a full batch, and a backlog on one queue cannot starve the rest of the tick.
@@ -218,6 +219,13 @@ command: a host clock that steps back a little holds the applied timestamp still
 rather than regressing it, and one that steps back further has the command
 refused. Refusal is not yet wired to a readiness signal — the sweep is logged and
 retried on the next tick.
+
+Duplicate detection is an opt-in queue setting. Its history records the original
+submission deadline by message ID and expires independently of settlement or
+schedule cancellation. Both send and schedule check the same history, including
+earlier entries in an atomic scheduling batch; activation only makes a previously
+accepted schedule ready. History cleanup is bounded, and overdue cleanup never
+extends the detection window because submissions check deadlines directly.
 
 Topic sends evaluate the current subscription rule revision before proposing
 fanout. The command records the matched subscriptions and encrypted property

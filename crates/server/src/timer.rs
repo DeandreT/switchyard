@@ -39,6 +39,7 @@ pub struct SweepReport {
     pub messages_dead_lettered: u32,
     pub sessions_released: u32,
     pub messages_activated: u32,
+    pub duplicate_history_expired: u32,
 }
 
 impl SweepReport {
@@ -48,6 +49,7 @@ impl SweepReport {
             && self.messages_dead_lettered == 0
             && self.sessions_released == 0
             && self.messages_activated == 0
+            && self.duplicate_history_expired == 0
     }
 }
 
@@ -76,6 +78,7 @@ impl<'a> TimerWorker<'a> {
             self.expire_locks(&namespace, &entity, &mut report)?;
             self.expire_messages(&namespace, &entity, &mut report)?;
             self.expire_session_locks(&namespace, &entity, &mut report)?;
+            self.expire_duplicate_history(&namespace, &entity, &mut report)?;
         }
         Ok(report)
     }
@@ -180,6 +183,29 @@ impl<'a> TimerWorker<'a> {
         Ok(())
     }
 
+    fn expire_duplicate_history(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+        report: &mut SweepReport,
+    ) -> Result<(), SubmitError> {
+        for _ in 0..MAX_ROUNDS_PER_INDEX {
+            let outcome = self.broker.submit_blocking(
+                namespace.clone(),
+                entity.clone(),
+                CommandKind::ExpireDuplicateHistory,
+            )?;
+            let CommandOutcome::DuplicateHistoryExpired { expired } = outcome else {
+                return Err(unexpected(outcome));
+            };
+            report.duplicate_history_expired += expired;
+            if (expired as usize) < TIMER_SCAN_LIMIT {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Sweeps every `interval` until `shutdown` is signalled.
     ///
     /// A failed sweep is logged rather than fatal: a host clock that stepped
@@ -201,6 +227,7 @@ impl<'a> TimerWorker<'a> {
                         messages_dead_lettered = report.messages_dead_lettered,
                         sessions_released = report.sessions_released,
                         messages_activated = report.messages_activated,
+                        duplicate_history_expired = report.duplicate_history_expired,
                         "sweep applied deadlines"
                     );
                 }

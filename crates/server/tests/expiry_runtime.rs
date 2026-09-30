@@ -290,6 +290,50 @@ fn a_sweep_drains_a_scheduled_backlog_in_bounded_batches<P: StoreProvider>(
     Ok(())
 }
 
+fn a_sweep_prunes_duplicate_history_without_consuming_messages<P: StoreProvider>(
+    provider: P,
+) -> Result<(), Box<dyn Error>> {
+    let runtime = Runtime::new(
+        provider,
+        QueueConfig {
+            requires_duplicate_detection: true,
+            duplicate_detection_history_time_window_millis: 20_000,
+            ..queue_config()
+        },
+    )?;
+    let backlog = TIMER_SCAN_LIMIT + 1;
+    for index in 0..backlog {
+        runtime.send(&format!("deduplicate-{index}"), None)?;
+    }
+    runtime.clock.set(20_999);
+    assert!(runtime.sweep()?.is_idle());
+    runtime.clock.set(21_000);
+    let report = runtime.sweep()?;
+    assert_eq!(report.duplicate_history_expired, backlog as u32);
+    assert_eq!(report.messages_dead_lettered, 0);
+    assert!(!report.is_idle());
+    assert!(runtime.sweep()?.is_idle());
+    for _ in 0..backlog {
+        let delivery = runtime
+            .receive()?
+            .expect("history cleanup leaves every message deliverable");
+        runtime.propose(CommandKind::Complete {
+            sequence: delivery.sequence,
+            lock_token: delivery.lock.expect("the receive was peek-lock").token,
+        })?;
+    }
+    assert_eq!(runtime.receive()?, None);
+    runtime.send("deduplicate-0", None)?;
+    assert_eq!(
+        runtime
+            .receive()?
+            .expect("the ID can be used again")
+            .message_id,
+        "deduplicate-0"
+    );
+    Ok(())
+}
+
 // ---- instantiation ---------------------------------------------------------
 
 macro_rules! for_each_backend {
@@ -322,4 +366,5 @@ for_each_backend! {
     a_sweep_never_moves_the_applied_clock_backward,
     a_sweep_activates_scheduled_messages_and_starts_their_ttl,
     a_sweep_drains_a_scheduled_backlog_in_bounded_batches,
+    a_sweep_prunes_duplicate_history_without_consuming_messages,
 }

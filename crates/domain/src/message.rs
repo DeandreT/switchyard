@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CodecError, SessionId, Timestamp, codec};
 
+/// Service Bus measures string message identifiers in UTF-16 code units.
+pub const MAX_MESSAGE_ID_LENGTH: usize = 128;
+
 /// Position of a message in its entity's total order. Allocated from a
 /// replicated counter, never from a local generator.
 #[derive(
@@ -318,7 +321,7 @@ impl MessageRecord {
             codec::VALUE_FORMAT_V3 | codec::VALUE_FORMAT_V4 => {
                 Ok(codec::decode_payload::<MessageRecordV4>(payload)?.into())
             }
-            codec::VALUE_FORMAT_V5 => codec::decode_payload(payload),
+            codec::VALUE_FORMAT_V5 | codec::VALUE_FORMAT_V6 => codec::decode_payload(payload),
             _ => unreachable!("split rejects unknown value formats"),
         }
     }
@@ -434,7 +437,7 @@ mod tests {
             ..record(None)
         };
         let envelope = codec::encode(&original)?;
-        assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V5));
+        assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V6));
         assert_eq!(MessageRecord::decode(&envelope)?, original);
         Ok(())
     }
@@ -470,6 +473,22 @@ mod tests {
     }
 
     #[test]
+    fn a_version_5_scheduled_message_keeps_its_shape_in_version_6() -> Result<(), CodecError> {
+        let original = MessageRecord {
+            state: MessageState::Scheduled {
+                enqueue_at: Timestamp::from_millis(100),
+                time_to_live_millis: Some(50),
+            },
+            scheduled_enqueue_time: Some(Timestamp::from_millis(100)),
+            ..record(None)
+        };
+        let mut envelope = vec![codec::VALUE_FORMAT_V5];
+        envelope.extend_from_slice(&postcard::to_stdvec(&original).expect("message encodes"));
+        assert_eq!(MessageRecord::decode(&envelope)?, original);
+        Ok(())
+    }
+
+    #[test]
     fn a_scheduled_state_cannot_be_misread_as_a_version_4_state() {
         let state = MessageState::Scheduled {
             enqueue_at: Timestamp::from_millis(100),
@@ -483,7 +502,7 @@ mod tests {
             ..record(None)
         };
         let envelope = codec::encode(&original).expect("encodes");
-        assert_eq!(envelope[0], codec::VALUE_FORMAT_V5);
+        assert_eq!(envelope[0], codec::VALUE_FORMAT_V6);
         assert_eq!(MessageRecord::decode(&envelope), Ok(original));
     }
 

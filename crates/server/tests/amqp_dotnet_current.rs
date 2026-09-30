@@ -74,6 +74,17 @@ async fn current_stable_dotnet_client_completes_message_and_session_workflows()
         },
     )?;
 
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        domain::EntityPath::new("duplicates")?,
+        CommandKind::CreateQueue {
+            config: QueueConfig {
+                requires_duplicate_detection: true,
+                duplicate_detection_history_time_window_millis: 20_000,
+                ..QueueConfig::default()
+            },
+        },
+    )?;
     let _timer = TestTimer::start(broker.handle());
 
     let rule = SharedAccessRule::new(
@@ -128,6 +139,7 @@ async fn current_stable_dotnet_client_completes_message_and_session_workflows()
             .arg(format!("sb://localhost:{}", address.port()))
             .arg("orders")
             .arg("sessions")
+            .arg("duplicates")
             .arg(RULE)
             .arg(KEY)
             .output()
@@ -156,6 +168,19 @@ async fn current_stable_dotnet_client_completes_message_and_session_workflows()
         )?,
         CommandOutcome::Received(None),
         "the SDK returned from completion before the broker removed the message"
+    );
+    assert_eq!(
+        broker.handle().submit_blocking(
+            domain::NamespaceName::new("tenant")?,
+            domain::EntityPath::new("duplicates")?,
+            CommandKind::Peek {
+                from_sequence: domain::SequenceNumber::new(0),
+                max_messages: 10,
+                session_id: None,
+            },
+        )?,
+        CommandOutcome::Peeked(Vec::new()),
+        "duplicate workflows left retained messages in the broker"
     );
     Ok(())
 }

@@ -288,7 +288,7 @@ impl ManagementResponse {
         let status_code = match condition {
             crate::MESSAGE_LOCK_LOST | crate::SESSION_LOCK_LOST => 410,
             crate::NOT_FOUND => 404,
-            crate::NOT_ALLOWED | crate::PRECONDITION_FAILED => 400,
+            crate::INVALID_FIELD | crate::NOT_ALLOWED | crate::PRECONDITION_FAILED => 400,
             crate::RESOURCE_LOCKED => 503,
             _ => 500,
         };

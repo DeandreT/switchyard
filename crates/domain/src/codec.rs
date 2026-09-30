@@ -26,7 +26,11 @@ pub const VALUE_FORMAT_V4: u8 = 4;
 /// message records. The configured lifetime starts once a message becomes active.
 pub const VALUE_FORMAT_V5: u8 = 5;
 
-pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V5;
+/// Appends duplicate-detection settings to queue configurations. Message
+/// records retain their version 5 shape.
+pub const VALUE_FORMAT_V6: u8 = 6;
+
+pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V6;
 
 /// Encodes a value into a versioned envelope.
 ///
@@ -106,6 +110,7 @@ mod tests {
             VALUE_FORMAT_V3,
             VALUE_FORMAT_V4,
             VALUE_FORMAT_V5,
+            VALUE_FORMAT_V6,
         ] {
             let mut envelope = vec![version];
             envelope.extend_from_slice(&payload);

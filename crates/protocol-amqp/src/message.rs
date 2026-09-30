@@ -27,9 +27,9 @@ pub struct IncomingMessage {
 
 /// Reads an incoming AMQP message into the parts a send command needs.
 ///
-/// A message with no identifier of its own is accepted: Service Bus assigns one
-/// rather than refusing the send, and the broker's own sequence number is what
-/// actually identifies the message afterwards.
+/// A message with no identifier of its own is accepted. Its broker sequence
+/// identifies the stored record, and duplicate detection treats anonymous
+/// submissions independently.
 pub fn read_incoming(message: &Message) -> Result<IncomingMessage, ProtocolError> {
     let properties = message.properties.as_ref();
     let session_id = properties
@@ -227,8 +227,7 @@ mod tests {
 
     #[test]
     fn a_message_without_properties_still_crosses() -> Result<(), ProtocolError> {
-        // Service Bus assigns an identifier rather than refusing the send, and
-        // the sequence number is what identifies the message afterwards.
+        // The sequence number identifies an anonymous message afterwards.
         let incoming = read_incoming(&sent(None, b"payload".to_vec()))?;
         assert_eq!(incoming.message_id, "");
         assert_eq!(incoming.body, b"payload".to_vec());

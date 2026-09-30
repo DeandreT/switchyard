@@ -33,6 +33,8 @@ pub enum BrokerError {
         body_bytes: usize,
         maximum_bytes: usize,
     },
+    #[error("message identifier length of {length} exceeds the {maximum}-character limit")]
+    MessageIdTooLong { length: usize, maximum: usize },
     #[error("command timestamp {proposed} precedes the applied timestamp {last_applied}")]
     ClockRegression {
         last_applied: Timestamp,

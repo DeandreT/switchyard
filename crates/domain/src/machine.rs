@@ -16,9 +16,10 @@ use storage::{StateStore, WriteBatch};
 
 use crate::{
     AcceptedSession, BrokerError, Command, CommandKind, CommandOutcome, DeadLetterInfo,
-    DeadLetterReason, Delivery, DeliveryLock, EntityPath, LockToken, MessageRecord, MessageState,
-    MessageStatus, NamespaceName, QueueConfig, QueueCounters, ReceiveMode, ScheduledMessage,
-    SequenceNumber, SessionHold, SessionId, SessionLock, SessionRecord, Timestamp, codec, keys,
+    DeadLetterReason, Delivery, DeliveryLock, EntityPath, LockToken, MAX_MESSAGE_ID_LENGTH,
+    MessageRecord, MessageState, MessageStatus, NamespaceName, QueueConfig, QueueCounters,
+    ReceiveMode, ScheduledMessage, SequenceNumber, SessionHold, SessionId, SessionLock,
+    SessionRecord, Timestamp, codec, keys,
 };
 
 /// Ready entries a single receive may walk past while discarding expired
@@ -178,6 +179,9 @@ impl<S: StateStore> StateMachine<S> {
             CommandKind::ExpireMessages => self.expire_messages(command, &mut batch)?,
             CommandKind::ExpireSessionLocks => self.expire_session_locks(command, &mut batch)?,
             CommandKind::ActivateScheduled => self.activate_scheduled(command, &mut batch)?,
+            CommandKind::ExpireDuplicateHistory => {
+                self.expire_duplicate_history(command, &mut batch)?
+            }
         };
 
         // A command that changed nothing commits nothing. The clock advance is
@@ -206,7 +210,10 @@ impl<S: StateStore> StateMachine<S> {
         namespace: &NamespaceName,
         entity: &EntityPath,
     ) -> Result<Option<QueueConfig>, BrokerError> {
-        self.read(&keys::queue_config(namespace, entity))
+        match self.store.get(&keys::queue_config(namespace, entity))? {
+            Some(bytes) => Ok(Some(QueueConfig::decode(&bytes)?)),
+            None => Ok(None),
+        }
     }
 
     /// Every queue in the store, in key order, across every namespace. The timer
@@ -316,8 +323,8 @@ impl<S: StateStore> StateMachine<S> {
         }
     }
 
-    /// Messages are the one record whose stored shape has changed, so they read
-    /// through their own version-aware decode rather than through [`Self::read`].
+    /// Reads messages through their version-aware decode rather than treating
+    /// their stored shape as stable.
     fn read_message(&self, key: &[u8]) -> Result<Option<MessageRecord>, BrokerError> {
         match self.store.get(key)? {
             Some(bytes) => Ok(Some(MessageRecord::decode(&bytes)?)),
@@ -392,6 +399,7 @@ impl<S: StateStore> StateMachine<S> {
             max_delivery_count: u32::MAX,
             default_time_to_live_millis: None,
             requires_session: false,
+            requires_duplicate_detection: false,
             ..config
         };
         batch.push_put(key, codec::encode(&config)?);
@@ -416,6 +424,7 @@ impl<S: StateStore> StateMachine<S> {
         }
         let config = self.load_config(command)?;
         require_session_agreement(&config, session_id.is_some())?;
+        validate_message_id(message_id)?;
         if body.len() > config.max_message_bytes {
             return Err(BrokerError::MessageTooLarge {
                 body_bytes: body.len(),
@@ -426,6 +435,14 @@ impl<S: StateStore> StateMachine<S> {
         let mut counters = self.load_counters(command)?;
         let sequence = SequenceNumber::new(counters.next_sequence);
         counters.next_sequence = counters.next_sequence.saturating_add(1);
+
+        batch.push_put(
+            keys::queue_counters(&command.namespace, &command.entity),
+            codec::encode(&counters)?,
+        );
+        if self.record_message_id(command, &config, message_id, &mut BTreeSet::new(), batch)? {
+            return Ok(CommandOutcome::Sent { sequence });
+        }
 
         let expires_at = time_to_live_millis
             .or(config.default_time_to_live_millis)
@@ -457,10 +474,6 @@ impl<S: StateStore> StateMachine<S> {
                 Vec::new(),
             );
         }
-        batch.push_put(
-            keys::queue_counters(namespace, entity),
-            codec::encode(&counters)?,
-        );
         Ok(CommandOutcome::Sent { sequence })
     }
 
@@ -478,9 +491,11 @@ impl<S: StateStore> StateMachine<S> {
         let namespace = &command.namespace;
         let entity = &command.entity;
         let mut sequences = Vec::with_capacity(messages.len());
+        let mut staged_history = BTreeSet::new();
 
         for message in messages {
             require_session_agreement(&config, message.session_id.is_some())?;
+            validate_message_id(&message.message_id)?;
             if message.body.len() > config.max_message_bytes {
                 return Err(BrokerError::MessageTooLarge {
                     body_bytes: message.body.len(),
@@ -489,6 +504,16 @@ impl<S: StateStore> StateMachine<S> {
             }
             let sequence = SequenceNumber::new(counters.next_sequence);
             counters.next_sequence = counters.next_sequence.saturating_add(1);
+            sequences.push(sequence);
+            if self.record_message_id(
+                command,
+                &config,
+                &message.message_id,
+                &mut staged_history,
+                batch,
+            )? {
+                continue;
+            }
             let time_to_live_millis = message
                 .time_to_live_millis
                 .or(config.default_time_to_live_millis);
@@ -535,7 +560,6 @@ impl<S: StateStore> StateMachine<S> {
                     );
                 }
             }
-            sequences.push(sequence);
         }
         if !messages.is_empty() {
             batch.push_put(
@@ -544,6 +568,77 @@ impl<S: StateStore> StateMachine<S> {
             );
         }
         Ok(CommandOutcome::Scheduled { sequences })
+    }
+
+    /// Returns whether this is a duplicate and remembers only newly accepted
+    /// identifiers. The overlay makes earlier messages in an uncommitted batch
+    /// visible to later messages in that same batch.
+    fn record_message_id(
+        &self,
+        command: &Command,
+        config: &QueueConfig,
+        message_id: &str,
+        staged: &mut BTreeSet<String>,
+        batch: &mut WriteBatch,
+    ) -> Result<bool, BrokerError> {
+        // Empty identifiers represent an omitted message-id at the wire edge;
+        // anonymous submissions must not all collapse into one message.
+        if !config.requires_duplicate_detection || message_id.is_empty() {
+            return Ok(false);
+        }
+        if staged.contains(message_id) {
+            return Ok(true);
+        }
+        let namespace = &command.namespace;
+        let entity = &command.entity;
+        let key = keys::duplicate_history(namespace, entity, message_id);
+        if let Some(expires_at) = self.read::<Timestamp>(&key)? {
+            if expires_at > command.issued_at {
+                return Ok(true);
+            }
+            batch.push_delete(keys::duplicate_history_expiry(
+                namespace, entity, expires_at, message_id,
+            ));
+        }
+        let expires_at = command
+            .issued_at
+            .saturating_add_millis(config.duplicate_detection_history_time_window_millis);
+        batch.push_put(key, codec::encode(&expires_at)?);
+        batch.push_put(
+            keys::duplicate_history_expiry(namespace, entity, expires_at, message_id),
+            Vec::new(),
+        );
+        staged.insert(message_id.to_owned());
+        Ok(false)
+    }
+
+    fn expire_duplicate_history(
+        &self,
+        command: &Command,
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        self.load_config(command)?;
+        let namespace = &command.namespace;
+        let entity = &command.entity;
+        let prefix = keys::duplicate_history_expiry_prefix(namespace, entity);
+        let entries = self.store.scan_prefix(&prefix, TIMER_SCAN_LIMIT)?;
+        let mut expired = 0;
+
+        for (key, _) in entries {
+            let (expires_at, message_id) = keys::duplicate_history_expiry_parts(&prefix, &key)
+                .ok_or(BrokerError::MalformedIndexKey)?;
+            if expires_at > command.issued_at {
+                break;
+            }
+            let history_key = keys::duplicate_history(namespace, entity, message_id);
+            // A stale cleanup entry must never remove a more recent retention.
+            if self.read::<Timestamp>(&history_key)? == Some(expires_at) {
+                batch.push_delete(history_key);
+            }
+            batch.push_delete(key);
+            expired += 1;
+        }
+        Ok(CommandOutcome::DuplicateHistoryExpired { expired })
     }
 
     fn cancel_scheduled(
@@ -1510,4 +1605,15 @@ fn require_session_agreement(config: &QueueConfig, names_session: bool) -> Resul
         (false, true) => Err(BrokerError::SessionNotSupported),
         _ => Ok(()),
     }
+}
+
+fn validate_message_id(message_id: &str) -> Result<(), BrokerError> {
+    let length = message_id.encode_utf16().count();
+    if length > MAX_MESSAGE_ID_LENGTH {
+        return Err(BrokerError::MessageIdTooLong {
+            length,
+            maximum: MAX_MESSAGE_ID_LENGTH,
+        });
+    }
+    Ok(())
 }

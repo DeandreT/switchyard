@@ -12,6 +12,7 @@
 //!   receiver looking for a session to accept walks the groups in turn;
 //! - the session lock index sorts by lock deadline, like the message one.
 //! - the scheduled index sorts by enqueue time, then cancellation handle.
+//! - duplicate history expires in deadline order without inspecting messages.
 //!
 //! Every entity-scoped key is `tag || namespace || 0x00 || path || 0x00 || ..`,
 //! and a session-scoped key appends `session || 0x00` to that. The terminators
@@ -34,6 +35,8 @@ const TAG_SESSION: u8 = 0x08;
 const TAG_SESSION_READY: u8 = 0x09;
 const TAG_SESSION_LOCK: u8 = 0x0A;
 const TAG_SCHEDULED: u8 = 0x0B;
+const TAG_DUPLICATE_HISTORY: u8 = 0x0C;
+const TAG_DUPLICATE_HISTORY_EXPIRY: u8 = 0x0D;
 
 const SEPARATOR: u8 = 0x00;
 
@@ -160,6 +163,53 @@ pub fn scheduled(
 ) -> Vec<u8> {
     let key = with_u64(scheduled_prefix(namespace, entity), enqueue_at.as_millis());
     with_u64(key, sequence.as_u64())
+}
+
+pub fn duplicate_history_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_DUPLICATE_HISTORY, namespace, entity)
+}
+
+/// Message identifiers are unstructured strings and may contain zero bytes.
+/// They occupy the whole remaining key, so no identifier can forge a suffix.
+pub fn duplicate_history(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    message_id: &str,
+) -> Vec<u8> {
+    let mut key = duplicate_history_prefix(namespace, entity);
+    key.extend_from_slice(message_id.as_bytes());
+    key
+}
+
+pub fn duplicate_history_expiry_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_DUPLICATE_HISTORY_EXPIRY, namespace, entity)
+}
+
+pub fn duplicate_history_expiry(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    expires_at: Timestamp,
+    message_id: &str,
+) -> Vec<u8> {
+    let mut key = with_u64(
+        duplicate_history_expiry_prefix(namespace, entity),
+        expires_at.as_millis(),
+    );
+    key.extend_from_slice(message_id.as_bytes());
+    key
+}
+
+pub fn duplicate_history_expiry_parts<'a>(
+    prefix: &[u8],
+    key: &'a [u8],
+) -> Option<(Timestamp, &'a str)> {
+    let rest = key.strip_prefix(prefix)?;
+    let bytes: [u8; 8] = rest.get(..8)?.try_into().ok()?;
+    let message_id = std::str::from_utf8(rest.get(8..)?).ok()?;
+    Some((
+        Timestamp::from_millis(u64::from_be_bytes(bytes)),
+        message_id,
+    ))
 }
 
 /// The record holding one session's lock and state.
@@ -352,6 +402,37 @@ mod tests {
                 (Timestamp::from_millis(200), SequenceNumber::new(1)),
             ]
         );
+    }
+
+    #[test]
+    fn duplicate_history_keys_preserve_embedded_zero_bytes() {
+        let plain = duplicate_history(&namespace(), &entity(), "id");
+        let with_zero = duplicate_history(&namespace(), &entity(), "id\0suffix");
+        assert_ne!(plain, with_zero);
+        let key = duplicate_history_expiry(
+            &namespace(),
+            &entity(),
+            Timestamp::from_millis(20_000),
+            "id\0suffix",
+        );
+        let prefix = duplicate_history_expiry_prefix(&namespace(), &entity());
+        assert_eq!(
+            duplicate_history_expiry_parts(&prefix, &key),
+            Some((Timestamp::from_millis(20_000), "id\0suffix"))
+        );
+        assert_eq!(
+            duplicate_history_expiry_parts(&ready_prefix(&namespace(), &entity()), &key),
+            None
+        );
+    }
+
+    #[test]
+    fn duplicate_history_cleanup_orders_by_deadline_before_identifier() {
+        let early =
+            duplicate_history_expiry(&namespace(), &entity(), Timestamp::from_millis(10), "z");
+        let late =
+            duplicate_history_expiry(&namespace(), &entity(), Timestamp::from_millis(20), "a");
+        assert!(early < late);
     }
 
     #[test]

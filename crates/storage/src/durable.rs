@@ -28,13 +28,17 @@ pub const STORE_FORMAT_V2: u32 = 2;
 /// a new sequence number. Earlier builds cannot activate or cancel them.
 pub const STORE_FORMAT_V3: u32 = 3;
 
+/// Version 4: duplicate-detection history and its expiry index are part of the
+/// enqueue contract. Earlier builds cannot enforce or prune that history.
+pub const STORE_FORMAT_V4: u32 = 4;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V3;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V4;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
@@ -256,6 +260,20 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V2,
+                expected: ACTIVE_STORE_FORMAT,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_store_from_before_duplicate_detection() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        stamp_format(directory.path(), &STORE_FORMAT_V3.to_be_bytes())?;
+        assert_eq!(
+            FjallStore::open(directory.path()).err(),
+            Some(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V3,
                 expected: ACTIVE_STORE_FORMAT,
             })
         );

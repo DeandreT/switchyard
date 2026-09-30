@@ -1,10 +1,10 @@
 using Azure;
 using Azure.Messaging.ServiceBus;
 
-if (args.Length != 6)
+if (args.Length != 7)
 {
     Console.Error.WriteLine(
-        "usage: <namespace> <custom-endpoint> <queue> <session-queue> <key-name> <key>");
+        "usage: <namespace> <custom-endpoint> <queue> <session-queue> <duplicate-queue> <key-name> <key>");
     return 2;
 }
 
@@ -12,8 +12,9 @@ string fullyQualifiedNamespace = args[0];
 var customEndpoint = new Uri(args[1]);
 string queue = args[2];
 string sessionQueue = args[3];
-string keyName = args[4];
-string key = args[5];
+string duplicateQueue = args[4];
+string keyName = args[5];
+string key = args[6];
 
 var options = new ServiceBusClientOptions
 {
@@ -252,13 +253,112 @@ if (scheduledSessionMessage?.Body.ToString() != "official-scheduled-session-curr
 }
 await sessionReceiver.CompleteMessageAsync(scheduledSessionMessage);
 
+await using ServiceBusSender duplicateSender = client.CreateSender(duplicateQueue);
+await using ServiceBusReceiver duplicateReceiver = client.CreateReceiver(duplicateQueue);
+const string duplicateMessageId = "official-duplicate-current";
+await duplicateSender.SendMessageAsync(new ServiceBusMessage("official-duplicate-original-current")
+{
+    MessageId = duplicateMessageId,
+});
+await duplicateSender.SendMessageAsync(new ServiceBusMessage("official-duplicate-dropped-current")
+{
+    MessageId = duplicateMessageId,
+});
+IReadOnlyList<ServiceBusReceivedMessage> duplicatePeek =
+    await duplicateReceiver.PeekMessagesAsync(2, fromSequenceNumber: 1);
+if (duplicatePeek.Count != 1
+    || duplicatePeek[0].Body.ToString() != "official-duplicate-original-current"
+    || duplicatePeek[0].MessageId != duplicateMessageId)
+{
+    Console.Error.WriteLine("duplicate sends were not acknowledged and reduced to the original message");
+    return 22;
+}
+ServiceBusReceivedMessage? duplicateOriginal =
+    await duplicateReceiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+if (duplicateOriginal?.Body.ToString() != "official-duplicate-original-current")
+{
+    Console.Error.WriteLine($"unexpected duplicate original message: {duplicateOriginal?.Body}");
+    return 23;
+}
+await duplicateReceiver.CompleteMessageAsync(duplicateOriginal);
+await duplicateSender.SendMessageAsync(new ServiceBusMessage("official-duplicate-after-complete-current")
+{
+    MessageId = duplicateMessageId,
+});
+await duplicateSender.ScheduleMessageAsync(
+    new ServiceBusMessage("official-scheduled-duplicate-of-completed-current")
+    {
+        MessageId = duplicateMessageId,
+    }, DateTimeOffset.UtcNow.AddMinutes(1));
+if (await duplicateReceiver.PeekMessageAsync(fromSequenceNumber: 1) is not null)
+{
+    Console.Error.WriteLine("completing a message erased its duplicate-detection history");
+    return 24;
+}
+
+const string scheduledDuplicateMessageId = "official-scheduled-duplicate-current";
+const string scheduledBatchDuplicateMessageId = "official-scheduled-batch-duplicate-current";
+DateTimeOffset duplicateEnqueueTime = DateTimeOffset.UtcNow.AddMinutes(1);
+long scheduledDuplicateOriginal = await duplicateSender.ScheduleMessageAsync(
+    new ServiceBusMessage("official-scheduled-duplicate-original-current")
+    {
+        MessageId = scheduledDuplicateMessageId,
+    }, duplicateEnqueueTime);
+await duplicateSender.SendMessageAsync(new ServiceBusMessage("official-ordinary-duplicate-of-scheduled-current")
+{
+    MessageId = scheduledDuplicateMessageId,
+});
+IReadOnlyList<long> duplicateScheduledBatchSequences =
+    await duplicateSender.ScheduleMessagesAsync(new[]
+    {
+        new ServiceBusMessage("official-scheduled-existing-duplicate-a-current")
+        {
+            MessageId = scheduledDuplicateMessageId,
+        },
+        new ServiceBusMessage("official-scheduled-existing-duplicate-b-current")
+        {
+            MessageId = scheduledDuplicateMessageId,
+        },
+        new ServiceBusMessage("official-scheduled-batch-original-current")
+        {
+            MessageId = scheduledBatchDuplicateMessageId,
+        },
+        new ServiceBusMessage("official-scheduled-batch-duplicate-current")
+        {
+            MessageId = scheduledBatchDuplicateMessageId,
+        },
+    }, duplicateEnqueueTime);
+IReadOnlyList<ServiceBusReceivedMessage> duplicateScheduledPeek =
+    await duplicateReceiver.PeekMessagesAsync(5, fromSequenceNumber: 1);
+if (duplicateScheduledBatchSequences.Count != 4
+    || duplicateScheduledBatchSequences.Distinct().Count() != 4
+    || duplicateScheduledBatchSequences.Contains(scheduledDuplicateOriginal)
+    || duplicateScheduledPeek.Count != 2
+    || duplicateScheduledPeek[0].SequenceNumber != scheduledDuplicateOriginal
+    || duplicateScheduledPeek[0].Body.ToString() != "official-scheduled-duplicate-original-current"
+    || duplicateScheduledPeek[1].SequenceNumber != duplicateScheduledBatchSequences[2]
+    || duplicateScheduledPeek[1].Body.ToString() != "official-scheduled-batch-original-current"
+    || duplicateScheduledPeek.Any(message => message.State != ServiceBusMessageState.Scheduled
+        || message.ScheduledEnqueueTime.ToUnixTimeMilliseconds()
+            != duplicateEnqueueTime.ToUnixTimeMilliseconds()))
+{
+    Console.Error.WriteLine("scheduled duplicate detection did not preserve only the original messages");
+    return 25;
+}
+await duplicateSender.CancelScheduledMessagesAsync(new[]
+{
+    scheduledDuplicateOriginal,
+    duplicateScheduledBatchSequences[2],
+});
+
 if (await receiver.PeekMessageAsync(fromSequenceNumber: 1) is not null
-    || await sessionReceiver.PeekMessageAsync(fromSequenceNumber: 1) is not null)
+    || await sessionReceiver.PeekMessageAsync(fromSequenceNumber: 1) is not null
+    || await duplicateReceiver.PeekMessageAsync(fromSequenceNumber: 1) is not null)
 {
     Console.Error.WriteLine("the official client left messages in a queue");
     return 21;
 }
 
 Console.WriteLine(
-    "official .NET Service Bus client send/peek/receive/defer/renew/complete/schedule/cancel and session renew/state passed");
+    "official .NET Service Bus client send/peek/receive/defer/renew/complete/schedule/cancel/duplicate and session renew/state passed");
 return 0;

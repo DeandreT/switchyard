@@ -217,6 +217,118 @@ async fn a_client_peeks_without_locking_or_consuming() -> Result<(), Box<dyn Err
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_client_gets_successful_acknowledgements_for_duplicate_sends()
+-> Result<(), Box<dyn Error>> {
+    let node = Node::start(
+        "orders",
+        QueueConfig {
+            requires_duplicate_detection: true,
+            ..QueueConfig::default()
+        },
+    )
+    .await?;
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
+    for text in ["original", "retried-with-different-body"] {
+        let message = Message::builder()
+            .properties(Properties {
+                message_id: Some("retry-id".into()),
+                ..Properties::default()
+            })
+            .body(body(text))
+            .build();
+        assert!(matches!(sender.send(message).await?, Outcome::Accepted(_)));
+    }
+    let peek = || {
+        node._broker.handle().submit_blocking(
+            domain::NamespaceName::new("tenant").expect("a valid namespace"),
+            domain::EntityPath::new("orders").expect("a valid entity"),
+            CommandKind::Peek {
+                from_sequence: domain::SequenceNumber::new(0),
+                max_messages: 10,
+                session_id: None,
+            },
+        )
+    };
+    let domain::CommandOutcome::Peeked(messages) = peek()? else {
+        panic!("peek outcome");
+    };
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].body, b"original");
+    let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
+    let delivery =
+        tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv()).await??;
+    assert_eq!(text_of(delivery.message()), "original");
+    receiver.accept(&delivery).await?;
+    receiver.close().await?;
+    assert!(matches!(
+        sender
+            .send(
+                Message::builder()
+                    .properties(Properties {
+                        message_id: Some("retry-id".into()),
+                        ..Properties::default()
+                    })
+                    .body(body("retry-after-completion"))
+                    .build()
+            )
+            .await?,
+        Outcome::Accepted(_)
+    ));
+    assert_eq!(peek()?, domain::CommandOutcome::Peeked(Vec::new()));
+    sender.close().await?;
+    session.end().await?;
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overlong_message_id_is_rejected_and_the_sender_stays_usable()
+-> Result<(), Box<dyn Error>> {
+    let node = Node::start("orders", QueueConfig::default()).await?;
+    let mut connection = node.connect().await?;
+    let mut session = Session::begin(&mut connection).await?;
+    let mut sender = Sender::attach(&mut session, "test-sender", "orders").await?;
+    let invalid = Message::builder()
+        .properties(Properties {
+            message_id: Some("a".repeat(129).into()),
+            ..Properties::default()
+        })
+        .body(body("invalid"))
+        .build();
+    let Outcome::Rejected(rejected) = sender.send(invalid).await? else {
+        panic!("an overlong ID must be rejected");
+    };
+    assert_eq!(
+        rejected
+            .error
+            .expect("rejection condition")
+            .condition
+            .as_symbol(),
+        Symbol::from(protocol_amqp::INVALID_FIELD)
+    );
+    let valid = Message::builder()
+        .properties(Properties {
+            message_id: Some("a".repeat(128).into()),
+            ..Properties::default()
+        })
+        .body(body("valid"))
+        .build();
+    assert!(matches!(sender.send(valid).await?, Outcome::Accepted(_)));
+    let mut receiver = Receiver::attach(&mut session, "test-receiver", "orders").await?;
+    let delivery =
+        tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv()).await??;
+    assert_eq!(text_of(delivery.message()), "valid");
+    receiver.accept(&delivery).await?;
+    sender.close().await?;
+    receiver.close().await?;
+    session.end().await?;
+    connection.close().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_client_defers_and_receives_by_sequence() -> Result<(), Box<dyn Error>> {
     let node = Node::start("orders", QueueConfig::default()).await?;
 
