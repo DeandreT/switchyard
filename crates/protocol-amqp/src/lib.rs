@@ -8,6 +8,7 @@
 
 mod address;
 mod authorization;
+mod batch;
 mod broker;
 mod cbs;
 mod condition;
@@ -26,6 +27,7 @@ pub use crate::{
         parse_attachment, parse_session_id,
     },
     authorization::SharedAccessAuthentication,
+    batch::SERVICE_BUS_BATCH_MESSAGE_FORMAT,
     broker::{Broker, BrokerRejection},
     condition::{
         ENTITY_ALREADY_EXISTS, INTERNAL_ERROR, INVALID_FIELD, MESSAGE_LOCK_LOST, MESSAGE_NOT_FOUND,

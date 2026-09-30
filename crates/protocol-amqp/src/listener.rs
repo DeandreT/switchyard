@@ -9,8 +9,8 @@ use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use amqp::{
     AmqpError, Attach, DeliveryTag, EngineError, Error as AmqpProtocolError, ErrorCondition,
-    Fields, LinkEndpoint, Receiver, Role, Sender, SenderSettleMode, ServerConnection,
-    ServerSession,
+    Fields, LinkEndpoint, MessageFormatDecoders, Receiver, Role, Sender, SenderSettleMode,
+    ServerConnection, ServerSession,
 };
 use auth::{Permission, ResourceScope};
 use domain::{
@@ -28,12 +28,13 @@ use tracing::{debug, info, warn};
 use crate::{
     Attachment, Broker, BrokerRejection, ProtocolError, SessionRequest, SharedAccessAuthentication,
     authorization::{ConnectionAuthorization, SharedAccessSaslAcceptor},
+    batch::read_ingress,
     cbs::{serve_cbs_replies, serve_cbs_requests},
     management::{
         ConnectionManagement, ManagementAuthorization, serve_management_replies,
         serve_management_requests,
     },
-    parse_attachment, read_incoming, read_session_filter,
+    parse_attachment, read_session_filter,
     settlement::settlement_command,
     stamp_session_filter,
 };
@@ -549,11 +550,20 @@ async fn serve_session<B: Broker>(
             .ok()
             .and_then(|(_, accepted, _)| accepted.as_ref())
             .map(session_attach_properties);
+        let decoders = if attach.role == Role::Sender && plan.is_ok() {
+            MessageFormatDecoders::default().with_decoder(
+                crate::SERVICE_BUS_BATCH_MESSAGE_FORMAT,
+                amqp::decode_message,
+            )?
+        } else {
+            MessageFormatDecoders::default()
+        };
         let endpoint = match session
-            .accept_attach_with_properties(
+            .accept_attach_with_decoders(
                 attach,
                 crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64,
                 response_properties,
+                decoders,
             )
             .await
         {
@@ -835,40 +845,25 @@ async fn serve_sending_client<B: Broker>(
             receiver.close_with_error(error).await?;
             return Ok(());
         }
-        let incoming = match read_incoming(delivery.message()) {
-            Ok(incoming) => incoming,
+        let kind = match read_ingress(delivery.message(), delivery.message_format()) {
+            Ok(kind) => kind,
             Err(error) => {
                 // The client's message, the client's fault: reject this transfer
                 // and keep the link.
                 receiver
                     .reject(
                         &delivery,
-                        Some(error_for(AmqpError::InvalidField, error.to_string())),
+                        Some(AmqpProtocolError::new(
+                            ErrorCondition::Custom(Symbol::from(error.condition())),
+                            error.to_string(),
+                            None,
+                        )),
                     )
                     .await?;
                 continue;
             }
         };
 
-        let kind = match incoming.scheduled_enqueue_time {
-            Some(enqueue_at) => CommandKind::ScheduleEnvelopes {
-                messages: vec![domain::ScheduledEnvelope {
-                    message_id: incoming.message_id,
-                    body: incoming.body,
-                    time_to_live_millis: incoming.time_to_live_millis,
-                    session_id: incoming.session_id,
-                    enqueue_at,
-                    envelope: incoming.envelope,
-                }],
-            },
-            None => CommandKind::SendEnvelope {
-                message_id: incoming.message_id,
-                body: incoming.body,
-                time_to_live_millis: incoming.time_to_live_millis,
-                session_id: incoming.session_id,
-                envelope: incoming.envelope.into(),
-            },
-        };
         let outcome = broker.submit(namespace.clone(), entity.clone(), kind).await;
 
         // Accepting only after the command committed is what makes the
