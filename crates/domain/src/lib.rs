@@ -19,6 +19,7 @@ mod message_content;
 mod queue;
 mod rule;
 mod session;
+mod sql_filter;
 mod time;
 mod topic;
 
@@ -63,5 +64,14 @@ pub use rule::{
     MAX_TOPIC_RULE_MATCH_WORK, RuleDefinition, RuleFilter, RuleMatchLimit, RuleName,
 };
 pub use session::{AcceptedSession, SessionHold, SessionLock, SessionRecord};
+pub use sql_filter::{
+    MAX_SQL_COMPILE_NODES, MAX_SQL_COMPILE_SOURCE_BYTES, MAX_SQL_COMPILE_TOKENS,
+    MAX_SQL_EXPRESSION_BYTES, MAX_SQL_EXPRESSION_DEPTH, MAX_SQL_EXPRESSION_NODES,
+    MAX_SQL_EXPRESSION_TOKENS, MAX_SQL_EXPRESSION_UTF16_UNITS, MAX_SQL_IN_ITEMS,
+    MAX_SQL_LIKE_PATTERN_BYTES, MAX_SQL_PARSER_DEPTH, MAX_SQL_REGEX_ENGINE_BYTES, SqlCompileBudget,
+    SqlCompileError, SqlCompileLimit, SqlCompileUsage, SqlEvaluationBudget, SqlEvaluationError,
+    SqlEvaluationLimit, SqlEvaluationUsage, SqlMessageContext, SqlProgram, SqlProgramMetrics,
+    SqlTruth,
+};
 pub use time::Timestamp;
 pub use topic::{MAX_TOPIC_SUBSCRIPTIONS, SubscriptionConfig, SubscriptionDefinition, TopicConfig};
