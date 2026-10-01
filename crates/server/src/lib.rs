@@ -24,7 +24,7 @@ use thiserror::Error;
 pub use crate::{
     broker::{Broker, BrokerHandle, SubmitError},
     clock::{Clock, ManualClock, SystemClock},
-    native_admin::NativeAdminService,
+    native_admin::{MAX_NATIVE_QUEUE_SCAN_ROUNDS, MAX_NATIVE_QUEUE_SCAN_ROWS, NativeAdminService},
     native_admin_listener::{
         DEFAULT_NATIVE_ADMIN_CONNECTION_LIMIT, NATIVE_ADMIN_DEVELOPMENT_PORT,
         NATIVE_ADMIN_REQUEST_LIMIT, NATIVE_ADMIN_RESPONSE_LIMIT, NATIVE_ADMIN_TLS_PORT,

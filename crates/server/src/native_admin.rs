@@ -23,10 +23,12 @@ use tonic::{Request, Response, Status};
 use crate::{AdminTarget, BrokerHandle, ProposeError, SubmitError};
 
 mod paging;
+mod queue_paging;
 mod topology;
 
+pub use queue_paging::{MAX_NATIVE_QUEUE_SCAN_ROUNDS, MAX_NATIVE_QUEUE_SCAN_ROWS};
+
 const DEFAULT_PAGE_SIZE: usize = 100;
-const TOKEN_PREFIX: &str = "v1.";
 const MAX_PAGE_TOKEN_BYTES: usize = 512;
 const MAX_CONCURRENT_REQUESTS: usize = 128;
 
@@ -150,44 +152,6 @@ impl NativeAdminService {
             .map_err(read_status)?
             .ok_or_else(|| Status::not_found("entity does not exist"))?;
         topology::response(&self.namespace, &path, metadata)
-    }
-
-    fn decode_cursor(&self, token: &str) -> Result<Option<QueueCursor>, Status> {
-        if token.is_empty() {
-            return Ok(None);
-        }
-        if token.len() > MAX_PAGE_TOKEN_BYTES {
-            return Err(Status::invalid_argument("page token is too large"));
-        }
-        let encoded = token
-            .strip_prefix(TOKEN_PREFIX)
-            .ok_or_else(|| Status::invalid_argument("unsupported page token version"))?;
-        let bytes = URL_SAFE_NO_PAD
-            .decode(encoded)
-            .map_err(|_| Status::invalid_argument("malformed page token"))?;
-        let cursor = GetEntityRequest::decode(bytes.as_slice())
-            .map_err(|_| Status::invalid_argument("malformed page token"))?;
-        if cursor.encode_to_vec() != bytes {
-            return Err(Status::invalid_argument("noncanonical page token"));
-        }
-        if cursor.namespace != self.namespace.as_str() {
-            return Err(Status::invalid_argument(
-                "page token belongs to another namespace",
-            ));
-        }
-        Ok(Some(QueueCursor {
-            namespace: self.namespace.clone(),
-            entity: self.entity_path(&cursor.path)?,
-        }))
-    }
-
-    fn encode_cursor(&self, path: &EntityPath) -> String {
-        let bytes = GetEntityRequest {
-            namespace: self.namespace.as_str().to_owned(),
-            path: path.as_str().to_owned(),
-        }
-        .encode_to_vec();
-        format!("{TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))
     }
 }
 
@@ -332,44 +296,7 @@ impl EntityService for NativeAdminService {
             }
             EntityKind::Queue | EntityKind::Unspecified => {}
         }
-        let mut cursor = self.decode_cursor(&input.page_token)?;
-        let mut paths = Vec::with_capacity(page_size);
-        let mut has_more = false;
-        loop {
-            let limit = (page_size - paths.len() + 1).min(MAX_QUEUE_PAGE_SIZE);
-            let page = self
-                .broker
-                .queues_page(Some(self.namespace.clone()), cursor, limit)
-                .await
-                .map_err(submit_status)?;
-            for (_, path) in &page.queues {
-                if path.is_dead_letter_queue() || path.is_subscription_path() {
-                    continue;
-                }
-                if paths.len() == page_size {
-                    has_more = true;
-                    break;
-                }
-                paths.push(path.clone());
-            }
-            if has_more || page.continuation.is_none() {
-                break;
-            }
-            cursor = page.continuation;
-        }
-        let next_page_token = if has_more {
-            self.encode_cursor(paths.last().expect("a nonempty page has a lookahead"))
-        } else {
-            String::new()
-        };
-        let mut entities = Vec::with_capacity(paths.len());
-        for path in paths {
-            entities.push(self.read_entity(path).await?);
-        }
-        Ok(Response::new(ListEntitiesResponse {
-            entities,
-            next_page_token,
-        }))
+        Ok(Response::new(self.list_queues(input, page_size).await?))
     }
 
     async fn update_entity(

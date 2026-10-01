@@ -70,8 +70,22 @@ async fn kind_filtered_pages_are_sorted_bounded_and_keep_legacy_queue_tokens<P: 
         list(EntityKind::Unspecified, "", 1, &first.next_page_token),
     )
     .await?;
+    assert_eq!(last.entities.len(), 1);
     assert_eq!(last.entities[0].path, "omega");
-    assert!(last.next_page_token.is_empty());
+    assert!(last.next_page_token.starts_with("queue.scan.v1."));
+    let mut token = last.next_page_token;
+    for _ in 0..4 {
+        let result = page(&node, list(EntityKind::Unspecified, "", 1, &token)).await?;
+        assert!(result.entities.is_empty());
+        if result.next_page_token.is_empty() {
+            token.clear();
+            break;
+        }
+        assert!(result.next_page_token.starts_with("queue.scan.v1."));
+        assert_ne!(result.next_page_token, token);
+        token = result.next_page_token;
+    }
+    assert!(token.is_empty(), "hidden rows must reach exact exhaustion");
     let first = page(&node, list(EntityKind::Topic, "", 0, "")).await?;
     assert_eq!(first.entities.len(), 100);
     assert!(first.next_page_token.starts_with("topic.v1."));
