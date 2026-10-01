@@ -1,7 +1,7 @@
 use std::{collections::HashMap, error::Error, time::Duration};
 
 use amqp::{
-    Accepted, Attach, Begin, ClientConnection, ClientReceiver, ClientSender, ClientSession,
+    Accepted, Attach, Begin, ClientConnection, ClientReceiver, ClientSender, ClientSession, Close,
     ConnectionOptions, Delivery, DeliveryState, Detach, Disposition, EngineError, Flow, Frame,
     IncomingAttach, LinkEndpoint, Message, Open, Outcome, Performative, ProtocolHeader, Receiver,
     ReceiverSettleMode, Role, Sender, SenderSettleMode, ServerConnection, ServerSession, Source,
@@ -9,6 +9,7 @@ use amqp::{
     write_frame, write_protocol_header,
 };
 use tokio::{
+    io::AsyncReadExt,
     net::{TcpListener, TcpStream},
     time::timeout,
 };
@@ -208,6 +209,43 @@ impl Peer {
                 frame => panic!("expected bounded mapped End, got {frame:?}"),
             }
         }
+    }
+
+    pub async fn close(&mut self, condition: &str) -> TestResult {
+        let frame = self.read().await?;
+        let Frame::Amqp {
+            channel,
+            performative: Some(Performative::Close(close)),
+            payload,
+        } = &frame
+        else {
+            panic!("expected immediate connection Close, not session or link traffic: {frame:?}")
+        };
+        assert_eq!(*channel, 0);
+        assert!(payload.is_empty());
+        assert_eq!(
+            close
+                .error
+                .as_ref()
+                .expect("connection refusal")
+                .condition
+                .as_symbol()
+                .as_str(),
+            condition
+        );
+        Ok(())
+    }
+
+    pub async fn acknowledge_close_and_expect_eof(&mut self) -> TestResult {
+        self.send(0, Performative::Close(Close::default()), Vec::new())
+            .await?;
+        let mut byte = [0];
+        assert_eq!(
+            timeout(IO_TIMEOUT, self.stream.read(&mut byte)).await??,
+            0,
+            "Close acknowledgement must finish the connection without further frames"
+        );
+        Ok(())
     }
 
     pub async fn accepted(&mut self, channels: Channels, id: u32) -> TestResult {
@@ -504,6 +542,22 @@ impl Node {
     }
 
     pub async fn sender(&mut self, session: &mut Session, link: Link) -> TestResult<Sending> {
+        let sender = self.sender_without_credit(session, link).await?;
+        let mut flow = self.peer.flow(link.channels);
+        flow.handle = Some(link.peer);
+        flow.delivery_count = Some(0);
+        flow.link_credit = Some(2);
+        self.peer
+            .send(link.channels.incoming, Performative::Flow(flow), Vec::new())
+            .await?;
+        Ok(sender)
+    }
+
+    pub async fn sender_without_credit(
+        &mut self,
+        session: &mut Session,
+        link: Link,
+    ) -> TestResult<Sending> {
         let sender = if matches!(session, Session::Server(_)) {
             let incoming = self.pending(session, link, Role::Receiver).await?;
             let Session::Server(session) = session else {
@@ -547,13 +601,6 @@ impl Node {
             )?;
             Sending::Client(sender)
         };
-        let mut flow = self.peer.flow(link.channels);
-        flow.handle = Some(link.peer);
-        flow.delivery_count = Some(0);
-        flow.link_credit = Some(2);
-        self.peer
-            .send(link.channels.incoming, Performative::Flow(flow), Vec::new())
-            .await?;
         Ok(sender)
     }
 

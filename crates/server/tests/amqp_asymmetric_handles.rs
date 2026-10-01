@@ -9,7 +9,8 @@ use tokio::time::timeout;
 mod fixture;
 
 use fixture::{
-    CASE_TIMEOUT, IO_TIMEOUT, Link, Node, Session, TestResult, attach, channels, detach, transfer,
+    CASE_TIMEOUT, Connection, IO_TIMEOUT, Link, Node, Session, TestResult, attach, channels,
+    detach, transfer,
 };
 
 fn only_session_flow(frames: &[Frame], outgoing: u16) {
@@ -473,6 +474,254 @@ async fn numeric_local_handle_is_not_a_peer_alias(server: bool) -> TestResult {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ServerDuplicateStage {
+    Installed,
+    Pending,
+    Closing,
+}
+
+async fn server_approval_queue_is_retired(session: &mut Session) -> TestResult {
+    let Session::Server(session) = session else {
+        panic!("server approval queue")
+    };
+    assert!(
+        timeout(IO_TIMEOUT, session.next_incoming_attach())
+            .await?
+            .is_none(),
+        "a connection refusal must retire the whole approval queue"
+    );
+    Ok(())
+}
+
+async fn server_duplicate_attach_closes_connection(stage: ServerDuplicateStage) -> TestResult {
+    let mut node = Node::new(true).await?;
+    let main = channels(true, 0);
+    let sibling = channels(true, 1);
+    let waiting = channels(true, 2);
+    let mut session = node.session(main, 0).await?;
+    let mut sibling_session = node.session(sibling, 0).await?;
+    let mut waiting_session = node.session(waiting, 0).await?;
+    let existing = Link {
+        channels: main,
+        peer: 55,
+        local: 0,
+    };
+    let mut pending = None;
+    let mut receiver = match stage {
+        ServerDuplicateStage::Pending => {
+            pending = Some(node.pending(&mut session, existing, Role::Sender).await?);
+            None
+        }
+        ServerDuplicateStage::Installed | ServerDuplicateStage::Closing => {
+            Some(node.receiver(&mut session, existing).await?)
+        }
+    };
+    if matches!(stage, ServerDuplicateStage::Closing) {
+        timeout(
+            IO_TIMEOUT,
+            receiver.as_ref().expect("installed link").close(),
+        )
+        .await??;
+        node.peer.detach(existing).await?;
+    }
+    let sibling_link = Link {
+        channels: sibling,
+        peer: 77,
+        local: 0,
+    };
+    let mut sibling_receiver = node.receiver(&mut sibling_session, sibling_link).await?;
+    let waiting_link = Link {
+        channels: waiting,
+        peer: 88,
+        local: 0,
+    };
+    let mut sender = node
+        .sender_without_credit(&mut waiting_session, waiting_link)
+        .await?;
+    let sending = sender.send(Message::data(vec![22]));
+    tokio::pin!(sending);
+    let frames = tokio::select! {
+        biased;
+        result = &mut sending => panic!("a sender without credit must remain blocked: {result:?}"),
+        frames = node.peer.barrier(waiting) => frames?,
+    };
+    only_session_flow(&frames, waiting.outgoing);
+
+    let mut duplicate = attach(existing, Role::Sender);
+    duplicate.name = "different-name-same-bound-handle".into();
+    node.peer
+        .send(
+            main.incoming,
+            Performative::Attach(Box::new(duplicate)),
+            Vec::new(),
+        )
+        .await?;
+    node.peer.close("amqp:session:handle-in-use").await?;
+
+    // Authority is retired before the peer acknowledges the connection Close.
+    assert!(matches!(
+        timeout(IO_TIMEOUT, &mut sending).await?,
+        Err(EngineError::RemoteDetached | EngineError::RemoteClosed)
+    ));
+    if let Some(receiver) = receiver.as_mut() {
+        assert!(matches!(
+            timeout(IO_TIMEOUT, receiver.recv()).await?,
+            Err(EngineError::RemoteDetached)
+        ));
+    }
+    assert!(matches!(
+        timeout(IO_TIMEOUT, sibling_receiver.recv()).await?,
+        Err(EngineError::RemoteDetached)
+    ));
+    if let Some(incoming) = pending {
+        let Session::Server(server_session) = &session else {
+            panic!("server receipt")
+        };
+        assert!(matches!(
+            timeout(IO_TIMEOUT, server_session.accept_attach(incoming, 4096)).await?,
+            Err(EngineError::RemoteDetached)
+        ));
+    }
+    server_approval_queue_is_retired(&mut session).await?;
+    server_approval_queue_is_retired(&mut sibling_session).await?;
+    server_approval_queue_is_retired(&mut waiting_session).await?;
+    node.peer.acknowledge_close_and_expect_eof().await?;
+    let Connection::Server(connection) = &mut node.connection else {
+        panic!("server connection queue")
+    };
+    assert!(
+        timeout(IO_TIMEOUT, connection.next_incoming_session())
+            .await?
+            .is_none()
+    );
+    node.shutdown().await;
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ClientDuplicateStage {
+    UnmatchedResponse,
+    PendingResponse,
+    Closing,
+}
+
+async fn client_duplicate_attach_closes_connection(stage: ClientDuplicateStage) -> TestResult {
+    let mut node = Node::new(false).await?;
+    let main = channels(false, 0);
+    let sibling = channels(false, 1);
+    let mut session = node
+        .session(
+            main,
+            u32::from(matches!(stage, ClientDuplicateStage::PendingResponse)),
+        )
+        .await?;
+    let mut sibling_session = node.session(sibling, 0).await?;
+    let existing = Link {
+        channels: main,
+        peer: 55,
+        local: 0,
+    };
+    let mut receiver = node.receiver(&mut session, existing).await?;
+    let sibling_link = Link {
+        channels: sibling,
+        peer: 77,
+        local: 0,
+    };
+    let mut sibling_receiver = node.receiver(&mut sibling_session, sibling_link).await?;
+    let mut duplicate = attach(existing, Role::Sender);
+    duplicate.name = "unmatched-name-same-bound-handle".into();
+    match stage {
+        ClientDuplicateStage::UnmatchedResponse => {
+            let Connection::Client(connection) = &mut node.connection else {
+                panic!("client connection")
+            };
+            let (result, wire) = tokio::join!(timeout(IO_TIMEOUT, connection.begin()), async {
+                assert!(matches!(node.peer.read().await?, Frame::Amqp {
+                        channel: 2, performative: Some(Performative::Begin(begin)), ..
+                    } if begin.remote_channel.is_none()));
+                node.peer
+                    .send(
+                        main.incoming,
+                        Performative::Attach(Box::new(duplicate)),
+                        Vec::new(),
+                    )
+                    .await?;
+                node.peer.close("amqp:session:handle-in-use").await
+            });
+            wire?;
+            assert!(matches!(result?, Err(EngineError::RemoteClosed)));
+        }
+        ClientDuplicateStage::PendingResponse => {
+            let Session::Client(client_session) = &mut session else {
+                panic!("client pending Attach")
+            };
+            let collision = Link {
+                channels: main,
+                peer: existing.peer,
+                local: 1,
+            };
+            let (result, wire) = tokio::join!(
+                timeout(
+                    IO_TIMEOUT,
+                    client_session.attach_receiver("colliding-response", "queue")
+                ),
+                async {
+                    let request = node.peer.own_attach(collision, Role::Receiver).await?;
+                    let mut response =
+                        request.response(request.source.clone(), request.target.clone());
+                    response.handle = existing.peer;
+                    node.peer
+                        .send(
+                            main.incoming,
+                            Performative::Attach(Box::new(response)),
+                            Vec::new(),
+                        )
+                        .await?;
+                    node.peer.close("amqp:session:handle-in-use").await
+                }
+            );
+            wire?;
+            assert!(matches!(result?, Err(EngineError::RemoteClosed)));
+        }
+        ClientDuplicateStage::Closing => {
+            let (result, wire) = tokio::join!(timeout(IO_TIMEOUT, receiver.close()), async {
+                node.peer.detach(existing).await?;
+                node.peer
+                    .send(
+                        main.incoming,
+                        Performative::Attach(Box::new(duplicate)),
+                        Vec::new(),
+                    )
+                    .await?;
+                node.peer.close("amqp:session:handle-in-use").await
+            });
+            wire?;
+            assert!(matches!(result?, Err(EngineError::RemoteClosed)));
+        }
+    }
+    assert!(matches!(
+        timeout(IO_TIMEOUT, receiver.recv()).await?,
+        Err(EngineError::RemoteDetached)
+    ));
+    assert!(matches!(
+        timeout(IO_TIMEOUT, sibling_receiver.recv()).await?,
+        Err(EngineError::RemoteDetached)
+    ));
+    for session in [&mut session, &mut sibling_session] {
+        let Session::Client(session) = session else {
+            panic!("client retired session")
+        };
+        assert!(matches!(
+            timeout(IO_TIMEOUT, session.attach_receiver("after-close", "queue")).await?,
+            Err(EngineError::RemoteDetached)
+        ));
+    }
+    node.peer.acknowledge_close_and_expect_eof().await?;
+    node.shutdown().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn server_routes_both_link_roles_with_distinct_channels_and_handles() -> TestResult {
     timeout(CASE_TIMEOUT, both_roles(true)).await?
@@ -567,6 +816,61 @@ async fn client_local_handle_number_is_not_an_incoming_peer_alias() -> TestResul
     timeout(
         CASE_TIMEOUT,
         numeric_local_handle_is_not_a_peer_alias(false),
+    )
+    .await?
+}
+
+#[tokio::test]
+async fn server_duplicate_installed_peer_handle_closes_every_mapped_session() -> TestResult {
+    timeout(
+        CASE_TIMEOUT,
+        server_duplicate_attach_closes_connection(ServerDuplicateStage::Installed),
+    )
+    .await?
+}
+
+#[tokio::test]
+async fn server_duplicate_pending_peer_handle_closes_and_retires_approval() -> TestResult {
+    timeout(
+        CASE_TIMEOUT,
+        server_duplicate_attach_closes_connection(ServerDuplicateStage::Pending),
+    )
+    .await?
+}
+
+#[tokio::test]
+async fn server_duplicate_normally_closing_peer_handle_is_still_connection_fatal() -> TestResult {
+    timeout(
+        CASE_TIMEOUT,
+        server_duplicate_attach_closes_connection(ServerDuplicateStage::Closing),
+    )
+    .await?
+}
+
+#[tokio::test]
+async fn client_duplicate_peer_handle_is_checked_before_pending_attach_name_lookup() -> TestResult {
+    timeout(
+        CASE_TIMEOUT,
+        client_duplicate_attach_closes_connection(ClientDuplicateStage::UnmatchedResponse),
+    )
+    .await?
+}
+
+#[tokio::test]
+async fn client_colliding_attach_response_closes_connection_and_fails_pending_caller() -> TestResult
+{
+    timeout(
+        CASE_TIMEOUT,
+        client_duplicate_attach_closes_connection(ClientDuplicateStage::PendingResponse),
+    )
+    .await?
+}
+
+#[tokio::test]
+async fn client_duplicate_normally_closing_peer_handle_fails_exact_pending_detach() -> TestResult {
+    timeout(
+        CASE_TIMEOUT,
+        client_duplicate_attach_closes_connection(ClientDuplicateStage::Closing),
     )
     .await?
 }
