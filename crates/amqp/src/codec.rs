@@ -1,15 +1,28 @@
 use std::io;
 
+#[cfg(test)]
+use serde_amqp::primitives::Timestamp;
 use serde_amqp::{
     Value,
     described::Described,
     descriptor::Descriptor,
-    primitives::{Array, Binary, OrderedMap, Symbol, Timestamp},
+    primitives::{Array, Binary, OrderedMap, Symbol},
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::types::*;
 use crate::value_codec::{MessageDecodeBudget, ValueDecoder, decode_value};
+
+mod message_encoder;
+mod value_encoder;
+
+pub(crate) use message_encoder::prepare_message;
+pub use message_encoder::{MessageSizeError, encode_message_with_max_size};
+
+#[cfg(test)]
+pub(crate) fn encoded_message_buffer_allocations() -> usize {
+    value_encoder::buffer_allocations()
+}
 
 pub const AMQP_PROTOCOL_ID: u8 = 0;
 pub const SASL_PROTOCOL_ID: u8 = 3;
@@ -270,6 +283,11 @@ fn decode_frame(frame: &[u8]) -> io::Result<Frame> {
 }
 
 pub fn encode_message(message: &Message) -> io::Result<Vec<u8>> {
+    encode_message_with_max_size(message, usize::MAX)
+}
+
+#[cfg(test)]
+fn encode_message_legacy(message: &Message) -> io::Result<Vec<u8>> {
     let mut encoded = Vec::new();
     if let Some(header) = &message.header {
         append_value(&mut encoded, header_to_value(header))?;
@@ -988,6 +1006,7 @@ fn error_from_value(value: Value) -> io::Result<Error> {
     })
 }
 
+#[cfg(test)]
 fn header_to_value(header: &Header) -> Value {
     described(
         HEADER,
@@ -1012,6 +1031,7 @@ fn header_from_value(value: Value) -> io::Result<Header> {
     })
 }
 
+#[cfg(test)]
 fn properties_to_value(properties: &Properties) -> Value {
     described(
         PROPERTIES,
@@ -1078,6 +1098,7 @@ fn properties_from_value(value: Value) -> io::Result<Properties> {
     })
 }
 
+#[cfg(test)]
 fn application_properties_to_value(properties: &ApplicationProperties) -> Value {
     let mut map = OrderedMap::new();
     for (key, value) in properties.0.iter() {
@@ -1100,6 +1121,7 @@ fn application_properties_from_value(value: Value) -> io::Result<ApplicationProp
     Ok(ApplicationProperties(properties))
 }
 
+#[cfg(test)]
 fn message_id_to_value(message_id: &MessageId) -> Value {
     match message_id {
         MessageId::Ulong(value) => Value::Ulong(*value),
@@ -1176,6 +1198,7 @@ fn fields_to_value(fields: &Option<impl FieldKey>) -> Value {
     Value::Map(map)
 }
 
+#[cfg(test)]
 fn annotations_to_value(annotations: &Annotations) -> Value {
     Value::Map(
         annotations
@@ -1438,6 +1461,7 @@ fn optional_u32(value: Option<u32>) -> Value {
     value.map(Value::Uint).unwrap_or(Value::Null)
 }
 
+#[cfg(test)]
 fn append_value(buffer: &mut Vec<u8>, value: Value) -> io::Result<()> {
     buffer.extend(encode_value(&value)?);
     Ok(())
@@ -1651,6 +1675,9 @@ fn invalid_data(error: impl Into<String>) -> io::Error {
 
 #[cfg(test)]
 mod decode_budget_tests;
+
+#[cfg(test)]
+mod encode_budget_tests;
 
 #[cfg(test)]
 mod tests {

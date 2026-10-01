@@ -9,9 +9,10 @@ mod value_codec;
 
 pub use crate::{
     codec::{
-        AMQP_HEADER, AMQP_PROTOCOL_ID, Frame, ProtocolHeader, SASL_HEADER, SASL_PROTOCOL_ID,
-        decode_message, decode_message_with_budget, encode_frame, encode_message, read_frame,
-        read_frame_with_max_size, read_protocol_header, write_frame, write_protocol_header,
+        AMQP_HEADER, AMQP_PROTOCOL_ID, Frame, MessageSizeError, ProtocolHeader, SASL_HEADER,
+        SASL_PROTOCOL_ID, decode_message, decode_message_with_budget, encode_frame, encode_message,
+        encode_message_with_max_size, read_frame, read_frame_with_max_size, read_protocol_header,
+        write_frame, write_protocol_header,
     },
     server::{
         ConnectionOptions, Delivery, EngineError, IncomingAttach, IncomingSession, LinkEndpoint,

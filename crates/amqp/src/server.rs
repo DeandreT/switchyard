@@ -11,16 +11,16 @@ use tokio::{
     sync::{Notify, mpsc, oneshot, watch},
 };
 
+use crate::codec::prepare_message;
 use crate::{
     Accepted, Attach, Begin, Close, DeliveryState, DeliveryTag, Detach, Disposition, End, Error,
     Fields, Flow, Frame, Message, Open, Outcome, Performative, ProtocolHeader, ReceiverSettleMode,
     Role, SaslCode, SaslInit, SaslMechanisms, SaslOutcome, SaslPerformative, SenderSettleMode,
-    Transfer, encode_message, read_frame_with_max_size, read_protocol_header, write_frame,
-    write_protocol_header,
+    Transfer, read_frame_with_max_size, read_protocol_header, write_frame, write_protocol_header,
 };
 
 #[cfg(test)]
-use crate::{decode_message, read_frame};
+use crate::{decode_message, encode_message, read_frame};
 
 mod content_budget;
 mod flow_control;
@@ -2957,14 +2957,14 @@ async fn queue_send<W: AsyncWrite + Unpin>(
         let _ = reply.send(Err(invalid_state("outgoing delivery queue is full")));
         return Ok(());
     }
-    let payload = match encode_message(&message) {
-        Ok(payload) => payload,
+    let prepared = match prepare_message(&message) {
+        Ok(prepared) => prepared,
         Err(error) => {
             let _ = reply.send(Err(error.into()));
             return Ok(());
         }
     };
-    let message_bytes = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    let message_bytes = u64::try_from(prepared.encoded_len()).unwrap_or(u64::MAX);
     if let Some(maximum_bytes) = link.max_message_size
         && message_bytes > maximum_bytes
     {
@@ -2983,6 +2983,21 @@ async fn queue_send<W: AsyncWrite + Unpin>(
         }));
         return Ok(());
     }
+    let content_lease = match writer.content_budget().try_reserve(prepared.encoded_len()) {
+        Ok(lease) => lease,
+        Err(error) => {
+            let _ = reply.send(Err(invalid_state(error.to_string())));
+            return Ok(());
+        }
+    };
+    let payload = match prepared.encode() {
+        Ok(payload) => payload,
+        Err(error) => {
+            drop(content_lease);
+            let _ = reply.send(Err(error.into()));
+            return Ok(());
+        }
+    };
     let Some(LinkState::Sending(link)) = session.links.get_mut(&handle) else {
         unreachable!("the validated sending link has not changed");
     };
@@ -2998,6 +3013,8 @@ async fn queue_send<W: AsyncWrite + Unpin>(
         false,
         writer,
     ) {
+        drop(payload);
+        drop(content_lease);
         detach_link_error(
             channel,
             handle,
@@ -3010,13 +3027,6 @@ async fn queue_send<W: AsyncWrite + Unpin>(
         let _ = reply.send(Err(error.into()));
         return Ok(());
     }
-    let content_lease = match writer.content_budget().try_reserve(payload.len()) {
-        Ok(lease) => lease,
-        Err(error) => {
-            let _ = reply.send(Err(invalid_state(error.to_string())));
-            return Ok(());
-        }
-    };
     link.outstanding_tags.insert(delivery_tag.as_ref().to_vec());
     link.queued.push_back(QueuedSend {
         payload,

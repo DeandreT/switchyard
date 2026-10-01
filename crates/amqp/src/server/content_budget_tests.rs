@@ -629,12 +629,17 @@ async fn exhausted_send_admission_is_retryable_without_tag_credit_id_or_wire_cha
     let credit = fixture.sending(CHANNEL, SENDING).credit.snapshot();
     let next_id = fixture.sessions[&CHANNEL].next_delivery_id;
     let output = fixture.output_len();
+    let allocations = crate::codec::encoded_message_buffer_allocations();
     let refused = fixture.queue(CHANNEL, SENDING, message.clone(), 1).await;
     assert!(matches!(
         refused.await.expect("send reply"),
         Err(EngineError::InvalidState(_))
     ));
     assert_eq!(fixture.budget.retained_bytes(), 8);
+    assert_eq!(
+        crate::codec::encoded_message_buffer_allocations(),
+        allocations
+    );
     assert_eq!(fixture.output_len(), output);
     assert_eq!(fixture.sessions[&CHANNEL].flow.snapshot(), flow);
     assert_eq!(fixture.sessions[&CHANNEL].next_delivery_id, next_id);
@@ -656,6 +661,45 @@ async fn exhausted_send_admission_is_retryable_without_tag_credit_id_or_wire_cha
             .sending(CHANNEL, SENDING)
             .outstanding_tags
             .contains(&vec![1])
+    );
+}
+
+#[tokio::test]
+async fn peer_size_refusal_precedes_local_exhaustion_without_payload_allocation() {
+    let mut fixture = Fixture::new(0);
+    fixture.sender(CHANNEL, SENDING, SenderSettleMode::Unsettled);
+    let LinkState::Sending(link) = fixture
+        .sessions
+        .get_mut(&CHANNEL)
+        .expect("session")
+        .links
+        .get_mut(&SENDING)
+        .expect("sender")
+    else {
+        panic!("sending link")
+    };
+    link.max_message_size = Some(1);
+    let allocations = crate::codec::encoded_message_buffer_allocations();
+    let refused = fixture
+        .queue(CHANNEL, SENDING, Message::data(vec![1, 2]), 1)
+        .await;
+    assert!(matches!(
+        refused.await.expect("reply"),
+        Err(EngineError::MessageSizeExceeded {
+            message_bytes: 7,
+            maximum_bytes: 1
+        })
+    ));
+    assert_eq!(
+        crate::codec::encoded_message_buffer_allocations(),
+        allocations
+    );
+    assert_eq!(fixture.budget.retained_bytes(), 0);
+    assert!(!fixture.sessions[&CHANNEL].links.contains_key(&SENDING));
+    assert!(
+        fixture.sessions[&CHANNEL]
+            .closing_handles
+            .contains(&SENDING)
     );
 }
 
