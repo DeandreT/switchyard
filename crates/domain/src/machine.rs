@@ -1286,7 +1286,11 @@ impl<S: StateStore> StateMachine<S> {
         budget: Option<DeliveryBudget>,
     ) -> Result<CommandOutcome, BrokerError> {
         let config = self.load_config(command)?;
-        require_session_agreement(&config, session_id.is_some())?;
+        // Browsing does not acquire a session; an explicit ID still requires
+        // a session-enabled entity and limits the records returned below.
+        if session_id.is_some() {
+            require_session_agreement(&config, true)?;
+        }
         if max_messages == 0 {
             return Ok(CommandOutcome::Peeked(Vec::new()));
         }

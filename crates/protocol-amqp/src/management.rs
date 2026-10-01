@@ -1194,8 +1194,8 @@ async fn peek_messages<B: Broker>(
             "message-count exceeds the supported maximum",
         );
     };
-    let session_id = match string_map_value(&message.body, SESSION_ID) {
-        Some(session_id) => match SessionId::new(session_id) {
+    let session_id = match map_value(&message.body, SESSION_ID) {
+        Some(Value::String(session_id)) => match SessionId::new(session_id) {
             Ok(session_id) => Some(session_id),
             Err(error) => {
                 return ManagementResponse::bad_request(
@@ -1205,6 +1205,13 @@ async fn peek_messages<B: Broker>(
                 );
             }
         },
+        Some(_) => {
+            return ManagementResponse::bad_request(
+                message_id,
+                tracking_id,
+                "session-id must be an AMQP value string",
+            );
+        }
         None => None,
     };
 
@@ -1676,6 +1683,9 @@ fn unauthorized_error(description: impl Into<String>) -> AmqpProtocolError {
 
 #[derive(Clone, Copy, Debug)]
 struct RouteError;
+
+#[cfg(test)]
+mod peek_session_tests;
 
 #[cfg(test)]
 mod tests {

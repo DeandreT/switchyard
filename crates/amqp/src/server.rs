@@ -2885,6 +2885,8 @@ async fn refuse_connection<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     sessions: &mut HashMap<u16, SessionState>,
 ) -> Result<(), EngineError> {
+    let description = description.into();
+    tracing::debug!(condition, %description, "refusing AMQP connection");
     let frame = Frame::Amqp {
         channel: 0,
         performative: Some(Performative::Close(Close {
