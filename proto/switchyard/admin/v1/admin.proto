@@ -103,6 +103,8 @@ message CreateEntityRequest {
   uint32 max_delivery_count = 8;
   bool requires_session = 9;
   QueueConfiguration queue_config = 10;
+  TopicConfiguration topic_config = 11;
+  SubscriptionConfiguration subscription_config = 12;
 }
 
 message UnlimitedTimeToLive {}
@@ -124,6 +126,28 @@ message QueueConfiguration {
   optional bool dead_lettering_on_message_expiration = 8;
 }
 
+message TopicConfiguration {
+  oneof default_time_to_live {
+    uint64 default_ttl_millis = 1;
+    UnlimitedTimeToLive default_ttl_unlimited = 5;
+  }
+  optional uint64 max_message_bytes = 2;
+  optional bool requires_duplicate_detection = 3;
+  optional uint64 duplicate_detection_history_time_window_millis = 4;
+}
+
+message SubscriptionConfiguration {
+  optional uint64 lock_duration_millis = 1;
+  optional uint32 max_delivery_count = 2;
+  oneof default_time_to_live {
+    uint64 default_ttl_millis = 3;
+    UnlimitedTimeToLive default_ttl_unlimited = 7;
+  }
+  optional uint64 max_message_bytes = 4;
+  optional bool requires_session = 5;
+  optional bool dead_lettering_on_message_expiration = 6;
+}
+
 message UpdateEntityRequest {
   string namespace = 1;
   string path = 2;
@@ -139,6 +163,10 @@ message ListEntitiesRequest {
   string namespace = 1;
   string page_token = 2;
   uint32 page_size = 3;
+  // Unspecified preserves the original queue-only listing.
+  EntityKind kind = 4;
+  // Required only for a subscription listing.
+  string parent_topic = 5;
 }
 
 message DeleteEntityRequest {
@@ -155,6 +183,8 @@ message Entity {
   optional uint64 max_size_bytes = 5;
   optional uint64 used_logical_bytes = 6;
   QueueConfiguration queue_config = 7;
+  TopicConfiguration topic_config = 8;
+  SubscriptionConfiguration subscription_config = 9;
 }
 
 message ListEntitiesResponse {

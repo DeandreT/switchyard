@@ -16,7 +16,9 @@ use thiserror::Error;
 
 use crate::Clock;
 
+mod admin_metadata;
 mod entity_metadata;
+pub use admin_metadata::AdminTarget;
 
 /// How far the host clock may step backward before the proposer refuses.
 ///

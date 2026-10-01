@@ -30,7 +30,7 @@ pub use crate::{
         NATIVE_ADMIN_REQUEST_LIMIT, NATIVE_ADMIN_RESPONSE_LIMIT, NATIVE_ADMIN_TLS_PORT,
         NativeAdminError, NativeAdminListener,
     },
-    proposer::{DEFAULT_MAX_CLOCK_REGRESSION_MILLIS, LocalProposer, ProposeError},
+    proposer::{AdminTarget, DEFAULT_MAX_CLOCK_REGRESSION_MILLIS, LocalProposer, ProposeError},
     timer::{
         DEFAULT_SWEEP_INTERVAL, MAX_QUEUES_PER_SWEEP, MAX_ROUNDS_PER_INDEX, MAX_TOPICS_PER_SWEEP,
         Shutdown, SweepReport, TimerWorker,

@@ -1,3 +1,4 @@
+use domain::{SubscriptionConfig, SubscriptionDefinition, SubscriptionName};
 use protocol_amqp::{Attachment, EntityMetadata, parse_attachment};
 
 use super::*;
@@ -43,19 +44,7 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
                 topic,
                 subscription,
             } => {
-                let backing = topic
-                    .subscription(subscription)
-                    .map_err(BrokerError::from)?;
-                let shadow = backing.dead_letter_queue().map_err(BrokerError::from)?;
-                if self.machine.queue_config(namespace, topic)?.is_some()
-                    || self.machine.topic_config(namespace, &backing)?.is_some()
-                    || self.machine.topic_config(namespace, &shadow)?.is_some()
-                {
-                    return Err(BrokerError::DanglingEntityMetadata.into());
-                }
-                let config = self
-                    .machine
-                    .subscription_config(namespace, topic, subscription)?;
+                let config = self.subscription_entity_metadata(namespace, topic, subscription)?;
                 Ok(config.map(|config| match target {
                     Attachment::Subscription { .. } => EntityMetadata::Subscription(config),
                     _ => EntityMetadata::DeadLetter(config.to_queue_config().dead_letter_shadow()),
@@ -64,7 +53,7 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
         }
     }
 
-    fn primary_entity_metadata(
+    pub(super) fn primary_entity_metadata(
         &self,
         namespace: &NamespaceName,
         entity: &EntityPath,
@@ -77,23 +66,50 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
                 queue.validate().map_err(BrokerError::from)?,
             ))),
             (None, Some(topic)) => {
-                for subscription in self.machine.subscriptions(namespace, entity)? {
-                    let shadow = subscription
-                        .entity
-                        .dead_letter_queue()
-                        .map_err(BrokerError::from)?;
-                    if self
-                        .machine
-                        .topic_config(namespace, &subscription.entity)?
-                        .is_some()
-                        || self.machine.topic_config(namespace, &shadow)?.is_some()
-                    {
-                        return Err(BrokerError::DanglingEntityMetadata.into());
-                    }
-                }
+                self.complete_subscriptions(namespace, entity)?;
                 Ok(Some(EntityMetadata::Topic(topic)))
             }
             (None, None) => Ok(None),
         }
+    }
+
+    pub(super) fn subscription_entity_metadata(
+        &self,
+        namespace: &NamespaceName,
+        topic: &EntityPath,
+        name: &SubscriptionName,
+    ) -> Result<Option<SubscriptionConfig>, ProposeError> {
+        let backing = topic.subscription(name).map_err(BrokerError::from)?;
+        let shadow = backing.dead_letter_queue().map_err(BrokerError::from)?;
+        if self.machine.queue_config(namespace, topic)?.is_some()
+            || self.machine.topic_config(namespace, &backing)?.is_some()
+            || self.machine.topic_config(namespace, &shadow)?.is_some()
+        {
+            return Err(BrokerError::DanglingEntityMetadata.into());
+        }
+        Ok(self.machine.subscription_config(namespace, topic, name)?)
+    }
+
+    pub(super) fn complete_subscriptions(
+        &self,
+        namespace: &NamespaceName,
+        topic: &EntityPath,
+    ) -> Result<Vec<SubscriptionDefinition>, ProposeError> {
+        let subscriptions = self.machine.subscriptions(namespace, topic)?;
+        for subscription in &subscriptions {
+            let shadow = subscription
+                .entity
+                .dead_letter_queue()
+                .map_err(BrokerError::from)?;
+            if self
+                .machine
+                .topic_config(namespace, &subscription.entity)?
+                .is_some()
+                || self.machine.topic_config(namespace, &shadow)?.is_some()
+            {
+                return Err(BrokerError::DanglingEntityMetadata.into());
+            }
+        }
+        Ok(subscriptions)
     }
 }

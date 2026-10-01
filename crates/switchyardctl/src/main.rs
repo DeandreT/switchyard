@@ -25,6 +25,12 @@ use tonic::{
 };
 use url::{Host, Position, Url};
 
+mod topology;
+
+use topology::{
+    SubscriptionCommand, SubscriptionConfigurationOutput, TopicCommand, TopicConfigurationOutput,
+};
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CA_FILE_BYTES: usize = 1024 * 1024;
@@ -54,11 +60,19 @@ struct Arguments {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Print the native API contract and supported queue operations.
+    /// Print the native API contract and supported entity operations.
     Compatibility,
     Queue {
         #[command(subcommand)]
         command: QueueCommand,
+    },
+    Topic {
+        #[command(subcommand)]
+        command: TopicCommand,
+    },
+    Subscription {
+        #[command(subcommand)]
+        command: SubscriptionCommand,
     },
 }
 
@@ -406,6 +420,10 @@ struct EntityOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     used_logical_bytes: Option<u64>,
     queue_config: Option<ConfigurationOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topic_config: Option<TopicConfigurationOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subscription_config: Option<SubscriptionConfigurationOutput>,
 }
 
 impl From<Entity> for EntityOutput {
@@ -424,6 +442,8 @@ impl From<Entity> for EntityOutput {
             max_size_bytes: entity.max_size_bytes,
             used_logical_bytes: entity.used_logical_bytes,
             queue_config: entity.queue_config.map(Into::into),
+            topic_config: entity.topic_config.map(Into::into),
+            subscription_config: entity.subscription_config.map(Into::into),
         }
     }
 }
@@ -483,6 +503,8 @@ struct CompatibilityOutput {
     transport: &'static str,
     version: &'static str,
     queue_operations: [&'static str; 4],
+    topic_operations: [&'static str; 3],
+    subscription_operations: [&'static str; 3],
 }
 
 fn write_output(output: &impl Serialize) -> Result<(), CliError> {
@@ -492,13 +514,22 @@ fn write_output(output: &impl Serialize) -> Result<(), CliError> {
 }
 
 async fn execute(arguments: Arguments) -> Result<(), CliError> {
-    let Command::Queue { command } = &arguments.command else {
-        return write_output(&CompatibilityOutput {
-            package: PROTOBUF_PACKAGE,
-            transport: "grpc",
-            version: env!("CARGO_PKG_VERSION"),
-            queue_operations: ["create", "get", "list", "update"],
-        });
+    let command = match &arguments.command {
+        Command::Compatibility => {
+            return write_output(&CompatibilityOutput {
+                package: PROTOBUF_PACKAGE,
+                transport: "grpc",
+                version: env!("CARGO_PKG_VERSION"),
+                queue_operations: ["create", "get", "list", "update"],
+                topic_operations: ["create", "get", "list"],
+                subscription_operations: ["create", "get", "list"],
+            });
+        }
+        Command::Topic { command } => return topology::execute_topic(&arguments, command).await,
+        Command::Subscription { command } => {
+            return topology::execute_subscription(&arguments, command).await;
+        }
+        Command::Queue { command } => command,
     };
     validate_queue_command(command)?;
     let settings = ConnectionSettings::prepare(&arguments)?;
@@ -517,7 +548,7 @@ async fn execute(arguments: Arguments) -> Result<(), CliError> {
                     }))
                     .await
                     .map_err(|status| CliError::Request(status.code()))?;
-                write_output(&EntityOutput::from(response.into_inner()))
+                topology::write_entity(response.into_inner(), EntityKind::Queue)
             }
             QueueCommand::Get { path } => {
                 let response = client
@@ -527,7 +558,7 @@ async fn execute(arguments: Arguments) -> Result<(), CliError> {
                     }))
                     .await
                     .map_err(|status| CliError::Request(status.code()))?;
-                write_output(&EntityOutput::from(response.into_inner()))
+                topology::write_entity(response.into_inner(), EntityKind::Queue)
             }
             QueueCommand::List {
                 page_size,
@@ -538,6 +569,7 @@ async fn execute(arguments: Arguments) -> Result<(), CliError> {
                         namespace,
                         page_size: *page_size,
                         page_token: page_token.clone(),
+                        ..ListEntitiesRequest::default()
                     }))
                     .await
                     .map_err(|status| CliError::Request(status.code()))?;
@@ -552,7 +584,7 @@ async fn execute(arguments: Arguments) -> Result<(), CliError> {
                     }))
                     .await
                     .map_err(|status| CliError::Request(status.code()))?;
-                write_output(&EntityOutput::from(response.into_inner()))
+                topology::write_entity(response.into_inner(), EntityKind::Queue)
             }
         }
     };
@@ -586,10 +618,19 @@ fn validate_queue_command(command: &QueueCommand) -> Result<(), CliError> {
 }
 
 fn validate_queue_path(path: &str) -> Result<(), CliError> {
-    validate_identifier(path, 260, "invalid queue path")?;
+    validate_identifier(path, 260, "invalid entity path")?;
     if path.to_ascii_lowercase().ends_with("/$deadletterqueue") {
         return Err(CliError::Input(
             "dead-letter queues cannot be administered directly",
+        ));
+    }
+    if path
+        .as_bytes()
+        .windows(b"/subscriptions/".len())
+        .any(|part| part.eq_ignore_ascii_case(b"/subscriptions/"))
+    {
+        return Err(CliError::Input(
+            "subscription paths require the subscription command",
         ));
     }
     Ok(())

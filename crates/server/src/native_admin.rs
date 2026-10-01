@@ -1,4 +1,4 @@
-//! Namespace-bound queue administration through the broker owner.
+//! Namespace-bound entity administration through the broker owner.
 
 use std::{
     sync::Arc,
@@ -20,7 +20,10 @@ use prost::Message;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response, Status};
 
-use crate::{BrokerHandle, ProposeError, SubmitError};
+use crate::{AdminTarget, BrokerHandle, ProposeError, SubmitError};
+
+mod paging;
+mod topology;
 
 const DEFAULT_PAGE_SIZE: usize = 100;
 const TOKEN_PREFIX: &str = "v1.";
@@ -98,7 +101,7 @@ impl NativeAdminService {
             };
             if !grant.allows(&scope, Permission::Manage, now) {
                 return Err(Status::permission_denied(
-                    "queue management permission required",
+                    "entity management permission required",
                 ));
             }
         }
@@ -129,13 +132,24 @@ impl NativeAdminService {
     }
 
     async fn read_entity(&self, path: EntityPath) -> Result<Entity, Status> {
-        let config = self
+        let entity = self.read_target(AdminTarget::Primary(path)).await?;
+        if entity.kind != EntityKind::Queue as i32 {
+            return Err(Status::internal("unexpected queue metadata"));
+        }
+        Ok(entity)
+    }
+
+    async fn read_target(&self, target: AdminTarget) -> Result<Entity, Status> {
+        let path = target
+            .canonical_entity()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let metadata = self
             .broker
-            .queue_config(self.namespace.clone(), path.clone())
+            .admin_entity_metadata(self.namespace.clone(), target)
             .await
-            .map_err(submit_status)?
-            .ok_or_else(|| Status::not_found("queue does not exist"))?;
-        Ok(entity_response(&self.namespace, &path, config))
+            .map_err(read_status)?
+            .ok_or_else(|| Status::not_found("entity does not exist"))?;
+        topology::response(&self.namespace, &path, metadata)
     }
 
     fn decode_cursor(&self, token: &str) -> Result<Option<QueueCursor>, Status> {
@@ -184,16 +198,12 @@ impl EntityService for NativeAdminService {
         request: Request<CreateEntityRequest>,
     ) -> Result<Response<Entity>, Status> {
         let input = request.get_ref();
-        let _permit = self.begin_request(&request, &input.namespace, Some(&input.path))?;
-        let path = self.entity_path(&input.path)?;
-        if input.kind != EntityKind::Queue as i32 {
-            return Err(if input.kind == EntityKind::Unspecified as i32 {
-                Status::invalid_argument("entity kind is required")
-            } else if EntityKind::try_from(input.kind).is_ok() {
-                Status::unimplemented("only queues are implemented")
-            } else {
-                Status::invalid_argument("unknown entity kind")
-            });
+        let resource = topology::requested_resource(&input.path);
+        let _permit = self.begin_request(&request, &input.namespace, Some(&resource))?;
+        let kind = EntityKind::try_from(input.kind)
+            .map_err(|_| Status::invalid_argument("unknown entity kind"))?;
+        if kind == EntityKind::Unspecified {
+            return Err(Status::invalid_argument("entity kind is required"));
         }
         if !input.placement_group_id.is_empty() {
             return Err(Status::unimplemented(
@@ -205,24 +215,74 @@ impl EntityService for NativeAdminService {
                 "entity storage capacity is not implemented",
             ));
         }
-        let config = create_configuration(input)?;
+        topology::reject_other_configuration(input, kind)?;
+        let (path, command, expected, metadata) = match kind {
+            EntityKind::Queue => {
+                let path = self.entity_path(&input.path)?;
+                let config = create_configuration(input)?;
+                (
+                    path,
+                    CommandKind::CreateQueue { config },
+                    CommandOutcome::QueueCreated,
+                    protocol_amqp::EntityMetadata::Queue(config),
+                )
+            }
+            EntityKind::Topic => {
+                let path = self.entity_path(&input.path)?;
+                let config = topology::topic_configuration(input.topic_config.as_ref())?;
+                (
+                    path,
+                    CommandKind::CreateTopic { config },
+                    CommandOutcome::TopicCreated,
+                    protocol_amqp::EntityMetadata::Topic(config),
+                )
+            }
+            EntityKind::Subscription => {
+                let AdminTarget::Subscription { topic, name } = topology::target(&input.path)?
+                else {
+                    return Err(Status::invalid_argument(
+                        "a subscription entity path is required",
+                    ));
+                };
+                let path = topic
+                    .subscription(&name)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                path.dead_letter_queue()
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                let config =
+                    topology::subscription_configuration(input.subscription_config.as_ref())?;
+                let command = CommandKind::CreateSubscription { name, config };
+                let outcome = self
+                    .broker
+                    .submit(self.namespace.clone(), topic, command)
+                    .await
+                    .map_err(submit_status)?;
+                if outcome != CommandOutcome::SubscriptionCreated {
+                    return Err(Status::internal("unexpected subscription creation result"));
+                }
+                return Ok(Response::new(topology::response(
+                    &self.namespace,
+                    &path,
+                    protocol_amqp::EntityMetadata::Subscription(config),
+                )?));
+            }
+            EntityKind::Unspecified => {
+                return Err(Status::invalid_argument("entity kind is required"));
+            }
+        };
         let outcome = self
             .broker
-            .submit(
-                self.namespace.clone(),
-                path.clone(),
-                CommandKind::CreateQueue { config },
-            )
+            .submit(self.namespace.clone(), path.clone(), command)
             .await
             .map_err(submit_status)?;
-        if outcome != CommandOutcome::QueueCreated {
-            return Err(Status::internal("unexpected queue creation result"));
+        if outcome != expected {
+            return Err(Status::internal("unexpected entity creation result"));
         }
-        Ok(Response::new(entity_response(
+        Ok(Response::new(topology::response(
             &self.namespace,
             &path,
-            config,
-        )))
+            metadata,
+        )?))
     }
 
     async fn get_entity(
@@ -230,9 +290,11 @@ impl EntityService for NativeAdminService {
         request: Request<GetEntityRequest>,
     ) -> Result<Response<Entity>, Status> {
         let input = request.get_ref();
-        let _permit = self.begin_request(&request, &input.namespace, Some(&input.path))?;
-        let path = self.entity_path(&input.path)?;
-        Ok(Response::new(self.read_entity(path).await?))
+        let resource = topology::requested_resource(&input.path);
+        let _permit = self.begin_request(&request, &input.namespace, Some(&resource))?;
+        Ok(Response::new(
+            self.read_target(topology::target(&input.path)?).await?,
+        ))
     }
 
     async fn list_entities(
@@ -240,7 +302,16 @@ impl EntityService for NativeAdminService {
         request: Request<ListEntitiesRequest>,
     ) -> Result<Response<ListEntitiesResponse>, Status> {
         let input = request.get_ref();
-        let _permit = self.begin_request(&request, &input.namespace, None)?;
+        let scope =
+            (input.kind == EntityKind::Subscription as i32).then_some(input.parent_topic.as_str());
+        let _permit = self.begin_request(&request, &input.namespace, scope)?;
+        let kind = EntityKind::try_from(input.kind)
+            .map_err(|_| Status::invalid_argument("unknown entity kind"))?;
+        if kind != EntityKind::Subscription && !input.parent_topic.is_empty() {
+            return Err(Status::invalid_argument(
+                "parent topic is only valid for subscription listings",
+            ));
+        }
         let page_size = if input.page_size == 0 {
             DEFAULT_PAGE_SIZE
         } else {
@@ -249,6 +320,17 @@ impl EntityService for NativeAdminService {
         };
         if page_size > MAX_QUEUE_PAGE_SIZE {
             return Err(Status::invalid_argument("page size exceeds 1024"));
+        }
+        match kind {
+            EntityKind::Topic => {
+                return Ok(Response::new(self.list_topics(input, page_size).await?));
+            }
+            EntityKind::Subscription => {
+                return Ok(Response::new(
+                    self.list_subscriptions(input, page_size).await?,
+                ));
+            }
+            EntityKind::Queue | EntityKind::Unspecified => {}
         }
         let mut cursor = self.decode_cursor(&input.page_token)?;
         let mut paths = Vec::with_capacity(page_size);
@@ -295,8 +377,21 @@ impl EntityService for NativeAdminService {
         request: Request<UpdateEntityRequest>,
     ) -> Result<Response<Entity>, Status> {
         let input = request.get_ref();
-        let _permit = self.begin_request(&request, &input.namespace, Some(&input.path))?;
-        let path = self.entity_path(&input.path)?;
+        let resource = topology::requested_resource(&input.path);
+        let _permit = self.begin_request(&request, &input.namespace, Some(&resource))?;
+        let AdminTarget::Primary(path) = topology::target(&input.path)? else {
+            return Err(Status::unimplemented(
+                "subscription updates are not implemented",
+            ));
+        };
+        let metadata = self
+            .broker
+            .admin_entity_metadata(self.namespace.clone(), AdminTarget::Primary(path.clone()))
+            .await
+            .map_err(read_status)?;
+        if matches!(metadata, Some(protocol_amqp::EntityMetadata::Topic(_))) {
+            return Err(Status::unimplemented("topic updates are not implemented"));
+        }
         let config = input
             .queue_config
             .as_ref()
@@ -322,9 +417,10 @@ impl EntityService for NativeAdminService {
         request: Request<DeleteEntityRequest>,
     ) -> Result<Response<Operation>, Status> {
         let input = request.get_ref();
-        let _permit = self.begin_request(&request, &input.namespace, Some(&input.path))?;
-        self.entity_path(&input.path)?;
-        Err(Status::unimplemented("queue deletion is not implemented"))
+        let resource = topology::requested_resource(&input.path);
+        let _permit = self.begin_request(&request, &input.namespace, Some(&resource))?;
+        topology::target(&input.path)?;
+        Err(Status::unimplemented("entity deletion is not implemented"))
     }
 }
 
@@ -437,6 +533,8 @@ fn entity_response(namespace: &NamespaceName, path: &EntityPath, config: QueueCo
             ),
             dead_lettering_on_message_expiration: Some(config.dead_lettering_on_message_expiration),
         }),
+        topic_config: None,
+        subscription_config: None,
     }
 }
 
@@ -479,5 +577,17 @@ fn submit_status(error: SubmitError) -> Status {
         SubmitError::Propose(ProposeError::UnexpectedOutcome { .. }) => {
             Status::internal("unexpected broker operation result")
         }
+    }
+}
+
+fn read_status(error: SubmitError) -> Status {
+    match error {
+        SubmitError::Propose(ProposeError::Broker(
+            BrokerError::QueueConfig(_)
+            | BrokerError::TopicConfig(_)
+            | BrokerError::SubscriptionConfig(_)
+            | BrokerError::Identifier(_),
+        )) => Status::internal("invalid stored entity metadata"),
+        error => submit_status(error),
     }
 }

@@ -31,7 +31,9 @@ use thiserror::Error;
 use tokio::sync::Notify;
 use tracing::debug;
 
-use crate::{Clock, LocalProposer, ProposeError};
+use crate::{AdminTarget, Clock, LocalProposer, ProposeError};
+
+mod admin_reads;
 
 /// Commands that may be waiting ahead of a caller's own.
 ///
@@ -75,6 +77,16 @@ enum Request {
         namespace: NamespaceName,
         target: Attachment,
         reply: flume::Sender<Result<Option<EntityMetadata>, ProposeError>>,
+    },
+    GetAdminEntityMetadata {
+        namespace: NamespaceName,
+        target: AdminTarget,
+        reply: flume::Sender<Result<Option<EntityMetadata>, ProposeError>>,
+    },
+    ListSubscriptions {
+        namespace: NamespaceName,
+        topic: EntityPath,
+        reply: flume::Sender<Result<Vec<domain::SubscriptionDefinition>, ProposeError>>,
     },
     /// The highest timestamp the machine has applied. Readiness and
     /// diagnostics need it, and it is what a caller compares its own clock
@@ -553,6 +565,20 @@ impl Broker {
                             reply,
                         } => {
                             let _ = reply.send(proposer.entity_metadata(&namespace, &target));
+                        }
+                        Request::GetAdminEntityMetadata {
+                            namespace,
+                            target,
+                            reply,
+                        } => {
+                            let _ = reply.send(proposer.admin_entity_metadata(&namespace, &target));
+                        }
+                        Request::ListSubscriptions {
+                            namespace,
+                            topic,
+                            reply,
+                        } => {
+                            let _ = reply.send(proposer.subscriptions(&namespace, &topic));
                         }
                         Request::LastApplied { reply } => {
                             let _ = reply.send(

@@ -156,6 +156,7 @@ fn list(size: u32, token: String) -> ListEntitiesRequest {
         namespace: "tenant".to_owned(),
         page_size: size,
         page_token: token,
+        ..ListEntitiesRequest::default()
     }
 }
 
@@ -438,12 +439,12 @@ async fn legacy_configuration_and_errors<P: StoreProvider>(provider: P) -> TestR
         node.service.create_entity(Request::new(mixed)).await,
         Code::InvalidArgument,
     );
-    for kind in [EntityKind::Topic, EntityKind::Subscription] {
+    for kind in [EntityKind::Unspecified as i32, 99] {
         let mut unsupported = create("unsupported", None);
-        unsupported.kind = kind as i32;
+        unsupported.kind = kind;
         assert_code(
             node.service.create_entity(Request::new(unsupported)).await,
-            Code::Unimplemented,
+            Code::InvalidArgument,
         );
     }
     for field in ["capacity", "placement"] {
@@ -613,6 +614,7 @@ async fn ordered_bounded_pagination<P: StoreProvider>(provider: P) -> TestResult
                 namespace: "neighbor".to_owned(),
                 page_token: first.next_page_token,
                 page_size: 7,
+                ..ListEntitiesRequest::default()
             }))
             .await,
         Code::InvalidArgument,
@@ -787,7 +789,9 @@ async fn sas_authentication_and_scope<P: StoreProvider>(provider: P) -> TestResu
     Ok(())
 }
 
-async fn subscription_backing_queues_are_not_administrable<P: StoreProvider>(
+async fn queue_administration_keeps_subscription_backings_out_of_legacy_listing<
+    P: StoreProvider,
+>(
     provider: P,
 ) -> TestResult {
     let node = Node::start(provider)?;
@@ -848,13 +852,20 @@ async fn subscription_backing_queues_are_not_administrable<P: StoreProvider>(
     for path in [
         "m-events/subscriptions/accounting",
         "m-events/Subscriptions/audit",
-        "m-events/subscriptions/accounting/$deadletterqueue",
     ] {
-        let reads = node.reads();
-        assert_code(
-            node.service.get_entity(Request::new(get(path))).await,
-            Code::InvalidArgument,
+        let entity = node
+            .service
+            .get_entity(Request::new(get(path)))
+            .await?
+            .into_inner();
+        assert_eq!(entity.kind, EntityKind::Subscription as i32);
+        assert!(entity.queue_config.is_none());
+        assert!(entity.subscription_config.is_some());
+        assert_eq!(
+            entity.path,
+            path.replace("/Subscriptions/", "/subscriptions/")
         );
+        let reads = node.reads();
         assert_code(
             node.service
                 .create_entity(Request::new(create(path, None)))
@@ -865,10 +876,29 @@ async fn subscription_backing_queues_are_not_administrable<P: StoreProvider>(
             node.service
                 .update_entity(Request::new(patch(path, QueueConfiguration::default())))
                 .await,
-            Code::InvalidArgument,
+            Code::Unimplemented,
         );
         assert_eq!(node.reads(), reads, "reserved paths never reach the owner");
     }
+    let path = "m-events/subscriptions/accounting/$deadletterqueue";
+    let reads = node.reads();
+    assert_code(
+        node.service.get_entity(Request::new(get(path))).await,
+        Code::InvalidArgument,
+    );
+    assert_code(
+        node.service
+            .create_entity(Request::new(create(path, None)))
+            .await,
+        Code::InvalidArgument,
+    );
+    assert_code(
+        node.service
+            .update_entity(Request::new(patch(path, QueueConfiguration::default())))
+            .await,
+        Code::InvalidArgument,
+    );
+    assert_eq!(node.reads(), reads);
     assert_code(
         node.service
             .create_entity(Request::new(create("m-events", None)))
@@ -992,8 +1022,10 @@ macro_rules! suite {
                 ordered_bounded_pagination($provider).await
             }
             #[tokio::test]
-            async fn typed_subscription_queues_remain_hidden_and_reserved() -> TestResult {
-                subscription_backing_queues_are_not_administrable($provider).await
+            async fn typed_subscription_queues_remain_hidden_from_queue_administration()
+            -> TestResult {
+                queue_administration_keeps_subscription_backings_out_of_legacy_listing($provider)
+                    .await
             }
             #[tokio::test]
             async fn per_request_sas_authentication_and_scoping() -> TestResult {
