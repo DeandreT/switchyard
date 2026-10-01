@@ -236,6 +236,20 @@ optional credit, wrapping counts, and early second-mode dispositions have raw
 transport regressions. Every outgoing frame is checked against the peer's frame
 cap before writing bytes. Connection-wide byte budgets and asymmetric
 channel/handle routing remain unfinished.
+Session startup tracks local Begin publication separately from application
+approval. A required response to a pipelined Flow, pending Detach, End, or
+session refusal first publishes the server's Begin exactly once; later approval
+does not repeat it. This preserves the
+[session-state send ordering](https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html)
+without buffering additional control responses. An approval for an absent or
+still-ending session returns a local detached error, which the broker listener
+skips without disconnecting healthy sibling sessions. Application approval
+still controls link installation; pending attaches share a 32-entry bound.
+Approval provenance across session-channel reuse remains unfinished.
+An End on an unmapped channel is refused without manufacturing a session reply.
+Locally closing receiver links do not publish further link-credit updates, even
+when a queued delivery-consumption notification is processed after Detach.
+Session-window replenishment and healthy sibling links remain independent.
 First transfers require an explicit delivery ID, binary tag, and message format.
 Tags may be empty but cannot exceed 32 bytes. Continuations may omit identity
 fields, but repeated ID, tag, and format values must match the first fragment;
