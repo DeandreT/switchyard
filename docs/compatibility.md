@@ -279,8 +279,26 @@ additional. Existing per-frame decode limits remain in force. Cancellation
 aborts and joins the reader and drops the queued results without draining more
 wire input.
 Frames on channels above the locally advertised limit receive a framing-error
-Close without refreshing receive activity. Asymmetric channel/handle routing
-remains a separate unfinished feature.
+Close without refreshing receive activity. Session channels are independent in
+each direction, as specified by the [AMQP session establishment protocol](https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html).
+The server advertises its own incoming channel range and reserves a vacant
+outgoing channel within the peer's inclusive limit, preferring the incoming
+number when it is available. Its Begin response references the actual incoming
+channel. The test client correlates a response through Begin's `remote-channel`
+and the original pending session generation, not the response frame's number.
+Later session traffic resolves only through the peer-channel association; a
+numerically equal local channel is not a routing fallback. Duplicate or invalid
+associations and traffic on an unknown incoming session channel receive a bounded
+framing-error Close. A server unable to reserve an outgoing channel returns a
+resource-limit Close without creating a session or application event; a local
+client Begin instead returns retryable `InvalidState` without writing a frame.
+The test client still does not accept peer-initiated sessions and explicitly
+closes with `amqp:not-implemented`.
+An ending session discards traffic until End on its mapped incoming channel;
+the binding and local reservation survive until that acknowledgement. Session
+approval and endpoint generation fences continue to reject stale commands after
+channel reuse. Link handles still require matching numeric values in each
+direction, and Begin's `handle-max` is not yet enforced.
 Session windows count Transfer frames independently of link delivery counts.
 Incoming windows replenish after bounded frame processing; receive links grant
 32 message slots and return credit only as the application consumes a delivery
@@ -289,8 +307,8 @@ other links. Fragmented sends yield when their session window closes, resume on
 session Flow, and consume only one link credit per message. Flow echo, drain,
 optional credit, wrapping counts, and early second-mode dispositions have raw
 transport regressions. Every outgoing frame is checked against the peer's frame
-cap before writing bytes. Connection-wide byte budgets and asymmetric
-channel/handle routing remain unfinished.
+cap before writing bytes. Independent link-handle routing and additional
+metadata and command-content resource policies remain unfinished.
 Session startup tracks local Begin publication separately from application
 approval. A required response to a pipelined Flow, pending Detach, End, or
 session refusal first publishes the server's Begin exactly once; later approval
