@@ -22,6 +22,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{AdminTarget, BrokerHandle, ProposeError, SubmitError};
 
+mod deletion;
 mod paging;
 mod queue_paging;
 mod topology;
@@ -395,8 +396,28 @@ impl EntityService for NativeAdminService {
         let input = request.get_ref();
         let resource = topology::requested_resource(&input.path);
         let _permit = self.begin_request(&request, &input.namespace, Some(&resource))?;
-        topology::target(&input.path)?;
-        Err(Status::unimplemented("entity deletion is not implemented"))
+        let kind = EntityKind::try_from(input.kind)
+            .map_err(|_| Status::invalid_argument("unknown entity kind"))?;
+        let (path, target) = deletion::target(topology::target(&input.path)?, kind)?;
+        let outcome = self
+            .broker
+            .submit(
+                self.namespace.clone(),
+                path,
+                CommandKind::DeleteEntity {
+                    target: target.clone(),
+                },
+            )
+            .await
+            .map_err(deletion::status)?;
+        if !deletion::matches_outcome(&target, &outcome) {
+            return Err(Status::internal("unexpected entity deletion result"));
+        }
+        Ok(Response::new(Operation {
+            operation_id: String::new(),
+            state: "completed".to_owned(),
+            error: String::new(),
+        }))
     }
 }
 
@@ -536,6 +557,7 @@ fn submit_status(error: SubmitError) -> Status {
             BrokerError::QueueConfig(_)
             | BrokerError::TopicConfig(_)
             | BrokerError::SubscriptionConfig(_)
+            | BrokerError::EntityKindMismatch
             | BrokerError::Identifier(_)
             | BrokerError::DeadLetterQueueIsReserved
             | BrokerError::SubscriptionPathIsReserved
@@ -547,6 +569,7 @@ fn submit_status(error: SubmitError) -> Status {
             }
             BrokerError::TopicDataPlaneNotImplemented => Status::unimplemented(error.to_string()),
             BrokerError::SubscriptionLimitExceeded { .. }
+            | BrokerError::EntityDeleteTooLarge { .. }
             | BrokerError::TopicFanoutTooLarge { .. } => {
                 Status::resource_exhausted(error.to_string())
             }

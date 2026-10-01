@@ -45,6 +45,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         BrokerError::QueueCounterExhausted { .. }
         | BrokerError::SubscriptionLimitExceeded { .. }
         | BrokerError::RuleLimitExceeded { .. }
+        | BrokerError::EntityDeleteTooLarge { .. }
         | BrokerError::TopicRuleMatchTooLarge { .. } => RESOURCE_LIMIT_EXCEEDED,
         BrokerError::TopicDataPlaneNotImplemented => NOT_IMPLEMENTED,
         BrokerError::SqlRuleCompilation(error) => match error {
@@ -88,6 +89,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         BrokerError::MessageIdTooLong { .. }
         | BrokerError::InvalidMessageContent { .. }
         | BrokerError::InvalidRule { .. }
+        | BrokerError::EntityKindMismatch
         | BrokerError::QueuePageLimitExceeded { .. }
         | BrokerError::QueueCursorNamespaceMismatch { .. }
         | BrokerError::TopicPageLimitExceeded { .. }
@@ -193,6 +195,24 @@ mod tests {
             assert_eq!(condition_for(&error), PRECONDITION_FAILED);
             assert!(!is_retryable(&error));
         }
+    }
+
+    #[test]
+    fn deletion_limits_and_kind_mismatches_are_not_retryable() {
+        for limit in [
+            domain::EntityDeleteLimit::Keys,
+            domain::EntityDeleteLimit::KeyBytes,
+            domain::EntityDeleteLimit::ValueBytes,
+        ] {
+            let error = BrokerError::EntityDeleteTooLarge { limit, maximum: 1 };
+            assert_eq!(condition_for(&error), RESOURCE_LIMIT_EXCEEDED);
+            assert!(!is_retryable(&error));
+        }
+        assert_eq!(
+            condition_for(&BrokerError::EntityKindMismatch),
+            INVALID_FIELD
+        );
+        assert!(!is_retryable(&BrokerError::EntityKindMismatch));
     }
 
     #[test]

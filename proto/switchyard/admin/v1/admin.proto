@@ -175,6 +175,8 @@ message ListEntitiesRequest {
 message DeleteEntityRequest {
   string namespace = 1;
   string path = 2;
+  // Unspecified resolves the entity kind atomically in the broker owner.
+  EntityKind kind = 3;
 }
 
 message Entity {

@@ -2,9 +2,9 @@ use storage::StorageError;
 use thiserror::Error;
 
 use crate::{
-    CodecError, IdentifierError, IngressBatchLimit, NamespaceName, QueueConfigError,
-    QueueCounterKind, QueueImmutableProperty, RuleMatchLimit, SequenceNumber, SessionId,
-    SqlCompileError, SubscriptionImmutableProperty, Timestamp, TopicImmutableProperty,
+    CodecError, EntityDeleteLimit, IdentifierError, IngressBatchLimit, NamespaceName,
+    QueueConfigError, QueueCounterKind, QueueImmutableProperty, RuleMatchLimit, SequenceNumber,
+    SessionId, SqlCompileError, SubscriptionImmutableProperty, Timestamp, TopicImmutableProperty,
 };
 
 /// Every rejection the state machine can produce.
@@ -173,5 +173,12 @@ pub enum BrokerError {
     #[error("subscription property {property} cannot be changed after creation")]
     SubscriptionPropertyIsImmutable {
         property: SubscriptionImmutableProperty,
+    },
+    #[error("entity kind does not match the requested operation")]
+    EntityKindMismatch,
+    #[error("entity deletion {limit} exceeds the maximum of {maximum}")]
+    EntityDeleteTooLarge {
+        limit: EntityDeleteLimit,
+        maximum: usize,
     },
 }

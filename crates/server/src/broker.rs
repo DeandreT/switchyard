@@ -515,6 +515,11 @@ impl Broker {
                             let application =
                                 proposer.propose_with_effects(&namespace, &entity, *kind);
                             if let Ok(applied) = &application {
+                                if let Some(targets) = &applied.entity_deletions {
+                                    for target in targets {
+                                        watching.notify(&namespace, target);
+                                    }
+                                }
                                 if let Some(targets) = &applied.subscription_enqueues {
                                     for target in targets {
                                         watching.notify(&namespace, target);
@@ -714,6 +719,9 @@ pub enum SubmitError {
 
 #[cfg(test)]
 mod wakeup_tests;
+
+#[cfg(test)]
+mod deletion_tests;
 
 #[cfg(test)]
 mod tests {

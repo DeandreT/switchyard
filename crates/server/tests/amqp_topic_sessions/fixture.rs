@@ -206,6 +206,22 @@ impl<P: StoreProvider> Node<P> {
         self.submits.load(Ordering::SeqCst)
     }
 
+    pub(super) async fn delete_entity(
+        &self,
+        entity: &EntityPath,
+        target: domain::DeleteEntityTarget,
+    ) -> TestResult<CommandOutcome> {
+        Ok(timeout(
+            DEADLINE,
+            self._broker.handle().submit(
+                self.namespace.clone(),
+                entity.clone(),
+                CommandKind::DeleteEntity { target },
+            ),
+        )
+        .await??)
+    }
+
     pub(super) async fn wait_waiting(&self, entity: &EntityPath) -> TestResult {
         timeout(DEADLINE, async {
             loop {

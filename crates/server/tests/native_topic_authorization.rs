@@ -284,6 +284,8 @@ fn code<T>(result: Result<T, tonic::Status>, expected: Code) {
     }
 }
 
+#[path = "native_topic_authorization/deletion.rs"]
+mod deletion;
 #[path = "native_topic_authorization/updates.rs"]
 mod updates;
 

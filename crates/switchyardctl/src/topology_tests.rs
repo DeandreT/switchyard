@@ -127,6 +127,90 @@ fn update_commands_preserve_topic_and_member_spelling() {
 }
 
 #[test]
+fn deletion_commands_keep_literal_names_and_have_no_configuration_flags() {
+    let Command::Queue {
+        command: crate::QueueCommand::Delete { path },
+    } = arguments(&["queue", "delete", "/Orders/$Management"]).command
+    else {
+        panic!("queue delete")
+    };
+    assert_eq!(path, "/Orders/$Management");
+    let Command::Topic {
+        command: TopicCommand::Delete { path },
+    } = arguments(&["topic", "delete", "/Orders/$Management"]).command
+    else {
+        panic!("topic delete")
+    };
+    assert_eq!(path, "/Orders/$Management");
+    let Command::Subscription {
+        command: SubscriptionCommand::Delete { topic, name },
+    } = arguments(&[
+        "subscription",
+        "delete",
+        "/Orders/$Management",
+        "Subscriptions",
+    ])
+    .command
+    else {
+        panic!("subscription delete")
+    };
+    assert_eq!(
+        subscription_path(&topic, &name).unwrap(),
+        "/Orders/$Management/subscriptions/Subscriptions"
+    );
+    for command in [
+        vec!["queue", "delete", "Orders", "--max-delivery-count", "1"],
+        vec!["topic", "delete", "Orders", "--max-message-bytes", "1"],
+        vec![
+            "subscription",
+            "delete",
+            "Orders",
+            "Alpha",
+            "--requires-session",
+        ],
+        vec!["topic", "delete", "Orders", "--page-size", "1"],
+        vec!["subscription", "delete", "Orders"],
+    ] {
+        let mut argv = vec!["switchyardctl"];
+        argv.extend(command);
+        assert!(Arguments::try_parse_from(argv).is_err());
+    }
+}
+
+#[test]
+fn operation_output_accepts_only_a_completed_synchronous_result() {
+    let completed = Operation {
+        operation_id: String::new(),
+        state: "completed".to_owned(),
+        error: String::new(),
+    };
+    let output = operation_output(completed.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(output).unwrap(),
+        serde_json::json!({
+            "operation_id": "", "state": "completed", "error": "",
+        })
+    );
+    for operation in [
+        Operation {
+            state: "pending".to_owned(),
+            ..completed.clone()
+        },
+        Operation {
+            operation_id: "untracked-job".to_owned(),
+            ..completed.clone()
+        },
+        Operation {
+            error: "failure".to_owned(),
+            ..completed
+        },
+        Operation::default(),
+    ] {
+        assert!(operation_output(operation).is_err());
+    }
+}
+
+#[test]
 fn omitted_configuration_preserves_presence() {
     assert_eq!(topic_config(&[]), TopicConfiguration::default());
     assert_eq!(

@@ -466,9 +466,10 @@ async fn legacy_configuration_and_errors<P: StoreProvider>(provider: P) -> TestR
             .delete_entity(Request::new(DeleteEntityRequest {
                 namespace: "tenant".to_owned(),
                 path: "legacy".to_owned(),
+                kind: EntityKind::Topic as i32,
             }))
             .await,
-        Code::Unimplemented,
+        Code::InvalidArgument,
     );
     for path in ["legacy/$deadletterqueue", "legacy/$DeadLetterQueue"] {
         assert_code(
@@ -492,6 +493,7 @@ async fn legacy_configuration_and_errors<P: StoreProvider>(provider: P) -> TestR
                 .delete_entity(Request::new(DeleteEntityRequest {
                     namespace: "tenant".to_owned(),
                     path: path.to_owned(),
+                    ..Default::default()
                 }))
                 .await,
             Code::InvalidArgument,
@@ -731,6 +733,7 @@ async fn sas_authentication_and_scope<P: StoreProvider>(provider: P) -> TestResu
             .delete_entity(Request::new(DeleteEntityRequest {
                 namespace: "tenant".to_owned(),
                 path: "orders".to_owned(),
+                ..Default::default()
             }))
             .await,
         Code::Unauthenticated,
@@ -776,17 +779,25 @@ async fn sas_authentication_and_scope<P: StoreProvider>(provider: P) -> TestResu
             &namespace_token,
         ))
         .await?;
+    let deleted = service
+        .delete_entity(authorized(
+            DeleteEntityRequest {
+                namespace: "tenant".to_owned(),
+                path: "created".to_owned(),
+                kind: EntityKind::Queue as i32,
+            },
+            &namespace_token,
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(deleted.state, "completed");
+    assert!(deleted.operation_id.is_empty());
+    assert!(deleted.error.is_empty());
     assert_code(
         service
-            .delete_entity(authorized(
-                DeleteEntityRequest {
-                    namespace: "tenant".to_owned(),
-                    path: "created".to_owned(),
-                },
-                &namespace_token,
-            ))
+            .get_entity(authorized(get("created"), &namespace_token))
             .await,
-        Code::Unimplemented,
+        Code::NotFound,
     );
     Ok(())
 }

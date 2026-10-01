@@ -1,7 +1,8 @@
 use admin_api::v1::{
-    CreateEntityRequest, Entity, EntityKind, GetEntityRequest, ListEntitiesRequest,
-    ListEntitiesResponse, SubscriptionConfiguration, TopicConfiguration, UnlimitedTimeToLive,
-    UpdateEntityRequest, subscription_configuration::DefaultTimeToLive as SubscriptionTimeToLive,
+    CreateEntityRequest, DeleteEntityRequest, Entity, EntityKind, GetEntityRequest,
+    ListEntitiesRequest, ListEntitiesResponse, Operation, SubscriptionConfiguration,
+    TopicConfiguration, UnlimitedTimeToLive, UpdateEntityRequest,
+    subscription_configuration::DefaultTimeToLive as SubscriptionTimeToLive,
     topic_configuration::DefaultTimeToLive as TopicTimeToLive,
 };
 use clap::{Args, Subcommand};
@@ -17,6 +18,9 @@ pub(super) enum TopicCommand {
     Create(TopicMutation),
     Update(TopicMutation),
     Get {
+        path: String,
+    },
+    Delete {
         path: String,
     },
     List {
@@ -75,6 +79,10 @@ pub(super) enum SubscriptionCommand {
     Create(SubscriptionMutation),
     Update(SubscriptionMutation),
     Get {
+        topic: String,
+        name: String,
+    },
+    Delete {
         topic: String,
         name: String,
     },
@@ -150,7 +158,7 @@ pub(super) async fn execute_topic(
         TopicCommand::Create(input) | TopicCommand::Update(input) => {
             validate_primary_path(&input.path)?
         }
-        TopicCommand::Get { path } => validate_primary_path(path)?,
+        TopicCommand::Get { path } | TopicCommand::Delete { path } => validate_primary_path(path)?,
         TopicCommand::List {
             page_size,
             page_token,
@@ -196,6 +204,17 @@ pub(super) async fn execute_topic(
                     .map_err(|status| CliError::Request(status.code()))?;
                 write_entity(response.into_inner(), EntityKind::Topic)
             }
+            TopicCommand::Delete { path } => {
+                let response = client
+                    .delete_entity(settings.request(DeleteEntityRequest {
+                        namespace,
+                        path: path.clone(),
+                        kind: EntityKind::Topic as i32,
+                    }))
+                    .await
+                    .map_err(|status| CliError::Request(status.code()))?;
+                write_operation(response.into_inner())
+            }
             TopicCommand::List {
                 page_size,
                 page_token,
@@ -227,7 +246,9 @@ pub(super) async fn execute_subscription(
         SubscriptionCommand::Create(input) | SubscriptionCommand::Update(input) => {
             subscription_path(&input.topic, &input.name)?
         }
-        SubscriptionCommand::Get { topic, name } => subscription_path(topic, name)?,
+        SubscriptionCommand::Get { topic, name } | SubscriptionCommand::Delete { topic, name } => {
+            subscription_path(topic, name)?
+        }
         SubscriptionCommand::List {
             topic,
             page_size,
@@ -275,6 +296,17 @@ pub(super) async fn execute_subscription(
                     .map_err(|status| CliError::Request(status.code()))?;
                 write_entity(response.into_inner(), EntityKind::Subscription)
             }
+            SubscriptionCommand::Delete { .. } => {
+                let response = client
+                    .delete_entity(settings.request(DeleteEntityRequest {
+                        namespace,
+                        path,
+                        kind: EntityKind::Subscription as i32,
+                    }))
+                    .await
+                    .map_err(|status| CliError::Request(status.code()))?;
+                write_operation(response.into_inner())
+            }
             SubscriptionCommand::List {
                 topic,
                 page_size,
@@ -306,6 +338,33 @@ pub(super) fn write_entity(entity: Entity, kind: EntityKind) -> Result<(), CliEr
         ));
     }
     write_output(&EntityOutput::from(entity))
+}
+
+#[derive(Serialize)]
+struct OperationOutput {
+    operation_id: String,
+    state: String,
+    error: String,
+}
+
+fn operation_output(operation: Operation) -> Result<OperationOutput, CliError> {
+    if operation.state != "completed"
+        || !operation.operation_id.is_empty()
+        || !operation.error.is_empty()
+    {
+        return Err(CliError::Input(
+            "response is not a completed synchronous operation",
+        ));
+    }
+    Ok(OperationOutput {
+        operation_id: operation.operation_id,
+        state: operation.state,
+        error: operation.error,
+    })
+}
+
+pub(super) fn write_operation(operation: Operation) -> Result<(), CliError> {
+    write_output(&operation_output(operation)?)
 }
 
 fn write_list(response: ListEntitiesResponse, kind: EntityKind) -> Result<(), CliError> {

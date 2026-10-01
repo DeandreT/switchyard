@@ -144,7 +144,7 @@ pub fn rule_prefix(
     topic: &EntityPath,
     subscription: &SubscriptionName,
 ) -> Vec<u8> {
-    let mut prefix = entity_scope(TAG_SUBSCRIPTION_RULE, namespace, topic);
+    let mut prefix = topic_rule_prefix(namespace, topic);
     prefix.extend_from_slice(subscription.as_str().as_bytes());
     prefix.push(SEPARATOR);
     prefix
@@ -160,6 +160,93 @@ pub fn rule(
     key.extend_from_slice(name.as_str().as_bytes());
     key.push(SEPARATOR);
     key
+}
+
+pub fn topic_rule_prefix(namespace: &NamespaceName, topic: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_SUBSCRIPTION_RULE, namespace, topic)
+}
+
+pub fn topic_rule_parts<'a>(prefix: &[u8], key: &'a [u8]) -> Option<(&'a str, &'a str)> {
+    if prefix.first().copied()? != TAG_SUBSCRIPTION_RULE {
+        return None;
+    }
+    let rest = key.strip_prefix(prefix)?;
+    let separator = rest.iter().position(|byte| *byte == SEPARATOR)?;
+    let subscription = std::str::from_utf8(rest.get(..separator)?).ok()?;
+    SubscriptionName::validate(subscription).ok()?;
+    let rule = std::str::from_utf8(rest.get(separator + 1..)?.strip_suffix(&[SEPARATOR])?).ok()?;
+    RuleName::validate(rule).ok()?;
+    Some((subscription, rule))
+}
+
+pub fn subscription_backing_config_prefix(
+    namespace: &NamespaceName,
+    topic: &EntityPath,
+) -> Vec<u8> {
+    subscription_descendant_scope(TAG_QUEUE_CONFIG, namespace, topic)
+}
+
+pub fn subscription_topic_config_prefix(namespace: &NamespaceName, topic: &EntityPath) -> Vec<u8> {
+    subscription_descendant_scope(TAG_TOPIC_CONFIG, namespace, topic)
+}
+
+pub(crate) fn subscription_membership_descendant_prefix(
+    namespace: &NamespaceName,
+    topic: &EntityPath,
+) -> Vec<u8> {
+    subscription_descendant_scope(TAG_TOPIC_SUBSCRIPTION, namespace, topic)
+}
+
+pub(crate) fn subscription_rule_descendant_prefix(
+    namespace: &NamespaceName,
+    topic: &EntityPath,
+) -> Vec<u8> {
+    subscription_descendant_scope(TAG_SUBSCRIPTION_RULE, namespace, topic)
+}
+
+fn subscription_descendant_scope(
+    tag: u8,
+    namespace: &NamespaceName,
+    topic: &EntityPath,
+) -> Vec<u8> {
+    let mut prefix = entity_scope(tag, namespace, topic);
+    prefix.pop();
+    prefix.extend_from_slice(b"/subscriptions/");
+    prefix
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum RuntimeKind {
+    Message,
+    LocalToken,
+    Other,
+}
+
+const RUNTIME_FAMILIES: [(u8, RuntimeKind); 10] = [
+    (TAG_MESSAGE, RuntimeKind::Message),
+    (TAG_READY, RuntimeKind::Other),
+    (TAG_LOCK, RuntimeKind::LocalToken),
+    (TAG_EXPIRY, RuntimeKind::Other),
+    (TAG_SESSION, RuntimeKind::LocalToken),
+    (TAG_SESSION_READY, RuntimeKind::Other),
+    (TAG_SESSION_LOCK, RuntimeKind::LocalToken),
+    (TAG_SCHEDULED, RuntimeKind::Other),
+    (TAG_DUPLICATE_HISTORY, RuntimeKind::Other),
+    (TAG_DUPLICATE_HISTORY_EXPIRY, RuntimeKind::Other),
+];
+
+pub(crate) fn entity_runtime_prefixes(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+) -> [(Vec<u8>, RuntimeKind); 10] {
+    RUNTIME_FAMILIES.map(|(tag, kind)| (entity_scope(tag, namespace, entity), kind))
+}
+
+pub(crate) fn subscription_runtime_prefixes(
+    namespace: &NamespaceName,
+    topic: &EntityPath,
+) -> [(Vec<u8>, RuntimeKind); 10] {
+    RUNTIME_FAMILIES.map(|(tag, kind)| (subscription_descendant_scope(tag, namespace, topic), kind))
 }
 
 pub fn rule_name_parts<'a>(prefix: &[u8], key: &'a [u8]) -> Option<&'a str> {
@@ -305,6 +392,10 @@ pub fn session(namespace: &NamespaceName, entity: &EntityPath, session_id: &Sess
     session_scope(TAG_SESSION, namespace, entity, session_id)
 }
 
+pub fn entity_session_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_SESSION, namespace, entity)
+}
+
 /// Ready messages of one session, ordered by sequence — the FIFO order a
 /// session guarantees.
 pub fn session_ready_prefix(
@@ -413,6 +504,111 @@ mod tests {
 
     fn entity() -> EntityPath {
         EntityPath::new("orders").expect("valid entity path")
+    }
+
+    #[test]
+    fn topic_rule_parser_requires_exact_valid_owner_and_rule_tails() {
+        let subscription = SubscriptionName::new("Alpha").expect("valid name");
+        let name = RuleName::new("$Default").expect("valid name");
+        let prefix = topic_rule_prefix(&namespace(), &entity());
+        let key = rule(&namespace(), &entity(), &subscription, &name);
+        assert_eq!(topic_rule_parts(&prefix, &key), Some(("Alpha", "$Default")));
+        assert_eq!(
+            topic_rule_parts(&subscription_prefix(&namespace(), &entity()), &key),
+            None
+        );
+        assert_eq!(topic_rule_parts(&[], &key), None);
+        let foreign = topic_rule_prefix(
+            &NamespaceName::new("tenant-other").expect("valid namespace"),
+            &entity(),
+        );
+        assert_eq!(topic_rule_parts(&foreign, &key), None);
+        for suffix in [
+            b"".as_slice(),
+            b"Alpha\0".as_slice(),
+            b"Alpha\0rule".as_slice(),
+            b"Alpha\0rule\0tail".as_slice(),
+            b"Alpha\0rule\0\0".as_slice(),
+            b"Alpha\0a/b\0".as_slice(),
+            b"a/b\0rule\0".as_slice(),
+            b"Alpha\0\xff\0".as_slice(),
+        ] {
+            let mut malformed = prefix.clone();
+            malformed.extend_from_slice(suffix);
+            assert_eq!(topic_rule_parts(&prefix, &malformed), None, "{suffix:?}");
+        }
+    }
+
+    #[test]
+    fn descendant_prefixes_keep_canonical_parent_and_namespace_boundaries() {
+        let topic = EntityPath::new("orders/Subscriptions").expect("valid parent");
+        let name = SubscriptionName::new("Subscriptions").expect("valid name");
+        let child = topic.subscription(&name).expect("valid child");
+        let shadow = child.dead_letter_queue().expect("valid shadow");
+        let prefix = subscription_backing_config_prefix(&namespace(), &topic);
+        assert!(queue_config(&namespace(), &child).starts_with(&prefix));
+        assert!(queue_config(&namespace(), &shadow).starts_with(&prefix));
+        assert!(!queue_config(&namespace(), &topic).starts_with(&prefix));
+        assert!(!queue_counters(&namespace(), &child).starts_with(&prefix));
+        let similar = EntityPath::new("orders/Subscriptions-extra")
+            .expect("valid parent")
+            .subscription(&name)
+            .expect("valid child");
+        assert!(!queue_config(&namespace(), &similar).starts_with(&prefix));
+        let foreign = NamespaceName::new("tenant-other").expect("valid namespace");
+        assert!(!queue_config(&foreign, &child).starts_with(&prefix));
+        assert!(
+            topic_config(&namespace(), &child)
+                .starts_with(&subscription_topic_config_prefix(&namespace(), &topic))
+        );
+        assert!(subscription(&namespace(), &child, &name).starts_with(
+            &subscription_membership_descendant_prefix(&namespace(), &topic)
+        ));
+        assert!(
+            rule(
+                &namespace(),
+                &child,
+                &name,
+                &RuleName::new("r").expect("valid rule")
+            )
+            .starts_with(&subscription_rule_descendant_prefix(&namespace(), &topic))
+        );
+    }
+
+    #[test]
+    fn deletion_runtime_families_cover_live_indexes_but_not_counter_tombstones() {
+        let exact = entity_runtime_prefixes(&namespace(), &entity());
+        let tags = exact
+            .iter()
+            .map(|(prefix, _)| prefix[0])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tags,
+            vec![0x03, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D]
+        );
+        assert!(matches!(exact[0].1, RuntimeKind::Message));
+        for index in [2, 4, 6] {
+            assert!(matches!(exact[index].1, RuntimeKind::LocalToken));
+        }
+        assert_eq!(entity_session_prefix(&namespace(), &entity()), exact[4].0);
+        let child = entity()
+            .subscription(&SubscriptionName::new("Alpha").expect("valid name"))
+            .expect("valid child");
+        let descendants = subscription_runtime_prefixes(&namespace(), &entity());
+        let child_exact = entity_runtime_prefixes(&namespace(), &child);
+        for ((descendant, _), (child_prefix, _)) in descendants.iter().zip(&child_exact) {
+            assert!(child_prefix.starts_with(descendant));
+        }
+        assert!(
+            exact
+                .iter()
+                .all(|(prefix, _)| !queue_counters(&namespace(), &entity()).starts_with(prefix))
+        );
+        assert!(
+            descendants
+                .iter()
+                .all(|(prefix, _)| !queue_counters(&namespace(), &child).starts_with(prefix))
+        );
     }
 
     #[test]

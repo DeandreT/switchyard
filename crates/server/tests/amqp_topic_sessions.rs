@@ -567,3 +567,6 @@ mod wakeups;
 
 #[path = "amqp_topic_sessions/close_cleanup.rs"]
 mod close_cleanup;
+
+#[path = "amqp_topic_sessions/deletion.rs"]
+mod deletion;

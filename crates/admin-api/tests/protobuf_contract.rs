@@ -66,6 +66,10 @@ fn existing_entity_fields_keep_their_wire_numbers() {
                 ("subscription_config", 5),
             ],
         ),
+        (
+            "DeleteEntityRequest",
+            vec![("namespace", 1), ("path", 2), ("kind", 3)],
+        ),
     ] {
         let message = descriptor
             .message_type
@@ -80,6 +84,35 @@ fn existing_entity_fields_keep_their_wire_numbers() {
                 .expect("existing field");
             assert_eq!(field.number, Some(number), "{name}.{field_name}");
         }
+    }
+}
+
+#[test]
+fn deletion_keeps_legacy_bytes_and_adds_only_the_expected_kind() {
+    let original = [
+        0x0a, 6, b't', b'e', b'n', b'a', b'n', b't', 0x12, 6, b'o', b'r', b'd', b'e', b'r', b's',
+    ];
+    let request = v1::DeleteEntityRequest::decode(original.as_slice()).unwrap();
+    assert_eq!(request.namespace, "tenant");
+    assert_eq!(request.path, "orders");
+    assert_eq!(request.kind, v1::EntityKind::Unspecified as i32);
+    assert_eq!(request.encode_to_vec(), original);
+    for kind in [
+        v1::EntityKind::Queue,
+        v1::EntityKind::Topic,
+        v1::EntityKind::Subscription,
+    ] {
+        let request = v1::DeleteEntityRequest {
+            kind: kind as i32,
+            ..request.clone()
+        };
+        let mut expected = original.to_vec();
+        expected.extend_from_slice(&[0x18, kind as u8]);
+        assert_eq!(request.encode_to_vec(), expected);
+        assert_eq!(
+            v1::DeleteEntityRequest::decode(expected.as_slice()).unwrap(),
+            request
+        );
     }
 }
 

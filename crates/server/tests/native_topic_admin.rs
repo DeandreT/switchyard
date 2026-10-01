@@ -413,6 +413,8 @@ async fn native_primary_paths_and_final_subscription_markers_preserve_literal_by
     Ok(())
 }
 
+#[path = "native_topic_admin/deletion.rs"]
+mod deletion;
 #[path = "native_topic_admin/failures.rs"]
 mod failures;
 #[path = "native_topic_admin/paging.rs"]

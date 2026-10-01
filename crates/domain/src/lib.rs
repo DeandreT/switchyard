@@ -25,8 +25,8 @@ mod topic;
 
 pub use codec::CodecError;
 pub use command::{
-    Command, CommandKind, CommandOutcome, DeliveryBudget, IngressBatchLimit, IngressEnvelope,
-    ScheduledEnvelope, ScheduledMessage, SettlementDisposition,
+    Command, CommandKind, CommandOutcome, DeleteEntityTarget, DeliveryBudget, EntityDeleteLimit,
+    IngressBatchLimit, IngressEnvelope, ScheduledEnvelope, ScheduledMessage, SettlementDisposition,
 };
 pub use error::BrokerError;
 pub use identifier::{
@@ -37,6 +37,7 @@ pub use identifier::{
 };
 pub use machine::{
     BROKER_HEADER_RESERVE_BYTES, CommandApplication, MAX_DEAD_LETTER_DETAIL_LENGTH,
+    MAX_ENTITY_DELETE_KEY_BYTES, MAX_ENTITY_DELETE_KEYS, MAX_ENTITY_DELETE_VALUE_BYTES,
     MAX_INGRESS_BATCH_CONTENT_BYTES, MAX_INGRESS_BATCH_MESSAGES, MAX_INGRESS_BATCH_VALUE_ITEMS,
     MAX_QUEUE_PAGE_SIZE, MAX_TOPIC_FANOUT_CONTENT_BYTES, MAX_TOPIC_FANOUT_COPIES,
     MAX_TOPIC_FANOUT_VALUE_ITEMS, MAX_TOPIC_PAGE_SIZE, QueueCursor, QueuePage, StateMachine,

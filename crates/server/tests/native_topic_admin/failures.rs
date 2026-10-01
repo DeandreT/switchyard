@@ -177,10 +177,11 @@ async fn local_validation_missing_parents_and_occupancy_never_mutate_topology<P:
                     .delete_entity(Request::new(admin_api::v1::DeleteEntityRequest {
                         namespace: "tenant".into(),
                         path: path.into(),
+                        kind: EntityKind::Queue as i32,
                     })),
             )
             .await?,
-            Code::Unimplemented,
+            Code::InvalidArgument,
         );
         node.unchanged(&before, writes)?;
     }

@@ -24,6 +24,7 @@ use crate::{
     SessionLock, SessionRecord, SettlementDisposition, Timestamp, codec, keys,
 };
 
+mod entity_deletion;
 mod message_retention;
 mod rules;
 mod topic_fanout;
@@ -33,6 +34,10 @@ mod topic_topology;
 mod topology_updates;
 
 use message_retention::message_record;
+
+pub use entity_deletion::{
+    MAX_ENTITY_DELETE_KEY_BYTES, MAX_ENTITY_DELETE_KEYS, MAX_ENTITY_DELETE_VALUE_BYTES,
+};
 
 pub use topic_fanout::{
     MAX_TOPIC_FANOUT_CONTENT_BYTES, MAX_TOPIC_FANOUT_COPIES, MAX_TOPIC_FANOUT_VALUE_ITEMS,
@@ -102,6 +107,8 @@ pub struct CommandApplication {
     /// Topic publications report only sorted backing or dead-letter shadow
     /// destinations that retained copies. `Some([])` suppresses a parent wakeup.
     pub subscription_enqueues: Option<Vec<EntityPath>>,
+    /// Sorted removed entity scopes, published only after the purge commits.
+    pub entity_deletions: Option<Vec<EntityPath>>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -222,6 +229,7 @@ impl<S: StateStore> StateMachine<S> {
 
         let mut batch = WriteBatch::default();
         let mut subscription_enqueues = None;
+        let mut entity_deletions = None;
         let outcome = match &command.kind {
             CommandKind::CreateQueue { config } => {
                 self.create_queue(command, *config, &mut batch)?
@@ -248,6 +256,11 @@ impl<S: StateStore> StateMachine<S> {
             }
             CommandKind::UpdateSubscription { name, update } => {
                 self.update_subscription(command, name, *update, &mut batch)?
+            }
+            CommandKind::DeleteEntity { target } => {
+                let (outcome, removed) = self.delete_entity(command, target, &mut batch)?;
+                entity_deletions = Some(removed);
+                outcome
             }
             CommandKind::Send {
                 message_id,
@@ -532,6 +545,7 @@ impl<S: StateStore> StateMachine<S> {
             outcome,
             dead_letters_enqueued,
             subscription_enqueues,
+            entity_deletions,
         })
     }
 

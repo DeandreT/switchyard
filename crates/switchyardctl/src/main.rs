@@ -11,9 +11,10 @@ use std::{
 use admin_api::{
     PROTOBUF_PACKAGE,
     v1::{
-        CreateEntityRequest, Entity, EntityKind, GetEntityRequest, ListEntitiesRequest,
-        ListEntitiesResponse, QueueConfiguration, UnlimitedTimeToLive, UpdateEntityRequest,
-        entity_service_client::EntityServiceClient, queue_configuration::DefaultTimeToLive,
+        CreateEntityRequest, DeleteEntityRequest, Entity, EntityKind, GetEntityRequest,
+        ListEntitiesRequest, ListEntitiesResponse, QueueConfiguration, UnlimitedTimeToLive,
+        UpdateEntityRequest, entity_service_client::EntityServiceClient,
+        queue_configuration::DefaultTimeToLive,
     },
 };
 use clap::{Args, Parser, Subcommand};
@@ -79,6 +80,9 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum QueueCommand {
     Create(QueueMutation),
+    Delete {
+        path: String,
+    },
     Get {
         path: String,
     },
@@ -502,9 +506,9 @@ struct CompatibilityOutput {
     package: &'static str,
     transport: &'static str,
     version: &'static str,
-    queue_operations: [&'static str; 4],
-    topic_operations: [&'static str; 4],
-    subscription_operations: [&'static str; 4],
+    queue_operations: [&'static str; 5],
+    topic_operations: [&'static str; 5],
+    subscription_operations: [&'static str; 5],
 }
 
 fn write_output(output: &impl Serialize) -> Result<(), CliError> {
@@ -520,9 +524,9 @@ async fn execute(arguments: Arguments) -> Result<(), CliError> {
                 package: PROTOBUF_PACKAGE,
                 transport: "grpc",
                 version: env!("CARGO_PKG_VERSION"),
-                queue_operations: ["create", "get", "list", "update"],
-                topic_operations: ["create", "get", "list", "update"],
-                subscription_operations: ["create", "get", "list", "update"],
+                queue_operations: ["create", "get", "list", "update", "delete"],
+                topic_operations: ["create", "get", "list", "update", "delete"],
+                subscription_operations: ["create", "get", "list", "update", "delete"],
             });
         }
         Command::Topic { command } => return topology::execute_topic(&arguments, command).await,
@@ -559,6 +563,17 @@ async fn execute(arguments: Arguments) -> Result<(), CliError> {
                     .await
                     .map_err(|status| CliError::Request(status.code()))?;
                 topology::write_entity(response.into_inner(), EntityKind::Queue)
+            }
+            QueueCommand::Delete { path } => {
+                let response = client
+                    .delete_entity(settings.request(DeleteEntityRequest {
+                        namespace,
+                        path: path.clone(),
+                        kind: EntityKind::Queue as i32,
+                    }))
+                    .await
+                    .map_err(|status| CliError::Request(status.code()))?;
+                topology::write_operation(response.into_inner())
             }
             QueueCommand::List {
                 page_size,
@@ -599,7 +614,7 @@ fn validate_queue_command(command: &QueueCommand) -> Result<(), CliError> {
         QueueCommand::Create(input) | QueueCommand::Update(input) => {
             validate_queue_path(&input.path)
         }
-        QueueCommand::Get { path } => validate_queue_path(path),
+        QueueCommand::Get { path } | QueueCommand::Delete { path } => validate_queue_path(path),
         QueueCommand::List {
             page_size,
             page_token,

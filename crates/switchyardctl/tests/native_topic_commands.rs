@@ -1,5 +1,8 @@
 //! Topology CLI commands use the real native listener and preserve queue clients.
 
+#[path = "native_topic_commands/deletion.rs"]
+mod deletion;
+
 use std::{
     error::Error,
     io,
@@ -498,11 +501,11 @@ async fn topology_updates_roundtrip(tls: bool) -> TestResult {
     let compatibility = node.json(&["compatibility"]).await?;
     assert_eq!(
         compatibility["topic_operations"],
-        serde_json::json!(["create", "get", "list", "update"])
+        serde_json::json!(["create", "get", "list", "update", "delete"])
     );
     assert_eq!(
         compatibility["subscription_operations"],
-        serde_json::json!(["create", "get", "list", "update"])
+        serde_json::json!(["create", "get", "list", "update", "delete"])
     );
     node.json(&[
         "topic",
