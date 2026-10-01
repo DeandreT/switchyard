@@ -12,8 +12,9 @@ either the Fjall backend or the memory backend, so a single node survives a
 restart.
 
 The `switchyard` binary accepts AMQP connections over development plaintext or
-TLS, authenticates a configured shared-access policy through SASL PLAIN or CBS
-SAS, carries messages and sessions across that edge, and sweeps scheduled
+TLS and an optional WS/WSS listener, authenticates a configured shared-access
+policy through SASL PLAIN or CBS SAS, carries messages and sessions across that
+edge, and sweeps scheduled
 activation, lock, time-to-live, session-lock, and duplicate-history expiry.
 JWT/OIDC, mTLS, policy administration,
 Raft, and compliance implementations remain to be built. Within the semantics
@@ -102,7 +103,10 @@ transactions, and settlements are replicated.
 
 The repository-owned AMQP engine handles framing, sessions, links, flow
 control, settlement, and SASL. The protocol listener establishes TLS before
-that engine starts. Switchyard implements the Service Bus-specific layer:
+that engine starts. The optional WebSocket listener uses the same engine behind
+a bounded binary adapter, with standalone protocol headers and explicit close
+cleanup; see [WebSocket Transport](docs/websocket-transport.md).
+Switchyard implements the Service Bus-specific layer:
 
 - SASL PLAIN for shared access policies
 - SASL ANONYMOUS followed by CBS `$cbs` SAS or JWT authorization

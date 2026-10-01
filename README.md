@@ -85,6 +85,11 @@ default port to 5671. A shared-access policy is configured with
 and CBS SAS authorization. Production mode refuses to start without both TLS
 and a shared-access policy.
 
+AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
+the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
+TLS identity and shared-access policy also apply to this separate listener.
+See [WebSocket Transport](docs/websocket-transport.md) for limits and client gates.
+
 Native entity administration is opt-in with `--admin-listen`. For an isolated
 development node, add `--admin-listen 127.0.0.1:9080`, then create and inspect a
 queue:

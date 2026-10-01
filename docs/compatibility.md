@@ -21,7 +21,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Capability | Target release | Status |
 | --- | --- | --- |
 | AMQP 1.0 over TLS | Pre-1.0 | Protocol edge, Rust client end to end |
-| AMQP over WebSockets | Pre-1.0 | Not implemented |
+| AMQP over WebSockets | Pre-1.0 | Opt-in WS/WSS listener, bounded binary transport, both Rust backends and both pinned .NET clients; see [WebSocket Transport](websocket-transport.md) |
 | SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. JWT: not implemented |
 | Queue send, receive, and settlement | Pre-1.0 | State machine |
 | Atomic message batch send | Pre-1.0 | State machine, AMQP producer mapping, Rust clients on both backends and both pinned .NET batch APIs |
@@ -442,8 +442,13 @@ scope normalization does not rewrite signed bytes. Scoped TLS/CBS socket tests
 cover these boundaries separately from the namespace-wide SDK gates.
 Native administration retains literal, case-sensitive scopes, including
 primary entity names that happen to end in AMQP control words.
+The optional WS/WSS listener carries the same engine and authorization through
+the exact `/$servicebus/websocket/` endpoint. Its HTTP and buffer limits,
+standalone protocol headers, close cleanup, and client gates are described in
+[WebSocket Transport](websocket-transport.md).
 The listener has local defaults of 128 live connections, including unfinished
-security handshakes, and one 10-second deadline covering TLS, SASL, and AMQP Open.
+security handshakes, and one 10-second deadline covering TLS, HTTP upgrade,
+SASL, and AMQP Open.
 Excess sockets are refused; handshake progress does not restart that deadline.
 Listener builders can configure both limits, with a zero handshake timeout
 requesting immediate refusal. The CBS authorization deadline starts after Open.
