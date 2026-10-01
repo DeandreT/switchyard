@@ -20,6 +20,9 @@ mod error_name_cases;
 #[path = "support/error_handle_cases.rs"]
 mod error_handle_cases;
 
+#[path = "support/live_name_cases.rs"]
+mod live_name_cases;
+
 use fixture::{
     CASE_TIMEOUT, Connection, IO_TIMEOUT, Link, Node, Session, TestResult, attach, channels,
     detach, transfer,

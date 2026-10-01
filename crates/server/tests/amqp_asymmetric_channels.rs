@@ -301,6 +301,7 @@ impl Sending {
 struct Node {
     connection: Connection,
     peer: Peer,
+    next_link_name: u64,
 }
 
 impl Node {
@@ -370,7 +371,11 @@ impl Node {
             peer.send(0, Performative::Open(open), Vec::new()).await?;
             Connection::Client(timeout(IO_TIMEOUT, opening).await???)
         };
-        Ok(Self { connection, peer })
+        Ok(Self {
+            connection,
+            peer,
+            next_link_name: 0,
+        })
     }
 
     async fn session(&mut self, binding: Binding) -> TestResult<Session> {
@@ -423,12 +428,15 @@ impl Node {
         binding: Binding,
         handle: u32,
     ) -> TestResult<Receiving> {
+        let name = self.fresh_name("receiver", binding, handle);
         let receiver = match session {
             Session::Server(session) => {
+                let mut request = attach(handle, Role::Sender);
+                request.name = name.clone();
                 self.peer
                     .send(
                         binding.incoming,
-                        Performative::Attach(Box::new(attach(handle, Role::Sender))),
+                        Performative::Attach(Box::new(request)),
                         Vec::new(),
                     )
                     .await?;
@@ -449,9 +457,7 @@ impl Node {
                 let (receiver, ()) = tokio::try_join!(
                     async {
                         Ok::<_, Box<dyn Error>>(
-                            session
-                                .attach_receiver(format!("receiver-{handle}"), "queue")
-                                .await?,
+                            session.attach_receiver(name.clone(), "queue").await?,
                         )
                     },
                     async {
@@ -492,12 +498,15 @@ impl Node {
         binding: Binding,
         handle: u32,
     ) -> TestResult<Sending> {
+        let name = self.fresh_name("sender", binding, handle);
         let sender = match session {
             Session::Server(session) => {
+                let mut request = attach(handle, Role::Receiver);
+                request.name = name.clone();
                 self.peer
                     .send(
                         binding.incoming,
-                        Performative::Attach(Box::new(attach(handle, Role::Receiver))),
+                        Performative::Attach(Box::new(request)),
                         Vec::new(),
                     )
                     .await?;
@@ -517,11 +526,7 @@ impl Node {
             Session::Client(session) => {
                 let (sender, ()) = tokio::try_join!(
                     async {
-                        Ok::<_, Box<dyn Error>>(
-                            session
-                                .attach_sender(format!("sender-{handle}"), "queue")
-                                .await?,
-                        )
+                        Ok::<_, Box<dyn Error>>(session.attach_sender(name.clone(), "queue").await?)
                     },
                     async {
                         let Frame::Amqp {
@@ -557,6 +562,12 @@ impl Node {
             .send(binding.incoming, Performative::Flow(flow), Vec::new())
             .await?;
         Ok(sender)
+    }
+
+    fn fresh_name(&mut self, kind: &str, binding: Binding, handle: u32) -> String {
+        let suffix = self.next_link_name;
+        self.next_link_name += 1;
+        format!("{kind}-{}-{handle}-{suffix}", binding.outgoing)
     }
 
     async fn incoming_message(

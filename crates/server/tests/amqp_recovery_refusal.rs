@@ -453,6 +453,7 @@ async fn pipelined_recovery_waits_for_local_begin_and_never_becomes_public_link_
             .send(1, Performative::Begin(Begin::default()), Vec::new())
             .await?;
         let mut recovery = attach(0, Role::Sender);
+        recovery.name = String::from("pipelined-recovery");
         retained(&mut recovery, nonempty, incomplete);
         node.peer
             .send(1, Performative::Attach(Box::new(recovery)), Vec::new())

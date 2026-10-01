@@ -169,7 +169,10 @@ impl ServerNode {
         handle: u32,
     ) -> TestResult<Receiver> {
         self.peer
-            .send(channel, Performative::Attach(Box::new(attach(handle))))
+            .send(
+                channel,
+                Performative::Attach(Box::new(attach(channel, handle))),
+            )
             .await?;
         let incoming = timeout(IO_TIMEOUT, session.next_incoming_attach())
             .await?
@@ -320,9 +323,9 @@ impl ClientNode {
     }
 }
 
-fn attach(handle: u32) -> Attach {
+fn attach(channel: u16, handle: u32) -> Attach {
     Attach {
-        name: format!("server-link-{handle}"),
+        name: format!("server-link-{channel}-{handle}"),
         handle,
         role: Role::Sender,
         snd_settle_mode: SenderSettleMode::Mixed,
@@ -482,7 +485,7 @@ async fn server_connection_link_limit_keeps_closing_alias_until_ack_then_reuses_
     } if detach.handle == 0 && detach.closed && detach.error.is_none()));
 
     node.peer
-        .send(2, Performative::Attach(Box::new(attach(0))))
+        .send(2, Performative::Attach(Box::new(attach(2, 0))))
         .await?;
     node.peer.end_reply(2, true).await?;
     assert!(
