@@ -62,6 +62,7 @@ const MAX_CLOSING_HANDLES: usize = 65_536;
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_FRAME_SIZE: u32 = 262_144;
 const MIN_MAX_FRAME_SIZE: u32 = 512;
+const MAX_RECEIVED_MESSAGE_BYTES: u64 = crate::codec::MAX_FRAME_SIZE as u64;
 
 fn normalized_frame_size(advertised: u32) -> Result<u32, EngineError> {
     if advertised < MIN_MAX_FRAME_SIZE {
@@ -1770,9 +1771,10 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 )));
                 return Ok(CommandAction::Continue);
             }
+            let receive_maximum = effective_receive_maximum(Some(max_message_size));
             let mut response = attach.response(attach.source.clone(), attach.target.clone());
             response.max_message_size =
-                (response.role == Role::Receiver).then_some(max_message_size);
+                (response.role == Role::Receiver).then_some(receive_maximum);
             response.properties = properties;
             let default_outcome = match source_default_outcome(response.source.as_ref()) {
                 Ok(outcome) => outcome,
@@ -1838,8 +1840,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                     session.links.insert(
                         handle,
                         LinkState::Receiving(ReceivingLink {
-                            max_message_size: normalized_message_size(Some(max_message_size))
-                                .unwrap_or(u64::MAX),
+                            max_message_size: receive_maximum,
                             deliveries: deliveries_tx,
                             partial: None,
                             detached: detached_tx,
@@ -2805,6 +2806,12 @@ fn normalized_message_size(maximum: Option<u64>) -> Option<u64> {
     maximum.filter(|maximum| *maximum != 0)
 }
 
+fn effective_receive_maximum(maximum: Option<u64>) -> u64 {
+    normalized_message_size(maximum)
+        .unwrap_or(MAX_RECEIVED_MESSAGE_BYTES)
+        .min(MAX_RECEIVED_MESSAGE_BYTES)
+}
+
 fn has_recovery_state(attach: &Attach) -> bool {
     attach.incomplete_unsettled
         || attach
@@ -3714,3 +3721,6 @@ mod outgoing_id_tests;
 
 #[cfg(test)]
 mod lifecycle_limit_tests;
+
+#[cfg(test)]
+mod receive_ceiling_tests;

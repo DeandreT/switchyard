@@ -646,7 +646,10 @@ mod client_tests {
             else {
                 panic!("client attach");
             };
-            assert_eq!(attach.max_message_size, maximum);
+            assert_eq!(
+                attach.max_message_size,
+                Some(effective_receive_maximum(maximum))
+            );
             let handle = attach.handle;
             let mut response = attach.response(attach.source.clone(), attach.target.clone());
             response.snd_settle_mode = SenderSettleMode::Mixed;
@@ -816,11 +819,11 @@ mod client_tests {
     }
 
     #[tokio::test]
-    async fn receiver_builder_zero_means_unlimited() {
+    async fn receiver_builder_zero_selects_the_local_default_ceiling() {
         let (mut connection, mut peer) = open_client().await;
         let mut session = begin_client(&mut connection, &mut peer).await;
         let (mut receiver, handle) =
-            attach_receiver(&mut session, &mut peer, "unlimited", Some(0)).await;
+            attach_receiver(&mut session, &mut peer, "local-default", Some(0)).await;
         let message = Message::data(vec![5; 256]);
         raw_transfer(
             &mut peer,
@@ -831,7 +834,7 @@ mod client_tests {
         )
         .await;
         assert_eq!(
-            receiver.recv().await.expect("unlimited delivery").message(),
+            receiver.recv().await.expect("fitting delivery").message(),
             &message
         );
         close_client(&connection, &mut peer).await;

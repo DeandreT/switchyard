@@ -645,7 +645,8 @@ impl ClientReceiverBuilder {
         self
     }
 
-    /// Advertises the encoded-message limit; zero leaves the link unlimited.
+    /// Advertises the encoded-message limit, capped by the local 4 MiB ceiling.
+    /// Zero or omission selects that local default.
     pub fn max_message_size(mut self, maximum: u64) -> Self {
         self.max_message_size = Some(maximum);
         self
@@ -1187,6 +1188,7 @@ where
                                         continue;
                                     }
                                     let request = *request;
+                                    let receive_maximum = effective_receive_maximum(request.max_message_size);
                                     let next_handle = next_handles
                                         .get_mut(&channel)
                                         .expect("live initiated session has a handle counter");
@@ -1202,7 +1204,7 @@ where
                                         unsettled: None,
                                         incomplete_unsettled: false,
                                         initial_delivery_count: (request.role == Role::Sender).then_some(0),
-                                        max_message_size: request.max_message_size,
+                                        max_message_size: if request.role == Role::Receiver { Some(receive_maximum) } else { request.max_message_size },
                                         offered_capabilities: None,
                                         desired_capabilities: None,
                                         properties: None,
@@ -1246,8 +1248,7 @@ where
                                         }
                                         Role::Receiver => {
                                             LinkState::Receiving(ReceivingLink {
-                                                max_message_size: normalized_message_size(request.max_message_size)
-                                                    .unwrap_or(u64::MAX),
+                                                max_message_size: receive_maximum,
                                                 deliveries: deliveries_tx,
                                                 partial: None,
                                                 detached: detached_tx,
