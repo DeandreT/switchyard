@@ -245,8 +245,21 @@ without buffering additional control responses. An approval for an absent or
 still-ending session returns a local detached error, which the broker listener
 skips without disconnecting healthy sibling sessions. Application approval
 still controls link installation; pending attaches share a 32-entry bound.
-Approval provenance across session-channel reuse remains unfinished.
+Session approvals, installed session endpoints, and client session commands
+retain an opaque session generation instead of relying on a reusable channel.
+Link approval uses an `IncomingAttach` receipt with that original session,
+an exact pending approval token, and immutable handle, name, and role. The
+application can still edit terminus and response metadata, including the granted
+Service Bus session filter. A foreign or altered receipt is refused locally
+without consuming the rightful approval or writing bytes; clones can approve
+only once. Raw Attach content cannot be converted back into approval authority.
+This is a source-level change for callers of the in-tree transport API.
 An End on an unmapped channel is refused without manufacturing a session reply.
+Client Begin searches only vacant channels within the peer's inclusive channel
+limit. Pending, live, and ending sessions cannot be overwritten. Client End
+retires its original endpoints before writing and waits for the matching peer
+End acknowledgement before its channel is reusable. Repeated or stale End and
+Attach commands are local refusals, not commands against a replacement session.
 Locally closing receiver links do not publish further link-credit updates, even
 when a queued delivery-consumption notification is processed after Detach.
 Session-window replenishment and healthy sibling links remain independent.
@@ -345,11 +358,14 @@ and repeated named descriptors are charged before allocation. Scheduling
 management requests and producer batches share that inner allowance and reject
 more than 1,024 members before decoding them. These bounds do not provide a
 connection-wide memory limit and are not Azure batch quotas.
-If a peer detaches a link while application approval is outstanding, a bounded
-canceled-approval tombstone refuses early handle reuse until that approval returns
-an error. Canceled approvals count toward the 32 pending link approvals allowed
-per session. A stale approval cannot reopen the canceled link. This is a local
-admission policy, not a restriction imposed by AMQP.
+If a peer detaches a link while application approval is outstanding, its receipt
+is retired and the pending slot is removed immediately. The handle can be reused
+without waiting for the application to consume the cancelled receipt. A stale
+receipt cannot open the replacement link or consume its approval. Retired queued
+session and link events are skipped. Cancellation during asynchronous broker
+planning releases any newly granted domain session hold and leaves the listener
+available for later links on the same AMQP session, including CBS and management
+approvals. No numeric cancelled-approval tombstones are retained.
 The edge resolves a link's address to an entity, turns transfers into send
 commands and dispositions into settlements, and answers a rejection with the
 condition an SDK keys its behaviour off. A receiving link's settle mode selects
