@@ -91,6 +91,7 @@ fn sending(
         identity,
         auto_acknowledge: automatic,
         default_outcome,
+        outstanding_tags: HashSet::new(),
         max_message_size: None,
         receiver_settle_mode: ReceiverSettleMode::Second,
         settle_mode: SenderSettleMode::Unsettled,
@@ -143,6 +144,9 @@ impl Fixture {
         active: bool,
     ) -> oneshot::Receiver<Result<SendOutcome, EngineError>> {
         let (reply, result) = oneshot::channel();
+        self.link_mut()
+            .outstanding_tags
+            .insert(id.to_be_bytes().to_vec());
         assert!(
             self.link_mut()
                 .unsettled
@@ -150,6 +154,7 @@ impl Fixture {
                     id,
                     OutgoingDelivery {
                         reply,
+                        delivery_tag: id.to_be_bytes().to_vec().into(),
                         outcome: None,
                         receiver_settled: false,
                     }
@@ -445,7 +450,7 @@ async fn remote_settlement_retires_a_pending_manual_ack_and_owned_repeats_never_
     ] {
         let mut fixture = Fixture::new(None, false);
         let owner = fixture.link().identity.clone();
-        let token = AckIdentity::new(&owner, ID);
+        let token = AckIdentity::new(&owner, ID, &[]);
         let clone = token.clone();
         fixture
             .link_mut()
@@ -488,14 +493,14 @@ async fn remote_settlement_retires_a_pending_manual_ack_and_owned_repeats_never_
 async fn remote_retired_token_cannot_consume_reused_numeric_alias_or_cross_owner_replacement() {
     let mut fixture = Fixture::new(None, false);
     let owner = fixture.link().identity.clone();
-    let old = AckIdentity::new(&owner, ID);
+    let old = AckIdentity::new(&owner, ID, &[]);
     fixture
         .link_mut()
         .pending_acknowledgements
         .insert(ID, old.clone());
     fixture.update(ID, None, true, None).await;
     assert!(old.is_settled());
-    let fresh = AckIdentity::new(&owner, ID);
+    let fresh = AckIdentity::new(&owner, ID, &[]);
     fixture
         .link_mut()
         .pending_acknowledgements
@@ -507,7 +512,7 @@ async fn remote_retired_token_cannot_consume_reused_numeric_alias_or_cross_owner
     fixture.output.assert_silent();
     assert!(!fresh.is_settled());
     assert!(fixture.link().pending_acknowledgements[&ID].same_ack(&fresh));
-    let impostor = AckIdentity::new(&owner, ID);
+    let impostor = AckIdentity::new(&owner, ID, &[]);
     assert!(matches!(
         fixture
             .settle(&owner, &impostor, DeliveryState::Accepted(Accepted))
@@ -535,7 +540,7 @@ async fn remote_retired_token_cannot_consume_reused_numeric_alias_or_cross_owner
             HANDLE,
             LinkState::Sending(Box::new(sending(replacement_owner.clone(), None, false))),
         );
-    let replacement = AckIdentity::new(&replacement_owner, ID);
+    let replacement = AckIdentity::new(&replacement_owner, ID, &[]);
     fixture
         .link_mut()
         .pending_acknowledgements
@@ -567,9 +572,9 @@ async fn remote_ranges_leave_foreign_wrong_key_or_retired_pending_aliases_untouc
         let mut fixture = Fixture::new(None, false);
         let owner = fixture.link().identity.clone();
         let token = match fault {
-            0 => AckIdentity::new(&LinkIdentity::new(), ID),
-            1 => AckIdentity::new(&owner, ID + 1),
-            2 | 3 => AckIdentity::new(&owner, ID),
+            0 => AckIdentity::new(&LinkIdentity::new(), ID, &[]),
+            1 => AckIdentity::new(&owner, ID + 1, &[]),
+            2 | 3 => AckIdentity::new(&owner, ID, &[]),
             _ => unreachable!("four invalid alias cases"),
         };
         fixture
@@ -594,6 +599,9 @@ fn delivery_at(
     id: u32,
 ) -> oneshot::Receiver<Result<SendOutcome, EngineError>> {
     let (reply, result) = oneshot::channel();
+    sending_mut(session, handle)
+        .outstanding_tags
+        .insert(id.to_be_bytes().to_vec());
     assert!(
         sending_mut(session, handle)
             .unsettled
@@ -601,6 +609,7 @@ fn delivery_at(
                 id,
                 OutgoingDelivery {
                     reply,
+                    delivery_tag: id.to_be_bytes().to_vec().into(),
                     outcome: None,
                     receiver_settled: false
                 }
@@ -662,7 +671,7 @@ async fn wrapping_and_full_span_ranges_only_scan_owned_outgoing_aliases_in_the_n
     let mut selected_tokens = Vec::new();
     for (handle, id) in [(HANDLE, u32::MAX), (HANDLE + 1, 1)] {
         let link = sending_mut(fixture.sessions.get_mut(&CHANNEL).expect("session"), handle);
-        let token = AckIdentity::new(&link.identity, id);
+        let token = AckIdentity::new(&link.identity, id, &[]);
         link.pending_acknowledgements.insert(id, token.clone());
         selected_tokens.push(token);
     }
@@ -674,7 +683,7 @@ async fn wrapping_and_full_span_ranges_only_scan_owned_outgoing_aliases_in_the_n
                 .expect("other session"),
             HANDLE,
         );
-        let token = AckIdentity::new(&link.identity, u32::MAX);
+        let token = AckIdentity::new(&link.identity, u32::MAX, &[]);
         link.pending_acknowledgements
             .insert(u32::MAX, token.clone());
         token
@@ -723,7 +732,7 @@ async fn wrapping_and_full_span_ranges_only_scan_owned_outgoing_aliases_in_the_n
             fixture.sessions.get_mut(&CHANNEL).expect("session"),
             HANDLE + 1,
         );
-        let token = AckIdentity::new(&link.identity, u32::MAX / 2);
+        let token = AckIdentity::new(&link.identity, u32::MAX / 2, &[]);
         link.pending_acknowledgements
             .insert(token.id(), token.clone());
         token
@@ -758,7 +767,7 @@ async fn wrapping_and_full_span_ranges_only_scan_owned_outgoing_aliases_in_the_n
     fixture.output.assert_silent();
 
     let mut untouched = fixture.delivery(3, false);
-    let untouched_token = AckIdentity::new(&fixture.link().identity, 4);
+    let untouched_token = AckIdentity::new(&fixture.link().identity, 4, &[]);
     fixture
         .link_mut()
         .pending_acknowledgements

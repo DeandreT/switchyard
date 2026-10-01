@@ -1225,6 +1225,7 @@ where
                                                 max_message_size: None,
                                                 receiver_settle_mode: request.receiver_settle_mode,
                                                 default_outcome: None,
+                                                outstanding_tags: HashSet::new(),
                                                 settle_mode: request.sender_settle_mode,
                                                 credit: LinkCredit::new(0),
                                                 queued: VecDeque::new(),

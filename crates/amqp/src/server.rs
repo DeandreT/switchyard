@@ -52,6 +52,8 @@ const DELIVERY_QUEUE_CAPACITY: usize = LINK_CREDIT as usize;
 const MAX_PENDING_ATTACHES: usize = 32;
 const SEND_FRAME_QUANTUM: usize = 16;
 const MAX_DELIVERY_TAG_BYTES: usize = 32;
+const MAX_OUTGOING_DELIVERIES_PER_LINK: usize = 1_024;
+const MAX_OUTGOING_DELIVERIES_PER_SESSION: usize = 4_096;
 const RECOVERY_NOT_IMPLEMENTED: &str = "link recovery is not implemented";
 const MAX_CLOSING_HANDLES: usize = 65_536;
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1131,6 +1133,7 @@ struct SendingLink {
     max_message_size: Option<u64>,
     receiver_settle_mode: ReceiverSettleMode,
     default_outcome: Option<Outcome>,
+    outstanding_tags: HashSet<Vec<u8>>,
     settle_mode: SenderSettleMode,
     credit: LinkCredit,
     queued: VecDeque<QueuedSend>,
@@ -1160,6 +1163,7 @@ struct ActiveSend {
 
 struct OutgoingDelivery {
     reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
+    delivery_tag: DeliveryTag,
     outcome: Option<Outcome>,
     receiver_settled: bool,
 }
@@ -1808,6 +1812,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                             settle_mode: attach.snd_settle_mode,
                             receiver_settle_mode: attach.rcv_settle_mode,
                             default_outcome,
+                            outstanding_tags: HashSet::new(),
                             credit,
                             queued: VecDeque::new(),
                             active: None,
@@ -2052,6 +2057,7 @@ async fn write_outgoing_acknowledgement<W: AsyncWrite + Unpin>(
         .expect("the actor retains the validated acknowledgement through its write");
     debug_assert!(pending.same_ack(identity));
     identity.mark_settled();
+    link.outstanding_tags.remove(identity.tag());
     Ok(())
 }
 
@@ -2829,6 +2835,36 @@ async fn queue_send<W: AsyncWrite + Unpin>(
         let _ = reply.send(Err(invalid_state("delivery tag exceeds 32 bytes")));
         return Ok(());
     }
+    if link.outstanding_tags.contains(delivery_tag.as_ref()) {
+        let _ = reply.send(Err(invalid_state(
+            "outgoing delivery tag is already in use on this link",
+        )));
+        return Ok(());
+    }
+    if link.outstanding_tags.len() >= MAX_OUTGOING_DELIVERIES_PER_LINK {
+        let _ = reply.send(Err(invalid_state(
+            "outgoing delivery limit reached on this link",
+        )));
+        return Ok(());
+    }
+    let outstanding = session
+        .links
+        .values()
+        .filter_map(|link| match link {
+            LinkState::Sending(link) => Some(link.outstanding_tags.len()),
+            _ => None,
+        })
+        .sum::<usize>();
+    if outstanding >= MAX_OUTGOING_DELIVERIES_PER_SESSION {
+        let _ = reply.send(Err(invalid_state(
+            "outgoing delivery limit reached on this session",
+        )));
+        return Ok(());
+    }
+    if link.queued.len() >= DELIVERY_QUEUE_CAPACITY {
+        let _ = reply.send(Err(invalid_state("outgoing delivery queue is full")));
+        return Ok(());
+    }
     let payload = match encode_message(&message) {
         Ok(payload) => payload,
         Err(error) => {
@@ -2858,10 +2894,6 @@ async fn queue_send<W: AsyncWrite + Unpin>(
     let Some(LinkState::Sending(link)) = session.links.get_mut(&handle) else {
         unreachable!("the validated sending link has not changed");
     };
-    if link.queued.len() == DELIVERY_QUEUE_CAPACITY {
-        let _ = reply.send(Err(invalid_state("outgoing delivery queue is full")));
-        return Ok(());
-    }
     if let Err(error) = fragment_frame(
         channel,
         handle,
@@ -2886,6 +2918,7 @@ async fn queue_send<W: AsyncWrite + Unpin>(
         let _ = reply.send(Err(error.into()));
         return Ok(());
     }
+    link.outstanding_tags.insert(delivery_tag.as_ref().to_vec());
     link.queued.push_back(QueuedSend {
         payload,
         delivery_tag,
@@ -3150,6 +3183,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
                 id,
                 OutgoingDelivery {
                     reply: queued.reply,
+                    delivery_tag: queued.delivery_tag.clone(),
                     outcome: None,
                     receiver_settled: false,
                 },
@@ -3174,6 +3208,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
     if complete {
         let active = link.active.take().expect("completed delivery exists");
         if let Some(reply) = active.settled_reply {
+            link.outstanding_tags.remove(active.delivery_tag.as_ref());
             let _ = reply.send(Ok(SendOutcome {
                 outcome: Outcome::Accepted(Accepted),
                 acknowledgement: None,
@@ -3213,6 +3248,7 @@ async fn resolve_outgoing<W: AsyncWrite + Unpin>(
         .remove(&id)
         .expect("resolvable delivery exists");
     let Some(outcome) = delivery.outcome.or_else(|| link.default_outcome.clone()) else {
+        link.outstanding_tags.remove(delivery.delivery_tag.as_ref());
         let _ = delivery
             .reply
             .send(Err(EngineError::RemoteSettledWithoutOutcome));
@@ -3220,7 +3256,8 @@ async fn resolve_outgoing<W: AsyncWrite + Unpin>(
     };
     let acknowledge =
         link.receiver_settle_mode == ReceiverSettleMode::Second && !delivery.receiver_settled;
-    let mut acknowledgement = acknowledge.then(|| AckIdentity::new(&link.identity, id));
+    let mut acknowledgement =
+        acknowledge.then(|| AckIdentity::new(&link.identity, id, delivery.delivery_tag.as_ref()));
     if let Some(identity) = &acknowledgement {
         link.pending_acknowledgements.insert(id, identity.clone());
         if link.auto_acknowledge {
@@ -3231,6 +3268,8 @@ async fn resolve_outgoing<W: AsyncWrite + Unpin>(
             write_outgoing_acknowledgement(link, identity, &frame, writer).await?;
             acknowledgement = None;
         }
+    } else {
+        link.outstanding_tags.remove(delivery.delivery_tag.as_ref());
     }
     let _ = delivery.reply.send(Ok(SendOutcome {
         outcome,
@@ -3292,6 +3331,7 @@ async fn apply_disposition<W: AsyncWrite + Unpin>(
                 {
                     identity.mark_settled();
                     link.pending_acknowledgements.remove(&id);
+                    link.outstanding_tags.remove(identity.tag());
                 }
             }
         }
@@ -3325,6 +3365,7 @@ fn stop_link(link: &mut LinkState) {
         LinkState::Sending(link) => {
             link.identity.retire();
             link.pending_acknowledgements.clear();
+            link.outstanding_tags.clear();
             let _ = link.detached.send(true);
             for queued in link.queued.drain(..) {
                 let _ = queued.reply.send(Err(EngineError::RemoteDetached));
@@ -3563,3 +3604,6 @@ mod session_provenance_tests;
 
 #[cfg(test)]
 mod outgoing_remote_settlement_tests;
+
+#[cfg(test)]
+mod outgoing_tag_tests;

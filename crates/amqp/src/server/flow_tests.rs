@@ -266,6 +266,7 @@ async fn echo(peer: &mut DuplexStream, channel: u16, flow: Flow) -> Flow {
 async fn enqueue(
     sender: &Sender,
     message: Message,
+    tag: u8,
 ) -> oneshot::Receiver<Result<SendOutcome, EngineError>> {
     let (reply, response) = oneshot::channel();
     sender
@@ -275,7 +276,7 @@ async fn enqueue(
             handle: sender.handle,
             identity: sender.identity.clone(),
             message: Box::new(message),
-            delivery_tag: vec![1, 2, 3].into(),
+            delivery_tag: vec![1, 2, tag].into(),
             reply,
         })
         .await
@@ -312,7 +313,7 @@ async fn one_message_credit_resumes_fragments_on_handleless_session_flow_and_lat
     .expect("one delivery grant");
     let message = Message::data(vec![7; 1_600]);
     let encoded = encode_message(&message).expect("message encoding");
-    let mut response = enqueue(&sender, message).await;
+    let mut response = enqueue(&sender, message, 1).await;
     let Frame::Amqp {
         performative: Some(Performative::Transfer(first)),
         payload,
@@ -424,7 +425,7 @@ async fn one_message_credit_resumes_fragments_on_handleless_session_flow_and_lat
     )
     .await
     .expect("next delivery grant");
-    let next = enqueue(&sender, Message::data(vec![9])).await;
+    let next = enqueue(&sender, Message::data(vec![9]), 2).await;
     assert!(matches!(
         next_frame(&mut peer).await,
         Frame::Amqp {
@@ -664,6 +665,7 @@ async fn wrapping_disposition_resolves_existing_ids_without_reusing_an_outstandi
             max_message_size: None,
             receiver_settle_mode: ReceiverSettleMode::First,
             default_outcome: None,
+            outstanding_tags: HashSet::from([vec![0]]),
             settle_mode: SenderSettleMode::Unsettled,
             credit,
             queued: VecDeque::new(),
@@ -672,6 +674,7 @@ async fn wrapping_disposition_resolves_existing_ids_without_reusing_an_outstandi
                 0,
                 OutgoingDelivery {
                     reply: old_reply,
+                    delivery_tag: vec![0].into(),
                     outcome: None,
                     receiver_settled: false,
                 },
@@ -843,7 +846,7 @@ async fn unknown_link_flow_ends_only_its_session_and_does_not_allocate_pending_s
     )
     .await
     .expect("healthy grant");
-    let _outcome = enqueue(&sender, Message::data(vec![3])).await;
+    let _outcome = enqueue(&sender, Message::data(vec![3]), 1).await;
     assert!(matches!(
         next_frame(&mut peer).await,
         Frame::Amqp {
@@ -921,8 +924,8 @@ async fn pending_attach_coalesces_omitted_credit_without_erasing_grants_echo_or_
     assert!(!link_echo.echo);
     assert_eq!(link_echo.delivery_count, Some(0));
     assert_eq!(link_echo.link_credit, Some(10));
-    let _first = enqueue(&sender, Message::data(vec![1])).await;
-    let _second = enqueue(&sender, Message::data(vec![2])).await;
+    let _first = enqueue(&sender, Message::data(vec![1]), 1).await;
+    let _second = enqueue(&sender, Message::data(vec![2]), 2).await;
     assert!(matches!(
         next_frame(&mut peer).await,
         Frame::Amqp {
@@ -1142,7 +1145,7 @@ async fn detached_pending_attach_rejects_late_approval_before_the_handle_can_be_
     )
     .await
     .expect("fresh grant");
-    let _outcome = enqueue(&sender, Message::data(vec![5])).await;
+    let _outcome = enqueue(&sender, Message::data(vec![5]), 1).await;
     assert!(matches!(
         next_frame(&mut peer).await,
         Frame::Amqp {

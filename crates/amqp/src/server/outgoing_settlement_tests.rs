@@ -96,6 +96,7 @@ fn sending_link(identity: LinkIdentity, auto_acknowledge: bool) -> SendingLink {
         max_message_size: None,
         receiver_settle_mode: ReceiverSettleMode::Second,
         default_outcome: None,
+        outstanding_tags: HashSet::new(),
         settle_mode: SenderSettleMode::Unsettled,
         credit: LinkCredit::new(0),
         queued: VecDeque::new(),
@@ -153,7 +154,9 @@ impl Fixture {
     }
 
     fn pending(&mut self, id: u32) -> AckIdentity {
-        let token = AckIdentity::new(&self.owner, id);
+        let tag = id.to_be_bytes();
+        let token = AckIdentity::new(&self.owner, id, &tag);
+        self.sending_mut().outstanding_tags.insert(tag.to_vec());
         assert!(
             self.sending_mut()
                 .pending_acknowledgements
@@ -257,7 +260,7 @@ async fn fresh_tokens_with_the_same_numeric_id_never_claim_the_pending_acknowled
     let owner = fixture.owner.clone();
     let pending = fixture.pending(ID);
     for token_owner in [owner.clone(), LinkIdentity::new()] {
-        let impostor = AckIdentity::new(&token_owner, ID);
+        let impostor = AckIdentity::new(&token_owner, ID, &[]);
         assert!(
             fixture
                 .settle(&owner, Some(impostor.clone()), accepted())
@@ -332,7 +335,7 @@ async fn owner_validation_precedes_no_ack_and_terminal_noops() {
     let owner = fixture.owner.clone();
     let pending = fixture.pending(ID);
     let foreign_owner = LinkIdentity::new();
-    let foreign_terminal = AckIdentity::new(&foreign_owner, ID);
+    let foreign_terminal = AckIdentity::new(&foreign_owner, ID, &[]);
     foreign_terminal.mark_settled();
     assert!(
         fixture
@@ -343,7 +346,7 @@ async fn owner_validation_precedes_no_ack_and_terminal_noops() {
     assert!(!pending.is_settled());
     assert!(fixture.sending().pending_acknowledgements[&ID].same_ack(&pending));
     fixture.output.assert_silent();
-    let terminal = AckIdentity::new(&owner, ID);
+    let terminal = AckIdentity::new(&owner, ID, &[]);
     terminal.mark_settled();
     for acknowledgement in [None, Some(terminal)] {
         assert!(
@@ -419,7 +422,7 @@ async fn retired_pending_and_terminal_tokens_cannot_settle_reused_handles_or_cha
         let mut fixture = Fixture::new(false);
         let old_owner = fixture.owner.clone();
         let old_pending = fixture.pending(ID);
-        let old_terminal = AckIdentity::new(&old_owner, ID.wrapping_add(1));
+        let old_terminal = AckIdentity::new(&old_owner, ID.wrapping_add(1), &[]);
         old_terminal.mark_settled();
         let mut retired = fixture
             .sessions
@@ -622,10 +625,15 @@ async fn automatic_acknowledgement_precedes_send_reply_and_survives_a_dropped_re
         let mut fixture = Fixture::new(true);
         let (reply, result) = oneshot::channel();
         let mut result = (!dropped).then_some(result);
+        fixture
+            .sending_mut()
+            .outstanding_tags
+            .insert(vec![ID as u8]);
         fixture.sending_mut().unsettled.insert(
             ID,
             OutgoingDelivery {
                 reply,
+                delivery_tag: vec![ID as u8].into(),
                 outcome: Some(Outcome::Accepted(Accepted)),
                 receiver_settled: false,
             },
@@ -675,10 +683,15 @@ async fn automatic_acknowledgement_precedes_send_reply_and_survives_a_dropped_re
 async fn automatic_acknowledgement_flush_failure_never_publishes_a_successful_send() {
     let mut fixture = Fixture::new(true);
     let (reply, mut result) = oneshot::channel();
+    fixture
+        .sending_mut()
+        .outstanding_tags
+        .insert(vec![ID as u8]);
     fixture.sending_mut().unsettled.insert(
         ID,
         OutgoingDelivery {
             reply,
+            delivery_tag: vec![ID as u8].into(),
             outcome: Some(Outcome::Accepted(Accepted)),
             receiver_settled: false,
         },
@@ -723,10 +736,12 @@ async fn early_outcome_is_latched_until_final_transfer_then_automatically_acknow
     let mut fixture = Fixture::new(true);
     let (reply, mut result) = oneshot::channel();
     let link = fixture.sending_mut();
+    link.outstanding_tags.insert(vec![ID as u8]);
     link.unsettled.insert(
         ID,
         OutgoingDelivery {
             reply,
+            delivery_tag: vec![ID as u8].into(),
             outcome: None,
             receiver_settled: false,
         },
@@ -804,10 +819,15 @@ async fn automatic_policy_never_acknowledges_first_mode_or_already_settled_outco
             let mut fixture = Fixture::new(true);
             fixture.sending_mut().receiver_settle_mode = receiver_settle_mode.clone();
             let (reply, result) = oneshot::channel();
+            fixture
+                .sending_mut()
+                .outstanding_tags
+                .insert(vec![ID as u8]);
             fixture.sending_mut().unsettled.insert(
                 ID,
                 OutgoingDelivery {
                     reply,
+                    delivery_tag: vec![ID as u8].into(),
                     outcome: None,
                     receiver_settled: false,
                 },
