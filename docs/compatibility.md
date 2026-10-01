@@ -233,8 +233,26 @@ default. Exceeding the limit detaches only the offending link with
 the message, even if every Transfer still has `more=true`. Aborting an admitted
 partial delivery releases its content and aliases for reuse. The broker's
 smaller producer-link limit is unchanged. An absent or zero peer-advertised
-outgoing limit still means no peer limit; this receive policy does not bound
-temporary send encoding, combined connection content, or exact heap usage.
+outgoing limit still means no peer limit.
+Each connection also shares a 64 MiB retained encoded-content allowance across
+all sessions and both directions. Incoming partials are charged before append;
+completed deliveries keep their original encoded-byte charge while queued in a
+receiver's inbox. Detach or End does not refund an unread inbox, and replacing
+every session does not reset the connection allowance. Both receiving APIs
+refund a delivery's charge before returning it to the application, independently
+of settlement; dropping an inbox also refunds its queued messages. Incoming
+exhaustion detaches only the offending link with `amqp:resource-limit-exceeded`.
+Outgoing queued and active payloads keep their full encoded-byte charge through
+the final Transfer flush. Failed or cancelled flushes retain it until teardown;
+subsequent outcome and acknowledgement metadata does not retain content bytes.
+Local send exhaustion is a retryable state error that does not reserve a tag,
+advance delivery or credit counters, or write a frame. Aborts, decoding failures,
+unavailable inboxes, and actor-owned teardown refund their actual leases.
+This allowance counts logical retained content, not exact heap usage. Decoded
+object overhead, custom decoder expansion, the bounded reader-frame backlog,
+unencoded command messages, transient encoding/decoding and frame copies, and
+application-owned messages are outside it. Local outgoing encoding still occurs
+before admission and needs a separate bounded encoder.
 Frames on channels above the locally advertised limit receive a framing-error
 Close without refreshing receive activity. Asymmetric channel/handle routing
 remains a separate unfinished feature.
