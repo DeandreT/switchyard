@@ -245,6 +245,22 @@ without buffering additional control responses. An approval for an absent or
 still-ending session returns a local detached error, which the broker listener
 skips without disconnecting healthy sibling sessions. Application approval
 still controls link installation; pending attaches share a 32-entry bound.
+The transport additionally limits one connection to 32 session states, including
+unapproved, pending-client, and ending sessions. It permits 128 distinct link
+lifecycle handles per session and 256 across the connection. Installed links,
+pending approvals, and handles awaiting Detach acknowledgement share that
+allowance; overlapping bookkeeping for one handle counts only once. Approving
+an admitted link does not charge it again. A closing handle remains charged
+until the peer acknowledges Detach, and a session state remains charged until
+the peer's End removes it, even though End retires that session's links.
+An excess peer Begin receives an `amqp:resource-limit-exceeded` Close without
+creating a session or application event. An excess peer Attach ends only its
+requesting session with that condition, without allocating an extra approval or
+refusal handle. The test client refuses excess local Begin and Attach calls with
+`InvalidState`, before advancing counters or writing bytes, and can retry once
+the relevant acknowledgement frees capacity. These cardinality limits do not
+change the negotiated numeric channel range and do not bound retained content
+bytes or exact heap usage.
 Session approvals, installed session endpoints, and client session commands
 retain an opaque session generation instead of relying on a reusable channel.
 Link approval uses an `IncomingAttach` receipt with that original session,
