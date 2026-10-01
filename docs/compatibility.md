@@ -310,6 +310,15 @@ send waiter does not release a tag; a failed or cancelled final Transfer or
 acknowledgement flush retains it until teardown. An old terminal receipt cannot
 release a later send's reused tag or numeric ID. These are metadata allowances,
 not a connection-wide content or heap limit.
+Outgoing delivery IDs are allocated independently of incoming IDs, within one
+session's sending direction. When the cursor wraps onto a live ID, a bounded
+vacancy search skips unresolved deliveries, pending acknowledgements, and active
+fragments across every sending link in that session. It does not overwrite an
+old alias or stall solely because the next ID is occupied. The selected ID is
+captured for every fragment of that delivery; first-frame admission advances the
+cursor, while a lack of link credit or session window leaves it unchanged.
+Session Transfer-frame counters remain separate and advance once per fragment,
+without gaps introduced by skipped delivery IDs.
 Outgoing sends and explicit second-mode acknowledgement receipts also retain
 their original link generation. A stale sender cannot send or close a
 replacement link, and a receipt cannot acknowledge a different delivery that
