@@ -325,6 +325,16 @@ impl ManagementResponse {
             crate::MESSAGE_LOCK_LOST | crate::SESSION_LOCK_LOST => 410,
             crate::NOT_FOUND | crate::condition::MESSAGE_NOT_FOUND => 404,
             crate::ENTITY_ALREADY_EXISTS => 409,
+            crate::NOT_IMPLEMENTED
+                if matches!(
+                    rejection,
+                    BrokerRejection::Refused(domain::BrokerError::SqlRuleCompilation(
+                        domain::SqlCompileError::Unsupported { .. }
+                    ))
+                ) =>
+            {
+                501
+            }
             crate::MESSAGE_SIZE_EXCEEDED | crate::RESOURCE_LIMIT_EXCEEDED => 403,
             crate::INVALID_FIELD | crate::NOT_ALLOWED | crate::PRECONDITION_FAILED => 400,
             crate::RESOURCE_LOCKED => 503,

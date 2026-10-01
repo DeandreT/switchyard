@@ -70,12 +70,17 @@ fn independent_flags_keep_explicit_false_zero_and_unlimited() {
         "--ttl-unlimited",
         "--requires-session=false",
         "--dead-letter-on-expiration=false",
+        "--dead-letter-on-filter-exceptions=false",
     ]);
     assert_eq!(subscription.lock_duration_millis, Some(5000));
     assert_eq!(subscription.max_delivery_count, Some(7));
     assert_eq!(subscription.requires_session, Some(false));
     assert_eq!(
         subscription.dead_lettering_on_message_expiration,
+        Some(false)
+    );
+    assert_eq!(
+        subscription.dead_lettering_on_filter_evaluation_exceptions,
         Some(false)
     );
     assert_eq!(
@@ -87,9 +92,41 @@ fn independent_flags_keep_explicit_false_zero_and_unlimited() {
 }
 
 #[test]
+fn filter_error_dead_letter_option_preserves_omitted_false_and_true() {
+    for (options, expected) in [
+        (vec![], None),
+        (
+            vec!["--dead-lettering-on-filter-evaluation-exceptions=false"],
+            Some(false),
+        ),
+        (vec!["--dead-letter-on-filter-exceptions"], Some(true)),
+        (vec!["--dead-letter-on-filter-exceptions=true"], Some(true)),
+    ] {
+        let config = subscription_config(&options);
+        assert_eq!(
+            config.dead_lettering_on_filter_evaluation_exceptions,
+            expected
+        );
+        assert_eq!(config.dead_lettering_on_message_expiration, None);
+        let output =
+            serde_json::to_value(SubscriptionConfigurationOutput::from(config)).expect("JSON");
+        assert_eq!(
+            output["dead_lettering_on_filter_evaluation_exceptions"],
+            serde_json::to_value(expected).expect("flag")
+        );
+    }
+}
+
+#[test]
 fn wrong_kind_flags_and_conflicting_ttl_are_local_parse_errors() {
     for argv in [
         vec!["topic", "create", "Orders", "--requires-session"],
+        vec![
+            "topic",
+            "create",
+            "Orders",
+            "--dead-letter-on-filter-exceptions",
+        ],
         vec![
             "topic",
             "create",

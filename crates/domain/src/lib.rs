@@ -62,6 +62,7 @@ pub use rule::{
     CorrelationFilter, MAX_CORRELATION_RULE_CONDITIONS, MAX_RULE_BYTES, MAX_RULE_NAME_LENGTH,
     MAX_SUBSCRIPTION_RULE_BYTES, MAX_SUBSCRIPTION_RULES, MAX_TOPIC_RULE_COMPARISON_BYTES,
     MAX_TOPIC_RULE_MATCH_WORK, RuleDefinition, RuleFilter, RuleMatchLimit, RuleName,
+    SQL_FILTER_SEMANTIC_VERSION, SqlFilter,
 };
 pub use session::{AcceptedSession, SessionHold, SessionLock, SessionRecord};
 pub use sql_filter::{

@@ -131,6 +131,7 @@ fn topology_configuration_fields_have_additive_stable_numbers() {
                 ("requires_session", 5),
                 ("dead_lettering_on_message_expiration", 6),
                 ("default_ttl_unlimited", 7),
+                ("dead_lettering_on_filter_evaluation_exceptions", 8),
             ],
         ),
     ] {
@@ -199,6 +200,7 @@ fn typed_topology_false_zero_and_all_ttl_forms_preserve_presence() {
             max_message_bytes: Some(0),
             requires_session: Some(false),
             dead_lettering_on_message_expiration: Some(false),
+            dead_lettering_on_filter_evaluation_exceptions: Some(false),
         };
         let bytes = config.encode_to_vec();
         assert!(subscription_encodings.insert(bytes.clone()));
@@ -213,6 +215,35 @@ fn typed_topology_false_zero_and_all_ttl_forms_preserve_presence() {
         v1::SubscriptionConfiguration::default()
             .encode_to_vec()
             .is_empty()
+    );
+}
+
+#[test]
+fn filter_evaluation_dead_letter_flag_preserves_all_presence_states() {
+    let mut encodings = std::collections::BTreeSet::new();
+    for flag in [None, Some(false), Some(true)] {
+        let config = v1::SubscriptionConfiguration {
+            dead_lettering_on_filter_evaluation_exceptions: flag,
+            ..Default::default()
+        };
+        let encoded = config.encode_to_vec();
+        assert!(encodings.insert(encoded.clone()));
+        assert_eq!(
+            v1::SubscriptionConfiguration::decode(encoded.as_slice()).expect("config"),
+            config
+        );
+    }
+    assert_eq!(
+        v1::SubscriptionConfiguration::decode([0x40, 0].as_slice())
+            .expect("tag8 false")
+            .dead_lettering_on_filter_evaluation_exceptions,
+        Some(false)
+    );
+    assert_eq!(
+        v1::SubscriptionConfiguration::decode([0x40, 1].as_slice())
+            .expect("tag8 true")
+            .dead_lettering_on_filter_evaluation_exceptions,
+        Some(true)
     );
 }
 

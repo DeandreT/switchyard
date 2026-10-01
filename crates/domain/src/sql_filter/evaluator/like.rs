@@ -9,6 +9,39 @@ pub(super) fn matches(
     negated: bool,
     budget: &mut SqlEvaluationBudget,
 ) -> Result<SqlTruth, SqlEvaluationError> {
+    let input_string = string(input);
+    let pattern_string = string(pattern);
+    let escape_string = escape.and_then(string);
+    let escape_value = match escape {
+        None => Ok(None),
+        Some(Value::String(value)) => {
+            let mut chars = value.chars();
+            match (chars.next(), chars.next()) {
+                (Some(value), None) => Ok(Some(value)),
+                _ => Err(SqlEvaluationError::InvalidEscape),
+            }
+        }
+        Some(_) => Err(SqlEvaluationError::TypeMismatch),
+    };
+    let escape_bytes = escape_string.map_or(0, str::len);
+    budget.charge_work(escape_bytes)?;
+    budget.charge_bytes(escape_bytes)?;
+    // Charge text traversal before counting generated syntax. Every literal is
+    // escaped by the existing regex engine; counting uses only tiny scalars.
+    let source_bytes = input_string
+        .map_or(0, str::len)
+        .saturating_add(pattern_string.map_or(0, str::len));
+    budget.charge_work(source_bytes)?;
+    budget.charge_bytes(source_bytes)?;
+    let (generated, pattern_error) = match (pattern_string, escape_value) {
+        (Some(pattern), Ok(escape)) => count_pattern(pattern, escape)?,
+        _ => (
+            conservative_pattern_bytes(pattern_string.map_or(0, str::len))?,
+            None,
+        ),
+    };
+    charge_product(generated, input_string.map_or(0, str::len), budget)?;
+
     if input.is_unknown() || pattern.is_unknown() || escape.is_some_and(Value::is_unknown) {
         return Ok(SqlTruth::Unknown);
     }
@@ -18,43 +51,13 @@ pub(super) fn matches(
     {
         return Err(SqlEvaluationError::UnsupportedValue);
     }
-    let (Value::String(input), Value::String(pattern)) = (input, pattern) else {
+    let (Some(input), Some(pattern)) = (input_string, pattern_string) else {
         return Err(SqlEvaluationError::TypeMismatch);
     };
-    let escape = match escape {
-        None => None,
-        Some(Value::String(value)) => {
-            budget.charge_work(value.len())?;
-            budget.charge_bytes(value.len())?;
-            let mut chars = value.chars();
-            let value = chars.next().ok_or(SqlEvaluationError::InvalidEscape)?;
-            if chars.next().is_some() {
-                return Err(SqlEvaluationError::InvalidEscape);
-            }
-            Some(value)
-        }
-        _ => return Err(SqlEvaluationError::TypeMismatch),
-    };
-    // Charge text traversal before counting generated syntax. Every literal is
-    // escaped by the existing regex engine; counting uses only tiny scalars.
-    let source_bytes = input.len().saturating_add(pattern.len());
-    budget.charge_work(source_bytes)?;
-    budget.charge_bytes(source_bytes)?;
-    let generated = pattern_bytes(pattern, escape)?;
-    let product = generated
-        .checked_add(1)
-        .and_then(|size| {
-            input
-                .len()
-                .checked_add(1)
-                .and_then(|text| size.checked_mul(text))
-        })
-        .ok_or(SqlEvaluationError::Limit {
-            kind: SqlEvaluationLimit::WorkUnits,
-            maximum: budget.limits.work,
-        })?;
-    budget.charge_work(product)?;
-    budget.charge_bytes(product)?;
+    let escape = escape_value?;
+    if let Some(error) = pattern_error {
+        return Err(error);
+    }
 
     let mut expression = String::with_capacity(generated);
     expression.push_str("\\A");
@@ -89,6 +92,64 @@ pub(super) fn matches(
     })
 }
 
+fn string(value: Value<'_>) -> Option<&str> {
+    match value {
+        Value::String(value) => Some(value),
+        _ => None,
+    }
+}
+
+pub(super) fn charge_unresolved(
+    input_bytes: usize,
+    pattern_bytes: usize,
+    escape_bytes: usize,
+    budget: &mut SqlEvaluationBudget,
+) -> Result<(), SqlEvaluationError> {
+    let source_bytes = input_bytes
+        .saturating_add(pattern_bytes)
+        .saturating_add(escape_bytes);
+    budget.charge_work(source_bytes)?;
+    budget.charge_bytes(source_bytes)?;
+    charge_product(
+        conservative_pattern_bytes(pattern_bytes)?,
+        input_bytes,
+        budget,
+    )
+}
+
+fn conservative_pattern_bytes(bytes: usize) -> Result<usize, SqlEvaluationError> {
+    // An escaped literal needs at most twice its UTF-8 bytes; this also bounds
+    // every wildcard interpretation when a failed lookup hides the pattern.
+    let generated = bytes.saturating_mul(2).saturating_add(4);
+    if generated > MAX_SQL_LIKE_PATTERN_BYTES {
+        return Err(SqlEvaluationError::Limit {
+            kind: SqlEvaluationLimit::LikePatternBytes,
+            maximum: MAX_SQL_LIKE_PATTERN_BYTES,
+        });
+    }
+    Ok(generated)
+}
+
+fn charge_product(
+    generated: usize,
+    input_bytes: usize,
+    budget: &mut SqlEvaluationBudget,
+) -> Result<(), SqlEvaluationError> {
+    let product = generated
+        .checked_add(1)
+        .and_then(|size| {
+            input_bytes
+                .checked_add(1)
+                .and_then(|text| size.checked_mul(text))
+        })
+        .ok_or(SqlEvaluationError::Limit {
+            kind: SqlEvaluationLimit::WorkUnits,
+            maximum: budget.limits.work,
+        })?;
+    budget.charge_work(product)?;
+    budget.charge_bytes(product)
+}
+
 enum Part {
     Literal(char),
     One,
@@ -116,9 +177,35 @@ fn walk_pattern(
     Ok(())
 }
 
+#[cfg(test)]
 fn pattern_bytes(pattern: &str, escape: Option<char>) -> Result<usize, SqlEvaluationError> {
+    let (bytes, error) = count_pattern(pattern, escape)?;
+    error.map_or(Ok(bytes), Err)
+}
+
+fn count_pattern(
+    pattern: &str,
+    escape: Option<char>,
+) -> Result<(usize, Option<SqlEvaluationError>), SqlEvaluationError> {
     let mut generated = 4_usize; // Both absolute anchors.
-    walk_pattern(pattern, escape, |part| {
+    let mut error = None;
+    let mut chars = pattern.chars();
+    while let Some(value) = chars.next() {
+        let part = if Some(value) == escape {
+            match chars.next() {
+                Some(value) => Part::Literal(value),
+                None => {
+                    error = Some(SqlEvaluationError::InvalidEscape);
+                    Part::Literal(value)
+                }
+            }
+        } else {
+            match value {
+                '%' => Part::Many,
+                '_' => Part::One,
+                value => Part::Literal(value),
+            }
+        };
         generated += match part {
             Part::Many => 2,
             Part::One => 1,
@@ -133,9 +220,8 @@ fn pattern_bytes(pattern: &str, escape: Option<char>) -> Result<usize, SqlEvalua
                 maximum: MAX_SQL_LIKE_PATTERN_BYTES,
             });
         }
-        Ok(())
-    })?;
-    Ok(generated)
+    }
+    Ok((generated, error))
 }
 
 #[cfg(test)]

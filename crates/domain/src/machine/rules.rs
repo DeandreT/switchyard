@@ -1,7 +1,9 @@
 use crate::{
     CorrelationFilter, MAX_RULE_BYTES, MAX_SUBSCRIPTION_RULE_BYTES, MAX_SUBSCRIPTION_RULES,
     MAX_TOPIC_RULE_COMPARISON_BYTES, MAX_TOPIC_RULE_MATCH_WORK, RuleDefinition, RuleFilter,
-    RuleMatchLimit, RuleName, SubscriptionName,
+    RuleMatchLimit, RuleName, SqlCompileBudget, SqlCompileError, SqlCompileLimit,
+    SqlEvaluationBudget, SqlEvaluationError, SqlEvaluationLimit, SqlMessageContext, SqlProgram,
+    SubscriptionName,
 };
 
 use super::*;
@@ -10,6 +12,22 @@ impl<S: StateStore> StateMachine<S> {
     /// The complete, sorted rule set. An empty set deliberately matches nothing.
     /// This metadata query never reads or advances the applied clock.
     pub fn rules(
+        &self,
+        namespace: &NamespaceName,
+        topic: &EntityPath,
+        subscription: &SubscriptionName,
+    ) -> Result<Vec<RuleDefinition>, BrokerError> {
+        Ok(self
+            .load_rules(
+                namespace,
+                topic,
+                subscription,
+                &mut SqlCompileBudget::default(),
+            )?
+            .definitions)
+    }
+
+    fn read_rule_definitions(
         &self,
         namespace: &NamespaceName,
         topic: &EntityPath,
@@ -36,7 +54,7 @@ impl<S: StateStore> StateMachine<S> {
         for (key, bytes) in entries {
             let name =
                 keys::rule_name_parts(&prefix, &key).ok_or(BrokerError::MalformedIndexKey)?;
-            let rule: RuleDefinition = codec::decode(&bytes)?;
+            let rule = RuleDefinition::decode(&bytes)?;
             if rule.name.as_str() != name
                 || keys::rule(namespace, topic, subscription, &rule.name) != key
                 || rule.encoded_size().is_err()
@@ -46,6 +64,31 @@ impl<S: StateStore> StateMachine<S> {
             rules.push(rule);
         }
         Ok(rules)
+    }
+
+    pub(super) fn load_rules(
+        &self,
+        namespace: &NamespaceName,
+        topic: &EntityPath,
+        subscription: &SubscriptionName,
+        budget: &mut SqlCompileBudget,
+    ) -> Result<LoadedRules, BrokerError> {
+        let definitions = self.read_rule_definitions(namespace, topic, subscription)?;
+        let mut programs = Vec::with_capacity(definitions.len());
+        for definition in &definitions {
+            let program = match &definition.filter {
+                RuleFilter::Sql(filter) => Some(
+                    SqlProgram::compile_with_budget(filter.expression(), budget)
+                        .map_err(stored_compile_error)?,
+                ),
+                _ => None,
+            };
+            programs.push(program);
+        }
+        Ok(LoadedRules {
+            definitions,
+            programs,
+        })
     }
 
     fn require_rule_subscription(
@@ -118,6 +161,9 @@ impl<S: StateStore> StateMachine<S> {
             });
         }
         filter.validate()?;
+        if let RuleFilter::Sql(filter) = filter {
+            SqlProgram::compile(filter.expression()).map_err(BrokerError::SqlRuleCompilation)?;
+        }
         let size = rule_definition_size(name, filter, command.issued_at)?;
         let total = rules.iter().try_fold(size, |total, rule| {
             Ok::<_, BrokerError>(total.saturating_add(rule.encoded_size()?))
@@ -163,10 +209,34 @@ impl<S: StateStore> StateMachine<S> {
     }
 }
 
+fn stored_compile_error(error: SqlCompileError) -> BrokerError {
+    match error {
+        SqlCompileError::Limit {
+            kind:
+                SqlCompileLimit::AggregateSourceBytes
+                | SqlCompileLimit::AggregateTokens
+                | SqlCompileLimit::AggregateNodes,
+            ..
+        } => BrokerError::SqlRuleCompilation(error),
+        _ => BrokerError::DanglingRuleMetadata,
+    }
+}
+
+pub(super) struct LoadedRules {
+    definitions: Vec<RuleDefinition>,
+    programs: Vec<Option<SqlProgram>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SubscriptionMatch {
+    NoMatch,
+    Matched,
+    FilterError(SqlEvaluationError),
+}
+
 #[derive(Clone, Copy, Default)]
 pub(super) struct RuleMatchBudget {
-    work: usize,
-    bytes: usize,
+    evaluation: SqlEvaluationBudget,
 }
 
 impl RuleMatchBudget {
@@ -176,7 +246,7 @@ impl RuleMatchBudget {
     pub(super) fn charge(
         &mut self,
         message: MessageInput<'_>,
-        subscriptions: &[Vec<RuleDefinition>],
+        subscriptions: &[LoadedRules],
     ) -> Result<(), BrokerError> {
         let properties = message
             .envelope
@@ -194,7 +264,7 @@ impl RuleMatchBudget {
         });
         let candidates = system_candidates(message);
         for rules in subscriptions {
-            for rule in rules {
+            for rule in &rules.definitions {
                 self.add_work(1)?;
                 if let RuleFilter::Correlation(filter) = &rule.filter {
                     for (expected, actual) in filter.system_conditions().into_iter().zip(candidates)
@@ -223,43 +293,94 @@ impl RuleMatchBudget {
     }
 
     fn add_work(&mut self, amount: usize) -> Result<(), BrokerError> {
-        self.work = self.work.saturating_add(amount);
-        if self.work > MAX_TOPIC_RULE_MATCH_WORK {
-            return Err(BrokerError::TopicRuleMatchTooLarge {
-                limit: RuleMatchLimit::WorkUnits,
-                maximum: MAX_TOPIC_RULE_MATCH_WORK,
-            });
-        }
-        Ok(())
+        self.evaluation
+            .charge_work(amount)
+            .map_err(evaluation_limit)
     }
 
     fn add_bytes(&mut self, amount: usize) -> Result<(), BrokerError> {
-        self.bytes = self.bytes.saturating_add(amount);
-        if self.bytes > MAX_TOPIC_RULE_COMPARISON_BYTES {
-            return Err(BrokerError::TopicRuleMatchTooLarge {
-                limit: RuleMatchLimit::ComparisonBytes,
-                maximum: MAX_TOPIC_RULE_COMPARISON_BYTES,
-            });
-        }
-        Ok(())
+        self.evaluation
+            .charge_bytes(amount)
+            .map_err(evaluation_limit)
     }
 }
 
 pub(super) fn matching_subscriptions(
     message: MessageInput<'_>,
-    subscriptions: &[Vec<RuleDefinition>],
-) -> u32 {
-    let mut mask = 0;
-    for (index, rules) in subscriptions.iter().enumerate() {
-        if rules.iter().any(|rule| match &rule.filter {
-            RuleFilter::True => true,
-            RuleFilter::False => false,
-            RuleFilter::Correlation(filter) => correlation_matches(message, filter),
-        }) {
-            mask |= 1_u32 << index;
+    subscriptions: &[LoadedRules],
+    budget: &mut RuleMatchBudget,
+) -> Result<Vec<SubscriptionMatch>, BrokerError> {
+    budget.charge(message, subscriptions)?;
+    let mut matches = Vec::with_capacity(subscriptions.len());
+    for rules in subscriptions {
+        let mut matched = false;
+        let mut first_error = None;
+        for (rule, program) in rules.definitions.iter().zip(&rules.programs) {
+            matched |= match &rule.filter {
+                RuleFilter::True => true,
+                RuleFilter::False => false,
+                RuleFilter::Correlation(filter) => correlation_matches(message, filter),
+                RuleFilter::Sql(_) => {
+                    let program = program.as_ref().ok_or(BrokerError::DanglingRuleMetadata)?;
+                    match program.evaluate(
+                        SqlMessageContext {
+                            message_id: message.message_id,
+                            session_id: message.session_id,
+                            envelope: message.envelope,
+                        },
+                        &mut budget.evaluation,
+                    ) {
+                        Ok(truth) => truth.is_match(),
+                        Err(error @ SqlEvaluationError::Limit { .. }) => {
+                            return Err(evaluation_limit(error));
+                        }
+                        Err(error) => {
+                            first_error.get_or_insert(error);
+                            false
+                        }
+                    }
+                }
+            };
         }
+        matches.push(match first_error {
+            Some(error) => SubscriptionMatch::FilterError(error),
+            None if matched => SubscriptionMatch::Matched,
+            None => SubscriptionMatch::NoMatch,
+        });
     }
-    mask
+    Ok(matches)
+}
+
+fn evaluation_limit(error: SqlEvaluationError) -> BrokerError {
+    let (limit, maximum) = match error {
+        SqlEvaluationError::Limit {
+            kind: SqlEvaluationLimit::WorkUnits,
+            ..
+        } => (RuleMatchLimit::WorkUnits, MAX_TOPIC_RULE_MATCH_WORK),
+        SqlEvaluationError::Limit {
+            kind: SqlEvaluationLimit::ComparisonBytes,
+            ..
+        } => (
+            RuleMatchLimit::ComparisonBytes,
+            MAX_TOPIC_RULE_COMPARISON_BYTES,
+        ),
+        SqlEvaluationError::Limit {
+            kind: SqlEvaluationLimit::LikePatternBytes,
+            ..
+        } => (
+            RuleMatchLimit::LikePatternBytes,
+            crate::MAX_SQL_LIKE_PATTERN_BYTES,
+        ),
+        SqlEvaluationError::Limit {
+            kind: SqlEvaluationLimit::RegexEngineBytes,
+            ..
+        } => (
+            RuleMatchLimit::RegexEngineBytes,
+            crate::MAX_SQL_REGEX_ENGINE_BYTES,
+        ),
+        _ => return BrokerError::DanglingRuleMetadata,
+    };
+    BrokerError::TopicRuleMatchTooLarge { limit, maximum }
 }
 
 fn correlation_matches(message: MessageInput<'_>, filter: &CorrelationFilter) -> bool {

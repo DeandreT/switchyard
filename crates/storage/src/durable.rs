@@ -62,13 +62,17 @@ pub const STORE_FORMAT_V10: u32 = 10;
 /// ignore those rules and deliver excluded publications.
 pub const STORE_FORMAT_V11: u32 = 11;
 
+/// Version 12: SQL rule selection and subscription-local filter-error policy.
+/// Earlier builds cannot interpret those filters or their failure destinations.
+pub const STORE_FORMAT_V12: u32 = 12;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V11;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V12;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
@@ -416,6 +420,20 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V10,
+                expected: ACTIVE_STORE_FORMAT,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_store_from_before_sql_filter_policy() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        stamp_format(directory.path(), &STORE_FORMAT_V11.to_be_bytes())?;
+        assert_eq!(
+            FjallStore::open(directory.path()).err(),
+            Some(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V11,
                 expected: ACTIVE_STORE_FORMAT,
             })
         );

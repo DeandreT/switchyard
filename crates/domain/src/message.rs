@@ -366,9 +366,10 @@ impl MessageRecord {
             codec::VALUE_FORMAT_V5 | codec::VALUE_FORMAT_V6 => {
                 Ok(codec::decode_payload::<MessageRecordV6>(payload)?.into())
             }
-            codec::VALUE_FORMAT_V7 | codec::VALUE_FORMAT_V8 | codec::VALUE_FORMAT_V9 => {
-                codec::decode_payload(payload)
-            }
+            codec::VALUE_FORMAT_V7
+            | codec::VALUE_FORMAT_V8
+            | codec::VALUE_FORMAT_V9
+            | codec::VALUE_FORMAT_V10 => codec::decode_payload(payload),
             _ => unreachable!("split rejects unknown value formats"),
         }?;
         if version < codec::VALUE_FORMAT_V9
@@ -565,7 +566,9 @@ mod tests {
             ..record(None)
         };
         let mut envelope = codec::encode(&original)?;
-        assert_eq!(envelope[0], codec::VALUE_FORMAT_V9);
+        assert_eq!(envelope[0], codec::ACTIVE_VALUE_FORMAT);
+        assert_eq!(MessageRecord::decode(&envelope)?, original);
+        envelope[0] = codec::VALUE_FORMAT_V9;
         assert_eq!(MessageRecord::decode(&envelope)?, original);
         envelope[0] = codec::VALUE_FORMAT_V8;
         assert_eq!(MessageRecord::decode(&envelope), Err(CodecError::Decode));

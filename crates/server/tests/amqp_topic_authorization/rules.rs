@@ -266,7 +266,10 @@ fn add(name: &str) -> OrderedMap<Value, Value> {
                 ("rule-name", Value::String(name.into())),
                 (
                     "sql-filter",
-                    Value::Map(map([("expression", Value::String("1=1".into()))])),
+                    Value::Map(map([(
+                        "expression",
+                        Value::String("sys.MessageId IS NOT NULL".into()),
+                    )])),
                 ),
                 ("sql-rule-action", Value::Null),
             ])),
@@ -381,6 +384,15 @@ async fn exact_subscription_management_listen_can_create_remove_and_enumerate<P:
             .await?,
         200,
     );
+    let definitions = node.rules("Alpha")?;
+    let created = definitions
+        .iter()
+        .find(|rule| rule.name.as_str() == "listen-created")
+        .expect("created rule");
+    let domain::RuleFilter::Sql(filter) = &created.filter else {
+        panic!("compiled SQL rule");
+    };
+    assert_eq!(filter.expression(), "sys.MessageId IS NOT NULL");
     status(
         &client
             .request(
@@ -578,7 +590,7 @@ async fn foreign_associated_name_cannot_redirect_the_canonical_subscription<P: S
             [(EntityPath::new("Orders")?, SubscriptionName::new("Alpha")?)]
         );
         assert!(
-            matches!(&calls.submits[..], [(entity, CommandKind::CreateRule { subscription, filter: RuleFilter::True, .. })] if entity.as_str() == "Orders" && subscription.as_str() == "Alpha")
+            matches!(&calls.submits[..], [(entity, CommandKind::CreateRule { subscription, filter: RuleFilter::Sql(filter), .. })] if entity.as_str() == "Orders" && subscription.as_str() == "Alpha" && filter.expression() == "sys.MessageId IS NOT NULL")
         );
     }
     timeout(DEADLINE, connection.close()).await??;

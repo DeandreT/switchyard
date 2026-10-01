@@ -284,6 +284,7 @@ async fn complete_typed_creation_and_reads_survive_reopen_without_clock_stamps<P
             max_message_bytes: Some(8_192),
             requires_session: Some(true),
             dead_lettering_on_message_expiration: Some(true),
+            dead_lettering_on_filter_evaluation_exceptions: Some(false),
         }),
     )?;
     request.path = "Orders/SUBSCRIPTIONS/Alpha".into();
@@ -298,6 +299,10 @@ async fn complete_typed_creation_and_reads_survive_reopen_without_clock_stamps<P
     assert_eq!(config.max_delivery_count, Some(7));
     assert_eq!(config.requires_session, Some(true));
     assert_eq!(config.dead_lettering_on_message_expiration, Some(true));
+    assert_eq!(
+        config.dead_lettering_on_filter_evaluation_exceptions,
+        Some(false)
+    );
     assert_eq!(config.max_message_bytes, Some(8_192));
     assert!(matches!(
         config.default_time_to_live,
@@ -328,6 +333,27 @@ async fn complete_typed_creation_and_reads_survive_reopen_without_clock_stamps<P
     )?;
     assert!(backing.requires_session);
     assert!(!backing.requires_duplicate_detection);
+    for (name, input) in [("FilterDefault", None), ("FilterEnabled", Some(true))] {
+        let created = node
+            .create(subscription(
+                "Orders",
+                name,
+                Some(SubscriptionConfiguration {
+                    dead_lettering_on_filter_evaluation_exceptions: input,
+                    ..Default::default()
+                }),
+            )?)
+            .await?;
+        assert_eq!(
+            created
+                .subscription_config
+                .as_ref()
+                .expect("config")
+                .dead_lettering_on_filter_evaluation_exceptions,
+            Some(true)
+        );
+        assert_eq!(node.get(&created.path).await?, created);
+    }
     let before = node.snapshot()?;
     let writes = node.writes();
     let applied = node.broker.handle().last_applied_blocking()?;

@@ -249,6 +249,7 @@ async fn typed_topology_commands_print_complete_configs_and_preserve_queue_workf
             "8192",
             "--requires-session=false",
             "--dead-lettering-on-message-expiration=false",
+            "--dead-lettering-on-filter-evaluation-exceptions=false",
         ])
         .await?;
     assert_eq!(child["kind"], "subscription");
@@ -261,6 +262,10 @@ async fn typed_topology_commands_print_complete_configs_and_preserve_queue_workf
     assert_eq!(config["max_message_bytes"], 8_192);
     assert_eq!(config["requires_session"], false);
     assert_eq!(config["dead_lettering_on_message_expiration"], false);
+    assert_eq!(
+        config["dead_lettering_on_filter_evaluation_exceptions"],
+        false
+    );
     assert!(config["default_time_to_live_millis"].is_null());
     assert!(config.get("requires_duplicate_detection").is_none());
     assert_eq!(
@@ -268,10 +273,33 @@ async fn typed_topology_commands_print_complete_configs_and_preserve_queue_workf
             .await?,
         child
     );
-    node.json(&["subscription", "create", "Orders", "beta"])
+    let default_filter_policy = node
+        .json(&["subscription", "create", "Orders", "beta"])
         .await?;
+    assert_eq!(
+        default_filter_policy["subscription_config"]["dead_lettering_on_filter_evaluation_exceptions"],
+        true
+    );
     node.json(&["topic", "create", "Orders-extra", "--ttl-unlimited"])
         .await?;
+    let enabled_filter_policy = node
+        .json(&[
+            "subscription",
+            "create",
+            "Orders-extra",
+            "Enabled",
+            "--dead-letter-on-filter-exceptions",
+        ])
+        .await?;
+    assert_eq!(
+        enabled_filter_policy["subscription_config"]["dead_lettering_on_filter_evaluation_exceptions"],
+        true
+    );
+    assert_eq!(
+        node.json(&["subscription", "get", "Orders-extra", "Enabled"])
+            .await?,
+        enabled_filter_policy
+    );
     let ordinary = node
         .json(&["queue", "create", "work", "--lock-duration-millis", "30000"])
         .await?;

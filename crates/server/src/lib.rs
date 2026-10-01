@@ -78,6 +78,8 @@ pub fn open(cluster: ClusterConfig, storage: StorageChoice) -> Result<NodeState,
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum StartupError {
+    #[error("the diagnostic logger could not be initialized")]
+    LoggingInitialization,
     #[error("production mode cannot run on in-memory storage")]
     MemoryStorageInProduction,
     #[error("the durable backend needs a data directory")]

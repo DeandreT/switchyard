@@ -42,6 +42,26 @@ impl Value<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Slot<'a> {
+    value: Result<Value<'a>, SqlEvaluationError>,
+    string_bound: usize,
+}
+
+impl<'a> Slot<'a> {
+    fn new(value: Result<Value<'a>, SqlEvaluationError>, failed_string_bound: usize) -> Self {
+        let string_bound = match value {
+            Ok(Value::String(value)) => value.len(),
+            Ok(_) => 0,
+            Err(_) => failed_string_bound,
+        };
+        Self {
+            value,
+            string_bound,
+        }
+    }
+}
+
 pub(super) fn evaluate<'a>(
     program: &'a SqlProgram,
     message: SqlMessageContext<'a>,
@@ -55,30 +75,59 @@ pub(super) fn evaluate<'a>(
         }
     }
 
-    // Programs are postorder arenas. Slots borrow both source literals and
-    // message properties; no message tree is copied during evaluation.
+    // Finite failures stay in the arena so they cannot conceal independent
+    // comparisons or LIKE limits. Failed slots carry conservative string
+    // bounds for dependent operations; all payloads remain borrowed.
     let mut slots = Vec::with_capacity(program.nodes.len());
+    let mut first_error = None;
     for node in &program.nodes {
         let value = match node {
-            SqlNode::Literal(literal) => match literal {
-                SqlLiteral::Null => Value::Null,
-                SqlLiteral::Bool(value) => Value::Bool(*value),
-                SqlLiteral::Int64(value) => {
-                    Value::Number(Number::literal(NumericKind::I64(*value)))
-                }
-                SqlLiteral::DoubleBits(value) => {
-                    Value::Number(Number::literal(NumericKind::F64(f64::from_bits(*value))))
-                }
-                SqlLiteral::String(value) => Value::String(value),
-            },
-            SqlNode::Property(property) => properties::lookup(message, property)?.value,
-            SqlNode::Exists(property) => Value::Bool(properties::lookup(message, property)?.exists),
-            SqlNode::Unary { op, input } => unary(*op, slot(&slots, *input)?)?,
+            SqlNode::Literal(literal) => Slot::new(
+                Ok(match literal {
+                    SqlLiteral::Null => Value::Null,
+                    SqlLiteral::Bool(value) => Value::Bool(*value),
+                    SqlLiteral::Int64(value) => {
+                        Value::Number(Number::literal(NumericKind::I64(*value)))
+                    }
+                    SqlLiteral::DoubleBits(value) => {
+                        Value::Number(Number::literal(NumericKind::F64(f64::from_bits(*value))))
+                    }
+                    SqlLiteral::String(value) => Value::String(value),
+                }),
+                0,
+            ),
+            SqlNode::Property(property) | SqlNode::Exists(property) => {
+                let property = properties::lookup(message, property);
+                let value = if matches!(node, SqlNode::Exists(_)) {
+                    property.value.map(|_| Value::Bool(property.exists))
+                } else {
+                    property.value
+                };
+                Slot::new(value, property.string_bound)
+            }
+            SqlNode::Unary { op, input } => {
+                let input = slot(&slots, *input)?;
+                Slot::new(
+                    input.value.and_then(|value| unary(*op, value)),
+                    input.string_bound,
+                )
+            }
             SqlNode::Binary { op, left, right } => {
-                binary(*op, slot(&slots, *left)?, slot(&slots, *right)?, budget)?
+                let left = slot(&slots, *left)?;
+                let right = slot(&slots, *right)?;
+                Slot::new(
+                    binary_slots(*op, left, right, budget),
+                    left.string_bound.max(right.string_bound),
+                )
             }
             SqlNode::IsNull { input, negated } => {
-                Value::Bool(slot(&slots, *input)?.is_unknown() != *negated)
+                let input = slot(&slots, *input)?;
+                Slot::new(
+                    input
+                        .value
+                        .map(|value| Value::Bool(value.is_unknown() != *negated)),
+                    input.string_bound,
+                )
             }
             SqlNode::In {
                 input,
@@ -93,26 +142,40 @@ pub(super) fn evaluate<'a>(
                 let input = slot(&slots, *input)?;
                 let mut found = false;
                 let mut unknown = false;
+                let mut error = None;
+                let mut string_bound = input.string_bound;
                 for operand in operands {
-                    match compare(SqlBinaryOp::Eq, input, slot(&slots, *operand)?, budget)? {
-                        SqlTruth::True => found = true,
-                        SqlTruth::Unknown => unknown = true,
-                        SqlTruth::False => {}
+                    let operand = slot(&slots, *operand)?;
+                    string_bound = string_bound.max(operand.string_bound);
+                    match compare_slots(SqlBinaryOp::Eq, input, operand, budget) {
+                        Ok(SqlTruth::True) => found = true,
+                        Ok(SqlTruth::Unknown) => unknown = true,
+                        Ok(SqlTruth::False) => {}
+                        Err(failure @ SqlEvaluationError::Limit { .. }) => return Err(failure),
+                        Err(failure) => {
+                            error.get_or_insert(failure);
+                        }
                     }
                 }
-                Value::from_truth(if found {
-                    if *negated {
-                        SqlTruth::False
-                    } else {
-                        SqlTruth::True
-                    }
-                } else if unknown {
-                    SqlTruth::Unknown
-                } else if *negated {
-                    SqlTruth::True
-                } else {
-                    SqlTruth::False
-                })
+                let value = error.map_or_else(
+                    || {
+                        Ok(Value::from_truth(if found {
+                            if *negated {
+                                SqlTruth::False
+                            } else {
+                                SqlTruth::True
+                            }
+                        } else if unknown {
+                            SqlTruth::Unknown
+                        } else if *negated {
+                            SqlTruth::True
+                        } else {
+                            SqlTruth::False
+                        }))
+                    },
+                    Err,
+                );
+                Slot::new(value, string_bound)
             }
             SqlNode::Like {
                 input,
@@ -121,25 +184,109 @@ pub(super) fn evaluate<'a>(
                 negated,
             } => {
                 let escape = escape.map(|id| slot(&slots, id)).transpose()?;
-                Value::from_truth(like::matches(
-                    slot(&slots, *input)?,
-                    slot(&slots, *pattern)?,
-                    escape,
-                    *negated,
-                    budget,
-                )?)
+                let input = slot(&slots, *input)?;
+                let pattern = slot(&slots, *pattern)?;
+                let string_bound = input
+                    .string_bound
+                    .max(pattern.string_bound)
+                    .max(escape.map_or(0, |escape| escape.string_bound));
+                Slot::new(
+                    like_slots(input, pattern, escape, *negated, budget).map(Value::from_truth),
+                    string_bound,
+                )
             }
         };
+        if let Err(error) = value.value {
+            if matches!(error, SqlEvaluationError::Limit { .. }) {
+                return Err(error);
+            }
+            first_error.get_or_insert(error);
+        }
         slots.push(value);
     }
-    slot(&slots, program.root)?.truth()
+    match first_error {
+        Some(error) => Err(error),
+        None => slot(&slots, program.root)?.value?.truth(),
+    }
 }
 
-fn slot<'a>(slots: &[Value<'a>], index: u16) -> Result<Value<'a>, SqlEvaluationError> {
+fn slot<'a>(slots: &[Slot<'a>], index: u16) -> Result<Slot<'a>, SqlEvaluationError> {
     slots
         .get(usize::from(index))
         .copied()
         .ok_or(SqlEvaluationError::TypeMismatch)
+}
+
+fn binary_slots<'a>(
+    op: SqlBinaryOp,
+    left: Slot<'a>,
+    right: Slot<'a>,
+    budget: &mut SqlEvaluationBudget,
+) -> Result<Value<'a>, SqlEvaluationError> {
+    if matches!(
+        op,
+        SqlBinaryOp::Eq
+            | SqlBinaryOp::Ne
+            | SqlBinaryOp::Gt
+            | SqlBinaryOp::Ge
+            | SqlBinaryOp::Lt
+            | SqlBinaryOp::Le
+    ) {
+        return compare_slots(op, left, right, budget).map(Value::from_truth);
+    }
+    binary(op, left.value?, right.value?, budget)
+}
+
+fn compare_slots(
+    op: SqlBinaryOp,
+    left: Slot<'_>,
+    right: Slot<'_>,
+    budget: &mut SqlEvaluationBudget,
+) -> Result<SqlTruth, SqlEvaluationError> {
+    match (left.value, right.value) {
+        (Ok(left), Ok(right)) => compare(op, left, right, budget),
+        _ => {
+            budget.charge_work(1)?;
+            budget.charge_bytes(left.string_bound.saturating_add(right.string_bound))?;
+            Err(left
+                .value
+                .err()
+                .or_else(|| right.value.err())
+                .unwrap_or(SqlEvaluationError::TypeMismatch))
+        }
+    }
+}
+
+fn like_slots(
+    input: Slot<'_>,
+    pattern: Slot<'_>,
+    escape: Option<Slot<'_>>,
+    negated: bool,
+    budget: &mut SqlEvaluationBudget,
+) -> Result<SqlTruth, SqlEvaluationError> {
+    match (
+        input.value,
+        pattern.value,
+        escape.map(|escape| escape.value).transpose(),
+    ) {
+        (Ok(input), Ok(pattern), Ok(escape)) => {
+            like::matches(input, pattern, escape, negated, budget)
+        }
+        _ => {
+            like::charge_unresolved(
+                input.string_bound,
+                pattern.string_bound,
+                escape.map_or(0, |escape| escape.string_bound),
+                budget,
+            )?;
+            Err(input
+                .value
+                .err()
+                .or_else(|| pattern.value.err())
+                .or_else(|| escape.and_then(|escape| escape.value.err()))
+                .unwrap_or(SqlEvaluationError::TypeMismatch))
+        }
+    }
 }
 
 fn unary(op: SqlUnaryOp, value: Value<'_>) -> Result<Value<'_>, SqlEvaluationError> {
@@ -213,6 +360,11 @@ fn compare(
     budget: &mut SqlEvaluationBudget,
 ) -> Result<SqlTruth, SqlEvaluationError> {
     budget.charge_work(1)?;
+    let string_bytes = |value| match value {
+        Value::String(value) => value.len(),
+        _ => 0,
+    };
+    budget.charge_bytes(string_bytes(left).saturating_add(string_bytes(right)))?;
     if left.is_unknown() || right.is_unknown() {
         return Ok(SqlTruth::Unknown);
     }
@@ -223,14 +375,11 @@ fn compare(
             SqlBinaryOp::Ne => left != right,
             _ => return Err(SqlEvaluationError::TypeMismatch),
         },
-        (Value::String(left), Value::String(right)) => {
-            budget.charge_bytes(left.len().saturating_add(right.len()))?;
-            match op {
-                SqlBinaryOp::Eq => left == right,
-                SqlBinaryOp::Ne => left != right,
-                _ => return Err(SqlEvaluationError::StringOrderingUnsupported),
-            }
-        }
+        (Value::String(left), Value::String(right)) => match op {
+            SqlBinaryOp::Eq => left == right,
+            SqlBinaryOp::Ne => left != right,
+            _ => return Err(SqlEvaluationError::StringOrderingUnsupported),
+        },
         (Value::Unsupported, _) | (_, Value::Unsupported) => {
             return Err(SqlEvaluationError::UnsupportedValue);
         }

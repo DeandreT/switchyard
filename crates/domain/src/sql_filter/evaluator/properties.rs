@@ -49,35 +49,50 @@ impl Summary {
 
 pub(super) struct PropertyValue<'a> {
     pub(super) exists: bool,
-    pub(super) value: Value<'a>,
+    pub(super) value: Result<Value<'a>, SqlEvaluationError>,
+    pub(super) string_bound: usize,
 }
 
 pub(super) fn lookup<'a>(
     message: SqlMessageContext<'a>,
     property: &SqlProperty,
-) -> Result<PropertyValue<'a>, SqlEvaluationError> {
+) -> PropertyValue<'a> {
     match property {
         SqlProperty::User(name) => {
             let mut found = None;
+            let mut ambiguous = false;
+            let mut string_bound = 0;
             if let Some(envelope) = message.envelope {
                 for (key, value) in &envelope.application_properties {
                     if lowercase_equal(key, name) {
                         if found.is_some() {
-                            return Err(SqlEvaluationError::AmbiguousProperty);
+                            ambiguous = true;
+                        }
+                        if let MessageValue::String(value) = value {
+                            string_bound = string_bound.max(value.len());
                         }
                         found = Some(value);
                     }
                 }
             }
-            match found {
-                Some(value) => Ok(PropertyValue {
+            if ambiguous {
+                return PropertyValue {
                     exists: true,
-                    value: message_value(value)?,
-                }),
-                None => Ok(PropertyValue {
+                    value: Err(SqlEvaluationError::AmbiguousProperty),
+                    string_bound,
+                };
+            }
+            match found {
+                Some(value) => PropertyValue {
+                    exists: true,
+                    value: message_value(value),
+                    string_bound,
+                },
+                None => PropertyValue {
                     exists: false,
-                    value: Value::Unknown,
-                }),
+                    value: Ok(Value::Unknown),
+                    string_bound: 0,
+                },
             }
         }
         SqlProperty::System(property) => system(message, *property),
@@ -90,10 +105,7 @@ fn lowercase_equal(left: &str, right: &str) -> bool {
         .eq(right.chars().flat_map(char::to_lowercase))
 }
 
-fn system(
-    message: SqlMessageContext<'_>,
-    property: SqlSystemProperty,
-) -> Result<PropertyValue<'_>, SqlEvaluationError> {
+fn system(message: SqlMessageContext<'_>, property: SqlSystemProperty) -> PropertyValue<'_> {
     let properties = message.envelope.map(|envelope| &envelope.properties);
     let value = match property {
         SqlSystemProperty::MessageId => Some(message.message_id),
@@ -102,10 +114,11 @@ fn system(
             match properties.and_then(|properties| properties.correlation_id.as_ref()) {
                 Some(MessageIdentifier::String(value)) => Some(value.as_str()),
                 Some(_) => {
-                    return Ok(PropertyValue {
+                    return PropertyValue {
                         exists: true,
-                        value: Value::Unsupported,
-                    });
+                        value: Ok(Value::Unsupported),
+                        string_bound: 0,
+                    };
                 }
                 None => None,
             }
@@ -120,8 +133,9 @@ fn system(
             properties.and_then(|value| value.content_type.as_deref())
         }
     };
-    Ok(PropertyValue {
+    PropertyValue {
         exists: value.is_some(),
-        value: value.map_or(Value::Null, Value::String),
-    })
+        value: Ok(value.map_or(Value::Null, Value::String)),
+        string_bound: value.map_or(0, str::len),
+    }
 }

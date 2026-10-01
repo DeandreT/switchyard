@@ -146,6 +146,7 @@ message SubscriptionConfiguration {
   optional uint64 max_message_bytes = 4;
   optional bool requires_session = 5;
   optional bool dead_lettering_on_message_expiration = 6;
+  optional bool dead_lettering_on_filter_evaluation_exceptions = 8;
 }
 
 message UpdateEntityRequest {

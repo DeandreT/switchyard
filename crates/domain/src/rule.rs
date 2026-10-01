@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::{BrokerError, IdentifierError, MessageValue, Timestamp};
 
 mod scalar;
+mod sql;
+
+pub use sql::{SQL_FILTER_SEMANTIC_VERSION, SqlFilter};
 
 pub const MAX_RULE_NAME_LENGTH: usize = 50;
 pub const MAX_SUBSCRIPTION_RULES: usize = 32;
@@ -133,12 +136,16 @@ pub enum RuleFilter {
     True,
     False,
     Correlation(CorrelationFilter),
+    Sql(SqlFilter),
 }
 
 impl RuleFilter {
     pub fn validate(&self) -> Result<(), BrokerError> {
         match self {
             Self::Correlation(filter) => filter.validate(),
+            Self::Sql(filter) => filter
+                .validate_source()
+                .map_err(BrokerError::SqlRuleCompilation),
             Self::True | Self::False => Ok(()),
         }
     }
@@ -152,6 +159,16 @@ pub struct RuleDefinition {
 }
 
 impl RuleDefinition {
+    /// SQL was introduced in value format 10; older envelopes must not claim it.
+    pub fn decode(bytes: &[u8]) -> Result<Self, crate::CodecError> {
+        let (version, payload) = crate::codec::split(bytes)?;
+        let rule: Self = crate::codec::decode_payload(payload)?;
+        if version < crate::codec::VALUE_FORMAT_V10 && matches!(&rule.filter, RuleFilter::Sql(_)) {
+            return Err(crate::CodecError::Decode);
+        }
+        Ok(rule)
+    }
+
     /// Validates and counts the complete stored envelope without copying it.
     pub fn encoded_size(&self) -> Result<usize, BrokerError> {
         RuleName::validate(self.name.as_str())?;
@@ -173,6 +190,8 @@ impl RuleDefinition {
 pub enum RuleMatchLimit {
     WorkUnits,
     ComparisonBytes,
+    LikePatternBytes,
+    RegexEngineBytes,
 }
 
 pub(crate) fn is_rule_scalar(value: &MessageValue) -> bool {

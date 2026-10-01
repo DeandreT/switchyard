@@ -204,7 +204,7 @@ pub enum SqlEvaluationLimit {
     RegexEngineBytes,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SqlEvaluationError {
     #[error("SQL operands have incompatible types")]
     TypeMismatch,
@@ -269,7 +269,7 @@ impl SqlEvaluationBudget {
         self.used
     }
 
-    fn charge_work(&mut self, amount: usize) -> Result<(), SqlEvaluationError> {
+    pub(crate) fn charge_work(&mut self, amount: usize) -> Result<(), SqlEvaluationError> {
         Self::charge(
             &mut self.used.work,
             self.limits.work,
@@ -278,7 +278,7 @@ impl SqlEvaluationBudget {
         )
     }
 
-    fn charge_bytes(&mut self, amount: usize) -> Result<(), SqlEvaluationError> {
+    pub(crate) fn charge_bytes(&mut self, amount: usize) -> Result<(), SqlEvaluationError> {
         Self::charge(
             &mut self.used.comparison_bytes,
             self.limits.comparison_bytes,

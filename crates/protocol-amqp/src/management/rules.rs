@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use domain::{
-    BrokerError, CorrelationFilter, RuleDefinition, RuleFilter, RuleName, SubscriptionName,
-    Timestamp,
+    BrokerError, CorrelationFilter, RuleDefinition, RuleFilter, RuleName, SqlCompileError,
+    SqlCompileLimit, SqlFilter, SubscriptionName, Timestamp,
 };
 use serde_amqp::{described::Described, descriptor::Descriptor};
 
@@ -38,6 +38,7 @@ const RULE_DESCRIPTION_CODE: u64 = 0x0000013700000004;
 const EMPTY_ACTION_CODE: u64 = 0x0000013700000005;
 const TRUE_FILTER_CODE: u64 = 0x000001370000007;
 const FALSE_FILTER_CODE: u64 = 0x000001370000008;
+const SQL_FILTER_CODE: u64 = 0x000001370000006;
 const CORRELATION_FILTER_CODE: u64 = 0x000001370000009;
 
 #[derive(Debug)]
@@ -279,11 +280,7 @@ fn create_rule(message: &Message) -> Result<(RuleName, RuleFilter), RuleRequestE
             match get(sql, EXPRESSION) {
                 Some(Value::String(expression)) if expression == "1=1" => RuleFilter::True,
                 Some(Value::String(expression)) if expression == "1=0" => RuleFilter::False,
-                Some(Value::String(_)) => {
-                    return Err(RuleRequestError::Unsupported(
-                        "SQL filters other than 1=1 and 1=0 are not implemented",
-                    ));
-                }
+                Some(Value::String(expression)) => sql_filter(expression)?,
                 _ => {
                     return Err(RuleRequestError::invalid(
                         "sql-filter requires a string expression",
@@ -305,6 +302,34 @@ fn create_rule(message: &Message) -> Result<(RuleName, RuleFilter), RuleRequestE
     };
     rule.encoded_size()?;
     Ok((rule.name, rule.filter))
+}
+
+fn sql_filter(expression: &str) -> Result<RuleFilter, RuleRequestError> {
+    // Refuse an impossible borrowed source before the typed constructor copies it.
+    for (actual, maximum, kind) in [
+        (
+            expression.len(),
+            domain::MAX_SQL_EXPRESSION_BYTES,
+            SqlCompileLimit::SourceBytes,
+        ),
+        (
+            expression
+                .encode_utf16()
+                .take(domain::MAX_SQL_EXPRESSION_UTF16_UNITS + 1)
+                .count(),
+            domain::MAX_SQL_EXPRESSION_UTF16_UNITS,
+            SqlCompileLimit::SourceUtf16Units,
+        ),
+    ] {
+        if actual > maximum {
+            return Err(
+                BrokerError::SqlRuleCompilation(SqlCompileError::Limit { kind, maximum }).into(),
+            );
+        }
+    }
+    SqlFilter::new(expression)
+        .map(RuleFilter::Sql)
+        .map_err(|error| BrokerError::SqlRuleCompilation(error).into())
 }
 
 fn remove_rule(message: &Message) -> Result<RuleName, RuleRequestError> {
@@ -339,6 +364,13 @@ fn encoded_filter(filter: &RuleFilter) -> Value {
     match filter {
         RuleFilter::True => described(TRUE_FILTER_CODE, vec![]),
         RuleFilter::False => described(FALSE_FILTER_CODE, vec![]),
+        RuleFilter::Sql(filter) => described(
+            SQL_FILTER_CODE,
+            vec![
+                Value::String(filter.expression().to_owned()),
+                Value::Int(20),
+            ],
+        ),
         RuleFilter::Correlation(filter) => {
             let mut fields: Vec<_> = [
                 filter.correlation_id.as_ref(),

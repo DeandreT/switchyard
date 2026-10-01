@@ -488,7 +488,7 @@ async fn malformed_targets_and_complete_oversized_pages_refuse_without_mutation<
             Value::Map(map([("label", Value::Int(1))])),
             400,
         ),
-        ("sql-filter", sql("color = 'red'"), 501),
+        ("sql-filter", sql("newid()=NULL"), 501),
         (
             "correlation-filter",
             correlation("subject", map([("compound", Value::List(vec![]))])),
@@ -554,3 +554,6 @@ for_each_backend! {
     rules_precede_null_session_dlq_and_scheduled_activation_uses_current_rules,
     malformed_targets_and_complete_oversized_pages_refuse_without_mutation,
 }
+
+#[path = "sql_rules.rs"]
+mod sql_rules;

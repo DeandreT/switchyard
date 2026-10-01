@@ -243,6 +243,7 @@ async fn typed_topology_round_trip<P: StoreProvider>(provider: P, tls: bool) -> 
         max_message_bytes: Some(512),
         requires_session: Some(true),
         dead_lettering_on_message_expiration: Some(true),
+        dead_lettering_on_filter_evaluation_exceptions: Some(false),
     });
     let created_sub = timeout(DEADLINE, client.create_entity(node.request(input)))
         .await??
@@ -258,19 +259,57 @@ async fn typed_topology_round_trip<P: StoreProvider>(provider: P, tls: bool) -> 
     assert_eq!(config.max_message_bytes, Some(512));
     assert_eq!(config.requires_session, Some(true));
     assert_eq!(config.dead_lettering_on_message_expiration, Some(true));
+    assert_eq!(
+        config.dead_lettering_on_filter_evaluation_exceptions,
+        Some(false)
+    );
     assert!(matches!(
         config.default_time_to_live,
         Some(SubscriptionTtl::DefaultTtlUnlimited(_))
     ));
-    timeout(
+    let default_sub = timeout(
         DEADLINE,
         client.create_entity(node.request(create(
             "Orders/subscriptions/Beta",
             EntityKind::Subscription,
         ))),
     )
-    .await??;
+    .await??
+    .into_inner();
+    assert_eq!(
+        default_sub
+            .subscription_config
+            .as_ref()
+            .expect("config")
+            .dead_lettering_on_filter_evaluation_exceptions,
+        Some(true)
+    );
+    let mut enabled = create("Orders-old/subscriptions/Enabled", EntityKind::Subscription);
+    enabled.subscription_config = Some(SubscriptionConfiguration {
+        dead_lettering_on_filter_evaluation_exceptions: Some(true),
+        ..Default::default()
+    });
+    let enabled = timeout(DEADLINE, client.create_entity(node.request(enabled)))
+        .await??
+        .into_inner();
+    assert_eq!(
+        enabled
+            .subscription_config
+            .as_ref()
+            .expect("config")
+            .dead_lettering_on_filter_evaluation_exceptions,
+        Some(true)
+    );
     node.clock.set(0);
+    assert_eq!(
+        timeout(
+            DEADLINE,
+            client.get_entity(node.request(get(&enabled.path)))
+        )
+        .await??
+        .into_inner(),
+        enabled
+    );
     assert_eq!(
         timeout(DEADLINE, client.get_entity(node.request(get("Orders"))))
             .await??

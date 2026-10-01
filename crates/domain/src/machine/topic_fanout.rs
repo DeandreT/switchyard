@@ -1,6 +1,6 @@
 use crate::TopicConfig;
 
-use super::rules::{RuleMatchBudget, matching_subscriptions};
+use super::rules::{LoadedRules, RuleMatchBudget, SubscriptionMatch, matching_subscriptions};
 use super::*;
 
 /// Copies retained by one topic publication or scheduled activation.
@@ -18,7 +18,7 @@ struct TopicMessagePlan<'a> {
     cost: TopicMessageCost,
     duplicate: bool,
     previous_history: Option<Timestamp>,
-    matches: u32,
+    matches: Vec<SubscriptionMatch>,
 }
 
 #[derive(Clone, Copy)]
@@ -30,14 +30,94 @@ pub(super) struct TopicMessageCost {
 pub(super) struct TopicTargets {
     subscriptions: Vec<crate::SubscriptionDefinition>,
     shadows: Vec<EntityPath>,
-    rules: Vec<Vec<crate::RuleDefinition>>,
+    rules: Vec<LoadedRules>,
 }
 
 pub(super) struct TopicEmission<'a> {
     pub(super) message: MessageInput<'a>,
     pub(super) sequence: SequenceNumber,
     pub(super) scheduled_enqueue_time: Option<Timestamp>,
-    pub(super) matches: u32,
+    pub(super) matches: &'a [SubscriptionMatch],
+}
+
+const SQL_FILTER_ERROR_REASON: &str = "SwitchyardSqlFilterError";
+
+#[derive(Clone, Copy)]
+enum RetentionRoute {
+    None,
+    Active,
+    DeadLetter(TopicDeadLetter),
+}
+
+#[derive(Clone, Copy)]
+enum TopicDeadLetter {
+    MissingSession,
+    Sql(crate::SqlEvaluationError),
+}
+
+impl TopicDeadLetter {
+    fn reason_str(self) -> &'static str {
+        match self {
+            Self::MissingSession => "Session ID is null",
+            Self::Sql(_) => SQL_FILTER_ERROR_REASON,
+        }
+    }
+
+    fn reason(self) -> DeadLetterReason {
+        match self {
+            Self::MissingSession => DeadLetterReason::MissingSessionId,
+            Self::Sql(_) => DeadLetterReason::Application(SQL_FILTER_ERROR_REASON.to_owned()),
+        }
+    }
+
+    fn description(self) -> &'static str {
+        use crate::SqlEvaluationError;
+        match self {
+            Self::MissingSession => MISSING_SESSION_ID_DESCRIPTION,
+            Self::Sql(SqlEvaluationError::TypeMismatch) => {
+                "SQL filter operands have incompatible types."
+            }
+            Self::Sql(SqlEvaluationError::UnsupportedValue) => {
+                "SQL filter references an unsupported message value."
+            }
+            Self::Sql(SqlEvaluationError::NumericOverflow) => {
+                "SQL filter integer arithmetic overflowed."
+            }
+            Self::Sql(SqlEvaluationError::DivisionByZero) => {
+                "SQL filter integer arithmetic divided by zero."
+            }
+            Self::Sql(SqlEvaluationError::InvalidEscape) => "SQL filter LIKE escape is invalid.",
+            Self::Sql(SqlEvaluationError::AmbiguousProperty) => {
+                "SQL filter property names collide under lowercase comparison."
+            }
+            Self::Sql(SqlEvaluationError::StringOrderingUnsupported) => {
+                "SQL filter string ordering is unsupported."
+            }
+            Self::Sql(SqlEvaluationError::NonPredicate) => {
+                "SQL filter result is not a Boolean predicate."
+            }
+            Self::Sql(SqlEvaluationError::Limit { .. }) => "SQL filter evaluation failed.",
+        }
+    }
+}
+
+fn retention_route(
+    config: &crate::SubscriptionConfig,
+    message: MessageInput<'_>,
+    outcome: SubscriptionMatch,
+) -> RetentionRoute {
+    match outcome {
+        SubscriptionMatch::FilterError(error)
+            if config.dead_lettering_on_filter_evaluation_exceptions =>
+        {
+            RetentionRoute::DeadLetter(TopicDeadLetter::Sql(error))
+        }
+        SubscriptionMatch::NoMatch | SubscriptionMatch::FilterError(_) => RetentionRoute::None,
+        SubscriptionMatch::Matched if config.requires_session && message.session_id.is_none() => {
+            RetentionRoute::DeadLetter(TopicDeadLetter::MissingSession)
+        }
+        SubscriptionMatch::Matched => RetentionRoute::Active,
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -102,25 +182,28 @@ impl TopicBudget {
         cost: TopicMessageCost,
         message: MessageInput<'_>,
         targets: &TopicTargets,
-        matches: u32,
+        matches: &[SubscriptionMatch],
     ) -> Result<(), BrokerError> {
+        if matches.len() != targets.subscriptions.len() {
+            return Err(BrokerError::DanglingRuleMetadata);
+        }
         for (index, subscription) in targets.subscriptions.iter().enumerate() {
-            if matches & (1_u32 << index) == 0 {
-                continue;
+            match retention_route(&subscription.config, message, matches[index]) {
+                RetentionRoute::None => {}
+                RetentionRoute::Active => self.charge_copy(cost)?,
+                RetentionRoute::DeadLetter(info) => self.charge_copy(TopicMessageCost {
+                    content_bytes: cost
+                        .content_bytes
+                        .saturating_sub(
+                            message
+                                .session_id
+                                .map_or(0, |session| session.as_str().len()),
+                        )
+                        .saturating_add(info.reason_str().len())
+                        .saturating_add(info.description().len()),
+                    value_items: cost.value_items.saturating_add(2),
+                })?,
             }
-            let missing_session =
-                subscription.config.requires_session && message.session_id.is_none();
-            self.charge_copy(TopicMessageCost {
-                content_bytes: cost.content_bytes.saturating_add(if missing_session {
-                    DeadLetterReason::MissingSessionId.as_str().len()
-                        + MISSING_SESSION_ID_DESCRIPTION.len()
-                } else {
-                    0
-                }),
-                value_items: cost
-                    .value_items
-                    .saturating_add(usize::from(missing_session) * 2),
-            })?;
         }
         Ok(())
     }
@@ -195,8 +278,7 @@ impl<S: StateStore> StateMachine<S> {
         for (message, scheduled_enqueue_time) in messages {
             let cost = topic_message_cost(message)?;
             budget.charge_input(cost)?;
-            match_budget.charge(message, &targets.rules)?;
-            let matches = matching_subscriptions(message, &targets.rules);
+            let matches = self.topic_matches(message, &targets, &mut match_budget)?;
             plans.push(TopicMessagePlan {
                 message,
                 scheduled_enqueue_time,
@@ -234,7 +316,7 @@ impl<S: StateStore> StateMachine<S> {
                     plan.cost,
                     plan.message,
                     &targets,
-                    plan.matches,
+                    &plan.matches,
                 )?;
             }
             if !plan.duplicate {
@@ -244,7 +326,7 @@ impl<S: StateStore> StateMachine<S> {
                 if future {
                     budget.charge_copy(plan.cost)?;
                 } else {
-                    budget.charge_fanout(plan.cost, plan.message, &targets, plan.matches)?;
+                    budget.charge_fanout(plan.cost, plan.message, &targets, &plan.matches)?;
                 }
             }
         }
@@ -293,7 +375,7 @@ impl<S: StateStore> StateMachine<S> {
                         message: plan.message,
                         sequence,
                         scheduled_enqueue_time: plan.scheduled_enqueue_time,
-                        matches: plan.matches,
+                        matches: &plan.matches,
                     },
                     batch,
                     &mut enqueued,
@@ -316,9 +398,17 @@ impl<S: StateStore> StateMachine<S> {
             .iter()
             .map(|subscription| subscription.entity.dead_letter_queue())
             .collect::<Result<Vec<_>, _>>()?;
+        let mut compile_budget = crate::SqlCompileBudget::default();
         let rules = subscriptions
             .iter()
-            .map(|subscription| self.rules(&command.namespace, &command.entity, &subscription.name))
+            .map(|subscription| {
+                self.load_rules(
+                    &command.namespace,
+                    &command.entity,
+                    &subscription.name,
+                    &mut compile_budget,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(TopicTargets {
             subscriptions,
@@ -332,9 +422,8 @@ impl<S: StateStore> StateMachine<S> {
         message: MessageInput<'_>,
         targets: &TopicTargets,
         budget: &mut RuleMatchBudget,
-    ) -> Result<u32, BrokerError> {
-        budget.charge(message, &targets.rules)?;
-        Ok(matching_subscriptions(message, &targets.rules))
+    ) -> Result<Vec<SubscriptionMatch>, BrokerError> {
+        matching_subscriptions(message, &targets.rules, budget)
     }
 
     pub(super) fn validate_topic_message(
@@ -372,17 +461,21 @@ impl<S: StateStore> StateMachine<S> {
             ),
             ..emission.message
         };
+        if emission.matches.len() != targets.subscriptions.len() {
+            return Err(BrokerError::DanglingRuleMetadata);
+        }
         for (index, (subscription, shadow)) in targets
             .subscriptions
             .iter()
             .zip(&targets.shadows)
             .enumerate()
         {
-            if emission.matches & (1_u32 << index) == 0 {
+            let subscription_config = subscription.config.to_queue_config();
+            let route = retention_route(&subscription.config, message, emission.matches[index]);
+            if matches!(route, RetentionRoute::None) {
                 continue;
             }
-            let subscription_config = subscription.config.to_queue_config();
-            if subscription.config.requires_session && message.session_id.is_none() {
+            if let RetentionRoute::DeadLetter(info) = route {
                 let scope = EnqueueScope {
                     namespace: &command.namespace,
                     entity: shadow,
@@ -402,8 +495,8 @@ impl<S: StateStore> StateMachine<S> {
                 // These fixed fields fit the ingress header reserve; their
                 // content and projected value nodes were budgeted beforehand.
                 record.dead_letter = Some(DeadLetterInfo {
-                    reason: DeadLetterReason::MissingSessionId,
-                    description: MISSING_SESSION_ID_DESCRIPTION.to_owned(),
+                    reason: info.reason(),
+                    description: info.description().to_owned(),
                     dead_lettered_at: command.issued_at,
                 });
                 record.scheduled_enqueue_time = emission.scheduled_enqueue_time;
@@ -471,6 +564,37 @@ fn checked_retained_total(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finite_sql_error_fields_fit_the_ingress_header_reserve() -> Result<(), BrokerError> {
+        use crate::SqlEvaluationError;
+        for error in [
+            SqlEvaluationError::TypeMismatch,
+            SqlEvaluationError::UnsupportedValue,
+            SqlEvaluationError::NumericOverflow,
+            SqlEvaluationError::DivisionByZero,
+            SqlEvaluationError::InvalidEscape,
+            SqlEvaluationError::AmbiguousProperty,
+            SqlEvaluationError::StringOrderingUnsupported,
+            SqlEvaluationError::NonPredicate,
+        ] {
+            let info = TopicDeadLetter::Sql(error);
+            let original = MessageEnvelope::default();
+            let mut projected = original.clone();
+            projected.application_properties.insert(
+                "DeadLetterReason".into(),
+                MessageValue::String(info.reason_str().into()),
+            );
+            projected.application_properties.insert(
+                "DeadLetterErrorDescription".into(),
+                MessageValue::String(info.description().into()),
+            );
+            let extra = projected.header_content_size() - original.header_content_size();
+            assert!(extra <= BROKER_HEADER_RESERVE_BYTES - BROKER_BASE_HEADER_RESERVE_BYTES);
+            projected.validate_property_quotas()?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn missing_session_fields_fit_the_ingress_header_reserve() -> Result<(), BrokerError> {

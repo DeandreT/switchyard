@@ -296,7 +296,7 @@ async fn malformed_and_unsupported_inputs_never_reach_the_owner() {
     let cases = [
         (sql("invalid/name", "1=1"), 400),
         (mismatch, 400),
-        (sql("sql", "label = 'Order'"), 501),
+        (sql("sql", "newid()=NULL"), 501),
         (action, 501),
         (
             add(
@@ -338,6 +338,8 @@ async fn malformed_and_unsupported_inputs_never_reach_the_owner() {
         assert!(broker.reads.lock().expect("reads").is_empty());
     }
 }
+
+mod sql;
 
 #[tokio::test]
 async fn wrong_targets_are_refused_before_mutation_or_rule_reads() {

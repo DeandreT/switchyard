@@ -131,6 +131,9 @@ pub(super) fn subscription_configuration(
         dead_lettering_on_message_expiration: input
             .dead_lettering_on_message_expiration
             .unwrap_or(defaults.dead_lettering_on_message_expiration),
+        dead_lettering_on_filter_evaluation_exceptions: input
+            .dead_lettering_on_filter_evaluation_exceptions
+            .unwrap_or(defaults.dead_lettering_on_filter_evaluation_exceptions),
     };
     config
         .validate()
@@ -193,6 +196,9 @@ pub(super) fn response(
                 requires_session: Some(config.requires_session),
                 dead_lettering_on_message_expiration: Some(
                     config.dead_lettering_on_message_expiration,
+                ),
+                dead_lettering_on_filter_evaluation_exceptions: Some(
+                    config.dead_lettering_on_filter_evaluation_exceptions,
                 ),
             });
         }

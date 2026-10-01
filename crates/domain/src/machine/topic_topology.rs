@@ -27,8 +27,11 @@ impl<S: StateStore> StateMachine<S> {
     ) -> Result<Option<SubscriptionConfig>, BrokerError> {
         let entity = topic.subscription(name)?;
         let shadow = entity.dead_letter_queue()?;
-        let config =
-            self.read::<SubscriptionConfig>(&keys::subscription(namespace, topic, name))?;
+        let config = self
+            .store
+            .get(&keys::subscription(namespace, topic, name))?
+            .map(|bytes| SubscriptionConfig::decode(&bytes))
+            .transpose()?;
         let backing = self.queue_config(namespace, &entity)?;
         let dead_letter = self.queue_config(namespace, &shadow)?;
         if config.is_none() && backing.is_none() && dead_letter.is_none() {
@@ -83,7 +86,7 @@ impl<S: StateStore> StateMachine<S> {
             if keys::subscription(namespace, topic, &name) != key {
                 return Err(BrokerError::MalformedIndexKey);
             }
-            let config = codec::decode::<SubscriptionConfig>(&bytes)?;
+            let config = SubscriptionConfig::decode(&bytes)?;
             if config.validate().is_err() {
                 return Err(BrokerError::DanglingSubscriptionMetadata);
             }

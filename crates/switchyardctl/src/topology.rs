@@ -113,6 +113,8 @@ struct SubscriptionConfigurationArguments {
     requires_session: Option<bool>,
     #[arg(long, visible_alias = "dead-letter-on-expiration", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     dead_lettering_on_message_expiration: Option<bool>,
+    #[arg(long, visible_alias = "dead-letter-on-filter-exceptions", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    dead_lettering_on_filter_evaluation_exceptions: Option<bool>,
 }
 
 impl SubscriptionConfigurationArguments {
@@ -132,6 +134,8 @@ impl SubscriptionConfigurationArguments {
             max_message_bytes: self.max_message_bytes,
             requires_session: self.requires_session,
             dead_lettering_on_message_expiration: self.dead_lettering_on_message_expiration,
+            dead_lettering_on_filter_evaluation_exceptions: self
+                .dead_lettering_on_filter_evaluation_exceptions,
         }
     }
 }
@@ -356,6 +360,7 @@ pub(super) struct SubscriptionConfigurationOutput {
     max_message_bytes: Option<u64>,
     requires_session: Option<bool>,
     dead_lettering_on_message_expiration: Option<bool>,
+    dead_lettering_on_filter_evaluation_exceptions: Option<bool>,
 }
 
 impl From<SubscriptionConfiguration> for SubscriptionConfigurationOutput {
@@ -370,6 +375,8 @@ impl From<SubscriptionConfiguration> for SubscriptionConfigurationOutput {
             max_message_bytes: config.max_message_bytes,
             requires_session: config.requires_session,
             dead_lettering_on_message_expiration: config.dead_lettering_on_message_expiration,
+            dead_lettering_on_filter_evaluation_exceptions: config
+                .dead_lettering_on_filter_evaluation_exceptions,
         }
     }
 }

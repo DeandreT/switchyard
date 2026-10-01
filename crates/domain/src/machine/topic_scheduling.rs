@@ -1,4 +1,4 @@
-use super::rules::RuleMatchBudget;
+use super::rules::{RuleMatchBudget, SubscriptionMatch};
 use super::topic_fanout::{TopicBudget, TopicEmission, topic_message_cost};
 use super::*;
 
@@ -6,7 +6,7 @@ struct ScheduledTopicMessage {
     key: Vec<u8>,
     record: MessageRecord,
     time_to_live_millis: Option<u64>,
-    matches: u32,
+    matches: Vec<SubscriptionMatch>,
 }
 
 impl ScheduledTopicMessage {
@@ -67,7 +67,7 @@ impl<S: StateStore> StateMachine<S> {
                 key,
                 record,
                 time_to_live_millis,
-                matches: 0,
+                matches: Vec::new(),
             };
             let message = candidate.input();
             let cost = topic_message_cost(message)?;
@@ -76,13 +76,13 @@ impl<S: StateStore> StateMachine<S> {
             let admission = (|| {
                 next_budget.charge_input(cost)?;
                 let matches = self.topic_matches(message, &targets, &mut next_match_budget)?;
-                next_budget.charge_fanout(cost, message, &targets, matches)?;
+                next_budget.charge_fanout(cost, message, &targets, &matches)?;
                 Ok(matches)
             })();
             candidate.matches = match admission {
                 Ok(matches) => matches,
                 Err(error) => {
-                    if selected.is_empty() {
+                    if selected.is_empty() || !is_admission_limit(&error) {
                         return Err(error);
                     }
                     // The first item outside this command's envelope remains
@@ -117,7 +117,7 @@ impl<S: StateStore> StateMachine<S> {
                     message: candidate.input(),
                     sequence,
                     scheduled_enqueue_time: candidate.record.scheduled_enqueue_time,
-                    matches: candidate.matches,
+                    matches: &candidate.matches,
                 },
                 batch,
                 &mut enqueued,
@@ -134,4 +134,13 @@ impl<S: StateStore> StateMachine<S> {
             activated: selected.len() as u32,
         })
     }
+}
+
+fn is_admission_limit(error: &BrokerError) -> bool {
+    matches!(
+        error,
+        BrokerError::IngressBatchLimitExceeded { .. }
+            | BrokerError::TopicFanoutTooLarge { .. }
+            | BrokerError::TopicRuleMatchTooLarge { .. }
+    )
 }

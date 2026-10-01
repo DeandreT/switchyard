@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::{MAX_TOPIC_RULE_COMPARISON_BYTES, MAX_TOPIC_RULE_MATCH_WORK};
+
 use super::*;
 
 fn program(nodes: Vec<SqlNode>) -> SqlProgram {
@@ -47,6 +49,93 @@ fn evaluate_program(
     envelope: &MessageEnvelope,
 ) -> Result<SqlTruth, SqlEvaluationError> {
     program.evaluate(context(envelope), &mut SqlEvaluationBudget::default())
+}
+
+#[test]
+fn finite_error_cannot_hide_an_independent_like_limit() {
+    let program = SqlProgram::compile("1 / 0 = 1 OR input LIKE pattern").expect("supported SQL");
+    let mut envelope = MessageEnvelope::default();
+    envelope
+        .application_properties
+        .insert("input".into(), MessageValue::String("x".into()));
+    envelope.application_properties.insert(
+        "pattern".into(),
+        MessageValue::String("x".repeat(MAX_SQL_LIKE_PATTERN_BYTES)),
+    );
+    assert_eq!(
+        evaluate_program(&program, &envelope),
+        Err(SqlEvaluationError::Limit {
+            kind: SqlEvaluationLimit::LikePatternBytes,
+            maximum: MAX_SQL_LIKE_PATTERN_BYTES,
+        })
+    );
+    envelope
+        .application_properties
+        .insert("pattern".into(), MessageValue::String("%".into()));
+    assert_eq!(
+        evaluate_program(&program, &envelope),
+        Err(SqlEvaluationError::DivisionByZero)
+    );
+}
+
+#[test]
+fn ambiguous_leaf_preserves_dependent_comparison_and_like_admission() {
+    let mut envelope = MessageEnvelope::default();
+    envelope
+        .application_properties
+        .insert("value".into(), MessageValue::String("x".repeat(1000)));
+    envelope
+        .application_properties
+        .insert("Value".into(), MessageValue::String("short".into()));
+    let program = SqlProgram::compile("value = 'x'").expect("supported SQL");
+    let mut budget = SqlEvaluationBudget::with_limits(MAX_TOPIC_RULE_MATCH_WORK, 100);
+    assert_eq!(
+        program.evaluate(context(&envelope), &mut budget),
+        Err(SqlEvaluationError::Limit {
+            kind: SqlEvaluationLimit::ComparisonBytes,
+            maximum: 100,
+        })
+    );
+    let program = SqlProgram::compile("value LIKE '%'").expect("supported SQL");
+    let mut budget = SqlEvaluationBudget::with_limits(1000, MAX_TOPIC_RULE_COMPARISON_BYTES);
+    assert_eq!(
+        program.evaluate(context(&envelope), &mut budget),
+        Err(SqlEvaluationError::Limit {
+            kind: SqlEvaluationLimit::WorkUnits,
+            maximum: 1000,
+        })
+    );
+    assert_eq!(
+        evaluate_program(&program, &envelope),
+        Err(SqlEvaluationError::AmbiguousProperty)
+    );
+}
+
+#[test]
+fn invalid_escape_still_admits_the_potential_like_product() {
+    let program = SqlProgram::compile("input LIKE pattern ESCAPE escape").expect("supported SQL");
+    let mut envelope = MessageEnvelope::default();
+    for (key, value) in [
+        ("input", "x".repeat(1000)),
+        ("pattern", "%".into()),
+        ("escape", "ab".into()),
+    ] {
+        envelope
+            .application_properties
+            .insert(key.into(), MessageValue::String(value));
+    }
+    let mut budget = SqlEvaluationBudget::with_limits(2000, MAX_TOPIC_RULE_COMPARISON_BYTES);
+    assert_eq!(
+        program.evaluate(context(&envelope), &mut budget),
+        Err(SqlEvaluationError::Limit {
+            kind: SqlEvaluationLimit::WorkUnits,
+            maximum: 2000,
+        })
+    );
+    assert_eq!(
+        evaluate_program(&program, &envelope),
+        Err(SqlEvaluationError::InvalidEscape)
+    );
 }
 
 #[test]

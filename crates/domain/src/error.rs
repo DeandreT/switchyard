@@ -3,7 +3,8 @@ use thiserror::Error;
 
 use crate::{
     CodecError, IdentifierError, IngressBatchLimit, NamespaceName, QueueConfigError,
-    QueueCounterKind, QueueImmutableProperty, RuleMatchLimit, SequenceNumber, SessionId, Timestamp,
+    QueueCounterKind, QueueImmutableProperty, RuleMatchLimit, SequenceNumber, SessionId,
+    SqlCompileError, Timestamp,
 };
 
 /// Every rejection the state machine can produce.
@@ -47,6 +48,8 @@ pub enum BrokerError {
     InvalidRule { reason: String },
     #[error("stored rule metadata is inconsistent")]
     DanglingRuleMetadata,
+    #[error("SQL rule could not be compiled: {0}")]
+    SqlRuleCompilation(#[from] SqlCompileError),
     #[error("topic rule matching {limit:?} exceeds the maximum of {maximum}")]
     TopicRuleMatchTooLarge {
         limit: RuleMatchLimit,

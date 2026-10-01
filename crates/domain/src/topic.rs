@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{EntityPath, QueueConfig, QueueConfigError, SubscriptionName};
+use crate::{CodecError, EntityPath, QueueConfig, QueueConfigError, SubscriptionName, codec};
 
 /// Bounds topology reads and the eventual fanout of a single topic submission.
 pub const MAX_TOPIC_SUBSCRIPTIONS: usize = 32;
@@ -53,6 +53,8 @@ pub struct SubscriptionConfig {
     pub max_message_bytes: usize,
     pub requires_session: bool,
     pub dead_lettering_on_message_expiration: bool,
+    /// Topic rule errors are subscription-local, not a backing-queue policy.
+    pub dead_lettering_on_filter_evaluation_exceptions: bool,
 }
 
 impl Default for SubscriptionConfig {
@@ -65,11 +67,25 @@ impl Default for SubscriptionConfig {
             max_message_bytes: defaults.max_message_bytes,
             requires_session: defaults.requires_session,
             dead_lettering_on_message_expiration: defaults.dead_lettering_on_message_expiration,
+            dead_lettering_on_filter_evaluation_exceptions: true,
         }
     }
 }
 
 impl SubscriptionConfig {
+    /// Older records predate filter exceptions and select the SDK's true default.
+    pub fn decode(envelope: &[u8]) -> Result<Self, CodecError> {
+        let (version, payload) = codec::split(envelope)?;
+        match version {
+            codec::VALUE_FORMAT_V1..=codec::VALUE_FORMAT_V9 => {
+                let legacy: SubscriptionConfigV9 = codec::decode_payload(payload)?;
+                Ok(legacy.into())
+            }
+            codec::VALUE_FORMAT_V10 => codec::decode_payload(payload),
+            _ => unreachable!("split rejects unknown value formats"),
+        }
+    }
+
     pub fn validate(self) -> Result<Self, QueueConfigError> {
         self.to_queue_config().validate()?;
         Ok(self)
@@ -90,12 +106,40 @@ impl SubscriptionConfig {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct SubscriptionConfigV9 {
+    lock_duration_millis: u64,
+    max_delivery_count: u32,
+    default_time_to_live_millis: Option<u64>,
+    max_message_bytes: usize,
+    requires_session: bool,
+    dead_lettering_on_message_expiration: bool,
+}
+
+impl From<SubscriptionConfigV9> for SubscriptionConfig {
+    fn from(legacy: SubscriptionConfigV9) -> Self {
+        Self {
+            lock_duration_millis: legacy.lock_duration_millis,
+            max_delivery_count: legacy.max_delivery_count,
+            default_time_to_live_millis: legacy.default_time_to_live_millis,
+            max_message_bytes: legacy.max_message_bytes,
+            requires_session: legacy.requires_session,
+            dead_lettering_on_message_expiration: legacy.dead_lettering_on_message_expiration,
+            dead_lettering_on_filter_evaluation_exceptions: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SubscriptionDefinition {
     pub name: SubscriptionName,
     pub entity: EntityPath,
     pub config: SubscriptionConfig,
 }
+
+#[cfg(test)]
+#[path = "topic/policy_tests.rs"]
+mod policy_tests;
 
 #[cfg(test)]
 mod tests {
@@ -156,6 +200,7 @@ mod tests {
             max_message_bytes: 1_024,
             requires_session: true,
             dead_lettering_on_message_expiration: true,
+            dead_lettering_on_filter_evaluation_exceptions: false,
         };
         assert_eq!(config.validate(), Ok(config));
         assert_eq!(

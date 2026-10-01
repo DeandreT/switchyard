@@ -37,6 +37,7 @@ clap = { version = "4.5", features = ["derive"] }
 fjall = "3.1.8"
 flume = "0.12"
 hmac = "0.12"
+log = "0.4"
 percent-encoding = "2.3"
 postcard = { version = "1.1", features = ["use-std"] }
 prost = "0.14.4"
@@ -60,6 +61,7 @@ tonic = { version = "0.14.6", default-features = false, features = ["router", "t
 tonic-prost = "0.14.6"
 tonic-prost-build = "0.14.6"
 tracing = "0.1"
+tracing-log = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2.5"
 

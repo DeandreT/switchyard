@@ -42,7 +42,11 @@ pub const VALUE_FORMAT_V8: u8 = 8;
 /// all other stored record shapes retain their version 8 encoding.
 pub const VALUE_FORMAT_V9: u8 = 9;
 
-pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V9;
+/// Appends the subscription filter-error policy and the source-only SQL filter
+/// variant. Message and queue records retain their version 9 shapes.
+pub const VALUE_FORMAT_V10: u8 = 10;
+
+pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V10;
 
 /// Encodes a value into a versioned envelope.
 ///
@@ -142,6 +146,7 @@ mod tests {
             VALUE_FORMAT_V7,
             VALUE_FORMAT_V8,
             VALUE_FORMAT_V9,
+            VALUE_FORMAT_V10,
         ] {
             let mut envelope = vec![version];
             envelope.extend_from_slice(&payload);

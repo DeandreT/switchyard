@@ -47,6 +47,11 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::RuleLimitExceeded { .. }
         | BrokerError::TopicRuleMatchTooLarge { .. } => RESOURCE_LIMIT_EXCEEDED,
         BrokerError::TopicDataPlaneNotImplemented => NOT_IMPLEMENTED,
+        BrokerError::SqlRuleCompilation(error) => match error {
+            domain::SqlCompileError::Syntax => INVALID_FIELD,
+            domain::SqlCompileError::Unsupported { .. } => NOT_IMPLEMENTED,
+            domain::SqlCompileError::Limit { .. } => RESOURCE_LIMIT_EXCEEDED,
+        },
         BrokerError::IngressBatchLimitExceeded { limit, .. }
         | BrokerError::TopicFanoutTooLarge { limit, .. } => match limit {
             IngressBatchLimit::ContentBytes => MESSAGE_SIZE_EXCEEDED,

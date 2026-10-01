@@ -214,7 +214,9 @@ impl QueueConfig {
             codec::VALUE_FORMAT_V6 | codec::VALUE_FORMAT_V7 => {
                 Ok(codec::decode_payload::<QueueConfigV7>(payload)?.into())
             }
-            codec::VALUE_FORMAT_V8 | codec::VALUE_FORMAT_V9 => codec::decode_payload(payload),
+            codec::VALUE_FORMAT_V8 | codec::VALUE_FORMAT_V9 | codec::VALUE_FORMAT_V10 => {
+                codec::decode_payload(payload)
+            }
             _ => unreachable!("split rejects unknown value formats"),
         }
     }

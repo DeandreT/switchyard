@@ -1606,6 +1606,7 @@ dependencies = [
  "domain",
  "flume",
  "hmac",
+ "log",
  "prost",
  "protocol-amqp",
  "rcgen",
@@ -1620,6 +1621,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "url",
 ]

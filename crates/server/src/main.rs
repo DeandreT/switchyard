@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod logging;
+
 use std::{
     fs,
     net::SocketAddr,
@@ -21,7 +23,6 @@ use server::{
     NodeState, Shutdown, StartupError, StorageChoice, SystemClock, TimerWorker,
 };
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -215,10 +216,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), StartupError> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_target(false)
-        .init();
+    logging::initialize()?;
 
     let arguments = Arguments::parse();
     let mode = DeploymentMode::from(arguments.mode);
