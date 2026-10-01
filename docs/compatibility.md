@@ -251,8 +251,22 @@ unavailable inboxes, and actor-owned teardown refund their actual leases.
 This allowance counts logical retained content, not exact heap usage. Decoded
 object overhead, custom decoder expansion, the bounded reader-frame backlog,
 unencoded command messages, transient encoding/decoding and frame copies, and
-application-owned messages are outside it. Local outgoing encoding still occurs
-before admission and needs a separate bounded encoder.
+application-owned messages are outside it. Outgoing message encoding now measures
+and validates borrowed sections before content admission, applies the peer's
+limit with the exact encoded length, reserves the content allowance, and only
+then creates one fallibly reserved output buffer. Metadata and bodies are not
+cloned into temporary value trees or nested container buffers. The count and
+write passes use the same canonical encodings, including shared array
+constructors and compact collection widths from the [AMQP type system](https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-types-v1.0-os.html).
+Encoding additionally limits nesting to 68 and cumulative constructed-value
+visits to 132,096 across all message sections, including zero-width array values;
+violations are detected before output allocation. The standalone
+`encode_message_with_max_size` API rejects an exact oversized length with typed
+`MessageSizeError` before allocation. `encode_message` keeps no explicit byte
+cap, but now uses the same borrowed traversal and structural limits. The native
+send path uses the shared connection allowance before allocating its payload,
+including when a peer advertises no maximum. Unencoded command contents and
+performative metadata conversions still need separate resource policies.
 Frames on channels above the locally advertised limit receive a framing-error
 Close without refreshing receive activity. Asymmetric channel/handle routing
 remains a separate unfinished feature.
