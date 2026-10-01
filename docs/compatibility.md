@@ -310,9 +310,17 @@ installed, and closing links reserve their local handles; a matching Detach
 acknowledgement releases the closing binding. Exhausting the peer's output range
 ends the requesting server session with `amqp:resource-limit-exceeded`, without
 creating a link or approval event. A local client Attach instead returns retryable
-`InvalidState` without advancing its cursor or writing bytes. A link frame on an
-unpublished peer handle ends only its session with
+`InvalidState` without advancing its cursor or writing bytes. Flow, Transfer, or
+Detach on an unpublished peer handle ends only its session with
 `amqp:session:unattached-handle`.
+A duplicate Attach on a bound peer handle, including a pending approval or a
+normal close awaiting acknowledgement, instead receives an immediate connection
+Close with `amqp:session:handle-in-use`. That refusal precedes link-name matching,
+approval publication, and handle-capacity checks. It publishes no lazy Begin or
+session End, retires all local session and link owners before the Close write,
+and fails pending client operations with a closed-connection error after a
+successful flush. Failed or cancelled reply I/O retains the existing teardown
+error classifications. The bounded Close handshake controls connection shutdown.
 Session windows count Transfer frames independently of link delivery counts.
 Incoming windows replenish after bounded frame processing; receive links grant
 32 message slots and return credit only as the application consumes a delivery
