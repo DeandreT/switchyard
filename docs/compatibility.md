@@ -31,7 +31,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | Atomic immediate default-true fanout, AMQP subscription and dead-letter routing, Rust clients on both backends and both pinned .NET clients; topic sessions, scheduling, rules and administration not implemented |
+| Topics and subscriptions | Pre-1.0 | Atomic immediate default-true fanout, AMQP subscription and dead-letter routing, native create/get/list, Rust clients on both backends and both pinned .NET clients; topic sessions, scheduling, rules and Azure administration not implemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -42,7 +42,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Queue configuration updates | Pre-1.0 | Atomic state-machine patches; native queue API |
 | Same-placement-group transactions | Pre-1.0 | Not implemented |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
-| Native gRPC administration | Pre-1.0 | Queue create/get/list/update over HTTP/2 and authenticated TLS; other services and deletion not implemented |
+| Native gRPC administration | Pre-1.0 | Queue create/get/list/update and topic/subscription create/get/list over HTTP/2 and authenticated TLS; other services, topic/subscription updates and deletion not implemented |
 | Partitioned entities | Later | Out of initial scope |
 | Cross-placement-group transactions | Later | Out of initial scope |
 | Geo-replication | Later | Out of initial scope |
@@ -224,7 +224,8 @@ refused before acquiring a session hold; their session-free dead-letter queues
 remain receivable. Topic management links can attach, but topic peek currently
 returns the existing queue-not-found refusal and topic scheduling returns
 `amqp:not-implemented`; neither claims a topic workflow.
-Native topic administration and rules remain unimplemented.
+Native administration can create, get, and list topics and subscriptions;
+configuration updates for those entity kinds and rules remain unimplemented.
 
 Identifier allocation refuses exhaustion instead of saturating and reusing a
 stored identity. Sequence numbers are limited to `i64::MAX`, preserving exact
@@ -831,23 +832,48 @@ parity remain unverified.
 ## Native Administration
 
 The optional `--admin-listen` endpoint serves native queue create/get/list/update
-through the broker owner. It is a separate HTTP/2 listener and reuses the AMQP
+and topic/subscription create/get/list through the broker owner. It is a
+separate HTTP/2 listener and reuses the AMQP
 TLS identity and shared-access policy when configured. Authenticated requests
 require TLS and a SAS token in `authorization` metadata with Manage permission
-for the requested entity; listing needs namespace scope. The configured namespace
-is the only namespace accessible through that endpoint. Dead-letter shadows and
-subscription backing queues are hidden and cannot be administered through the
-queue API. Entity capacity and usage fields are absent because quota accounting
+for the requested entity. Queue and topic listings need namespace Manage;
+subscription listing needs Manage on its parent topic, so an exact-child grant
+cannot enumerate siblings. The configured namespace is the only namespace
+accessible through that endpoint. Dead-letter shadows cannot be administered.
+Subscription definitions use their typed configuration rather than exposing
+their backing queue through queue commands. Entity capacity and usage fields
+are absent because quota accounting
 is not implemented; they are not reported as zero-byte measurements.
 
-Pages are ordered, exclusive, namespace-bound, and limited to 1,024 parent queues.
+The existing `EntityService` RPCs and field numbers are retained. Creation has
+separate presence-aware queue, topic, and subscription configurations; wrong-kind
+or mixed legacy settings are refused instead of ignored. Get returns the
+committed entity kind and only its matching configuration. A subscription path
+is canonicalized only at its structural `/subscriptions/` separator, preserving
+literal parent and member spelling. Native SAS audiences use canonical entity
+paths and remain case-sensitive; AMQP scope conversion is not applied here.
+Read-only topology queries run on the owner without consulting the clock or
+stamping commands, validate complete metadata before returning a result, and
+refuse corrupt or dangling topology without partial responses.
+
+List defaults to queues only, preserving existing queue clients and their `v1.`
+tokens. Explicit topic and subscription kinds use separate tokens bound to the
+namespace, entity kind, and subscription parent. Pages are ordered and exclusive,
+with a default size of 100 and a maximum of 1,024. Topic discovery scans one
+bounded index page; subscription listing validates all at most 32 members before
+slicing a page. Queue listing hides subscription backings and all shadows; it
+still fills visible pages by scanning successive bounded index pages, so its
+total hidden-row work is not yet capped. All token families have a 512-byte
+ceiling and reject noncanonical or cross-context tokens before owner reads.
+
 Local defaults admit 128 sockets and 128 concurrent requests across service clones,
 with at most 32 HTTP/2 streams per connection, a 10-second TLS handshake deadline,
 30-second request deadlines, 64 KiB decoded requests, and 1 MiB encoded replies.
 HTTP/2 connections send keepalive pings after 30 seconds, allow 10 seconds for an
 acknowledgment, and retire after five minutes with a 30-second graceful deadline.
-These are local resource policies. Queue deletion and the cluster, namespace,
-backup, and audit services return unimplemented rather than simulated success.
+These are local resource policies. Entity deletion, topic/subscription updates,
+and the cluster, namespace, backup, and audit services return unimplemented
+rather than simulated success.
 This endpoint is not Azure Atom/XML administration compatibility.
 `switchyardctl queue create|get|list|update` exposes these operations with JSON
 responses and nonzero errors. It reads SAS tokens only from bounded regular

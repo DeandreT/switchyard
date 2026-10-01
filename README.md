@@ -85,7 +85,7 @@ default port to 5671. A shared-access policy is configured with
 and CBS SAS authorization. Production mode refuses to start without both TLS
 and a shared-access policy.
 
-Native queue administration is opt-in with `--admin-listen`. For an isolated
+Native entity administration is opt-in with `--admin-listen`. For an isolated
 development node, add `--admin-listen 127.0.0.1:9080`, then create and inspect a
 queue:
 
@@ -98,12 +98,27 @@ cargo run -p switchyardctl -- \
   queue get orders
 ```
 
-The CLI also supports `queue list` and `queue update`, and emits JSON. HTTPS
-requires `--ca-certificate`; use `--tls-server-name` when connecting through a
+The CLI also supports `queue list` and `queue update`, and emits JSON. Topics
+and subscriptions have separate create/get/list commands:
+
+```sh
+cargo run -p switchyardctl -- \
+  --endpoint http://127.0.0.1:9080 --allow-insecure \
+  topic create events --requires-duplicate-detection
+cargo run -p switchyardctl -- \
+  --endpoint http://127.0.0.1:9080 --allow-insecure \
+  subscription create events audit --dead-letter-on-expiration
+cargo run -p switchyardctl -- \
+  --endpoint http://127.0.0.1:9080 --allow-insecure \
+  subscription list events
+```
+
+HTTPS requires `--ca-certificate`; use `--tls-server-name` when connecting through a
 local address that differs from the certificate name. Supply a Manage SAS token
 with `--token-file`, never on the command line. Authenticated administration
-requires TLS and uses the node's existing shared-access policy. Queue deletion,
-other native services, and Azure administration compatibility remain unfinished.
+requires TLS and uses the node's existing shared-access policy. Entity deletion,
+topic/subscription updates, other native services, and Azure administration
+compatibility remain unfinished.
 
 ## Production Contract
 

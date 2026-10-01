@@ -21,7 +21,9 @@ below, topics have persisted definitions, bounded subscription topology, and
 atomic immediate default-true fanout, AMQP subscription and dead-letter routing,
 and subscription management operations. Both pinned .NET gates cover immediate
 topic publications and independent subscription workflows. Topic sessions,
-scheduling, rules, and administration remain unimplemented; the timer worker covers
+scheduling, rules, and Azure administration remain unimplemented. Native
+administration creates and reads topology, lists topics and subscriptions, and
+updates queues; the timer worker covers
 scheduled activation and the four expiry indexes that exist,
 and the storage keyspace layout under [Storage](#storage) is still a single
 record keyspace rather than the split listed there.
