@@ -421,10 +421,23 @@ async fn pending_attach_detach_ack_starts_the_session_and_removes_only_undispatc
         .await?;
     let frames = node.peer.barrier(0).await?;
     let responses = channel_frames(&frames, 1);
-    let [Performative::Begin(begin), Performative::Detach(detach)] = responses.as_slice() else {
-        panic!("pending detach must begin its outgoing session first: {responses:?}");
+    let [
+        Performative::Begin(begin),
+        Performative::Attach(attach),
+        Performative::Detach(detach),
+    ] = responses.as_slice()
+    else {
+        panic!(
+            "pending detach must publish its session and link before cancellation: {responses:?}"
+        );
     };
     assert_eq!(begin.remote_channel, Some(1));
+    assert_eq!(attach.name, "undispatched-canceled");
+    assert_eq!(attach.handle, 0);
+    assert_eq!(attach.role, Role::Receiver);
+    assert!(attach.source.is_none());
+    assert!(attach.target.is_none());
+    assert!(attach.initial_delivery_count.is_none());
     assert_eq!(detach.handle, 0);
     assert!(detach.closed);
     assert!(detach.error.is_none());

@@ -440,6 +440,11 @@ async fn dispatched_pending_detach_allows_immediate_handle_reuse_before_old_appr
             Vec::new(),
         )
         .await?;
+    assert!(matches!(node.peer.read().await?, Frame::Amqp {
+        channel: 0, performative: Some(Performative::Attach(response)), ..
+    } if response.name == request.name && response.handle == 0
+        && response.role == Role::Receiver && response.source.is_none()
+        && response.target.is_none() && response.initial_delivery_count.is_none()));
     node.peer.detach_reply(0, 0).await?;
     let fresh = node.request(&mut session, 0, &request).await?;
     assert_eq!(old.attach(), fresh.attach());

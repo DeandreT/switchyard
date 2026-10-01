@@ -28,6 +28,7 @@ mod format_registry;
 mod frame_writer;
 mod idle;
 mod incoming_ledger;
+mod link_handles;
 mod outgoing_identity;
 mod receive_credit;
 mod session_channels;
@@ -44,6 +45,7 @@ use incoming_ledger::Completion;
 use incoming_ledger::{
     DeliveryIdentity, IncomingLedger, IncomingLedgerError, LinkIdentity, SettlementAction,
 };
+use link_handles::{HandleAlias, local_handle_for_peer, preferred_vacant_handle};
 use outgoing_identity::AckIdentity;
 use receive_credit::{Consumption, ReceiveCredit};
 use session_channels::{local_channel_for_peer, preferred_vacant_channel};
@@ -714,7 +716,7 @@ impl ServerSession {
         let role = attach.role.clone();
         let name = attach.name.clone();
         let max_message_size_for_sender = normalized_message_size(attach.max_message_size);
-        let handle = attach.handle;
+        let handle = attach.approval().local_handle();
         request(&self.commands, |reply| Command::AcceptLink {
             channel: self.channel,
             session: self.identity.clone(),
@@ -1027,6 +1029,8 @@ fn reject_closed_command(command: Command) {
 struct SessionState {
     identity: SessionIdentity,
     peer_channel: Option<u16>,
+    remote_handle_max: u32,
+    handle_aliases: HashMap<u32, HandleAlias>,
     attach_tx: Option<mpsc::Sender<IncomingAttach>>,
     local_begin_sent: bool,
     links: HashMap<u32, LinkState>,
@@ -1105,6 +1109,8 @@ impl SessionState {
         Self {
             identity: SessionIdentity::new(),
             peer_channel: None,
+            remote_handle_max: peer.handle_max,
+            handle_aliases: HashMap::new(),
             attach_tx: None,
             local_begin_sent: false,
             links: HashMap::new(),
@@ -1126,17 +1132,26 @@ impl SessionState {
 }
 
 fn link_slot_count(session: &SessionState) -> usize {
-    session.links.len()
+    session.handle_aliases.len()
+        + session
+            .links
+            .keys()
+            .filter(|handle| !session.handle_aliases.contains_key(*handle))
+            .count()
         + session
             .pending_attaches
             .keys()
-            .filter(|handle| !session.links.contains_key(*handle))
+            .filter(|handle| {
+                !session.handle_aliases.contains_key(*handle)
+                    && !session.links.contains_key(*handle)
+            })
             .count()
         + session
             .closing_handles
             .iter()
             .filter(|handle| {
-                !session.links.contains_key(*handle)
+                !session.handle_aliases.contains_key(*handle)
+                    && !session.links.contains_key(*handle)
                     && !session.pending_attaches.contains_key(*handle)
             })
             .count()
@@ -1457,7 +1472,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
     else {
         return Err(invalid_state("SASL frame after AMQP open"));
     };
-    let Some(performative) = performative else {
+    let Some(mut performative) = performative else {
         return Ok(FrameAction::Continue);
     };
     let peer_channel = channel;
@@ -1532,6 +1547,35 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
         }
     };
 
+    let input_handle = match &performative {
+        Performative::Flow(flow) => flow.handle,
+        Performative::Transfer(transfer) => Some(transfer.handle),
+        Performative::Detach(detach) => Some(detach.handle),
+        _ => None,
+    };
+    if let Some(peer_handle) = input_handle {
+        let Some(handle) = sessions
+            .get(&channel)
+            .and_then(|session| local_handle_for_peer(peer_handle, session))
+        else {
+            refuse_session(
+                channel,
+                "amqp:session:unattached-handle",
+                "frame on an unassigned peer link handle",
+                writer,
+                sessions,
+            )
+            .await?;
+            return Ok(FrameAction::Continue);
+        };
+        match &mut performative {
+            Performative::Flow(flow) => flow.handle = Some(handle),
+            Performative::Transfer(transfer) => transfer.handle = handle,
+            Performative::Detach(detach) => detach.handle = handle,
+            _ => unreachable!("only link performatives carry an input handle"),
+        }
+    }
+
     match performative {
         Performative::Begin(begin) => {
             let mut session = SessionState::new(&begin);
@@ -1560,10 +1604,11 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
             let session = sessions
                 .get_mut(&channel)
                 .ok_or_else(|| invalid_state("attach on an unknown session"))?;
-            let handle = attach.handle;
-            if session.links.contains_key(&handle)
-                || session.pending_attaches.contains_key(&handle)
-                || session.closing_handles.contains(&handle)
+            let peer_handle = attach.handle;
+            if session
+                .handle_aliases
+                .values()
+                .any(|alias| alias.peer_handle == Some(peer_handle))
             {
                 refuse_session(
                     channel,
@@ -1593,22 +1638,35 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                     sessions,
                 )
                 .await?;
-            } else if has_recovery_state(&attach) {
-                if session.attach_tx.is_some() {
-                    refuse_recovery_attach(channel, &attach, session, writer).await?;
-                } else {
-                    let attach = IncomingAttach::new(*attach, session.identity.clone());
-                    let mut pending = PendingLinkFlow::incoming(&attach);
-                    pending.recovery_refusal = true;
-                    session.pending_attaches.insert(handle, pending);
-                    session.pending_attach_events.push_back(attach);
-                }
             } else {
-                let attach = IncomingAttach::new(*attach, session.identity.clone());
-                session
-                    .pending_attaches
-                    .insert(handle, PendingLinkFlow::incoming(&attach));
-                if let Some(attach_tx) = &session.attach_tx {
+                let Some(handle) =
+                    preferred_vacant_handle(peer_handle, session.remote_handle_max, session)
+                else {
+                    refuse_session(
+                        channel,
+                        "amqp:resource-limit-exceeded",
+                        "peer link handle limit reached",
+                        writer,
+                        sessions,
+                    )
+                    .await?;
+                    return Ok(FrameAction::Continue);
+                };
+                let attach = IncomingAttach::new(*attach, session.identity.clone(), handle);
+                session.handle_aliases.insert(
+                    handle,
+                    HandleAlias {
+                        identity: attach.approval().link_identity().clone(),
+                        peer_handle: Some(peer_handle),
+                        own_attach_sent: false,
+                    },
+                );
+                let mut pending = PendingLinkFlow::incoming(&attach);
+                pending.recovery_refusal = has_recovery_state(&attach);
+                session.pending_attaches.insert(handle, pending);
+                if has_recovery_state(&attach) && session.attach_tx.is_some() {
+                    refuse_recovery_attach(channel, &attach, session, writer).await?;
+                } else if let Some(attach_tx) = &session.attach_tx {
                     if attach_tx.try_send(attach).is_err() {
                         refuse_session(
                             channel,
@@ -1635,27 +1693,11 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
         }
         Performative::Detach(detach) => {
             if let Some(session) = sessions.get_mut(&channel) {
-                let locally_closing = session.closing_handles.remove(&detach.handle);
-                if let Some(pending) = session.pending_attaches.remove(&detach.handle) {
-                    pending.retire();
-                    session
-                        .pending_attach_events
-                        .retain(|attach| attach.handle != detach.handle);
-                    if !locally_closing {
-                        ensure_local_begin(channel, session, writer).await?;
-                        writer
-                            .write_amqp(
-                                channel,
-                                Performative::Detach(Detach {
-                                    handle: detach.handle,
-                                    closed: true,
-                                    error: None,
-                                }),
-                                Vec::new(),
-                            )
-                            .await?;
-                    }
+                let locally_closing = session.closing_handles.contains(&detach.handle);
+                if session.pending_attaches.contains_key(&detach.handle) && !locally_closing {
+                    acknowledge_pending_detach(channel, detach.handle, session, writer).await?;
                 } else if let Some(mut link) = session.links.remove(&detach.handle) {
+                    let identity = link.identity().clone();
                     forget_incoming_link(&mut session.incoming, &link);
                     stop_link(&mut link);
                     if !locally_closing {
@@ -1671,6 +1713,16 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                                 Vec::new(),
                             )
                             .await?;
+                    }
+                    remove_handle_alias(session, detach.handle, &identity);
+                    session.closing_handles.remove(&detach.handle);
+                } else if locally_closing {
+                    if let Some(alias) = session.handle_aliases.remove(&detach.handle) {
+                        alias.identity.retire();
+                    }
+                    session.closing_handles.remove(&detach.handle);
+                    if let Some(pending) = session.pending_attaches.remove(&detach.handle) {
+                        pending.retire();
                     }
                 }
             }
@@ -1792,7 +1844,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 let _ = reply.send(Err(attach_approval_error(error)));
                 return Ok(CommandAction::Continue);
             }
-            let handle = attach.handle;
+            let handle = attach.approval().local_handle();
             let Some(approval) = session
                 .pending_attaches
                 .get(&handle)
@@ -1803,6 +1855,15 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             };
             if let Err(error) = attach.validate(&session.identity, approval) {
                 let _ = reply.send(Err(attach_approval_error(error)));
+                return Ok(CommandAction::Continue);
+            }
+            if !session.handle_aliases.get(&handle).is_some_and(|alias| {
+                alias.identity.same_link(approval.link_identity())
+                    && alias.peer_handle == Some(attach.handle)
+            }) {
+                let _ = reply.send(Err(invalid_state(
+                    "attach approval has no matching handle alias",
+                )));
                 return Ok(CommandAction::Continue);
             }
             if has_recovery_state(&attach) {
@@ -1832,6 +1893,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             }
             let receive_maximum = effective_receive_maximum(Some(max_message_size));
             let mut response = attach.response(attach.source.clone(), attach.target.clone());
+            response.handle = handle;
             response.max_message_size =
                 (response.role == Role::Receiver).then_some(receive_maximum);
             response.properties = properties;
@@ -1848,38 +1910,30 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 payload: Vec::new(),
             };
             if let Err(error) = writer.encoded_frame(&response_frame) {
-                response.source = None;
-                response.target = None;
-                response.properties = None;
-                ensure_local_begin(channel, session, writer).await?;
-                writer
-                    .write_amqp(
-                        channel,
-                        Performative::Attach(Box::new(response)),
-                        Vec::new(),
-                    )
-                    .await?;
-                remember_closing_handle(session, handle)?;
-                writer
-                    .write_amqp(
-                        channel,
-                        Performative::Detach(Detach {
-                            handle,
-                            closed: true,
-                            error: Some(Error::new(
-                                crate::AmqpError::FrameSizeTooSmall,
-                                "attach response exceeds the peer frame limit",
-                                None,
-                            )),
-                        }),
-                        Vec::new(),
-                    )
-                    .await?;
+                close_pending_link(
+                    channel,
+                    handle,
+                    &approval,
+                    session,
+                    writer,
+                    Some(Error::new(
+                        crate::AmqpError::FrameSizeTooSmall,
+                        "attach response exceeds the peer frame limit",
+                        None,
+                    )),
+                    false,
+                )
+                .await?;
                 let _ = reply.send(Err(error.into()));
                 return Ok(CommandAction::Continue);
             }
             ensure_local_begin(channel, session, writer).await?;
             writer.write_frame(&response_frame).await?;
+            session
+                .handle_aliases
+                .get_mut(&handle)
+                .expect("validated handle alias")
+                .own_attach_sent = true;
             match attach.role {
                 Role::Sender => {
                     let Some(initial_count) = attach.initial_delivery_count else {
@@ -2638,22 +2692,26 @@ async fn ensure_local_begin<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
 ) -> Result<(), EngineError> {
     if !session.local_begin_sent {
-        let peer_channel = session
-            .peer_channel
-            .ok_or_else(|| invalid_state("session has no associated peer channel"))?;
         writer
-            .write_amqp(
-                channel,
-                Performative::Begin(Begin {
-                    remote_channel: Some(peer_channel),
-                    ..Begin::default()
-                }),
-                Vec::new(),
-            )
+            .write_frame(&local_begin_frame(channel, session)?)
             .await?;
         session.local_begin_sent = true;
     }
     Ok(())
+}
+
+fn local_begin_frame(channel: u16, session: &SessionState) -> Result<Frame, EngineError> {
+    let peer_channel = session
+        .peer_channel
+        .ok_or_else(|| invalid_state("session has no associated peer channel"))?;
+    Ok(Frame::Amqp {
+        channel,
+        performative: Some(Performative::Begin(Begin {
+            remote_channel: Some(peer_channel),
+            ..Begin::default()
+        })),
+        payload: Vec::new(),
+    })
 }
 
 async fn refuse_connection<W: AsyncWrite + Unpin>(
@@ -2688,15 +2746,8 @@ async fn refuse_session<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     sessions: &mut HashMap<u16, SessionState>,
 ) -> Result<(), EngineError> {
-    let description = description.into();
-    tracing::debug!(channel, condition, %description, "refusing AMQP session");
     if let Some(session) = sessions.get_mut(&channel) {
-        if session.ending {
-            return Ok(());
-        }
-        ensure_local_begin(channel, session, writer).await?;
-        session.ending = true;
-        stop_session(session);
+        return refuse_session_state(channel, condition, description, session, writer).await;
     }
     writer
         .write_amqp(
@@ -2711,6 +2762,40 @@ async fn refuse_session<W: AsyncWrite + Unpin>(
             Vec::new(),
         )
         .await?;
+    Ok(())
+}
+
+async fn refuse_session_state<W: AsyncWrite + Unpin>(
+    channel: u16,
+    condition: &str,
+    description: impl Into<String>,
+    session: &mut SessionState,
+    writer: &mut FrameWriter<W>,
+) -> Result<(), EngineError> {
+    if session.ending {
+        return Ok(());
+    }
+    let description = description.into();
+    tracing::debug!(channel, condition, %description, "refusing AMQP session");
+    let frame = Frame::Amqp {
+        channel,
+        performative: Some(Performative::End(End {
+            error: Some(Error::new(
+                crate::ErrorCondition::Custom(Symbol::from(condition)),
+                description,
+                None,
+            )),
+        })),
+        payload: Vec::new(),
+    };
+    writer.encoded_frame(&frame)?;
+    if !session.local_begin_sent {
+        writer.encoded_frame(&local_begin_frame(channel, session)?)?;
+    }
+    ensure_local_begin(channel, session, writer).await?;
+    session.ending = true;
+    stop_session(session);
+    writer.write_frame(&frame).await?;
     Ok(())
 }
 
@@ -2930,35 +3015,125 @@ fn has_recovery_state(attach: &Attach) -> bool {
 
 async fn refuse_recovery_attach<W: AsyncWrite + Unpin>(
     channel: u16,
-    attach: &Attach,
+    attach: &IncomingAttach,
     session: &mut SessionState,
     writer: &mut FrameWriter<W>,
 ) -> Result<(), EngineError> {
+    close_pending_link(
+        channel,
+        attach.approval().local_handle(),
+        attach.approval(),
+        session,
+        writer,
+        Some(Error::new(
+            crate::AmqpError::NotImplemented,
+            RECOVERY_NOT_IMPLEMENTED,
+            None,
+        )),
+        false,
+    )
+    .await
+}
+
+async fn acknowledge_pending_detach<W: AsyncWrite + Unpin>(
+    channel: u16,
+    handle: u32,
+    session: &mut SessionState,
+    writer: &mut FrameWriter<W>,
+) -> Result<(), EngineError> {
+    let approval = session
+        .pending_attaches
+        .get(&handle)
+        .and_then(|pending| pending.approval.as_ref())
+        .ok_or_else(|| invalid_state("pending link has no attach approval"))?
+        .clone();
+    close_pending_link(channel, handle, &approval, session, writer, None, true).await
+}
+
+async fn close_pending_link<W: AsyncWrite + Unpin>(
+    channel: u16,
+    handle: u32,
+    approval: &Arc<AttachApproval>,
+    session: &mut SessionState,
+    writer: &mut FrameWriter<W>,
+    error: Option<Error>,
+    peer_detached: bool,
+) -> Result<(), EngineError> {
+    let alias = session
+        .handle_aliases
+        .get(&handle)
+        .filter(|alias| alias.identity.same_link(approval.link_identity()))
+        .ok_or_else(|| invalid_state("pending link has no matching handle alias"))?;
+    let needs_attach = !alias.own_attach_sent;
     let response = Frame::Amqp {
         channel,
-        performative: Some(Performative::Attach(Box::new(attach.response(None, None)))),
+        performative: Some(Performative::Attach(Box::new(approval.refusal_attach()))),
         payload: Vec::new(),
     };
-    let refusal = Frame::Amqp {
+    if needs_attach && writer.encoded_frame(&response).is_err() {
+        return refuse_session_state(
+            channel,
+            "amqp:frame-size-too-small",
+            "minimal attach response exceeds the peer frame limit",
+            session,
+            writer,
+        )
+        .await;
+    }
+    let detach = Frame::Amqp {
         channel,
         performative: Some(Performative::Detach(Detach {
-            handle: attach.handle,
+            handle,
             closed: true,
-            error: Some(Error::new(
-                crate::AmqpError::NotImplemented,
-                RECOVERY_NOT_IMPLEMENTED,
-                None,
-            )),
+            error,
         })),
         payload: Vec::new(),
     };
-    writer.encoded_frame(&response)?;
-    writer.encoded_frame(&refusal)?;
+    writer.encoded_frame(&detach)?;
+    if !session.local_begin_sent {
+        writer.encoded_frame(&local_begin_frame(channel, session)?)?;
+    }
+    if peer_detached {
+        approval.retire();
+    } else {
+        remember_closing_handle(session, handle)?;
+    }
     ensure_local_begin(channel, session, writer).await?;
-    remember_closing_handle(session, attach.handle)?;
-    writer.write_frame(&response).await?;
-    writer.write_frame(&refusal).await?;
+    if needs_attach {
+        writer.write_frame(&response).await?;
+        session
+            .handle_aliases
+            .get_mut(&handle)
+            .expect("validated pending handle alias")
+            .own_attach_sent = true;
+    }
+    writer.write_frame(&detach).await?;
+    if peer_detached {
+        if session
+            .pending_attaches
+            .get(&handle)
+            .and_then(|pending| pending.approval.as_ref())
+            .is_some_and(|current| Arc::ptr_eq(current, approval))
+        {
+            session.pending_attaches.remove(&handle);
+        }
+        session
+            .pending_attach_events
+            .retain(|attach| !Arc::ptr_eq(attach.approval(), approval));
+        remove_handle_alias(session, handle, approval.link_identity());
+        session.closing_handles.remove(&handle);
+    }
     Ok(())
+}
+
+fn remove_handle_alias(session: &mut SessionState, handle: u32, identity: &LinkIdentity) {
+    if session
+        .handle_aliases
+        .get(&handle)
+        .is_some_and(|alias| alias.identity.same_link(identity))
+    {
+        session.handle_aliases.remove(&handle);
+    }
 }
 
 fn remember_closing_handle(session: &mut SessionState, handle: u32) -> Result<(), EngineError> {
@@ -3643,6 +3818,10 @@ fn stop_session(session: &mut SessionState) {
         stop_link(link);
     }
     session.links.clear();
+    for alias in session.handle_aliases.values() {
+        alias.identity.retire();
+    }
+    session.handle_aliases.clear();
     session.incoming = IncomingLedger::new();
 }
 
@@ -3745,6 +3924,15 @@ mod tests {
                 properties: None,
             },
             session.identity.clone(),
+            handle,
+        );
+        session.handle_aliases.insert(
+            handle,
+            HandleAlias {
+                identity: receipt.approval().link_identity().clone(),
+                peer_handle: Some(handle),
+                own_attach_sent: false,
+            },
         );
         session
             .pending_attaches
@@ -3867,3 +4055,6 @@ mod content_budget_tests;
 
 #[cfg(test)]
 mod session_channel_tests;
+
+#[cfg(test)]
+mod link_handle_tests;

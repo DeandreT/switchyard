@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{Attach, Role};
+use crate::{Attach, ReceiverSettleMode, Role, SenderSettleMode};
 
 use super::incoming_ledger::LinkIdentity;
 
@@ -34,13 +34,39 @@ pub(super) struct AttachApproval {
     session: SessionIdentity,
     link: LinkIdentity,
     handle: u32,
+    local_handle: u32,
     name: String,
     role: Role,
+    sender_settle_mode: SenderSettleMode,
+    receiver_settle_mode: ReceiverSettleMode,
 }
 
 impl AttachApproval {
     pub(super) fn link_identity(&self) -> &LinkIdentity {
         &self.link
+    }
+
+    pub(super) fn local_handle(&self) -> u32 {
+        self.local_handle
+    }
+
+    pub(super) fn refusal_attach(&self) -> Attach {
+        Attach {
+            name: self.name.clone(),
+            handle: self.local_handle,
+            role: self.role.opposite(),
+            snd_settle_mode: self.sender_settle_mode.clone(),
+            rcv_settle_mode: self.receiver_settle_mode.clone(),
+            source: None,
+            target: None,
+            unsettled: None,
+            incomplete_unsettled: false,
+            initial_delivery_count: (self.role == Role::Receiver).then_some(0),
+            max_message_size: None,
+            offered_capabilities: None,
+            desired_capabilities: None,
+            properties: None,
+        }
     }
 
     pub(super) fn retire(&self) {
@@ -56,13 +82,16 @@ pub struct IncomingAttach {
 }
 
 impl IncomingAttach {
-    pub(super) fn new(attach: Attach, session: SessionIdentity) -> Self {
+    pub(super) fn new(attach: Attach, session: SessionIdentity, local_handle: u32) -> Self {
         let approval = Arc::new(AttachApproval {
             session,
             link: LinkIdentity::new(),
             handle: attach.handle,
+            local_handle,
             name: attach.name.clone(),
             role: attach.role.clone(),
+            sender_settle_mode: attach.snd_settle_mode.clone(),
+            receiver_settle_mode: attach.rcv_settle_mode.clone(),
         });
         Self { attach, approval }
     }
@@ -232,7 +261,7 @@ mod tests {
     #[test]
     fn cloned_receipt_preserves_exact_approval_and_endpoint_generation() {
         let session = SessionIdentity::new();
-        let receipt = IncomingAttach::new(attach(), session.clone());
+        let receipt = IncomingAttach::new(attach(), session.clone(), 7);
         let clone = receipt.clone();
         assert!(Arc::ptr_eq(receipt.approval(), clone.approval()));
         assert!(
@@ -247,8 +276,8 @@ mod tests {
     #[test]
     fn identical_request_content_cannot_approve_replacement_link() {
         let session = SessionIdentity::new();
-        let old = IncomingAttach::new(attach(), session.clone());
-        let replacement = IncomingAttach::new(old.attach().clone(), session.clone());
+        let old = IncomingAttach::new(attach(), session.clone(), 7);
+        let replacement = IncomingAttach::new(old.attach().clone(), session.clone(), 7);
         assert_eq!(old.attach(), replacement.attach());
         assert_eq!(
             old.validate(&session, replacement.approval()),
@@ -269,8 +298,8 @@ mod tests {
     fn identical_request_content_cannot_cross_session_reuse() {
         let old_session = SessionIdentity::new();
         let new_session = SessionIdentity::new();
-        let old = IncomingAttach::new(attach(), old_session.clone());
-        let replacement = IncomingAttach::new(old.attach().clone(), new_session.clone());
+        let old = IncomingAttach::new(attach(), old_session.clone(), 7);
+        let replacement = IncomingAttach::new(old.attach().clone(), new_session.clone(), 7);
         assert_eq!(
             old.validate(&new_session, replacement.approval()),
             Err(AttachApprovalError::WrongSession)
@@ -292,7 +321,7 @@ mod tests {
     #[test]
     fn handle_name_and_role_are_immutable_approval_fields() {
         let session = SessionIdentity::new();
-        let receipt = IncomingAttach::new(attach(), session.clone());
+        let receipt = IncomingAttach::new(attach(), session.clone(), 7);
         let mut changed = receipt.clone();
         changed.handle += 1;
         assert_eq!(
@@ -330,7 +359,7 @@ mod tests {
     #[test]
     fn listener_filter_and_missing_sender_count_adjustments_remain_valid() {
         let session = SessionIdentity::new();
-        let mut receipt = IncomingAttach::new(attach(), session.clone());
+        let mut receipt = IncomingAttach::new(attach(), session.clone(), 7);
         let mut source = receipt.source.clone().expect("fixture source");
         source.filter = Some(Default::default());
         source.address = Some(String::from("granted-session"));
@@ -348,7 +377,7 @@ mod tests {
     #[test]
     fn attach_accessors_and_owned_parts_keep_provenance_separate() {
         let session = SessionIdentity::new();
-        let mut receipt = IncomingAttach::new(attach(), session.clone());
+        let mut receipt = IncomingAttach::new(attach(), session.clone(), 7);
         receipt.attach_mut().max_message_size = Some(512);
         assert_eq!(receipt.max_message_size, Some(512));
         let expected = receipt.attach().clone();
@@ -357,7 +386,7 @@ mod tests {
         assert_eq!(request, expected);
         assert!(Arc::ptr_eq(&approval, &captured));
 
-        let receipt = IncomingAttach::new(request.clone(), session);
+        let receipt = IncomingAttach::new(request.clone(), session, 7);
         let retained = receipt.approval().clone();
         assert_eq!(receipt.into_attach(), request);
         assert!(!Arc::ptr_eq(&retained, &approval));
@@ -366,8 +395,8 @@ mod tests {
     #[test]
     fn retiring_pending_approval_retires_its_endpoint_generation_only() {
         let session = SessionIdentity::new();
-        let old = IncomingAttach::new(attach(), session.clone());
-        let replacement = IncomingAttach::new(old.attach().clone(), session);
+        let old = IncomingAttach::new(attach(), session.clone(), 7);
+        let replacement = IncomingAttach::new(old.attach().clone(), session, 7);
         let mut ledger = IncomingLedger::new();
         old.approval().retire();
         old.approval().retire();
@@ -385,8 +414,8 @@ mod tests {
     #[test]
     fn prequeue_validation_does_not_claim_an_identical_pending_generation() {
         let session = SessionIdentity::new();
-        let receipt = IncomingAttach::new(attach(), session.clone());
-        let replacement = IncomingAttach::new(receipt.attach().clone(), session.clone());
+        let receipt = IncomingAttach::new(attach(), session.clone(), 7);
+        let replacement = IncomingAttach::new(receipt.attach().clone(), session.clone(), 7);
         assert_eq!(receipt.validate_request(&session), Ok(()));
         assert_eq!(replacement.validate_request(&session), Ok(()));
         assert_eq!(
@@ -407,7 +436,7 @@ mod tests {
     #[test]
     fn retired_current_or_origin_sessions_fail_prequeue_and_final_validation() {
         let origin = SessionIdentity::new();
-        let receipt = IncomingAttach::new(attach(), origin.clone());
+        let receipt = IncomingAttach::new(attach(), origin.clone(), 7);
         let retired_current = SessionIdentity::new();
         retired_current.retire();
         assert_eq!(
@@ -419,7 +448,7 @@ mod tests {
             Err(AttachApprovalError::RetiredSession)
         );
         assert_eq!(receipt.validate_request(&origin), Ok(()));
-        let retired_pending = IncomingAttach::new(attach(), retired_current);
+        let retired_pending = IncomingAttach::new(attach(), retired_current, 7);
         assert_eq!(
             receipt.validate(&origin, retired_pending.approval()),
             Err(AttachApprovalError::RetiredSession)
@@ -441,8 +470,8 @@ mod tests {
     #[test]
     fn retired_receipt_or_pending_approval_cannot_validate_fresh_metadata() {
         let session = SessionIdentity::new();
-        let mut receipt = IncomingAttach::new(attach(), session.clone());
-        let replacement = IncomingAttach::new(receipt.attach().clone(), session.clone());
+        let mut receipt = IncomingAttach::new(attach(), session.clone(), 7);
+        let replacement = IncomingAttach::new(receipt.attach().clone(), session.clone(), 7);
         receipt.approval().retire();
         receipt.initial_delivery_count = Some(0);
         receipt.source = Some(Source::new("fresh-metadata"));
@@ -470,7 +499,7 @@ mod tests {
     #[test]
     fn retirement_is_rejected_before_mutated_identity_fields() {
         let session = SessionIdentity::new();
-        let mut receipt = IncomingAttach::new(attach(), session.clone());
+        let mut receipt = IncomingAttach::new(attach(), session.clone(), 7);
         receipt.role = Role::Receiver;
         receipt.approval().retire();
         assert_eq!(

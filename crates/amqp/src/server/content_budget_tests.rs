@@ -114,8 +114,17 @@ impl Fixture {
                 properties: None,
             },
             session.identity.clone(),
+            handle,
         );
         let identity = attach.approval().link_identity().clone();
+        session.handle_aliases.insert(
+            handle,
+            super::link_handles::HandleAlias {
+                identity: identity.clone(),
+                peer_handle: Some(handle),
+                own_attach_sent: false,
+            },
+        );
         session
             .pending_attaches
             .insert(handle, PendingLinkFlow::incoming(&attach));

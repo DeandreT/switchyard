@@ -95,6 +95,14 @@ impl Fixture {
         session.local_begin_sent = begun;
         for handle in 0..count as u32 {
             session.links.insert(handle, sending());
+            session.handle_aliases.insert(
+                handle,
+                super::link_handles::HandleAlias {
+                    identity: session.links[&handle].identity().clone(),
+                    peer_handle: Some(handle),
+                    own_attach_sent: true,
+                },
+            );
         }
         assert!(self.sessions.insert(channel, session).is_none());
     }
@@ -251,7 +259,7 @@ async fn excess_begin_publishes_no_new_session_and_retires_existing_owners_befor
         session.ending = channel % 3 == 0;
     }
     assert!(fixture.frames().await.is_empty());
-    let pending = IncomingAttach::new(request(19), fixture.sessions[&1].identity.clone());
+    let pending = IncomingAttach::new(request(19), fixture.sessions[&1].identity.clone(), 19);
     fixture
         .sessions
         .get_mut(&1)

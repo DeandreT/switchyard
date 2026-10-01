@@ -214,6 +214,12 @@ async fn cancelled_planning_preserves_session(grant_session: bool) -> TestResult
     )
     .await?;
     assert!(matches!(peer.read().await?, Frame::Amqp {
+        channel: 0, performative: Some(Performative::Attach(attach)), payload,
+    } if attach.name == "reused-link" && attach.handle == 0 && attach.role == Role::Sender
+        && attach.initial_delivery_count == Some(0) && attach.snd_settle_mode == SenderSettleMode::Mixed
+        && attach.rcv_settle_mode == ReceiverSettleMode::First && attach.source.is_none() && attach.target.is_none()
+        && attach.unsettled.is_none() && !attach.incomplete_unsettled && payload.is_empty()));
+    assert!(matches!(peer.read().await?, Frame::Amqp {
         channel: 0, performative: Some(Performative::Detach(detach)), ..
     } if detach.handle == 0 && detach.closed && detach.error.is_none()));
 

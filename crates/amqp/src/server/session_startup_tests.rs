@@ -276,6 +276,15 @@ async fn pending_detach_starts_wire_session_then_cancels_only_that_approval() {
         fixture.assert_begin(5).await;
         let (channel, performative) = fixture.frame().await;
         assert_eq!(channel, 5);
+        let Performative::Attach(response) = performative else {
+            panic!("pending cancellation first publishes its own Attach");
+        };
+        assert_eq!(response.handle, 1);
+        assert_eq!(response.role, role.opposite());
+        assert!(response.source.is_none());
+        assert!(response.target.is_none());
+        let (channel, performative) = fixture.frame().await;
+        assert_eq!(channel, 5);
         let Performative::Detach(detach) = performative else {
             panic!("pending link Detach acknowledgement");
         };

@@ -119,7 +119,19 @@ impl Fixture {
     }
 
     fn pending(&mut self, handle: u32, role: Role) -> IncomingAttach {
-        let receipt = IncomingAttach::new(request(handle, role), self.session().identity.clone());
+        let receipt = IncomingAttach::new(
+            request(handle, role),
+            self.session().identity.clone(),
+            handle,
+        );
+        self.session_mut().handle_aliases.insert(
+            handle,
+            super::link_handles::HandleAlias {
+                identity: receipt.approval().link_identity().clone(),
+                peer_handle: Some(handle),
+                own_attach_sent: false,
+            },
+        );
         self.session_mut()
             .pending_attaches
             .insert(handle, PendingLinkFlow::incoming(&receipt));
@@ -444,9 +456,15 @@ async fn peer_pending_detach_retires_the_exact_receipt_without_tombstoning_repla
         let frames = fixture.output.frames().await;
         assert!(matches!(frames.as_slice(), [Frame::Amqp {
             channel: CHANNEL,
+            performative: Some(Performative::Attach(response)),
+            payload: attach_payload,
+        }, Frame::Amqp {
+            channel: CHANNEL,
             performative: Some(Performative::Detach(detach)),
             payload,
-        }] if detach.handle == HANDLE && detach.closed && detach.error.is_none() && payload.is_empty()));
+        }] if response.handle == HANDLE && response.role == role.opposite() && response.source.is_none()
+            && response.target.is_none() && attach_payload.is_empty()
+            && detach.handle == HANDLE && detach.closed && detach.error.is_none() && payload.is_empty()));
         fixture.output.clear();
 
         let fresh = fixture.pending(HANDLE, role);

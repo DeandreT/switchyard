@@ -1130,6 +1130,9 @@ async fn detached_pending_attach_rejects_late_approval_before_the_handle_can_be_
     )
     .await
     .expect("peer cancels before approval");
+    assert!(matches!(next_frame(&mut peer).await, Frame::Amqp {
+        performative: Some(Performative::Attach(response)), ..
+    } if response.handle == 0 && response.role == Role::Sender && response.source.is_none() && response.target.is_none()));
     assert!(matches!(
         next_frame(&mut peer).await,
         Frame::Amqp {
@@ -1212,6 +1215,9 @@ async fn pending_handle_reuse_before_stale_approval_is_safe_without_affecting_ot
     )
     .await
     .expect("peer cancellation");
+    assert!(matches!(next_frame(&mut peer).await, Frame::Amqp {
+        performative: Some(Performative::Attach(response)), ..
+    } if response.handle == 0 && response.role == Role::Sender && response.source.is_none() && response.target.is_none()));
     assert!(matches!(
         next_frame(&mut peer).await,
         Frame::Amqp {
@@ -1479,8 +1485,7 @@ async fn client_peer_end_retires_associated_session_and_releases_pending_attach_
 
 #[cfg(feature = "test-client")]
 #[tokio::test]
-async fn pending_sender_counts_must_agree_before_client_attach_and_peer_detach_cancels_pending_reply()
- {
+async fn unpublished_client_flow_refuses_the_session_and_associated_peer_detach_retires_the_link() {
     let (mut connection, mut peer) = client_pair().await;
     let mut session = client_begin(&mut connection, &mut peer).await;
     let refusing = async {
@@ -1515,11 +1520,11 @@ async fn pending_sender_counts_must_agree_before_client_attach_and_peer_detach_c
             ..
         } = next_frame(&mut peer).await
         else {
-            panic!("disagreeing pre-Attach sender counters refuse session");
+            panic!("unpublished peer handle refuses the session");
         };
         assert_eq!(
             end.error.expect("count error").condition.as_symbol(),
-            Symbol::from("amqp:invalid-field")
+            Symbol::from("amqp:session:unattached-handle")
         );
         write_amqp(
             &mut peer,
@@ -1534,7 +1539,7 @@ async fn pending_sender_counts_must_agree_before_client_attach_and_peer_detach_c
         tokio::join!(session.attach_receiver("pending-count", "queue"), refusing)
     })
     .await
-    .expect("pending count rejection unblocks caller");
+    .expect("unpublished peer handle rejection unblocks caller");
     assert!(matches!(rejected, Err(EngineError::RemoteDetached)));
     let mut healthy = client_begin(&mut connection, &mut peer).await;
     let refusing = async {
@@ -1546,6 +1551,15 @@ async fn pending_sender_counts_must_agree_before_client_attach_and_peer_detach_c
         else {
             panic!("pending sender Attach");
         };
+        let response = attach.response(attach.source.clone(), attach.target.clone());
+        write_amqp(
+            &mut peer,
+            channel,
+            Performative::Attach(Box::new(response)),
+            Vec::new(),
+        )
+        .await
+        .expect("peer publishes its handle before detaching the link");
         write_amqp(
             &mut peer,
             channel,
@@ -1557,7 +1571,7 @@ async fn pending_sender_counts_must_agree_before_client_attach_and_peer_detach_c
             Vec::new(),
         )
         .await
-        .expect("peer cancels pending Attach");
+        .expect("peer detaches the associated link");
         assert!(matches!(
             next_frame(&mut peer).await,
             Frame::Amqp {
@@ -1566,19 +1580,23 @@ async fn pending_sender_counts_must_agree_before_client_attach_and_peer_detach_c
             }
         ));
     };
-    let (rejected, ()) = timeout(DEADLINE, async {
+    let (accepted, ()) = timeout(DEADLINE, async {
         tokio::join!(healthy.attach_sender("pending-detach", "queue"), refusing)
     })
     .await
-    .expect("peer Detach unblocks pending caller");
-    assert!(matches!(rejected, Err(EngineError::RemoteDetached)));
+    .expect("peer Detach retires the associated link promptly");
+    let mut detached = accepted.expect("the valid Attach response resolves before peer Detach");
+    assert!(matches!(
+        detached.send(Message::data(vec![1])).await,
+        Err(EngineError::RemoteDetached)
+    ));
     connection.shutdown().await;
 }
 
 #[cfg(feature = "test-client")]
 #[tokio::test]
-async fn client_sender_attach_must_match_cached_count_and_stale_send_does_not_close_other_sessions()
-{
+async fn client_sender_count_must_match_negotiated_attach_and_stale_send_does_not_close_other_sessions()
+ {
     let (mut connection, mut peer) = client_pair().await;
     let mut session = client_begin(&mut connection, &mut peer).await;
     let refusing = async {
@@ -1590,6 +1608,19 @@ async fn client_sender_attach_must_match_cached_count_and_stale_send_does_not_cl
         else {
             panic!("pending receiver Attach");
         };
+        let mut response = attach.response(attach.source.clone(), attach.target.clone());
+        response.initial_delivery_count = Some(8);
+        write_amqp(
+            &mut peer,
+            channel,
+            Performative::Attach(Box::new(response)),
+            Vec::new(),
+        )
+        .await
+        .expect("peer negotiates initial sender count");
+        assert!(matches!(next_frame(&mut peer).await, Frame::Amqp {
+            performative: Some(Performative::Flow(flow)), ..
+        } if flow.handle == Some(attach.handle) && flow.delivery_count == Some(8)));
         write_amqp(
             &mut peer,
             channel,
@@ -1605,23 +1636,13 @@ async fn client_sender_attach_must_match_cached_count_and_stale_send_does_not_cl
             Vec::new(),
         )
         .await
-        .expect("cached first sender count");
-        let mut response = attach.response(attach.source.clone(), attach.target.clone());
-        response.initial_delivery_count = Some(8);
-        write_amqp(
-            &mut peer,
-            channel,
-            Performative::Attach(Box::new(response)),
-            Vec::new(),
-        )
-        .await
-        .expect("mismatching actual sender count");
+        .expect("sender count disagrees after its handle is published");
         let Frame::Amqp {
             performative: Some(Performative::End(end)),
             ..
         } = next_frame(&mut peer).await
         else {
-            panic!("mismatching Attach must refuse before granting receiver credit");
+            panic!("mismatching published sender count refuses the session");
         };
         assert_eq!(
             end.error.expect("count mismatch").condition.as_symbol(),
@@ -1636,12 +1657,16 @@ async fn client_sender_attach_must_match_cached_count_and_stale_send_does_not_cl
         .await
         .expect("End acknowledgment");
     };
-    let (rejected, ()) = timeout(DEADLINE, async {
+    let (accepted, ()) = timeout(DEADLINE, async {
         tokio::join!(session.attach_receiver("cached-count", "queue"), refusing)
     })
     .await
-    .expect("mismatch unblocks attach caller");
-    assert!(matches!(rejected, Err(EngineError::InvalidState(_))));
+    .expect("published count mismatch retires the receiver promptly");
+    let mut retired = accepted.expect("the valid Attach response resolves before the invalid Flow");
+    assert!(matches!(
+        retired.recv().await,
+        Err(EngineError::RemoteDetached)
+    ));
     let mut old_session = client_begin(&mut connection, &mut peer).await;
     let accepting = async {
         let Frame::Amqp {

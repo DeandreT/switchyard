@@ -82,7 +82,20 @@ async fn accept_sender(
     let requested = IncomingAttach::new(
         receiver_attach(handle, maximum, mode),
         session.identity.clone(),
+        handle,
     );
+    sessions
+        .get_mut(&CHANNEL)
+        .expect("session fixture")
+        .handle_aliases
+        .insert(
+            handle,
+            super::link_handles::HandleAlias {
+                identity: requested.approval().link_identity().clone(),
+                peer_handle: Some(handle),
+                own_attach_sent: false,
+            },
+        );
     sessions
         .get_mut(&CHANNEL)
         .expect("session fixture")
@@ -429,6 +442,16 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
             receiver_settle_mode: ReceiverSettleMode::First,
         }),
     );
+    for handle in [0, 1] {
+        session.handle_aliases.insert(
+            handle,
+            super::link_handles::HandleAlias {
+                identity: session.links[&handle].identity().clone(),
+                peer_handle: Some(handle),
+                own_attach_sent: true,
+            },
+        );
+    }
     let mut sessions = HashMap::from([(CHANNEL, session)]);
     receive_transfer(
         CHANNEL,
@@ -470,6 +493,7 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
             attach: Box::new(IncomingAttach::new(
                 receiver_attach(0, None, SenderSettleMode::Settled),
                 sessions[&CHANNEL].identity.clone(),
+                0,
             )),
             max_message_size: 1_024,
             properties: None,

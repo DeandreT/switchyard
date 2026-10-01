@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot, watch};
 use url::Url;
 
+use super::link_handles::vacant_handle;
 use super::session_channels::vacant_channel;
 use super::*;
 use crate::{Source, Target};
@@ -936,7 +937,7 @@ where
                                 }
                             };
                         let Frame::Amqp { channel, performative, payload } = frame else { break };
-                        let Some(performative) = performative else { continue };
+                        let Some(mut performative) = performative else { continue };
                         if activity.is_closing() && !matches!(&performative, Performative::Close(_)) {
                             continue;
                         }
@@ -978,26 +979,69 @@ where
                                 continue;
                             }
                         };
+                        let input_handle = match &performative {
+                            Performative::Flow(flow) => flow.handle,
+                            Performative::Transfer(transfer) => Some(transfer.handle),
+                            Performative::Detach(detach) => Some(detach.handle),
+                            _ => None,
+                        };
+                        if let Some(peer_handle) = input_handle {
+                            let Some(handle) = sessions.get(&channel)
+                                .and_then(|session| local_handle_for_peer(peer_handle, session))
+                            else {
+                                refuse_session(channel, "amqp:session:unattached-handle", "frame on an unassigned peer link handle", &mut writer, &mut sessions).await?;
+                                fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
+                                continue;
+                            };
+                            match &mut performative {
+                                Performative::Flow(flow) => flow.handle = Some(handle),
+                                Performative::Transfer(transfer) => transfer.handle = handle,
+                                Performative::Detach(detach) => detach.handle = handle,
+                                _ => unreachable!("only link performatives carry an input handle"),
+                            }
+                        }
                             let result = match performative {
                                 Performative::Begin(begin) => {
                                     let pending = pending_begins.remove(&channel).expect("validated pending begin");
                                     let session = sessions.get_mut(&channel).expect("validated initiated session");
                                     session.peer_channel = Some(peer_channel);
+                                    session.remote_handle_max = begin.handle_max;
                                     session.flow = SessionWindow::new(0, begin.next_outgoing_id, begin.incoming_window, begin.outgoing_window, SESSION_WINDOW);
                                     let _ = pending.reply.send(Ok((channel, pending.identity)));
                                     Ok(false)
                                 }
                                 Performative::Attach(attach) => {
                                     let attach = *attach;
+                                    if sessions.get(&channel).is_some_and(|session| session.handle_aliases.values().any(|alias| alias.peer_handle == Some(attach.handle))) {
+                                        refuse_session(channel, "amqp:session:handle-in-use", "peer link handle is already assigned", &mut writer, &mut sessions).await?;
+                                        fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
+                                        continue;
+                                    }
                                     let matches = pending_attaches.get(&attach.name).is_some_and(|pending| {
                                         pending.channel == channel && sessions.get(&channel).is_some_and(|session| {
                                             !session.ending && !pending.session.is_retired()
                                                 && session.identity.same_session(&pending.session)
+                                                && session.handle_aliases.get(&pending.handle).is_some_and(|alias| {
+                                                    alias.identity.same_link(pending.link.identity()) && alias.peer_handle.is_none() && alias.own_attach_sent
+                                                })
                                         })
                                     });
                                     if !matches { continue; }
+                                    let pending = pending_attaches.get(&attach.name).expect("validated pending attach");
+                                    let role_matches = matches!((&pending.link, &attach.role), (LinkState::Sending(_), Role::Receiver) | (LinkState::Receiving(_), Role::Sender));
+                                    if !role_matches {
+                                        refuse_session(channel, "amqp:invalid-field", "attach response has the wrong role", &mut writer, &mut sessions).await?;
+                                        fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
+                                        continue;
+                                    }
+                                    if attach.role == Role::Sender && attach.initial_delivery_count.is_none() {
+                                        refuse_session(channel, "amqp:invalid-field", "sender attach has no initial delivery count", &mut writer, &mut sessions).await?;
+                                        fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
+                                        continue;
+                                    }
                                     let default_outcome = source_default_outcome(attach.source.as_ref())?;
                                     if let Some(pending) = pending_attaches.remove(&attach.name) {
+                                        sessions.get_mut(&channel).expect("validated pending session").handle_aliases.get_mut(&pending.handle).expect("validated pending handle alias").peer_handle = Some(attach.handle);
                                         let pending_flow = sessions
                                             .get_mut(&channel)
                                             .and_then(|session| session.pending_attaches.remove(&pending.handle));
@@ -1080,6 +1124,7 @@ where
                                     Ok(false)
                                 }
                                 Performative::Detach(detach) => {
+                                    let alias_identity = sessions.get(&channel).and_then(|session| session.handle_aliases.get(&detach.handle)).map(|alias| alias.identity.clone());
                                     let pending_name = pending_attaches.iter().find_map(|(name, pending)| {
                                         (pending.channel == channel && pending.handle == detach.handle).then_some(name.clone())
                                     });
@@ -1112,6 +1157,11 @@ where
                                             }),
                                             Vec::new(),
                                         ).await?;
+                                    }
+                                    if let Some(session) = sessions.get_mut(&channel)
+                                        && let Some(identity) = alias_identity
+                                    {
+                                        remove_handle_alias(session, detach.handle, &identity);
                                     }
                                     Ok(false)
                                 }
@@ -1238,7 +1288,18 @@ where
                                     let next_handle = next_handles
                                         .get_mut(&channel)
                                         .expect("live initiated session has a handle counter");
-                                    let handle = *next_handle;
+                                    if session.pending_attaches.len() == MAX_PENDING_ATTACHES || pending_attaches.contains_key(&request.name) {
+                                        let _ = reply.send(Err(invalid_state("pending attach limit reached or name is already assigned")));
+                                        continue;
+                                    }
+                                    if link_slot_count(session) >= MAX_LINKS_PER_SESSION || connection_slots >= MAX_LINKS_PER_CONNECTION {
+                                        let _ = reply.send(Err(invalid_state("link lifecycle slot limit reached")));
+                                        continue;
+                                    }
+                                    let Some(handle) = vacant_handle(*next_handle, session.remote_handle_max, session) else {
+                                        let _ = reply.send(Err(invalid_state("peer link handle limit reached")));
+                                        continue;
+                                    };
                                     let attach = Attach {
                                         name: request.name.clone(),
                                         handle,
@@ -1255,25 +1316,14 @@ where
                                         desired_capabilities: None,
                                         properties: None,
                                     };
-                                    if session.links.contains_key(&handle) || session.closing_handles.contains(&handle) {
-                                        let _ = reply.send(Err(invalid_state("link handle is attached or awaiting detach acknowledgement")));
-                                        continue;
-                                    }
-                                    if session.pending_attaches.contains_key(&handle) || session.pending_attaches.len() == MAX_PENDING_ATTACHES || pending_attaches.contains_key(&request.name) {
-                                        let _ = reply.send(Err(invalid_state("pending attach limit reached or name is already assigned")));
-                                        continue;
-                                    }
-                                    if link_slot_count(session) >= MAX_LINKS_PER_SESSION || connection_slots >= MAX_LINKS_PER_CONNECTION {
-                                        let _ = reply.send(Err(invalid_state("link lifecycle slot limit reached")));
-                                        continue;
-                                    }
                                     let peer_role = attach.role.opposite();
                                     let attach_frame = Frame::Amqp { channel, performative: Some(Performative::Attach(Box::new(attach))), payload: Vec::new() };
                                     if let Err(error) = writer.encoded_frame(&attach_frame) {
                                         let _ = reply.send(Err(error.into()));
                                         continue;
                                     }
-                                    *next_handle = next_handle.wrapping_add(1);
+                                    *next_handle = if handle == session.remote_handle_max { 0 } else { handle + 1 };
+                                    session.handle_aliases.insert(handle, HandleAlias { identity: identity.clone(), peer_handle: None, own_attach_sent: false });
                                     let link = match request.role {
                                         Role::Sender => {
                                             LinkState::Sending(Box::new(SendingLink {
@@ -1308,7 +1358,9 @@ where
                                     };
                                     session.pending_attaches.insert(handle, PendingLinkFlow::new(peer_role, None));
                                     pending_attaches.insert(request.name, PendingAttach { channel, session: owner, handle, reply, link, consumption });
-                                    writer.write_frame(&attach_frame).await.map_err(Into::into)
+                                    writer.write_frame(&attach_frame).await?;
+                                    session.handle_aliases.get_mut(&handle).expect("published pending handle alias").own_attach_sent = true;
+                                    Ok(())
                                 }
                                 ClientCommand::Send {
                                     channel,
@@ -1497,3 +1549,7 @@ where
 #[cfg(test)]
 #[path = "client_channel_tests.rs"]
 mod channel_tests;
+
+#[cfg(test)]
+#[path = "link_handle_client_tests.rs"]
+mod handle_tests;

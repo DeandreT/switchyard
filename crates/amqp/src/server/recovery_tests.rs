@@ -56,6 +56,14 @@ impl Fixture {
                     receiver_settle_mode: ReceiverSettleMode::First,
                 }),
             );
+            session.handle_aliases.insert(
+                handle,
+                super::link_handles::HandleAlias {
+                    identity: session.links[&handle].identity().clone(),
+                    peer_handle: Some(handle),
+                    own_attach_sent: true,
+                },
+            );
             receivers.push(receiver);
             if handle == 0 {
                 affected_detached = Some(observed_detached);
