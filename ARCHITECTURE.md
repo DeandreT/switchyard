@@ -23,6 +23,7 @@ and subscription management operations. Both pinned .NET gates cover immediate
 topic publications and independent subscription workflows. Session-required
 subscriptions reuse entity-local session ownership and state, while ordinary
 subscriptions retain session identifiers without session-affine delivery.
+Read-only management browsing can inspect all sessions without acquiring a hold.
 Topic scheduling, rules, and Azure administration remain unimplemented. Native
 administration creates and reads topology, lists topics and subscriptions, and
 updates queues; the timer worker covers

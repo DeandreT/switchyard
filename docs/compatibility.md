@@ -26,7 +26,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Queue send, receive, and settlement | Pre-1.0 | State machine |
 | Atomic message batch send | Pre-1.0 | State machine, AMQP producer mapping, Rust clients on both backends and both pinned .NET batch APIs |
 | Message properties and AMQP body preservation | Pre-1.0 | State machine and AMQP mapping; typed properties, application values, annotations, footer and all body kinds. Rust clients on both backends and official .NET property gate |
-| Peek without lock acquisition | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
+| Peek without lock acquisition | Pre-1.0 | State machine and AMQP management, including entity-wide session browsing; Rust clients on both backends and both pinned .NET clients |
 | Receive-delete | Pre-1.0 | State machine, AMQP mapping |
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -150,10 +150,13 @@ policies:
   [session-wide TTL expiry](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sessions#message-expiration);
   this increment does not add that policy.
 
-Peeking a session-required queue or subscription currently requires a session
-identifier and filters to that session. Browsing all sessions through an ordinary
-receiver's management link remains unimplemented; Azure supports
-[that read-only browse](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-troubleshooting-guide#how-to-browse-session-messages-across-all-sessions).
+An ordinary receiver can browse all sessions in a session-required queue or
+subscription through its management link, without attaching a data receiver or
+acquiring a session. This matches the documented
+[read-only browse](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-troubleshooting-guide#how-to-browse-session-messages-across-all-sessions).
+A supplied session identifier filters the same sequence-ordered scan; it is
+still invalid on an entity that does not require sessions. Browsing does not
+relax session ownership for ordinary or deferred receive.
 
 Queue settings can be patched atomically with the parent and its dead-letter
 shadow in the same batch. An omitted setting is unchanged; an explicit unlimited
@@ -721,6 +724,14 @@ condition an SDK keys its behaviour off. A receiving link's settle mode selects
 the delivery guarantee: unsettled is peek-lock, pre-settled is receive-delete.
 Peeking is served through the entity's `$management` request/reply links and
 returns encoded AMQP messages without touching their broker state.
+Each peek inspects at most 256 stored records and retains the existing response
+budget. It leaves message states, delivery counts, ready indexes, session holds,
+and the persisted clock unchanged, even when skipping expired ready messages.
+It still passes through the normal proposal timestamp checks; it is not an
+unstamped metadata read. Listen authorization applies to the management link's
+entity. An absent `session-id` requests entity-wide browsing, while a present
+non-string or invalid identifier is refused before broker submission. An
+associated receiver link is not required and cannot redirect the browse.
 Receiving transfers encode the number of preceding acquisitions, so the official
 .NET client reports 1 on the first receive and 2 after abandonment and redelivery.
 Peek retains the stored acquisition count without the client's receive increment.
