@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Send, both batch-send APIs, peek, receive, abandon/defer/dead-letter property updates, renew, complete, schedule, cancel, duplicate detection and message properties; session renew/state/scheduling | Planned | Experimental gate on 7.21.0 |
+| Official .NET SDK, current stable | Queue and topic send, both batch-send APIs, subscription receive/peek/renew/defer/complete/dead-letter, queue scheduling/cancellation, duplicate detection and message properties; queue session renew/state/scheduling | Planned | Experimental gate on 7.21.0 |
 | Official .NET SDK, previous stable | Same gated workflows as current | Planned | Experimental gate on 7.20.2 |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -31,7 +31,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | State-machine topology and atomic immediate default-true fanout; sessions, scheduling, subscription protocol routing and administration not implemented |
+| Topics and subscriptions | Pre-1.0 | Atomic immediate default-true fanout, AMQP subscription and dead-letter routing, Rust clients on both backends and both pinned .NET clients; topic sessions, scheduling, rules and administration not implemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -202,9 +202,29 @@ Topic scheduling and all session-bearing publications are explicitly
 unimplemented. A topic with any session-enabled subscription refuses the whole
 publication, including a duplicate-only or empty batch. Batch publications with
 any scheduled timestamp are refused, even when that timestamp is already due.
-Plain producer addresses use the same send commands, but topic SDK workflows
-are not yet gated. Subscription link routing, native topic administration, and
-rules remain unimplemented.
+Plain producer addresses resolve committed metadata and permit queue or topic
+send. Ordinary topic receivers and senders to subscriptions or dead-letter
+queues are refused. Subscription receivers use
+`topic/subscriptions/name`; their dead-letter receivers add `/$deadletterqueue`,
+and either target can add `/$management` for request/reply operations. Reserved
+control segments are case-insensitive, including the SDK's `/Subscriptions/`
+and `/$DeadLetterQueue` forms; user topic and subscription names remain exact.
+A literal topic path ending in `Subscriptions` and a member named
+`Subscriptions` remain valid. Malformed or nested subscription paths are
+refused rather than routed as ordinary queues.
+
+Link planning reads typed metadata through the serialized owner without
+consulting the clock, writing storage, or acquiring a message or session lock.
+Missing targets are refused before transfers. Malformed values, dangling
+membership or dead-letter projections, and conflicting entity kinds retain
+their errors instead of becoming absent targets. Authentication precedes this
+read, so an unauthorized connection cannot probe entity existence through the
+metadata lookup. Session-enabled subscription data receivers are explicitly
+refused before acquiring a session hold; their session-free dead-letter queues
+remain receivable. Topic management links can attach, but topic peek currently
+returns the existing queue-not-found refusal and topic scheduling returns
+`amqp:not-implemented`; neither claims a topic workflow.
+Native topic administration and rules remain unimplemented.
 
 Identifier allocation refuses exhaustion instead of saturating and reusing a
 stored identity. Sequence numbers are limited to `i64::MAX`, preserving exact
@@ -234,7 +254,8 @@ cleanup or vice versa. Topics receive only duplicate-history expiry commands.
 Each index gets at most eight bounded command rounds per sweep. Discovery reads
 do not stamp commands or advance the applied clock.
 
-An AMQP 1.0 client can reach a queue. The node accepts AMQP over TLS with the
+An AMQP 1.0 client can reach queues, topic producers, and subscription receivers.
+The node accepts AMQP over TLS with the
 socket secured before the protocol handshake, as Service Bus port 5671
 requires. Plain TCP remains available only in development mode. A configured
 shared-access policy accepts either SASL PLAIN credentials or SASL ANONYMOUS
@@ -243,6 +264,16 @@ grants are scoped to a namespace or entity and to Send, Listen, or Manage; they
 authorize links connection-wide and close an open link when its token expires.
 A connection without a valid grant gets 20 seconds to complete CBS
 authorization. JWT, OIDC, and mTLS are not implemented.
+AMQP resource scopes normalize only recognized subscription, dead-letter, and
+management control segments, never user names. Namespace and parent grants
+inherit to their children; exact dead-letter or management grants do not grant
+access to the parent or siblings. A management link retains its complete
+`/$management` scope for per-request authorization rather than dropping the
+endpoint suffix. SAS signatures still cover the original encoded audience;
+scope normalization does not rewrite signed bytes. Scoped TLS/CBS socket tests
+cover these boundaries separately from the namespace-wide SDK gates.
+Native administration retains literal, case-sensitive scopes, including
+primary entity names that happen to end in AMQP control words.
 The listener has local defaults of 128 live connections, including unfinished
 security handshakes, and one 10-second deadline covering TLS, SASL, and AMQP Open.
 Excess sockets are refused; handshake progress does not restart that deadline.
@@ -730,7 +761,11 @@ and cancellation, duplicate detection for ordinary and scheduled sends, plus
 session state, renewal, receive, completion, and scheduling. Both gates exercise
 message properties, application-property CLR types, footer data, a lifetime
 longer than the AMQP header can represent, and property-preserving redelivery;
-the rest of those client gates remains incomplete.
+both also exercise immediate topic fanout, independent subscription settlement,
+peek, lock renewal, deferral, deferred receive, dead-letter reasons and property
+updates, and both topic batch-send APIs with ingress duplicate detection. These
+gates cover the local shared-sequence policy, not cloud parity for that policy.
+Topic sessions, scheduling, filters/actions, and administration remain ungated.
 
 The SDK gates build into separate temporary directories and run the resulting
 assemblies directly. Run them explicitly with
