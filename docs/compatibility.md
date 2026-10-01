@@ -861,10 +861,21 @@ tokens. Explicit topic and subscription kinds use separate tokens bound to the
 namespace, entity kind, and subscription parent. Pages are ordered and exclusive,
 with a default size of 100 and a maximum of 1,024. Topic discovery scans one
 bounded index page; subscription listing validates all at most 32 members before
-slicing a page. Queue listing hides subscription backings and all shadows; it
-still fills visible pages by scanning successive bounded index pages, so its
-total hidden-row work is not yet capped. All token families have a 512-byte
-ceiling and reject noncanonical or cross-context tokens before owner reads.
+slicing a page. Queue listing hides subscription backings and all shadows. Each
+request discovers at most 4,096 physical queue-index rows, counting backend
+lookahead, over at most 16 owner discovery turns. These bounds apply to queue
+discovery, not the subsequent metadata reads for returned entities. A request
+that reaches either budget before exhaustion may return a partial or empty page
+with an opaque `queue.scan.v1.` progress token. That token resumes exclusively
+after the last consumed raw row, never after an unseen lookahead row; a deleted
+marker remains a valid keyset position. Clients must continue while the token is
+nonempty, regardless of the number of entities in the page. Ordinary visible
+lookahead still emits the existing `v1.` token, whose decoding is unchanged.
+All token families have a 512-byte ceiling and reject cross-context tokens before
+owner reads. Topic, subscription, and queue-progress tokens also require
+canonical base64 and protobuf encodings. A hidden path in a queue-progress token
+is only a cursor position; it never authorizes or returns that entity through
+queue listing.
 
 Local defaults admit 128 sockets and 128 concurrent requests across service clones,
 with at most 32 HTTP/2 streams per connection, a 10-second TLS handshake deadline,

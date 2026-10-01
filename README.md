@@ -113,6 +113,10 @@ cargo run -p switchyardctl -- \
   subscription list events
 ```
 
+Listing is exhausted only when `next_page_token` is empty. Queue discovery has a
+per-request work budget, so an empty page may still carry a token; pass it to the
+next list request with `--page-token` to continue.
+
 HTTPS requires `--ca-certificate`; use `--tls-server-name` when connecting through a
 local address that differs from the certificate name. Supply a Manage SAS token
 with `--token-file`, never on the command line. Authenticated administration

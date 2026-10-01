@@ -189,6 +189,8 @@ message Entity {
 
 message ListEntitiesResponse {
   repeated Entity entities = 1;
+  // Opaque continuation. An empty entity page can still have a continuation;
+  // listing is exhausted only when this token is empty.
   string next_page_token = 2;
 }
 
