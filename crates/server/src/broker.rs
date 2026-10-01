@@ -36,7 +36,11 @@ use crate::{AdminTarget, Clock, LocalProposer, ProposeError};
 mod admin_reads;
 mod atomic_messaging;
 mod bindings;
+mod guarded_atomic_messaging;
 mod protocol;
+mod request_queue;
+
+pub use guarded_atomic_messaging::GuardedAtomicSubmitError;
 
 /// Commands that may be waiting ahead of a caller's own.
 ///
@@ -46,6 +50,12 @@ mod protocol;
 const COMMAND_QUEUE_DEPTH: usize = 1_024;
 
 enum Request {
+    ApplyAtomicMessagingGuarded {
+        binding: EntityBinding,
+        kinds: Vec<CommandKind>,
+        ticket: protocol_amqp::AtomicCommitTicket,
+        reply: flume::Sender<Result<domain::AtomicMessagingApplication, GuardedAtomicSubmitError>>,
+    },
     ApplyAtomicMessaging {
         binding: EntityBinding,
         kinds: Vec<CommandKind>,
@@ -244,7 +254,7 @@ fn makes_deliverable(outcome: &CommandOutcome) -> bool {
 /// onto the same owner.
 #[derive(Clone, Debug)]
 pub struct BrokerHandle {
-    requests: flume::Sender<Request>,
+    requests: request_queue::RequestSender,
     watchers: Arc<Watchers>,
 }
 
@@ -515,7 +525,7 @@ pub struct Broker {
 impl Broker {
     /// Starts the owner thread for `proposer`.
     pub fn spawn<S: StateStore, C: Clock>(proposer: LocalProposer<S, C>) -> Self {
-        let (requests, incoming) = flume::bounded::<Request>(COMMAND_QUEUE_DEPTH);
+        let (requests, incoming) = request_queue::bounded(COMMAND_QUEUE_DEPTH);
         let watchers = Arc::new(Watchers::default());
         let watching = Arc::clone(&watchers);
         let owner = thread::Builder::new()
@@ -523,6 +533,14 @@ impl Broker {
             .spawn(move || {
                 while let Ok(request) = incoming.recv() {
                     match request {
+                        Request::ApplyAtomicMessagingGuarded {
+                            binding,
+                            kinds,
+                            ticket,
+                            reply,
+                        } => guarded_atomic_messaging::apply_guarded(
+                            &proposer, &watching, binding, kinds, ticket, reply,
+                        ),
                         Request::ApplyAtomicMessaging {
                             binding,
                             kinds,

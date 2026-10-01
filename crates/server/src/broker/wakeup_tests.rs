@@ -70,7 +70,7 @@ async fn one_broadcast_wakes_both_polled_and_unpolled_registrations() {
 async fn factory_futures_capture_a_broadcast_before_their_first_poll() {
     let watchers = Arc::new(Watchers::default());
     let (namespace, entity) = target();
-    let (requests, _receiver) = flume::bounded(1);
+    let (requests, _receiver) = super::request_queue::bounded(1);
     let handle = BrokerHandle {
         requests,
         watchers: watchers.clone(),
