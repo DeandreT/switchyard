@@ -281,6 +281,22 @@ returns after writing its outcome, not after that acknowledgement. A sender
 settling before the application finishes suppresses an unnecessary response;
 partial deliveries retain their aliases until completion or abort. Completing
 sender-settled deliveries need no outcome or retained alias.
+Outgoing sends and explicit second-mode acknowledgement receipts also retain
+their original link generation. A stale sender cannot send or close a
+replacement link, and a receipt cannot acknowledge a different delivery that
+reuses its numeric ID. Owned terminal acknowledgements are repeatable no-ops
+only while that original endpoint remains open. Explicit receipt methods borrow
+the receipt, so an oversized rejection leaves it available for a smaller retry;
+the exact pending receipt is removed only after writing and flushing its sender
+disposition successfully. The test client automatically writes a state-less,
+settled sender acknowledgement before reporting a second-mode send outcome,
+even if the caller has dropped its waiting future. An early receiver outcome
+waits for the final Transfer before that acknowledgement. First-mode, pre-settled,
+and initially receiver-settled outcomes do not emit redundant acknowledgements.
+Later state-less receiver settlement and source default-outcome handling remain
+unfinished.
+Local client Detach retires the endpoint before waiting for the peer's reply;
+repeated closes are local no-ops and cannot enqueue another Detach.
 The negotiated sender mode is enforced at completion, with aborted transfers
 implicitly settled. A per-transfer receiver mode defaults to the negotiated
 mode on the completing frame, rather than becoming sticky from an earlier
