@@ -360,6 +360,28 @@ its known error name receives scoped not-implemented End without replacement
 allocation. This is the native conservative policy for the overlapping
 [link-error and duplicate-handle rules](https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html),
 not an implementation of link resumption.
+Live names are also reserved by exact, case-sensitive name and canonical local
+direction across a connection's sessions. Current pending and installed links,
+including ordinary closes awaiting mapped Detach acknowledgement, hold that
+reservation. A normal acknowledgement or session End releases it; error-name
+history follows the separate lifetime above. The scan uses existing bounded
+aliases rather than another retained-name registry, and ignores ending sessions,
+orphaned or foreign-generation aliases, and error-detached reservations.
+A fresh peer handle claiming an already-live name in the same direction receives
+scoped session End with `amqp:not-implemented`, without replacing the original
+endpoint, publishing an approval, or adding error-name history. An original
+endpoint on another session remains usable. This is an explicit refusal of
+unsupported link stealing, not the occupied-handle Close rule; occupied handles
+and known error names retain their earlier classification priority. A local
+client duplicate returns `InvalidState` before cursor advancement or output.
+Opposite directions and case-distinct names remain independent.
+Client pending replies are indexed by exact name and local direction, then
+checked against their mapped session generation. Opposite-role same-name pending
+links can therefore coexist. An exact directional entry on another session is
+ignored without consuming it or falling back to the other role. Only when that
+entry is absent can a current-session opposite-role entry receive the existing
+invalid-field refusal for a wrong-role reply. Cleanup retires only the owning
+session's entries in either direction.
 Error Detach also retains the exact owners of known live delivery IDs in separate
 incoming and outgoing session indexes. Each direction holds at most 4,096 IDs;
 admitting more ends only that session with `amqp:resource-limit-exceeded` rather
@@ -374,7 +396,7 @@ after header and format validation, exact ledger reservation, and successful
 credit admission; rejected attempts and continuations do not reassign it.
 Normal closes do not create these records. Already released successful or
 pre-settled delivery IDs are not tracked. Link and delivery resumption,
-general live-link name uniqueness and stealing remain unfinished.
+cross-connection name ownership and stealing remain unfinished.
 Session windows count Transfer frames independently of link delivery counts.
 Incoming windows replenish after bounded frame processing; receive links grant
 32 message slots and return credit only as the application consumes a delivery
