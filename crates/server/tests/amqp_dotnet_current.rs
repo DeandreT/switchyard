@@ -234,6 +234,31 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
             },
         )?;
     }
+    let sql_topic = domain::EntityPath::new("orders-topic-sql")?;
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        sql_topic.clone(),
+        CommandKind::CreateTopic {
+            config: TopicConfig::default(),
+        },
+    )?;
+    for name in ["Alpha", "beta", "healthy"] {
+        broker.handle().submit_blocking(
+            namespace.clone(),
+            sql_topic.clone(),
+            CommandKind::CreateSubscription {
+                name: SubscriptionName::new(name)?,
+                config: if name == "beta" {
+                    SubscriptionConfig {
+                        dead_lettering_on_filter_evaluation_exceptions: false,
+                        ..SubscriptionConfig::default()
+                    }
+                } else {
+                    SubscriptionConfig::default()
+                },
+            },
+        )?;
+    }
     let _timer = TestTimer::start(broker.handle());
 
     let rule = SharedAccessRule::new(
@@ -334,6 +359,7 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
         "topic schedule/cancel/parent browse/timer/TTL/new sequence/dedup passed",
         "scheduled topic session/ordinary/independent SDLQ copies passed",
         "rule manager/default/true/false/correlation/types/null/OR/batch/current activation rules passed",
+        "SQL source/descriptors/numeric/case/LIKE/Unknown/OR/batches/current activation/local filter-error policy passed",
     ] {
         assert!(
             String::from_utf8_lossy(&output.stdout).contains(marker),
@@ -510,6 +536,50 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
                     .scan_prefix(&domain::keys::session_lock_prefix(&namespace, &target), 1)?
                     .is_empty(),
                 "rule SDK cleanup left an active hold in {target}"
+            );
+        }
+    }
+    for prefix in [
+        domain::keys::message_prefix(&namespace, &sql_topic),
+        domain::keys::scheduled_prefix(&namespace, &sql_topic),
+    ] {
+        assert!(
+            store.scan_prefix(&prefix, 1)?.is_empty(),
+            "SQL SDK workflow left parent retention in {sql_topic}"
+        );
+    }
+    for name in ["Alpha", "beta", "healthy"] {
+        let name = SubscriptionName::new(name)?;
+        let rules =
+            broker
+                .handle()
+                .rules_blocking(namespace.clone(), sql_topic.clone(), name.clone())?;
+        assert_eq!(
+            rules.len(),
+            1,
+            "SQL SDK cleanup left unexpected rules for {name}"
+        );
+        assert_eq!(rules[0].name.as_str(), "$Default");
+        assert_eq!(rules[0].filter, RuleFilter::True);
+        let entity = sql_topic.subscription(&name)?;
+        for target in [entity.clone(), entity.dead_letter_queue()?] {
+            assert!(
+                store
+                    .scan_prefix(&domain::keys::message_prefix(&namespace, &target), 1)?
+                    .is_empty(),
+                "SQL SDK workflow left retained messages in {target}"
+            );
+            assert!(
+                store
+                    .scan_prefix(&domain::keys::scheduled_prefix(&namespace, &target), 1)?
+                    .is_empty(),
+                "SQL SDK workflow left a pending schedule in {target}"
+            );
+            assert!(
+                store
+                    .scan_prefix(&domain::keys::session_lock_prefix(&namespace, &target), 1)?
+                    .is_empty(),
+                "SQL SDK cleanup left an active hold in {target}"
             );
         }
     }
