@@ -267,6 +267,17 @@ cap, but now uses the same borrowed traversal and structural limits. The native
 send path uses the shared connection allowance before allocating its payload,
 including when a peer advertises no maximum. Unencoded command contents and
 performative metadata conversions still need separate resource policies.
+Both connection drivers queue at most 16 complete decoded frame results, rather
+than 256. A saturated queue stops further reads until the actor makes room; the
+reader can hold one additional complete frame waiting to enqueue, and an actor
+handling a frame can hold one more. Those 18 frame slots have an encoded-content
+envelope of about 4.5 MiB at the default 256 KiB receive frame limit, or 72 MiB
+when the test client selects the 4 MiB ceiling. This is separate from retained
+message content accounting and is not a heap bound: decoded metadata expansion,
+object overhead, transient codec/conversion copies, and socket buffers are
+additional. Existing per-frame decode limits remain in force. Cancellation
+aborts and joins the reader and drops the queued results without draining more
+wire input.
 Frames on channels above the locally advertised limit receive a framing-error
 Close without refreshing receive activity. Asymmetric channel/handle routing
 remains a separate unfinished feature.
