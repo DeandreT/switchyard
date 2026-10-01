@@ -1,6 +1,6 @@
 //! Queue identifiers remain exact at the signed Service Bus wire boundary.
 
-use std::{error::Error, time::Duration};
+use std::{error::Error, fmt::Display, future::Future, time::Duration};
 
 use amqp::{
     ApplicationProperties, Array, Body, ClientConnection, ClientReceiver, ClientSender,
@@ -19,6 +19,16 @@ use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const DEADLINE: Duration = Duration::from_secs(5);
+
+async fn bounded<T, E: Display>(
+    operation: &str,
+    future: impl Future<Output = Result<T, E>>,
+) -> TestResult<T> {
+    timeout(DEADLINE, future)
+        .await
+        .map_err(|error| std::io::Error::other(format!("{operation}: {error}")))?
+        .map_err(|error| std::io::Error::other(format!("{operation}: {error}")).into())
+}
 
 struct Node<P: StoreProvider> {
     broker: Broker,
@@ -403,6 +413,10 @@ async fn signed_boundary<P: StoreProvider>(provider: P) -> TestResult {
 }
 
 async fn exhausted_locks<P: StoreProvider>(provider: P) -> TestResult {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     let node = Node::start(
         provider,
         QueueCounters {
@@ -412,31 +426,46 @@ async fn exhausted_locks<P: StoreProvider>(provider: P) -> TestResult {
         true,
     )
     .await?;
-    let mut connection = node.connect().await?;
-    let mut session = ClientSession::begin(&mut connection).await?;
+    let mut connection = bounded("connect", node.connect()).await?;
+    let mut session = bounded("begin", ClientSession::begin(&mut connection)).await?;
     let before = node.snapshot()?;
-    let mut receiver = ClientReceiver::attach(&mut session, "counter-receiver", "orders").await?;
+    let mut receiver = bounded(
+        "attach exhausted receiver",
+        ClientReceiver::attach(&mut session, "counter-receiver", "orders"),
+    )
+    .await?;
     let error = timeout(DEADLINE, receiver.recv())
         .await?
         .expect_err("no lock token can be allocated");
     assert!(matches!(error, EngineError::RemoteDetached), "{error}");
     assert_eq!(node.snapshot()?, before);
-    let mut other = ClientSender::attach(&mut session, "unaffected-sender", "other").await?;
+    let mut other = bounded(
+        "attach unaffected sender",
+        ClientSender::attach(&mut session, "unaffected-sender", "other"),
+    )
+    .await?;
     assert!(matches!(
-        other.send(Message::data(b"unaffected".to_vec())).await?,
+        bounded(
+            "send unaffected",
+            other.send(Message::data(b"unaffected".to_vec()))
+        )
+        .await?,
         Outcome::Accepted(_)
     ));
-    let mut drain = ClientReceiver::builder()
-        .name("delete-receiver")
-        .source("orders")
-        .sender_settle_mode(SenderSettleMode::Settled)
-        .attach(&mut session)
-        .await?;
-    let delivery = timeout(DEADLINE, drain.recv()).await??;
+    let mut drain = bounded(
+        "attach delete receiver",
+        ClientReceiver::builder()
+            .name("delete-receiver")
+            .source("orders")
+            .sender_settle_mode(SenderSettleMode::Settled)
+            .attach(&mut session),
+    )
+    .await?;
+    let delivery = bounded("receive delete", drain.recv()).await?;
     assert_eq!(sequence(delivery.message()), Some(&Value::Long(1)));
-    drain.close().await?;
-    session.end().await?;
-    connection.close().await?;
+    bounded("close delete receiver", drain.close()).await?;
+    bounded("end", session.end()).await?;
+    bounded("close", connection.close()).await?;
     Ok(())
 }
 

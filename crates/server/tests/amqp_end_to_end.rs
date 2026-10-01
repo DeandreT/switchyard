@@ -841,6 +841,15 @@ fn schedule_request_body(messages: &[Message]) -> Result<OrderedMap<Value, Value
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_schedules_peeks_cancels_and_receives_after_activation()
 -> Result<(), Box<dyn Error>> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        scheduled_message_workflow(),
+    )
+    .await
+    .expect("scheduling workflow completes")
+}
+
+async fn scheduled_message_workflow() -> Result<(), Box<dyn Error>> {
     let node = Node::start("orders", QueueConfig::default()).await?;
     let mut connection = node.connect().await?;
     let mut session = Session::begin(&mut connection).await?;
@@ -1001,11 +1010,21 @@ async fn a_client_schedules_peeks_cancels_and_receives_after_activation()
         Some(&Value::Timestamp(2_000_i64.into()))
     );
     receiver.accept(&delivery).await?;
-    receiver.close().await?;
-    requests.close().await?;
-    responses.close().await?;
-    session.end().await?;
-    connection.close().await?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), receiver.close())
+        .await
+        .expect("scheduled receiver close completes")?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), requests.close())
+        .await
+        .expect("scheduling request link close completes")?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), responses.close())
+        .await
+        .expect("scheduling response link close completes")?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), session.end())
+        .await
+        .expect("scheduling session end completes")?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), connection.close())
+        .await
+        .expect("scheduling connection close completes")?;
     Ok(())
 }
 
