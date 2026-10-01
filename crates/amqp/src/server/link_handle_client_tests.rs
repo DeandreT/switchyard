@@ -493,34 +493,122 @@ async fn pending_and_closing_local_handles_respect_zero_peer_maximum_until_exact
 }
 
 #[tokio::test]
-async fn duplicate_peer_handle_cannot_claim_another_pending_link_and_spares_a_sibling_session() {
-    let (mut connection, session, mut peer) = pair(1).await;
-    let healthy = begin(&mut connection, &mut peer, 0).await;
-    let mut first = pending(&session, &mut peer, "first", Role::Sender).await;
-    let second = pending(&session, &mut peer, "second", Role::Sender).await;
-    answer(&mut peer, &session, &mut first, 7).await;
-    let mut response = second
-        .request
-        .response(second.request.source.clone(), second.request.target.clone());
-    response.handle = 7;
-    write_amqp(
-        &mut peer,
-        17,
-        Performative::Attach(Box::new(response)),
-        Vec::new(),
-    )
-    .await
-    .expect("duplicate peer handle response");
-    assert_end(&mut peer, 0, "amqp:session:handle-in-use").await;
-    assert!(matches!(
-        timeout(DEADLINE, second.reply)
+async fn duplicate_live_or_closing_peer_handle_closes_every_session_and_pending_caller() {
+    for closing in [false, true] {
+        let (mut connection, session, mut peer) = pair(1).await;
+        let sibling = begin(&mut connection, &mut peer, 0).await;
+        let mut first = pending(&session, &mut peer, "first", Role::Sender).await;
+        answer(&mut peer, &session, &mut first, 7).await;
+        let pending_detach = if closing {
+            let (reply, result) = oneshot::channel();
+            session
+                .commands
+                .send(ClientCommand::Detach {
+                    channel: session.channel,
+                    handle: first.request.handle,
+                    identity: first.identity.clone(),
+                    reply,
+                })
+                .await
+                .expect("local Detach");
+            assert!(matches!(
+                frame(&mut peer).await,
+                (0, Performative::Detach(Detach { handle: 0, .. }), _)
+            ));
+            Some(result)
+        } else {
+            None
+        };
+        let second = pending(&session, &mut peer, "second", Role::Sender).await;
+        assert_eq!(second.request.handle, 1);
+        let sibling_pending = pending(&sibling, &mut peer, "sibling-pending", Role::Sender).await;
+        let (reply, pending_begin) = oneshot::channel();
+        connection
+            .commands
+            .send(ClientCommand::Begin { reply })
             .await
-            .expect("prompt rejected alias")
-            .expect("Attach reply"),
-        Err(EngineError::RemoteDetached)
-    ));
-    assert!(first.identity.is_retired());
-    assert!(second.identity.is_retired());
-    assert!(!healthy.identity.is_retired());
-    cleanup(connection).await;
+            .expect("pending Begin command");
+        assert!(matches!(
+            frame(&mut peer).await,
+            (
+                2,
+                Performative::Begin(Begin {
+                    remote_channel: None,
+                    ..
+                }),
+                _
+            )
+        ));
+        let mut response = second
+            .request
+            .response(second.request.source.clone(), second.request.target.clone());
+        response.handle = 7;
+        write_amqp(
+            &mut peer,
+            17,
+            Performative::Attach(Box::new(response)),
+            Vec::new(),
+        )
+        .await
+        .expect("duplicate peer handle response");
+        let (channel, performative, payload) = frame(&mut peer).await;
+        assert_eq!(channel, 0);
+        assert!(payload.is_empty());
+        assert!(
+            crate::encode_frame(&Frame::Amqp {
+                channel,
+                performative: Some(performative.clone()),
+                payload
+            })
+            .expect("Close encoding")
+            .len()
+                <= 512
+        );
+        let Performative::Close(close) = performative else {
+            panic!("duplicate peer handle closes without session End");
+        };
+        assert_eq!(
+            close.error.expect("Close error").condition.as_symbol(),
+            Symbol::from("amqp:session:handle-in-use")
+        );
+        assert!(matches!(
+            timeout(DEADLINE, second.reply)
+                .await
+                .expect("prompt rejected alias")
+                .expect("Attach reply"),
+            Err(EngineError::RemoteClosed)
+        ));
+        assert!(matches!(
+            timeout(DEADLINE, sibling_pending.reply)
+                .await
+                .expect("prompt sibling rejection")
+                .expect("Attach reply"),
+            Err(EngineError::RemoteClosed)
+        ));
+        assert!(matches!(
+            timeout(DEADLINE, pending_begin)
+                .await
+                .expect("prompt Begin rejection")
+                .expect("Begin reply"),
+            Err(EngineError::RemoteClosed)
+        ));
+        if let Some(reply) = pending_detach {
+            assert!(matches!(
+                timeout(DEADLINE, reply)
+                    .await
+                    .expect("prompt Detach rejection")
+                    .expect("Detach reply"),
+                Err(EngineError::RemoteClosed)
+            ));
+        }
+        assert!(first.identity.is_retired());
+        assert!(second.identity.is_retired());
+        assert!(sibling_pending.identity.is_retired());
+        assert!(session.identity.is_retired());
+        assert!(sibling.identity.is_retired());
+        assert!(*first.detached.borrow());
+        assert!(*sibling_pending.detached.borrow());
+        silent(&mut peer).await;
+        cleanup(connection).await;
+    }
 }

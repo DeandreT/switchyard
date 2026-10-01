@@ -359,7 +359,6 @@ async fn immediate_peer_end_starts_wire_session_before_ack_and_never_starts_unkn
 #[tokio::test]
 async fn preapproval_refusals_start_wire_session_then_end_without_publishing_pending_links() {
     for (case, condition) in [
-        (0, "amqp:session:handle-in-use"),
         (1, "amqp:resource-limit-exceeded"),
         (2, "amqp:invalid-field"),
         (3, "amqp:session:unattached-handle"),
@@ -367,13 +366,6 @@ async fn preapproval_refusals_start_wire_session_then_end_without_publishing_pen
         let mut fixture = Fixture::new(32);
         fixture.begin(9).await;
         match case {
-            0 => {
-                for _ in 0..2 {
-                    fixture
-                        .input(9, Performative::Attach(Box::new(attach(0, Role::Sender))))
-                        .await;
-                }
-            }
             1 => {
                 for handle in 0..MAX_PENDING_ATTACHES as u32 {
                     fixture
@@ -414,7 +406,7 @@ async fn preapproval_refusals_start_wire_session_then_end_without_publishing_pen
                     .input(9, Performative::Transfer(unattached_transfer()))
                     .await;
             }
-            _ => unreachable!("four refusal cases"),
+            _ => unreachable!("three session refusal cases"),
         }
         fixture.assert_begin(9).await;
         fixture.assert_end(9, Some(condition)).await;
@@ -442,6 +434,53 @@ async fn preapproval_refusals_start_wire_session_then_end_without_publishing_pen
         fixture.assert_begin(10).await;
         fixture.assert_silent().await;
     }
+}
+
+#[tokio::test]
+async fn duplicate_preapproval_attach_closes_without_begin_and_retires_all_session_owners() {
+    let mut fixture = Fixture::new(32);
+    fixture.begin(9).await;
+    fixture.begin(10).await;
+    fixture
+        .input(9, Performative::Attach(Box::new(attach(0, Role::Sender))))
+        .await;
+    let pending = fixture.sessions[&9].pending_attaches[&0]
+        .approval
+        .as_ref()
+        .expect("pending approval")
+        .clone();
+    let owners = [
+        fixture.sessions[&9].identity.clone(),
+        fixture.sessions[&10].identity.clone(),
+    ];
+    assert!(matches!(
+        fixture
+            .input_result(9, Performative::Attach(Box::new(attach(0, Role::Sender))))
+            .await
+            .expect("duplicate Attach response"),
+        FrameAction::CloseSent
+    ));
+    let (channel, performative) = fixture.frame().await;
+    assert_eq!(channel, 0);
+    let Performative::Close(close) = performative else {
+        panic!("duplicate peer handle closes the connection without a Begin");
+    };
+    assert_eq!(
+        close.error.expect("Close error").condition.as_symbol(),
+        Symbol::from("amqp:session:handle-in-use")
+    );
+    assert!(pending.link_identity().is_retired());
+    for (channel, owner) in [(9, &owners[0]), (10, &owners[1])] {
+        assert!(owner.is_retired());
+        assert!(!fixture.sessions[&channel].local_begin_sent);
+        assert!(fixture.sessions[&channel].pending_attach_events.is_empty());
+        assert!(fixture.sessions[&channel].pending_attaches.is_empty());
+        assert!(fixture.sessions[&channel].handle_aliases.is_empty());
+        let (result, mut approvals) = fixture.approve(channel).await;
+        assert!(matches!(result, Err(EngineError::RemoteDetached)));
+        assert!(approvals.try_recv().is_err());
+    }
+    fixture.assert_silent().await;
 }
 
 #[tokio::test]

@@ -1013,8 +1013,9 @@ where
                                 Performative::Attach(attach) => {
                                     let attach = *attach;
                                     if sessions.get(&channel).is_some_and(|session| session.handle_aliases.values().any(|alias| alias.peer_handle == Some(attach.handle))) {
-                                        refuse_session(channel, "amqp:session:handle-in-use", "peer link handle is already assigned", &mut writer, &mut sessions).await?;
-                                        fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
+                                        refuse_connection("amqp:session:handle-in-use", "peer link handle is already assigned", &mut writer, &mut sessions).await?;
+                                        fail_pending_connection(&mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
+                                        pump_ready = false;
                                         continue;
                                     }
                                     let matches = pending_attaches.get(&attach.name).is_some_and(|pending| {

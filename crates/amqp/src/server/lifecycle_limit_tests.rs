@@ -598,20 +598,40 @@ async fn recovery_refusal_owns_one_closing_slot_and_capacity_precedes_another_re
 async fn existing_handle_error_has_priority_over_capacity_and_does_not_publish_a_receipt() {
     let mut fixture = Fixture::new();
     fixture.seed_session(0, MAX_LINKS_PER_SESSION, true);
-    fixture.attach(0, 0).await;
+    fixture.seed_session(1, 1, true);
+    let owner = fixture.sessions[&0].identity.clone();
+    let sibling = fixture.sessions[&1].identity.clone();
+    assert!(matches!(
+        fixture
+            .input(0, Performative::Attach(Box::new(request(0))))
+            .await
+            .expect("duplicate handle refusal"),
+        FrameAction::CloseSent
+    ));
     let frames = fixture.frames().await;
     assert_eq!(frames.len(), 1);
     let Frame::Amqp {
-        performative: Some(Performative::End(end)),
+        channel: 0,
+        performative: Some(Performative::Close(close)),
         ..
     } = &frames[0]
     else {
-        panic!("handle-in-use End")
+        panic!("handle-in-use connection Close")
     };
     assert_eq!(
-        end.error.as_ref().expect("End error").condition.as_symbol(),
+        close
+            .error
+            .as_ref()
+            .expect("Close error")
+            .condition
+            .as_symbol(),
         Symbol::from("amqp:session:handle-in-use")
     );
     assert!(fixture.sessions[&0].pending_attaches.is_empty());
     assert!(fixture.sessions[&0].pending_attach_events.is_empty());
+    assert!(owner.is_retired());
+    assert!(sibling.is_retired());
+    assert!(fixture.sessions[&0].links.is_empty());
+    assert!(fixture.sessions[&1].links.is_empty());
+    assert!(fixture.incoming.try_recv().is_err());
 }

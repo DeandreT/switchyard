@@ -122,7 +122,7 @@ impl Fixture {
             &self.incoming,
             &mut self.sessions,
             512,
-            0,
+            u16::MAX,
             false,
         )
         .await
@@ -160,6 +160,30 @@ impl Fixture {
         session
             .pending_attaches
             .insert(local, PendingLinkFlow::incoming(&receipt));
+        receipt
+    }
+
+    fn seed_sibling(&mut self) -> IncomingAttach {
+        let mut session = SessionState::new(&Begin {
+            handle_max: 0,
+            ..Begin::default()
+        });
+        session.peer_channel = Some(18);
+        session.local_begin_sent = true;
+        let receipt = IncomingAttach::new(request(88, Role::Receiver), session.identity.clone(), 0);
+        session.handle_aliases.insert(
+            0,
+            HandleAlias {
+                identity: receipt.approval().link_identity().clone(),
+                peer_handle: Some(88),
+                own_attach_sent: false,
+            },
+        );
+        session
+            .pending_attaches
+            .insert(0, PendingLinkFlow::incoming(&receipt));
+        session.pending_attach_events.push_back(receipt.clone());
+        assert!(self.sessions.insert(1, session).is_none());
         receipt
     }
 
@@ -219,6 +243,30 @@ impl Fixture {
         assert!(payload.is_empty());
         assert_eq!(
             end.error.as_ref().expect("End error").condition.as_symbol(),
+            Symbol::from(condition)
+        );
+    }
+
+    async fn assert_close(&self, condition: &str) {
+        let frames = self.frames().await;
+        let [
+            Frame::Amqp {
+                channel: 0,
+                performative: Some(Performative::Close(close)),
+                payload,
+            },
+        ] = frames.as_slice()
+        else {
+            panic!("one bounded connection Close: {frames:?}");
+        };
+        assert!(payload.is_empty());
+        assert_eq!(
+            close
+                .error
+                .as_ref()
+                .expect("Close error")
+                .condition
+                .as_symbol(),
             Symbol::from(condition)
         );
     }
@@ -576,15 +624,172 @@ async fn peer_handle_collision_has_priority_over_the_exhausted_local_output_rang
     ] {
         let mut fixture = Fixture::new(0);
         let receipt = fixture.attach(7, Role::Receiver).await;
-        fixture
-            .input(
+        let sibling = fixture.seed_sibling();
+        let action = fixture
+            .input_result(
                 Performative::Attach(Box::new(request(peer, Role::Receiver))),
                 Vec::new(),
             )
-            .await;
-        fixture.assert_end(condition).await;
+            .await
+            .expect("Attach refusal");
+        if peer == 7 {
+            assert!(matches!(action, FrameAction::CloseSent));
+            fixture.assert_close(condition).await;
+            assert!(fixture.sessions[&1].identity.is_retired());
+            assert!(sibling.approval().link_identity().is_retired());
+        } else {
+            assert!(matches!(action, FrameAction::Continue));
+            fixture.assert_end(condition).await;
+            assert!(!fixture.sessions[&1].identity.is_retired());
+            assert!(!sibling.approval().link_identity().is_retired());
+        }
         assert!(fixture.attaches.try_recv().is_err());
         assert!(receipt.approval().link_identity().is_retired());
-        assert!(fixture.sessions[&0].ending);
+        assert!(fixture.sessions[&0].identity.is_retired());
+    }
+}
+
+#[tokio::test]
+async fn duplicate_pending_installed_or_closing_alias_closes_and_retires_every_owner() {
+    for state in 0..3 {
+        let mut fixture = Fixture::new(0);
+        let receipt = fixture.attach(7, Role::Receiver).await;
+        let owner = receipt.approval().link_identity().clone();
+        if state > 0 {
+            fixture
+                .approve(receipt.clone())
+                .await
+                .0
+                .expect("installed link");
+            fixture.frames().await;
+        }
+        if state == 2 {
+            let (reply, result) = oneshot::channel();
+            handle_command(
+                Command::Detach {
+                    channel: 0,
+                    handle: 0,
+                    identity: owner.clone(),
+                    error: None,
+                    reply,
+                },
+                &mut fixture.writer,
+                &mut fixture.sessions,
+                512,
+            )
+            .await
+            .expect("local Detach");
+            result.await.expect("Detach reply").expect("Detach success");
+            fixture.frames().await;
+            assert!(fixture.sessions[&0].closing_handles.contains(&0));
+            assert!(owner.is_retired());
+            assert_eq!(local_handle_for_peer(7, &fixture.sessions[&0]), Some(0));
+        }
+        let sibling = fixture.seed_sibling();
+        let sessions = [
+            fixture.sessions[&0].identity.clone(),
+            fixture.sessions[&1].identity.clone(),
+        ];
+        let mut duplicate = request(7, Role::Sender);
+        duplicate.name = "different-name".to_owned();
+        assert!(matches!(
+            fixture
+                .input_result(Performative::Attach(Box::new(duplicate)), Vec::new())
+                .await
+                .expect("duplicate response"),
+            FrameAction::CloseSent
+        ));
+        fixture.assert_close("amqp:session:handle-in-use").await;
+        assert!(owner.is_retired());
+        assert!(sibling.approval().link_identity().is_retired());
+        assert!(sessions.iter().all(SessionIdentity::is_retired));
+        assert!(fixture.attaches.try_recv().is_err());
+        for session in fixture.sessions.values() {
+            assert!(session.links.is_empty());
+            assert!(session.pending_attaches.is_empty());
+            assert!(session.pending_attach_events.is_empty());
+            assert!(session.handle_aliases.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn oversized_close_preflight_preserves_all_exact_owners_without_writing() {
+    let mut fixture = Fixture::new(0);
+    let receipt = fixture.attach(7, Role::Receiver).await;
+    let sibling = fixture.seed_sibling();
+    let result = refuse_connection(
+        "amqp:session:handle-in-use",
+        "x".repeat(2048),
+        &mut fixture.writer,
+        &mut fixture.sessions,
+    )
+    .await;
+    let Err(EngineError::Io(error)) = result else {
+        panic!("oversized Close preflight must fail");
+    };
+    let limit = error
+        .get_ref()
+        .and_then(|error| error.downcast_ref::<super::frame_writer::FrameWriteError>())
+        .expect("typed frame limit");
+    assert_eq!(limit.maximum, 512);
+    assert!(limit.actual > limit.maximum);
+    assert!(fixture.frames().await.is_empty());
+    assert_eq!(fixture.output.flushes.load(Ordering::Acquire), 0);
+    for (local, pending) in [(0, &receipt), (1, &sibling)] {
+        let session = &fixture.sessions[&local];
+        assert!(!session.identity.is_retired());
+        assert!(!pending.approval().link_identity().is_retired());
+        assert!(
+            session.handle_aliases[&0]
+                .identity
+                .same_link(pending.approval().link_identity())
+        );
+        assert!(Arc::ptr_eq(
+            session.pending_attaches[&0]
+                .approval
+                .as_ref()
+                .expect("pending approval"),
+            pending.approval()
+        ));
+    }
+}
+
+#[tokio::test]
+async fn failed_or_cancelled_duplicate_close_flush_retires_all_connection_owners() {
+    for fail in [false, true] {
+        let mut fixture = Fixture::new(0);
+        let receipt = fixture.attach(7, Role::Receiver).await;
+        let sibling = fixture.seed_sibling();
+        let sessions = [
+            fixture.sessions[&0].identity.clone(),
+            fixture.sessions[&1].identity.clone(),
+        ];
+        fixture.output.stop_at.store(1, Ordering::Release);
+        fixture
+            .output
+            .fail
+            .store(usize::from(fail), Ordering::Release);
+        let result = timeout(
+            Duration::from_millis(20),
+            fixture.input_result(
+                Performative::Attach(Box::new(request(7, Role::Sender))),
+                Vec::new(),
+            ),
+        )
+        .await;
+        if fail {
+            assert!(matches!(result, Ok(Err(EngineError::Io(_)))));
+        } else {
+            assert!(result.is_err());
+        }
+        fixture.assert_close("amqp:session:handle-in-use").await;
+        assert!(sessions.iter().all(SessionIdentity::is_retired));
+        assert!(receipt.approval().link_identity().is_retired());
+        assert!(sibling.approval().link_identity().is_retired());
+        assert!(fixture.attaches.try_recv().is_err());
+        assert!(fixture.sessions.values().all(
+            |session| session.handle_aliases.is_empty() && session.pending_attaches.is_empty()
+        ));
     }
 }

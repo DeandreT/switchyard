@@ -1351,6 +1351,7 @@ async fn run_connection<Io>(
                                 activity.is_closing(),
                             ).await {
                                 Ok(FrameAction::Continue) => pump_ready = true,
+                                Ok(FrameAction::CloseSent) => pump_ready = false,
                                 Ok(FrameAction::Closed) => {
                                     for reply in closing_replies.drain(..) {
                                         let _ = reply.send(Ok(()));
@@ -1452,6 +1453,7 @@ async fn run_connection<Io>(
 
 enum FrameAction {
     Continue,
+    CloseSent,
     Closed,
 }
 
@@ -1610,14 +1612,14 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                 .values()
                 .any(|alias| alias.peer_handle == Some(peer_handle))
             {
-                refuse_session(
-                    channel,
+                refuse_connection(
                     "amqp:session:handle-in-use",
                     "link handle is already assigned",
                     writer,
                     sessions,
                 )
                 .await?;
+                return Ok(FrameAction::CloseSent);
             } else if link_slot_count(session) >= MAX_LINKS_PER_SESSION
                 || connection_slots >= MAX_LINKS_PER_CONNECTION
             {
