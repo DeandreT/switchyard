@@ -28,7 +28,7 @@ use domain::{
 use protocol_amqp::{Attachment, EntityMetadata};
 use storage::StateStore;
 use thiserror::Error;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, futures::OwnedNotified};
 use tracing::debug;
 
 use crate::{AdminTarget, Clock, LocalProposer, ProposeError};
@@ -100,9 +100,9 @@ enum Request {
 /// Wakes the links waiting on an entity when a command makes it worth asking
 /// again.
 ///
-/// One notify per registered entity, permit-style. Registration precedes the
-/// receive, so a notification before polling the wait remains available. The
-/// last waiting future removes the entry when it completes or is canceled.
+/// One broadcast channel per registered entity. Each watch captures its
+/// notification before the receive, so even an unpolled wait observes the
+/// broadcast. The last completed or canceled watch removes the entry.
 #[derive(Debug, Default)]
 struct Watchers {
     entities: Mutex<HashMap<(NamespaceName, EntityPath), EntityWaiters>>,
@@ -117,12 +117,16 @@ struct EntityWaiters {
 struct EntityWatch {
     watchers: Arc<Watchers>,
     key: (NamespaceName, EntityPath),
+    notification: Option<OwnedNotified>,
+    #[cfg(test)]
     notify: Arc<Notify>,
 }
 
 impl EntityWatch {
-    async fn wait(self) {
-        self.notify.notified().await;
+    async fn wait(mut self) {
+        if let Some(notification) = self.notification.take() {
+            notification.await;
+        }
     }
 }
 
@@ -155,6 +159,8 @@ impl Watchers {
         EntityWatch {
             watchers: Arc::clone(self),
             key,
+            notification: Some(Arc::clone(&entry.notify).notified_owned()),
+            #[cfg(test)]
             notify: Arc::clone(&entry.notify),
         }
     }
@@ -168,7 +174,7 @@ impl Watchers {
             .map(|entry| Arc::clone(&entry.notify));
         // Waking a waiter can drop its registration, which takes the map lock.
         if let Some(notify) = notify {
-            notify.notify_one();
+            notify.notify_waiters();
         }
     }
 
@@ -675,6 +681,9 @@ pub enum SubmitError {
     #[error(transparent)]
     Propose(#[from] ProposeError),
 }
+
+#[cfg(test)]
+mod wakeup_tests;
 
 #[cfg(test)]
 mod tests {
