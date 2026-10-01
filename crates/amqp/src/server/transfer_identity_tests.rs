@@ -351,6 +351,7 @@ async fn oversized_outbound_tag_is_refused_before_credit_and_delivery_or_frame_i
             auto_acknowledge: false,
             max_message_size: None,
             receiver_settle_mode: ReceiverSettleMode::First,
+            default_outcome: None,
             settle_mode: SenderSettleMode::Settled,
             credit,
             queued: VecDeque::new(),

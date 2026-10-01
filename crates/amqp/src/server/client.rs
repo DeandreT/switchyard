@@ -949,6 +949,7 @@ where
                                         })
                                     });
                                     if !matches { continue; }
+                                    let default_outcome = source_default_outcome(attach.source.as_ref())?;
                                     if let Some(pending) = pending_attaches.remove(&attach.name) {
                                         let pending_flow = sessions
                                             .get_mut(&channel)
@@ -973,6 +974,7 @@ where
                                             LinkState::Sending(link) if attach.role == Role::Receiver => {
                                                 link.max_message_size = normalized_message_size(attach.max_message_size);
                                                 link.receiver_settle_mode = attach.rcv_settle_mode.clone();
+                                                link.default_outcome = default_outcome;
                                                 if let Some(pending_flow) = &pending_flow {
                                                     link.credit = pending_flow.credit.clone();
                                                 }
@@ -1222,6 +1224,7 @@ where
                                                 auto_acknowledge: true,
                                                 max_message_size: None,
                                                 receiver_settle_mode: request.receiver_settle_mode,
+                                                default_outcome: None,
                                                 settle_mode: request.sender_settle_mode,
                                                 credit: LinkCredit::new(0),
                                                 queued: VecDeque::new(),

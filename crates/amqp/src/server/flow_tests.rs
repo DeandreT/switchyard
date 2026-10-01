@@ -663,6 +663,7 @@ async fn wrapping_disposition_resolves_existing_ids_without_reusing_an_outstandi
             auto_acknowledge: false,
             max_message_size: None,
             receiver_settle_mode: ReceiverSettleMode::First,
+            default_outcome: None,
             settle_mode: SenderSettleMode::Unsettled,
             credit,
             queued: VecDeque::new(),
@@ -672,6 +673,7 @@ async fn wrapping_disposition_resolves_existing_ids_without_reusing_an_outstandi
                 OutgoingDelivery {
                     reply: old_reply,
                     outcome: None,
+                    receiver_settled: false,
                 },
             )]),
             pending_acknowledgements: HashMap::new(),

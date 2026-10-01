@@ -304,6 +304,35 @@ async fn cloned_approval_is_admitted_once_and_reuses_the_captured_endpoint_ident
 }
 
 #[tokio::test]
+async fn invalid_actor_source_default_preserves_the_exact_pending_approval_without_wire() {
+    for role in [Role::Sender, Role::Receiver] {
+        let mut fixture = Fixture::new();
+        let original = fixture.pending(HANDLE, role);
+        let session = fixture.session().identity.clone();
+        let mut invalid = original.clone();
+        invalid
+            .source
+            .as_mut()
+            .expect("source fixture")
+            .default_outcome = Some(DeliveryState::Received {
+            section_number: 0,
+            section_offset: 0,
+        });
+        assert!(matches!(
+            fixture.accept(&session, invalid).await,
+            Err(EngineError::InvalidState(reason)) if reason == "source default outcome must be terminal"
+        ));
+        fixture.output.assert_silent();
+        fixture.assert_pending(&original);
+        fixture
+            .accept(&session, original.clone())
+            .await
+            .expect("the original approval can retry without a default");
+        fixture.assert_approved(&original).await;
+    }
+}
+
+#[tokio::test]
 async fn stale_or_retired_receipt_cannot_consume_a_fresh_same_handle_approval() {
     for role in [Role::Sender, Role::Receiver] {
         for retire_old in [false, true] {

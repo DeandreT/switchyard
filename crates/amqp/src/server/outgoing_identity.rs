@@ -43,8 +43,8 @@ impl AckIdentity {
         self.0.settled.load(Ordering::Acquire)
     }
 
-    // The actor checks its exact pending token before IO and calls this only
-    // after the Sender acknowledgement frame has been written successfully.
+    // The actor commits an exact owned token after a flushed Sender ACK or
+    // after observing the peer receiver settle that pending delivery.
     pub(super) fn mark_settled(&self) {
         self.0.settled.store(true, Ordering::Release);
     }

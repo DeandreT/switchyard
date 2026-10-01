@@ -450,6 +450,7 @@ fn performative_to_value(performative: &Performative) -> io::Result<Value> {
                     .source
                     .as_ref()
                     .map(source_to_value)
+                    .transpose()?
                     .unwrap_or(Value::Null),
                 attach
                     .target
@@ -785,8 +786,15 @@ fn sasl_from_value(value: Value) -> io::Result<SaslPerformative> {
     })
 }
 
-fn source_to_value(source: &Source) -> Value {
-    described(
+fn source_to_value(source: &Source) -> io::Result<Value> {
+    let default_outcome = match source.default_outcome.as_ref() {
+        Some(state) => {
+            validate_default_outcome(state)?;
+            delivery_state_to_value(state)?
+        }
+        None => Value::Null,
+    };
+    Ok(described(
         SOURCE,
         list(vec![
             optional_string(&source.address),
@@ -805,17 +813,18 @@ fn source_to_value(source: &Source) -> Value {
                 .map(|value| Value::Symbol(value.clone()))
                 .unwrap_or(Value::Null),
             fields_to_value(&source.filter),
-            source
-                .default_outcome
-                .as_ref()
-                .map(delivery_state_to_value)
-                .transpose()
-                .unwrap_or(None)
-                .unwrap_or(Value::Null),
+            default_outcome,
             symbol_array(&source.outcomes),
             symbol_array(&source.capabilities),
         ]),
-    )
+    ))
+}
+
+fn validate_default_outcome(state: &DeliveryState) -> io::Result<()> {
+    if !state.is_terminal() {
+        return Err(invalid_data("source default outcome must be terminal"));
+    }
+    Ok(())
 }
 
 fn source_from_value(value: Value) -> io::Result<Source> {
@@ -835,7 +844,11 @@ fn source_from_value(value: Value) -> io::Result<Source> {
         filter: fields_field(&fields, 7)?,
         default_outcome: match field(&fields, 8) {
             Value::Null => None,
-            value => Some(delivery_state_from_value(value)?),
+            value => {
+                let state = delivery_state_from_value(value)?;
+                validate_default_outcome(&state)?;
+                Some(state)
+            }
         },
         outcomes: symbol_array_field(&fields, 9)?,
         capabilities: symbol_array_field(&fields, 10)?,
@@ -1751,6 +1764,126 @@ mod tests {
         };
         let encoded = encode_frame(&frame).expect("frame encodes");
         assert_eq!(decode_frame(&encoded).expect("frame decodes"), frame);
+    }
+
+    fn source_attach(source: Source) -> Attach {
+        Attach {
+            name: String::from("source-default"),
+            handle: 7,
+            role: Role::Sender,
+            snd_settle_mode: SenderSettleMode::Unsettled,
+            rcv_settle_mode: ReceiverSettleMode::Second,
+            source: Some(source),
+            target: Some(Target::new("orders")),
+            unsettled: None,
+            incomplete_unsettled: false,
+            initial_delivery_count: Some(0),
+            max_message_size: None,
+            offered_capabilities: None,
+            desired_capabilities: None,
+            properties: None,
+        }
+    }
+
+    #[test]
+    fn source_default_outcomes_round_trip_through_attach() {
+        let mut details = Fields::default();
+        details.insert(
+            Symbol::from("detail"),
+            Value::String(String::from("retained")),
+        );
+        for default_outcome in [
+            None,
+            Some(DeliveryState::Accepted(Accepted)),
+            Some(DeliveryState::Rejected(Rejected {
+                error: Some(Error::new(
+                    AmqpError::NotAllowed,
+                    "explicit source rejection",
+                    Some(details.clone()),
+                )),
+            })),
+            Some(DeliveryState::Released(Released)),
+            Some(DeliveryState::Modified(Modified {
+                delivery_failed: Some(true),
+                undeliverable_here: Some(false),
+                message_annotations: Some(details),
+            })),
+        ] {
+            let mut source = Source::new("orders");
+            source.default_outcome = default_outcome;
+            round_trip(Performative::Attach(Box::new(source_attach(source))));
+        }
+    }
+
+    #[test]
+    fn source_default_outcome_decode_rejects_nonterminal_received() {
+        let mut fields = vec![Value::Null; 9];
+        fields[0] = Value::String(String::from("orders"));
+        fields[8] = delivery_state_to_value(&DeliveryState::Received {
+            section_number: 1,
+            section_offset: 42,
+        })
+        .expect("Received remains valid as a delivery state");
+        let invalid_source = described(SOURCE, Value::List(fields));
+        let error = source_from_value(invalid_source.clone())
+            .expect_err("Source requires an outcome rather than a nonterminal state");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "source default outcome must be terminal");
+
+        let performative = Performative::Attach(Box::new(source_attach(Source::new("orders"))));
+        let (_, body) = take_described(performative_to_value(&performative).unwrap()).unwrap();
+        let mut attach_fields = take_list(body).unwrap();
+        attach_fields[5] = invalid_source;
+        let body = encode_value(&described(ATTACH, Value::List(attach_fields))).unwrap();
+        let mut bytes = encode_frame(&Frame::Amqp {
+            channel: 0,
+            performative: None,
+            payload: Vec::new(),
+        })
+        .unwrap();
+        bytes.extend(body);
+        let size = u32::try_from(bytes.len()).unwrap();
+        bytes[..4].copy_from_slice(&size.to_be_bytes());
+        let error =
+            decode_frame(&bytes).expect_err("malformed Attach source cannot reach admission");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "source default outcome must be terminal");
+    }
+
+    #[tokio::test]
+    async fn invalid_source_default_is_refused_before_writing_and_allows_valid_retry() {
+        let mut source = Source::new("orders");
+        source.default_outcome = Some(DeliveryState::Received {
+            section_number: 0,
+            section_offset: 0,
+        });
+        let mut frame = Frame::Amqp {
+            channel: 0,
+            performative: Some(Performative::Attach(Box::new(source_attach(source)))),
+            payload: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        assert_eq!(
+            write_frame(&mut bytes, &frame)
+                .await
+                .expect_err("invalid source defaults cannot emit a frame")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(bytes.is_empty());
+        let Frame::Amqp {
+            performative: Some(Performative::Attach(attach)),
+            ..
+        } = &mut frame
+        else {
+            unreachable!("Attach fixture");
+        };
+        attach.source.as_mut().expect("source").default_outcome =
+            Some(DeliveryState::Released(Released));
+        write_frame(&mut bytes, &frame)
+            .await
+            .expect("a terminal default remains encodable");
+        assert_eq!(decode_frame(&bytes).expect("valid retry decodes"), frame);
     }
 
     #[test]

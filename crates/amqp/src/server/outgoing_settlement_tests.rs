@@ -95,6 +95,7 @@ fn sending_link(identity: LinkIdentity, auto_acknowledge: bool) -> SendingLink {
         auto_acknowledge,
         max_message_size: None,
         receiver_settle_mode: ReceiverSettleMode::Second,
+        default_outcome: None,
         settle_mode: SenderSettleMode::Unsettled,
         credit: LinkCredit::new(0),
         queued: VecDeque::new(),
@@ -625,7 +626,8 @@ async fn automatic_acknowledgement_precedes_send_reply_and_survives_a_dropped_re
             ID,
             OutgoingDelivery {
                 reply,
-                outcome: Some((Outcome::Accepted(Accepted), true)),
+                outcome: Some(Outcome::Accepted(Accepted)),
+                receiver_settled: false,
             },
         );
         fixture.output.blocked_flush.store(true, Ordering::Release);
@@ -677,7 +679,8 @@ async fn automatic_acknowledgement_flush_failure_never_publishes_a_successful_se
         ID,
         OutgoingDelivery {
             reply,
-            outcome: Some((Outcome::Accepted(Accepted), true)),
+            outcome: Some(Outcome::Accepted(Accepted)),
+            receiver_settled: false,
         },
     );
     fixture.output.failed_flush.store(true, Ordering::Release);
@@ -725,6 +728,7 @@ async fn early_outcome_is_latched_until_final_transfer_then_automatically_acknow
         OutgoingDelivery {
             reply,
             outcome: None,
+            receiver_settled: false,
         },
     );
     link.active = Some(ActiveSend {
@@ -805,6 +809,7 @@ async fn automatic_policy_never_acknowledges_first_mode_or_already_settled_outco
                 OutgoingDelivery {
                     reply,
                     outcome: None,
+                    receiver_settled: false,
                 },
             );
             apply_disposition(

@@ -240,6 +240,8 @@ pub enum EngineError {
     RemoteClosed,
     #[error("the remote peer detached the link")]
     RemoteDetached,
+    #[error("the remote peer settled the delivery without reporting an outcome")]
+    RemoteSettledWithoutOutcome,
     #[error("the AMQP engine stopped")]
     Stopped,
     #[error("invalid AMQP state: {0}")]
@@ -688,6 +690,7 @@ impl ServerSession {
         if has_recovery_state(&attach) {
             return Err(invalid_state(RECOVERY_NOT_IMPLEMENTED));
         }
+        source_default_outcome(attach.source.as_ref())?;
         if attach.role == Role::Receiver && !decoders.is_default() {
             return Err(invalid_state(
                 "custom message-format decoders require a local receiving endpoint",
@@ -1127,6 +1130,7 @@ struct SendingLink {
     auto_acknowledge: bool,
     max_message_size: Option<u64>,
     receiver_settle_mode: ReceiverSettleMode,
+    default_outcome: Option<Outcome>,
     settle_mode: SenderSettleMode,
     credit: LinkCredit,
     queued: VecDeque<QueuedSend>,
@@ -1156,7 +1160,8 @@ struct ActiveSend {
 
 struct OutgoingDelivery {
     reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
-    outcome: Option<(Outcome, bool)>,
+    outcome: Option<Outcome>,
+    receiver_settled: bool,
 }
 
 struct SendOutcome {
@@ -1708,6 +1713,13 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             response.max_message_size =
                 (response.role == Role::Receiver).then_some(max_message_size);
             response.properties = properties;
+            let default_outcome = match source_default_outcome(response.source.as_ref()) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return Ok(CommandAction::Continue);
+                }
+            };
             let response_frame = Frame::Amqp {
                 channel,
                 performative: Some(Performative::Attach(Box::new(response.clone()))),
@@ -1795,6 +1807,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                             max_message_size: normalized_message_size(attach.max_message_size),
                             settle_mode: attach.snd_settle_mode,
                             receiver_settle_mode: attach.rcv_settle_mode,
+                            default_outcome,
                             credit,
                             queued: VecDeque::new(),
                             active: None,
@@ -3138,6 +3151,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
                 OutgoingDelivery {
                     reply: queued.reply,
                     outcome: None,
+                    receiver_settled: false,
                 },
             );
             None
@@ -3190,12 +3204,22 @@ async fn resolve_outgoing<W: AsyncWrite + Unpin>(
     if !link
         .unsettled
         .get(&id)
-        .is_some_and(|delivery| delivery.outcome.is_some())
+        .is_some_and(|delivery| delivery.outcome.is_some() || delivery.receiver_settled)
     {
         return Ok(());
     }
-    let delivery = link.unsettled.remove(&id).expect("latched outcome exists");
-    let (outcome, acknowledge) = delivery.outcome.expect("latched outcome exists");
+    let delivery = link
+        .unsettled
+        .remove(&id)
+        .expect("resolvable delivery exists");
+    let Some(outcome) = delivery.outcome.or_else(|| link.default_outcome.clone()) else {
+        let _ = delivery
+            .reply
+            .send(Err(EngineError::RemoteSettledWithoutOutcome));
+        return Ok(());
+    };
+    let acknowledge =
+        link.receiver_settle_mode == ReceiverSettleMode::Second && !delivery.receiver_settled;
     let mut acknowledgement = acknowledge.then(|| AckIdentity::new(&link.identity, id));
     if let Some(identity) = &acknowledgement {
         link.pending_acknowledgements.insert(id, identity.clone());
@@ -3231,20 +3255,46 @@ async fn apply_disposition<W: AsyncWrite + Unpin>(
         }
         return Ok(());
     }
-    let Some(state) = disposition.state else {
-        return Ok(());
-    };
-    let Ok(outcome) = Outcome::try_from(state) else {
-        return Ok(());
-    };
+    let outcome = disposition
+        .state
+        .and_then(|state| Outcome::try_from(state).ok());
     let last = disposition.last.unwrap_or(disposition.first);
     let Some(session) = sessions.get_mut(&channel) else {
         return Ok(());
     };
+    if session.ending || session.identity.is_retired() {
+        return Ok(());
+    }
     for link in session.links.values_mut() {
         let LinkState::Sending(link) = link else {
             continue;
         };
+        if link.identity.is_retired() {
+            continue;
+        }
+        if disposition.settled {
+            let acknowledgements: Vec<_> = link
+                .pending_acknowledgements
+                .iter()
+                .filter(|(id, identity)| {
+                    **id == identity.id()
+                        && id.wrapping_sub(disposition.first)
+                            <= last.wrapping_sub(disposition.first)
+                        && identity.validate_owner(&link.identity).is_ok()
+                })
+                .map(|(&id, identity)| (id, identity.clone()))
+                .collect();
+            for (id, identity) in acknowledgements {
+                if link
+                    .pending_acknowledgements
+                    .get(&id)
+                    .is_some_and(|pending| pending.same_ack(&identity))
+                {
+                    identity.mark_settled();
+                    link.pending_acknowledgements.remove(&id);
+                }
+            }
+        }
         let ids: Vec<_> = link
             .unsettled
             .keys()
@@ -3253,10 +3303,9 @@ async fn apply_disposition<W: AsyncWrite + Unpin>(
             .collect();
         for id in ids {
             if let Some(delivery) = link.unsettled.get_mut(&id) {
-                let acknowledge =
-                    link.receiver_settle_mode == ReceiverSettleMode::Second && !disposition.settled;
+                delivery.receiver_settled |= disposition.settled;
                 if delivery.outcome.is_none() {
-                    delivery.outcome = Some((outcome.clone(), acknowledge));
+                    delivery.outcome = outcome.clone();
                 }
                 resolve_outgoing(channel, link, id, writer).await?;
             }
@@ -3318,6 +3367,16 @@ fn attach_approval_error(error: AttachApprovalError) -> EngineError {
         }
         _ => invalid_state(error.to_string()),
     }
+}
+
+fn source_default_outcome(source: Option<&crate::Source>) -> Result<Option<Outcome>, EngineError> {
+    source
+        .and_then(|source| source.default_outcome.clone())
+        .map(|state| {
+            Outcome::try_from(state)
+                .map_err(|_| invalid_state("source default outcome must be terminal"))
+        })
+        .transpose()
 }
 
 #[cfg(test)]
@@ -3501,3 +3560,6 @@ mod outgoing_settlement_tests;
 
 #[cfg(test)]
 mod session_provenance_tests;
+
+#[cfg(test)]
+mod outgoing_remote_settlement_tests;
