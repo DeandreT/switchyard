@@ -327,10 +327,23 @@ Flow or Transfer ends its session with `amqp:session:errant-link` before changin
 session windows, link credit, delivery ownership, or retained message content.
 The marker survives failed or cancelled Detach flushes. Normal closing links
 continue to tolerate crossing traffic, and a mapped peer Detach acknowledgement
-releases the exact alias for reuse. This covers in-flight handle references,
-not all link-error recovery: destroyed delivery-ID references, pipelined
-same-name re-Attach classification, and post-acknowledgement error history remain
-unfinished.
+releases the exact alias for reuse.
+Error Detach also retains the exact owners of known live delivery IDs in separate
+incoming and outgoing session indexes. Each direction holds at most 4,096 IDs;
+admitting more ends only that session with `amqp:resource-limit-exceeded` rather
+than evicting error history. Any peer Disposition touching one of those IDs,
+including a mixed or wrapping range, ends the session with
+`amqp:session:errant-link` before applying any healthy settlement. This check is
+independent of the supplied outcome and settled flag. The indexes retain neither
+message bodies nor delivery tags, survive Detach acknowledgement and handle
+reuse, and clear when the session ends. The outgoing allocator skips retained
+error IDs. A fresh incoming delivery replaces an old incoming error record only
+after header and format validation, exact ledger reservation, and successful
+credit admission; rejected attempts and continuations do not reassign it.
+Normal closes do not create these records. This is not yet complete link-error
+recovery: IDs already released by successful settlement or pre-settled delivery,
+pipelined same-name re-Attach classification, and error-handle history after
+Detach acknowledgement remain unfinished.
 Session windows count Transfer frames independently of link delivery counts.
 Incoming windows replenish after bounded frame processing; receive links grant
 32 message slots and return credit only as the application consumes a delivery
