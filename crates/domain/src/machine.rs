@@ -27,6 +27,7 @@ use crate::{
 mod message_retention;
 mod topic_fanout;
 mod topic_paging;
+mod topic_scheduling;
 mod topic_topology;
 
 use message_retention::message_record;
@@ -283,6 +284,7 @@ impl<S: StateStore> StateMachine<S> {
                     enqueue_at: message.enqueue_at,
                 }),
                 &mut batch,
+                &mut subscription_enqueues,
             )?,
             CommandKind::ScheduleEnvelopes { messages } => self.schedule(
                 command,
@@ -297,9 +299,10 @@ impl<S: StateStore> StateMachine<S> {
                     enqueue_at: message.enqueue_at,
                 }),
                 &mut batch,
+                &mut subscription_enqueues,
             )?,
             CommandKind::CancelScheduled { sequences } => {
-                self.cancel_scheduled(command, sequences, &mut batch)?
+                self.cancel_scheduled(command, sequences, &mut batch, &mut subscription_enqueues)?
             }
             CommandKind::Receive {
                 mode,
@@ -488,7 +491,9 @@ impl<S: StateStore> StateMachine<S> {
             CommandKind::ExpireLocks => self.expire_locks(command, &mut batch)?,
             CommandKind::ExpireMessages => self.expire_messages(command, &mut batch)?,
             CommandKind::ExpireSessionLocks => self.expire_session_locks(command, &mut batch)?,
-            CommandKind::ActivateScheduled => self.activate_scheduled(command, &mut batch)?,
+            CommandKind::ActivateScheduled => {
+                self.activate_scheduled(command, &mut batch, &mut subscription_enqueues)?
+            }
             CommandKind::ExpireDuplicateHistory => {
                 self.expire_duplicate_history(command, &mut batch)?
             }
@@ -751,6 +756,15 @@ impl<S: StateStore> StateMachine<S> {
             .ok_or(BrokerError::QueueNotFound)
     }
 
+    fn load_browsable_config(&self, command: &Command) -> Result<(QueueConfig, bool), BrokerError> {
+        if let Some(config) = self.queue_config(&command.namespace, &command.entity)? {
+            return Ok((config, false));
+        }
+        self.topic_config(&command.namespace, &command.entity)?
+            .map(|config| (config.to_queue_config(), true))
+            .ok_or(BrokerError::QueueNotFound)
+    }
+
     fn load_counters(&self, command: &Command) -> Result<QueueCounters, BrokerError> {
         Ok(self
             .read(&keys::queue_counters(&command.namespace, &command.entity))?
@@ -980,7 +994,18 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         messages: impl ExactSizeIterator<Item = ScheduledInput<'a>>,
         batch: &mut WriteBatch,
+        subscription_enqueues: &mut Option<Vec<EntityPath>>,
     ) -> Result<CommandOutcome, BrokerError> {
+        if let Some(config) = self.topic_ingress_config(command)? {
+            let sequences = self.publish_topic(
+                command,
+                config,
+                messages.map(|scheduled| (scheduled.message, Some(scheduled.enqueue_at))),
+                batch,
+                subscription_enqueues,
+            )?;
+            return Ok(CommandOutcome::Scheduled { sequences });
+        }
         self.require_queue_ingress_target(command)?;
         let config = self.load_config(command)?;
         let mut counters = self.load_counters(command)?;
@@ -1093,8 +1118,9 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         sequences: &[SequenceNumber],
         batch: &mut WriteBatch,
+        subscription_enqueues: &mut Option<Vec<EntityPath>>,
     ) -> Result<CommandOutcome, BrokerError> {
-        self.load_config(command)?;
+        let (_, topic) = self.load_browsable_config(command)?;
         let namespace = &command.namespace;
         let entity = &command.entity;
         let mut cancelled = 0_u32;
@@ -1108,6 +1134,9 @@ impl<S: StateStore> StateMachine<S> {
             batch.push_delete(keys::scheduled(namespace, entity, enqueue_at, sequence));
             cancelled = cancelled.saturating_add(1);
         }
+        if topic {
+            *subscription_enqueues = Some(Vec::new());
+        }
         Ok(CommandOutcome::ScheduledCancelled { cancelled })
     }
 
@@ -1115,8 +1144,12 @@ impl<S: StateStore> StateMachine<S> {
         &self,
         command: &Command,
         batch: &mut WriteBatch,
+        subscription_enqueues: &mut Option<Vec<EntityPath>>,
     ) -> Result<CommandOutcome, BrokerError> {
-        let config = self.load_config(command)?;
+        let (config, topic) = self.load_browsable_config(command)?;
+        if topic {
+            return self.activate_topic_scheduled(command, config, batch, subscription_enqueues);
+        }
         let namespace = &command.namespace;
         let entity = &command.entity;
         let scheduled = self
@@ -1285,7 +1318,7 @@ impl<S: StateStore> StateMachine<S> {
         session_id: Option<&SessionId>,
         budget: Option<DeliveryBudget>,
     ) -> Result<CommandOutcome, BrokerError> {
-        let config = self.load_config(command)?;
+        let (config, topic) = self.load_browsable_config(command)?;
         // Browsing does not acquire a session; an explicit ID still requires
         // a session-enabled entity and limits the records returned below.
         if session_id.is_some() {
@@ -1323,6 +1356,10 @@ impl<S: StateStore> StateMachine<S> {
                 let sequence =
                     keys::trailing_sequence(&key).ok_or(BrokerError::MalformedIndexKey)?;
                 let record = MessageRecord::decode(&value)?;
+
+                if topic && !matches!(record.state, MessageState::Scheduled { .. }) {
+                    continue;
+                }
 
                 let protected_from_expiry = match record.state {
                     MessageState::Deferred => true,

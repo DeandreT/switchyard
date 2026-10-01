@@ -2,14 +2,18 @@ use amqp::{Array, Modified, Uuid, decode_message};
 
 use super::*;
 
-struct Management {
+pub(super) struct Management {
     sender: ClientSender,
     receiver: ClientReceiver,
     reply_to: String,
 }
 
 impl Management {
-    async fn attach(session: &mut ClientSession, name: &str, address: &str) -> TestResult<Self> {
+    pub(super) async fn attach(
+        session: &mut ClientSession,
+        name: &str,
+        address: &str,
+    ) -> TestResult<Self> {
         let reply_to = format!("{name}-replies");
         let receiver = ClientReceiver::builder()
             .name(format!("{name}-responses"))
@@ -25,7 +29,7 @@ impl Management {
         })
     }
 
-    async fn request(
+    pub(super) async fn request(
         &mut self,
         id: &str,
         operation: &str,
@@ -70,14 +74,16 @@ impl Management {
     }
 }
 
-fn map(entries: impl IntoIterator<Item = (&'static str, Value)>) -> OrderedMap<Value, Value> {
+pub(super) fn map(
+    entries: impl IntoIterator<Item = (&'static str, Value)>,
+) -> OrderedMap<Value, Value> {
     entries
         .into_iter()
         .map(|(key, value)| (Value::String(key.into()), value))
         .collect()
 }
 
-fn status(message: &Message, expected: i32) {
+pub(super) fn status(message: &Message, expected: i32) {
     assert_eq!(
         message
             .application_properties
@@ -303,9 +309,7 @@ async fn subscription_management_scopes_peek_renew_defer_and_completion<P: Store
     Ok(())
 }
 
-async fn a_topic_management_endpoint_attaches_without_claiming_queue_operations<
-    P: StoreProvider,
->(
+async fn a_topic_management_endpoint_browses_only_parent_scheduled_messages<P: StoreProvider>(
     provider: P,
 ) -> TestResult {
     let node = Node::start(provider, "Orders", TopicConfig::default()).await?;
@@ -325,14 +329,15 @@ async fn a_topic_management_endpoint_attaches_without_claiming_queue_operations<
             ]),
         )
         .await?;
-    status(&peeked, 404);
+    status(&peeked, 200);
+    let Body::Value(Value::Map(body)) = &peeked.body else {
+        panic!("topic peek body")
+    };
     assert_eq!(
-        peeked
-            .application_properties
-            .as_ref()
-            .and_then(|properties| properties.get(protocol_amqp::ERROR_CONDITION_PROPERTY)),
-        Some(&Value::Symbol(Symbol::from("amqp:not-found")))
+        body.get(&Value::String(protocol_amqp::MESSAGES.into())),
+        Some(&Value::List(Vec::new()))
     );
+    assert_eq!(node.snapshot()?, before);
     let mut message = rich(0);
     let mut annotations = OrderedMap::new();
     annotations.insert(
@@ -355,15 +360,13 @@ async fn a_topic_management_endpoint_attaches_without_claiming_queue_operations<
             )]),
         )
         .await?;
-    status(&scheduled, 500);
-    assert_eq!(
-        scheduled
-            .application_properties
-            .as_ref()
-            .and_then(|properties| properties.get(protocol_amqp::ERROR_CONDITION_PROPERTY)),
-        Some(&Value::Symbol(Symbol::from("amqp:not-implemented")))
+    status(&scheduled, 200);
+    assert_eq!(node.peek(&node.topic).await?.len(), 1);
+    assert!(
+        node.peek(&node.topic.subscription(&SubscriptionName::new("Alpha")?)?)
+            .await?
+            .is_empty()
     );
-    assert_eq!(node.snapshot()?, before);
     connection.close().await?;
     Ok(())
 }
@@ -377,5 +380,5 @@ macro_rules! for_each_backend {
 
 for_each_backend! {
     subscription_management_scopes_peek_renew_defer_and_completion,
-    a_topic_management_endpoint_attaches_without_claiming_queue_operations,
+    a_topic_management_endpoint_browses_only_parent_scheduled_messages,
 }

@@ -268,7 +268,7 @@ fn final_topic_sequence_is_shared_and_child_sequence_exhaustion_never_allocates<
     Ok(())
 }
 
-fn scheduled_inputs_refuse_even_empty_or_duplicate_batches_with_session_targets<
+fn scheduled_inputs_accept_empty_and_duplicate_batches_without_retaining_duplicate_copies<
     P: StoreProvider,
 >(
     provider: P,
@@ -280,8 +280,8 @@ fn scheduled_inputs_refuse_even_empty_or_duplicate_batches_with_session_targets<
             ..TopicConfig::default()
         },
     )?;
-    subscribe(&fixture, "plain", SubscriptionConfig::default(), 0)?;
-    subscribe(
+    let plain = subscribe(&fixture, "plain", SubscriptionConfig::default(), 0)?;
+    let session = subscribe(
         &fixture,
         "session",
         SubscriptionConfig {
@@ -295,24 +295,58 @@ fn scheduled_inputs_refuse_even_empty_or_duplicate_batches_with_session_targets<
         CommandKind::Schedule { messages: vec![] },
         CommandKind::ScheduleEnvelopes { messages: vec![] },
     ] {
-        reject(
-            &fixture,
-            10,
-            kind,
-            BrokerError::TopicDataPlaneNotImplemented,
-        )?;
+        let before = fixture.machine.store().snapshot()?;
+        let application = apply(&fixture, 10, kind)?;
+        assert_eq!(
+            application.outcome,
+            CommandOutcome::Scheduled { sequences: vec![] }
+        );
+        effects(&application, &[]);
+        assert_eq!(fixture.machine.store().snapshot()?, before);
     }
-    for scheduled in [0, 2, 100] {
+    for (index, scheduled) in [0, 2, 100].into_iter().enumerate() {
         let mut message = member("known");
         message.scheduled_enqueue_time = Some(Timestamp::from_millis(scheduled));
-        reject(
+        let application = apply(
             &fixture,
             2,
             CommandKind::SendBatch {
-                messages: vec![member("new"), message],
+                messages: vec![member(&format!("new-{scheduled}")), message],
             },
-            BrokerError::TopicDataPlaneNotImplemented,
         )?;
+        let active = SequenceNumber::new(2 + index as u64 * 2);
+        let discarded = SequenceNumber::new(active.as_u64() + 1);
+        assert_eq!(
+            application.outcome,
+            CommandOutcome::BatchSent {
+                sequences: vec![active, discarded]
+            }
+        );
+        effects(&application, &[plain.clone(), session.dead_letter_queue()?]);
+        assert!(
+            fixture
+                .machine
+                .message(&fixture.namespace, &fixture.entity, discarded)?
+                .is_none()
+        );
+        assert!(
+            fixture
+                .machine
+                .message(&fixture.namespace, &plain, discarded)?
+                .is_none()
+        );
+        assert!(
+            fixture
+                .machine
+                .store()
+                .get(&keys::scheduled(
+                    &fixture.namespace,
+                    &fixture.entity,
+                    Timestamp::from_millis(scheduled),
+                    discarded
+                ))?
+                .is_none()
+        );
     }
     Ok(())
 }
@@ -526,6 +560,6 @@ for_each_backend! {
     invalid_late_inputs_and_stricter_duplicate_destinations_leave_every_record_unchanged,
     duplicate_admission_at_the_exact_deadline_replaces_history_without_keeping_old_expiry,
     final_topic_sequence_is_shared_and_child_sequence_exhaustion_never_allocates,
-    scheduled_inputs_refuse_even_empty_or_duplicate_batches_with_session_targets,
+    scheduled_inputs_accept_empty_and_duplicate_batches_without_retaining_duplicate_copies,
     one_commit_failure_retry_and_late_read_corruption_never_publish_partial_copies,
 }

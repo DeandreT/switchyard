@@ -2,7 +2,7 @@ use crate::TopicConfig;
 
 use super::*;
 
-/// Copies retained by one immediate topic publication, across all subscribers.
+/// Copies retained by one topic publication or scheduled activation.
 pub const MAX_TOPIC_FANOUT_COPIES: usize = 1_024;
 /// Typed content, compatibility bodies, normalized IDs, and DLQ details.
 pub const MAX_TOPIC_FANOUT_CONTENT_BYTES: usize = 4 * 1024 * 1024;
@@ -13,10 +13,130 @@ const MISSING_SESSION_ID_DESCRIPTION: &str =
 
 struct TopicMessagePlan<'a> {
     message: MessageInput<'a>,
-    content_bytes: usize,
-    value_items: usize,
+    scheduled_enqueue_time: Option<Timestamp>,
+    cost: TopicMessageCost,
     duplicate: bool,
     previous_history: Option<Timestamp>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TopicMessageCost {
+    content_bytes: usize,
+    value_items: usize,
+}
+
+pub(super) struct TopicTargets {
+    subscriptions: Vec<crate::SubscriptionDefinition>,
+    shadows: Vec<EntityPath>,
+}
+
+pub(super) struct TopicEmission<'a> {
+    pub(super) message: MessageInput<'a>,
+    pub(super) sequence: SequenceNumber,
+    pub(super) scheduled_enqueue_time: Option<Timestamp>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct TopicBudget {
+    input_messages: usize,
+    input_bytes: usize,
+    input_items: usize,
+    retained_copies: usize,
+    retained_bytes: usize,
+    retained_items: usize,
+}
+
+impl TopicBudget {
+    pub(super) fn charge_input(&mut self, cost: TopicMessageCost) -> Result<(), BrokerError> {
+        self.input_messages = self.input_messages.saturating_add(1);
+        self.input_bytes = self.input_bytes.saturating_add(cost.content_bytes);
+        self.input_items = self.input_items.saturating_add(cost.value_items);
+        enforce_input_limit(
+            IngressBatchLimit::Messages,
+            self.input_messages,
+            MAX_INGRESS_BATCH_MESSAGES,
+        )?;
+        enforce_input_limit(
+            IngressBatchLimit::ContentBytes,
+            self.input_bytes,
+            MAX_INGRESS_BATCH_CONTENT_BYTES,
+        )?;
+        enforce_input_limit(
+            IngressBatchLimit::ValueItems,
+            self.input_items,
+            MAX_INGRESS_BATCH_VALUE_ITEMS,
+        )
+    }
+
+    fn charge_copy(&mut self, cost: TopicMessageCost) -> Result<(), BrokerError> {
+        self.retained_copies = checked_retained_total(
+            self.retained_copies,
+            1,
+            1,
+            IngressBatchLimit::Messages,
+            MAX_TOPIC_FANOUT_COPIES,
+        )?;
+        self.retained_bytes = checked_retained_total(
+            self.retained_bytes,
+            cost.content_bytes,
+            1,
+            IngressBatchLimit::ContentBytes,
+            MAX_TOPIC_FANOUT_CONTENT_BYTES,
+        )?;
+        self.retained_items = checked_retained_total(
+            self.retained_items,
+            cost.value_items,
+            1,
+            IngressBatchLimit::ValueItems,
+            MAX_TOPIC_FANOUT_VALUE_ITEMS,
+        )?;
+        Ok(())
+    }
+
+    pub(super) fn charge_fanout(
+        &mut self,
+        cost: TopicMessageCost,
+        message: MessageInput<'_>,
+        targets: &TopicTargets,
+    ) -> Result<(), BrokerError> {
+        for subscription in &targets.subscriptions {
+            let missing_session =
+                subscription.config.requires_session && message.session_id.is_none();
+            self.charge_copy(TopicMessageCost {
+                content_bytes: cost.content_bytes.saturating_add(if missing_session {
+                    DeadLetterReason::MissingSessionId.as_str().len()
+                        + MISSING_SESSION_ID_DESCRIPTION.len()
+                } else {
+                    0
+                }),
+                value_items: cost
+                    .value_items
+                    .saturating_add(usize::from(missing_session) * 2),
+            })?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn topic_message_cost(
+    message: MessageInput<'_>,
+) -> Result<TopicMessageCost, BrokerError> {
+    Ok(TopicMessageCost {
+        value_items: match message.envelope {
+            Some(envelope) => envelope.validate_value_limits()?,
+            None => 0,
+        },
+        content_bytes: message
+            .envelope
+            .map_or(0, MessageEnvelope::content_size)
+            .saturating_add(message.body.len())
+            .saturating_add(message.message_id.len())
+            .saturating_add(
+                message
+                    .session_id
+                    .map_or(0, |session| session.as_str().len()),
+            ),
+    })
 }
 
 impl<S: StateStore> StateMachine<S> {
@@ -47,61 +167,26 @@ impl<S: StateStore> StateMachine<S> {
             MAX_INGRESS_BATCH_MESSAGES,
         )?;
         let messages: Vec<_> = messages.collect();
-        let subscriptions = self.subscriptions(&command.namespace, &command.entity)?;
-        if messages.iter().any(|(_, scheduled)| scheduled.is_some()) {
-            return Err(BrokerError::TopicDataPlaneNotImplemented);
-        }
-        let shadows = subscriptions
-            .iter()
-            .map(|subscription| subscription.entity.dead_letter_queue())
-            .collect::<Result<Vec<_>, _>>()?;
+        let targets = self.topic_targets(command)?;
 
         let queue_config = config.to_queue_config();
         let mut plans = Vec::with_capacity(messages.len());
-        let mut input_bytes = 0_usize;
-        let mut input_items = 0_usize;
+        let mut budget = TopicBudget::default();
         // The admission plan borrows every payload. Even compound map-key
         // validation waits until input and retained-copy budgets are known.
-        for (message, _) in messages {
-            let value_items = match message.envelope {
-                Some(envelope) => envelope.validate_value_limits()?,
-                None => 0,
-            };
-            input_items = input_items.saturating_add(value_items);
-            enforce_input_limit(
-                IngressBatchLimit::ValueItems,
-                input_items,
-                MAX_INGRESS_BATCH_VALUE_ITEMS,
-            )?;
-            let content_bytes = message
-                .envelope
-                .map_or(0, MessageEnvelope::content_size)
-                .saturating_add(message.body.len())
-                .saturating_add(message.message_id.len())
-                .saturating_add(
-                    message
-                        .session_id
-                        .map_or(0, |session| session.as_str().len()),
-                );
-            input_bytes = input_bytes.saturating_add(content_bytes);
-            enforce_input_limit(
-                IngressBatchLimit::ContentBytes,
-                input_bytes,
-                MAX_INGRESS_BATCH_CONTENT_BYTES,
-            )?;
+        for (message, scheduled_enqueue_time) in messages {
+            let cost = topic_message_cost(message)?;
+            budget.charge_input(cost)?;
             plans.push(TopicMessagePlan {
                 message,
-                content_bytes,
-                value_items,
+                scheduled_enqueue_time,
+                cost,
                 duplicate: false,
                 previous_history: None,
             });
         }
 
         let mut accepted_ids = BTreeSet::new();
-        let mut retained_copies = 0_usize;
-        let mut retained_bytes = 0_usize;
-        let mut retained_items = 0_usize;
         for plan in &mut plans {
             let message_id = plan.message.message_id;
             validate_message_id(message_id)?;
@@ -118,58 +203,28 @@ impl<S: StateStore> StateMachine<S> {
                     || plan
                         .previous_history
                         .is_some_and(|expires_at| expires_at > command.issued_at));
+            let future = plan
+                .scheduled_enqueue_time
+                .is_some_and(|enqueue_at| enqueue_at > command.issued_at);
+            if future {
+                // A future batch need not fit one activation, but each item
+                // must be activatable against the topology known at admission.
+                TopicBudget::default().charge_fanout(plan.cost, plan.message, &targets)?;
+            }
             if !plan.duplicate {
                 if deduplicate {
                     accepted_ids.insert(message_id);
                 }
-                retained_copies = checked_retained_total(
-                    retained_copies,
-                    1,
-                    subscriptions.len(),
-                    IngressBatchLimit::Messages,
-                    MAX_TOPIC_FANOUT_COPIES,
-                )?;
-                for subscription in &subscriptions {
-                    let missing_session =
-                        subscription.config.requires_session && plan.message.session_id.is_none();
-                    let (extra_bytes, extra_items) = if missing_session {
-                        (
-                            DeadLetterReason::MissingSessionId.as_str().len()
-                                + MISSING_SESSION_ID_DESCRIPTION.len(),
-                            2,
-                        )
-                    } else {
-                        (0, 0)
-                    };
-                    retained_bytes = checked_retained_total(
-                        retained_bytes,
-                        plan.content_bytes.saturating_add(extra_bytes),
-                        1,
-                        IngressBatchLimit::ContentBytes,
-                        MAX_TOPIC_FANOUT_CONTENT_BYTES,
-                    )?;
-                    retained_items = checked_retained_total(
-                        retained_items,
-                        plan.value_items.saturating_add(extra_items),
-                        1,
-                        IngressBatchLimit::ValueItems,
-                        MAX_TOPIC_FANOUT_VALUE_ITEMS,
-                    )?;
+                if future {
+                    budget.charge_copy(plan.cost)?;
+                } else {
+                    budget.charge_fanout(plan.cost, plan.message, &targets)?;
                 }
             }
         }
 
         for plan in &plans {
-            validate_message_content(&queue_config, plan.message)?;
-            let content_bytes = message_content_bytes(plan.message);
-            for subscription in &subscriptions {
-                if content_bytes > subscription.config.max_message_bytes {
-                    return Err(BrokerError::MessageTooLarge {
-                        body_bytes: content_bytes,
-                        maximum_bytes: subscription.config.max_message_bytes,
-                    });
-                }
-            }
+            self.validate_topic_message(&queue_config, plan.message, &targets)?;
         }
 
         let mut counters = self.load_counters(command)?;
@@ -191,63 +246,31 @@ impl<S: StateStore> StateMachine<S> {
                     batch,
                 )?;
             }
-            let message = MessageInput {
-                time_to_live_millis: effective_time_to_live_millis(
+            if plan
+                .scheduled_enqueue_time
+                .is_some_and(|enqueue_at| enqueue_at > command.issued_at)
+            {
+                self.enqueue_message(
+                    command.into(),
                     &queue_config,
-                    plan.message.time_to_live_millis,
-                ),
-                ..plan.message
-            };
-            for (subscription, shadow) in subscriptions.iter().zip(&shadows) {
-                let subscription_config = subscription.config.to_queue_config();
-                if subscription.config.requires_session && message.session_id.is_none() {
-                    let scope = EnqueueScope {
-                        namespace: &command.namespace,
-                        entity: shadow,
-                        issued_at: command.issued_at,
-                    };
-                    let mut record = message_record(
-                        scope,
-                        &subscription_config.dead_letter_shadow(),
-                        MessageInput {
-                            time_to_live_millis: None,
-                            session_id: None,
-                            ..message
-                        },
+                    plan.message,
+                    sequence,
+                    plan.scheduled_enqueue_time,
+                    batch,
+                )?;
+            } else {
+                self.emit_topic_message(
+                    command,
+                    &queue_config,
+                    &targets,
+                    TopicEmission {
+                        message: plan.message,
                         sequence,
-                        None,
-                    );
-                    // These fixed fields fit the ingress header reserve; their
-                    // content and projected value nodes were budgeted above.
-                    record.dead_letter = Some(DeadLetterInfo {
-                        reason: DeadLetterReason::MissingSessionId,
-                        description: MISSING_SESSION_ID_DESCRIPTION.to_owned(),
-                        dead_lettered_at: command.issued_at,
-                    });
-                    batch.push_put(
-                        keys::message(&command.namespace, shadow, sequence),
-                        codec::encode(&record)?,
-                    );
-                    batch.push_put(
-                        keys::ready(&command.namespace, shadow, sequence),
-                        Vec::new(),
-                    );
-                    enqueued.insert(shadow.clone());
-                } else {
-                    self.enqueue_message(
-                        EnqueueScope {
-                            namespace: &command.namespace,
-                            entity: &subscription.entity,
-                            issued_at: command.issued_at,
-                        },
-                        &subscription_config,
-                        message,
-                        sequence,
-                        None,
-                        batch,
-                    )?;
-                    enqueued.insert(subscription.entity.clone());
-                }
+                        scheduled_enqueue_time: plan.scheduled_enqueue_time,
+                    },
+                    batch,
+                    &mut enqueued,
+                )?;
             }
         }
         if !plans.is_empty() {
@@ -258,6 +281,108 @@ impl<S: StateStore> StateMachine<S> {
         }
         *subscription_enqueues = Some(enqueued.into_iter().collect());
         Ok(sequences)
+    }
+
+    pub(super) fn topic_targets(&self, command: &Command) -> Result<TopicTargets, BrokerError> {
+        let subscriptions = self.subscriptions(&command.namespace, &command.entity)?;
+        let shadows = subscriptions
+            .iter()
+            .map(|subscription| subscription.entity.dead_letter_queue())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(TopicTargets {
+            subscriptions,
+            shadows,
+        })
+    }
+
+    pub(super) fn validate_topic_message(
+        &self,
+        config: &QueueConfig,
+        message: MessageInput<'_>,
+        targets: &TopicTargets,
+    ) -> Result<(), BrokerError> {
+        validate_message_content(config, message)?;
+        let content_bytes = message_content_bytes(message);
+        for subscription in &targets.subscriptions {
+            if content_bytes > subscription.config.max_message_bytes {
+                return Err(BrokerError::MessageTooLarge {
+                    body_bytes: content_bytes,
+                    maximum_bytes: subscription.config.max_message_bytes,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn emit_topic_message(
+        &self,
+        command: &Command,
+        config: &QueueConfig,
+        targets: &TopicTargets,
+        emission: TopicEmission<'_>,
+        batch: &mut WriteBatch,
+        enqueued: &mut BTreeSet<EntityPath>,
+    ) -> Result<(), BrokerError> {
+        let message = MessageInput {
+            time_to_live_millis: effective_time_to_live_millis(
+                config,
+                emission.message.time_to_live_millis,
+            ),
+            ..emission.message
+        };
+        for (subscription, shadow) in targets.subscriptions.iter().zip(&targets.shadows) {
+            let subscription_config = subscription.config.to_queue_config();
+            if subscription.config.requires_session && message.session_id.is_none() {
+                let scope = EnqueueScope {
+                    namespace: &command.namespace,
+                    entity: shadow,
+                    issued_at: command.issued_at,
+                };
+                let mut record = message_record(
+                    scope,
+                    &subscription_config.dead_letter_shadow(),
+                    MessageInput {
+                        time_to_live_millis: None,
+                        session_id: None,
+                        ..message
+                    },
+                    emission.sequence,
+                    None,
+                );
+                // These fixed fields fit the ingress header reserve; their
+                // content and projected value nodes were budgeted beforehand.
+                record.dead_letter = Some(DeadLetterInfo {
+                    reason: DeadLetterReason::MissingSessionId,
+                    description: MISSING_SESSION_ID_DESCRIPTION.to_owned(),
+                    dead_lettered_at: command.issued_at,
+                });
+                record.scheduled_enqueue_time = emission.scheduled_enqueue_time;
+                batch.push_put(
+                    keys::message(&command.namespace, shadow, emission.sequence),
+                    codec::encode(&record)?,
+                );
+                batch.push_put(
+                    keys::ready(&command.namespace, shadow, emission.sequence),
+                    Vec::new(),
+                );
+                enqueued.insert(shadow.clone());
+            } else {
+                self.enqueue_message(
+                    EnqueueScope {
+                        namespace: &command.namespace,
+                        entity: &subscription.entity,
+                        issued_at: command.issued_at,
+                    },
+                    &subscription_config,
+                    message,
+                    emission.sequence,
+                    emission.scheduled_enqueue_time,
+                    batch,
+                )?;
+                enqueued.insert(subscription.entity.clone());
+            }
+        }
+        Ok(())
     }
 }
 

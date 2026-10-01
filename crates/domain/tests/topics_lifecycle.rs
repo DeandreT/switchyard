@@ -531,7 +531,7 @@ fn composed_path_and_membership_boundaries_leave_no_partial_topology<P: StorePro
     Ok(())
 }
 
-fn immediate_topic_ingress_preserves_scheduling_and_subscription_refusal_guards<
+fn topic_ingress_accepts_empty_schedules_and_preserves_subscription_refusal_guards<
     P: StoreProvider,
 >(
     provider: P,
@@ -572,11 +572,12 @@ fn immediate_topic_ingress_preserves_scheduling_and_subscription_refusal_guards<
             );
             assert_eq!(fixture.machine.store().snapshot()?, before);
         } else {
-            reject(
-                &fixture,
-                fixture.command(10, kind.clone()),
-                BrokerError::TopicDataPlaneNotImplemented,
-            )?;
+            let before = fixture.machine.store().snapshot()?;
+            assert_eq!(
+                fixture.at(10, kind.clone())?,
+                CommandOutcome::Scheduled { sequences: vec![] }
+            );
+            assert_eq!(fixture.machine.store().snapshot()?, before);
         }
         let mut command = fixture.command(10, kind);
         command.entity = subscription.clone();
@@ -993,7 +994,7 @@ for_each_backend! {
     missing_duplicate_config_and_type_collisions_are_atomic,
     canonical_subscription_and_dlq_paths_are_reserved_before_other_validation,
     composed_path_and_membership_boundaries_leave_no_partial_topology,
-    immediate_topic_ingress_preserves_scheduling_and_subscription_refusal_guards,
+    topic_ingress_accepts_empty_schedules_and_preserves_subscription_refusal_guards,
     session_configs_are_valid_topology_and_children_never_inherit_topic_dedup,
     dangling_or_malformed_membership_never_becomes_a_partial_success,
 }

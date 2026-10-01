@@ -53,13 +53,17 @@ pub const STORE_FORMAT_V8: u32 = 8;
 /// Earlier builds would select the wrong ready index when releasing a copy.
 pub const STORE_FORMAT_V9: u32 = 9;
 
+/// Version 10: scheduled topic publications are retained on their parent and
+/// fan out only when activated. Earlier builds cannot activate those records.
+pub const STORE_FORMAT_V10: u32 = 10;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V9;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V10;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
@@ -379,6 +383,20 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V8,
+                expected: ACTIVE_STORE_FORMAT,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_store_from_before_topic_scheduling() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        stamp_format(directory.path(), &STORE_FORMAT_V9.to_be_bytes())?;
+        assert_eq!(
+            FjallStore::open(directory.path()).err(),
+            Some(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V9,
                 expected: ACTIVE_STORE_FORMAT,
             })
         );

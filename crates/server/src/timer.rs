@@ -2,8 +2,9 @@
 //!
 //! The state machine has no clock of its own, so nothing expires until something
 //! asks it to. This is that something: on every tick it walks queues and topics,
-//! proposing queue deadlines and each entity's duplicate-history cleanup. Without it, scheduled
-//! messages stay hidden, locks are held forever, and messages outlive their TTL.
+//! proposing queue deadlines, topic activation, and each entity's duplicate-history
+//! cleanup. Without it, scheduled messages stay hidden, locks are held forever,
+//! and messages outlive their TTL.
 //!
 //! The sweep itself is deterministic given the clock, so a test drives it
 //! directly and only the surrounding loop deals in real time.
@@ -30,8 +31,9 @@ pub const MAX_TOPICS_PER_SWEEP: usize = domain::MAX_TOPIC_PAGE_SIZE;
 /// Times one sweep will re-propose against a single index before moving on.
 ///
 /// A sweep command processes at most [`TIMER_SCAN_LIMIT`] entries, so a backlog
-/// needs several. Bounding the rounds keeps one queue's backlog from starving
-/// every other queue on the tick.
+/// needs several. Bounding the rounds keeps one entity's backlog from starving
+/// every other entity on the tick. Topic activation can stop at a smaller
+/// prefix because its retained fanout has separate byte, value, and copy caps.
 pub const MAX_ROUNDS_PER_INDEX: usize = 8;
 
 pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
@@ -146,6 +148,7 @@ impl<'a> TimerWorker<'a> {
                 entity: entity.clone(),
             });
             report.topics_swept += 1;
+            self.activate_topic_scheduled(&namespace, &entity, report)?;
             self.expire_duplicate_history(&namespace, &entity, report)?;
         }
         *cursor = page.continuation;
@@ -169,6 +172,31 @@ impl<'a> TimerWorker<'a> {
             };
             report.messages_activated += activated;
             if (activated as usize) < TIMER_SCAN_LIMIT {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn activate_topic_scheduled(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+        report: &mut SweepReport,
+    ) -> Result<(), SubmitError> {
+        for _ in 0..MAX_ROUNDS_PER_INDEX {
+            let outcome = self.broker.submit_blocking(
+                namespace.clone(),
+                entity.clone(),
+                CommandKind::ActivateScheduled,
+            )?;
+            let CommandOutcome::ScheduledActivated { activated } = outcome else {
+                return Err(unexpected(outcome));
+            };
+            report.messages_activated += activated;
+            // A positive prefix can be smaller than TIMER_SCAN_LIMIT when
+            // fanout admission fills first. Only zero proves no progress.
+            if activated == 0 {
                 break;
             }
         }

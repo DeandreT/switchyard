@@ -20,6 +20,8 @@ use server::{
 use storage::{StateStore, StorageError, StoreSnapshot, WriteBatch};
 use testkit::StoreProvider;
 
+#[path = "timer_topic_paging/scheduling_cases.rs"]
+mod scheduling_cases;
 #[path = "timer_topic_paging/wakeup_cases.rs"]
 mod wakeup_cases;
 
@@ -410,7 +412,7 @@ fn independent_pages_wrap_without_starving_either_entity_kind<P: StoreProvider>(
     assert_eq!(first.topics_swept, MAX_TOPICS_PER_SWEEP);
     assert_eq!(first.queues_swept, MAX_QUEUES_PER_SWEEP);
     assert!(first.is_idle());
-    assert_eq!(node.store.topic_reads().len(), MAX_TOPICS_PER_SWEEP);
+    assert_eq!(node.store.topic_reads().len(), MAX_TOPICS_PER_SWEEP * 3);
     assert_eq!(node.store.pages(14).len(), 1);
     assert_eq!(node.store.pages(1).len(), 1);
     let scans = node
@@ -423,7 +425,11 @@ fn independent_pages_wrap_without_starving_either_entity_kind<P: StoreProvider>(
         scans
             .iter()
             .filter(|(_, entity, _)| entity.as_str().starts_with("topic-"))
-            .all(|(tag, _, limit)| *tag == 13 && *limit == TIMER_SCAN_LIMIT)
+            .all(|(tag, _, limit)| match tag {
+                11 | 13 => *limit == TIMER_SCAN_LIMIT,
+                15 => *limit == domain::MAX_TOPIC_SUBSCRIPTIONS + 1,
+                _ => false,
+            })
     );
     drop(scans);
     node.store.clear();
@@ -432,7 +438,7 @@ fn independent_pages_wrap_without_starving_either_entity_kind<P: StoreProvider>(
     assert_eq!(tail.queues_swept, 2);
     assert_eq!(
         node.store.topic_reads(),
-        vec![cursor(&format!("topic-{:04}", MAX_TOPICS_PER_SWEEP))]
+        vec![cursor(&format!("topic-{:04}", MAX_TOPICS_PER_SWEEP)); 3]
     );
     node.store.clear();
     let wrapped = worker.sweep_once()?;
@@ -526,7 +532,7 @@ fn corrupt_topic_and_transient_discovery_advance_only_the_attempted_cursor<P: St
     assert_eq!(resumed.topics_swept, 1);
     assert_eq!(resumed.duplicate_history_expired, 1);
     assert_eq!(node.store.pages(14)[0].start, failed_start);
-    assert_eq!(node.store.topic_reads(), vec![cursor("z-due")]);
+    assert_eq!(node.store.topic_reads(), vec![cursor("z-due"); 3]);
     assert_eq!(node.history("z-due", "due")?, None);
     Ok(())
 }
