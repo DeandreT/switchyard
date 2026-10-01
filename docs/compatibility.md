@@ -255,6 +255,83 @@ due prefix, or leaves the first unfit publication pending and cancelable. Rule
 matching precedes missing-session routing, so an excluded publication creates
 no dead-letter copy on that subscription.
 
+### SQL Predicate Foundation
+
+The domain library exposes an ephemeral `SqlProgram` compiler and evaluator.
+It is not yet a persisted `RuleFilter` variant or an AMQP rule-management
+capability: general SQL rule requests remain explicitly unsupported. This
+foundation does not change publication routing or either durable format.
+
+Expression syntax is parsed by the pinned SQL parser, then lowered to a flat
+postorder program with backward-only child indexes. Neither the dependency AST
+nor the native program is serialized. The compiler permits Boolean logic,
+comparisons, numeric arithmetic, `IS NULL`, `IN`, `LIKE`, and property existence;
+queries, actions, casts, and nondeterministic functions remain unsupported.
+`p('literal')` and `property('literal')` address literal user-property names,
+including periods. Dynamic property-name expressions are unsupported. Explicit
+`sys` scope supports the same eight retained properties as correlation rules;
+unknown system names and scopes are rejected at compilation.
+User-property names must be nonempty and contain no control characters.
+
+SQL predicates distinguish true, false, and unknown; only true selects a
+message. Missing user properties are unknown, while present Null and absent
+known optional system properties are Null. `IS NULL` accepts either missing
+or Null. The Boolean truth tables and missing-user behavior follow the
+[SQL filter specification](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-messaging-sql-filter).
+Known-system absence is an explicit local choice, not cloud-verified behavior.
+Existence distinguishes missing user properties from present Null, and treats
+unset known system properties as absent. Null comparisons and null/unknown
+`IN` operands propagate unknown locally; a successful `IN` comparison wins over
+unknown candidates, but incompatible candidates remain errors. Those additional
+choices have not been compared with a cloud namespace.
+Authoritative ingress message/session identifiers are borrowed from the caller.
+
+User-property lookup compares allocation-free Unicode lowercase streams and
+refuses case-colliding keys rather than selecting one by map order. Regular
+identifiers use Unicode alphabetic starts and alphanumeric/underscore
+continuations; quoted names preserve other characters. These Unicode policies
+are local, not claims of exact .NET culture or character-category parity.
+String equality and `LIKE` are case-sensitive; string ordering is unsupported.
+`LIKE` uses a bounded regular-expression engine with escaped literals, full
+string anchors, newline-aware wildcards, and one Unicode scalar per `_`.
+The scalar-width choice is local and has not been compared with Azure.
+
+Integer literals retain Int64 semantics and floating literals use Double.
+Numeric comparison preserves integer precision instead of converting every
+value to floating point. Supported numeric promotions distinguish signed and
+unsigned widths. Nonnegative constant-only integral expressions can convert
+to Ulong, while signed runtime properties cannot; this constant-binding choice
+is local, not a cloud-verified interpretation of the SDK's Int64 literals.
+Integral overflow and zero divisors
+are finite evaluation errors; floating arithmetic retains IEEE-754 results.
+SQL values currently support Boolean, string, and integer/floating numeric
+constructors. Decimal, character, timestamp, UUID, binary, symbol, and compound
+values remain unsupported for scalar operators, but existence/null checks do
+not traverse or reject an otherwise present value.
+Unsupported message scalar types, incompatible operands, ambiguous names,
+and invalid `LIKE` escapes are errors, not false matches. Resource-limit
+refusals are separately typed and must not become dead-letter events when
+the evaluator is integrated into publication routing.
+
+Local compilation limits are 1,024 UTF-16 units, 4,096 UTF-8 bytes, 128 physical
+tokens, parser depth 32, 128 native nodes, native depth 32, and 32 `IN` items per
+expression. Source bounds apply before tokenization; the token bound applies
+before parsing and also bounds recursive AST destruction for flat chains.
+The tokenizer's temporary allocation is source-bounded, not token-capped during
+allocation. A shared compile allowance bounds a complete caller-defined rule
+load to 1 MiB source, 32,768 tokens, and 32,768 native nodes.
+
+Evaluation has a separate shared allowance of 1,048,576 work units and 32 MiB
+comparison bytes. Property scans and potential comparisons are charged before
+the corresponding work. Programs evaluate their flat nodes without Boolean
+shortcuts. Generated `LIKE` patterns are limited to 16 KiB, with 1 MiB compiled
+engine and DFA-cache limits; these are not total process-memory guarantees.
+The native evaluator owns no recursive message values and copies no producer
+payloads.
+The parser dependency's debug logs can contain rule source, so embedders must
+disable its logging targets. Public compiler/evaluator errors contain no rule
+source or producer values; the evaluator itself emits no logs.
+
 Topic publications may carry session identifiers, including mixed-session
 batches. Session-required subscriptions use session-affine ready indexes and
 the existing exclusive ownership, FIFO, state, renewal, release, and deferred
