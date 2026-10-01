@@ -6,8 +6,8 @@ use std::{
 
 use auth::{PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule};
 use domain::{
-    CommandKind, CommandOutcome, QueueConfig, ReceiveMode, StateMachine, SubscriptionConfig,
-    SubscriptionName, TopicConfig,
+    CommandKind, CommandOutcome, QueueConfig, ReceiveMode, RuleFilter, StateMachine,
+    SubscriptionConfig, SubscriptionName, TopicConfig,
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use server::{Broker, BrokerHandle, LocalProposer, Shutdown, SystemClock, TimerWorker};
@@ -216,6 +216,24 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
             )?;
         }
     }
+    let rule_topic = domain::EntityPath::new("orders-topic-rules")?;
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        rule_topic.clone(),
+        CommandKind::CreateTopic {
+            config: TopicConfig::default(),
+        },
+    )?;
+    for name in ["Alpha", "beta"] {
+        broker.handle().submit_blocking(
+            namespace.clone(),
+            rule_topic.clone(),
+            CommandKind::CreateSubscription {
+                name: SubscriptionName::new(name)?,
+                config: SubscriptionConfig::default(),
+            },
+        )?;
+    }
     let _timer = TestTimer::start(broker.handle());
 
     let rule = SharedAccessRule::new(
@@ -315,6 +333,7 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
         "required queue management-only global/session-filtered peek passed",
         "topic schedule/cancel/parent browse/timer/TTL/new sequence/dedup passed",
         "scheduled topic session/ordinary/independent SDLQ copies passed",
+        "rule manager/default/true/false/correlation/types/null/OR/batch/current activation rules passed",
     ] {
         assert!(
             String::from_utf8_lossy(&output.stdout).contains(marker),
@@ -453,6 +472,45 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
                     "scheduled topic SDK cleanup left an active hold in {target}"
                 );
             }
+        }
+    }
+    let namespace = domain::NamespaceName::new("tenant")?;
+    for prefix in [
+        domain::keys::message_prefix(&namespace, &rule_topic),
+        domain::keys::scheduled_prefix(&namespace, &rule_topic),
+    ] {
+        assert!(
+            store.scan_prefix(&prefix, 1)?.is_empty(),
+            "rule SDK workflow left parent retention in {rule_topic}"
+        );
+    }
+    for name in ["Alpha", "beta"] {
+        let name = SubscriptionName::new(name)?;
+        let rules =
+            broker
+                .handle()
+                .rules_blocking(namespace.clone(), rule_topic.clone(), name.clone())?;
+        assert_eq!(
+            rules.len(),
+            1,
+            "rule SDK cleanup left unexpected rules for {name}"
+        );
+        assert_eq!(rules[0].name.as_str(), "$Default");
+        assert_eq!(rules[0].filter, RuleFilter::True);
+        let entity = rule_topic.subscription(&name)?;
+        for target in [entity.clone(), entity.dead_letter_queue()?] {
+            assert!(
+                store
+                    .scan_prefix(&domain::keys::message_prefix(&namespace, &target), 1)?
+                    .is_empty(),
+                "rule SDK workflow left retained messages in {target}"
+            );
+            assert!(
+                store
+                    .scan_prefix(&domain::keys::session_lock_prefix(&namespace, &target), 1)?
+                    .is_empty(),
+                "rule SDK cleanup left an active hold in {target}"
+            );
         }
     }
     Ok(())
