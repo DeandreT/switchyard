@@ -18,7 +18,7 @@ activation, lock, time-to-live, session-lock, and duplicate-history expiry.
 JWT/OIDC, mTLS, policy administration,
 Raft, and compliance implementations remain to be built. Within the semantics
 below, topics have persisted definitions, bounded subscription topology, and
-atomic default-true fanout, parent-retained topic scheduling, AMQP subscription and dead-letter routing,
+atomic rule-selected fanout, parent-retained topic scheduling, AMQP subscription and dead-letter routing,
 and subscription management operations. Both pinned .NET gates cover immediate
 topic publications and independent subscription workflows. Session-required
 subscriptions reuse entity-local session ownership and state, while ordinary
@@ -26,7 +26,8 @@ subscriptions retain session identifiers without session-affine delivery.
 Read-only management browsing can inspect all sessions without acquiring a hold.
 Committed delivery notifications wake all registered entity waiters, including
 independent session receivers; registration precedes each receive attempt.
-Topic rules and Azure administration remain unimplemented. Native
+Boolean and scalar correlation rules are persisted and managed through AMQP;
+general SQL, actions, and Azure administration remain unimplemented. Native
 administration creates and reads topology, lists topics and subscriptions, and
 updates queues; the timer worker covers
 scheduled activation and the four expiry indexes that exist,
@@ -247,23 +248,27 @@ once at immediate or scheduled admission. Activation makes previously accepted
 work ready without rechecking or extending duplicate history. History cleanup is bounded, and overdue cleanup never
 extends the detection window because submissions check deadlines directly.
 
-Topic sends evaluate the current subscription rule revision before proposing
-fanout. The command records the matched subscriptions and encrypted property
+In the planned replicated design, topic sends evaluate the current subscription
+rule revision before proposing fanout. The command records the matched subscriptions and encrypted property
 overlays, making follower application deterministic. One encrypted payload can
 be referenced by multiple subscriptions and is removed after the final
 reference disappears.
 
-The implementation currently applies default-true fanout directly
-inside the deterministic state machine, using its validated bounded membership
-and one atomic batch. Topic ingress owns sequence allocation and duplicate
+The implementation currently evaluates Boolean and scalar correlation rules
+inside the deterministic state machine, using its validated bounded membership,
+complete rule sets, and one atomic batch. Subscription creation persists an
+explicit `$Default` true rule; removing the final rule selects nothing. Conditions
+AND within a correlation rule and action-free rules OR without extra copies.
+Topic ingress owns sequence allocation and duplicate
 history; subscription copies share that sequence but have independent receive
 and settlement state. It stores separate payload records rather than shared
 encrypted payloads. Future publications retain one scheduled record on the topic,
-not copies in its subscriptions. Activation uses current validated membership,
+not copies in its subscriptions. Activation uses current validated membership and rules,
 assigns a new shared active sequence, and starts each copy's TTL. Late-member
-participation is a local policy, not a cloud-verified guarantee. Session-required
+participation and rule timing are local policies, not cloud-verified guarantees. Session-required
 subscriptions own sessions independently; missing identifiers route copies to
-their respective dead-letter shadows. Rules and actions remain unimplemented.
+their respective dead-letter shadows only when their rules select the publication.
+General SQL and actions remain unimplemented.
 Fanout admission bounds retained copies, content, and typed value items before
 cloning; committed application effects name only actual ready destinations.
 Topic activation commits a fitting due prefix of at most 256 inspected sources,
@@ -271,6 +276,11 @@ Topic activation commits a fitting due prefix of at most 256 inspected sources,
 The timer continues positive prefixes for at most eight rounds per visited
 topic, so the sweep bound is eight command budgets, not one. An unfit first
 publication remains pending and cancelable rather than partially fanning out.
+Rule metadata has separate per-rule, per-subscription, and count bounds, while
+every input precharges all possible rule work and comparison bytes before
+payload cloning. Duplicate and nonmatching inputs do not bypass those limits.
+Detailed scalar semantics and local limits are recorded in
+[compatibility.md](docs/compatibility.md).
 
 ## Transactions And Forwarding
 

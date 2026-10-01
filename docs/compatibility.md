@@ -31,8 +31,8 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | Atomic default-true fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list, Rust clients on both backends and both pinned .NET clients; rules and Azure administration not implemented |
-| Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
+| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list, Rust clients on both backends and both pinned .NET clients; Azure administration not implemented |
+| Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean and scalar correlation rules through AMQP; general SQL and actions not implemented |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Dead-letter | Pre-1.0 | State machine, AMQP mapping |
@@ -171,7 +171,8 @@ is a Switchyard policy, not a verified Azure queue-update property.
 The state machine can create and read distinct topic definitions and bounded,
 sorted subscription membership. Queue and topic names cannot occupy the same
 namespace path. Subscription creation names its parent topic and atomically
-stores the member, its receive-only backing queue, and its dead-letter shadow;
+stores the member, its receive-only backing queue, its dead-letter shadow, and
+an explicit `$Default` true rule;
 invalid settings, path collisions, composed path limits, or storage failure
 leave all of them and the applied clock unchanged. Topics have no queue or
 dead-letter shadow of their own. Membership is limited to 32 subscriptions per
@@ -188,9 +189,9 @@ shadows through its existing queue index. Subscriptions cannot be sent to or
 updated through queue commands.
 
 Immediate topic send, envelope send, and batch send copy each accepted message
-to every currently registered subscription in one storage commit. This is the
-[default-true subscription model](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-queues-topics-subscriptions),
-without filters or actions. Duplicate detection runs once at topic ingress;
+to each currently matching subscription in one storage commit. New subscriptions
+initially match all publications through their persisted `$Default` rule.
+Duplicate detection runs once at topic ingress;
 duplicate publications consume a sequence but create no copies. A topic with
 no subscriptions acknowledges publications without retaining messages, and a
 later subscription sees only later publications. Each copy preserves its body
@@ -210,6 +211,50 @@ aggregate retained typed content, compatibility bodies and normalized IDs, and
 65,536 typed value items. These are local resource policies, not Azure quotas.
 Only committed destinations are notified, without a post-commit topology read.
 
+Subscription rules are persisted independently under their exact member and
+rule names. True and false filters are supported, including the SDK's exact SQL
+aliases `1=1` and `1=0`. Correlation conditions AND together; action-free rules
+OR together and emit at most one copy per matching subscription. Removing the
+final rule selects nothing, with no implicit default fallback. These Boolean,
+default, and combination semantics follow Microsoft's
+[topic filter documentation](https://learn.microsoft.com/en-us/azure/service-bus-messaging/topic-filters).
+General SQL expressions, actions, and compound correlation predicates are
+explicitly unsupported rather than treated as successful matches.
+
+Correlation rules select the eight retained system string properties and scalar
+application properties. `label` maps to subject; message and session identifiers
+use the existing authoritative ingress values. Non-string AMQP correlation IDs
+do not match a system-string condition. Strings are case-sensitive. Application
+property keys and values use exact local typed equality: no case folding or
+numeric coercion, float equality follows retained bit patterns, and a missing
+property never equals a present Null. An empty correlation filter matches all
+messages by vacuous AND. Those exact scalar, key, normalization, and empty-filter
+choices are local policies, not cloud-verified guarantees. Original typed message
+IDs remain unchanged in retained envelopes. An absent message ID and an explicit
+empty message ID follow the existing anonymous ingress ID rather than a new
+wire-presence comparison. All destination content-size limits are still checked,
+including destinations excluded by a filter; filtering only changes retention.
+
+Rule names retain their spelling and permit `$Default`; the SDK-compatible
+length bound counts 50 UTF-16 units rather than UTF-8 bytes. Whitespace-only
+names and the SDK's forbidden path characters are rejected. Control characters
+are additionally forbidden by the local storage policy. Rules are limited to
+32 per subscription, with 32 total conditions per correlation rule, 64 KiB per
+versioned stored rule, and 256 KiB across one subscription's complete rule set.
+Reads scan at most 33 rule entries, validate the complete topology and rule
+metadata, and reject corruption instead of omitting entries. With 32 members,
+rule metadata can total 8 MiB independently of the message fanout budget.
+
+Matching has its own deterministic limits: 1,048,576 work units and 32 MiB of
+potential comparison bytes per command. All inputs precharge every rule and
+condition, including custom-property lookup work and potential key/value
+comparisons, before retained content is cloned. Duplicates, nonmatches, and
+short-circuit success do not bypass these charges. Immediate and scheduled
+admission reject an over-budget command atomically. Activation selects a fitting
+due prefix, or leaves the first unfit publication pending and cancelable. Rule
+matching precedes missing-session routing, so an excluded publication creates
+no dead-letter copy on that subscription.
+
 Topic publications may carry session identifiers, including mixed-session
 batches. Session-required subscriptions use session-affine ready indexes and
 the existing exclusive ownership, FIFO, state, renewal, release, and deferred
@@ -221,8 +266,8 @@ Duplicate detection remains topic-local and based on message ID, independent of
 session ID, consistent with Microsoft's
 [nonpartitioned duplicate-detection description](https://learn.microsoft.com/en-us/azure/service-bus-messaging/duplicate-detection).
 
-A publication without a session identifier reaches ordinary subscriptions
-normally, while each session-required subscription receives its copy directly
+A matching publication without a session identifier reaches ordinary subscriptions
+normally, while each matching session-required subscription receives its copy directly
 in its dead-letter shadow with reason `Session ID is null`. Those copies keep the
 topic sequence but have no lifetime or session identifier. This per-copy routing
 is a local policy inferred from the documented
@@ -255,8 +300,9 @@ browsing, but returns only pending schedules; explicit session filters remain
 unsupported on the parent. Subscriptions cannot schedule publications directly.
 
 Activation removes the parent schedule and fans out atomically to current,
-validated membership. Late-created subscriptions participate in this local
-policy; that behavior has not been compared with a live Azure namespace. Each
+validated membership and current rules. Late-created subscriptions and rule
+changes before activation participate in this local policy; that behavior has
+not been compared with a live Azure namespace. Each
 logical publication receives a new shared topic sequence after earlier active
 work. Its actual activation timestamp becomes enqueue time and starts the
 shortest requested/topic/current-subscription lifetime. These sequence and TTL
@@ -276,7 +322,7 @@ serializes activation and cancellation, unlike Azure's documented race between
 those operations.
 
 Scheduled batches budget one retained parent copy per accepted future input.
-Every future input must also fit an individual fanout against current membership
+Every future input must also fit an individual fanout against current matching membership
 before retention. Activation processes a fitting due prefix within the existing
 ingress budgets and at most 256 inspected scheduling entries, 1,024 copies,
 4 MiB retained content, and 65,536 projected values. A later input that would
@@ -310,7 +356,17 @@ remain receivable. Topic management links support scheduled browsing,
 scheduling, and cancellation with operation-specific authorization; ordinary
 topic data receivers remain refused.
 Native administration can create, get, and list topics and subscriptions;
-configuration updates for those entity kinds and rules remain unimplemented.
+configuration updates for those entity kinds remain unimplemented. Subscription
+management links support `com.microsoft:add-rule`, `com.microsoft:remove-rule`,
+and `com.microsoft:enumerate-rules`. All three use Listen authorization on the
+complete endpoint scope, consistent with the SDK's
+[ServiceBusRuleManager contract](https://github.com/Azure/azure-sdk-for-net/blob/Azure.Messaging.ServiceBus_7.21.0/sdk/servicebus/Azure.Messaging.ServiceBus/src/RuleManager/ServiceBusRuleManager.cs),
+not the Manage requirement of HTTP administration. Rule enumeration is a pure
+serialized metadata read without a command stamp or clock access; mutations use
+the normal atomic stamped-command path. Enumeration accepts `top` 1 through 100
+and a nonnegative `skip` against the complete bounded, sorted rule set. A requested
+page that exceeds the response allowance fails rather than returning a shortened
+successful page, which could prematurely stop the SDK's enumeration loop.
 
 Identifier allocation refuses exhaustion instead of saturating and reusing a
 stored identity. Sequence numbers are limited to `i64::MAX`, preserving exact
@@ -871,8 +927,9 @@ updates, and both topic batch-send APIs with ingress duplicate detection. These
 gates cover the local shared-sequence policy, not cloud parity for that policy.
 Both pins also cover independent subscription sessions and management-only
 session browsing, plus parent topic scheduled browsing, cancellation, annotated
-send, and timer activation. Topic filters/actions and Azure administration remain
-ungated.
+send, and timer activation. Boolean/correlation rule creation, removal,
+enumeration, and delivery selection are also exercised. General SQL, actions,
+and Azure administration remain ungated.
 
 The SDK gates build into separate temporary directories and run the resulting
 assemblies directly. Run them explicitly with
@@ -1000,14 +1057,16 @@ token. Command-line settings preserve omitted, false, zero, and unlimited TTL.
 
 ## Durable Format
 
-The current value format is version 9 and durable store layout is version 10.
+The current value format is version 9 and durable store layout is version 11.
 The value format appends the missing-session dead-letter reason without changing
 existing reason tags or message fields. Version 8 messages with earlier reasons
 and version 8 queue configurations remain decodable. A missing-session reason
 cannot be relabeled as an earlier message version. The layout protects the new
 policy-dependent ready indexes for session-bearing ordinary subscription copies
-and parent-retained topic schedules. An older build would choose the wrong index
-when releasing those copies or leave pending topic publications unactivated.
+and parent-retained topic schedules. It also protects explicit subscription
+rules, including an empty rule set after deletion. An older build would choose
+the wrong index when releasing those copies, leave pending topic publications
+unactivated, or deliver publications excluded by the new rules.
 Earlier message and queue-configuration shapes have tested decoders, but an
 earlier store directory is refused at open because its broker contract differs.
 There is no directory migration tooling yet; development directories
