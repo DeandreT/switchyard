@@ -524,6 +524,7 @@ if (await receiver.PeekMessageAsync(fromSequenceNumber: 1) is not null
 
 await BatchCases.RunAsync(client, queue + "-batches", sessionQueue + "-batches",
     duplicateQueue + "-batches");
+await TopicCases.RunAsync(client, queue + "-topics", "Alpha", "beta");
 
 Console.WriteLine(
     "official .NET Service Bus client send/batch/peek/receive/settlement updates/defer/dead-letter/expiry/renew/complete/schedule/cancel/duplicate and session renew/state/deferred receive passed");

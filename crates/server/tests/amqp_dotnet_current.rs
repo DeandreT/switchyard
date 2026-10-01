@@ -5,7 +5,10 @@ use std::{
 };
 
 use auth::{PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule};
-use domain::{CommandKind, CommandOutcome, QueueConfig, ReceiveMode, StateMachine};
+use domain::{
+    CommandKind, CommandOutcome, QueueConfig, ReceiveMode, StateMachine, SubscriptionConfig,
+    SubscriptionName, TopicConfig,
+};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use server::{Broker, BrokerHandle, LocalProposer, Shutdown, SystemClock, TimerWorker};
 use storage::MemoryStore;
@@ -122,6 +125,28 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
             CommandKind::CreateQueue { config },
         )?;
     }
+    let topic = domain::EntityPath::new("orders-topics")?;
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        topic.clone(),
+        CommandKind::CreateTopic {
+            config: TopicConfig {
+                requires_duplicate_detection: true,
+                duplicate_detection_history_time_window_millis: 300_000,
+                ..TopicConfig::default()
+            },
+        },
+    )?;
+    for name in ["Alpha", "beta"] {
+        broker.handle().submit_blocking(
+            namespace.clone(),
+            topic.clone(),
+            CommandKind::CreateSubscription {
+                name: SubscriptionName::new(name)?,
+                config: SubscriptionConfig::default(),
+            },
+        )?;
+    }
     let _timer = TestTimer::start(broker.handle());
 
     let rule = SharedAccessRule::new(
@@ -205,6 +230,12 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
             .contains("session renew/state/deferred receive passed"),
         "the client exited without reporting the completed workflow"
     );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(
+            "topic fanout/subscription peek/renew/defer/complete/dead-letter/batch passed"
+        ),
+        "the client exited without completing topic workflows"
+    );
     assert_eq!(
         broker.handle().submit_blocking(
             domain::NamespaceName::new("tenant")?,
@@ -231,5 +262,23 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
         CommandOutcome::Peeked(Vec::new()),
         "duplicate workflows left retained messages in the broker"
     );
+    for name in ["Alpha", "beta"] {
+        let entity = topic.subscription(&SubscriptionName::new(name)?)?;
+        for target in [entity.clone(), entity.dead_letter_queue()?] {
+            assert_eq!(
+                broker.handle().submit_blocking(
+                    domain::NamespaceName::new("tenant")?,
+                    target.clone(),
+                    CommandKind::Peek {
+                        from_sequence: domain::SequenceNumber::new(0),
+                        max_messages: 10,
+                        session_id: None
+                    }
+                )?,
+                CommandOutcome::Peeked(vec![]),
+                "topic SDK workflow left retained messages in {target}"
+            );
+        }
+    }
     Ok(())
 }
