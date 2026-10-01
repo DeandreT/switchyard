@@ -57,7 +57,12 @@ struct Arguments {
     #[arg(long)]
     admin_listen: Option<SocketAddr>,
 
-    /// PEM certificate chain for AMQP over TLS.
+    /// Enable AMQP over WebSockets at this address. Uses the same TLS identity
+    /// and shared-access policy as the other listeners when configured.
+    #[arg(long)]
+    websocket_listen: Option<SocketAddr>,
+
+    /// PEM certificate chain for the configured TLS listeners.
     #[arg(long, value_name = "PATH")]
     tls_certificate: Option<PathBuf>,
 
@@ -159,6 +164,22 @@ fn listen_address(configured: Option<SocketAddr>, tls: bool) -> SocketAddr {
             },
         ))
     })
+}
+
+fn amqp_listener(
+    broker: server::BrokerHandle,
+    namespace: domain::NamespaceName,
+    tls: Option<&LoadedTls>,
+    authentication: Option<&SharedAccessAuthentication>,
+) -> AmqpListener<server::BrokerHandle> {
+    let mut listener = AmqpListener::new(broker, namespace);
+    if let Some(tls) = tls {
+        listener = listener.with_tls(tls.amqp.clone());
+    }
+    if let Some(authentication) = authentication {
+        listener = listener.with_shared_access_authentication(authentication.clone());
+    }
+    listener
 }
 
 fn load_shared_access_authentication(
@@ -277,6 +298,24 @@ fn run() -> Result<(), StartupError> {
                 address: listen.to_string(),
                 detail: error.to_string(),
             })?;
+        let websocket = if let Some(address) = arguments.websocket_listen {
+            let socket = tokio::net::TcpListener::bind(address)
+                .await
+                .map_err(|error| StartupError::Listen {
+                    address: address.to_string(),
+                    detail: error.to_string(),
+                })?;
+            let listener = amqp_listener(
+                broker.handle(),
+                namespace.clone(),
+                tls.as_ref(),
+                shared_access_authentication.as_ref(),
+            )
+            .with_websocket();
+            Some((listener, socket))
+        } else {
+            None
+        };
         let native = if let Some(address) = arguments.admin_listen {
             let socket = tokio::net::TcpListener::bind(address)
                 .await
@@ -301,27 +340,38 @@ fn run() -> Result<(), StartupError> {
             None
         };
         info!(address = %listener.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, namespace = %namespace, tls = tls.is_some(), "accepting AMQP connections");
-        let amqp = AmqpListener::new(broker.handle(), namespace);
-        let amqp = match tls {
-            Some(config) => amqp.with_tls(config.amqp),
-            None => amqp,
+        if let Some((_, socket)) = &websocket {
+            info!(address = %socket.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, namespace = %namespace, tls = tls.is_some(), "accepting AMQP WebSocket connections");
+        }
+        let amqp = amqp_listener(
+            broker.handle(),
+            namespace,
+            tls.as_ref(),
+            shared_access_authentication.as_ref(),
+        );
+        // Bind every configured socket before any listener can accept a client.
+        let serve_native = async {
+            match native {
+                Some((admin, socket)) => admin.serve(socket).await,
+                None => std::future::pending().await,
+            }
         };
-        let amqp = match shared_access_authentication {
-            Some(authentication) => amqp.with_shared_access_authentication(authentication),
-            None => amqp,
+        let serve_websocket = async {
+            match websocket {
+                Some((websocket, socket)) => websocket.serve(socket).await,
+                None => std::future::pending().await,
+            }
         };
-        match native {
-            Some((admin, socket)) => tokio::select! {
-                result = amqp.serve(listener) => {
-                    result.map_err(|error| StartupError::Runtime(error.to_string()))
-                }
-                result = admin.serve(socket) => {
-                    result.map_err(|error| StartupError::Runtime(error.to_string()))
-                }
-            },
-            None => amqp.serve(listener)
-                .await
-                .map_err(|error| StartupError::Runtime(error.to_string())),
+        tokio::select! {
+            result = amqp.serve(listener) => {
+                result.map_err(|error| StartupError::Runtime(error.to_string()))
+            }
+            result = serve_native => {
+                result.map_err(|error| StartupError::Runtime(error.to_string()))
+            }
+            result = serve_websocket => {
+                result.map_err(|error| StartupError::Runtime(error.to_string()))
+            }
         }
     });
 
@@ -360,6 +410,34 @@ mod tests {
         assert_eq!(
             listen_address(None, true).port(),
             protocol_amqp::AMQP_TLS_PORT
+        );
+    }
+
+    #[test]
+    fn websocket_listener_is_opt_in_and_has_an_independent_address() {
+        let defaults = Arguments::try_parse_from(["switchyard"]).expect("default arguments");
+        assert!(defaults.websocket_listen.is_none());
+        let configured = Arguments::try_parse_from([
+            "switchyard",
+            "--listen",
+            "127.0.0.1:5672",
+            "--websocket-listen",
+            "127.0.0.1:8080",
+            "--admin-listen",
+            "127.0.0.1:9080",
+        ])
+        .expect("independent listener arguments");
+        assert_eq!(configured.listen.expect("raw listener").port(), 5672);
+        assert_eq!(
+            configured
+                .websocket_listen
+                .expect("WebSocket listener")
+                .port(),
+            8080
+        );
+        assert_eq!(
+            configured.admin_listen.expect("admin listener").port(),
+            9080
         );
     }
 

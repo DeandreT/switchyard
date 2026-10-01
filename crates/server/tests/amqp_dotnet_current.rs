@@ -20,6 +20,10 @@ const KEY: &str = "test-secret";
 const CURRENT_SDK: &str = "7.21.0";
 const PREVIOUS_SDK: &str = "7.20.2";
 
+#[cfg(target_os = "linux")]
+#[path = "amqp_dotnet_current/websocket.rs"]
+mod websocket;
+
 struct TestTimer {
     shutdown: Arc<Shutdown>,
     thread: Option<JoinHandle<()>>,

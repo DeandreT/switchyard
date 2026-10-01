@@ -12,10 +12,12 @@ pub(super) fn initialize() -> Result<(), StartupError> {
 }
 
 fn initialize_bridge() -> Result<(), StartupError> {
-    // The parser logs expression text. Deny it before dispatch, independently
-    // of user-selected tracing levels, without disabling other dependencies.
+    // These dependencies log rule text, HTTP headers, and wire payloads. Deny
+    // them before dispatch, independently of user-selected tracing levels.
     tracing_log::LogTracer::builder()
         .ignore_crate("sqlparser")
+        .ignore_crate("tungstenite")
+        .ignore_crate("tokio_tungstenite")
         .init()
         .map_err(|_| StartupError::LoggingInitialization)
 }
@@ -46,20 +48,29 @@ mod tests {
     }
 
     #[test]
-    fn explicit_parser_trace_cannot_log_rule_text_but_other_diagnostics_work() {
+    fn explicit_dependency_trace_cannot_log_private_data_but_diagnostics_work() {
         initialize_bridge().expect("the binary test owns its log bridge");
         let output = Arc::new(Mutex::new(Vec::new()));
         let writer = Arc::clone(&output);
         let subscriber = tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::new(
-                "trace,sqlparser=trace,sqlparser::parser=trace,sqlparser::dialect=trace",
+                "trace,sqlparser=trace,tungstenite=trace,tokio_tungstenite=trace",
             ))
             .without_time()
             .with_ansi(false)
             .with_writer(move || Capture(Arc::clone(&writer)))
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            for target in ["sqlparser", "sqlparser::parser", "sqlparser::dialect"] {
+            for target in [
+                "sqlparser",
+                "sqlparser::parser",
+                "sqlparser::dialect",
+                "tungstenite",
+                "tungstenite::protocol::frame",
+                "tungstenite::handshake::server",
+                "tokio_tungstenite",
+                "tokio_tungstenite::compat",
+            ] {
                 assert!(
                     !log::logger().enabled(
                         &log::Metadata::builder()
@@ -68,6 +79,7 @@ mod tests {
                             .build()
                     )
                 );
+                log::trace!(target: target, "private_websocket_credential private_message_body");
             }
             assert!(
                 log::logger().enabled(
@@ -88,5 +100,7 @@ mod tests {
         assert!(output.contains("healthy native event"), "{output}");
         assert!(!output.contains("private_rule_key"), "{output}");
         assert!(!output.contains("private_rule_literal"), "{output}");
+        assert!(!output.contains("private_websocket_credential"), "{output}");
+        assert!(!output.contains("private_message_body"), "{output}");
     }
 }
