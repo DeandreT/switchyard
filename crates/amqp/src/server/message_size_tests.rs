@@ -25,6 +25,7 @@ fn transfer(handle: u32, id: Option<u32>, more: bool) -> Transfer {
 
 fn session_state() -> SessionState {
     let mut session = SessionState::new(&Begin::default());
+    session.peer_channel = Some(CHANNEL);
     session.local_begin_sent = true;
     session
 }
@@ -500,6 +501,7 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
         &incoming,
         &mut sessions,
         u32::MAX,
+        u16::MAX,
         false,
     )
     .await

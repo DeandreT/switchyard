@@ -604,7 +604,7 @@ async fn client_peer() -> TestResult<(ClientConnection, Peer)> {
 }
 
 #[tokio::test]
-async fn client_pending_and_mapped_session_errors_never_repeat_its_own_begin() -> TestResult {
+async fn client_mapped_session_errors_never_repeat_its_own_begin() -> TestResult {
     for refused in [false, true] {
         let (mut connection, mut peer) = client_peer().await?;
         let (mut session, ()) = timeout(IO_TIMEOUT, async {
@@ -632,6 +632,7 @@ async fn client_pending_and_mapped_session_errors_never_repeat_its_own_begin() -
         let (result, peer_result) = timeout(IO_TIMEOUT, async {
             tokio::join!(connection.begin(), async {
                 assert!(matches!(peer.read().await?, Frame::Amqp { channel: 1, performative: Some(Performative::Begin(begin)), .. } if begin.remote_channel.is_none()));
+                peer.send(1, Performative::Begin(Begin { remote_channel: Some(1), ..Begin::default() }), Vec::new()).await?;
                 if refused {
                     let mut flow = peer.flow(1);
                     flow.handle = Some(99);
@@ -644,7 +645,11 @@ async fn client_pending_and_mapped_session_errors_never_repeat_its_own_begin() -
             })
         }).await?;
         peer_result?;
-        assert!(matches!(result, Err(EngineError::RemoteDetached)));
+        let ended = result?;
+        assert!(matches!(
+            ended.end().await,
+            Err(EngineError::RemoteDetached)
+        ));
         if refused {
             peer.send(1, Performative::End(End::default()), Vec::new())
                 .await?;

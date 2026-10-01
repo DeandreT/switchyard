@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use tokio::sync::{mpsc, oneshot, watch};
 use url::Url;
 
+use super::session_channels::vacant_channel;
 use super::*;
 use crate::{Source, Target};
 
@@ -774,13 +775,6 @@ struct PendingEnd {
     reply: oneshot::Sender<Result<(), EngineError>>,
 }
 
-fn vacant_channel(start: u16, maximum: u16, sessions: &HashMap<u16, SessionState>) -> Option<u16> {
-    let count = u32::from(maximum) + 1;
-    (0..count)
-        .map(|offset| ((u32::from(start) + offset) % count) as u16)
-        .find(|channel| !sessions.contains_key(channel))
-}
-
 fn fail_pending_session(
     channel: u16,
     pending_begins: &mut HashMap<u16, PendingBegin>,
@@ -816,6 +810,29 @@ fn fail_pending_session(
     if let Some(pending) = pending_ends.remove(&channel) {
         pending.identity.retire();
         let _ = pending.reply.send(Err(EngineError::RemoteDetached));
+    }
+}
+
+fn fail_pending_connection(
+    pending_begins: &mut HashMap<u16, PendingBegin>,
+    pending_attaches: &mut HashMap<String, PendingAttach>,
+    pending_detaches: &mut HashMap<(u16, u32), oneshot::Sender<Result<(), EngineError>>>,
+    pending_ends: &mut HashMap<u16, PendingEnd>,
+) {
+    for (_, pending) in pending_begins.drain() {
+        pending.identity.retire();
+        let _ = pending.reply.send(Err(EngineError::RemoteClosed));
+    }
+    for (_, mut pending) in pending_attaches.drain() {
+        stop_link(&mut pending.link);
+        let _ = pending.reply.send(Err(EngineError::RemoteClosed));
+    }
+    for (_, reply) in pending_detaches.drain() {
+        let _ = reply.send(Err(EngineError::RemoteClosed));
+    }
+    for (_, pending) in pending_ends.drain() {
+        pending.identity.retire();
+        let _ = pending.reply.send(Err(EngineError::RemoteClosed));
     }
 }
 
@@ -923,23 +940,51 @@ where
                         if activity.is_closing() && !matches!(&performative, Performative::Close(_)) {
                             continue;
                         }
-                        if sessions.get(&channel).is_some_and(|session| session.ending)
-                            && !matches!(&performative, Performative::End(_) | Performative::Close(_))
+                        let peer_channel = channel;
+                        let associated = local_channel_for_peer(peer_channel, &sessions);
+                        if associated.is_some_and(|channel| sessions[&channel].ending)
+                            && !matches!(&performative, Performative::End(_) | Performative::Open(_) | Performative::Close(_))
                         { continue; }
-                            let result = match performative {
-                                Performative::Begin(begin) => {
+                        let association = match &performative {
+                            Performative::Begin(begin) => {
+                                if associated.is_some() {
+                                    Err(("amqp:connection:framing-error", "peer session channel is already assigned"))
+                                } else if let Some(channel) = begin.remote_channel {
                                     let matches = pending_begins.get(&channel).is_some_and(|pending| {
                                         sessions.get(&channel).is_some_and(|session| {
-                                            !session.ending && !pending.identity.is_retired()
+                                            !session.ending && session.peer_channel.is_none()
+                                                && !pending.identity.is_retired() && !session.identity.is_retired()
                                                 && session.identity.same_session(&pending.identity)
                                         })
                                     });
                                     if matches {
-                                        let pending = pending_begins.remove(&channel).expect("matching pending begin");
-                                        let session = sessions.get_mut(&channel).expect("matching initiated session");
-                                        session.flow = SessionWindow::new(0, begin.next_outgoing_id, begin.incoming_window, begin.outgoing_window, SESSION_WINDOW);
-                                        let _ = pending.reply.send(Ok((channel, pending.identity)));
+                                        Ok(channel)
+                                    } else {
+                                        Err(("amqp:connection:framing-error", "begin response does not reference a pending local session"))
                                     }
+                                } else {
+                                    Err(("amqp:not-implemented", "peer-initiated sessions are not implemented by this client"))
+                                }
+                            }
+                            Performative::Open(_) | Performative::Close(_) => Ok(channel),
+                            _ => associated.ok_or(("amqp:connection:framing-error", "frame on an unassigned peer session channel")),
+                        };
+                        let channel = match association {
+                            Ok(channel) => channel,
+                            Err((condition, description)) => {
+                                refuse_connection(condition, description, &mut writer, &mut sessions).await?;
+                                fail_pending_connection(&mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
+                                pump_ready = false;
+                                continue;
+                            }
+                        };
+                            let result = match performative {
+                                Performative::Begin(begin) => {
+                                    let pending = pending_begins.remove(&channel).expect("validated pending begin");
+                                    let session = sessions.get_mut(&channel).expect("validated initiated session");
+                                    session.peer_channel = Some(peer_channel);
+                                    session.flow = SessionWindow::new(0, begin.next_outgoing_id, begin.incoming_window, begin.outgoing_window, SESSION_WINDOW);
+                                    let _ = pending.reply.send(Ok((channel, pending.identity)));
                                     Ok(false)
                                 }
                                 Performative::Attach(attach) => {
@@ -1448,3 +1493,7 @@ where
     let _ = closed.send(true);
     result
 }
+
+#[cfg(test)]
+#[path = "client_channel_tests.rs"]
+mod channel_tests;

@@ -100,6 +100,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let mut session = SessionState::new(&Begin::default());
+        session.peer_channel = Some(CHANNEL);
         session.local_begin_sent = true;
         let output = Arc::new(Output::default());
         Self {
@@ -240,6 +241,7 @@ impl Fixture {
             &incoming,
             &mut self.sessions,
             512,
+            u16::MAX,
             false,
         )
         .await
@@ -366,6 +368,7 @@ async fn old_caller_and_receipt_cannot_claim_a_replacement_session_with_identica
             old_session.retire();
         }
         let mut replacement = SessionState::new(&Begin::default());
+        replacement.peer_channel = Some(CHANNEL);
         replacement.local_begin_sent = true;
         fixture.sessions.insert(CHANNEL, replacement);
         let fresh = fixture.pending(HANDLE, Role::Sender);
@@ -477,6 +480,7 @@ async fn old_incoming_session_cannot_publish_begin_or_consume_fresh_pending_sess
         fixture
             .sessions
             .insert(CHANNEL, SessionState::new(&Begin::default()));
+        fixture.session_mut().peer_channel = Some(CHANNEL);
         let fresh = fixture.pending(HANDLE, Role::Sender);
         fixture
             .session_mut()

@@ -30,6 +30,7 @@ mod idle;
 mod incoming_ledger;
 mod outgoing_identity;
 mod receive_credit;
+mod session_channels;
 mod session_identity;
 
 use content_budget::ContentLease;
@@ -45,6 +46,7 @@ use incoming_ledger::{
 };
 use outgoing_identity::AckIdentity;
 use receive_credit::{Consumption, ReceiveCredit};
+use session_channels::{local_channel_for_peer, preferred_vacant_channel};
 pub use session_identity::IncomingAttach;
 use session_identity::{AttachApproval, AttachApprovalError, SessionIdentity};
 
@@ -478,7 +480,7 @@ impl ServerConnection {
     {
         options.validate()?;
         let local_max_frame_size = normalized_frame_size(DEFAULT_MAX_FRAME_SIZE)?;
-        let mut local_open = Open {
+        let local_open = Open {
             max_frame_size: local_max_frame_size,
             idle_time_out: Some(options.advertised_idle_timeout()),
             ..Open::new(container_id)
@@ -529,7 +531,6 @@ impl ServerConnection {
             _ => return Err(invalid_state("expected AMQP open")),
         };
         let remote_max_frame_size = normalized_frame_size(remote_open.max_frame_size)?;
-        local_open.channel_max = remote_open.channel_max;
         let channel_max = local_open.channel_max;
         negotiation_frame(&mut stream, &checked_open_frame(local_open)?, options).await?;
         let peer_idle_millis = peer_idle_timeout(
@@ -1025,6 +1026,7 @@ fn reject_closed_command(command: Command) {
 
 struct SessionState {
     identity: SessionIdentity,
+    peer_channel: Option<u16>,
     attach_tx: Option<mpsc::Sender<IncomingAttach>>,
     local_begin_sent: bool,
     links: HashMap<u32, LinkState>,
@@ -1102,6 +1104,7 @@ impl SessionState {
     fn new(peer: &Begin) -> Self {
         Self {
             identity: SessionIdentity::new(),
+            peer_channel: None,
             attach_tx: None,
             local_begin_sent: false,
             links: HashMap::new(),
@@ -1329,6 +1332,7 @@ async fn run_connection<Io>(
                                 &incoming_sessions,
                                 &mut sessions,
                                 remote_max_frame_size,
+                                settings.remote_channel_max,
                                 activity.is_closing(),
                             ).await {
                                 Ok(FrameAction::Continue) => pump_ready = true,
@@ -1442,6 +1446,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
     incoming_sessions: &mpsc::Sender<IncomingSession>,
     sessions: &mut HashMap<u16, SessionState>,
     remote_max_frame_size: u32,
+    remote_channel_max: u16,
     locally_closing: bool,
 ) -> Result<FrameAction, EngineError> {
     let Frame::Amqp {
@@ -1455,37 +1460,83 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
     let Some(performative) = performative else {
         return Ok(FrameAction::Continue);
     };
-    if sessions.get(&channel).is_some_and(|session| session.ending)
-        && !matches!(&performative, Performative::End(_) | Performative::Close(_))
+    let peer_channel = channel;
+    let associated = local_channel_for_peer(peer_channel, sessions);
+    if associated.is_some_and(|channel| sessions[&channel].ending)
+        && !matches!(
+            &performative,
+            Performative::End(_) | Performative::Open(_) | Performative::Close(_)
+        )
     {
         return Ok(FrameAction::Continue);
     }
+    let channel = match &performative {
+        Performative::Begin(begin) => {
+            if associated.is_some() {
+                refuse_connection(
+                    "amqp:connection:framing-error",
+                    "peer session channel is already assigned",
+                    writer,
+                    sessions,
+                )
+                .await?;
+                return Ok(FrameAction::Continue);
+            }
+            if begin.remote_channel.is_some() {
+                refuse_connection(
+                    "amqp:connection:framing-error",
+                    "unexpected response to a locally initiated session",
+                    writer,
+                    sessions,
+                )
+                .await?;
+                return Ok(FrameAction::Continue);
+            }
+            if sessions.len() >= MAX_SESSIONS_PER_CONNECTION {
+                refuse_connection(
+                    "amqp:resource-limit-exceeded",
+                    "connection session limit reached",
+                    writer,
+                    sessions,
+                )
+                .await?;
+                return Ok(FrameAction::Continue);
+            }
+            let Some(channel) =
+                preferred_vacant_channel(peer_channel, remote_channel_max, sessions)
+            else {
+                refuse_connection(
+                    "amqp:resource-limit-exceeded",
+                    "peer session channel limit reached",
+                    writer,
+                    sessions,
+                )
+                .await?;
+                return Ok(FrameAction::Continue);
+            };
+            channel
+        }
+        Performative::Open(_) | Performative::Close(_) => channel,
+        _ => {
+            let Some(channel) = associated else {
+                refuse_connection(
+                    "amqp:connection:framing-error",
+                    "frame on an unassigned peer session channel",
+                    writer,
+                    sessions,
+                )
+                .await?;
+                return Ok(FrameAction::Continue);
+            };
+            channel
+        }
+    };
 
     match performative {
         Performative::Begin(begin) => {
-            if sessions.contains_key(&channel) {
-                return Err(invalid_state("duplicate AMQP begin"));
-            }
-            if sessions.len() >= MAX_SESSIONS_PER_CONNECTION {
-                let frame = Frame::Amqp {
-                    channel: 0,
-                    performative: Some(Performative::Close(Close {
-                        error: Some(Error::new(
-                            crate::AmqpError::ResourceLimitExceeded,
-                            "connection session limit reached",
-                            None,
-                        )),
-                    })),
-                    payload: Vec::new(),
-                };
-                writer.encoded_frame(&frame)?;
-                for session in sessions.values_mut() {
-                    stop_session(session);
-                }
-                writer.write_frame(&frame).await?;
-                return Ok(FrameAction::Continue);
-            }
-            sessions.insert(channel, SessionState::new(&begin));
+            let mut session = SessionState::new(&begin);
+            session.peer_channel = Some(peer_channel);
+            sessions.insert(channel, session);
             if incoming_sessions
                 .try_send(IncomingSession {
                     channel,
@@ -2587,11 +2638,14 @@ async fn ensure_local_begin<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
 ) -> Result<(), EngineError> {
     if !session.local_begin_sent {
+        let peer_channel = session
+            .peer_channel
+            .ok_or_else(|| invalid_state("session has no associated peer channel"))?;
         writer
             .write_amqp(
                 channel,
                 Performative::Begin(Begin {
-                    remote_channel: Some(channel),
+                    remote_channel: Some(peer_channel),
                     ..Begin::default()
                 }),
                 Vec::new(),
@@ -2599,6 +2653,31 @@ async fn ensure_local_begin<W: AsyncWrite + Unpin>(
             .await?;
         session.local_begin_sent = true;
     }
+    Ok(())
+}
+
+async fn refuse_connection<W: AsyncWrite + Unpin>(
+    condition: &str,
+    description: impl Into<String>,
+    writer: &mut FrameWriter<W>,
+    sessions: &mut HashMap<u16, SessionState>,
+) -> Result<(), EngineError> {
+    let frame = Frame::Amqp {
+        channel: 0,
+        performative: Some(Performative::Close(Close {
+            error: Some(Error::new(
+                crate::ErrorCondition::Custom(Symbol::from(condition)),
+                description,
+                None,
+            )),
+        })),
+        payload: Vec::new(),
+    };
+    writer.encoded_frame(&frame)?;
+    for session in sessions.values_mut() {
+        stop_session(session);
+    }
+    writer.write_frame(&frame).await?;
     Ok(())
 }
 
@@ -3785,3 +3864,6 @@ mod receive_ceiling_tests;
 
 #[cfg(test)]
 mod content_budget_tests;
+
+#[cfg(test)]
+mod session_channel_tests;

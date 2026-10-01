@@ -60,6 +60,7 @@ impl Fixture {
                 &self.incoming_tx,
                 &mut self.sessions,
                 512,
+                u16::MAX,
                 false,
             ),
         )
@@ -310,25 +311,6 @@ async fn immediate_peer_end_starts_wire_session_before_ack_and_never_starts_unkn
     let (result, _) = fixture.approve(7).await;
     assert!(matches!(result, Err(EngineError::RemoteDetached)));
     fixture.assert_silent().await;
-    assert!(matches!(
-        fixture.input_result(99, Performative::Flow(flow())).await,
-        Err(EngineError::InvalidState(_))
-    ));
-    assert!(matches!(
-        fixture
-            .input_result(99, Performative::Transfer(unattached_transfer()))
-            .await,
-        Err(EngineError::InvalidState(_))
-    ));
-    assert!(matches!(
-        fixture
-            .input_result(99, Performative::End(End::default()))
-            .await,
-        Err(EngineError::InvalidState(_))
-    ));
-    assert!(!fixture.sessions.contains_key(&99));
-    fixture.assert_silent().await;
-
     fixture.begin(7).await;
     fixture
         .input(
@@ -342,6 +324,27 @@ async fn immediate_peer_end_starts_wire_session_before_ack_and_never_starts_unkn
     fixture.assert_begin(7).await;
     assert!(matches!(fixture.frame().await, (7, Performative::Flow(_))));
     fixture.assert_silent().await;
+
+    for performative in [
+        Performative::Flow(flow()),
+        Performative::Transfer(unattached_transfer()),
+        Performative::End(End::default()),
+    ] {
+        let mut unknown = Fixture::new(32);
+        unknown.input(99, performative).await;
+        let (channel, performative) = unknown.frame().await;
+        assert_eq!(channel, 0);
+        let Performative::Close(close) = performative else {
+            panic!("unknown peer channel gets a connection Close, not a Begin");
+        };
+        assert_eq!(
+            close.error.expect("framing error").condition.as_symbol(),
+            Symbol::from("amqp:connection:framing-error")
+        );
+        assert!(unknown.sessions.is_empty());
+        assert!(unknown.incoming.try_recv().is_err());
+        unknown.assert_silent().await;
+    }
 }
 
 #[tokio::test]
@@ -519,6 +522,7 @@ async fn local_begin_flag_is_not_published_on_failed_write_or_flush() {
         )
         .expect("frame writer");
         let mut session = SessionState::new(&Begin::default());
+        session.peer_channel = Some(0);
         assert!(!session.local_begin_sent);
         let result = timeout(DEADLINE, ensure_local_begin(0, &mut session, &mut writer))
             .await
@@ -576,18 +580,24 @@ async fn client_does_not_repeat_its_completed_begin_for_echo_or_early_refusal() 
             write_amqp(
                 &mut peer,
                 channel,
-                if peer_begins {
-                    Performative::Begin(Begin {
-                        remote_channel: Some(channel),
-                        ..Begin::default()
-                    })
-                } else {
-                    Performative::End(End::default())
-                },
+                Performative::Begin(Begin {
+                    remote_channel: Some(channel),
+                    ..Begin::default()
+                }),
                 Vec::new(),
             )
             .await
             .expect("peer session response");
+            if !peer_begins {
+                write_amqp(
+                    &mut peer,
+                    channel,
+                    Performative::End(End::default()),
+                    Vec::new(),
+                )
+                .await
+                .expect("peer early End after its Begin association");
+            }
             channel
         };
         let (session, channel) = timeout(DEADLINE, async {
@@ -642,7 +652,7 @@ async fn client_does_not_repeat_its_completed_begin_for_echo_or_early_refusal() 
             .await
             .expect("peer End acknowledgement");
         } else {
-            assert!(matches!(session, Err(EngineError::RemoteDetached)));
+            session.expect("the valid Begin response resolves before the early End");
             assert!(
                 matches!(next_frame(&mut peer).await, (actual, Performative::End(_)) if actual == channel)
             );

@@ -91,6 +91,7 @@ impl Fixture {
 
     fn seed_session(&mut self, channel: u16, count: usize, begun: bool) {
         let mut session = SessionState::new(&Begin::default());
+        session.peer_channel = Some(channel);
         session.local_begin_sent = begun;
         for handle in 0..count as u32 {
             session.links.insert(handle, sending());
@@ -113,6 +114,7 @@ impl Fixture {
             &self.incoming_tx,
             &mut self.sessions,
             512,
+            u16::MAX,
             false,
         )
         .await
@@ -300,17 +302,42 @@ async fn excess_begin_publishes_no_new_session_and_retires_existing_owners_befor
 }
 
 #[tokio::test]
-async fn duplicate_begin_retains_existing_error_priority_at_capacity_without_wire() {
+async fn duplicate_begin_retains_framing_error_priority_at_session_capacity() {
     let mut fixture = Fixture::new();
     for channel in 0..MAX_SESSIONS_PER_CONNECTION as u16 {
         fixture.seed_session(channel, 0, true);
     }
     let owner = fixture.sessions[&0].identity.clone();
-    assert!(
-        matches!(fixture.input(0, Performative::Begin(Begin::default())).await, Err(EngineError::InvalidState(ref message)) if message.contains("duplicate"))
+    assert!(matches!(
+        fixture
+            .input(0, Performative::Begin(Begin::default()))
+            .await
+            .expect("duplicate Begin refusal"),
+        FrameAction::Continue
+    ));
+    let frames = fixture.frames().await;
+    let [
+        Frame::Amqp {
+            channel: 0,
+            performative: Some(Performative::Close(close)),
+            payload,
+        },
+    ] = frames.as_slice()
+    else {
+        panic!("duplicate association gets one connection Close");
+    };
+    assert!(payload.is_empty());
+    assert_eq!(
+        close
+            .error
+            .as_ref()
+            .expect("collision error")
+            .condition
+            .as_symbol(),
+        Symbol::from("amqp:connection:framing-error")
     );
-    assert!(fixture.frames().await.is_empty());
-    assert!(!owner.is_retired());
+    assert!(owner.is_retired());
+    assert!(fixture.incoming.try_recv().is_err());
     assert_eq!(fixture.sessions.len(), MAX_SESSIONS_PER_CONNECTION);
 }
 

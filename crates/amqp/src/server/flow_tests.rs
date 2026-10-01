@@ -1392,7 +1392,8 @@ async fn client_begin(connection: &mut ClientConnection, peer: &mut DuplexStream
 
 #[cfg(feature = "test-client")]
 #[tokio::test]
-async fn client_session_end_releases_pending_begin_and_attach_callers_without_closing_connection() {
+async fn client_peer_end_retires_associated_session_and_releases_pending_attach_without_closing_connection()
+ {
     let (mut connection, mut peer) = client_pair().await;
     let refusing = async {
         let Frame::Amqp {
@@ -1406,11 +1407,22 @@ async fn client_session_end_releases_pending_begin_and_attach_callers_without_cl
         write_amqp(
             &mut peer,
             channel,
+            Performative::Begin(Begin {
+                remote_channel: Some(channel),
+                ..Begin::default()
+            }),
+            Vec::new(),
+        )
+        .await
+        .expect("peer associates the session before ending it");
+        write_amqp(
+            &mut peer,
+            channel,
             Performative::End(End::default()),
             Vec::new(),
         )
         .await
-        .expect("peer rejects Begin");
+        .expect("peer ends the associated session");
         assert!(matches!(
             next_frame(&mut peer).await,
             Frame::Amqp {
@@ -1419,12 +1431,16 @@ async fn client_session_end_releases_pending_begin_and_attach_callers_without_cl
             }
         ));
     };
-    let (rejected, ()) = timeout(DEADLINE, async {
+    let (accepted, ()) = timeout(DEADLINE, async {
         tokio::join!(connection.begin(), refusing)
     })
     .await
-    .expect("pending Begin fails promptly");
-    assert!(matches!(rejected, Err(EngineError::RemoteDetached)));
+    .expect("associated session ends promptly");
+    let ended = accepted.expect("the valid Begin response resolves before peer End");
+    assert!(matches!(
+        ended.end().await,
+        Err(EngineError::RemoteDetached)
+    ));
     let mut session = client_begin(&mut connection, &mut peer).await;
     let refusing = async {
         let Frame::Amqp {

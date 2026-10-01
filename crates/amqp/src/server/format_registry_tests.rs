@@ -413,7 +413,7 @@ fn first_fragment_preflight_includes_the_selected_format_encoding_width() {
 }
 
 #[tokio::test]
-async fn channel_above_our_advertised_maximum_gets_a_bounded_framing_error_close() {
+async fn server_receive_range_is_independent_of_the_peers_output_limit() {
     let (wire, mut peer) = tokio::io::duplex(4096);
     let opening = async {
         write_protocol_header(&mut peer, ProtocolHeader::AMQP)
@@ -440,41 +440,54 @@ async fn channel_above_our_advertised_maximum_gets_a_bounded_framing_error_close
         else {
             panic!("server Open");
         };
-        assert_eq!(open.channel_max, 2);
+        assert_eq!(open.channel_max, u16::MAX);
         peer
     };
     let (connection, mut peer) = tokio::join!(
         ServerConnection::accept(wire, "channel-server", None),
         opening
     );
-    let connection = connection.expect("connection");
-    write_frame(
+    let mut connection = connection.expect("connection");
+    write_amqp(
         &mut peer,
-        &Frame::Amqp {
-            channel: 3,
-            performative: None,
-            payload: Vec::new(),
-        },
+        3,
+        Performative::Begin(Begin::default()),
+        Vec::new(),
     )
     .await
-    .expect("out-of-range heartbeat");
+    .expect("Begin within the server's receive range");
+    let incoming = timeout(Duration::from_secs(2), connection.next_incoming_session())
+        .await
+        .expect("incoming session is prompt")
+        .expect("incoming session");
+    assert_eq!(incoming.channel, 0);
+    let _session = connection
+        .accept_session(incoming)
+        .await
+        .expect("accepted session");
     let Frame::Amqp {
-        performative: Some(Performative::Close(close)),
+        channel: 0,
+        performative: Some(Performative::Begin(begin)),
         ..
     } = next_frame(&mut peer).await
     else {
-        panic!("framing error Close");
+        panic!("Begin inside the peer's output limit");
     };
-    assert_eq!(
-        close.error.expect("channel limit error").condition,
-        crate::ErrorCondition::Custom(Symbol::from("amqp:connection:framing-error"))
-    );
-    connection.lifecycle.wait_terminated().await;
-    let mut remaining = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut peer, &mut remaining)
+    assert_eq!(begin.remote_channel, Some(3));
+    write_amqp(&mut peer, 3, Performative::End(End::default()), Vec::new())
         .await
-        .expect("reader joined without waiting for ack");
-    assert!(remaining.is_empty());
+        .expect("peer End on its own channel");
+    assert!(matches!(
+        next_frame(&mut peer).await,
+        Frame::Amqp {
+            channel: 0,
+            performative: Some(Performative::End(_)),
+            ..
+        }
+    ));
+    timeout(Duration::from_secs(2), connection.shutdown())
+        .await
+        .expect("owned server cleanup");
 }
 
 #[cfg(feature = "test-client")]
