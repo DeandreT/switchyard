@@ -89,6 +89,7 @@ impl Fixture {
                 identity: receipt.approval().link_identity().clone(),
                 peer_handle: Some(handle),
                 own_attach_sent: false,
+                error_detached: false,
             },
         );
         session

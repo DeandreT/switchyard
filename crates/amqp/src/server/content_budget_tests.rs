@@ -123,6 +123,7 @@ impl Fixture {
                 identity: identity.clone(),
                 peer_handle: Some(handle),
                 own_attach_sent: false,
+                error_detached: false,
             },
         );
         session

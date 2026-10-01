@@ -1288,12 +1288,13 @@ async fn a_held_session_is_refused_until_its_link_closes() -> Result<(), Box<dyn
         .attach(&mut session)
         .await?;
 
-    // The second claimant's attach completes, then the link is refused: its
-    // first receive reports the session as held.
+    // Isolate the rival's transport session: its initial credit may cross the
+    // error Detach and end that AMQP session without retiring the holder.
+    let mut rival_session = Session::begin(&mut connection).await?;
     let mut rival = Receiver::builder()
         .name("rival")
         .source(session_source("orders", Some("cart-1")))
-        .attach(&mut session)
+        .attach(&mut rival_session)
         .await?;
     let refused = tokio::time::timeout(std::time::Duration::from_secs(2), rival.recv()).await?;
     assert!(refused.is_err(), "a held session was granted twice");

@@ -101,6 +101,7 @@ impl Fixture {
                     identity: session.links[&handle].identity().clone(),
                     peer_handle: Some(handle),
                     own_attach_sent: true,
+                    error_detached: false,
                 },
             );
         }

@@ -94,6 +94,7 @@ async fn accept_sender(
                 identity: requested.approval().link_identity().clone(),
                 peer_handle: Some(handle),
                 own_attach_sent: false,
+                error_detached: false,
             },
         );
     sessions
@@ -449,6 +450,7 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
                 identity: session.links[&handle].identity().clone(),
                 peer_handle: Some(handle),
                 own_attach_sent: true,
+                error_detached: false,
             },
         );
     }
@@ -474,15 +476,6 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
     assert_size_detach(next_frame(&mut peer).await, 0);
     wait_for_detach(&mut detached_rx).await;
     assert!(received.recv().await.is_none());
-    receive_transfer(
-        CHANNEL,
-        transfer(0, None, false),
-        vec![0; 2],
-        &mut sessions,
-        &mut wire,
-    )
-    .await
-    .expect("a continuation can cross the link detach");
     let (deliveries_tx, _) = mpsc::channel(1);
     let (detached_tx, _) = watch::channel(false);
     let (reply, response) = oneshot::channel();
@@ -823,7 +816,6 @@ mod client_tests {
             bounded.recv().await,
             Err(EngineError::RemoteDetached)
         ));
-        raw_transfer(&mut peer, handle, 1, vec![0; 2], false).await;
         write_amqp(
             &mut peer,
             0,
@@ -835,7 +827,7 @@ mod client_tests {
             Vec::new(),
         )
         .await
-        .expect("peer acknowledges the detach after a crossing continuation");
+        .expect("peer acknowledges the error detach before further traffic");
         raw_transfer(&mut peer, healthy_handle, 2, encoded, false).await;
         assert_eq!(
             healthy.recv().await.expect("unrelated delivery").message(),

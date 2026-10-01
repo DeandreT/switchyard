@@ -155,6 +155,7 @@ impl Fixture {
                 identity: receipt.approval().link_identity().clone(),
                 peer_handle: Some(peer),
                 own_attach_sent: false,
+                error_detached: false,
             },
         );
         session
@@ -177,6 +178,7 @@ impl Fixture {
                 identity: receipt.approval().link_identity().clone(),
                 peer_handle: Some(88),
                 own_attach_sent: false,
+                error_detached: false,
             },
         );
         session
@@ -318,6 +320,7 @@ fn local_allocator_counts_the_lifecycle_union_and_wraps_the_full_u32_range() {
             identity: LinkIdentity::new(),
             peer_handle: None,
             own_attach_sent: false,
+            error_detached: false,
         },
     );
     session
@@ -336,6 +339,7 @@ fn local_allocator_counts_the_lifecycle_union_and_wraps_the_full_u32_range() {
             identity: LinkIdentity::new(),
             peer_handle: Some(42),
             own_attach_sent: true,
+            error_detached: false,
         },
     );
     assert_eq!(vacant_handle(u32::MAX, u32::MAX, &session), Some(2));

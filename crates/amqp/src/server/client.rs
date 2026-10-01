@@ -1048,17 +1048,22 @@ where
                                             .and_then(|session| session.pending_attaches.remove(&pending.handle));
                                         let mut link = pending.link;
                                         if has_recovery_state(&attach) {
-                                            stop_link(&mut link);
-                                            let session = sessions.get_mut(&channel).ok_or_else(|| invalid_state("attach on an unknown session"))?;
-                                            remember_closing_handle(session, pending.handle)?;
-                                            writer.write_amqp(channel,
-                                                Performative::Detach(Detach {
+                                            let identity = link.identity().clone();
+                                            let refusal = Frame::Amqp {
+                                                channel,
+                                                performative: Some(Performative::Detach(Detach {
                                                     handle: pending.handle,
                                                     closed: true,
                                                     error: Some(Error::new(crate::AmqpError::NotImplemented, RECOVERY_NOT_IMPLEMENTED, None)),
-                                                }),
-                                                Vec::new(),
-                                            ).await?;
+                                                })),
+                                                payload: Vec::new(),
+                                            };
+                                            writer.encoded_frame(&refusal)?;
+                                            stop_link(&mut link);
+                                            let session = sessions.get_mut(&channel).ok_or_else(|| invalid_state("attach on an unknown session"))?;
+                                            remember_closing_handle(session, pending.handle)?;
+                                            mark_error_detached(session, pending.handle, &identity);
+                                            writer.write_frame(&refusal).await?;
                                             let _ = pending.reply.send(Err(EngineError::RemoteDetached));
                                             continue;
                                         }
@@ -1324,7 +1329,7 @@ where
                                         continue;
                                     }
                                     *next_handle = if handle == session.remote_handle_max { 0 } else { handle + 1 };
-                                    session.handle_aliases.insert(handle, HandleAlias { identity: identity.clone(), peer_handle: None, own_attach_sent: false });
+                                    session.handle_aliases.insert(handle, HandleAlias { identity: identity.clone(), peer_handle: None, own_attach_sent: false, error_detached: false });
                                     let link = match request.role {
                                         Role::Sender => {
                                             LinkState::Sending(Box::new(SendingLink {

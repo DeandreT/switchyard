@@ -45,7 +45,10 @@ use incoming_ledger::Completion;
 use incoming_ledger::{
     DeliveryIdentity, IncomingLedger, IncomingLedgerError, LinkIdentity, SettlementAction,
 };
-use link_handles::{HandleAlias, local_handle_for_peer, preferred_vacant_handle};
+use link_handles::{
+    HandleAlias, is_error_detached, local_handle_for_peer, mark_error_detached,
+    preferred_vacant_handle,
+};
 use outgoing_identity::AckIdentity;
 use receive_credit::{Consumption, ReceiveCredit};
 use session_channels::{local_channel_for_peer, preferred_vacant_channel};
@@ -1661,6 +1664,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                         identity: attach.approval().link_identity().clone(),
                         peer_handle: Some(peer_handle),
                         own_attach_sent: false,
+                        error_detached: false,
                     },
                 );
                 let mut pending = PendingLinkFlow::incoming(&attach);
@@ -2082,6 +2086,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 let _ = reply.send(Err(EngineError::RemoteDetached));
                 return Ok(CommandAction::Continue);
             }
+            let error_detached = error.is_some();
             let frame = Frame::Amqp {
                 channel,
                 performative: Some(Performative::Detach(Detach {
@@ -2097,6 +2102,9 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             }
             ensure_local_begin(channel, session, writer).await?;
             remember_closing_handle(session, handle)?;
+            if error_detached {
+                mark_error_detached(session, handle, &identity);
+            }
             let mut link = session
                 .links
                 .remove(&handle)
@@ -2298,6 +2306,16 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
     let session = sessions
         .get_mut(&channel)
         .ok_or_else(|| invalid_state("transfer on an unknown session"))?;
+    if is_error_detached(session, transfer.handle) {
+        return refuse_session_state(
+            channel,
+            "amqp:session:errant-link",
+            "transfer on an error-detached link",
+            session,
+            writer,
+        )
+        .await;
+    }
     if let Err(error) = session.flow.receive_transfer() {
         return refuse_session(
             channel,
@@ -2814,6 +2832,19 @@ async fn apply_flow<W: AsyncWrite + Unpin>(
     if session.ending {
         return Ok(());
     }
+    if flow
+        .handle
+        .is_some_and(|handle| is_error_detached(session, handle))
+    {
+        return refuse_session_state(
+            channel,
+            "amqp:session:errant-link",
+            "flow on an error-detached link",
+            session,
+            writer,
+        )
+        .await;
+    }
     if let Err(error) = session.flow.update_peer(
         flow.next_incoming_id,
         flow.incoming_window,
@@ -2872,6 +2903,16 @@ async fn apply_link_flow<W: AsyncWrite + Unpin>(
     let session = sessions
         .get_mut(&channel)
         .ok_or_else(|| invalid_state("flow on an unknown session"))?;
+    if is_error_detached(session, handle) {
+        return refuse_session_state(
+            channel,
+            "amqp:session:errant-link",
+            "flow on an error-detached link",
+            session,
+            writer,
+        )
+        .await;
+    }
     if session.closing_handles.contains(&handle) {
         return Ok(());
     }
@@ -3066,6 +3107,7 @@ async fn close_pending_link<W: AsyncWrite + Unpin>(
         .get(&handle)
         .filter(|alias| alias.identity.same_link(approval.link_identity()))
         .ok_or_else(|| invalid_state("pending link has no matching handle alias"))?;
+    let error_detached = error.is_some();
     let needs_attach = !alias.own_attach_sent;
     let response = Frame::Amqp {
         channel,
@@ -3099,6 +3141,9 @@ async fn close_pending_link<W: AsyncWrite + Unpin>(
         approval.retire();
     } else {
         remember_closing_handle(session, handle)?;
+        if error_detached {
+            mark_error_detached(session, handle, approval.link_identity());
+        }
     }
     ensure_local_begin(channel, session, writer).await?;
     if needs_attach {
@@ -3329,7 +3374,14 @@ async fn detach_link_error<W: AsyncWrite + Unpin>(
     };
     writer.encoded_frame(&frame)?;
     ensure_local_begin(channel, session, writer).await?;
+    let owner = session
+        .links
+        .get(&handle)
+        .map(|link| link.identity().clone());
     remember_closing_handle(session, handle)?;
+    if let Some(owner) = &owner {
+        mark_error_detached(session, handle, owner);
+    }
     if let Some(mut link) = session.links.remove(&handle) {
         forget_incoming_link(&mut session.incoming, &link);
         stop_link(&mut link);
@@ -3934,6 +3986,7 @@ mod tests {
                 identity: receipt.approval().link_identity().clone(),
                 peer_handle: Some(handle),
                 own_attach_sent: false,
+                error_detached: false,
             },
         );
         session
@@ -4060,3 +4113,6 @@ mod session_channel_tests;
 
 #[cfg(test)]
 mod link_handle_tests;
+
+#[cfg(test)]
+mod error_closing_tests;

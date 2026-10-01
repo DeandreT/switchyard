@@ -266,6 +266,122 @@ async fn cleanup(connection: ClientConnection) {
 }
 
 #[tokio::test]
+async fn refused_recovery_attach_retains_an_error_alias_for_both_roles_until_errant_end() {
+    for role in [Role::Sender, Role::Receiver] {
+        for incoming_flow in [false, true] {
+            let (mut connection, session, mut peer) = pair(0).await;
+            let sibling = begin(&mut connection, &mut peer, 0).await;
+            let mut healthy = pending(&sibling, &mut peer, "recovery-sibling", Role::Sender).await;
+            answer(&mut peer, &sibling, &mut healthy, 77).await;
+            let refused = pending(&session, &mut peer, "refused-recovery", role.clone()).await;
+            let mut response = refused.request.response(
+                refused.request.source.clone(),
+                refused.request.target.clone(),
+            );
+            response.handle = 42;
+            response.incomplete_unsettled = true;
+            write_amqp(
+                &mut peer,
+                17 + session.channel,
+                Performative::Attach(Box::new(response)),
+                Vec::new(),
+            )
+            .await
+            .expect("peer recovery Attach");
+            let (channel, performative, payload) = frame(&mut peer).await;
+            assert_eq!(channel, session.channel);
+            assert!(payload.is_empty());
+            let Performative::Detach(detach) = performative else {
+                panic!("pending recovery response is an error detach");
+            };
+            assert_eq!(detach.handle, refused.request.handle);
+            assert_eq!(
+                detach
+                    .error
+                    .expect("recovery refusal")
+                    .condition
+                    .as_symbol(),
+                Symbol::from("amqp:not-implemented")
+            );
+            assert!(matches!(
+                timeout(DEADLINE, refused.reply)
+                    .await
+                    .expect("prompt recovery result")
+                    .expect("recovery reply"),
+                Err(EngineError::RemoteDetached)
+            ));
+            assert!(refused.identity.is_retired() && *refused.detached.borrow());
+            assert!(!session.identity.is_retired());
+            if incoming_flow {
+                flow(&mut peer, &session, 42, true).await;
+            } else {
+                write_amqp(
+                    &mut peer,
+                    17 + session.channel,
+                    Performative::Transfer(Transfer {
+                        handle: 42,
+                        delivery_id: Some(91),
+                        delivery_tag: Some(vec![91].into()),
+                        message_format: Some(0),
+                        settled: Some(true),
+                        more: true,
+                        rcv_settle_mode: None,
+                        state: None,
+                        resume: false,
+                        aborted: false,
+                        batchable: false,
+                    }),
+                    vec![9; 257],
+                )
+                .await
+                .expect("in-flight peer Transfer");
+            }
+            assert_end(&mut peer, session.channel, "amqp:session:errant-link").await;
+            assert!(session.identity.is_retired());
+            assert!(!sibling.identity.is_retired() && !healthy.identity.is_retired());
+            flow(&mut peer, &sibling, 77, true).await;
+            let (channel, performative, _) = frame(&mut peer).await;
+            assert_eq!(channel, sibling.channel);
+            assert!(
+                matches!(performative, Performative::Flow(flow) if flow.handle == Some(healthy.request.handle))
+            );
+            let result = send(&sibling, healthy.request.handle, &healthy.identity).await;
+            let (channel, performative, payload) = frame(&mut peer).await;
+            assert_eq!(channel, sibling.channel);
+            let Performative::Transfer(transfer) = performative else {
+                panic!("healthy sibling sends a Transfer");
+            };
+            assert_eq!(transfer.handle, healthy.request.handle);
+            assert_eq!(
+                decode_message(&payload).expect("healthy message"),
+                Message::data(vec![0])
+            );
+            write_amqp(
+                &mut peer,
+                17 + sibling.channel,
+                Performative::Disposition(Disposition {
+                    role: Role::Receiver,
+                    first: transfer.delivery_id.expect("healthy delivery ID"),
+                    last: None,
+                    settled: true,
+                    state: Some(DeliveryState::Accepted(Accepted)),
+                    batchable: false,
+                }),
+                Vec::new(),
+            )
+            .await
+            .expect("healthy sibling outcome");
+            timeout(DEADLINE, result)
+                .await
+                .expect("prompt healthy Send")
+                .expect("healthy Send reply")
+                .expect("healthy sibling Send");
+            cleanup(connection).await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn crossed_receiver_handles_route_incoming_messages_and_detach_to_local_authority() {
     let (connection, session, mut peer) = pair(1).await;
     let mut first = pending(&session, &mut peer, "first-receiver", Role::Receiver).await;
