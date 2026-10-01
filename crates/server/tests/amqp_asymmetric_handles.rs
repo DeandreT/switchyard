@@ -8,6 +8,9 @@ use tokio::time::timeout;
 #[path = "support/asymmetric_handle_fixture.rs"]
 mod fixture;
 
+#[path = "support/error_closing_cases.rs"]
+mod error_closing_cases;
+
 use fixture::{
     CASE_TIMEOUT, Connection, IO_TIMEOUT, Link, Node, Session, TestResult, attach, channels,
     detach, transfer,

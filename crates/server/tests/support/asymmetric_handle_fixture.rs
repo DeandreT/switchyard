@@ -183,6 +183,33 @@ impl Peer {
         }
     }
 
+    pub async fn error_detach(&mut self, link: Link, condition: &str) -> TestResult {
+        let frame = self.read().await?;
+        let Frame::Amqp {
+            channel,
+            performative: Some(Performative::Detach(detach)),
+            payload,
+        } = &frame
+        else {
+            panic!("expected immediate mapped error Detach: {frame:?}")
+        };
+        assert_eq!(*channel, link.channels.outgoing);
+        assert_eq!(detach.handle, link.local);
+        assert!(detach.closed);
+        assert!(payload.is_empty());
+        assert_eq!(
+            detach
+                .error
+                .as_ref()
+                .expect("link refusal")
+                .condition
+                .as_symbol()
+                .as_str(),
+            condition
+        );
+        Ok(())
+    }
+
     pub async fn end(&mut self, channels: Channels, condition: &str) -> TestResult {
         loop {
             match self.read().await? {
