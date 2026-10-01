@@ -708,7 +708,7 @@ async fn wrapping_disposition_resolves_existing_ids_without_reusing_an_outstandi
     assert!(
         !pump_connection(&mut writer, &mut sessions, &mut cursor)
             .await
-            .expect("pump until collision")
+            .expect("pump skips occupied wrapped aliases")
     );
     assert!(matches!(
         next_frame(&mut peer).await,
@@ -720,13 +720,23 @@ async fn wrapping_disposition_resolves_existing_ids_without_reusing_an_outstandi
             ..
         }
     ));
-    assert_eq!(sessions[&0].next_delivery_id, 0);
-    assert_eq!(sessions[&0].flow.snapshot().next_outgoing_id, 0);
+    assert!(matches!(
+        next_frame(&mut peer).await,
+        Frame::Amqp {
+            performative: Some(Performative::Transfer(Transfer {
+                delivery_id: Some(1),
+                ..
+            })),
+            ..
+        }
+    ));
+    assert_eq!(sessions[&0].next_delivery_id, 2);
+    assert_eq!(sessions[&0].flow.snapshot().next_outgoing_id, 1);
     let LinkState::Sending(link) = &sessions[&0].links[&0] else {
         panic!("sending link");
     };
-    assert_eq!(link.queued.len(), 1);
-    assert_eq!(link.unsettled.len(), 2);
+    assert_eq!(link.queued.len(), 0);
+    assert_eq!(link.unsettled.len(), 3);
     assert!(matches!(
         old_outcome.try_recv(),
         Err(oneshot::error::TryRecvError::Empty)
@@ -758,23 +768,38 @@ async fn wrapping_disposition_resolves_existing_ids_without_reusing_an_outstandi
     assert!(
         !pump_connection(&mut writer, &mut sessions, &mut cursor)
             .await
-            .expect("resume after alias released")
+            .expect("settlement does not create new queued work")
     );
-    assert!(matches!(
-        next_frame(&mut peer).await,
-        Frame::Amqp {
-            performative: Some(Performative::Transfer(Transfer {
-                delivery_id: Some(0),
-                ..
-            })),
-            ..
-        }
-    ));
     let LinkState::Sending(link) = &sessions[&0].links[&0] else {
         panic!("sending link");
     };
     assert_eq!(link.unsettled.len(), 1);
+    assert!(link.unsettled.contains_key(&1));
     assert_eq!(sessions[&0].flow.snapshot().next_outgoing_id, 1);
+    assert!(matches!(
+        outcomes[0].try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    apply_disposition(
+        0,
+        Disposition {
+            role: Role::Receiver,
+            first: 1,
+            last: None,
+            settled: true,
+            state: Some(DeliveryState::Accepted(Accepted)),
+            batchable: false,
+        },
+        &mut writer,
+        &mut sessions,
+    )
+    .await
+    .expect("fresh skipped-ID delivery settles independently");
+    outcomes
+        .remove(0)
+        .await
+        .expect("fresh alias reply")
+        .expect("fresh alias accepted");
 }
 
 #[tokio::test]

@@ -2897,7 +2897,7 @@ async fn queue_send<W: AsyncWrite + Unpin>(
     if let Err(error) = fragment_frame(
         channel,
         handle,
-        session.next_delivery_id,
+        u32::MAX,
         &delivery_tag,
         message_format,
         link.settle_mode == SenderSettleMode::Settled,
@@ -3033,13 +3033,43 @@ fn delivery_id_in_use(session: &SessionState, id: u32) -> bool {
     session.links.values().any(|link| matches!(link, LinkState::Sending(link) if link.unsettled.contains_key(&id) || link.pending_acknowledgements.contains_key(&id) || link.active.as_ref().is_some_and(|active| active.delivery_id == id)))
 }
 
+fn vacant_delivery_id(session: &SessionState) -> Option<u32> {
+    let start = session.next_delivery_id;
+    if !delivery_id_in_use(session, start) {
+        return Some(start);
+    }
+    let mut occupied = HashSet::new();
+    for link in session.links.values() {
+        let LinkState::Sending(link) = link else {
+            continue;
+        };
+        for id in link
+            .unsettled
+            .keys()
+            .copied()
+            .chain(link.pending_acknowledgements.keys().copied())
+            .chain(link.active.as_ref().map(|active| active.delivery_id))
+        {
+            occupied.insert(id);
+            if occupied.len() > MAX_OUTGOING_DELIVERIES_PER_SESSION {
+                return None;
+            }
+        }
+    }
+    // The admission bound guarantees a vacancy within this many candidates.
+    (1..=MAX_OUTGOING_DELIVERIES_PER_SESSION)
+        .map(|offset| start.wrapping_add(offset as u32))
+        .find(|id| !occupied.contains(id))
+}
+
 fn can_pump(session: &SessionState, link: &SendingLink) -> bool {
     !session.ending
+        && !link.identity.is_retired()
         && session.flow.outgoing_allowance() != 0
         && (link.active.is_some()
             || (!link.queued.is_empty()
                 && link.credit.allowance() != 0
-                && !delivery_id_in_use(session, session.next_delivery_id)))
+                && vacant_delivery_id(session).is_some()))
 }
 
 async fn pump_connection<W: AsyncWrite + Unpin>(
@@ -3121,12 +3151,26 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
     let Some(LinkState::Sending(link)) = session.links.get(&handle) else {
         return Ok(());
     };
+    if session.ending || link.identity.is_retired() || session.flow.outgoing_allowance() == 0 {
+        return Ok(());
+    }
     let starting = link.active.is_none();
+    let delivery_id = if let Some(active) = &link.active {
+        active.delivery_id
+    } else {
+        if link.queued.is_empty() || link.credit.allowance() == 0 {
+            return Ok(());
+        }
+        let Some(id) = vacant_delivery_id(session) else {
+            return Ok(());
+        };
+        id
+    };
     let (frame, offset, complete) = if let Some(active) = &link.active {
         fragment_frame(
             channel,
             handle,
-            active.delivery_id,
+            delivery_id,
             &active.delivery_tag,
             active.message_format,
             active.settled,
@@ -3142,7 +3186,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
         fragment_frame(
             channel,
             handle,
-            session.next_delivery_id,
+            delivery_id,
             &queued.delivery_tag,
             queued.message_format,
             link.settle_mode == SenderSettleMode::Settled,
@@ -3173,7 +3217,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
             ));
         }
         let queued = link.queued.pop_front().expect("queued delivery exists");
-        let id = session.next_delivery_id;
+        let id = delivery_id;
         session.next_delivery_id = id.wrapping_add(1);
         let settled = link.settle_mode == SenderSettleMode::Settled;
         let settled_reply = if settled {
@@ -3607,3 +3651,6 @@ mod outgoing_remote_settlement_tests;
 
 #[cfg(test)]
 mod outgoing_tag_tests;
+
+#[cfg(test)]
+mod outgoing_id_tests;
