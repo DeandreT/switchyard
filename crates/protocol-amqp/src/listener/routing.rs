@@ -48,18 +48,19 @@ pub(super) async fn plan_link<B: Broker>(
             format!("{entity} does not support this data link role"),
         ));
     }
-    if matches!(metadata, crate::EntityMetadata::Subscription(config) if config.requires_session) {
-        return Err(rejection_error(&BrokerRejection::Refused(
-            domain::BrokerError::TopicDataPlaneNotImplemented,
-        )));
-    }
-
     if attach.role != Role::Receiver {
         return Ok((entity, None, link_authorization));
     }
-    let session_id = match read_session_filter(attach.source.as_ref())
-        .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?
+    let session_request = read_session_filter(attach.source.as_ref())
+        .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?;
+    if matches!(metadata, crate::EntityMetadata::Subscription(config) if config.requires_session)
+        && matches!(session_request, SessionRequest::None)
     {
+        return Err(rejection_error(&BrokerRejection::Refused(
+            domain::BrokerError::SessionRequired,
+        )));
+    }
+    let session_id = match session_request {
         SessionRequest::None => return Ok((entity, None, link_authorization)),
         SessionRequest::NextAvailable => None,
         SessionRequest::Named(session_id) => Some(session_id),

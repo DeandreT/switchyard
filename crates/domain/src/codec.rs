@@ -38,7 +38,11 @@ pub const VALUE_FORMAT_V7: u8 = 7;
 /// Message records retain their version 7 shape.
 pub const VALUE_FORMAT_V8: u8 = 8;
 
-pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V8;
+/// Adds the missing-session dead-letter reason. Existing message fields and
+/// all other stored record shapes retain their version 8 encoding.
+pub const VALUE_FORMAT_V9: u8 = 9;
+
+pub const ACTIVE_VALUE_FORMAT: u8 = VALUE_FORMAT_V9;
 
 /// Encodes a value into a versioned envelope.
 ///
@@ -137,6 +141,7 @@ mod tests {
             VALUE_FORMAT_V6,
             VALUE_FORMAT_V7,
             VALUE_FORMAT_V8,
+            VALUE_FORMAT_V9,
         ] {
             let mut envelope = vec![version];
             envelope.extend_from_slice(&payload);

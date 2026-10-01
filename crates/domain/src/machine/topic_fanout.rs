@@ -4,9 +4,12 @@ use super::*;
 
 /// Copies retained by one immediate topic publication, across all subscribers.
 pub const MAX_TOPIC_FANOUT_COPIES: usize = 1_024;
-/// Typed content, compatibility bodies, and normalized IDs retained by copies.
+/// Typed content, compatibility bodies, normalized IDs, and DLQ details.
 pub const MAX_TOPIC_FANOUT_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_TOPIC_FANOUT_VALUE_ITEMS: usize = 65_536;
+
+const MISSING_SESSION_ID_DESCRIPTION: &str =
+    "Session enabled entity doesn't allow a message whose session identifier is null.";
 
 struct TopicMessagePlan<'a> {
     message: MessageInput<'a>,
@@ -45,15 +48,13 @@ impl<S: StateStore> StateMachine<S> {
         )?;
         let messages: Vec<_> = messages.collect();
         let subscriptions = self.subscriptions(&command.namespace, &command.entity)?;
-        if subscriptions
-            .iter()
-            .any(|subscription| subscription.config.requires_session)
-            || messages
-                .iter()
-                .any(|(message, scheduled)| message.session_id.is_some() || scheduled.is_some())
-        {
+        if messages.iter().any(|(_, scheduled)| scheduled.is_some()) {
             return Err(BrokerError::TopicDataPlaneNotImplemented);
         }
+        let shadows = subscriptions
+            .iter()
+            .map(|subscription| subscription.entity.dead_letter_queue())
+            .collect::<Result<Vec<_>, _>>()?;
 
         let queue_config = config.to_queue_config();
         let mut plans = Vec::with_capacity(messages.len());
@@ -76,7 +77,12 @@ impl<S: StateStore> StateMachine<S> {
                 .envelope
                 .map_or(0, MessageEnvelope::content_size)
                 .saturating_add(message.body.len())
-                .saturating_add(message.message_id.len());
+                .saturating_add(message.message_id.len())
+                .saturating_add(
+                    message
+                        .session_id
+                        .map_or(0, |session| session.as_str().len()),
+                );
             input_bytes = input_bytes.saturating_add(content_bytes);
             enforce_input_limit(
                 IngressBatchLimit::ContentBytes,
@@ -123,25 +129,38 @@ impl<S: StateStore> StateMachine<S> {
                     IngressBatchLimit::Messages,
                     MAX_TOPIC_FANOUT_COPIES,
                 )?;
-                retained_bytes = checked_retained_total(
-                    retained_bytes,
-                    plan.content_bytes,
-                    subscriptions.len(),
-                    IngressBatchLimit::ContentBytes,
-                    MAX_TOPIC_FANOUT_CONTENT_BYTES,
-                )?;
-                retained_items = checked_retained_total(
-                    retained_items,
-                    plan.value_items,
-                    subscriptions.len(),
-                    IngressBatchLimit::ValueItems,
-                    MAX_TOPIC_FANOUT_VALUE_ITEMS,
-                )?;
+                for subscription in &subscriptions {
+                    let missing_session =
+                        subscription.config.requires_session && plan.message.session_id.is_none();
+                    let (extra_bytes, extra_items) = if missing_session {
+                        (
+                            DeadLetterReason::MissingSessionId.as_str().len()
+                                + MISSING_SESSION_ID_DESCRIPTION.len(),
+                            2,
+                        )
+                    } else {
+                        (0, 0)
+                    };
+                    retained_bytes = checked_retained_total(
+                        retained_bytes,
+                        plan.content_bytes.saturating_add(extra_bytes),
+                        1,
+                        IngressBatchLimit::ContentBytes,
+                        MAX_TOPIC_FANOUT_CONTENT_BYTES,
+                    )?;
+                    retained_items = checked_retained_total(
+                        retained_items,
+                        plan.value_items.saturating_add(extra_items),
+                        1,
+                        IngressBatchLimit::ValueItems,
+                        MAX_TOPIC_FANOUT_VALUE_ITEMS,
+                    )?;
+                }
             }
         }
 
         for plan in &plans {
-            validate_message_input(&queue_config, plan.message)?;
+            validate_message_content(&queue_config, plan.message)?;
             let content_bytes = message_content_bytes(plan.message);
             for subscription in &subscriptions {
                 if content_bytes > subscription.config.max_message_bytes {
@@ -158,6 +177,7 @@ impl<S: StateStore> StateMachine<S> {
         for _ in &plans {
             sequences.push(counters.allocate_sequence()?);
         }
+        let mut enqueued = BTreeSet::new();
         for (plan, sequence) in plans.iter().zip(sequences.iter().copied()) {
             if plan.duplicate {
                 continue;
@@ -178,19 +198,56 @@ impl<S: StateStore> StateMachine<S> {
                 ),
                 ..plan.message
             };
-            for subscription in &subscriptions {
-                self.enqueue_message(
-                    EnqueueScope {
+            for (subscription, shadow) in subscriptions.iter().zip(&shadows) {
+                let subscription_config = subscription.config.to_queue_config();
+                if subscription.config.requires_session && message.session_id.is_none() {
+                    let scope = EnqueueScope {
                         namespace: &command.namespace,
-                        entity: &subscription.entity,
+                        entity: shadow,
                         issued_at: command.issued_at,
-                    },
-                    &subscription.config.to_queue_config(),
-                    message,
-                    sequence,
-                    None,
-                    batch,
-                )?;
+                    };
+                    let mut record = message_record(
+                        scope,
+                        &subscription_config.dead_letter_shadow(),
+                        MessageInput {
+                            time_to_live_millis: None,
+                            session_id: None,
+                            ..message
+                        },
+                        sequence,
+                        None,
+                    );
+                    // These fixed fields fit the ingress header reserve; their
+                    // content and projected value nodes were budgeted above.
+                    record.dead_letter = Some(DeadLetterInfo {
+                        reason: DeadLetterReason::MissingSessionId,
+                        description: MISSING_SESSION_ID_DESCRIPTION.to_owned(),
+                        dead_lettered_at: command.issued_at,
+                    });
+                    batch.push_put(
+                        keys::message(&command.namespace, shadow, sequence),
+                        codec::encode(&record)?,
+                    );
+                    batch.push_put(
+                        keys::ready(&command.namespace, shadow, sequence),
+                        Vec::new(),
+                    );
+                    enqueued.insert(shadow.clone());
+                } else {
+                    self.enqueue_message(
+                        EnqueueScope {
+                            namespace: &command.namespace,
+                            entity: &subscription.entity,
+                            issued_at: command.issued_at,
+                        },
+                        &subscription_config,
+                        message,
+                        sequence,
+                        None,
+                        batch,
+                    )?;
+                    enqueued.insert(subscription.entity.clone());
+                }
             }
         }
         if !plans.is_empty() {
@@ -199,14 +256,7 @@ impl<S: StateStore> StateMachine<S> {
                 codec::encode(&counters)?,
             );
         }
-        *subscription_enqueues = Some(if plans.iter().any(|plan| !plan.duplicate) {
-            subscriptions
-                .into_iter()
-                .map(|subscription| subscription.entity)
-                .collect()
-        } else {
-            Vec::new()
-        });
+        *subscription_enqueues = Some(enqueued.into_iter().collect());
         Ok(sequences)
     }
 }
@@ -240,5 +290,27 @@ fn checked_retained_total(
     {
         Some(total) if total <= maximum => Ok(total),
         _ => Err(BrokerError::TopicFanoutTooLarge { limit, maximum }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_session_fields_fit_the_ingress_header_reserve() -> Result<(), BrokerError> {
+        let original = MessageEnvelope::default();
+        let mut projected = original.clone();
+        projected.application_properties.insert(
+            String::from("DeadLetterReason"),
+            MessageValue::String(DeadLetterReason::MissingSessionId.as_str().to_owned()),
+        );
+        projected.application_properties.insert(
+            String::from("DeadLetterErrorDescription"),
+            MessageValue::String(MISSING_SESSION_ID_DESCRIPTION.to_owned()),
+        );
+        let extra = projected.header_content_size() - original.header_content_size();
+        assert!(extra <= BROKER_HEADER_RESERVE_BYTES - BROKER_BASE_HEADER_RESERVE_BYTES);
+        projected.validate_property_quotas()
     }
 }

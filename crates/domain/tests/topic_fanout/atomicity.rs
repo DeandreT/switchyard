@@ -268,7 +268,7 @@ fn final_topic_sequence_is_shared_and_child_sequence_exhaustion_never_allocates<
     Ok(())
 }
 
-fn session_and_scheduled_inputs_and_session_targets_refuse_even_empty_or_duplicate_batches<
+fn scheduled_inputs_refuse_even_empty_or_duplicate_batches_with_session_targets<
     P: StoreProvider,
 >(
     provider: P,
@@ -281,20 +281,17 @@ fn session_and_scheduled_inputs_and_session_targets_refuse_even_empty_or_duplica
         },
     )?;
     subscribe(&fixture, "plain", SubscriptionConfig::default(), 0)?;
+    subscribe(
+        &fixture,
+        "session",
+        SubscriptionConfig {
+            requires_session: true,
+            ..SubscriptionConfig::default()
+        },
+        0,
+    )?;
     apply(&fixture, 1, legacy("known"))?;
-    let mut session_message = member("known");
-    session_message.session_id = Some(SessionId::new("cart")?);
     for kind in [
-        CommandKind::Send {
-            message_id: "known".into(),
-            body: vec![],
-            time_to_live_millis: None,
-            session_id: session_message.session_id.clone(),
-        },
-        rich(session_message.clone()),
-        CommandKind::SendBatch {
-            messages: vec![session_message],
-        },
         CommandKind::Schedule { messages: vec![] },
         CommandKind::ScheduleEnvelopes { messages: vec![] },
     ] {
@@ -314,30 +311,6 @@ fn session_and_scheduled_inputs_and_session_targets_refuse_even_empty_or_duplica
             CommandKind::SendBatch {
                 messages: vec![member("new"), message],
             },
-            BrokerError::TopicDataPlaneNotImplemented,
-        )?;
-    }
-    subscribe(
-        &fixture,
-        "session",
-        SubscriptionConfig {
-            requires_session: true,
-            ..SubscriptionConfig::default()
-        },
-        1,
-    )?;
-    for kind in [
-        legacy("known"),
-        legacy("new"),
-        CommandKind::SendBatch { messages: vec![] },
-        CommandKind::SendBatch {
-            messages: vec![member("known")],
-        },
-    ] {
-        reject(
-            &fixture,
-            10,
-            kind,
             BrokerError::TopicDataPlaneNotImplemented,
         )?;
     }
@@ -553,6 +526,6 @@ for_each_backend! {
     invalid_late_inputs_and_stricter_duplicate_destinations_leave_every_record_unchanged,
     duplicate_admission_at_the_exact_deadline_replaces_history_without_keeping_old_expiry,
     final_topic_sequence_is_shared_and_child_sequence_exhaustion_never_allocates,
-    session_and_scheduled_inputs_and_session_targets_refuse_even_empty_or_duplicate_batches,
+    scheduled_inputs_refuse_even_empty_or_duplicate_batches_with_session_targets,
     one_commit_failure_retry_and_late_read_corruption_never_publish_partial_copies,
 }

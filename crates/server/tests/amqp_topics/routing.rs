@@ -317,7 +317,7 @@ async fn missing_forbidden_and_session_targets_refuse_before_mutation_with_healt
             6,
             Role::Receiver,
             "orders/subscriptions/sessions",
-            "amqp:not-implemented",
+            "amqp:not-allowed",
         ),
         (
             7,

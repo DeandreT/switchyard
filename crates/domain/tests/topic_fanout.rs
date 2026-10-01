@@ -8,7 +8,7 @@ use domain::{
     MAX_INGRESS_BATCH_MESSAGES, MAX_SEQUENCE_NUMBER, MAX_TOPIC_FANOUT_CONTENT_BYTES,
     MAX_TOPIC_FANOUT_COPIES, MAX_TOPIC_FANOUT_VALUE_ITEMS, MessageBody, MessageEnvelope,
     MessageHeader, MessageIdentifier, MessageProperties, MessageState, MessageValue, NamespaceName,
-    QueueCounterKind, QueueCounters, ReceiveMode, SequenceNumber, SessionId, SubscriptionConfig,
+    QueueCounterKind, QueueCounters, ReceiveMode, SequenceNumber, SubscriptionConfig,
     SubscriptionName, Timestamp, TopicConfig, codec, keys,
 };
 use storage::{StateStore, WriteBatch};

@@ -214,7 +214,7 @@ impl QueueConfig {
             codec::VALUE_FORMAT_V6 | codec::VALUE_FORMAT_V7 => {
                 Ok(codec::decode_payload::<QueueConfigV7>(payload)?.into())
             }
-            codec::VALUE_FORMAT_V8 => codec::decode_payload(payload),
+            codec::VALUE_FORMAT_V8 | codec::VALUE_FORMAT_V9 => codec::decode_payload(payload),
             _ => unreachable!("split rejects unknown value formats"),
         }
     }
@@ -452,8 +452,11 @@ mod tests {
                 ..QueueConfig::default()
             };
             let envelope = codec::encode(&config)?;
-            assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V8));
+            assert_eq!(envelope.first(), Some(&codec::ACTIVE_VALUE_FORMAT));
             assert_eq!(QueueConfig::decode(&envelope)?, config);
+            let mut previous = envelope;
+            previous[0] = codec::VALUE_FORMAT_V8;
+            assert_eq!(QueueConfig::decode(&previous)?, config);
         }
         Ok(())
     }
@@ -586,7 +589,7 @@ mod tests {
             next_lock_token: 2,
         };
         let mut encoded = codec::encode(&counters)?;
-        assert_eq!(encoded, vec![codec::VALUE_FORMAT_V8, 1, 2]);
+        assert_eq!(encoded, vec![codec::ACTIVE_VALUE_FORMAT, 1, 2]);
         for version in codec::VALUE_FORMAT_V1..=codec::ACTIVE_VALUE_FORMAT {
             encoded[0] = version;
             assert_eq!(codec::decode::<QueueCounters>(&encoded)?, counters);

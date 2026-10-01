@@ -48,13 +48,18 @@ pub const STORE_FORMAT_V7: u32 = 7;
 /// receive-only queue paths. Earlier builds could overwrite their topology.
 pub const STORE_FORMAT_V8: u32 = 8;
 
+/// Version 9: topic copies retain session identifiers independently of their
+/// ready-index policy, and missing-session copies enter subscription shadows.
+/// Earlier builds would select the wrong ready index when releasing a copy.
+pub const STORE_FORMAT_V9: u32 = 9;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V8;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V9;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
@@ -360,6 +365,20 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V7,
+                expected: ACTIVE_STORE_FORMAT,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_store_with_the_prior_topic_session_index_rules() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        stamp_format(directory.path(), &STORE_FORMAT_V8.to_be_bytes())?;
+        assert_eq!(
+            FjallStore::open(directory.path()).err(),
+            Some(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V8,
                 expected: ACTIVE_STORE_FORMAT,
             })
         );

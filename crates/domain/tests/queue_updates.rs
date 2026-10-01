@@ -848,6 +848,7 @@ fn legacy_stored_configurations_update_without_changing_the_value_format<P: Stor
         codec::VALUE_FORMAT_V6,
         codec::VALUE_FORMAT_V7,
         codec::VALUE_FORMAT_V8,
+        codec::VALUE_FORMAT_V9,
     ] {
         let base = 10 + u64::from(version) * 10;
         fixture.entity = EntityPath::new(format!("legacy-{version}"))?;
@@ -908,7 +909,7 @@ fn legacy_stored_configurations_update_without_changing_the_value_format<P: Stor
             .get(&keys::queue_config(&fixture.namespace, &fixture.entity))?
             .expect("configuration");
         assert_eq!(bytes[0], codec::ACTIVE_VALUE_FORMAT);
-        assert_eq!(codec::ACTIVE_VALUE_FORMAT, codec::VALUE_FORMAT_V8);
+        assert_eq!(codec::ACTIVE_VALUE_FORMAT, codec::VALUE_FORMAT_V9);
         assert_eq!(
             config(&fixture),
             QueueConfig {

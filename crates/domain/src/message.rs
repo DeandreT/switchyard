@@ -90,6 +90,7 @@ pub enum DeadLetterReason {
     MaxDeliveryCountExceeded,
     TimeToLiveExpired,
     Application(String),
+    MissingSessionId,
 }
 
 impl DeadLetterReason {
@@ -100,6 +101,7 @@ impl DeadLetterReason {
             Self::MaxDeliveryCountExceeded => "MaxDeliveryCountExceeded",
             Self::TimeToLiveExpired => "TTLExpiredException",
             Self::Application(reason) => reason,
+            Self::MissingSessionId => "Session ID is null",
         }
     }
 }
@@ -355,7 +357,7 @@ impl MessageRecord {
     /// through here rather than through the shape-stable [`codec::decode`].
     pub fn decode(envelope: &[u8]) -> Result<Self, CodecError> {
         let (version, payload) = codec::split(envelope)?;
-        match version {
+        let record: Self = match version {
             codec::VALUE_FORMAT_V1 => Ok(codec::decode_payload::<MessageRecordV1>(payload)?.into()),
             codec::VALUE_FORMAT_V2 => Ok(codec::decode_payload::<MessageRecordV2>(payload)?.into()),
             codec::VALUE_FORMAT_V3 | codec::VALUE_FORMAT_V4 => {
@@ -364,9 +366,20 @@ impl MessageRecord {
             codec::VALUE_FORMAT_V5 | codec::VALUE_FORMAT_V6 => {
                 Ok(codec::decode_payload::<MessageRecordV6>(payload)?.into())
             }
-            codec::VALUE_FORMAT_V7 | codec::VALUE_FORMAT_V8 => codec::decode_payload(payload),
+            codec::VALUE_FORMAT_V7 | codec::VALUE_FORMAT_V8 | codec::VALUE_FORMAT_V9 => {
+                codec::decode_payload(payload)
+            }
             _ => unreachable!("split rejects unknown value formats"),
+        }?;
+        if version < codec::VALUE_FORMAT_V9
+            && record
+                .dead_letter
+                .as_ref()
+                .is_some_and(|info| info.reason == DeadLetterReason::MissingSessionId)
+        {
+            return Err(CodecError::Decode);
         }
+        Ok(record)
     }
 
     /// A message with no configured lifetime never expires, which is the
@@ -533,9 +546,58 @@ mod tests {
         let envelope = codec::encode(&original)?;
         assert_eq!(envelope.first(), Some(&codec::ACTIVE_VALUE_FORMAT));
         assert_eq!(MessageRecord::decode(&envelope)?, original);
-        let mut previous = envelope;
-        previous[0] = codec::VALUE_FORMAT_V7;
-        assert_eq!(MessageRecord::decode(&previous)?, original);
+        for version in [codec::VALUE_FORMAT_V7, codec::VALUE_FORMAT_V8] {
+            let mut previous = envelope.clone();
+            previous[0] = version;
+            assert_eq!(MessageRecord::decode(&previous)?, original);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_session_dead_letters_require_the_new_record_version() -> Result<(), CodecError> {
+        let original = MessageRecord {
+            dead_letter: Some(DeadLetterInfo {
+                reason: DeadLetterReason::MissingSessionId,
+                description: String::from("a session identifier is required"),
+                dead_lettered_at: Timestamp::from_millis(9),
+            }),
+            ..record(None)
+        };
+        let mut envelope = codec::encode(&original)?;
+        assert_eq!(envelope[0], codec::VALUE_FORMAT_V9);
+        assert_eq!(MessageRecord::decode(&envelope)?, original);
+        envelope[0] = codec::VALUE_FORMAT_V8;
+        assert_eq!(MessageRecord::decode(&envelope), Err(CodecError::Decode));
+        assert_eq!(
+            DeadLetterReason::MissingSessionId.as_str(),
+            "Session ID is null"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prior_dead_letter_reasons_keep_their_encoding_and_version_eight_records()
+    -> Result<(), CodecError> {
+        for (tag, reason) in [
+            (0, DeadLetterReason::MaxDeliveryCountExceeded),
+            (1, DeadLetterReason::TimeToLiveExpired),
+            (2, DeadLetterReason::Application(String::from("custom"))),
+        ] {
+            assert_eq!(codec::encode(&reason)?[1], tag);
+            let original = MessageRecord {
+                dead_letter: Some(DeadLetterInfo {
+                    reason,
+                    description: String::from("prior reason"),
+                    dead_lettered_at: Timestamp::from_millis(9),
+                }),
+                ..record(None)
+            };
+            let mut envelope = codec::encode(&original)?;
+            envelope[0] = codec::VALUE_FORMAT_V8;
+            assert_eq!(MessageRecord::decode(&envelope)?, original);
+        }
+        assert_eq!(codec::encode(&DeadLetterReason::MissingSessionId)?[1], 3);
         Ok(())
     }
 
