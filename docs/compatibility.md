@@ -233,6 +233,17 @@ the two projected dead-letter values count toward its value-item budget. All
 admission checks precede retained payload clones, including these additions.
 Only actual backing or shadow destinations receive committed notifications.
 
+Delivery notifications broadcast to every currently registered waiter on the
+destination. The wait captures its signal before submitting receive, so a
+commit between an empty result and the first wait poll is not lost. This lets
+receivers holding different sessions on the same entity rescan independently
+instead of depending on the periodic retry. Ordinary competing receivers may
+also rescan; only the serialized receive command can acquire or consume a
+message. Repeated notifications coalesce per one-shot wait, and a later
+registration does not inherit an earlier broadcast. Cancellation and completion
+remove registrations, with no retained payload or session history. Wake work
+and memory remain proportional to live waiters, not a fixed process-wide bound.
+
 Topic scheduling remains explicitly unimplemented. Batch publications with any
 scheduled timestamp are refused, even when that timestamp is already due.
 Plain producer addresses resolve committed metadata and permit queue or topic
