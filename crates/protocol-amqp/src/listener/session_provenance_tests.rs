@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use super::{ServerConnection, serve_open_connection};
-use crate::{Broker, BrokerRejection, stamp_session_filter};
+use crate::{Attachment, Broker, BrokerRejection, EntityMetadata, stamp_session_filter};
 
 type TestResult<T = ()> = Result<T, Box<dyn StdError + Send + Sync>>;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -36,6 +36,19 @@ struct PausedBroker {
 }
 
 impl Broker for PausedBroker {
+    async fn entity_metadata(
+        &self,
+        namespace: NamespaceName,
+        target: Attachment,
+    ) -> Result<Option<EntityMetadata>, BrokerRejection> {
+        Ok((namespace.as_str() == "tenant"
+            && matches!(target, Attachment::Queue(entity) if entity.as_str() == "orders"))
+        .then_some(EntityMetadata::Queue(domain::QueueConfig {
+            requires_session: true,
+            ..domain::QueueConfig::default()
+        })))
+    }
+
     async fn submit(
         &self,
         namespace: NamespaceName,

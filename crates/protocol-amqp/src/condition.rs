@@ -92,6 +92,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         // failures are the broker's problem and are reported as its fault.
         BrokerError::DanglingIndexEntry { .. }
         | BrokerError::DanglingSubscriptionMetadata
+        | BrokerError::DanglingEntityMetadata
         | BrokerError::MalformedIndexKey
         | BrokerError::Codec(_)
         | BrokerError::Identifier(_)
@@ -192,6 +193,7 @@ mod tests {
                 RESOURCE_LIMIT_EXCEEDED,
             ),
             (BrokerError::DanglingSubscriptionMetadata, INTERNAL_ERROR),
+            (BrokerError::DanglingEntityMetadata, INTERNAL_ERROR),
         ] {
             assert_eq!(condition_for(&error), condition, "{error}");
             assert!(!is_retryable(&error), "{error}");

@@ -16,6 +16,8 @@ use thiserror::Error;
 
 use crate::Clock;
 
+mod entity_metadata;
+
 /// How far the host clock may step backward before the proposer refuses.
 ///
 /// Ordinary clock discipline moves time by small amounts. A jump past this is

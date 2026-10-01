@@ -25,6 +25,7 @@ use domain::{
     CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueConfig, QueueCursor, QueuePage,
     Timestamp, TopicCursor, TopicPage,
 };
+use protocol_amqp::{Attachment, EntityMetadata};
 use storage::StateStore;
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -69,6 +70,11 @@ enum Request {
         namespace: NamespaceName,
         entity: EntityPath,
         reply: flume::Sender<Result<Option<QueueConfig>, ProposeError>>,
+    },
+    GetEntityMetadata {
+        namespace: NamespaceName,
+        target: Attachment,
+        reply: flume::Sender<Result<Option<EntityMetadata>, ProposeError>>,
     },
     /// The highest timestamp the machine has applied. Readiness and
     /// diagnostics need it, and it is what a caller compares its own clock
@@ -296,6 +302,48 @@ impl BrokerHandle {
             .map_err(SubmitError::Propose)
     }
 
+    /// Reads validated link topology on the owner thread without a command stamp.
+    pub fn entity_metadata_blocking(
+        &self,
+        namespace: NamespaceName,
+        target: Attachment,
+    ) -> Result<Option<EntityMetadata>, SubmitError> {
+        let (reply, metadata) = flume::bounded(1);
+        self.requests
+            .send(Request::GetEntityMetadata {
+                namespace,
+                target,
+                reply,
+            })
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        metadata
+            .recv()
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
+
+    /// Reads validated link topology without blocking the executor.
+    pub async fn entity_metadata(
+        &self,
+        namespace: NamespaceName,
+        target: Attachment,
+    ) -> Result<Option<EntityMetadata>, SubmitError> {
+        let (reply, metadata) = flume::bounded(1);
+        self.requests
+            .send_async(Request::GetEntityMetadata {
+                namespace,
+                target,
+                reply,
+            })
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        metadata
+            .recv_async()
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
+
     /// The highest timestamp the machine has applied.
     pub fn last_applied_blocking(&self) -> Result<Timestamp, SubmitError> {
         let (reply, applied) = flume::bounded(1);
@@ -499,6 +547,13 @@ impl Broker {
                         } => {
                             let _ = reply.send(proposer.queue_config(&namespace, &entity));
                         }
+                        Request::GetEntityMetadata {
+                            namespace,
+                            target,
+                            reply,
+                        } => {
+                            let _ = reply.send(proposer.entity_metadata(&namespace, &target));
+                        }
                         Request::LastApplied { reply } => {
                             let _ = reply.send(
                                 proposer
@@ -547,6 +602,21 @@ impl Drop for Broker {
 /// Separating a refusal from an unreachable broker is what lets the edge report
 /// a condition the client can act on instead of a generic failure.
 impl protocol_amqp::Broker for BrokerHandle {
+    async fn entity_metadata(
+        &self,
+        namespace: NamespaceName,
+        target: Attachment,
+    ) -> Result<Option<EntityMetadata>, protocol_amqp::BrokerRejection> {
+        BrokerHandle::entity_metadata(self, namespace, target)
+            .await
+            .map_err(|error| match error {
+                SubmitError::Propose(ProposeError::Broker(refused)) => {
+                    protocol_amqp::BrokerRejection::Refused(refused)
+                }
+                other => protocol_amqp::BrokerRejection::Unavailable(other.to_string()),
+            })
+    }
+
     fn deliverable(
         &self,
         namespace: &NamespaceName,

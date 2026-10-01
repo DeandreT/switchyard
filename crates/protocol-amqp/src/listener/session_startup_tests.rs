@@ -13,7 +13,7 @@ use tokio::{
 };
 
 use super::{ServerConnection, serve_open_connection};
-use crate::{Broker, BrokerRejection};
+use crate::{Attachment, Broker, BrokerRejection, EntityMetadata};
 
 type TestResult<T = ()> = Result<T, Box<dyn StdError + Send + Sync>>;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -22,6 +22,16 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 struct ObservedBroker(mpsc::Sender<()>);
 
 impl Broker for ObservedBroker {
+    async fn entity_metadata(
+        &self,
+        namespace: NamespaceName,
+        target: Attachment,
+    ) -> Result<Option<EntityMetadata>, BrokerRejection> {
+        Ok((namespace.as_str() == "tenant"
+            && matches!(target, Attachment::Queue(entity) if entity.as_str() == "orders"))
+        .then_some(EntityMetadata::Queue(domain::QueueConfig::default())))
+    }
+
     async fn submit(
         &self,
         namespace: NamespaceName,

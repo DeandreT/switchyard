@@ -1386,22 +1386,184 @@ async fn a_sender_cannot_attach_to_a_dead_letter_queue() -> Result<(), Box<dyn E
 
 #[tokio::test(flavor = "multi_thread")]
 async fn attaching_to_a_queue_that_does_not_exist_is_refused() -> Result<(), Box<dyn Error>> {
-    let node = Node::start("orders", QueueConfig::default()).await?;
+    use amqp::{
+        Attach, Begin, Detach, Flow, Frame, Open, Performative, ProtocolHeader, Role, Target,
+        read_frame, read_protocol_header, write_frame, write_protocol_header,
+    };
+    use storage::StateStore;
+    use tokio::{net::TcpStream, time::timeout};
 
-    let mut connection = node.connect().await?;
-    let mut session = Session::begin(&mut connection).await?;
-    let mut sender = Sender::attach(&mut session, "test-sender", "invoices").await?;
-
-    // The link attaches — the broker learns the queue is missing only when a
-    // command reaches it — and the send is rejected rather than silently lost.
-    let outcome = sender
-        .send(Message::builder().body(body("nowhere")).build())
-        .await?;
-    assert!(
-        matches!(outcome, Outcome::Rejected(_)),
-        "expected a rejection, got {outcome:?}"
+    let deadline = std::time::Duration::from_secs(8);
+    let store = MemoryStore::default();
+    let broker = Broker::spawn(LocalProposer::new(
+        StateMachine::new(store.clone()),
+        ManualClock::at(1_000),
+    ));
+    let namespace = domain::NamespaceName::new("tenant")?;
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        domain::EntityPath::new("orders")?,
+        CommandKind::CreateQueue {
+            config: QueueConfig::default(),
+        },
+    )?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let mut stream = timeout(deadline, TcpStream::connect(listener.local_addr()?)).await??;
+    let handle = broker.handle();
+    let serving = tokio::spawn(async move {
+        let _ = protocol_amqp::AmqpListener::new(handle, namespace)
+            .serve(listener)
+            .await;
+    });
+    timeout(
+        deadline,
+        write_protocol_header(&mut stream, ProtocolHeader::AMQP),
+    )
+    .await??;
+    assert_eq!(
+        timeout(deadline, read_protocol_header(&mut stream)).await??,
+        ProtocolHeader::AMQP
     );
-
-    connection.close().await?;
+    for performative in [
+        Performative::Open(Open::new("missing-queue-peer")),
+        Performative::Begin(Begin::default()),
+    ] {
+        timeout(
+            deadline,
+            write_frame(
+                &mut stream,
+                &Frame::Amqp {
+                    channel: 0,
+                    performative: Some(performative),
+                    payload: vec![],
+                },
+            ),
+        )
+        .await??;
+        assert!(matches!(
+            timeout(deadline, read_frame(&mut stream)).await??,
+            Frame::Amqp {
+                performative: Some(Performative::Open(_) | Performative::Begin(_)),
+                ..
+            }
+        ));
+    }
+    let before = store.snapshot()?;
+    let applied = broker.handle().last_applied_blocking()?;
+    timeout(
+        deadline,
+        write_frame(
+            &mut stream,
+            &Frame::Amqp {
+                channel: 0,
+                performative: Some(Performative::Attach(Box::new(Attach {
+                    name: "missing-queue-sender".into(),
+                    handle: 0,
+                    role: Role::Sender,
+                    snd_settle_mode: amqp::SenderSettleMode::Unsettled,
+                    rcv_settle_mode: amqp::ReceiverSettleMode::First,
+                    source: None,
+                    target: Some(Target {
+                        address: Some("invoices".into()),
+                        ..Target::default()
+                    }),
+                    initial_delivery_count: Some(0),
+                    unsettled: None,
+                    incomplete_unsettled: false,
+                    max_message_size: None,
+                    offered_capabilities: None,
+                    desired_capabilities: None,
+                    properties: None,
+                }))),
+                payload: vec![],
+            },
+        ),
+    )
+    .await??;
+    assert!(
+        matches!(timeout(deadline, read_frame(&mut stream)).await??, Frame::Amqp { channel: 0, performative: Some(Performative::Attach(attach)), .. } if attach.name == "missing-queue-sender" && attach.role == Role::Receiver)
+    );
+    let detach = timeout(deadline, async {
+        loop {
+            match read_frame(&mut stream).await? {
+                Frame::Amqp {
+                    channel: 0,
+                    performative: Some(Performative::Detach(detach)),
+                    ..
+                } => return Ok::<_, Box<dyn Error>>(detach),
+                Frame::Amqp {
+                    channel: 0,
+                    performative: Some(Performative::Flow(flow)),
+                    ..
+                } => {
+                    assert_eq!(flow.handle, Some(0));
+                    assert_eq!(flow.delivery_count, Some(0));
+                    assert!(flow.link_credit.is_some_and(|credit| credit > 0));
+                    assert_eq!(flow.next_incoming_id, Some(0));
+                }
+                other => {
+                    panic!("the missing queue must refuse the link before a transfer: {other:?}")
+                }
+            }
+        }
+    })
+    .await??;
+    assert_eq!(detach.handle, 0);
+    assert!(detach.closed);
+    assert_eq!(
+        detach
+            .error
+            .expect("missing target reason")
+            .condition
+            .as_symbol(),
+        Symbol::from("amqp:not-found")
+    );
+    timeout(
+        deadline,
+        write_frame(
+            &mut stream,
+            &Frame::Amqp {
+                channel: 0,
+                performative: Some(Performative::Detach(Detach {
+                    handle: 0,
+                    closed: true,
+                    error: None,
+                })),
+                payload: vec![],
+            },
+        ),
+    )
+    .await??;
+    timeout(
+        deadline,
+        write_frame(
+            &mut stream,
+            &Frame::Amqp {
+                channel: 0,
+                performative: Some(Performative::Flow(Flow {
+                    next_incoming_id: Some(0),
+                    incoming_window: 2_048,
+                    next_outgoing_id: 0,
+                    outgoing_window: 2_048,
+                    echo: true,
+                    ..Flow::default()
+                })),
+                payload: vec![],
+            },
+        ),
+    )
+    .await??;
+    match timeout(deadline, read_frame(&mut stream)).await?? {
+        Frame::Amqp {
+            channel: 0,
+            performative: Some(Performative::Flow(flow)),
+            ..
+        } if flow.handle.is_none() && flow.next_incoming_id == Some(0) => {}
+        other => panic!("the refusal must keep its session alive: {other:?}"),
+    }
+    assert_eq!(store.snapshot()?, before);
+    assert_eq!(broker.handle().last_applied_blocking()?, applied);
+    serving.abort();
+    let _ = serving.await;
     Ok(())
 }

@@ -89,7 +89,6 @@ impl ResourceScope {
                 .map(decode_path_segment)
                 .collect::<Result<Vec<_>, _>>()?
         };
-
         Ok(Self { host, path })
     }
 
@@ -114,6 +113,13 @@ impl ResourceScope {
         Ok(scope)
     }
 
+    /// Applies the positional control aliases used by AMQP entity endpoints.
+    /// Native entity names retain their literal spelling unless explicitly converted.
+    pub fn into_amqp_scope(mut self) -> Self {
+        normalize_control_segments(&mut self.path);
+        self
+    }
+
     pub fn contains(&self, requested: &Self) -> bool {
         self.host == requested.host
             && self.path.len() <= requested.path.len()
@@ -131,6 +137,35 @@ impl ResourceScope {
     pub fn path(&self) -> impl Iterator<Item = &str> {
         self.path.iter().map(String::as_str)
     }
+}
+
+fn normalize_control_segments(path: &mut [String]) {
+    let mut end = path.len();
+    if end > 1 && path[end - 1].eq_ignore_ascii_case("$management") {
+        path[end - 1] = "$management".to_owned();
+        end -= 1;
+    }
+    if end > 1 && path[end - 1].eq_ignore_ascii_case("$deadletterqueue") {
+        path[end - 1] = "$deadletterqueue".to_owned();
+        end -= 1;
+    }
+    if end >= 3
+        && path[end - 2].eq_ignore_ascii_case("subscriptions")
+        && is_subscription_leaf(&path[end - 1])
+    {
+        path[end - 2] = "subscriptions".to_owned();
+    }
+}
+
+// Match routed SubscriptionName's ASCII subset without depending on domain storage types.
+fn is_subscription_leaf(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() <= 50
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
 }
 
 fn decode_path_segment(segment: &str) -> Result<String, ResourceScopeError> {
@@ -348,6 +383,202 @@ mod tests {
 
         assert!(namespace.contains(&orders));
         assert!(!namespace.contains(&foreign));
+    }
+
+    #[test]
+    fn explicit_amqp_conversion_normalizes_only_positional_transport_controls() {
+        let host = "tenant.servicebus.windows.net";
+        for (sdk_path, canonical) in [
+            (
+                "Orders/SubScriptions/Accounting",
+                "Orders/subscriptions/Accounting",
+            ),
+            (
+                "Orders/Subscriptions/Accounting/$DeadLetterQueue",
+                "Orders/subscriptions/Accounting/$deadletterqueue",
+            ),
+            (
+                "Orders/Subscriptions/Accounting/$Management",
+                "Orders/subscriptions/Accounting/$management",
+            ),
+            (
+                "Orders/Subscriptions/Accounting/$DeadLetterQueue/$MANAGEMENT",
+                "Orders/subscriptions/Accounting/$deadletterqueue/$management",
+            ),
+            (
+                "Orders/$DeadLetterQueue/$Management",
+                "Orders/$deadletterqueue/$management",
+            ),
+            (
+                "Subscriptions/Subscriptions/Subscriptions/$DeadLetterQueue",
+                "Subscriptions/subscriptions/Subscriptions/$deadletterqueue",
+            ),
+            (
+                "Orders/Subscriptions/Subscriptions/Accounting",
+                "Orders/Subscriptions/subscriptions/Accounting",
+            ),
+        ] {
+            let expected = ResourceScope::entity(host, canonical)
+                .expect("canonical scope")
+                .into_amqp_scope();
+            assert_eq!(
+                ResourceScope::entity(host, sdk_path)
+                    .expect("literal scope")
+                    .into_amqp_scope(),
+                expected
+            );
+            assert_eq!(
+                ResourceScope::parse(&format!("amqps://{host}/{sdk_path}"))
+                    .expect("URI scope")
+                    .into_amqp_scope(),
+                expected
+            );
+            assert_eq!(expected.path().collect::<Vec<_>>().join("/"), canonical);
+        }
+    }
+
+    #[test]
+    fn user_names_and_bare_control_words_keep_their_original_spelling() {
+        let host = "tenant.servicebus.windows.net";
+        for path in [
+            "Subscriptions",
+            "Orders/Subscriptions",
+            "$Management",
+            "$DeadLetterQueue",
+            "Orders/Subscriptions/_invalid",
+            "Orders/Subscriptions/a/b",
+        ] {
+            let scope = ResourceScope::entity(host, path)
+                .expect("ordinary resource path")
+                .into_amqp_scope();
+            assert_eq!(scope.path().collect::<Vec<_>>().join("/"), path);
+        }
+        for leaf in [".", "..", "-x", "x_", "a\u{e9}b", "a:b", &"a".repeat(51)] {
+            let path = format!("Orders/Subscriptions/{leaf}");
+            assert!(!is_subscription_leaf(leaf));
+            if !matches!(leaf, "." | "..") {
+                let scope = ResourceScope::entity(host, &path)
+                    .expect("ordinary resource path")
+                    .into_amqp_scope();
+                assert_eq!(scope.path().collect::<Vec<_>>().join("/"), path);
+            }
+        }
+        for (left, right) in [
+            (
+                "Orders/subscriptions/Accounting",
+                "orders/subscriptions/Accounting",
+            ),
+            (
+                "Orders/subscriptions/Accounting",
+                "Orders/subscriptions/accounting",
+            ),
+            (
+                "Subscriptions/subscriptions/Subscriptions/$deadletterqueue",
+                "subscriptions/subscriptions/Subscriptions/$deadletterqueue",
+            ),
+            (
+                "Subscriptions/subscriptions/Subscriptions/$deadletterqueue",
+                "Subscriptions/subscriptions/subscriptions/$deadletterqueue",
+            ),
+        ] {
+            let left = ResourceScope::entity(host, left)
+                .expect("left scope")
+                .into_amqp_scope();
+            let right = ResourceScope::entity(host, right)
+                .expect("right scope")
+                .into_amqp_scope();
+            assert_ne!(left, right);
+            assert!(!left.contains(&right));
+            assert!(!right.contains(&left));
+        }
+    }
+
+    #[test]
+    fn namespace_topic_subscription_and_endpoint_grants_have_exact_boundaries() {
+        let host = "tenant.servicebus.windows.net";
+        let paths = [
+            "Orders",
+            "Orders/subscriptions/Accounting",
+            "Orders/subscriptions/Accounting/$deadletterqueue",
+            "Orders/subscriptions/Accounting/$management",
+            "Orders/subscriptions/Accounting/$deadletterqueue/$management",
+        ];
+        let scopes = paths.map(|path| {
+            ResourceScope::entity(host, path)
+                .expect("scope")
+                .into_amqp_scope()
+        });
+        let namespace = ResourceScope::namespace(host).expect("namespace");
+        assert!(scopes.iter().all(|scope| namespace.contains(scope)));
+        assert!(scopes.iter().all(|scope| scopes[0].contains(scope)));
+        assert!(scopes[1..].iter().all(|scope| scopes[1].contains(scope)));
+        assert!(scopes[2].contains(&scopes[4]));
+        for (granted, requested) in [(1, 0), (2, 1), (2, 3), (3, 1), (3, 2), (4, 2), (4, 3)] {
+            assert!(!scopes[granted].contains(&scopes[requested]));
+        }
+        for sibling in [
+            "Orders-archive/subscriptions/Accounting",
+            "Orders/subscriptions/Accounting-old",
+            "Orders/subscriptions/Billing",
+        ] {
+            assert!(!scopes[1].contains(&ResourceScope::entity(host, sibling).expect("sibling")));
+        }
+        let foreign =
+            ResourceScope::entity("other.servicebus.windows.net", paths[1]).expect("foreign scope");
+        assert!(!namespace.contains(&foreign));
+        assert!(!scopes[1].contains(&foreign));
+    }
+
+    #[test]
+    fn decoded_controls_share_hash_identity_but_encoded_slashes_are_rejected() {
+        let encoded = ResourceScope::parse("amqps://tenant.servicebus.windows.net/Orders/%53ubscriptions/Accounting/%24DeadLetterQueue").expect("decoded scope").into_amqp_scope();
+        let canonical = ResourceScope::entity(
+            "tenant.servicebus.windows.net",
+            "Orders/subscriptions/Accounting/$deadletterqueue",
+        )
+        .expect("canonical scope")
+        .into_amqp_scope();
+        assert_eq!(encoded, canonical);
+        let mut set = std::collections::HashSet::new();
+        set.insert(encoded);
+        set.insert(canonical);
+        assert_eq!(set.len(), 1);
+        for invalid in [
+            "amqps://tenant.servicebus.windows.net/Orders/Subscriptions/Accounting%2Fsibling",
+            "amqps://tenant.servicebus.windows.net/Orders/Subscriptions/%00Accounting",
+            "amqps://tenant.servicebus.windows.net/Orders/%53ubscriptions/Accounting%GG",
+        ] {
+            assert!(ResourceScope::parse(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn default_scopes_keep_native_literal_control_names_distinct() {
+        let host = "tenant.servicebus.windows.net";
+        for (literal, alias) in [
+            ("Orders/$Management", "Orders/$management"),
+            ("Orders/$DeadLetterQueue", "Orders/$deadletterqueue"),
+            (
+                "Orders/Subscriptions/Accounting",
+                "Orders/subscriptions/Accounting",
+            ),
+        ] {
+            let left = ResourceScope::entity(host, literal).expect("literal scope");
+            let right = ResourceScope::entity(host, alias).expect("alias scope");
+            assert_ne!(left, right);
+            assert!(!left.contains(&right));
+            assert!(!right.contains(&left));
+            assert_eq!(
+                ResourceScope::parse(&format!("amqps://{host}/{literal}"))
+                    .expect("literal URI scope"),
+                left
+            );
+            assert_eq!(
+                left.into_amqp_scope(),
+                right.into_amqp_scope(),
+                "only explicit transport conversion aliases controls"
+            );
+        }
     }
 
     #[test]

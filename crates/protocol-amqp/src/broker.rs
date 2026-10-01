@@ -7,7 +7,21 @@
 
 use std::future::Future;
 
-use domain::{BrokerError, CommandKind, CommandOutcome, EntityPath, NamespaceName};
+use domain::{
+    BrokerError, CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueConfig,
+    SubscriptionConfig, TopicConfig,
+};
+
+use crate::Attachment;
+
+/// Committed metadata for a validated link target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntityMetadata {
+    Queue(QueueConfig),
+    Topic(TopicConfig),
+    Subscription(SubscriptionConfig),
+    DeadLetter(QueueConfig),
+}
 
 /// Why a command did not produce an outcome.
 ///
@@ -46,6 +60,13 @@ impl BrokerRejection {
 }
 
 pub trait Broker: Clone + Send + Sync + 'static {
+    /// Reads and validates committed topology without stamping a command.
+    fn entity_metadata(
+        &self,
+        namespace: NamespaceName,
+        target: Attachment,
+    ) -> impl Future<Output = Result<Option<EntityMetadata>, BrokerRejection>> + Send;
+
     /// Applies one command and reports what it produced.
     ///
     /// The future is required to be `Send` because a link is driven from a task

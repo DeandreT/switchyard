@@ -39,6 +39,13 @@ use crate::{
     stamp_session_filter,
 };
 
+mod routing;
+
+use routing::{management_target, plan_link, plan_management};
+
+#[cfg(test)]
+use routing::management_entity;
+
 /// How long a receiving link waits on a wakeup before asking the broker anyway.
 ///
 /// The wakeup is the mechanism; this is the net under it. A notification can be
@@ -417,49 +424,13 @@ async fn serve_session<B: Broker>(
         }
 
         let address = address_for_role(&attach.role, &source_address, &target_address);
-        if let Some(entity) = management_entity(address) {
+        if let Some(target) = management_target(address) {
             if attach.role == Role::Sender && attach.initial_delivery_count.is_none() {
                 attach.initial_delivery_count = Some(0);
             }
-            let plan = match entity {
-                Ok(entity) => {
-                    let link_authorization = match authorization.as_ref() {
-                        Some(authorization) => match authorization
-                            .authorize_entity_any(
-                                entity.as_str(),
-                                &[Permission::Send, Permission::Listen],
-                            )
-                            .await
-                        {
-                            Ok(resource) => Some(ManagementAuthorization::new(
-                                Arc::clone(authorization),
-                                resource,
-                            )),
-                            Err(_) => {
-                                let endpoint = match session
-                                    .accept_attach(
-                                        attach,
-                                        crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64,
-                                    )
-                                    .await
-                                {
-                                    Ok(endpoint) => endpoint,
-                                    Err(EngineError::RemoteDetached) => continue,
-                                    Err(error) => return Err(error.into()),
-                                };
-                                detach_with(
-                                    endpoint,
-                                    unauthorized_error(format!(
-                                        "Send or Listen is not authorized for {entity}"
-                                    )),
-                                )
-                                .await;
-                                continue;
-                            }
-                        },
-                        None => None,
-                    };
-                    Ok((entity, link_authorization))
+            let plan = match target {
+                Ok(target) => {
+                    plan_management(&broker, &namespace, target, authorization.as_ref()).await
                 }
                 Err(error) => Err(error_for(AmqpError::InvalidField, error.to_string())),
             };
@@ -707,121 +678,11 @@ impl LinkAuthorization {
     }
 }
 
-/// Everything an attach needs decided before it is answered: the entity it
-/// reaches, and the session lock it holds if its source asked for one.
-async fn plan_link<B: Broker>(
-    broker: &B,
-    namespace: &NamespaceName,
-    address: &str,
-    attach: &Attach,
-    authorization: Option<&Arc<ConnectionAuthorization>>,
-) -> Result<
-    (
-        EntityPath,
-        Option<AcceptedSession>,
-        Option<LinkAuthorization>,
-    ),
-    AmqpProtocolError,
-> {
-    let entity = resolve_entity(address, attach.role.clone())
-        .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?;
-    let link_authorization = match authorization {
-        Some(authorization) => {
-            let permission = match attach.role {
-                Role::Sender => Permission::Send,
-                Role::Receiver => Permission::Listen,
-            };
-            let resource = authorization
-                .authorize_entity(entity.as_str(), permission)
-                .await
-                .map_err(|_| {
-                    unauthorized_error(format!("{permission:?} is not authorized for {entity}"))
-                })?;
-            Some(LinkAuthorization {
-                connection: Arc::clone(authorization),
-                resource,
-                permission,
-            })
-        }
-        None => None,
-    };
-
-    // Only a receiving link takes a session lock; a sender names a session per
-    // message instead.
-    if attach.role != Role::Receiver {
-        return Ok((entity, None, link_authorization));
-    }
-    let session_id = match read_session_filter(attach.source.as_ref())
-        .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?
-    {
-        SessionRequest::None => return Ok((entity, None, link_authorization)),
-        SessionRequest::NextAvailable => None,
-        SessionRequest::Named(session_id) => Some(session_id),
-    };
-
-    match broker
-        .submit(
-            namespace.clone(),
-            entity.clone(),
-            CommandKind::AcceptSession {
-                session_id,
-                lock_duration_millis: None,
-            },
-        )
-        .await
-    {
-        Ok(CommandOutcome::SessionAccepted(Some(accepted))) => {
-            Ok((entity, Some(accepted), link_authorization))
-        }
-        // Nothing to grant is what Service Bus reports as a timeout: the client
-        // did nothing wrong and simply asks again.
-        Ok(CommandOutcome::SessionAccepted(None)) => Err(AmqpProtocolError::new(
-            ErrorCondition::Custom(Symbol::from(crate::TIMEOUT)),
-            String::from("no session is available to accept"),
-            None,
-        )),
-        Ok(other) => Err(error_for(
-            AmqpError::InternalError,
-            format!("accepting a session produced an unexpected outcome: {other:?}"),
-        )),
-        Err(rejection) => Err(rejection_error(&rejection)),
-    }
-}
-
-/// The entity a link may attach to, or why it may not.
-///
-/// A dead-letter address resolves to the shadow queue for a receiver and is
-/// refused for a sender: the only way in is dead-lettering.
-fn resolve_entity(address: &str, role: Role) -> Result<EntityPath, ProtocolError> {
-    match parse_attachment(address)? {
-        Attachment::Queue(entity) => Ok(entity),
-        Attachment::DeadLetter(entity) if role == Role::Receiver => entity
-            .dead_letter_queue()
-            .map_err(|error| ProtocolError::InvalidAddress {
-                address: address.to_owned(),
-                detail: error.to_string(),
-            }),
-        Attachment::DeadLetter(entity) => Err(ProtocolError::InvalidAddress {
-            address: address.to_owned(),
-            detail: format!("the dead-letter queue of {entity} cannot be sent to"),
-        }),
-        Attachment::Subscription { topic, .. } => Err(ProtocolError::InvalidAddress {
-            address: address.to_owned(),
-            detail: format!("subscriptions of topic {topic} are not implemented"),
-        }),
-    }
-}
-
 fn address_for_role<'a>(role: &Role, source: &'a str, target: &'a str) -> &'a str {
     match role {
         Role::Sender => target,
         Role::Receiver => source,
     }
-}
-
-fn management_entity(address: &str) -> Option<Result<EntityPath, ProtocolError>> {
-    let entity = address.strip_suffix("/$management")?;
-    Some(resolve_entity(entity, Role::Receiver))
 }
 
 /// Drives a link the client sends on: every transfer becomes one send command.
@@ -1205,23 +1066,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn addresses_resolve_by_role() {
+    fn addresses_resolve_to_canonical_entities() {
         assert_eq!(
-            resolve_entity("orders", Role::Sender)
-                .expect("a queue accepts senders")
+            parse_attachment("orders")
+                .expect("valid address")
+                .canonical_entity()
+                .expect("a queue address")
                 .as_str(),
             "orders"
         );
         // The dead-letter address is a real queue for a receiver and a refusal
         // for a sender: the only way in is dead-lettering.
         assert_eq!(
-            resolve_entity("orders/$deadletterqueue", Role::Receiver)
-                .expect("the shadow queue accepts receivers")
+            parse_attachment("orders/$deadletterqueue")
+                .expect("valid address")
+                .canonical_entity()
+                .expect("the shadow queue address")
                 .as_str(),
             "orders/$deadletterqueue"
         );
-        assert!(resolve_entity("orders/$deadletterqueue", Role::Sender).is_err());
-        assert!(resolve_entity("billing/Subscriptions/accounting", Role::Receiver).is_err());
+        assert_eq!(
+            parse_attachment("billing/Subscriptions/accounting")
+                .expect("valid address")
+                .canonical_entity()
+                .expect("canonical subscription")
+                .as_str(),
+            "billing/subscriptions/accounting",
+        );
     }
 
     #[test]

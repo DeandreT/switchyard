@@ -46,6 +46,15 @@ struct ControlledBroker {
 }
 
 impl protocol_amqp::Broker for ControlledBroker {
+    fn entity_metadata(
+        &self,
+        namespace: NamespaceName,
+        target: protocol_amqp::Attachment,
+    ) -> impl Future<Output = Result<Option<protocol_amqp::EntityMetadata>, BrokerRejection>> + Send
+    {
+        protocol_amqp::Broker::entity_metadata(&self.inner, namespace, target)
+    }
+
     async fn submit(
         &self,
         namespace: NamespaceName,

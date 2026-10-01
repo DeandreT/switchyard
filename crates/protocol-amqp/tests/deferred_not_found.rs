@@ -15,7 +15,7 @@ use domain::{
     BrokerError, CommandKind, CommandOutcome, Delivery, EntityPath, MessageStatus, NamespaceName,
     ReceiveMode, SequenceNumber, Timestamp,
 };
-use protocol_amqp::{AmqpListener, Broker, BrokerRejection};
+use protocol_amqp::{AmqpListener, Attachment, Broker, BrokerRejection, EntityMetadata};
 use tokio::{
     net::TcpListener,
     sync::{mpsc, oneshot},
@@ -34,6 +34,16 @@ struct BrokerState {
 }
 
 impl Broker for ControlledBroker {
+    async fn entity_metadata(
+        &self,
+        namespace: NamespaceName,
+        target: Attachment,
+    ) -> Result<Option<EntityMetadata>, BrokerRejection> {
+        Ok((namespace.as_str() == "tenant"
+            && matches!(target, Attachment::Queue(entity) if entity.as_str() == "orders"))
+        .then_some(EntityMetadata::Queue(domain::QueueConfig::default())))
+    }
+
     async fn submit(
         &self,
         namespace: NamespaceName,

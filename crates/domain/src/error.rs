@@ -142,4 +142,6 @@ pub enum BrokerError {
         namespace: NamespaceName,
         cursor_namespace: NamespaceName,
     },
+    #[error("entity metadata has a missing or mismatched topology component")]
+    DanglingEntityMetadata,
 }

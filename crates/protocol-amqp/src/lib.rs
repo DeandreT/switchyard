@@ -28,7 +28,7 @@ pub use crate::{
     },
     authorization::SharedAccessAuthentication,
     batch::SERVICE_BUS_BATCH_MESSAGE_FORMAT,
-    broker::{Broker, BrokerRejection},
+    broker::{Broker, BrokerRejection, EntityMetadata},
     condition::{
         ENTITY_ALREADY_EXISTS, INTERNAL_ERROR, INVALID_FIELD, MESSAGE_LOCK_LOST, MESSAGE_NOT_FOUND,
         MESSAGE_SIZE_EXCEEDED, NOT_ALLOWED, NOT_FOUND, NOT_IMPLEMENTED, PRECONDITION_FAILED,

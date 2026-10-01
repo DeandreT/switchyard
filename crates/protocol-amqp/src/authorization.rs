@@ -75,7 +75,12 @@ impl ConnectionAuthorization {
             policy: config.policy,
             audience_host: config.audience_host,
             authorization_timeout: config.authorization_timeout,
-            grants: RwLock::new(initial_grant.into_iter().collect()),
+            grants: RwLock::new(
+                initial_grant
+                    .into_iter()
+                    .map(AccessGrant::into_amqp_scope)
+                    .collect(),
+            ),
             grant_changed: Notify::new(),
             routes: Mutex::new(ReplyRoutes {
                 senders: HashMap::new(),
@@ -137,7 +142,8 @@ impl ConnectionAuthorization {
         permissions: &[Permission],
     ) -> Result<ResourceScope, AuthorizationError> {
         let resource = ResourceScope::entity(&self.audience_host, entity_path)
-            .map_err(|_| AuthorizationError)?;
+            .map_err(|_| AuthorizationError)?
+            .into_amqp_scope();
         self.authorize_resource_any(&resource, permissions).await?;
         Ok(resource)
     }
@@ -366,6 +372,120 @@ mod tests {
             SharedAccessAuthentication::new(policy, HOST).expect("valid authentication"),
             Some(grant),
         )
+    }
+
+    #[tokio::test]
+    async fn initial_plain_grants_use_explicit_amqp_controls_without_broadening_endpoints() {
+        for (sdk, canonical) in [
+            (
+                "Orders/Subscriptions/Accounting",
+                "Orders/subscriptions/Accounting",
+            ),
+            (
+                "Orders/Subscriptions/Accounting/$Management",
+                "Orders/subscriptions/Accounting/$management",
+            ),
+        ] {
+            let literal = ResourceScope::entity(HOST, sdk).expect("literal rule scope");
+            let expected = ResourceScope::entity(HOST, canonical).expect("canonical scope");
+            let policy = SharedAccessPolicy::new([SharedAccessRule::new(
+                "test-rule",
+                literal.clone(),
+                SharedAccessKey::new("test-secret").expect("key"),
+                None,
+                PermissionSet::MANAGE,
+            )
+            .expect("rule")])
+            .expect("policy");
+            let plain = policy
+                .authenticate_plain("test-rule", "test-secret")
+                .expect("PLAIN credential");
+            assert_eq!(plain.scope(), &literal);
+            assert!(!plain.allows(&expected, Permission::Manage, epoch_seconds()));
+            let connection = ConnectionAuthorization::new(
+                SharedAccessAuthentication::new(policy, HOST).expect("authentication"),
+                Some(plain),
+            );
+            assert_eq!(connection.grants.read().await[0].scope(), &expected);
+            for requested in [sdk, canonical] {
+                assert_eq!(
+                    connection
+                        .authorize_entity(requested, Permission::Manage)
+                        .await
+                        .expect("AMQP control alias"),
+                    expected
+                );
+            }
+            for denied in [
+                "Orders",
+                "Orders/subscriptions/Billing",
+                "orders/subscriptions/Accounting",
+                "Orders/subscriptions/accounting",
+            ] {
+                assert!(
+                    connection
+                        .authorize_entity(denied, Permission::Manage)
+                        .await
+                        .is_err()
+                );
+            }
+            if canonical.ends_with("/$management") {
+                for denied in [
+                    "Orders/subscriptions/Accounting",
+                    "Orders/subscriptions/Accounting/$deadletterqueue",
+                ] {
+                    assert!(
+                        connection
+                            .authorize_entity(denied, Permission::Manage)
+                            .await
+                            .is_err()
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cbs_control_aliases_replace_the_same_stored_grant_key() {
+        const SDK_TOKEN: &str = "SharedAccessSignature sr=amqps%3A%2F%2Ftenant.servicebus.windows.net%2FOrders%2FSubscriptions%2FAccounting%2F%24Management&sig=EC1J/CJScR/nGDN3aGox0IJnJisSGuV780wvOcxCU1E=&se=2000000000&skn=test-rule";
+        const CANONICAL_TOKEN: &str = "SharedAccessSignature sr=amqps%3A%2F%2Ftenant.servicebus.windows.net%2FOrders%2Fsubscriptions%2FAccounting%2F%24management&sig=XR8TnIBfC+cslXwvRG7lu8ZKbRfYP8+TG6aTXmZZtjU=&se=2000000000&skn=test-rule";
+        let sdk = "Orders/Subscriptions/Accounting/$Management";
+        let canonical = "Orders/subscriptions/Accounting/$management";
+        let expected = ResourceScope::entity(HOST, canonical).expect("canonical scope");
+        let policy = SharedAccessPolicy::new([SharedAccessRule::new(
+            "test-rule",
+            ResourceScope::entity(HOST, sdk).expect("literal rule scope"),
+            SharedAccessKey::new("test-secret").expect("key"),
+            None,
+            PermissionSet::MANAGE,
+        )
+        .expect("rule")])
+        .expect("policy");
+        let connection = ConnectionAuthorization::new(
+            SharedAccessAuthentication::new(policy, HOST).expect("authentication"),
+            None,
+        );
+        for (token, requested) in [(SDK_TOKEN, canonical), (CANONICAL_TOKEN, sdk)] {
+            connection
+                .validate_and_add(token, &format!("amqps://{HOST}/{requested}"))
+                .await
+                .expect("valid original signed bytes");
+            let grants = connection.grants.read().await;
+            assert_eq!(grants.len(), 1, "semantic aliases renew one grant");
+            assert_eq!(grants[0].scope(), &expected);
+        }
+        assert!(
+            connection
+                .authorize_entity(canonical, Permission::Manage)
+                .await
+                .is_ok()
+        );
+        assert!(
+            connection
+                .authorize_entity("Orders/subscriptions/Accounting", Permission::Manage)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

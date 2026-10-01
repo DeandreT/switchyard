@@ -190,7 +190,8 @@ impl Default for QueueConfig {
 }
 
 impl QueueConfig {
-    pub(crate) fn dead_letter_shadow(self) -> Self {
+    /// The receive-only shadow policy used for creation and topology validation.
+    pub fn dead_letter_shadow(self) -> Self {
         Self {
             max_delivery_count: u32::MAX,
             default_time_to_live_millis: None,

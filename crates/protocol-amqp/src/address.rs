@@ -5,7 +5,7 @@
 //! broker names both explicitly, so the edge resolves one into the other before
 //! any command is proposed.
 
-use domain::{EntityPath, NamespaceName, SessionId};
+use domain::{EntityPath, NamespaceName, SessionId, SubscriptionName};
 
 use crate::ProtocolError;
 
@@ -18,14 +18,60 @@ pub const SUBSCRIPTION_SEGMENT: &str = "/subscriptions/";
 /// What a link address resolved to.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Attachment {
+    /// A plain entity address; committed metadata distinguishes queues and topics.
     Queue(EntityPath),
-    /// Recognised so that attaching to one is refused as unimplemented rather
-    /// than silently creating a queue whose name ends in the suffix.
     DeadLetter(EntityPath),
     Subscription {
         topic: EntityPath,
-        subscription: String,
+        subscription: SubscriptionName,
     },
+    SubscriptionDeadLetter {
+        topic: EntityPath,
+        subscription: SubscriptionName,
+    },
+}
+
+impl Attachment {
+    /// The canonical storage path, preserving topic and subscription name case.
+    pub fn canonical_entity(&self) -> Result<EntityPath, ProtocolError> {
+        match self {
+            Self::Queue(entity) => Ok(entity.clone()),
+            Self::DeadLetter(parent) => parent.dead_letter_queue(),
+            Self::Subscription {
+                topic,
+                subscription,
+            } => topic.subscription(subscription),
+            Self::SubscriptionDeadLetter {
+                topic,
+                subscription,
+            } => topic
+                .subscription(subscription)
+                .and_then(|entity| entity.dead_letter_queue()),
+        }
+        .map_err(|source| ProtocolError::InvalidAddress {
+            address: self.address(),
+            detail: source.to_string(),
+        })
+    }
+
+    fn address(&self) -> String {
+        match self {
+            Self::Queue(entity) => entity.to_string(),
+            Self::DeadLetter(parent) => format!("{parent}{DEAD_LETTER_SUFFIX}"),
+            Self::Subscription {
+                topic,
+                subscription,
+            } => {
+                format!("{topic}{SUBSCRIPTION_SEGMENT}{subscription}")
+            }
+            Self::SubscriptionDeadLetter {
+                topic,
+                subscription,
+            } => {
+                format!("{topic}{SUBSCRIPTION_SEGMENT}{subscription}{DEAD_LETTER_SUFFIX}")
+            }
+        }
+    }
 }
 
 /// Resolves the namespace a connection is for from the hostname it opened with.
@@ -58,30 +104,82 @@ pub fn parse_attachment(address: &str) -> Result<Attachment, ProtocolError> {
             detail: String::from("address names no entity"),
         });
     }
-    let lowercase = trimmed.to_ascii_lowercase();
-
-    // Matched against the folded copy, but sliced out of the original, so the
-    // entity keeps the case the client wrote.
-    if let Some(folded) = lowercase.strip_suffix(DEAD_LETTER_SUFFIX) {
-        return Ok(Attachment::DeadLetter(entity(
+    let (base, dead_letter) = match strip_control_suffix(trimmed, DEAD_LETTER_SUFFIX) {
+        Some(base) => (base, true),
+        None => (trimmed, false),
+    };
+    if base.is_empty()
+        || base.split('/').any(str::is_empty)
+        || base.split('/').any(|part| {
+            part.eq_ignore_ascii_case("$management")
+                || part.eq_ignore_ascii_case("$deadletterqueue")
+                || part.eq_ignore_ascii_case("$transfer")
+        })
+    {
+        return Err(invalid_address(
             address,
-            &trimmed[..folded.len()],
-        )?));
+            "address contains an unsupported or empty path segment",
+        ));
     }
-    if let Some(position) = lowercase.find(SUBSCRIPTION_SEGMENT) {
-        let subscription = &trimmed[position + SUBSCRIPTION_SEGMENT.len()..];
-        if subscription.is_empty() {
-            return Err(ProtocolError::InvalidAddress {
-                address: address.to_owned(),
-                detail: String::from("address names a topic but no subscription"),
-            });
+
+    // Only the separator before the leaf is a control segment. A topic can
+    // itself end in the literal name "Subscriptions".
+    if let Some((parent, leaf)) = base.rsplit_once('/')
+        && let Some((topic, control)) = parent.rsplit_once('/')
+        && control.eq_ignore_ascii_case("subscriptions")
+    {
+        let topic = entity(address, topic)?;
+        if topic.is_subscription_path() {
+            return Err(invalid_address(
+                address,
+                "nested subscription paths are not supported",
+            ));
         }
-        return Ok(Attachment::Subscription {
-            topic: entity(address, &trimmed[..position])?,
-            subscription: subscription.to_owned(),
-        });
+        let subscription = SubscriptionName::new(leaf)
+            .map_err(|source| invalid_address(address, &source.to_string()))?;
+        let attachment = if dead_letter {
+            Attachment::SubscriptionDeadLetter {
+                topic,
+                subscription,
+            }
+        } else {
+            Attachment::Subscription {
+                topic,
+                subscription,
+            }
+        };
+        attachment.canonical_entity()?;
+        return Ok(attachment);
     }
-    Ok(Attachment::Queue(entity(address, trimmed)?))
+    let entity = entity(address, base)?;
+    if entity.is_subscription_path() {
+        return Err(invalid_address(
+            address,
+            "address must name exactly one subscription",
+        ));
+    }
+    let attachment = if dead_letter {
+        Attachment::DeadLetter(entity)
+    } else {
+        Attachment::Queue(entity)
+    };
+    attachment.canonical_entity()?;
+    Ok(attachment)
+}
+
+pub(crate) fn strip_control_suffix<'a>(address: &'a str, suffix: &str) -> Option<&'a str> {
+    let split = address.len().checked_sub(suffix.len())?;
+    address
+        .get(split..)?
+        .eq_ignore_ascii_case(suffix)
+        .then(|| &address[..split])
+}
+
+fn invalid_address(address: &str, detail: &str) -> ProtocolError {
+    ProtocolError::InvalidAddress {
+        address: address.to_owned(),
+        detail: detail.to_owned(),
+    }
 }
 
 /// Reads a session identifier a client asked for, rejecting one the broker
@@ -161,9 +259,60 @@ mod tests {
             queue("billing/Subscriptions/accounting"),
             Attachment::Subscription {
                 topic: EntityPath::new("billing").expect("valid"),
-                subscription: String::from("accounting"),
+                subscription: SubscriptionName::new("accounting").expect("valid"),
             }
         );
+    }
+
+    #[test]
+    fn subscription_controls_are_canonical_without_folding_user_names() {
+        for address in [
+            "Topic/Subscriptions/Member/$DeadLetterQueue",
+            "/Topic/sUbScRiPtIoNs/Member/$deadletterqueue",
+        ] {
+            assert_eq!(
+                queue(address),
+                Attachment::SubscriptionDeadLetter {
+                    topic: EntityPath::new("Topic").expect("valid"),
+                    subscription: SubscriptionName::new("Member").expect("valid"),
+                }
+            );
+            assert_eq!(
+                queue(address)
+                    .canonical_entity()
+                    .expect("canonical")
+                    .as_str(),
+                "Topic/subscriptions/Member/$deadletterqueue"
+            );
+        }
+        assert_eq!(
+            queue("a/Subscriptions/Subscriptions/Subscriptions")
+                .canonical_entity()
+                .expect("literal names")
+                .as_str(),
+            "a/Subscriptions/subscriptions/Subscriptions"
+        );
+        assert_eq!(
+            queue("a/Subscriptions"),
+            Attachment::Queue(EntityPath::new("a/Subscriptions").expect("literal primary name"))
+        );
+    }
+
+    #[test]
+    fn malformed_nested_and_repeated_endpoint_paths_are_refused() {
+        for address in [
+            "topic/subscriptions/",
+            "topic/subscriptions/member/extra",
+            "topic/subscriptions/member/subscriptions/nested",
+            "topic/subscriptions/bad name",
+            "topic/subscriptions/.member",
+            "topic/subscriptions/member/$deadletterqueue/$deadletterqueue",
+            "topic/$deadletterqueue/subscriptions/member",
+            "topic/$management",
+            "topic//$deadletterqueue",
+        ] {
+            assert!(parse_attachment(address).is_err(), "{address:?}");
+        }
     }
 
     #[test]

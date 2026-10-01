@@ -36,6 +36,12 @@ impl AccessGrant {
         self.permissions
     }
 
+    /// Converts an authenticated grant for use on AMQP transport endpoints only.
+    pub fn into_amqp_scope(mut self) -> Self {
+        self.scope = self.scope.into_amqp_scope();
+        self
+    }
+
     pub fn allows(
         &self,
         requested: &ResourceScope,
@@ -82,6 +88,8 @@ impl SharedAccessPolicy {
 
     /// Validates one Service Bus shared-access token for the CBS audience.
     ///
+    /// Positional transport control aliases apply only to CBS scope comparisons
+    /// and the returned grant, never to native `authenticate_sas` grants.
     /// The HMAC input deliberately retains the token's encoded `sr` field.
     /// Re-encoding the decoded URI can change its bytes and invalidate a
     /// signature that Service Bus clients generated correctly.
@@ -108,9 +116,13 @@ impl SharedAccessPolicy {
         let requested = requested_audience
             .map(ResourceScope::parse)
             .transpose()
-            .map_err(|_| SasError::InvalidAudience)?;
-        let token_scope =
+            .map_err(|_| SasError::InvalidAudience)?
+            .map(ResourceScope::into_amqp_scope);
+        let mut token_scope =
             ResourceScope::parse(&token.resource).map_err(|_| SasError::InvalidAudience)?;
+        if requested_audience.is_some() {
+            token_scope = token_scope.into_amqp_scope();
+        }
         if requested
             .as_ref()
             .is_some_and(|requested| !token_scope.contains(requested))
@@ -119,7 +131,9 @@ impl SharedAccessPolicy {
         }
 
         let rule = self.rule(&token.key_name).ok_or(SasError::UnknownRule)?;
-        if !rule.scope().contains(&token_scope) {
+        let amqp_rule_scope = requested_audience.map(|_| rule.scope().clone().into_amqp_scope());
+        let rule_scope = amqp_rule_scope.as_ref().unwrap_or(rule.scope());
+        if !rule_scope.contains(&token_scope) {
             return Err(SasError::RuleScopeMismatch);
         }
 
@@ -319,6 +333,189 @@ mod tests {
                 .scope()
                 .contains(&ResourceScope::parse(ORDERS).unwrap())
         );
+    }
+
+    #[test]
+    fn native_signed_scopes_remain_literal_while_cbs_controls_are_explicit_aliases() {
+        let sdk_resource = format!("amqps://{HOST}/Orders/$Management");
+        let canonical_resource = format!("amqps://{HOST}/Orders/$management");
+        let sdk_scope = ResourceScope::parse(&sdk_resource).unwrap();
+        let canonical_scope = ResourceScope::parse(&canonical_resource).unwrap();
+        let sdk_encoded = "amqps%3A%2F%2Ftenant.servicebus.windows.net%2FOrders%2F%24Management";
+        let canonical_encoded =
+            "amqps%3A%2F%2Ftenant.servicebus.windows.net%2FOrders%2F%24management";
+        let sdk_token = token(sdk_encoded, "send", EXPIRY, "secret");
+        let canonical_token = token(canonical_encoded, "send", EXPIRY, "secret");
+        let namespace_policy = policy(ResourceScope::namespace(HOST).unwrap(), "secret", None);
+        let scoped_token = namespace_policy
+            .authenticate_sas(&sdk_token, EXPIRY - 1)
+            .unwrap();
+        assert_eq!(scoped_token.scope(), &sdk_scope);
+        assert!(!scoped_token.allows(&canonical_scope, Permission::Send, EXPIRY - 1));
+        let policy = policy(sdk_scope.clone(), "secret", None);
+
+        let native = policy.authenticate_sas(&sdk_token, EXPIRY - 1).unwrap();
+        assert_eq!(native.scope(), &sdk_scope);
+        assert!(native.allows(&sdk_scope, Permission::Send, EXPIRY - 1));
+        assert!(!native.allows(&canonical_scope, Permission::Send, EXPIRY - 1));
+        assert_eq!(
+            policy.authenticate_sas(&canonical_token, EXPIRY - 1),
+            Err(SasError::RuleScopeMismatch)
+        );
+
+        for (token, requested) in [
+            (&sdk_token, canonical_resource.as_str()),
+            (&canonical_token, sdk_resource.as_str()),
+        ] {
+            let cbs = policy.validate_sas(token, requested, EXPIRY - 1).unwrap();
+            assert_eq!(cbs.scope(), &canonical_scope);
+            assert!(cbs.allows(&canonical_scope, Permission::Send, EXPIRY - 1));
+        }
+
+        let plain = policy.authenticate_plain("send", "secret").unwrap();
+        assert_eq!(plain.scope(), &sdk_scope);
+        assert!(!plain.allows(&canonical_scope, Permission::Send, EXPIRY - 1));
+        assert!(
+            plain
+                .into_amqp_scope()
+                .allows(&canonical_scope, Permission::Send, EXPIRY - 1)
+        );
+    }
+
+    #[test]
+    fn scoped_subscription_aliases_verify_only_the_original_signed_resource_bytes() {
+        let policy = policy(
+            ResourceScope::entity(HOST, "Orders/subscriptions/Accounting").unwrap(),
+            "secret",
+            None,
+        );
+        let sdk =
+            "amqps%3A%2F%2Ftenant.servicebus.windows.net%2FOrders%2FSubscriptions%2FAccounting";
+        let signed = token(sdk, "send", EXPIRY, "secret");
+        let grant = policy
+            .validate_sas(
+                &signed,
+                "amqps://tenant.servicebus.windows.net/Orders/subscriptions/Accounting",
+                EXPIRY - 1,
+            )
+            .unwrap();
+        assert!(
+            grant.allows(
+                &ResourceScope::entity(HOST, "Orders/SUBSCRIPTIONS/Accounting/$DeadLetterQueue")
+                    .unwrap()
+                    .into_amqp_scope(),
+                Permission::Send,
+                EXPIRY - 1,
+            )
+        );
+        let changed_signed_resource = signed.replace("%2FSubscriptions%2F", "%2Fsubscriptions%2F");
+        assert_eq!(
+            policy.validate_sas(
+                &changed_signed_resource,
+                "amqps://tenant.servicebus.windows.net/Orders/subscriptions/Accounting",
+                EXPIRY - 1,
+            ),
+            Err(SasError::InvalidSignature)
+        );
+        let encoded_control =
+            "amqps%3A%2F%2Ftenant.servicebus.windows.net%2FOrders%2F%2553ubscriptions%2FAccounting";
+        assert!(
+            policy
+                .validate_sas(
+                    &token(encoded_control, "send", EXPIRY, "secret"),
+                    "amqps://tenant.servicebus.windows.net/Orders/subscriptions/Accounting",
+                    EXPIRY - 1,
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn subscription_tokens_do_not_alias_user_case_hosts_or_sibling_resources() {
+        let policy = policy(
+            ResourceScope::entity(HOST, "Orders/subscriptions/Accounting").unwrap(),
+            "secret",
+            None,
+        );
+        let sdk =
+            "amqps%3A%2F%2Ftenant.servicebus.windows.net%2FOrders%2FSubscriptions%2FAccounting";
+        let signed = token(sdk, "send", EXPIRY, "secret");
+        let grant = policy
+            .validate_sas(
+                &signed,
+                "amqps://tenant.servicebus.windows.net/Orders/subscriptions/Accounting",
+                EXPIRY - 1,
+            )
+            .unwrap();
+        for requested in [
+            "amqps://tenant.servicebus.windows.net/orders/subscriptions/Accounting",
+            "amqps://tenant.servicebus.windows.net/Orders/subscriptions/accounting",
+            "amqps://tenant.servicebus.windows.net/Orders/subscriptions/Accounting-old",
+            "amqps://tenant.servicebus.windows.net/Orders/subscriptions/Billing",
+            "amqps://tenant.servicebus.windows.net/Orders-archive/subscriptions/Accounting",
+            "amqps://other.servicebus.windows.net/Orders/subscriptions/Accounting",
+        ] {
+            assert_eq!(
+                policy.validate_sas(&signed, requested, EXPIRY - 1),
+                Err(SasError::AudienceMismatch),
+                "{requested}"
+            );
+            assert!(!grant.allows(
+                &ResourceScope::parse(requested).unwrap().into_amqp_scope(),
+                Permission::Send,
+                EXPIRY - 1
+            ));
+        }
+        for resource in [
+            sdk.replace("%2FOrders%2F", "%2Forders%2F"),
+            sdk.replace("%2FAccounting", "%2Faccounting"),
+            sdk.replace("tenant.servicebus", "other.servicebus"),
+        ] {
+            let requested = percent_decode_str(&resource).decode_utf8().unwrap();
+            assert_eq!(
+                policy.validate_sas(
+                    &token(&resource, "send", EXPIRY, "secret"),
+                    requested.as_ref(),
+                    EXPIRY - 1,
+                ),
+                Err(SasError::RuleScopeMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn management_only_token_does_not_authorize_a_base_or_dead_letter_receiver() {
+        let policy = policy(ResourceScope::namespace(HOST).unwrap(), "secret", None);
+        let sdk = "amqps%3A%2F%2Ftenant.servicebus.windows.net%2FOrders%2FSubscriptions%2FAccounting%2F%24management";
+        let signed = token(sdk, "send", EXPIRY, "secret");
+        let grant = policy
+            .validate_sas(
+                &signed,
+                "amqps://tenant.servicebus.windows.net/Orders/subscriptions/Accounting/$management",
+                EXPIRY - 1,
+            )
+            .unwrap();
+        assert!(
+            grant.allows(
+                &ResourceScope::entity(HOST, "Orders/subscriptions/Accounting/$management")
+                    .unwrap()
+                    .into_amqp_scope(),
+                Permission::Send,
+                EXPIRY - 1
+            )
+        );
+        for path in [
+            "Orders/subscriptions/Accounting",
+            "Orders/subscriptions/Accounting/$deadletterqueue",
+            "Orders/subscriptions/Billing/$management",
+            "Orders",
+        ] {
+            assert!(!grant.allows(
+                &ResourceScope::entity(HOST, path).unwrap().into_amqp_scope(),
+                Permission::Send,
+                EXPIRY - 1
+            ));
+        }
     }
 
     #[test]
