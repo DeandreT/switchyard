@@ -52,8 +52,8 @@ use incoming_ledger::{
     DeliveryIdentity, IncomingLedger, IncomingLedgerError, LinkIdentity, SettlementAction,
 };
 use link_handles::{
-    HandleAlias, current_alias, is_error_detached, local_handle_for_peer, mark_error_detached,
-    preferred_vacant_handle,
+    HandleAlias, connection_link_name_in_use, current_alias, is_error_detached,
+    local_handle_for_peer, mark_error_detached, preferred_vacant_handle,
 };
 use outgoing_identity::AckIdentity;
 use receive_credit::{Consumption, ReceiveCredit};
@@ -1630,15 +1630,19 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
         }
         Performative::Attach(attach) => {
             let connection_slots = connection_link_slot_count(sessions);
+            let peer_handle = attach.handle;
+            let peer_handle_bound = sessions.get(&channel).is_some_and(|session| {
+                session
+                    .handle_aliases
+                    .values()
+                    .any(|alias| alias.peer_handle == Some(peer_handle))
+            });
+            let name_in_use = !peer_handle_bound
+                && connection_link_name_in_use(sessions, &attach.name, &attach.role.opposite());
             let session = sessions
                 .get_mut(&channel)
                 .ok_or_else(|| invalid_state("attach on an unknown session"))?;
-            let peer_handle = attach.handle;
-            if session
-                .handle_aliases
-                .values()
-                .any(|alias| alias.peer_handle == Some(peer_handle))
-            {
+            if peer_handle_bound {
                 if let Some(handle) = local_handle_for_peer(peer_handle, session)
                     && is_error_detached(session, handle)
                 {
@@ -1684,6 +1688,17 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                     channel,
                     "amqp:session:errant-link",
                     "pipelined attach for an error-detached link",
+                    session,
+                    writer,
+                )
+                .await?;
+                return Ok(FrameAction::Continue);
+            }
+            if !known_error && name_in_use {
+                refuse_session_state(
+                    channel,
+                    "amqp:not-implemented",
+                    "reattaching an existing link name is not implemented",
                     session,
                     writer,
                 )
@@ -4465,3 +4480,6 @@ mod error_delivery_tests;
 
 #[cfg(test)]
 mod error_link_tests;
+
+#[cfg(test)]
+mod live_name_tests;

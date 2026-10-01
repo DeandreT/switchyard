@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::Role;
 
@@ -19,6 +19,26 @@ pub(super) fn current_alias(handle: u32, session: &SessionState) -> Option<&Hand
         .handle_aliases
         .get(&handle)
         .filter(|alias| alias_is_current(handle, alias, session))
+}
+
+pub(super) fn connection_link_name_in_use(
+    sessions: &HashMap<u16, SessionState>,
+    name: &str,
+    local_role: &Role,
+) -> bool {
+    sessions.values().any(|session| {
+        !session.ending
+            && !session.identity.is_retired()
+            && session.handle_aliases.keys().any(|&handle| {
+                current_alias(handle, session).is_some_and(|alias| {
+                    !alias.error_detached
+                        && (!alias.identity.is_retired()
+                            || session.closing_handles.contains(&handle))
+                        && alias.name.as_ref() == name
+                        && &alias.role == local_role
+                })
+            })
+    })
 }
 
 fn alias_is_current(handle: u32, alias: &HandleAlias, session: &SessionState) -> bool {

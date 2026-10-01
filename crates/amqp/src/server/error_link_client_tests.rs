@@ -594,13 +594,37 @@ async fn historical_detach_cannot_reply_or_retire_a_fresh_different_peer_binding
 }
 
 #[tokio::test]
-async fn pending_same_name_response_records_its_own_error_handle_after_another_session_fails() {
+async fn same_role_name_admission_prevents_a_pending_replacement_before_and_after_the_original_errors()
+ {
     let (mut connection, original_session, mut peer) = pair().await;
     let replacement_session = begin(&mut connection, &mut peer).await;
     let mut original = pending(&original_session, &mut peer, "dead", Role::Receiver).await;
     answer(&mut peer, &original_session, &mut original, 42, false).await;
-    let replacement = pending(&replacement_session, &mut peer, "dead", Role::Receiver).await;
-    assert!(!original.owner.is_retired() && !replacement.owner.is_retired());
+    let refused = command(&replacement_session, "dead", Role::Receiver).await;
+    assert!(matches!(
+        timeout(DEADLINE, refused.reply)
+            .await
+            .expect("live name refusal")
+            .expect("refusal result"),
+        Err(EngineError::InvalidState(_))
+    ));
+    assert!(
+        timeout(Duration::from_millis(20), read_frame(&mut peer))
+            .await
+            .is_err()
+    );
+    link_flow(&mut peer, &original_session, 42).await;
+    assert!(
+        matches!(frame(&mut peer).await, (channel, Performative::Flow(flow), _)
+        if channel == original_session.channel && flow.handle == Some(original.request.handle))
+    );
+    assert!(!original.owner.is_retired());
+    let mut healthy = pending(&replacement_session, &mut peer, "healthy", Role::Receiver).await;
+    assert_eq!(
+        healthy.request.handle, 0,
+        "refused live names do not consume the cursor"
+    );
+    answer(&mut peer, &replacement_session, &mut healthy, 77, false).await;
 
     write_amqp(
         &mut peer,
@@ -629,57 +653,38 @@ async fn pending_same_name_response_records_its_own_error_handle_after_another_s
                 && detach.error.as_ref().expect("old error").condition.as_symbol() == Symbol::from("amqp:not-implemented"))
     );
     assert!(original.owner.is_retired() && *original.detached.borrow());
-    assert!(!replacement.owner.is_retired());
-
-    let mut response = replacement.request.response(
-        replacement.request.source.clone(),
-        replacement.request.target.clone(),
-    );
-    response.handle = 77;
-    response.unsettled = Some(Default::default());
-    assert!(
-        !has_recovery_state(&response),
-        "empty unsettled alone is fresh state"
-    );
-    write_amqp(
-        &mut peer,
-        17 + replacement_session.channel,
-        Performative::Attach(Box::new(response)),
-        Vec::new(),
-    )
-    .await
-    .expect("now-known pending response");
-    assert!(
-        matches!(frame(&mut peer).await, (channel, Performative::Detach(detach), payload)
-            if channel == replacement_session.channel && payload.is_empty()
-                && detach.handle == replacement.request.handle
-                && detach.error.as_ref().expect("pending recovery error").condition.as_symbol() == Symbol::from("amqp:not-implemented"))
-    );
+    assert!(!healthy.owner.is_retired());
+    let refused = command(&replacement_session, "dead", Role::Receiver).await;
     assert!(matches!(
-        timeout(DEADLINE, replacement.reply)
+        timeout(DEADLINE, refused.reply)
             .await
-            .expect("prompt pending refusal")
-            .expect("pending result"),
-        Err(EngineError::RemoteDetached)
+            .expect("historical name refusal")
+            .expect("refusal result"),
+        Err(EngineError::InvalidState(_))
     ));
-    assert!(replacement.owner.is_retired() && *replacement.detached.borrow());
-    assert!(!replacement_session.identity.is_retired());
-    write_amqp(
-        &mut peer,
-        17 + replacement_session.channel,
-        Performative::Detach(Detach {
-            handle: 77,
-            closed: true,
-            error: None,
-        }),
-        Vec::new(),
-    )
-    .await
-    .expect("pending refusal ACK");
-    barrier(&mut peer, &replacement_session).await;
+    assert!(
+        timeout(Duration::from_millis(20), read_frame(&mut peer))
+            .await
+            .is_err()
+    );
+    let mut opposite = pending(&replacement_session, &mut peer, "dead", Role::Sender).await;
+    assert_eq!(opposite.request.handle, 1);
+    answer(&mut peer, &replacement_session, &mut opposite, 78, true).await;
+    let mut distinct = pending(&replacement_session, &mut peer, "Dead", Role::Receiver).await;
+    assert_eq!(
+        distinct.request.handle, 2,
+        "historical name refusal does not consume the cursor"
+    );
+    answer(&mut peer, &replacement_session, &mut distinct, 79, false).await;
     link_flow(&mut peer, &replacement_session, 77).await;
-    end(&mut peer, &replacement_session, "amqp:session:errant-link").await;
-    assert!(replacement_session.identity.is_retired());
+    assert!(
+        matches!(frame(&mut peer).await, (channel, Performative::Flow(flow), _)
+        if channel == replacement_session.channel && flow.handle == Some(healthy.request.handle))
+    );
+    assert!(
+        !healthy.owner.is_retired() && !opposite.owner.is_retired() && !distinct.owner.is_retired()
+    );
+    assert!(!replacement_session.identity.is_retired());
     assert!(!original_session.identity.is_retired());
     barrier_at(&mut peer, &original_session, 1).await;
     cleanup(connection).await;

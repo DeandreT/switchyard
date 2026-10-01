@@ -8,6 +8,11 @@ use super::session_channels::vacant_channel;
 use super::*;
 use crate::{Source, Target};
 
+#[path = "client_pending_attaches.rs"]
+mod client_pending_attaches;
+
+use client_pending_attaches::PendingAttaches;
+
 pub struct ClientConnection {
     commands: mpsc::Sender<ClientCommand>,
     closed: watch::Receiver<bool>,
@@ -766,6 +771,27 @@ struct PendingAttach {
     consumption: Arc<Consumption>,
 }
 
+fn pending_attach_matches(
+    pending: &PendingAttach,
+    channel: u16,
+    sessions: &HashMap<u16, SessionState>,
+) -> bool {
+    pending.channel == channel
+        && sessions.get(&channel).is_some_and(|session| {
+            !session.ending
+                && !pending.session.is_retired()
+                && session.identity.same_session(&pending.session)
+                && session
+                    .handle_aliases
+                    .get(&pending.handle)
+                    .is_some_and(|alias| {
+                        alias.identity.same_link(pending.link.identity())
+                            && alias.peer_handle.is_none()
+                            && alias.own_attach_sent
+                    })
+        })
+}
+
 struct PendingBegin {
     identity: SessionIdentity,
     reply: oneshot::Sender<Result<(u16, SessionIdentity), EngineError>>,
@@ -779,7 +805,7 @@ struct PendingEnd {
 fn fail_pending_session(
     channel: u16,
     pending_begins: &mut HashMap<u16, PendingBegin>,
-    pending_attaches: &mut HashMap<String, PendingAttach>,
+    pending_attaches: &mut PendingAttaches,
     pending_detaches: &mut HashMap<(u16, u32), oneshot::Sender<Result<(), EngineError>>>,
     pending_ends: &mut HashMap<u16, PendingEnd>,
 ) {
@@ -789,11 +815,13 @@ fn fail_pending_session(
     }
     let names: Vec<_> = pending_attaches
         .iter()
-        .filter_map(|(name, pending)| (pending.channel == channel).then_some(name.clone()))
+        .filter_map(|(name, role, pending)| {
+            (pending.channel == channel).then_some((name.to_owned(), role))
+        })
         .collect();
-    for name in names {
+    for (name, role) in names {
         let mut pending = pending_attaches
-            .remove(&name)
+            .remove(&name, &role)
             .expect("pending attach exists");
         stop_link(&mut pending.link);
         let _ = pending.reply.send(Err(EngineError::RemoteDetached));
@@ -816,7 +844,7 @@ fn fail_pending_session(
 
 fn fail_pending_connection(
     pending_begins: &mut HashMap<u16, PendingBegin>,
-    pending_attaches: &mut HashMap<String, PendingAttach>,
+    pending_attaches: &mut PendingAttaches,
     pending_detaches: &mut HashMap<(u16, u32), oneshot::Sender<Result<(), EngineError>>>,
     pending_ends: &mut HashMap<u16, PendingEnd>,
 ) {
@@ -897,7 +925,7 @@ where
     let mut next_handles = HashMap::<u16, u32>::new();
     let mut pending_begins = HashMap::<u16, PendingBegin>::new();
     let mut pending_ends = HashMap::<u16, PendingEnd>::new();
-    let mut pending_attaches = HashMap::<String, PendingAttach>::new();
+    let mut pending_attaches = PendingAttaches::default();
     let mut pending_detaches =
         HashMap::<(u16, u32), oneshot::Sender<Result<(), EngineError>>>::new();
     let mut closing = Vec::<oneshot::Sender<Result<(), EngineError>>>::new();
@@ -1034,27 +1062,20 @@ where
                                         fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
                                         continue;
                                     }
-                                    let matches = pending_attaches.get(&attach.name).is_some_and(|pending| {
-                                        pending.channel == channel && sessions.get(&channel).is_some_and(|session| {
-                                            !session.ending && !pending.session.is_retired()
-                                                && session.identity.same_session(&pending.session)
-                                                && session.handle_aliases.get(&pending.handle).is_some_and(|alias| {
-                                                    alias.identity.same_link(pending.link.identity()) && alias.peer_handle.is_none() && alias.own_attach_sent
-                                                })
-                                        })
-                                    });
-                                    if !matches {
-                                        if known_error {
+                                    if let Some(pending) = pending_attaches.get(&attach.name, &local_role) {
+                                        // A directional request elsewhere owns this response name;
+                                        // never consume a current-session opposite-role request instead.
+                                        if !pending_attach_matches(pending, channel, &sessions) {
+                                            continue;
+                                        }
+                                    } else {
+                                        if pending_attaches.get(&attach.name, &local_role.opposite()).is_some_and(|pending| pending_attach_matches(pending, channel, &sessions)) {
+                                            refuse_session(channel, "amqp:invalid-field", "attach response has the wrong role", &mut writer, &mut sessions).await?;
+                                            fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
+                                        } else if known_error {
                                             refuse_session(channel, "amqp:not-implemented", RECOVERY_NOT_IMPLEMENTED, &mut writer, &mut sessions).await?;
                                             fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
                                         }
-                                        continue;
-                                    }
-                                    let pending = pending_attaches.get(&attach.name).expect("validated pending attach");
-                                    let role_matches = matches!((&pending.link, &attach.role), (LinkState::Sending(_), Role::Receiver) | (LinkState::Receiving(_), Role::Sender));
-                                    if !role_matches {
-                                        refuse_session(channel, "amqp:invalid-field", "attach response has the wrong role", &mut writer, &mut sessions).await?;
-                                        fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
                                         continue;
                                     }
                                     if attach.role == Role::Sender && attach.initial_delivery_count.is_none() {
@@ -1064,7 +1085,7 @@ where
                                     }
                                     let default_outcome = source_default_outcome(attach.source.as_ref())?;
                                     let recovery_reply = if has_recovery_state(&attach) || known_error {
-                                        let pending = pending_attaches.get(&attach.name).expect("validated pending attach");
+                                        let pending = pending_attaches.get(&attach.name, &local_role).expect("validated pending attach");
                                         let session = sessions.get(&channel).expect("validated pending session");
                                         let snapshot = match snapshot_error_histories(session, pending.handle, pending.link.identity(), Some(attach.handle), &writer) {
                                             Ok(snapshot) => snapshot,
@@ -1087,7 +1108,7 @@ where
                                         if !session.local_begin_sent { writer.encoded_frame(&local_begin_frame(channel, session)?)?; }
                                         Some((refusal, snapshot))
                                     } else { None };
-                                    if let Some(pending) = pending_attaches.remove(&attach.name) {
+                                    if let Some(pending) = pending_attaches.remove(&attach.name, &local_role) {
                                         let session = sessions.get_mut(&channel).expect("validated pending session");
                                         session.handle_aliases.get_mut(&pending.handle).expect("validated pending handle alias").peer_handle = Some(attach.handle);
                                         session.error_peer_handles.reassign(attach.handle);
@@ -1170,11 +1191,11 @@ where
                                 }
                                 Performative::Detach(detach) => {
                                     let alias_identity = sessions.get(&channel).and_then(|session| session.handle_aliases.get(&detach.handle)).map(|alias| alias.identity.clone());
-                                    let pending_name = pending_attaches.iter().find_map(|(name, pending)| {
-                                        (pending.channel == channel && pending.handle == detach.handle).then_some(name.clone())
+                                    let pending_name = pending_attaches.iter().find_map(|(name, role, pending)| {
+                                        (pending.channel == channel && pending.handle == detach.handle).then_some((name.to_owned(), role))
                                     });
-                                    if let Some(name) = pending_name {
-                                        let mut pending = pending_attaches.remove(&name).expect("pending attach exists");
+                                    if let Some((name, role)) = pending_name {
+                                        let mut pending = pending_attaches.remove(&name, &role).expect("pending attach exists");
                                         stop_link(&mut pending.link);
                                         let _ = pending.reply.send(Err(EngineError::RemoteDetached));
                                         if let Some(session) = sessions.get_mut(&channel) {
@@ -1316,6 +1337,7 @@ where
                                         continue;
                                     }
                                     let connection_slots = connection_link_slot_count(&sessions);
+                                    let name_in_use = connection_link_name_in_use(&sessions, &request.name, &request.role);
                                     let Some(session) = sessions.get_mut(&channel) else {
                                         let _ = reply.send(Err(EngineError::RemoteDetached));
                                         continue;
@@ -1333,11 +1355,15 @@ where
                                         let _ = reply.send(Err(invalid_state(RECOVERY_NOT_IMPLEMENTED)));
                                         continue;
                                     }
+                                    if name_in_use {
+                                        let _ = reply.send(Err(invalid_state("link name is already assigned")));
+                                        continue;
+                                    }
                                     let receive_maximum = effective_receive_maximum(request.max_message_size);
                                     let next_handle = next_handles
                                         .get_mut(&channel)
                                         .expect("live initiated session has a handle counter");
-                                    if session.pending_attaches.len() == MAX_PENDING_ATTACHES || pending_attaches.contains_key(&request.name) {
+                                    if session.pending_attaches.len() == MAX_PENDING_ATTACHES || pending_attaches.contains_key(&request.name, &request.role) {
                                         let _ = reply.send(Err(invalid_state("pending attach limit reached or name is already assigned")));
                                         continue;
                                     }
@@ -1577,7 +1603,7 @@ where
         pending.identity.retire();
         let _ = pending.reply.send(Err(EngineError::Stopped));
     }
-    for (_, mut pending) in pending_attaches {
+    for (_, mut pending) in pending_attaches.drain() {
         stop_link(&mut pending.link);
         let _ = pending.reply.send(Err(EngineError::Stopped));
     }
@@ -1606,3 +1632,7 @@ mod handle_tests;
 #[cfg(test)]
 #[path = "error_link_client_tests.rs"]
 mod error_link_tests;
+
+#[cfg(test)]
+#[path = "live_name_client_tests.rs"]
+mod live_name_tests;
