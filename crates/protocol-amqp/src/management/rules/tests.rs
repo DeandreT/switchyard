@@ -25,6 +25,8 @@ struct ObservedBroker {
 }
 
 impl Broker for ObservedBroker {
+    crate::broker::fixture_binding_methods!();
+
     async fn rules(
         &self,
         namespace: NamespaceName,
@@ -132,12 +134,16 @@ async fn process_request_for(
     authorization: Option<&ManagementAuthorization>,
     budget: DeliveryBudget,
 ) -> ManagementResponse {
+    let bound = BoundBroker::new(
+        broker.clone(),
+        test_binding(&EntityPath::new(ENTITY).expect("bound entity")),
+    );
     process_request(
         message,
         MessageId::Ulong(7),
         &NamespaceName::new("tenant").expect("namespace"),
         &EntityPath::new(entity).expect("entity"),
-        broker,
+        &bound,
         &ConnectionManagement::default(),
         authorization,
         budget,
@@ -408,16 +414,21 @@ async fn a_foreign_associated_link_name_cannot_redirect_a_rule_operation() {
                 session_id: SessionId::new("A").expect("session"),
                 token: LockToken::new(9),
             },
+            test_binding(&EntityPath::new("Orders/subscriptions/beta").expect("sibling")),
         )
         .await;
     let broker = ObservedBroker::default();
+    let bound = BoundBroker::new(
+        broker.clone(),
+        test_binding(&EntityPath::new(ENTITY).expect("bound entity")),
+    );
     let authorization = authorization(PermissionSet::LISTEN, &format!("{ENTITY}/$management"));
     let response = process_request(
         &message,
         MessageId::Ulong(7),
         &NamespaceName::new("tenant").expect("namespace"),
         &EntityPath::new(ENTITY).expect("entity"),
-        &broker,
+        &bound,
         &management,
         Some(&authorization),
         BUDGET,

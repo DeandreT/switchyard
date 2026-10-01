@@ -1,7 +1,7 @@
 //! The deterministic broker state machine.
 //!
-//! [`StateMachine::apply`] is the only entry point that mutates state. It reads
-//! the records a command touches, folds every resulting change into a single
+//! The ordinary and fenced apply entry points read
+//! the records a command touches, fold every resulting change into a single
 //! [`WriteBatch`], and commits that batch atomically. A command therefore
 //! either takes effect completely or not at all, and two replicas applying the
 //! same command in the same order reach byte-identical state.
@@ -25,6 +25,7 @@ use crate::{
 };
 
 mod entity_deletion;
+mod incarnations;
 mod message_retention;
 mod rules;
 mod topic_fanout;
@@ -861,6 +862,12 @@ impl<S: StateStore> StateMachine<S> {
             return Err(BrokerError::EntityPathAlreadyExists);
         }
         let shadow = config.dead_letter_shadow();
+        self.stage_create_incarnation(
+            &command.namespace,
+            &command.entity,
+            crate::EntityIncarnationKind::Queue,
+            batch,
+        )?;
         batch.push_put(key, codec::encode(&config)?);
         batch.push_put(
             keys::queue_config(&command.namespace, &dead_letter_queue),

@@ -123,7 +123,13 @@ fn queue_deletion_purges_every_live_state_but_not_counters_or_neighbors<P: Store
             .lock()
             .expect("observations");
         assert_eq!(observations.commits, 1);
-        assert_eq!(observations.puts, vec![keys::clock()]);
+        assert_eq!(
+            observations.puts,
+            vec![
+                keys::entity_incarnation(&fixture.namespace, &parent),
+                keys::clock()
+            ]
+        );
         assert!(
             !observations
                 .deleted
@@ -439,7 +445,13 @@ fn maximum_length_topic_deletion_keeps_source_fences_without_a_shadow<P: StorePr
                 .lock()
                 .expect("observations");
             assert_eq!(observations.commits, 1);
-            assert_eq!(observations.puts, vec![keys::clock()]);
+            assert_eq!(
+                observations.puts,
+                vec![
+                    keys::entity_incarnation(&fixture.namespace, &fixture.entity),
+                    keys::clock()
+                ]
+            );
             assert!(
                 !observations
                     .deleted

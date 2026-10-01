@@ -22,6 +22,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 struct ObservedBroker(mpsc::Sender<()>);
 
 impl Broker for ObservedBroker {
+    crate::broker::fixture_binding_methods!();
+
     async fn rules(
         &self,
         _namespace: NamespaceName,

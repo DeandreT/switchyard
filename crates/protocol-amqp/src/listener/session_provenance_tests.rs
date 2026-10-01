@@ -37,6 +37,8 @@ struct PausedBroker {
 }
 
 impl Broker for PausedBroker {
+    crate::broker::fixture_binding_methods!();
+
     async fn rules(
         &self,
         _namespace: NamespaceName,

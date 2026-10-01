@@ -84,6 +84,9 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
 #[path = "entity_metadata/rules.rs"]
 mod rule_reads;
 
+#[path = "entity_metadata/bindings.rs"]
+mod binding_reads;
+
 #[derive(Clone)]
 struct ProbeClock {
     inner: ManualClock,

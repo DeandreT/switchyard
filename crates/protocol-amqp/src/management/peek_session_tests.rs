@@ -32,6 +32,8 @@ impl ObservedBroker {
 }
 
 impl Broker for ObservedBroker {
+    crate::broker::fixture_binding_methods!();
+
     async fn rules(
         &self,
         _namespace: NamespaceName,
@@ -104,12 +106,14 @@ async fn process(
     management: &ConnectionManagement,
     authorization: Option<&ManagementAuthorization>,
 ) -> ManagementResponse {
+    let entity = EntityPath::new(ENTITY).expect("entity");
+    let bound = BoundBroker::new(broker.clone(), test_binding(&entity));
     process_request(
         message,
         MessageId::Ulong(7),
         &NamespaceName::new("tenant").expect("namespace"),
-        &EntityPath::new(ENTITY).expect("entity"),
-        broker,
+        &entity,
+        &bound,
         management,
         authorization,
         BUDGET,
@@ -262,8 +266,14 @@ async fn a_foreign_associated_link_neither_redirects_nor_locks_a_peek() {
         SessionId::new("Foreign-Session").expect("foreign session"),
         LockToken::new(99),
     );
+    let foreign_binding = test_binding(&foreign_entity);
     management
-        .register_session("foreign-link", foreign_entity.clone(), hold.clone())
+        .register_session(
+            "foreign-link",
+            foreign_entity.clone(),
+            hold.clone(),
+            foreign_binding.clone(),
+        )
         .await;
     management
         .register_delivery(
@@ -271,6 +281,7 @@ async fn a_foreign_associated_link_neither_redirects_nor_locks_a_peek() {
             foreign_entity.clone(),
             SequenceNumber::new(77),
             LockToken::new(99),
+            foreign_binding.clone(),
         )
         .await;
 
@@ -294,6 +305,7 @@ async fn a_foreign_associated_link_neither_redirects_nor_locks_a_peek() {
             Some(ManagedSession {
                 entity: foreign_entity.clone(),
                 hold: hold.clone(),
+                binding: foreign_binding.clone(),
             })
         );
         assert_eq!(
@@ -303,6 +315,7 @@ async fn a_foreign_associated_link_neither_redirects_nor_locks_a_peek() {
             Some(ManagedDelivery {
                 entity: foreign_entity.clone(),
                 sequence: SequenceNumber::new(77),
+                binding: foreign_binding.clone(),
             })
         );
     }

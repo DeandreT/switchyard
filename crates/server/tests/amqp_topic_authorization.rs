@@ -57,6 +57,36 @@ struct CountingBroker {
 }
 
 impl protocol_amqp::Broker for CountingBroker {
+    async fn bind(
+        &self,
+        namespace: NamespaceName,
+        target: Attachment,
+    ) -> Result<Option<protocol_amqp::EntityAdmission>, BrokerRejection> {
+        self.reads
+            .lock()
+            .expect("metadata reads")
+            .push((namespace.clone(), target.clone()));
+        protocol_amqp::Broker::bind(&self.inner, namespace, target).await
+    }
+
+    fn submit_fenced(
+        &self,
+        binding: domain::EntityBinding,
+        entity: EntityPath,
+        kind: CommandKind,
+    ) -> impl Future<Output = Result<CommandOutcome, BrokerRejection>> + Send {
+        protocol_amqp::Broker::submit_fenced(&self.inner, binding, entity, kind)
+    }
+
+    fn rules_fenced(
+        &self,
+        binding: domain::EntityBinding,
+        topic: EntityPath,
+        subscription: domain::SubscriptionName,
+    ) -> impl Future<Output = Result<Vec<domain::RuleDefinition>, BrokerRejection>> + Send {
+        protocol_amqp::Broker::rules_fenced(&self.inner, binding, topic, subscription)
+    }
+
     fn rules(
         &self,
         namespace: NamespaceName,

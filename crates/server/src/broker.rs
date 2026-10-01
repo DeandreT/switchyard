@@ -22,10 +22,10 @@ use std::{
 };
 
 use domain::{
-    CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueConfig, QueueCursor, QueuePage,
-    Timestamp, TopicCursor, TopicPage,
+    CommandKind, CommandOutcome, EntityBinding, EntityPath, NamespaceName, QueueConfig,
+    QueueCursor, QueuePage, Timestamp, TopicCursor, TopicPage,
 };
-use protocol_amqp::{Attachment, EntityMetadata};
+use protocol_amqp::{Attachment, EntityAdmission, EntityMetadata};
 use storage::StateStore;
 use thiserror::Error;
 use tokio::sync::{Notify, futures::OwnedNotified};
@@ -34,6 +34,8 @@ use tracing::debug;
 use crate::{AdminTarget, Clock, LocalProposer, ProposeError};
 
 mod admin_reads;
+mod bindings;
+mod protocol;
 
 /// Commands that may be waiting ahead of a caller's own.
 ///
@@ -46,6 +48,7 @@ enum Request {
     Apply {
         namespace: NamespaceName,
         entity: EntityPath,
+        binding: Option<EntityBinding>,
         kind: Box<CommandKind>,
         reply: flume::Sender<Result<CommandOutcome, ProposeError>>,
     },
@@ -78,6 +81,11 @@ enum Request {
         target: Attachment,
         reply: flume::Sender<Result<Option<EntityMetadata>, ProposeError>>,
     },
+    BindEntity {
+        namespace: NamespaceName,
+        target: Attachment,
+        reply: flume::Sender<Result<Option<EntityAdmission>, ProposeError>>,
+    },
     GetAdminEntityMetadata {
         namespace: NamespaceName,
         target: AdminTarget,
@@ -92,6 +100,7 @@ enum Request {
         namespace: NamespaceName,
         topic: EntityPath,
         subscription: domain::SubscriptionName,
+        binding: Option<EntityBinding>,
         reply: flume::Sender<Result<Vec<domain::RuleDefinition>, ProposeError>>,
     },
     /// The highest timestamp the machine has applied. Readiness and
@@ -250,6 +259,7 @@ impl BrokerHandle {
             .send(Request::Apply {
                 namespace,
                 entity,
+                binding: None,
                 kind: Box::new(kind),
                 reply,
             })
@@ -272,6 +282,7 @@ impl BrokerHandle {
             .send_async(Request::Apply {
                 namespace,
                 entity,
+                binding: None,
                 kind: Box::new(kind),
                 reply,
             })
@@ -509,11 +520,16 @@ impl Broker {
                         Request::Apply {
                             namespace,
                             entity,
+                            binding,
                             kind,
                             reply,
                         } => {
-                            let application =
-                                proposer.propose_with_effects(&namespace, &entity, *kind);
+                            let application = match binding {
+                                Some(binding) => {
+                                    proposer.propose_fenced_with_effects(&binding, &entity, *kind)
+                                }
+                                None => proposer.propose_with_effects(&namespace, &entity, *kind),
+                            };
                             if let Ok(applied) = &application {
                                 if let Some(targets) = &applied.entity_deletions {
                                     for target in targets {
@@ -583,6 +599,13 @@ impl Broker {
                         } => {
                             let _ = reply.send(proposer.entity_metadata(&namespace, &target));
                         }
+                        Request::BindEntity {
+                            namespace,
+                            target,
+                            reply,
+                        } => {
+                            let _ = reply.send(proposer.bind_entity(&namespace, &target));
+                        }
                         Request::GetAdminEntityMetadata {
                             namespace,
                             target,
@@ -601,9 +624,16 @@ impl Broker {
                             namespace,
                             topic,
                             subscription,
+                            binding,
                             reply,
                         } => {
-                            let _ = reply.send(proposer.rules(&namespace, &topic, &subscription));
+                            let result = match binding {
+                                Some(binding) => {
+                                    proposer.rules_fenced(&binding, &topic, &subscription)
+                                }
+                                None => proposer.rules(&namespace, &topic, &subscription),
+                            };
+                            let _ = reply.send(result);
                         }
                         Request::LastApplied { reply } => {
                             let _ = reply.send(
@@ -645,67 +675,6 @@ impl Drop for Broker {
         if let Some(owner) = self.owner.take() {
             let _ = owner.join();
         }
-    }
-}
-
-/// The broker as the protocol edge sees it.
-///
-/// Separating a refusal from an unreachable broker is what lets the edge report
-/// a condition the client can act on instead of a generic failure.
-impl protocol_amqp::Broker for BrokerHandle {
-    async fn rules(
-        &self,
-        namespace: NamespaceName,
-        topic: EntityPath,
-        subscription: domain::SubscriptionName,
-    ) -> Result<Vec<domain::RuleDefinition>, protocol_amqp::BrokerRejection> {
-        BrokerHandle::rules(self, namespace, topic, subscription)
-            .await
-            .map_err(|error| match error {
-                SubmitError::Propose(ProposeError::Broker(refused)) => {
-                    protocol_amqp::BrokerRejection::Refused(refused)
-                }
-                other => protocol_amqp::BrokerRejection::Unavailable(other.to_string()),
-            })
-    }
-
-    async fn entity_metadata(
-        &self,
-        namespace: NamespaceName,
-        target: Attachment,
-    ) -> Result<Option<EntityMetadata>, protocol_amqp::BrokerRejection> {
-        BrokerHandle::entity_metadata(self, namespace, target)
-            .await
-            .map_err(|error| match error {
-                SubmitError::Propose(ProposeError::Broker(refused)) => {
-                    protocol_amqp::BrokerRejection::Refused(refused)
-                }
-                other => protocol_amqp::BrokerRejection::Unavailable(other.to_string()),
-            })
-    }
-
-    fn deliverable(
-        &self,
-        namespace: &NamespaceName,
-        entity: &EntityPath,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        self.watchers.watch(namespace, entity).wait()
-    }
-
-    async fn submit(
-        &self,
-        namespace: NamespaceName,
-        entity: EntityPath,
-        kind: CommandKind,
-    ) -> Result<CommandOutcome, protocol_amqp::BrokerRejection> {
-        BrokerHandle::submit(self, namespace, entity, kind)
-            .await
-            .map_err(|error| match error {
-                SubmitError::Propose(ProposeError::Broker(refused)) => {
-                    protocol_amqp::BrokerRejection::Refused(refused)
-                }
-                other => protocol_amqp::BrokerRejection::Unavailable(other.to_string()),
-            })
     }
 }
 

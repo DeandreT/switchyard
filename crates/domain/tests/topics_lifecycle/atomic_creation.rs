@@ -113,6 +113,18 @@ fn atomic_topology_commits_and_failed_creation_retry_without_partial_state<P: St
         CommandOutcome::TopicCreated
     );
     assert_eq!(observations.lock().expect("observations").commits, 1);
+    assert_eq!(
+        observations
+            .lock()
+            .expect("observations")
+            .puts
+            .iter()
+            .filter(|key| {
+                **key == keys::entity_incarnation(&fixture.namespace, &fixture.entity)
+            })
+            .count(),
+        1
+    );
     let name = SubscriptionName::new("billing")?;
     let entity = fixture.entity.subscription(&name)?;
     let dlq = entity.dead_letter_queue()?;
@@ -141,6 +153,7 @@ fn atomic_topology_commits_and_failed_creation_retry_without_partial_state<P: St
         keys::subscription(&fixture.namespace, &fixture.entity, &name),
         keys::queue_config(&fixture.namespace, &entity),
         keys::queue_config(&fixture.namespace, &dlq),
+        keys::entity_incarnation(&fixture.namespace, &entity),
         keys::clock(),
     ] {
         assert_eq!(
@@ -161,6 +174,11 @@ fn atomic_topology_commits_and_failed_creation_retry_without_partial_state<P: St
         !observed
             .puts
             .contains(&keys::queue_counters(&fixture.namespace, &dlq))
+    );
+    assert!(
+        !observed
+            .puts
+            .contains(&keys::entity_incarnation(&fixture.namespace, &dlq))
     );
     drop(observed);
     assert_eq!(

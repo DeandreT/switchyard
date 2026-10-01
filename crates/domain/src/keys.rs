@@ -42,6 +42,7 @@ const TAG_DUPLICATE_HISTORY_EXPIRY: u8 = 0x0D;
 const TAG_TOPIC_CONFIG: u8 = 0x0E;
 const TAG_TOPIC_SUBSCRIPTION: u8 = 0x0F;
 const TAG_SUBSCRIPTION_RULE: u8 = 0x10;
+const TAG_ENTITY_INCARNATION: u8 = 0x11;
 
 const SEPARATOR: u8 = 0x00;
 
@@ -275,6 +276,11 @@ pub fn queue_counters(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8>
     entity_scope(TAG_QUEUE_COUNTERS, namespace, entity)
 }
 
+/// Retained incarnation ownership; a DLQ uses its parent owner's key.
+pub fn entity_incarnation(namespace: &NamespaceName, owner: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_ENTITY_INCARNATION, namespace, owner)
+}
+
 pub fn message(
     namespace: &NamespaceName,
     entity: &EntityPath,
@@ -504,6 +510,28 @@ mod tests {
 
     fn entity() -> EntityPath {
         EntityPath::new("orders").expect("valid entity path")
+    }
+
+    #[test]
+    fn incarnation_key_has_its_own_exact_owner_scope() {
+        let key = entity_incarnation(&namespace(), &entity());
+        assert_eq!(key, b"\x11tenant\0orders\0");
+        assert_ne!(key, queue_config(&namespace(), &entity()));
+        assert_ne!(key, queue_counters(&namespace(), &entity()));
+        assert_ne!(
+            key,
+            entity_incarnation(
+                &namespace(),
+                &entity().dead_letter_queue().expect("valid shadow")
+            )
+        );
+        assert_ne!(
+            key,
+            entity_incarnation(
+                &NamespaceName::new("tenant-other").expect("valid namespace"),
+                &entity()
+            )
+        );
     }
 
     #[test]

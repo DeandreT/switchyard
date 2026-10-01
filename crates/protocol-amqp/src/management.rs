@@ -7,8 +7,9 @@ use amqp::{
 };
 use auth::{Permission, ResourceScope};
 use domain::{
-    CommandKind, CommandOutcome, DeliveryBudget, EntityPath, LockToken, NamespaceName,
-    ScheduledEnvelope, SequenceNumber, SessionHold, SessionId, SettlementDisposition,
+    CommandKind, CommandOutcome, DeliveryBudget, EntityBinding, EntityPath, LockToken,
+    NamespaceName, ScheduledEnvelope, SequenceNumber, SessionHold, SessionId,
+    SettlementDisposition,
 };
 use serde_amqp::{
     Value,
@@ -20,6 +21,7 @@ use tracing::debug;
 use crate::{
     Broker, BrokerRejection,
     authorization::ConnectionAuthorization,
+    broker::BoundBroker,
     message::{read_incoming, write_delivery, write_peek_delivery},
     settlement::{dead_letter_disposition, read_properties_to_modify},
 };
@@ -69,6 +71,26 @@ const RESPONSE_ENTRY_OVERHEAD_BYTES: u64 = 64;
 const RESPONSE_WRAPPER_RESERVE_BYTES: u64 = 256;
 const RESPONSE_SIZE_DESCRIPTION: &str = "the requested response exceeds the reply capacity";
 
+#[cfg(test)]
+fn test_binding(entity: &EntityPath) -> EntityBinding {
+    let target = crate::parse_attachment(entity.as_str()).expect("test attachment");
+    let metadata = match &target {
+        crate::Attachment::Queue(_) => crate::EntityMetadata::Queue(domain::QueueConfig::default()),
+        crate::Attachment::Subscription { .. } => {
+            crate::EntityMetadata::Subscription(domain::SubscriptionConfig::default())
+        }
+        crate::Attachment::DeadLetter(_) | crate::Attachment::SubscriptionDeadLetter { .. } => {
+            crate::EntityMetadata::DeadLetter(domain::QueueConfig::default())
+        }
+    };
+    crate::broker::test_admission(
+        NamespaceName::new("tenant").expect("test namespace"),
+        target,
+        metadata,
+    )
+    .binding
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct DeliveryKey {
     link_name: String,
@@ -79,12 +101,14 @@ struct DeliveryKey {
 struct ManagedDelivery {
     entity: EntityPath,
     sequence: SequenceNumber,
+    binding: EntityBinding,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ManagedSession {
     entity: EntityPath,
     hold: SessionHold,
+    binding: EntityBinding,
 }
 
 #[derive(Debug, Default)]
@@ -96,6 +120,7 @@ struct ReplyRoutes {
 struct ReplyRoute {
     sender: mpsc::Sender<ManagementResponse>,
     max_message_size: u64,
+    binding: EntityBinding,
 }
 
 /// Protocol-only state shared by every session on one AMQP connection.
@@ -121,21 +146,38 @@ impl ConnectionManagement {
         entity: EntityPath,
         sequence: SequenceNumber,
         lock_token: LockToken,
+        binding: EntityBinding,
     ) {
         self.deliveries.write().await.insert(
             DeliveryKey {
                 link_name: link_name.to_owned(),
                 lock_token,
             },
-            ManagedDelivery { entity, sequence },
+            ManagedDelivery {
+                entity,
+                sequence,
+                binding,
+            },
         );
     }
 
-    pub(crate) async fn unregister_delivery(&self, link_name: &str, lock_token: LockToken) {
-        self.deliveries.write().await.remove(&DeliveryKey {
+    pub(crate) async fn unregister_delivery(
+        &self,
+        link_name: &str,
+        lock_token: LockToken,
+        binding: &EntityBinding,
+    ) {
+        let key = DeliveryKey {
             link_name: link_name.to_owned(),
             lock_token,
-        });
+        };
+        let mut deliveries = self.deliveries.write().await;
+        if deliveries
+            .get(&key)
+            .is_some_and(|delivery| &delivery.binding == binding)
+        {
+            deliveries.remove(&key);
+        }
     }
 
     async fn delivery(&self, link_name: &str, lock_token: LockToken) -> Option<ManagedDelivery> {
@@ -154,18 +196,28 @@ impl ConnectionManagement {
         link_name: &str,
         entity: EntityPath,
         hold: SessionHold,
+        binding: EntityBinding,
     ) {
-        self.sessions
-            .write()
-            .await
-            .insert(link_name.to_owned(), ManagedSession { entity, hold });
+        self.sessions.write().await.insert(
+            link_name.to_owned(),
+            ManagedSession {
+                entity,
+                hold,
+                binding,
+            },
+        );
     }
 
-    pub(crate) async fn unregister_session(&self, link_name: &str, hold: &SessionHold) {
+    pub(crate) async fn unregister_session(
+        &self,
+        link_name: &str,
+        hold: &SessionHold,
+        binding: &EntityBinding,
+    ) {
         let mut sessions = self.sessions.write().await;
         if sessions
             .get(link_name)
-            .is_some_and(|session| &session.hold == hold)
+            .is_some_and(|session| &session.hold == hold && &session.binding == binding)
         {
             sessions.remove(link_name);
         }
@@ -179,6 +231,7 @@ impl ConnectionManagement {
         &self,
         address: String,
         max_message_size: Option<u64>,
+        binding: EntityBinding,
     ) -> (
         mpsc::Sender<ManagementResponse>,
         mpsc::Receiver<ManagementResponse>,
@@ -192,6 +245,7 @@ impl ConnectionManagement {
                     .filter(|limit| *limit != 0)
                     .unwrap_or(u64::MAX)
                     .min(MAX_MANAGEMENT_RESPONSE_BYTES),
+                binding,
             },
         );
         self.route_changed.notify_waiters();
@@ -480,7 +534,7 @@ pub(crate) async fn serve_management_requests<B: Broker>(
     mut receiver: Receiver,
     namespace: NamespaceName,
     entity: EntityPath,
-    broker: B,
+    broker: BoundBroker<B>,
     management: Arc<ConnectionManagement>,
     authorization: Option<ManagementAuthorization>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -548,6 +602,17 @@ pub(crate) async fn serve_management_requests<B: Broker>(
                 continue;
             }
         };
+        if let Err(error) = validate_reply_binding(
+            delivery.message(),
+            broker.binding(),
+            &route.binding,
+            authorization.as_ref(),
+        )
+        .await
+        {
+            receiver.reject(&delivery, Some(error)).await?;
+            continue;
+        }
         let tracking_id = delivery
             .message()
             .application_properties
@@ -591,13 +656,37 @@ pub(crate) async fn serve_management_requests<B: Broker>(
     }
 }
 
+async fn validate_reply_binding(
+    message: &Message,
+    request_binding: &EntityBinding,
+    reply_binding: &EntityBinding,
+    authorization: Option<&ManagementAuthorization>,
+) -> Result<(), AmqpProtocolError> {
+    if request_binding == reply_binding {
+        return Ok(());
+    }
+    let permission = message
+        .application_properties
+        .as_ref()
+        .and_then(|properties| string_property(properties, OPERATION_PROPERTY))
+        .map(operation_permission);
+    if let (Some(authorization), Some(permission)) = (authorization, permission) {
+        authorization.ensure_permission(permission).await?;
+    }
+    Err(AmqpProtocolError::new(
+        amqp::ErrorCondition::Custom(Symbol::from(crate::NOT_FOUND)),
+        "the reply link belongs to another entity incarnation",
+        None,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_request<B: Broker>(
     message: &Message,
     message_id: MessageId,
     namespace: &NamespaceName,
     entity: &EntityPath,
-    broker: &B,
+    broker: &BoundBroker<B>,
     management: &ConnectionManagement,
     authorization: Option<&ManagementAuthorization>,
     budget: DeliveryBudget,
@@ -617,10 +706,7 @@ async fn process_request<B: Broker>(
     let Some(operation) = string_property(properties, OPERATION_PROPERTY) else {
         return ManagementResponse::bad_request(message_id, tracking_id, "operation is required");
     };
-    let permission = match operation {
-        SCHEDULE_MESSAGE_OPERATION | CANCEL_SCHEDULED_MESSAGE_OPERATION => Permission::Send,
-        _ => Permission::Listen,
-    };
+    let permission = operation_permission(operation);
     if let Some(authorization) = authorization
         && authorization.ensure_permission(permission).await.is_err()
     {
@@ -750,6 +836,13 @@ async fn process_request<B: Broker>(
     }
 }
 
+fn operation_permission(operation: &str) -> Permission {
+    match operation {
+        SCHEDULE_MESSAGE_OPERATION | CANCEL_SCHEDULED_MESSAGE_OPERATION => Permission::Send,
+        _ => Permission::Listen,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn schedule_messages<B: Broker>(
     message: &Message,
@@ -757,7 +850,7 @@ async fn schedule_messages<B: Broker>(
     tracking_id: Option<String>,
     namespace: &NamespaceName,
     entity: &EntityPath,
-    broker: &B,
+    broker: &BoundBroker<B>,
     budget: DeliveryBudget,
 ) -> ManagementResponse {
     let messages = match scheduled_messages(&message.body) {
@@ -899,7 +992,7 @@ async fn cancel_scheduled_messages<B: Broker>(
     tracking_id: Option<String>,
     namespace: &NamespaceName,
     entity: &EntityPath,
-    broker: &B,
+    broker: &BoundBroker<B>,
 ) -> ManagementResponse {
     let Some(sequences) = sequence_numbers(&message.body).filter(|sequences| !sequences.is_empty())
     else {
@@ -936,7 +1029,7 @@ async fn receive_by_sequence_number<B: Broker>(
     tracking_id: Option<String>,
     namespace: &NamespaceName,
     entity: &EntityPath,
-    broker: &B,
+    broker: &BoundBroker<B>,
     management: &ConnectionManagement,
     budget: DeliveryBudget,
 ) -> ManagementResponse {
@@ -971,7 +1064,7 @@ async fn receive_by_sequence_number<B: Broker>(
                     format!("session-id is invalid: {error}"),
                 );
             }
-            match requested_session(message, entity, management).await {
+            match requested_session(message, entity, broker.binding(), management).await {
                 Ok(session) => Some(session.hold),
                 Err(error) => return session_lookup_response(message_id, tracking_id, error),
             }
@@ -1021,7 +1114,13 @@ async fn receive_by_sequence_number<B: Broker>(
                 let lock = delivery.lock;
                 if let (Some(link_name), Some(lock)) = (link_name, lock) {
                     management
-                        .register_delivery(link_name, entity.clone(), delivery.sequence, lock.token)
+                        .register_delivery(
+                            link_name,
+                            entity.clone(),
+                            delivery.sequence,
+                            lock.token,
+                            broker.binding().clone(),
+                        )
                         .await;
                 }
 
@@ -1060,7 +1159,7 @@ async fn update_disposition<B: Broker>(
     tracking_id: Option<String>,
     namespace: &NamespaceName,
     entity: &EntityPath,
-    broker: &B,
+    broker: &BoundBroker<B>,
     management: &ConnectionManagement,
 ) -> ManagementResponse {
     let Some(properties) = message.application_properties.as_ref() else {
@@ -1107,7 +1206,7 @@ async fn update_disposition<B: Broker>(
             "the lock token is not active on the associated link",
         );
     };
-    if &delivery.entity != entity {
+    if &delivery.entity != entity || &delivery.binding != broker.binding() {
         return ManagementResponse::lock_lost(
             message_id,
             tracking_id,
@@ -1181,7 +1280,9 @@ async fn update_disposition<B: Broker>(
             | CommandOutcome::Deferred
             | CommandOutcome::DeadLettered,
         ) => {
-            management.unregister_delivery(link_name, lock_token).await;
+            management
+                .unregister_delivery(link_name, lock_token, broker.binding())
+                .await;
             ManagementResponse::accepted(message_id, tracking_id, Value::Null)
         }
         Ok(other) => ManagementResponse::internal(
@@ -1200,7 +1301,7 @@ async fn peek_messages<B: Broker>(
     tracking_id: Option<String>,
     namespace: &NamespaceName,
     entity: &EntityPath,
-    broker: &B,
+    broker: &BoundBroker<B>,
     budget: DeliveryBudget,
 ) -> ManagementResponse {
     let Some(from_sequence) = unsigned_map_value(&message.body, FROM_SEQUENCE_NUMBER) else {
@@ -1300,7 +1401,7 @@ async fn renew_message_lock<B: Broker>(
     tracking_id: Option<String>,
     namespace: &NamespaceName,
     entity: &EntityPath,
-    broker: &B,
+    broker: &BoundBroker<B>,
     management: &ConnectionManagement,
     budget: DeliveryBudget,
 ) -> ManagementResponse {
@@ -1344,7 +1445,7 @@ async fn renew_message_lock<B: Broker>(
             "the lock token is not active on the associated link",
         );
     };
-    if &delivery.entity != entity {
+    if &delivery.entity != entity || &delivery.binding != broker.binding() {
         return ManagementResponse::lock_lost(
             message_id,
             tracking_id,
@@ -1390,6 +1491,7 @@ enum SessionLookupError {
 async fn requested_session(
     message: &Message,
     entity: &EntityPath,
+    binding: &EntityBinding,
     management: &ConnectionManagement,
 ) -> Result<ManagedSession, SessionLookupError> {
     let properties =
@@ -1411,7 +1513,10 @@ async fn requested_session(
         .ok_or(SessionLookupError::LockLost(
             "the associated link does not hold a session",
         ))?;
-    if &session.entity != entity || session.hold.session_id.as_str() != session_id {
+    if &session.entity != entity
+        || &session.binding != binding
+        || session.hold.session_id.as_str() != session_id
+    {
         return Err(SessionLookupError::LockLost(
             "the associated link does not hold the named session",
         ));
@@ -1441,10 +1546,10 @@ async fn renew_session_lock<B: Broker>(
     tracking_id: Option<String>,
     namespace: &NamespaceName,
     entity: &EntityPath,
-    broker: &B,
+    broker: &BoundBroker<B>,
     management: &ConnectionManagement,
 ) -> ManagementResponse {
-    let session = match requested_session(message, entity, management).await {
+    let session = match requested_session(message, entity, broker.binding(), management).await {
         Ok(session) => session,
         Err(error) => return session_lookup_response(message_id, tracking_id, error),
     };
@@ -1480,10 +1585,10 @@ async fn get_session_state<B: Broker>(
     tracking_id: Option<String>,
     namespace: &NamespaceName,
     entity: &EntityPath,
-    broker: &B,
+    broker: &BoundBroker<B>,
     management: &ConnectionManagement,
 ) -> ManagementResponse {
-    let session = match requested_session(message, entity, management).await {
+    let session = match requested_session(message, entity, broker.binding(), management).await {
         Ok(session) => session,
         Err(error) => return session_lookup_response(message_id, tracking_id, error),
     };
@@ -1521,10 +1626,10 @@ async fn set_session_state<B: Broker>(
     tracking_id: Option<String>,
     namespace: &NamespaceName,
     entity: &EntityPath,
-    broker: &B,
+    broker: &BoundBroker<B>,
     management: &ConnectionManagement,
 ) -> ManagementResponse {
-    let session = match requested_session(message, entity, management).await {
+    let session = match requested_session(message, entity, broker.binding(), management).await {
         Ok(session) => session,
         Err(error) => return session_lookup_response(message_id, tracking_id, error),
     };
@@ -1716,6 +1821,9 @@ struct RouteError;
 
 #[cfg(test)]
 mod peek_session_tests;
+
+#[cfg(test)]
+mod binding_tests;
 
 #[cfg(test)]
 mod tests {

@@ -10,11 +10,11 @@ use std::{
 
 use domain::{
     BrokerError, Command, CommandApplication, CommandKind, CommandOutcome, DeleteEntityTarget,
-    Delivery, EntityDeleteLimit, EntityPath, MAX_ENTITY_DELETE_KEY_BYTES, MAX_ENTITY_DELETE_KEYS,
-    MAX_ENTITY_DELETE_VALUE_BYTES, MAX_SEQUENCE_NUMBER, MAX_TOPIC_SUBSCRIPTIONS, NamespaceName,
-    QueueConfig, QueueCounters, ReceiveMode, RuleFilter, RuleName, ScheduledMessage,
-    SequenceNumber, SessionHold, SessionId, SubscriptionConfig, SubscriptionName, Timestamp,
-    TopicConfig, codec, keys,
+    Delivery, EntityDeleteLimit, EntityIncarnation, EntityPath, MAX_ENTITY_DELETE_KEY_BYTES,
+    MAX_ENTITY_DELETE_KEYS, MAX_ENTITY_DELETE_VALUE_BYTES, MAX_SEQUENCE_NUMBER,
+    MAX_TOPIC_SUBSCRIPTIONS, NamespaceName, QueueConfig, QueueCounters, ReceiveMode, RuleFilter,
+    RuleName, ScheduledMessage, SequenceNumber, SessionHold, SessionId, SubscriptionConfig,
+    SubscriptionName, Timestamp, TopicConfig, codec, keys,
 };
 use storage::{Key, Mutation, StateStore, StorageError, StoreSnapshot, Value, WriteBatch};
 use testkit::{QueueFixture, StoreProvider};
@@ -235,9 +235,21 @@ fn assert_exact_purge<P: StoreProvider>(
                 return true;
             };
             key == &keys::queue_counters(&fixture.namespace, path)
+                || key == &keys::entity_incarnation(&fixture.namespace, path)
         })
         .cloned()
         .collect::<Vec<_>>();
+    for path in paths {
+        let key = keys::entity_incarnation(&fixture.namespace, path);
+        if let Some((_, value)) = expected.iter_mut().find(|(candidate, _)| *candidate == key) {
+            let live: EntityIncarnation = codec::decode(value)?;
+            *value = codec::encode(&EntityIncarnation::new(
+                live.generation(),
+                live.kind(),
+                true,
+            )?)?;
+        }
+    }
     expected.push((
         keys::clock(),
         codec::encode(&Timestamp::from_millis(millis))?,

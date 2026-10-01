@@ -17,6 +17,7 @@ use thiserror::Error;
 use crate::Clock;
 
 mod admin_metadata;
+mod bindings;
 mod entity_metadata;
 pub use admin_metadata::AdminTarget;
 

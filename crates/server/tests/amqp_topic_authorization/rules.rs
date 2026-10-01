@@ -19,6 +19,43 @@ struct RuleBroker {
 }
 
 impl protocol_amqp::Broker for RuleBroker {
+    async fn bind(
+        &self,
+        namespace: NamespaceName,
+        target: Attachment,
+    ) -> Result<Option<protocol_amqp::EntityAdmission>, BrokerRejection> {
+        self.calls.lock().expect("calls").metadata += 1;
+        protocol_amqp::Broker::bind(&self.inner, namespace, target).await
+    }
+
+    async fn submit_fenced(
+        &self,
+        binding: domain::EntityBinding,
+        entity: EntityPath,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, BrokerRejection> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .submits
+            .push((entity.clone(), kind.clone()));
+        protocol_amqp::Broker::submit_fenced(&self.inner, binding, entity, kind).await
+    }
+
+    async fn rules_fenced(
+        &self,
+        binding: domain::EntityBinding,
+        topic: EntityPath,
+        subscription: SubscriptionName,
+    ) -> Result<Vec<RuleDefinition>, BrokerRejection> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .rules
+            .push((topic.clone(), subscription.clone()));
+        protocol_amqp::Broker::rules_fenced(&self.inner, binding, topic, subscription).await
+    }
+
     async fn rules(
         &self,
         namespace: NamespaceName,

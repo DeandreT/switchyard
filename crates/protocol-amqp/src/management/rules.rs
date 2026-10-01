@@ -432,7 +432,7 @@ pub(super) async fn process<B: Broker>(
     tracking_id: Option<String>,
     namespace: &NamespaceName,
     entity: &EntityPath,
-    broker: &B,
+    broker: &BoundBroker<B>,
     budget: DeliveryBudget,
 ) -> ManagementResponse {
     let (topic, subscription) = match target(entity) {

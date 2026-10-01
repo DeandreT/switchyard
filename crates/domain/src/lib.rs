@@ -11,6 +11,7 @@ pub mod codec;
 pub mod keys;
 
 mod command;
+mod entity_binding;
 mod error;
 mod identifier;
 mod machine;
@@ -28,6 +29,7 @@ pub use command::{
     Command, CommandKind, CommandOutcome, DeleteEntityTarget, DeliveryBudget, EntityDeleteLimit,
     IngressBatchLimit, IngressEnvelope, ScheduledEnvelope, ScheduledMessage, SettlementDisposition,
 };
+pub use entity_binding::{EntityBinding, EntityIncarnation, EntityIncarnationKind, FencedCommand};
 pub use error::BrokerError;
 pub use identifier::{
     DEAD_LETTER_QUEUE_SUFFIX, EntityPath, IdentifierError, MAX_ENTITY_PATH_BYTES,

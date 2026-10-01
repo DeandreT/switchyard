@@ -13,6 +13,7 @@ pub(super) async fn plan_link<B: Broker>(
         EntityPath,
         Option<AcceptedSession>,
         Option<LinkAuthorization>,
+        BoundBroker<B>,
     ),
     AmqpProtocolError,
 > {
@@ -41,7 +42,9 @@ pub(super) async fn plan_link<B: Broker>(
         }
         None => None,
     };
-    let metadata = entity_metadata(broker, namespace, &target).await?;
+    let admission = admission(broker, namespace, &target).await?;
+    let metadata = admission.metadata;
+    let broker = BoundBroker::new(broker.clone(), admission.binding);
     if !data_role_allowed(&target, metadata, &attach.role) {
         return Err(error_for(
             AmqpError::NotAllowed,
@@ -49,7 +52,7 @@ pub(super) async fn plan_link<B: Broker>(
         ));
     }
     if attach.role != Role::Receiver {
-        return Ok((entity, None, link_authorization));
+        return Ok((entity, None, link_authorization, broker));
     }
     let session_request = read_session_filter(attach.source.as_ref())
         .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?;
@@ -61,7 +64,7 @@ pub(super) async fn plan_link<B: Broker>(
         )));
     }
     let session_id = match session_request {
-        SessionRequest::None => return Ok((entity, None, link_authorization)),
+        SessionRequest::None => return Ok((entity, None, link_authorization, broker)),
         SessionRequest::NextAvailable => None,
         SessionRequest::Named(session_id) => Some(session_id),
     };
@@ -77,7 +80,7 @@ pub(super) async fn plan_link<B: Broker>(
         .await
     {
         Ok(CommandOutcome::SessionAccepted(Some(accepted))) => {
-            Ok((entity, Some(accepted), link_authorization))
+            Ok((entity, Some(accepted), link_authorization, broker))
         }
         Ok(CommandOutcome::SessionAccepted(None)) => Err(AmqpProtocolError::new(
             ErrorCondition::Custom(Symbol::from(crate::TIMEOUT)),
@@ -97,7 +100,7 @@ pub(super) async fn plan_management<B: Broker>(
     namespace: &NamespaceName,
     target: Attachment,
     authorization: Option<&Arc<ConnectionAuthorization>>,
-) -> Result<(EntityPath, Option<ManagementAuthorization>), AmqpProtocolError> {
+) -> Result<(EntityPath, Option<ManagementAuthorization>, BoundBroker<B>), AmqpProtocolError> {
     let entity = target
         .canonical_entity()
         .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?;
@@ -117,17 +120,21 @@ pub(super) async fn plan_management<B: Broker>(
         }
         None => None,
     };
-    entity_metadata(broker, namespace, &target).await?;
-    Ok((entity, link_authorization))
+    let admission = admission(broker, namespace, &target).await?;
+    Ok((
+        entity,
+        link_authorization,
+        BoundBroker::new(broker.clone(), admission.binding),
+    ))
 }
 
-async fn entity_metadata<B: Broker>(
+async fn admission<B: Broker>(
     broker: &B,
     namespace: &NamespaceName,
     target: &Attachment,
-) -> Result<crate::EntityMetadata, AmqpProtocolError> {
-    let metadata = broker
-        .entity_metadata(namespace.clone(), target.clone())
+) -> Result<crate::EntityAdmission, AmqpProtocolError> {
+    let admission = broker
+        .bind(namespace.clone(), target.clone())
         .await
         .map_err(|rejection| rejection_error(&rejection))?
         .ok_or_else(|| {
@@ -136,7 +143,7 @@ async fn entity_metadata<B: Broker>(
             ))
         })?;
     let matches_target = matches!(
-        (target, metadata),
+        (target, admission.metadata),
         (
             Attachment::Queue(_),
             crate::EntityMetadata::Queue(_) | crate::EntityMetadata::Topic(_)
@@ -154,7 +161,18 @@ async fn entity_metadata<B: Broker>(
             String::from("entity metadata does not match the requested target"),
         ));
     }
-    Ok(metadata)
+    if admission.binding.namespace() != namespace
+        || admission.binding.target()
+            != &target
+                .canonical_entity()
+                .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?
+    {
+        return Err(error_for(
+            AmqpError::InternalError,
+            "admission identity does not match the requested target".to_owned(),
+        ));
+    }
+    Ok(admission)
 }
 
 fn data_role_allowed(target: &Attachment, metadata: crate::EntityMetadata, role: &Role) -> bool {

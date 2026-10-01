@@ -12,10 +12,12 @@ use amqp::{
     decode_message,
 };
 use domain::{
-    BrokerError, CommandKind, CommandOutcome, Delivery, EntityPath, MessageStatus, NamespaceName,
-    ReceiveMode, SequenceNumber, Timestamp,
+    BrokerError, CommandKind, CommandOutcome, Delivery, EntityBinding, EntityIncarnationKind,
+    EntityPath, MessageStatus, NamespaceName, ReceiveMode, SequenceNumber, Timestamp,
 };
-use protocol_amqp::{AmqpListener, Attachment, Broker, BrokerRejection, EntityMetadata};
+use protocol_amqp::{
+    AmqpListener, Attachment, Broker, BrokerRejection, EntityAdmission, EntityMetadata,
+};
 use tokio::{
     net::TcpListener,
     sync::{mpsc, oneshot},
@@ -34,6 +36,47 @@ struct BrokerState {
 }
 
 impl Broker for ControlledBroker {
+    async fn bind(
+        &self,
+        namespace: NamespaceName,
+        target: Attachment,
+    ) -> Result<Option<EntityAdmission>, BrokerRejection> {
+        let entity = target.canonical_entity().expect("fixture target");
+        Ok(self
+            .entity_metadata(namespace.clone(), target)
+            .await?
+            .map(|metadata| EntityAdmission {
+                metadata,
+                binding: EntityBinding::new(
+                    namespace,
+                    entity.clone(),
+                    entity,
+                    EntityIncarnationKind::Queue,
+                    1,
+                )
+                .expect("fixture binding"),
+            }))
+    }
+
+    async fn submit_fenced(
+        &self,
+        binding: EntityBinding,
+        entity: EntityPath,
+        kind: CommandKind,
+    ) -> Decision {
+        self.submit(binding.namespace().clone(), entity, kind).await
+    }
+
+    async fn rules_fenced(
+        &self,
+        binding: EntityBinding,
+        topic: EntityPath,
+        subscription: domain::SubscriptionName,
+    ) -> Result<Vec<domain::RuleDefinition>, BrokerRejection> {
+        self.rules(binding.namespace().clone(), topic, subscription)
+            .await
+    }
+
     async fn rules(
         &self,
         _namespace: NamespaceName,

@@ -8,11 +8,14 @@
 use std::future::Future;
 
 use domain::{
-    BrokerError, CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueConfig,
-    RuleDefinition, SubscriptionConfig, SubscriptionName, TopicConfig,
+    BrokerError, CommandKind, CommandOutcome, EntityBinding, EntityPath, NamespaceName,
+    QueueConfig, RuleDefinition, SubscriptionConfig, SubscriptionName, TopicConfig,
 };
 
 use crate::Attachment;
+
+mod bound;
+pub(crate) use bound::BoundBroker;
 
 /// Committed metadata for a validated link target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,6 +24,13 @@ pub enum EntityMetadata {
     Topic(TopicConfig),
     Subscription(SubscriptionConfig),
     DeadLetter(QueueConfig),
+}
+
+/// Metadata and its identity captured in one serialized owner read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EntityAdmission {
+    pub metadata: EntityMetadata,
+    pub binding: EntityBinding,
 }
 
 /// Why a command did not produce an outcome.
@@ -60,6 +70,26 @@ impl BrokerRejection {
 }
 
 pub trait Broker: Clone + Send + Sync + 'static {
+    fn bind(
+        &self,
+        namespace: NamespaceName,
+        target: Attachment,
+    ) -> impl Future<Output = Result<Option<EntityAdmission>, BrokerRejection>> + Send;
+
+    fn submit_fenced(
+        &self,
+        binding: EntityBinding,
+        entity: EntityPath,
+        kind: CommandKind,
+    ) -> impl Future<Output = Result<CommandOutcome, BrokerRejection>> + Send;
+
+    fn rules_fenced(
+        &self,
+        binding: EntityBinding,
+        topic: EntityPath,
+        subscription: SubscriptionName,
+    ) -> impl Future<Output = Result<Vec<RuleDefinition>, BrokerRejection>> + Send;
+
     /// Reads a subscription's complete bounded rule set without stamping a command.
     fn rules(
         &self,
@@ -98,6 +128,82 @@ pub trait Broker: Clone + Send + Sync + 'static {
         entity: &EntityPath,
     ) -> impl Future<Output = ()> + Send;
 }
+
+#[cfg(test)]
+pub(crate) fn test_admission(
+    namespace: NamespaceName,
+    target: Attachment,
+    metadata: EntityMetadata,
+) -> EntityAdmission {
+    use domain::EntityIncarnationKind;
+
+    let entity = target.canonical_entity().expect("test entity");
+    let (owner, kind) = match target {
+        Attachment::Queue(owner) => (
+            owner,
+            match metadata {
+                EntityMetadata::Topic(_) => EntityIncarnationKind::Topic,
+                _ => EntityIncarnationKind::Queue,
+            },
+        ),
+        Attachment::DeadLetter(owner) => (owner, EntityIncarnationKind::Queue),
+        Attachment::Subscription {
+            topic,
+            subscription,
+        }
+        | Attachment::SubscriptionDeadLetter {
+            topic,
+            subscription,
+        } => (
+            topic
+                .subscription(&subscription)
+                .expect("test subscription"),
+            EntityIncarnationKind::Subscription,
+        ),
+    };
+    EntityAdmission {
+        metadata,
+        binding: EntityBinding::new(namespace, entity, owner, kind, 1).expect("test binding"),
+    }
+}
+
+#[cfg(test)]
+macro_rules! fixture_binding_methods {
+    () => {
+        async fn bind(
+            &self,
+            namespace: domain::NamespaceName,
+            target: crate::Attachment,
+        ) -> Result<Option<crate::EntityAdmission>, crate::BrokerRejection> {
+            let metadata = self
+                .entity_metadata(namespace.clone(), target.clone())
+                .await?;
+            Ok(metadata.map(|metadata| crate::broker::test_admission(namespace, target, metadata)))
+        }
+
+        async fn submit_fenced(
+            &self,
+            binding: domain::EntityBinding,
+            entity: domain::EntityPath,
+            kind: domain::CommandKind,
+        ) -> Result<domain::CommandOutcome, crate::BrokerRejection> {
+            self.submit(binding.namespace().clone(), entity, kind).await
+        }
+
+        async fn rules_fenced(
+            &self,
+            binding: domain::EntityBinding,
+            topic: domain::EntityPath,
+            subscription: domain::SubscriptionName,
+        ) -> Result<Vec<domain::RuleDefinition>, crate::BrokerRejection> {
+            self.rules(binding.namespace().clone(), topic, subscription)
+                .await
+        }
+    };
+}
+
+#[cfg(test)]
+pub(crate) use fixture_binding_methods;
 
 #[cfg(test)]
 mod tests {

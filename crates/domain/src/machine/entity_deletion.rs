@@ -128,6 +128,12 @@ impl<S: StateStore> StateMachine<S> {
             _ => {
                 self.reject_unowned_topology(command, &command.entity, &mut plan)?;
                 self.require_no_runtime(command, &command.entity, &mut plan)?;
+                if self
+                    .entity_incarnation(&command.namespace, &command.entity)?
+                    .is_some_and(|record| !record.is_retired())
+                {
+                    return Err(BrokerError::DanglingEntityMetadata);
+                }
                 if let Ok(shadow) = command.entity.dead_letter_queue() {
                     if self
                         .store
@@ -150,6 +156,34 @@ impl<S: StateStore> StateMachine<S> {
                 });
             }
         };
+        let mut owners = Vec::new();
+        match outcome {
+            CommandOutcome::QueueDeleted => {
+                owners.push((&command.entity, crate::EntityIncarnationKind::Queue));
+            }
+            CommandOutcome::TopicDeleted => {
+                owners.push((&command.entity, crate::EntityIncarnationKind::Topic));
+                owners.extend(
+                    removed
+                        .iter()
+                        .skip(1)
+                        .filter(|entity| !entity.is_dead_letter_queue())
+                        .map(|entity| (entity, crate::EntityIncarnationKind::Subscription)),
+                );
+            }
+            CommandOutcome::SubscriptionDeleted => {
+                let owner = removed.first().ok_or(BrokerError::DanglingEntityMetadata)?;
+                owners.push((owner, crate::EntityIncarnationKind::Subscription));
+            }
+            _ => return Err(BrokerError::DanglingEntityMetadata),
+        }
+        for (owner, kind) in owners {
+            let record = self.require_live_incarnation(&command.namespace, owner, kind)?;
+            batch.push_put(
+                keys::entity_incarnation(&command.namespace, owner),
+                codec::encode(&record.retire())?,
+            );
+        }
         removed.sort();
         removed.dedup();
         for key in plan.keys {
@@ -197,9 +231,20 @@ impl<S: StateStore> StateMachine<S> {
             self.reject_unowned_topology(command, &shadow, plan)?;
             self.require_no_runtime(command, &entity, plan)?;
             self.require_no_runtime(command, &shadow, plan)?;
+            if self
+                .entity_incarnation(&command.namespace, &entity)?
+                .is_some_and(|record| !record.is_retired())
+            {
+                return Err(BrokerError::DanglingEntityMetadata);
+            }
             return Err(
                 if self
-                    .topic_config(&command.namespace, &command.entity)?
+                    .bind_entity(
+                        &command.namespace,
+                        &command.entity,
+                        &command.entity,
+                        crate::EntityIncarnationKind::Topic,
+                    )?
                     .is_some()
                 {
                     BrokerError::SubscriptionNotFound
@@ -208,6 +253,13 @@ impl<S: StateStore> StateMachine<S> {
                 },
             );
         };
+        self.bind_entity(
+            &command.namespace,
+            &command.entity,
+            &command.entity,
+            crate::EntityIncarnationKind::Topic,
+        )?
+        .ok_or(BrokerError::DanglingEntityMetadata)?;
         self.reject_unowned_topology(command, &entity, plan)?;
         self.reject_unowned_topology(command, &shadow, plan)?;
         let source = self.delete_counters(command, &command.entity)?;

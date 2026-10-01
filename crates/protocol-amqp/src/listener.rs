@@ -29,6 +29,7 @@ use crate::{
     Attachment, Broker, BrokerRejection, ProtocolError, SessionRequest, SharedAccessAuthentication,
     authorization::{ConnectionAuthorization, SharedAccessSaslAcceptor},
     batch::read_ingress,
+    broker::BoundBroker,
     cbs::{serve_cbs_replies, serve_cbs_requests},
     management::{
         ConnectionManagement, ManagementAuthorization, serve_management_replies,
@@ -444,7 +445,7 @@ async fn serve_session<B: Broker>(
                 Err(EngineError::RemoteDetached) => continue,
                 Err(error) => return Err(error.into()),
             };
-            let (entity, link_authorization) = match plan {
+            let (entity, link_authorization, bound) = match plan {
                 Ok(plan) => plan,
                 Err(error) => {
                     detach_with(endpoint, error).await;
@@ -454,7 +455,7 @@ async fn serve_session<B: Broker>(
             match (target_address.as_str(), source_address.as_str(), endpoint) {
                 (target, _, LinkEndpoint::Receiver(receiver)) if target == address => {
                     let namespace = namespace.clone();
-                    let broker = broker.clone();
+                    let broker = bound;
                     let management = Arc::clone(&management);
                     tokio::spawn(async move {
                         if let Err(error) = serve_management_requests(
@@ -475,7 +476,11 @@ async fn serve_session<B: Broker>(
                     if source == address && !target_address.is_empty() =>
                 {
                     let (route, responses) = management
-                        .register_reply_route(target_address.clone(), sender.max_message_size())
+                        .register_reply_route(
+                            target_address.clone(),
+                            sender.max_message_size(),
+                            bound.binding().clone(),
+                        )
                         .await;
                     let management = Arc::clone(&management);
                     tokio::spawn(async move {
@@ -529,7 +534,7 @@ async fn serve_session<B: Broker>(
             authorization.as_ref(),
         )
         .await;
-        if let Ok((_, Some(accepted), _)) = &plan
+        if let Ok((_, Some(accepted), _, _)) = &plan
             && let Some(source) = attach.source.as_mut()
         {
             stamp_session_filter(source, &accepted.session_id);
@@ -538,7 +543,7 @@ async fn serve_session<B: Broker>(
         let response_properties = plan
             .as_ref()
             .ok()
-            .and_then(|(_, accepted, _)| accepted.as_ref())
+            .and_then(|(_, accepted, _, _)| accepted.as_ref())
             .map(session_attach_properties);
         let decoders = if attach.role == Role::Sender && plan.is_ok() {
             MessageFormatDecoders::default().with_decoder(
@@ -559,9 +564,9 @@ async fn serve_session<B: Broker>(
         {
             Ok(endpoint) => endpoint,
             Err(error) => {
-                if let Ok((entity, Some(accepted), _)) = &plan {
+                if let Ok((entity, Some(accepted), _, bound)) = &plan {
                     let hold = accepted.hold();
-                    release_session(&broker, &namespace, entity, Some(&hold)).await;
+                    release_session(bound, &namespace, entity, Some(&hold)).await;
                 }
                 if matches!(error, EngineError::RemoteDetached) {
                     continue;
@@ -569,7 +574,7 @@ async fn serve_session<B: Broker>(
                 return Err(error.into());
             }
         };
-        let (entity, accepted, link_authorization) = match plan {
+        let (entity, accepted, link_authorization, broker) = match plan {
             Ok(plan) => plan,
             Err(error) => {
                 // Refusing the link rather than the connection: another link on
@@ -581,7 +586,6 @@ async fn serve_session<B: Broker>(
         };
 
         info!(%address, entity = %entity, session = accepted.as_ref().map(|accepted| accepted.session_id.as_str()), "link attached");
-        let broker = broker.clone();
         let namespace = namespace.clone();
         match endpoint {
             // The client sends; this end receives.
@@ -606,11 +610,17 @@ async fn serve_session<B: Broker>(
                 let link_name = sender.name().to_owned();
                 if let Some(hold) = hold.as_ref() {
                     management
-                        .register_session(&link_name, entity.clone(), hold.clone())
+                        .register_session(
+                            &link_name,
+                            entity.clone(),
+                            hold.clone(),
+                            broker.binding().clone(),
+                        )
                         .await;
                 }
                 let connection_management = Arc::clone(&management);
                 tokio::spawn(async move {
+                    let binding = broker.binding().clone();
                     let result = serve_receiving_client(
                         sender,
                         namespace,
@@ -626,7 +636,7 @@ async fn serve_session<B: Broker>(
                     .await;
                     if let Some(hold) = hold.as_ref() {
                         connection_management
-                            .unregister_session(&link_name, hold)
+                            .unregister_session(&link_name, hold, &binding)
                             .await;
                     }
                     if let Err(error) = result {
@@ -690,7 +700,7 @@ async fn serve_sending_client<B: Broker>(
     mut receiver: Receiver,
     namespace: NamespaceName,
     entity: EntityPath,
-    broker: B,
+    broker: BoundBroker<B>,
     authorization: Option<LinkAuthorization>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
@@ -768,7 +778,7 @@ async fn serve_receiving_client<B: Broker>(
     mut sender: Sender,
     namespace: NamespaceName,
     entity: EntityPath,
-    broker: B,
+    broker: BoundBroker<B>,
     mode: ReceiveMode,
     session: Option<SessionHold>,
     protocol: ReceivingLinkProtocol,
@@ -861,7 +871,7 @@ async fn wait_until_link_unauthorized(authorization: Option<&LinkAuthorization>)
 /// Frees the session a link held, so the next receiver need not wait out the
 /// lock. Failure is survivable: expiry frees it anyway.
 async fn release_session<B: Broker>(
-    broker: &B,
+    broker: &BoundBroker<B>,
     namespace: &NamespaceName,
     entity: &EntityPath,
     session: Option<&SessionHold>,
@@ -883,7 +893,7 @@ async fn release_session<B: Broker>(
 
 /// The next message the queue will part with, however long that takes.
 async fn next_delivery<B: Broker>(
-    broker: &B,
+    broker: &BoundBroker<B>,
     namespace: &NamespaceName,
     entity: &EntityPath,
     mode: ReceiveMode,
@@ -945,7 +955,7 @@ async fn settle<B: Broker>(
     sender: &mut Sender,
     namespace: &NamespaceName,
     entity: &EntityPath,
-    broker: &B,
+    broker: &BoundBroker<B>,
     delivery: Delivery,
     authorization: Option<&LinkAuthorization>,
     management: &ConnectionManagement,
@@ -977,7 +987,13 @@ async fn settle<B: Broker>(
     let delivery_tag = lock_delivery_tag(lock.token);
     let link_name = sender.name().to_owned();
     management
-        .register_delivery(&link_name, entity.clone(), sequence, lock.token)
+        .register_delivery(
+            &link_name,
+            entity.clone(),
+            sequence,
+            lock.token,
+            broker.binding().clone(),
+        )
         .await;
     let outcome = match authorization {
         Some(authorization) => {
@@ -992,7 +1008,9 @@ async fn settle<B: Broker>(
                 .await,
         ),
     };
-    management.unregister_delivery(&link_name, lock.token).await;
+    management
+        .unregister_delivery(&link_name, lock.token, broker.binding())
+        .await;
     let Some(outcome) = outcome else {
         return Ok(false);
     };
@@ -1067,6 +1085,9 @@ mod session_startup_tests;
 
 #[cfg(test)]
 mod session_provenance_tests;
+
+#[cfg(test)]
+mod binding_tests;
 
 #[cfg(test)]
 mod tests {

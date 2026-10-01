@@ -16,6 +16,7 @@ impl BrokerHandle {
                 namespace,
                 topic,
                 subscription,
+                binding: None,
                 reply,
             })
             .map_err(|_| SubmitError::BrokerStopped)?;
@@ -38,6 +39,7 @@ impl BrokerHandle {
                 namespace,
                 topic,
                 subscription,
+                binding: None,
                 reply,
             })
             .await

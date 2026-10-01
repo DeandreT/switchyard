@@ -126,6 +126,12 @@ impl<S: StateStore> StateMachine<S> {
             return Err(BrokerError::EntityPathAlreadyExists);
         }
         let config = config.validate().map_err(BrokerError::TopicConfig)?;
+        self.stage_create_incarnation(
+            &command.namespace,
+            &command.entity,
+            crate::EntityIncarnationKind::Topic,
+            batch,
+        )?;
         batch.push_put(key, codec::encode(&config)?);
         Ok(CommandOutcome::TopicCreated)
     }
@@ -140,6 +146,13 @@ impl<S: StateStore> StateMachine<S> {
         Self::require_primary_entity_path(&command.entity)?;
         self.topic_config(&command.namespace, &command.entity)?
             .ok_or(BrokerError::TopicNotFound)?;
+        self.bind_entity(
+            &command.namespace,
+            &command.entity,
+            &command.entity,
+            crate::EntityIncarnationKind::Topic,
+        )?
+        .ok_or(BrokerError::DanglingEntityMetadata)?;
         let config = config.validate().map_err(BrokerError::SubscriptionConfig)?;
         let entity = command.entity.subscription(name)?;
         let shadow = entity.dead_letter_queue()?;
@@ -180,6 +193,12 @@ impl<S: StateStore> StateMachine<S> {
             });
         }
         let backing = config.to_queue_config();
+        self.stage_create_incarnation(
+            &command.namespace,
+            &entity,
+            crate::EntityIncarnationKind::Subscription,
+            batch,
+        )?;
         batch.push_put(key, codec::encode(&config)?);
         batch.push_put(
             keys::queue_config(&command.namespace, &entity),

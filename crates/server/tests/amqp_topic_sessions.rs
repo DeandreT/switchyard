@@ -570,3 +570,6 @@ mod close_cleanup;
 
 #[path = "amqp_topic_sessions/deletion.rs"]
 mod deletion;
+
+#[path = "amqp_topic_sessions/incarnations.rs"]
+mod incarnations;

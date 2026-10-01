@@ -36,6 +36,34 @@ impl Drop for PendingWait {
 }
 
 impl protocol_amqp::Broker for CountedBroker {
+    fn bind(
+        &self,
+        namespace: NamespaceName,
+        target: Attachment,
+    ) -> impl Future<Output = Result<Option<protocol_amqp::EntityAdmission>, BrokerRejection>> + Send
+    {
+        protocol_amqp::Broker::bind(&self.inner, namespace, target)
+    }
+
+    async fn submit_fenced(
+        &self,
+        binding: domain::EntityBinding,
+        entity: EntityPath,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, BrokerRejection> {
+        self.submits.fetch_add(1, Ordering::SeqCst);
+        protocol_amqp::Broker::submit_fenced(&self.inner, binding, entity, kind).await
+    }
+
+    fn rules_fenced(
+        &self,
+        binding: domain::EntityBinding,
+        topic: EntityPath,
+        subscription: domain::SubscriptionName,
+    ) -> impl Future<Output = Result<Vec<domain::RuleDefinition>, BrokerRejection>> + Send {
+        protocol_amqp::Broker::rules_fenced(&self.inner, binding, topic, subscription)
+    }
+
     fn rules(
         &self,
         namespace: NamespaceName,
@@ -204,6 +232,20 @@ impl<P: StoreProvider> Node<P> {
 
     pub(super) fn submissions(&self) -> usize {
         self.submits.load(Ordering::SeqCst)
+    }
+
+    pub(super) async fn submit_entity(
+        &self,
+        entity: &EntityPath,
+        kind: CommandKind,
+    ) -> TestResult<CommandOutcome> {
+        Ok(timeout(
+            DEADLINE,
+            self._broker
+                .handle()
+                .submit(self.namespace.clone(), entity.clone(), kind),
+        )
+        .await??)
     }
 
     pub(super) async fn delete_entity(

@@ -13,6 +13,12 @@ use crate::{
 /// command rejects it exactly where the leader did.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum BrokerError {
+    #[error("the entity binding has been deleted or replaced")]
+    EntityBindingStale,
+    #[error("the entity binding does not match the requested operation")]
+    InvalidEntityBinding,
+    #[error("the entity incarnation counter is exhausted")]
+    EntityIncarnationExhausted,
     #[error("queue does not exist")]
     QueueNotFound,
     #[error("queue already exists")]

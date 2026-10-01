@@ -32,6 +32,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         BrokerError::QueueNotFound
         | BrokerError::TopicNotFound
         | BrokerError::SubscriptionNotFound
+        | BrokerError::EntityBindingStale
         | BrokerError::RuleNotFound
         | BrokerError::MessageNotScheduled { .. } => NOT_FOUND,
         BrokerError::MessageNotFound { .. } | BrokerError::MessageNotDeferred { .. } => {
@@ -46,6 +47,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::SubscriptionLimitExceeded { .. }
         | BrokerError::RuleLimitExceeded { .. }
         | BrokerError::EntityDeleteTooLarge { .. }
+        | BrokerError::EntityIncarnationExhausted
         | BrokerError::TopicRuleMatchTooLarge { .. } => RESOURCE_LIMIT_EXCEEDED,
         BrokerError::TopicDataPlaneNotImplemented => NOT_IMPLEMENTED,
         BrokerError::SqlRuleCompilation(error) => match error {
@@ -90,6 +92,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::InvalidMessageContent { .. }
         | BrokerError::InvalidRule { .. }
         | BrokerError::EntityKindMismatch
+        | BrokerError::InvalidEntityBinding
         | BrokerError::QueuePageLimitExceeded { .. }
         | BrokerError::QueueCursorNamespaceMismatch { .. }
         | BrokerError::TopicPageLimitExceeded { .. }
@@ -371,5 +374,20 @@ mod tests {
         assert!(is_retryable(&BrokerError::SessionAlreadyLocked {
             session_id: session()
         }));
+    }
+
+    #[test]
+    fn endpoint_identity_errors_have_distinct_non_retryable_wire_conditions() {
+        for (error, condition) in [
+            (BrokerError::EntityBindingStale, NOT_FOUND),
+            (BrokerError::InvalidEntityBinding, INVALID_FIELD),
+            (
+                BrokerError::EntityIncarnationExhausted,
+                RESOURCE_LIMIT_EXCEEDED,
+            ),
+        ] {
+            assert_eq!(condition_for(&error), condition);
+            assert!(!is_retryable(&error));
+        }
     }
 }

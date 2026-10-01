@@ -66,13 +66,17 @@ pub const STORE_FORMAT_V11: u32 = 11;
 /// Earlier builds cannot interpret those filters or their failure destinations.
 pub const STORE_FORMAT_V12: u32 = 12;
 
+/// Version 13: retained entity incarnations fence admitted live endpoints.
+/// Earlier builds ignore these records and can address a replacement by name.
+pub const STORE_FORMAT_V13: u32 = 13;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V12;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V13;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
@@ -212,6 +216,10 @@ impl StateStore for FjallStore {
 
 /// Rejects a store this build cannot read, rather than misreading it.
 fn require_readable_format(recorded: &[u8]) -> Result<(), StorageError> {
+    require_format_version(recorded, ACTIVE_STORE_FORMAT)
+}
+
+fn require_format_version(recorded: &[u8], expected: u32) -> Result<(), StorageError> {
     let bytes = <[u8; 4]>::try_from(recorded).map_err(|_| StorageError::CorruptMetadata {
         detail: format!(
             "format version record is {} bytes, expected 4",
@@ -219,11 +227,8 @@ fn require_readable_format(recorded: &[u8]) -> Result<(), StorageError> {
         ),
     })?;
     let found = u32::from_be_bytes(bytes);
-    if found != ACTIVE_STORE_FORMAT {
-        return Err(StorageError::UnsupportedStoreFormat {
-            found,
-            expected: ACTIVE_STORE_FORMAT,
-        });
+    if found != expected {
+        return Err(StorageError::UnsupportedStoreFormat { found, expected });
     }
     Ok(())
 }
@@ -438,6 +443,34 @@ mod tests {
             })
         );
         Ok(())
+    }
+
+    #[test]
+    fn refuses_a_store_from_before_entity_incarnations() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        stamp_format(directory.path(), &STORE_FORMAT_V12.to_be_bytes())?;
+        assert_eq!(
+            FjallStore::open(directory.path()).err(),
+            Some(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V12,
+                expected: STORE_FORMAT_V13,
+            })
+        );
+        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V13);
+        Ok(())
+    }
+
+    #[test]
+    fn incarnation_layout_is_not_readable_as_the_previous_layout() {
+        let recorded = STORE_FORMAT_V13.to_be_bytes();
+        assert_eq!(require_readable_format(&recorded), Ok(()));
+        assert_eq!(
+            require_format_version(&recorded, STORE_FORMAT_V12),
+            Err(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V13,
+                expected: STORE_FORMAT_V12,
+            })
+        );
     }
 
     #[test]

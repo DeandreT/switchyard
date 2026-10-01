@@ -544,6 +544,7 @@ fn submit_status(error: SubmitError) -> Status {
         SubmitError::Propose(ProposeError::Broker(error)) => match error {
             BrokerError::QueueNotFound
             | BrokerError::TopicNotFound
+            | BrokerError::EntityBindingStale
             | BrokerError::SubscriptionNotFound => Status::not_found(error.to_string()),
             BrokerError::QueueAlreadyExists
             | BrokerError::TopicAlreadyExists
@@ -558,6 +559,7 @@ fn submit_status(error: SubmitError) -> Status {
             | BrokerError::TopicConfig(_)
             | BrokerError::SubscriptionConfig(_)
             | BrokerError::EntityKindMismatch
+            | BrokerError::InvalidEntityBinding
             | BrokerError::Identifier(_)
             | BrokerError::DeadLetterQueueIsReserved
             | BrokerError::SubscriptionPathIsReserved
@@ -569,6 +571,7 @@ fn submit_status(error: SubmitError) -> Status {
             }
             BrokerError::TopicDataPlaneNotImplemented => Status::unimplemented(error.to_string()),
             BrokerError::SubscriptionLimitExceeded { .. }
+            | BrokerError::EntityIncarnationExhausted
             | BrokerError::EntityDeleteTooLarge { .. }
             | BrokerError::TopicFanoutTooLarge { .. } => {
                 Status::resource_exhausted(error.to_string())

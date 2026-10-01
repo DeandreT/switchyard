@@ -46,6 +46,48 @@ struct ControlledBroker {
 }
 
 impl protocol_amqp::Broker for ControlledBroker {
+    fn bind(
+        &self,
+        namespace: NamespaceName,
+        target: protocol_amqp::Attachment,
+    ) -> impl Future<Output = Result<Option<protocol_amqp::EntityAdmission>, BrokerRejection>> + Send
+    {
+        protocol_amqp::Broker::bind(&self.inner, namespace, target)
+    }
+
+    fn rules_fenced(
+        &self,
+        binding: domain::EntityBinding,
+        topic: EntityPath,
+        subscription: domain::SubscriptionName,
+    ) -> impl Future<Output = Result<Vec<domain::RuleDefinition>, BrokerRejection>> + Send {
+        protocol_amqp::Broker::rules_fenced(&self.inner, binding, topic, subscription)
+    }
+
+    async fn submit_fenced(
+        &self,
+        binding: domain::EntityBinding,
+        entity: EntityPath,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, BrokerRejection> {
+        let accepting = matches!(&kind, CommandKind::AcceptSession { .. });
+        let releasing = matches!(&kind, CommandKind::ReleaseSession { .. });
+        let outcome =
+            protocol_amqp::Broker::submit_fenced(&self.inner, binding, entity, kind).await;
+        if accepting && !self.gate.blocked.swap(true, Ordering::SeqCst) {
+            assert!(matches!(
+                &outcome,
+                Ok(CommandOutcome::SessionAccepted(Some(_)))
+            ));
+            self.gate.accepted.notify_one();
+            self.gate.return_outcome.notified().await;
+        }
+        if releasing && matches!(&outcome, Ok(CommandOutcome::SessionReleased)) {
+            self.gate.released.notify_one();
+        }
+        outcome
+    }
+
     fn rules(
         &self,
         namespace: NamespaceName,
