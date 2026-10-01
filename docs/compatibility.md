@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Queue and topic send, both batch-send APIs, subscription receive/peek/renew/defer/complete/dead-letter, queue scheduling/cancellation, duplicate detection and message properties; queue session renew/state/scheduling | Planned | Experimental gate on 7.21.0 |
+| Official .NET SDK, current stable | Queue and topic send, both batch-send APIs, ordinary/session subscription workflows, queue scheduling/cancellation, duplicate detection and message properties; queue session renew/state/scheduling | Planned | Experimental gate on 7.21.0 |
 | Official .NET SDK, previous stable | Same gated workflows as current | Planned | Experimental gate on 7.20.2 |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -31,7 +31,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | Atomic immediate default-true fanout, AMQP subscription and dead-letter routing, native create/get/list, Rust clients on both backends and both pinned .NET clients; topic sessions, scheduling, rules and Azure administration not implemented |
+| Topics and subscriptions | Pre-1.0 | Atomic immediate default-true fanout, ordinary/session subscription and dead-letter routing, native create/get/list, Rust clients on both backends and both pinned .NET clients; topic scheduling, rules and Azure administration not implemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -132,8 +132,8 @@ behavior it currently enforces:
   receiver that set it. A receiver holding the session can renew that lock and
   read, replace, or clear the opaque state through the management node.
 
-Three session behaviors deliberately differ from Azure Service Bus, and each is
-a rejection or a bound rather than a silent difference:
+Four session behaviors differ from Azure Service Bus under the current local
+policies:
 
 - A session identifier on a queue that does not require sessions is refused
   rather than carried, because it would promise an ordering that queue cannot
@@ -145,6 +145,15 @@ a rejection or a bound rather than a silent difference:
 - Accepting the next available session examines a bounded number of sessions and
   reports none available if they are all held, rather than walking the entity.
   The receiver retries.
+- Expiration is applied to individual messages, not to every message in a session
+  when one expires. Azure documents
+  [session-wide TTL expiry](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sessions#message-expiration);
+  this increment does not add that policy.
+
+Peeking a session-required queue or subscription currently requires a session
+identifier and filters to that session. Browsing all sessions through an ordinary
+receiver's management link remains unimplemented; Azure supports
+[that read-only browse](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-troubleshooting-guide#how-to-browse-session-messages-across-all-sessions).
 
 Queue settings can be patched atomically with the parent and its dead-letter
 shadow in the same batch. An omitted setting is unchanged; an explicit unlimited
@@ -198,10 +207,31 @@ aggregate retained typed content, compatibility bodies and normalized IDs, and
 65,536 typed value items. These are local resource policies, not Azure quotas.
 Only committed destinations are notified, without a post-commit topology read.
 
-Topic scheduling and all session-bearing publications are explicitly
-unimplemented. A topic with any session-enabled subscription refuses the whole
-publication, including a duplicate-only or empty batch. Batch publications with
-any scheduled timestamp are refused, even when that timestamp is already due.
+Topic publications may carry session identifiers, including mixed-session
+batches. Session-required subscriptions use session-affine ready indexes and
+the existing exclusive ownership, FIFO, state, renewal, release, and deferred
+receive machinery. Each subscription owns its sessions independently, even when
+sibling subscriptions receive the same identifier. Ordinary subscription copies
+preserve that identifier but use their global ready index and ordinary receive,
+settlement, and expiry rules; this does not relax ordinary queue ingress.
+Duplicate detection remains topic-local and based on message ID, independent of
+session ID, consistent with Microsoft's
+[nonpartitioned duplicate-detection description](https://learn.microsoft.com/en-us/azure/service-bus-messaging/duplicate-detection).
+
+A publication without a session identifier reaches ordinary subscriptions
+normally, while each session-required subscription receives its copy directly
+in its dead-letter shadow with reason `Session ID is null`. Those copies keep the
+topic sequence but have no lifetime or session identifier. This per-copy routing
+is a local policy inferred from the documented
+[missing-session dead-letter reason](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-dead-letter-queues),
+not a cloud-verified atomic fanout guarantee. Session identifiers and retained
+dead-letter reason/description bytes count toward the fanout content budget;
+the two projected dead-letter values count toward its value-item budget. All
+admission checks precede retained payload clones, including these additions.
+Only actual backing or shadow destinations receive committed notifications.
+
+Topic scheduling remains explicitly unimplemented. Batch publications with any
+scheduled timestamp are refused, even when that timestamp is already due.
 Plain producer addresses resolve committed metadata and permit queue or topic
 send. Ordinary topic receivers and senders to subscriptions or dead-letter
 queues are refused. Subscription receivers use
@@ -213,14 +243,16 @@ A literal topic path ending in `Subscriptions` and a member named
 `Subscriptions` remain valid. Malformed or nested subscription paths are
 refused rather than routed as ordinary queues.
 
-Link planning reads typed metadata through the serialized owner without
+Link planning first reads typed metadata through the serialized owner without
 consulting the clock, writing storage, or acquiring a message or session lock.
 Missing targets are refused before transfers. Malformed values, dangling
 membership or dead-letter projections, and conflicting entity kinds retain
 their errors instead of becoming absent targets. Authentication precedes this
 read, so an unauthorized connection cannot probe entity existence through the
-metadata lookup. Session-enabled subscription data receivers are explicitly
-refused before acquiring a session hold; their session-free dead-letter queues
+metadata lookup. A session-required subscription receiver without a session
+filter is refused before any command or session hold. Named and next-available
+filters then acquire a hold through the existing session command and echo the
+granted identifier; their session-free dead-letter queues
 remain receivable. Topic management links can attach, but topic peek currently
 returns the existing queue-not-found refusal and topic scheduling returns
 `amqp:not-implemented`; neither claims a topic workflow.
@@ -894,9 +926,13 @@ token. Command-line settings preserve omitted, false, zero, and unlimited TTL.
 
 ## Durable Format
 
-The current value format is version 8 and durable store layout is version 8.
-The layout reserves distinct topic metadata and subscription membership keys;
-existing queue and message value shapes are unchanged.
+The current value format is version 9 and durable store layout is version 9.
+The value format appends the missing-session dead-letter reason without changing
+existing reason tags or message fields. Version 8 messages with earlier reasons
+and version 8 queue configurations remain decodable. A missing-session reason
+cannot be relabeled as an earlier message version. The layout protects the new
+policy-dependent ready indexes for session-bearing ordinary subscription copies;
+an older build would choose the wrong index when releasing those copies.
 Earlier message and queue-configuration shapes have tested decoders, but an
 earlier store directory is refused at open because its broker contract differs.
 There is no directory migration tooling yet; development directories
