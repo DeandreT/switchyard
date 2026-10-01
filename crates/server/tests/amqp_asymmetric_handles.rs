@@ -14,6 +14,12 @@ mod error_closing_cases;
 #[path = "support/error_delivery_cases.rs"]
 mod error_delivery_cases;
 
+#[path = "support/error_name_cases.rs"]
+mod error_name_cases;
+
+#[path = "support/error_handle_cases.rs"]
+mod error_handle_cases;
+
 use fixture::{
     CASE_TIMEOUT, Connection, IO_TIMEOUT, Link, Node, Session, TestResult, attach, channels,
     detach, transfer,

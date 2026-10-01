@@ -354,6 +354,7 @@ impl Sending {
 pub(super) struct Node {
     pub connection: Connection,
     pub peer: Peer,
+    next_link_name: u64,
 }
 
 impl Node {
@@ -431,7 +432,11 @@ impl Node {
             peer.send(0, Performative::Open(open), Vec::new()).await?;
             Connection::Client(timeout(IO_TIMEOUT, opening).await???)
         };
-        Ok(Self { connection, peer })
+        Ok(Self {
+            connection,
+            peer,
+            next_link_name: 0,
+        })
     }
 
     pub async fn session(&mut self, channels: Channels, handle_max: u32) -> TestResult<Session> {
@@ -492,13 +497,26 @@ impl Node {
         link: Link,
         role: Role,
     ) -> TestResult<IncomingAttach> {
+        let name = format!("peer-{}-{}", link.channels.incoming, link.peer);
+        self.pending_named(session, link, role, name).await
+    }
+
+    async fn pending_named(
+        &mut self,
+        session: &mut Session,
+        link: Link,
+        role: Role,
+        name: String,
+    ) -> TestResult<IncomingAttach> {
         let Session::Server(session) = session else {
             panic!("server approval")
         };
+        let mut request = attach(link, role);
+        request.name = name;
         self.peer
             .send(
                 link.channels.incoming,
-                Performative::Attach(Box::new(attach(link, role))),
+                Performative::Attach(Box::new(request)),
                 Vec::new(),
             )
             .await?;
@@ -522,19 +540,33 @@ impl Node {
         let Session::Server(session) = session else {
             panic!("server approval")
         };
+        let name = incoming.attach().name.clone();
         let LinkEndpoint::Receiver(receiver) =
             timeout(IO_TIMEOUT, session.accept_attach(incoming, 4 * 1024 * 1024)).await??
         else {
             panic!("receiving endpoint")
         };
-        self.peer.own_attach(link, Role::Receiver).await?;
+        assert_eq!(self.peer.own_attach(link, Role::Receiver).await?.name, name);
         self.peer.receiving_flow(link).await?;
         Ok(Receiving::Server(receiver))
     }
 
     pub async fn receiver(&mut self, session: &mut Session, link: Link) -> TestResult<Receiving> {
+        let name = self.fresh_name("receiver", link);
+        self.receiver_named(session, link, name).await
+    }
+
+    pub async fn receiver_named(
+        &mut self,
+        session: &mut Session,
+        link: Link,
+        name: impl Into<String>,
+    ) -> TestResult<Receiving> {
+        let name = name.into();
         if matches!(session, Session::Server(_)) {
-            let incoming = self.pending(session, link, Role::Sender).await?;
+            let incoming = self
+                .pending_named(session, link, Role::Sender, name)
+                .await?;
             return self.approve_receiver(session, incoming, link).await;
         }
         let Session::Client(session) = session else {
@@ -542,17 +574,11 @@ impl Node {
         };
         let (receiver, ()) = tokio::try_join!(
             async {
-                Ok::<_, Box<dyn Error>>(
-                    session
-                        .attach_receiver(
-                            format!("receiver-{}-{}", link.channels.outgoing, link.local),
-                            "queue",
-                        )
-                        .await?,
-                )
+                Ok::<_, Box<dyn Error>>(session.attach_receiver(name.clone(), "queue").await?)
             },
             async {
                 let mut response = self.peer.own_attach(link, Role::Receiver).await?;
+                assert_eq!(response.name, name);
                 response = response.response(response.source.clone(), response.target.clone());
                 response.handle = link.peer;
                 self.peer
@@ -569,7 +595,19 @@ impl Node {
     }
 
     pub async fn sender(&mut self, session: &mut Session, link: Link) -> TestResult<Sending> {
-        let sender = self.sender_without_credit(session, link).await?;
+        let name = self.fresh_name("sender", link);
+        self.sender_named(session, link, name).await
+    }
+
+    pub async fn sender_named(
+        &mut self,
+        session: &mut Session,
+        link: Link,
+        name: impl Into<String>,
+    ) -> TestResult<Sending> {
+        let sender = self
+            .sender_without_credit_named(session, link, name.into())
+            .await?;
         let mut flow = self.peer.flow(link.channels);
         flow.handle = Some(link.peer);
         flow.delivery_count = Some(0);
@@ -585,8 +623,20 @@ impl Node {
         session: &mut Session,
         link: Link,
     ) -> TestResult<Sending> {
+        let name = self.fresh_name("sender", link);
+        self.sender_without_credit_named(session, link, name).await
+    }
+
+    async fn sender_without_credit_named(
+        &mut self,
+        session: &mut Session,
+        link: Link,
+        name: String,
+    ) -> TestResult<Sending> {
         let sender = if matches!(session, Session::Server(_)) {
-            let incoming = self.pending(session, link, Role::Receiver).await?;
+            let incoming = self
+                .pending_named(session, link, Role::Receiver, name.clone())
+                .await?;
             let Session::Server(session) = session else {
                 unreachable!()
             };
@@ -595,7 +645,7 @@ impl Node {
             else {
                 panic!("sending endpoint")
             };
-            self.peer.own_attach(link, Role::Sender).await?;
+            assert_eq!(self.peer.own_attach(link, Role::Sender).await?.name, name);
             Sending::Server(sender)
         } else {
             let Session::Client(session) = session else {
@@ -603,17 +653,11 @@ impl Node {
             };
             let (sender, ()) = tokio::try_join!(
                 async {
-                    Ok::<_, Box<dyn Error>>(
-                        session
-                            .attach_sender(
-                                format!("sender-{}-{}", link.channels.outgoing, link.local),
-                                "queue",
-                            )
-                            .await?,
-                    )
+                    Ok::<_, Box<dyn Error>>(session.attach_sender(name.clone(), "queue").await?)
                 },
                 async {
                     let request = self.peer.own_attach(link, Role::Sender).await?;
+                    assert_eq!(request.name, name);
                     let mut response =
                         request.response(request.source.clone(), request.target.clone());
                     response.handle = link.peer;
@@ -629,6 +673,12 @@ impl Node {
             Sending::Client(sender)
         };
         Ok(sender)
+    }
+
+    fn fresh_name(&mut self, kind: &str, link: Link) -> String {
+        let suffix = self.next_link_name;
+        self.next_link_name += 1;
+        format!("{kind}-{}-{}-{suffix}", link.channels.outgoing, link.local)
     }
 
     pub async fn incoming_message(
