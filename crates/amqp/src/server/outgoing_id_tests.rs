@@ -202,11 +202,17 @@ impl Fixture {
     ) -> oneshot::Receiver<Result<SendOutcome, EngineError>> {
         let (reply, result) = oneshot::channel();
         let tag = tag(handle, id);
+        let content_lease = self
+            .writer
+            .content_budget()
+            .try_reserve(1024)
+            .expect("active content");
         let link = self.link_mut(handle);
         assert!(link.outstanding_tags.insert(tag.clone()));
         assert!(link.active.is_none());
         link.active = Some(ActiveSend {
             payload: vec![1; 1024],
+            content_lease,
             offset: 1,
             first_frame_sent: true,
             delivery_id: id,
@@ -654,10 +660,17 @@ async fn defensive_overcapacity_scan_does_not_advance_or_overwrite_an_alias() {
     }
     // Seed the impossible overcapacity state directly to exercise the bounded fallback.
     let (reply, mut result) = oneshot::channel();
+    let payload = encode_message(&Message::data(vec![1])).expect("payload");
+    let content_lease = fixture
+        .writer
+        .content_budget()
+        .try_reserve(payload.len())
+        .expect("queued content");
     let link = fixture.link_mut(HANDLE);
     link.outstanding_tags.insert(b"queued".to_vec());
     link.queued.push_back(QueuedSend {
-        payload: encode_message(&Message::data(vec![1])).expect("payload"),
+        payload,
+        content_lease,
         delivery_tag: b"queued".to_vec().into(),
         message_format: 0,
         reply,

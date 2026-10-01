@@ -162,8 +162,14 @@ impl Fixture {
                 .is_none()
         );
         if active {
+            let content_lease = self
+                .writer
+                .content_budget()
+                .try_reserve(2)
+                .expect("active content");
             self.link_mut().active = Some(ActiveSend {
                 payload: vec![1, 2],
+                content_lease,
                 offset: 1,
                 first_frame_sent: true,
                 delivery_id: id,

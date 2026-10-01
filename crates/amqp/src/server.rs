@@ -22,6 +22,7 @@ use crate::{
 #[cfg(test)]
 use crate::{decode_message, read_frame};
 
+mod content_budget;
 mod flow_control;
 mod format_registry;
 mod frame_writer;
@@ -31,6 +32,7 @@ mod outgoing_identity;
 mod receive_credit;
 mod session_identity;
 
+use content_budget::ContentLease;
 use flow_control::{LinkCredit, LinkSnapshot, SessionWindow};
 pub use format_registry::MessageFormatDecoders;
 use frame_writer::FrameWriter;
@@ -439,6 +441,7 @@ pub struct Delivery {
     message_format: u32,
     message: Message,
     identity: DeliveryIdentity,
+    content_lease: Option<Arc<ContentLease>>,
 }
 
 impl Delivery {
@@ -831,13 +834,14 @@ impl Sender {
 
 impl Receiver {
     pub async fn recv(&mut self) -> Result<Delivery, EngineError> {
-        let delivery = self.deliveries.recv().await.ok_or_else(|| {
+        let mut delivery = self.deliveries.recv().await.ok_or_else(|| {
             if *self.detached.borrow() {
                 EngineError::RemoteDetached
             } else {
                 EngineError::Stopped
             }
         })?;
+        drop(delivery.content_lease.take());
         self.consumption.consumed();
         Ok(delivery)
     }
@@ -1172,6 +1176,7 @@ struct SendingLink {
 
 struct QueuedSend {
     payload: Vec<u8>,
+    content_lease: ContentLease,
     delivery_tag: DeliveryTag,
     message_format: u32,
     reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
@@ -1179,6 +1184,7 @@ struct QueuedSend {
 
 struct ActiveSend {
     payload: Vec<u8>,
+    content_lease: ContentLease,
     offset: usize,
     first_frame_sent: bool,
     delivery_id: u32,
@@ -1218,6 +1224,7 @@ struct PartialDelivery {
     message_format: u32,
     settled: bool,
     bytes: Vec<u8>,
+    content_lease: ContentLease,
     identity: DeliveryIdentity,
     forbidden_receiver_mode: bool,
     forbidden_sender_settled: bool,
@@ -2361,6 +2368,25 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         .await?;
         return refill_link(channel, transfer.handle, session, writer).await;
     }
+    let content_lease = match link.partial.as_mut() {
+        Some(partial) => partial.content_lease.try_grow(payload.len()).map(|()| None),
+        None => writer.content_budget().try_reserve(payload.len()).map(Some),
+    };
+    let content_lease = match content_lease {
+        Ok(lease) => lease,
+        Err(error) => {
+            detach_link_error(
+                channel,
+                transfer.handle,
+                session,
+                writer,
+                "amqp:resource-limit-exceeded",
+                error.to_string(),
+            )
+            .await?;
+            return refill_link(channel, transfer.handle, session, writer).await;
+        }
+    };
     let partial = match link.partial.take() {
         Some(mut partial) => {
             partial.bytes.extend_from_slice(&payload);
@@ -2385,6 +2411,7 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
                 .expect("first transfer format was validated"),
             settled: transfer.settled.unwrap_or(false),
             bytes: payload,
+            content_lease: content_lease.expect("a first transfer reserves its content"),
             identity,
             forbidden_receiver_mode: link.receiver_settle_mode == ReceiverSettleMode::First
                 && transfer.rcv_settle_mode == Some(ReceiverSettleMode::Second),
@@ -2469,6 +2496,7 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
             message_format: partial.message_format,
             message,
             identity: partial.identity,
+            content_lease: Some(Arc::new(partial.content_lease)),
         })
         .is_err()
     {
@@ -2982,9 +3010,17 @@ async fn queue_send<W: AsyncWrite + Unpin>(
         let _ = reply.send(Err(error.into()));
         return Ok(());
     }
+    let content_lease = match writer.content_budget().try_reserve(payload.len()) {
+        Ok(lease) => lease,
+        Err(error) => {
+            let _ = reply.send(Err(invalid_state(error.to_string())));
+            return Ok(());
+        }
+    };
     link.outstanding_tags.insert(delivery_tag.as_ref().to_vec());
     link.queued.push_back(QueuedSend {
         payload,
+        content_lease,
         delivery_tag,
         message_format,
         reply,
@@ -3300,6 +3336,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
         };
         link.active = Some(ActiveSend {
             payload: queued.payload,
+            content_lease: queued.content_lease,
             offset: 0,
             first_frame_sent: false,
             delivery_id: id,
@@ -3314,15 +3351,24 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
     active.offset = offset;
     active.first_frame_sent = true;
     if complete {
-        let active = link.active.take().expect("completed delivery exists");
-        if let Some(reply) = active.settled_reply {
-            link.outstanding_tags.remove(active.delivery_tag.as_ref());
+        let ActiveSend {
+            payload,
+            content_lease,
+            delivery_id,
+            delivery_tag,
+            settled_reply,
+            ..
+        } = link.active.take().expect("completed delivery exists");
+        drop(payload);
+        drop(content_lease);
+        if let Some(reply) = settled_reply {
+            link.outstanding_tags.remove(delivery_tag.as_ref());
             let _ = reply.send(Ok(SendOutcome {
                 outcome: Outcome::Accepted(Accepted),
                 acknowledgement: None,
             }));
         } else {
-            resolve_outgoing(channel, link, active.delivery_id, writer).await?;
+            resolve_outgoing(channel, link, delivery_id, writer).await?;
         }
     }
     Ok(())
@@ -3489,6 +3535,7 @@ fn stop_link(link: &mut LinkState) {
         }
         LinkState::Receiving(link) => {
             link.identity.retire();
+            link.partial = None;
             let _ = link.detached.send(true);
         }
     }
@@ -3724,3 +3771,6 @@ mod lifecycle_limit_tests;
 
 #[cfg(test)]
 mod receive_ceiling_tests;
+
+#[cfg(test)]
+mod content_budget_tests;

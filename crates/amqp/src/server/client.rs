@@ -546,13 +546,14 @@ impl ClientReceiver {
     }
 
     pub async fn recv(&mut self) -> Result<ClientDelivery, EngineError> {
-        let delivery = self.deliveries.recv().await.ok_or_else(|| {
+        let mut delivery = self.deliveries.recv().await.ok_or_else(|| {
             if *self.detached.borrow() {
                 EngineError::RemoteDetached
             } else {
                 EngineError::Stopped
             }
         })?;
+        drop(delivery.content_lease.take());
         self.consumption.consumed();
         Ok(delivery)
     }

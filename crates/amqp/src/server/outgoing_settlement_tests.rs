@@ -735,6 +735,11 @@ async fn automatic_acknowledgement_flush_failure_never_publishes_a_successful_se
 async fn early_outcome_is_latched_until_final_transfer_then_automatically_acknowledged() {
     let mut fixture = Fixture::new(true);
     let (reply, mut result) = oneshot::channel();
+    let content_lease = fixture
+        .writer
+        .content_budget()
+        .try_reserve(2)
+        .expect("active content");
     let link = fixture.sending_mut();
     link.outstanding_tags.insert(vec![ID as u8]);
     link.unsettled.insert(
@@ -748,6 +753,7 @@ async fn early_outcome_is_latched_until_final_transfer_then_automatically_acknow
     );
     link.active = Some(ActiveSend {
         payload: vec![1, 2],
+        content_lease,
         offset: 1,
         first_frame_sent: true,
         delivery_id: ID,
@@ -861,8 +867,14 @@ async fn automatic_policy_never_acknowledges_first_mode_or_already_settled_outco
 async fn presettled_active_send_reports_success_only_after_final_transfer_flush() {
     let mut fixture = Fixture::new(true);
     let (reply, mut result) = oneshot::channel();
+    let content_lease = fixture
+        .writer
+        .content_budget()
+        .try_reserve(2)
+        .expect("active content");
     fixture.sending_mut().active = Some(ActiveSend {
         payload: vec![1, 2],
+        content_lease,
         offset: 1,
         first_frame_sent: true,
         delivery_id: ID,
