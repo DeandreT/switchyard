@@ -297,8 +297,22 @@ closes with `amqp:not-implemented`.
 An ending session discards traffic until End on its mapped incoming channel;
 the binding and local reservation survive until that acknowledgement. Session
 approval and endpoint generation fences continue to reject stale commands after
-channel reuse. Link handles still require matching numeric values in each
-direction, and Begin's `handle-max` is not yet enforced.
+channel reuse.
+Link handles are also independent in each direction. The server reserves a
+vacant local handle within the peer Begin's inclusive `handle-max`, preferring
+the peer's number when available; the test client allocates from its own cursor
+within that same negotiated output range. Each endpoint advertises its own
+incoming handle range independently. Client Attach responses correlate by link
+name, mapped session, expected role, and the original link generation before
+binding the peer handle. Flow, Transfer, and Detach resolve only through that
+published peer binding, never through a numerically equal local handle. Pending,
+installed, and closing links reserve their local handles; a matching Detach
+acknowledgement releases the closing binding. Exhausting the peer's output range
+ends the requesting server session with `amqp:resource-limit-exceeded`, without
+creating a link or approval event. A local client Attach instead returns retryable
+`InvalidState` without advancing its cursor or writing bytes. A link frame on an
+unpublished peer handle ends only its session with
+`amqp:session:unattached-handle`.
 Session windows count Transfer frames independently of link delivery counts.
 Incoming windows replenish after bounded frame processing; receive links grant
 32 message slots and return credit only as the application consumes a delivery
@@ -307,8 +321,8 @@ other links. Fragmented sends yield when their session window closes, resume on
 session Flow, and consume only one link credit per message. Flow echo, drain,
 optional credit, wrapping counts, and early second-mode dispositions have raw
 transport regressions. Every outgoing frame is checked against the peer's frame
-cap before writing bytes. Independent link-handle routing and additional
-metadata and command-content resource policies remain unfinished.
+cap before writing bytes. Additional metadata and command-content resource
+policies remain unfinished.
 Session startup tracks local Begin publication separately from application
 approval. A required response to a pipelined Flow, pending Detach, End, or
 session refusal first publishes the server's Begin exactly once; later approval
@@ -321,11 +335,11 @@ still controls link installation; pending attaches share a 32-entry bound.
 The transport additionally limits one connection to 32 session states, including
 unapproved, pending-client, and ending sessions. It permits 128 distinct link
 lifecycle handles per session and 256 across the connection. Installed links,
-pending approvals, and handles awaiting Detach acknowledgement share that
-allowance; overlapping bookkeeping for one handle counts only once. Approving
-an admitted link does not charge it again. A closing handle remains charged
-until the peer acknowledges Detach, and a session state remains charged until
-the peer's End removes it, even though End retires that session's links.
+pending approvals, peer aliases, and handles awaiting Detach acknowledgement
+share that allowance; overlapping bookkeeping for one local handle counts only
+once. Approving an admitted link does not charge it again. A closing handle
+remains charged until the peer acknowledges Detach. A session state remains
+charged until the peer's End removes it, even though End retires its links.
 An excess peer Begin receives an `amqp:resource-limit-exceeded` Close without
 creating a session or application event. An excess peer Attach ends only its
 requesting session with that condition, without allocating an extra approval or
@@ -337,11 +351,12 @@ bytes or exact heap usage.
 Session approvals, installed session endpoints, and client session commands
 retain an opaque session generation instead of relying on a reusable channel.
 Link approval uses an `IncomingAttach` receipt with that original session,
-an exact pending approval token, and immutable handle, name, and role. The
-application can still edit terminus and response metadata, including the granted
-Service Bus session filter. A foreign or altered receipt is refused locally
-without consuming the rightful approval or writing bytes; clones can approve
-only once. Raw Attach content cannot be converted back into approval authority.
+an exact pending approval token, and immutable peer handle, name, and role. Its
+assigned local handle is separate approval authority, not editable raw content.
+The application can still edit terminus and response metadata, including the
+granted Service Bus session filter. A foreign or altered receipt is refused
+locally without consuming the rightful approval or writing bytes. Clones can
+approve only once. Raw Attach content cannot be converted back into approval authority.
 This is a source-level change for callers of the in-tree transport API.
 An End on an unmapped channel is refused without manufacturing a session reply.
 Client Begin searches only vacant channels within the peer's inclusive channel
@@ -486,12 +501,17 @@ management requests and producer batches share that inner allowance and reject
 more than 1,024 members before decoding them. These bounds do not provide a
 connection-wide memory limit and are not Azure batch quotas.
 If a peer detaches a link while application approval is outstanding, its receipt
-is retired and the pending slot is removed immediately. The handle can be reused
-without waiting for the application to consume the cancelled receipt. A stale
-receipt cannot open the replacement link or consume its approval. Retired queued
-session and link events are skipped. Cancellation during asynchronous broker
-planning releases any newly granted domain session hold and leaves the listener
-available for later links on the same AMQP session, including CBS and management
+is retired immediately. The server first publishes a minimal Attach response
+with its assigned local handle, then acknowledges with Detach; any required
+Begin precedes both. The pending slot and exact handle binding are released only
+after that final Detach flush, without waiting for the application to consume
+the cancelled receipt. Pending link-level Flow echoes likewise wait until the
+server's Attach is published. If even the minimal Attach cannot fit the peer's
+frame limit, a bounded `amqp:frame-size-too-small` End replaces the link reply.
+A stale receipt cannot open the replacement link or consume its approval.
+Retired queued session and link events are skipped. Cancellation during
+asynchronous broker planning releases any newly granted domain session hold.
+The listener remains available for later links on the same AMQP session, including CBS and management
 approvals. No numeric cancelled-approval tombstones are retained.
 The edge resolves a link's address to an entity, turns transfers into send
 commands and dispositions into settlements, and answers a rejection with the
