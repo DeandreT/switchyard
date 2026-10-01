@@ -23,7 +23,7 @@ use std::{
 
 use domain::{
     CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueConfig, QueueCursor, QueuePage,
-    Timestamp,
+    Timestamp, TopicCursor, TopicPage,
 };
 use storage::StateStore;
 use thiserror::Error;
@@ -58,6 +58,12 @@ enum Request {
         after: Option<QueueCursor>,
         limit: usize,
         reply: flume::Sender<Result<QueuePage, ProposeError>>,
+    },
+    ListTopicsPage {
+        namespace: Option<NamespaceName>,
+        after: Option<TopicCursor>,
+        limit: usize,
+        reply: flume::Sender<Result<TopicPage, ProposeError>>,
     },
     GetQueueConfig {
         namespace: NamespaceName,
@@ -362,6 +368,52 @@ impl BrokerHandle {
             .map_err(|_| SubmitError::BrokerStopped)?
             .map_err(SubmitError::Propose)
     }
+
+    /// One exclusive page of topics, optionally scoped to a namespace.
+    pub fn topics_page_blocking(
+        &self,
+        namespace: Option<NamespaceName>,
+        after: Option<TopicCursor>,
+        limit: usize,
+    ) -> Result<TopicPage, SubmitError> {
+        let (reply, topics) = flume::bounded(1);
+        self.requests
+            .send(Request::ListTopicsPage {
+                namespace,
+                after,
+                limit,
+                reply,
+            })
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        topics
+            .recv()
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
+
+    /// Discovers a topic page without blocking the caller's executor.
+    pub async fn topics_page(
+        &self,
+        namespace: Option<NamespaceName>,
+        after: Option<TopicCursor>,
+        limit: usize,
+    ) -> Result<TopicPage, SubmitError> {
+        let (reply, topics) = flume::bounded(1);
+        self.requests
+            .send_async(Request::ListTopicsPage {
+                namespace,
+                after,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        topics
+            .recv_async()
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
 }
 
 /// The owner thread, and the handle onto it.
@@ -390,16 +442,20 @@ impl Broker {
                         } => {
                             let application =
                                 proposer.propose_with_effects(&namespace, &entity, kind);
-                            if application
-                                .as_ref()
-                                .is_ok_and(|applied| makes_deliverable(&applied.outcome))
-                            {
-                                watching.notify(&namespace, &entity);
+                            if let Ok(applied) = &application {
+                                if let Some(targets) = &applied.subscription_enqueues {
+                                    for target in targets {
+                                        watching.notify(&namespace, target);
+                                    }
+                                } else if makes_deliverable(&applied.outcome) {
+                                    watching.notify(&namespace, &entity);
+                                }
                             }
                             if !entity.is_dead_letter_queue()
-                                && application
-                                    .as_ref()
-                                    .is_ok_and(|applied| applied.dead_letters_enqueued)
+                                && application.as_ref().is_ok_and(|applied| {
+                                    applied.subscription_enqueues.is_none()
+                                        && applied.dead_letters_enqueued
+                                })
                                 && let Ok(shadow) = entity.dead_letter_queue()
                             {
                                 watching.notify(&namespace, &shadow);
@@ -419,6 +475,18 @@ impl Broker {
                             reply,
                         } => {
                             let _ = reply.send(proposer.queues_page(
+                                namespace.as_ref(),
+                                after.as_ref(),
+                                limit,
+                            ));
+                        }
+                        Request::ListTopicsPage {
+                            namespace,
+                            after,
+                            limit,
+                            reply,
+                        } => {
+                            let _ = reply.send(proposer.topics_page(
                                 namespace.as_ref(),
                                 after.as_ref(),
                                 limit,

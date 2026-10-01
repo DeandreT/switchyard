@@ -464,11 +464,14 @@ fn submit_status(error: SubmitError) -> Status {
             | BrokerError::DeadLetterQueueIsReserved
             | BrokerError::SubscriptionPathIsReserved
             | BrokerError::QueuePageLimitExceeded { .. }
-            | BrokerError::QueueCursorNamespaceMismatch { .. } => {
+            | BrokerError::QueueCursorNamespaceMismatch { .. }
+            | BrokerError::TopicPageLimitExceeded { .. }
+            | BrokerError::TopicCursorNamespaceMismatch { .. } => {
                 Status::invalid_argument(error.to_string())
             }
             BrokerError::TopicDataPlaneNotImplemented => Status::unimplemented(error.to_string()),
-            BrokerError::SubscriptionLimitExceeded { .. } => {
+            BrokerError::SubscriptionLimitExceeded { .. }
+            | BrokerError::TopicFanoutTooLarge { .. } => {
                 Status::resource_exhausted(error.to_string())
             }
             _ => Status::internal("broker operation failed"),

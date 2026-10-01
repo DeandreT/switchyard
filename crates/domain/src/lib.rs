@@ -36,7 +36,9 @@ pub use identifier::{
 pub use machine::{
     BROKER_HEADER_RESERVE_BYTES, CommandApplication, MAX_DEAD_LETTER_DETAIL_LENGTH,
     MAX_INGRESS_BATCH_CONTENT_BYTES, MAX_INGRESS_BATCH_MESSAGES, MAX_INGRESS_BATCH_VALUE_ITEMS,
-    MAX_QUEUE_PAGE_SIZE, QueueCursor, QueuePage, StateMachine, TIMER_SCAN_LIMIT,
+    MAX_QUEUE_PAGE_SIZE, MAX_TOPIC_FANOUT_CONTENT_BYTES, MAX_TOPIC_FANOUT_COPIES,
+    MAX_TOPIC_FANOUT_VALUE_ITEMS, MAX_TOPIC_PAGE_SIZE, QueueCursor, QueuePage, StateMachine,
+    TIMER_SCAN_LIMIT, TopicCursor, TopicPage,
 };
 pub use message::{
     DeadLetterInfo, DeadLetterReason, Delivery, DeliveryGuarantee, DeliveryLock, LockToken,

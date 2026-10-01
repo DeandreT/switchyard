@@ -24,7 +24,14 @@ use crate::{
     SessionLock, SessionRecord, SettlementDisposition, Timestamp, codec, keys,
 };
 
+mod topic_fanout;
+mod topic_paging;
 mod topic_topology;
+
+pub use topic_fanout::{
+    MAX_TOPIC_FANOUT_CONTENT_BYTES, MAX_TOPIC_FANOUT_COPIES, MAX_TOPIC_FANOUT_VALUE_ITEMS,
+};
+pub use topic_paging::{MAX_TOPIC_PAGE_SIZE, TopicCursor, TopicPage};
 
 /// Ready entries a single receive may walk past while discarding expired
 /// messages. Bounds the work one command performs so a large backlog of
@@ -86,6 +93,9 @@ pub struct CommandApplication {
     /// The final batch retained a ready-index Put in this entity's canonical
     /// dead-letter queue. Only a successful commit can publish this effect.
     pub dead_letters_enqueued: bool,
+    /// Topic publications report only the sorted destinations that retained
+    /// copies. `Some([])` suppresses an ordinary wakeup of the parent topic.
+    pub subscription_enqueues: Option<Vec<EntityPath>>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -101,6 +111,23 @@ struct MessageInput<'a> {
     time_to_live_millis: Option<u64>,
     session_id: Option<&'a SessionId>,
     envelope: Option<&'a MessageEnvelope>,
+}
+
+#[derive(Clone, Copy)]
+struct EnqueueScope<'a> {
+    namespace: &'a NamespaceName,
+    entity: &'a EntityPath,
+    issued_at: Timestamp,
+}
+
+impl<'a> From<&'a Command> for EnqueueScope<'a> {
+    fn from(command: &'a Command) -> Self {
+        Self {
+            namespace: &command.namespace,
+            entity: &command.entity,
+            issued_at: command.issued_at,
+        }
+    }
 }
 
 impl<'a> From<&'a IngressEnvelope> for MessageInput<'a> {
@@ -176,8 +203,8 @@ impl<S: StateStore> StateMachine<S> {
         Ok(self.apply_with_effects(command)?.outcome)
     }
 
-    /// Applies one command and reports its committed dead-letter enqueue
-    /// effect without additional store reads or changes to ordinary outcomes.
+    /// Applies one command and reports its committed enqueue destinations
+    /// without additional store reads or changes to ordinary outcomes.
     pub fn apply_with_effects(&self, command: &Command) -> Result<CommandApplication, BrokerError> {
         let last_applied = self.last_applied_time()?;
         if command.issued_at < last_applied {
@@ -188,6 +215,7 @@ impl<S: StateStore> StateMachine<S> {
         }
 
         let mut batch = WriteBatch::default();
+        let mut subscription_enqueues = None;
         let outcome = match &command.kind {
             CommandKind::CreateQueue { config } => {
                 self.create_queue(command, *config, &mut batch)?
@@ -216,6 +244,7 @@ impl<S: StateStore> StateMachine<S> {
                     envelope: None,
                 },
                 &mut batch,
+                &mut subscription_enqueues,
             )?,
             CommandKind::SendEnvelope {
                 message_id,
@@ -233,9 +262,10 @@ impl<S: StateStore> StateMachine<S> {
                     envelope: Some(envelope.as_ref()),
                 },
                 &mut batch,
+                &mut subscription_enqueues,
             )?,
             CommandKind::SendBatch { messages } => {
-                self.send_batch(command, messages, &mut batch)?
+                self.send_batch(command, messages, &mut batch, &mut subscription_enqueues)?
             }
             CommandKind::Schedule { messages } => self.schedule(
                 command,
@@ -477,6 +507,7 @@ impl<S: StateStore> StateMachine<S> {
         Ok(CommandApplication {
             outcome,
             dead_letters_enqueued,
+            subscription_enqueues,
         })
     }
 
@@ -696,9 +727,9 @@ impl<S: StateStore> StateMachine<S> {
 
     /// The index a ready message sits in: its own session's on a session queue,
     /// and the entity-wide ready index otherwise.
-    fn ready_key(&self, command: &Command, record: &MessageRecord) -> Vec<u8> {
-        let namespace = &command.namespace;
-        let entity = &command.entity;
+    fn ready_key(&self, scope: EnqueueScope<'_>, record: &MessageRecord) -> Vec<u8> {
+        let namespace = scope.namespace;
+        let entity = scope.entity;
         match &record.session_id {
             Some(session_id) => keys::session_ready(namespace, entity, session_id, record.sequence),
             None => keys::ready(namespace, entity, record.sequence),
@@ -811,8 +842,20 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         message: MessageInput<'_>,
         batch: &mut WriteBatch,
+        subscription_enqueues: &mut Option<Vec<EntityPath>>,
     ) -> Result<CommandOutcome, BrokerError> {
-        self.require_queue_ingress_target(command)?;
+        if let Some(config) = self.topic_ingress_config(command)? {
+            let sequences = self.publish_topic(
+                command,
+                config,
+                std::iter::once((message, None)),
+                batch,
+                subscription_enqueues,
+            )?;
+            return Ok(CommandOutcome::Sent {
+                sequence: sequences[0],
+            });
+        }
         let config = self.load_config(command)?;
         validate_message_input(&config, message)?;
 
@@ -833,7 +876,7 @@ impl<S: StateStore> StateMachine<S> {
             return Ok(CommandOutcome::Sent { sequence });
         }
 
-        self.enqueue_message(command, &config, message, sequence, None, batch)?;
+        self.enqueue_message(command.into(), &config, message, sequence, None, batch)?;
         Ok(CommandOutcome::Sent { sequence })
     }
 
@@ -842,8 +885,20 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         messages: &[IngressEnvelope],
         batch: &mut WriteBatch,
+        subscription_enqueues: &mut Option<Vec<EntityPath>>,
     ) -> Result<CommandOutcome, BrokerError> {
-        self.require_queue_ingress_target(command)?;
+        if let Some(config) = self.topic_ingress_config(command)? {
+            let sequences = self.publish_topic(
+                command,
+                config,
+                messages
+                    .iter()
+                    .map(|message| (message.into(), message.scheduled_enqueue_time)),
+                batch,
+                subscription_enqueues,
+            )?;
+            return Ok(CommandOutcome::BatchSent { sequences });
+        }
         let config = self.load_config(command)?;
         validate_ingress_batch(&config, messages)?;
         if messages.is_empty() {
@@ -867,7 +922,7 @@ impl<S: StateStore> StateMachine<S> {
                 continue;
             }
             self.enqueue_message(
-                command,
+                command.into(),
                 &config,
                 message.into(),
                 sequence,
@@ -884,7 +939,7 @@ impl<S: StateStore> StateMachine<S> {
 
     fn enqueue_message(
         &self,
-        command: &Command,
+        scope: EnqueueScope<'_>,
         config: &QueueConfig,
         message: MessageInput<'_>,
         sequence: SequenceNumber,
@@ -893,16 +948,16 @@ impl<S: StateStore> StateMachine<S> {
     ) -> Result<(), BrokerError> {
         let time_to_live_millis =
             effective_time_to_live_millis(config, message.time_to_live_millis);
-        let future = scheduled_enqueue_time.filter(|enqueue_at| *enqueue_at > command.issued_at);
+        let future = scheduled_enqueue_time.filter(|enqueue_at| *enqueue_at > scope.issued_at);
         let record = MessageRecord {
             sequence,
             message_id: message.message_id.to_owned(),
             body: message.body.to_vec(),
-            enqueued_at: command.issued_at,
+            enqueued_at: scope.issued_at,
             expires_at: if future.is_some() {
                 None
             } else {
-                time_to_live_millis.map(|millis| command.issued_at.saturating_add_millis(millis))
+                time_to_live_millis.map(|millis| scope.issued_at.saturating_add_millis(millis))
             },
             delivery_count: 0,
             state: future.map_or(MessageState::Ready, |enqueue_at| MessageState::Scheduled {
@@ -914,8 +969,8 @@ impl<S: StateStore> StateMachine<S> {
             scheduled_enqueue_time,
             envelope: message.envelope.cloned().map(Box::new),
         };
-        let namespace = &command.namespace;
-        let entity = &command.entity;
+        let namespace = scope.namespace;
+        let entity = scope.entity;
         batch.push_put(
             keys::message(namespace, entity, sequence),
             codec::encode(&record)?,
@@ -926,8 +981,8 @@ impl<S: StateStore> StateMachine<S> {
                 Vec::new(),
             );
         } else {
-            batch.push_put(self.ready_key(command, &record), Vec::new());
-            index_ready_expiry(command, &record, batch);
+            batch.push_put(self.ready_key(scope, &record), Vec::new());
+            index_ready_expiry(scope, &record, batch);
         }
         Ok(())
     }
@@ -962,7 +1017,7 @@ impl<S: StateStore> StateMachine<S> {
                 continue;
             }
             self.enqueue_message(
-                command,
+                command.into(),
                 &config,
                 message,
                 sequence,
@@ -1001,22 +1056,11 @@ impl<S: StateStore> StateMachine<S> {
         let namespace = &command.namespace;
         let entity = &command.entity;
         let key = keys::duplicate_history(namespace, entity, message_id);
-        if let Some(expires_at) = self.read::<Timestamp>(&key)? {
-            if expires_at > command.issued_at {
-                return Ok(true);
-            }
-            batch.push_delete(keys::duplicate_history_expiry(
-                namespace, entity, expires_at, message_id,
-            ));
+        let previous = self.read::<Timestamp>(&key)?;
+        if previous.is_some_and(|expires_at| expires_at > command.issued_at) {
+            return Ok(true);
         }
-        let expires_at = command
-            .issued_at
-            .saturating_add_millis(config.duplicate_detection_history_time_window_millis);
-        batch.push_put(key, codec::encode(&expires_at)?);
-        batch.push_put(
-            keys::duplicate_history_expiry(namespace, entity, expires_at, message_id),
-            Vec::new(),
-        );
+        stage_message_id(command, config, message_id, previous, batch)?;
         staged.insert(message_id.to_owned());
         Ok(false)
     }
@@ -1026,7 +1070,13 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
-        self.load_config(command)?;
+        if self
+            .queue_config(&command.namespace, &command.entity)?
+            .is_none()
+        {
+            self.topic_config(&command.namespace, &command.entity)?
+                .ok_or(BrokerError::QueueNotFound)?;
+        }
         let namespace = &command.namespace;
         let entity = &command.entity;
         let prefix = keys::duplicate_history_expiry_prefix(namespace, entity);
@@ -1120,8 +1170,8 @@ impl<S: StateStore> StateMachine<S> {
                 keys::message(namespace, entity, record.sequence),
                 codec::encode(&record)?,
             );
-            batch.push_put(self.ready_key(command, &record), Vec::new());
-            index_ready_expiry(command, &record, batch);
+            batch.push_put(self.ready_key(command.into(), &record), Vec::new());
+            index_ready_expiry(command.into(), &record, batch);
             activated += 1;
         }
         if activated != 0 {
@@ -1172,7 +1222,7 @@ impl<S: StateStore> StateMachine<S> {
 
             record.delivery_count = record.delivery_count.saturating_add(1);
             let delivery_count = record.delivery_count;
-            let ready_key = self.ready_key(command, &record);
+            let ready_key = self.ready_key(command.into(), &record);
 
             let lock = match mode {
                 ReceiveMode::PeekLock => {
@@ -1403,8 +1453,8 @@ impl<S: StateStore> StateMachine<S> {
                     keys::message(namespace, entity, sequence),
                     codec::encode(&record)?,
                 );
-                batch.push_put(self.ready_key(command, &record), Vec::new());
-                index_ready_expiry(command, &record, batch);
+                batch.push_put(self.ready_key(command.into(), &record), Vec::new());
+                index_ready_expiry(command.into(), &record, batch);
                 Ok(CommandOutcome::Abandoned {
                     dead_lettered: false,
                     dropped: false,
@@ -1601,8 +1651,8 @@ impl<S: StateStore> StateMachine<S> {
                     keys::message(namespace, entity, sequence),
                     codec::encode(&record)?,
                 );
-                batch.push_put(self.ready_key(command, &record), Vec::new());
-                index_ready_expiry(command, &record, batch);
+                batch.push_put(self.ready_key(command.into(), &record), Vec::new());
+                index_ready_expiry(command.into(), &record, batch);
                 returned_to_ready += 1;
             }
         }
@@ -2032,7 +2082,7 @@ impl<S: StateStore> StateMachine<S> {
         let entity = &command.entity;
         let sequence = record.sequence;
         match record.state {
-            MessageState::Ready => batch.push_delete(self.ready_key(command, record)),
+            MessageState::Ready => batch.push_delete(self.ready_key(command.into(), record)),
             MessageState::Locked { locked_until, .. } => {
                 batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
             }
@@ -2087,6 +2137,34 @@ impl<S: StateStore> StateMachine<S> {
     }
 }
 
+fn stage_message_id(
+    command: &Command,
+    config: &QueueConfig,
+    message_id: &str,
+    previous: Option<Timestamp>,
+    batch: &mut WriteBatch,
+) -> Result<(), BrokerError> {
+    let namespace = &command.namespace;
+    let entity = &command.entity;
+    if let Some(expires_at) = previous {
+        batch.push_delete(keys::duplicate_history_expiry(
+            namespace, entity, expires_at, message_id,
+        ));
+    }
+    let expires_at = command
+        .issued_at
+        .saturating_add_millis(config.duplicate_detection_history_time_window_millis);
+    batch.push_put(
+        keys::duplicate_history(namespace, entity, message_id),
+        codec::encode(&expires_at)?,
+    );
+    batch.push_put(
+        keys::duplicate_history_expiry(namespace, entity, expires_at, message_id),
+        Vec::new(),
+    );
+    Ok(())
+}
+
 fn committed_dead_letter_put(command: &Command, batch: &WriteBatch) -> bool {
     if batch.is_empty() || command.entity.is_dead_letter_queue() {
         return false;
@@ -2116,15 +2194,10 @@ fn effective_time_to_live_millis(config: &QueueConfig, requested: Option<u64>) -
     }
 }
 
-fn index_ready_expiry(command: &Command, record: &MessageRecord, batch: &mut WriteBatch) {
+fn index_ready_expiry(scope: EnqueueScope<'_>, record: &MessageRecord, batch: &mut WriteBatch) {
     if let (MessageState::Ready, Some(expires_at)) = (&record.state, record.expires_at) {
         batch.push_put(
-            keys::expiry(
-                &command.namespace,
-                &command.entity,
-                expires_at,
-                record.sequence,
-            ),
+            keys::expiry(scope.namespace, scope.entity, expires_at, record.sequence),
             Vec::new(),
         );
     }
@@ -2297,7 +2370,18 @@ fn validate_message_input(
         }
         validate_envelope_content(envelope, message.message_id, message.session_id)?;
     }
-    let content_bytes = message.envelope.map_or(message.body.len(), |envelope| {
+    let content_bytes = message_content_bytes(message);
+    if content_bytes > config.max_message_bytes {
+        return Err(BrokerError::MessageTooLarge {
+            body_bytes: content_bytes,
+            maximum_bytes: config.max_message_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn message_content_bytes(message: MessageInput<'_>) -> usize {
+    message.envelope.map_or(message.body.len(), |envelope| {
         let size = envelope
             .content_size()
             .saturating_add(authoritative_property_overhead(
@@ -2308,14 +2392,7 @@ fn validate_message_input(
         // The byte body is only a compatibility view when typed content exists.
         // Count the larger representation, not both copies of the same body.
         size.max(message.body.len())
-    });
-    if content_bytes > config.max_message_bytes {
-        return Err(BrokerError::MessageTooLarge {
-            body_bytes: content_bytes,
-            maximum_bytes: config.max_message_bytes,
-        });
-    }
-    Ok(())
+    })
 }
 
 fn validate_ingress_batch(

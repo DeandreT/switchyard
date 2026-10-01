@@ -26,6 +26,11 @@ pub enum BrokerError {
         actual: usize,
         maximum: usize,
     },
+    #[error("topic fanout {limit} exceeds the maximum of {maximum}")]
+    TopicFanoutTooLarge {
+        limit: IngressBatchLimit,
+        maximum: usize,
+    },
     #[error("every message in a session queue batch must name the same session")]
     BatchSessionMismatch,
     #[error("queue page limit {limit} exceeds the maximum of {maximum}")]
@@ -120,7 +125,7 @@ pub enum BrokerError {
     SubscriptionLimitExceeded { maximum: usize },
     #[error("entity path is already occupied by another entity kind")]
     EntityPathAlreadyExists,
-    #[error("topic data-plane operations are not implemented")]
+    #[error("requested topic data-plane operation is not implemented")]
     TopicDataPlaneNotImplemented,
     #[error("invalid topic configuration: {0}")]
     TopicConfig(QueueConfigError),
@@ -128,4 +133,13 @@ pub enum BrokerError {
     SubscriptionConfig(QueueConfigError),
     #[error("subscription metadata has a missing or mismatched topology component")]
     DanglingSubscriptionMetadata,
+    #[error("topic page limit {limit} exceeds the maximum of {maximum}")]
+    TopicPageLimitExceeded { limit: usize, maximum: usize },
+    #[error(
+        "topic cursor namespace {cursor_namespace} does not match requested namespace {namespace}"
+    )]
+    TopicCursorNamespaceMismatch {
+        namespace: NamespaceName,
+        cursor_namespace: NamespaceName,
+    },
 }

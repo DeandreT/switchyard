@@ -32,8 +32,8 @@ pub use crate::{
     },
     proposer::{DEFAULT_MAX_CLOCK_REGRESSION_MILLIS, LocalProposer, ProposeError},
     timer::{
-        DEFAULT_SWEEP_INTERVAL, MAX_QUEUES_PER_SWEEP, MAX_ROUNDS_PER_INDEX, Shutdown, SweepReport,
-        TimerWorker,
+        DEFAULT_SWEEP_INTERVAL, MAX_QUEUES_PER_SWEEP, MAX_ROUNDS_PER_INDEX, MAX_TOPICS_PER_SWEEP,
+        Shutdown, SweepReport, TimerWorker,
     },
 };
 

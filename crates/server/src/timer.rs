@@ -1,8 +1,8 @@
 //! The worker that proposes deadline commands.
 //!
 //! The state machine has no clock of its own, so nothing expires until something
-//! asks it to. This is that something: on every tick it walks the queues and
-//! proposes activation and expiry commands for each. Without it, scheduled
+//! asks it to. This is that something: on every tick it walks queues and topics,
+//! proposing queue deadlines and each entity's duplicate-history cleanup. Without it, scheduled
 //! messages stay hidden, locks are held forever, and messages outlive their TTL.
 //!
 //! The sweep itself is deterministic given the clock, so a test drives it
@@ -15,6 +15,7 @@ use std::{
 
 use domain::{
     CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueCursor, TIMER_SCAN_LIMIT,
+    TopicCursor,
 };
 use tracing::{debug, warn};
 
@@ -23,6 +24,8 @@ use crate::{BrokerHandle, ProposeError, SubmitError};
 /// Queues one sweep will visit. Successive sweeps page through key order and
 /// wrap at the end, so every queue gets a turn.
 pub const MAX_QUEUES_PER_SWEEP: usize = domain::MAX_QUEUE_PAGE_SIZE;
+/// Topics one sweep visits independently of the queue discovery position.
+pub const MAX_TOPICS_PER_SWEEP: usize = domain::MAX_TOPIC_PAGE_SIZE;
 
 /// Times one sweep will re-propose against a single index before moving on.
 ///
@@ -37,6 +40,7 @@ pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SweepReport {
     pub queues_swept: usize,
+    pub topics_swept: usize,
     pub locks_returned_to_ready: u32,
     pub messages_dead_lettered: u32,
     pub messages_dropped: u32,
@@ -59,26 +63,45 @@ impl SweepReport {
 
 pub struct TimerWorker<'a> {
     broker: &'a BrokerHandle,
-    cursor: Mutex<Option<QueueCursor>>,
+    cursors: Mutex<SweepCursors>,
+}
+
+#[derive(Default)]
+struct SweepCursors {
+    queues: Option<QueueCursor>,
+    topics: Option<TopicCursor>,
 }
 
 impl<'a> TimerWorker<'a> {
     pub fn new(broker: &'a BrokerHandle) -> Self {
         Self {
             broker,
-            cursor: Mutex::new(None),
+            cursors: Mutex::new(SweepCursors::default()),
         }
     }
 
-    /// Proposes deadline commands for the next bounded page of queues.
+    /// Proposes deadlines for one independent bounded page of each entity kind.
     ///
-    /// An error abandons the rest of the sweep. Each command was atomic, so what
-    /// already applied stands and the next tick resumes from there.
+    /// An error abandons the rest of that family's page, but the other family
+    /// still runs. Committed commands stand, and each cursor resumes independently.
     pub fn sweep_once(&self) -> Result<SweepReport, SubmitError> {
-        let mut cursor = self
-            .cursor
+        let mut cursors = self
+            .cursors
             .lock()
             .expect("the timer cursor lock is not poisoned");
+        let mut report = SweepReport::default();
+        let queues = self.sweep_queues(&mut cursors.queues, &mut report);
+        let topics = self.sweep_topics(&mut cursors.topics, &mut report);
+        queues?;
+        topics?;
+        Ok(report)
+    }
+
+    fn sweep_queues(
+        &self,
+        cursor: &mut Option<QueueCursor>,
+        report: &mut SweepReport,
+    ) -> Result<(), SubmitError> {
         let mut page =
             self.broker
                 .queues_page_blocking(None, cursor.clone(), MAX_QUEUES_PER_SWEEP)?;
@@ -87,8 +110,6 @@ impl<'a> TimerWorker<'a> {
                 .broker
                 .queues_page_blocking(None, None, MAX_QUEUES_PER_SWEEP)?;
         }
-        let mut report = SweepReport::default();
-
         for (namespace, entity) in page.queues {
             // A failed queue must not pin discovery to this page forever.
             *cursor = Some(QueueCursor {
@@ -96,14 +117,39 @@ impl<'a> TimerWorker<'a> {
                 entity: entity.clone(),
             });
             report.queues_swept += 1;
-            self.activate_scheduled(&namespace, &entity, &mut report)?;
-            self.expire_locks(&namespace, &entity, &mut report)?;
-            self.expire_messages(&namespace, &entity, &mut report)?;
-            self.expire_session_locks(&namespace, &entity, &mut report)?;
-            self.expire_duplicate_history(&namespace, &entity, &mut report)?;
+            self.activate_scheduled(&namespace, &entity, report)?;
+            self.expire_locks(&namespace, &entity, report)?;
+            self.expire_messages(&namespace, &entity, report)?;
+            self.expire_session_locks(&namespace, &entity, report)?;
+            self.expire_duplicate_history(&namespace, &entity, report)?;
         }
         *cursor = page.continuation;
-        Ok(report)
+        Ok(())
+    }
+
+    fn sweep_topics(
+        &self,
+        cursor: &mut Option<TopicCursor>,
+        report: &mut SweepReport,
+    ) -> Result<(), SubmitError> {
+        let mut page =
+            self.broker
+                .topics_page_blocking(None, cursor.clone(), MAX_TOPICS_PER_SWEEP)?;
+        if page.topics.is_empty() && cursor.is_some() {
+            page = self
+                .broker
+                .topics_page_blocking(None, None, MAX_TOPICS_PER_SWEEP)?;
+        }
+        for (namespace, entity) in page.topics {
+            *cursor = Some(TopicCursor {
+                namespace: namespace.clone(),
+                entity: entity.clone(),
+            });
+            report.topics_swept += 1;
+            self.expire_duplicate_history(&namespace, &entity, report)?;
+        }
+        *cursor = page.continuation;
+        Ok(())
     }
 
     fn activate_scheduled(
@@ -248,12 +294,14 @@ impl<'a> TimerWorker<'a> {
                 Ok(report) if report.is_idle() => {
                     debug!(
                         queues = report.queues_swept,
+                        topics = report.topics_swept,
                         "sweep found nothing to expire"
                     );
                 }
                 Ok(report) => {
                     debug!(
                         queues = report.queues_swept,
+                        topics = report.topics_swept,
                         locks_returned_to_ready = report.locks_returned_to_ready,
                         messages_dead_lettered = report.messages_dead_lettered,
                         messages_dropped = report.messages_dropped,

@@ -280,7 +280,7 @@ pub enum CommandKind {
     SendBatch {
         messages: Vec<IngressEnvelope>,
     },
-    /// Creates a topic at Command.entity without enabling its data plane.
+    /// Creates a topic at Command.entity.
     CreateTopic {
         config: TopicConfig,
     },

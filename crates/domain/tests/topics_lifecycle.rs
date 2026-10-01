@@ -531,7 +531,9 @@ fn composed_path_and_membership_boundaries_leave_no_partial_topology<P: StorePro
     Ok(())
 }
 
-fn topic_and_subscription_ingress_stay_explicitly_unavailable<P: StoreProvider>(
+fn immediate_topic_ingress_preserves_scheduling_and_subscription_refusal_guards<
+    P: StoreProvider,
+>(
     provider: P,
 ) -> TestResult {
     let fixture = topic(provider)?;
@@ -554,12 +556,28 @@ fn topic_and_subscription_ingress_stay_explicitly_unavailable<P: StoreProvider>(
         CommandKind::Schedule { messages: vec![] },
         CommandKind::ScheduleEnvelopes { messages: vec![] },
     ];
-    for kind in kinds {
-        reject(
-            &fixture,
-            fixture.command(10, kind.clone()),
-            BrokerError::TopicDataPlaneNotImplemented,
-        )?;
+    for (index, kind) in kinds.into_iter().enumerate() {
+        if index < 2 {
+            assert_eq!(
+                fixture.at(1, kind.clone())?,
+                CommandOutcome::Sent {
+                    sequence: SequenceNumber::new(index as u64 + 1)
+                }
+            );
+        } else if index == 2 {
+            let before = fixture.machine.store().snapshot()?;
+            assert_eq!(
+                fixture.at(1, kind.clone())?,
+                CommandOutcome::BatchSent { sequences: vec![] }
+            );
+            assert_eq!(fixture.machine.store().snapshot()?, before);
+        } else {
+            reject(
+                &fixture,
+                fixture.command(10, kind.clone()),
+                BrokerError::TopicDataPlaneNotImplemented,
+            )?;
+        }
         let mut command = fixture.command(10, kind);
         command.entity = subscription.clone();
         reject(&fixture, command, BrokerError::SubscriptionPathIsReserved)?;
@@ -583,19 +601,31 @@ fn topic_and_subscription_ingress_stay_explicitly_unavailable<P: StoreProvider>(
     );
     command.entity = EntityPath::new("absent/SUBSCRIPTIONS/child")?;
     reject(&fixture, command, BrokerError::SubscriptionPathIsReserved)?;
+    let CommandOutcome::Peeked(deliveries) = at(
+        &fixture,
+        "tenant",
+        &subscription,
+        1,
+        CommandKind::Peek {
+            from_sequence: SequenceNumber::new(1),
+            max_messages: 2,
+            session_id: None,
+        },
+    )?
+    else {
+        panic!("subscription copies remain after every refusal")
+    };
     assert_eq!(
-        at(
-            &fixture,
-            "tenant",
-            &subscription,
-            1,
-            CommandKind::Peek {
-                from_sequence: SequenceNumber::new(1),
-                max_messages: 1,
-                session_id: None
-            }
-        )?,
-        CommandOutcome::Peeked(vec![])
+        deliveries
+            .iter()
+            .map(|delivery| delivery.sequence)
+            .collect::<Vec<_>>(),
+        vec![SequenceNumber::new(1), SequenceNumber::new(2)]
+    );
+    assert!(
+        deliveries
+            .iter()
+            .all(|delivery| delivery.message_id == "message")
     );
     Ok(())
 }
@@ -963,7 +993,7 @@ for_each_backend! {
     missing_duplicate_config_and_type_collisions_are_atomic,
     canonical_subscription_and_dlq_paths_are_reserved_before_other_validation,
     composed_path_and_membership_boundaries_leave_no_partial_topology,
-    topic_and_subscription_ingress_stay_explicitly_unavailable,
+    immediate_topic_ingress_preserves_scheduling_and_subscription_refusal_guards,
     session_configs_are_valid_topology_and_children_never_inherit_topic_dedup,
     dangling_or_malformed_membership_never_becomes_a_partial_success,
 }

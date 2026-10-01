@@ -42,7 +42,8 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         BrokerError::QueueCounterExhausted { .. }
         | BrokerError::SubscriptionLimitExceeded { .. } => RESOURCE_LIMIT_EXCEEDED,
         BrokerError::TopicDataPlaneNotImplemented => NOT_IMPLEMENTED,
-        BrokerError::IngressBatchLimitExceeded { limit, .. } => match limit {
+        BrokerError::IngressBatchLimitExceeded { limit, .. }
+        | BrokerError::TopicFanoutTooLarge { limit, .. } => match limit {
             IngressBatchLimit::ContentBytes => MESSAGE_SIZE_EXCEEDED,
             IngressBatchLimit::Messages | IngressBatchLimit::ValueItems => RESOURCE_LIMIT_EXCEEDED,
         },
@@ -74,7 +75,9 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         BrokerError::MessageIdTooLong { .. }
         | BrokerError::InvalidMessageContent { .. }
         | BrokerError::QueuePageLimitExceeded { .. }
-        | BrokerError::QueueCursorNamespaceMismatch { .. } => INVALID_FIELD,
+        | BrokerError::QueueCursorNamespaceMismatch { .. }
+        | BrokerError::TopicPageLimitExceeded { .. }
+        | BrokerError::TopicCursorNamespaceMismatch { .. } => INVALID_FIELD,
         BrokerError::QueueConfig(_)
         | BrokerError::TopicConfig(_)
         | BrokerError::SubscriptionConfig(_)
@@ -155,6 +158,19 @@ mod tests {
         ] {
             let error = BrokerError::QueuePropertyIsImmutable { property };
             assert_eq!(condition_for(&error), PRECONDITION_FAILED);
+            assert!(!is_retryable(&error));
+        }
+    }
+
+    #[test]
+    fn retained_topic_fanout_limits_are_not_retryable() {
+        for (limit, condition) in [
+            (IngressBatchLimit::Messages, RESOURCE_LIMIT_EXCEEDED),
+            (IngressBatchLimit::ContentBytes, MESSAGE_SIZE_EXCEEDED),
+            (IngressBatchLimit::ValueItems, RESOURCE_LIMIT_EXCEEDED),
+        ] {
+            let error = BrokerError::TopicFanoutTooLarge { limit, maximum: 1 };
+            assert_eq!(condition_for(&error), condition);
             assert!(!is_retryable(&error));
         }
     }
@@ -263,6 +279,23 @@ mod tests {
                 maximum: 1_024,
             },
             BrokerError::QueueCursorNamespaceMismatch {
+                namespace: domain::NamespaceName::new("tenant").expect("namespace"),
+                cursor_namespace: domain::NamespaceName::new("other").expect("namespace"),
+            },
+        ] {
+            assert_eq!(condition_for(&error), INVALID_FIELD);
+            assert!(!is_retryable(&error));
+        }
+    }
+
+    #[test]
+    fn invalid_topic_page_queries_are_non_retryable_client_errors() {
+        for error in [
+            BrokerError::TopicPageLimitExceeded {
+                limit: 1_025,
+                maximum: 1_024,
+            },
+            BrokerError::TopicCursorNamespaceMismatch {
                 namespace: domain::NamespaceName::new("tenant").expect("namespace"),
                 cursor_namespace: domain::NamespaceName::new("other").expect("namespace"),
             },

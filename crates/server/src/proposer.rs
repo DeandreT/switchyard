@@ -8,7 +8,8 @@
 
 use domain::{
     BrokerError, Command, CommandApplication, CommandKind, CommandOutcome, EntityPath,
-    NamespaceName, QueueConfig, QueueCursor, QueuePage, StateMachine, Timestamp,
+    NamespaceName, QueueConfig, QueueCursor, QueuePage, StateMachine, Timestamp, TopicCursor,
+    TopicPage,
 };
 use storage::StateStore;
 use thiserror::Error;
@@ -63,6 +64,16 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
         limit: usize,
     ) -> Result<QueuePage, ProposeError> {
         Ok(self.machine.queues_page(namespace, after, limit)?)
+    }
+
+    /// Reads one topic page without stamping a replicated command.
+    pub fn topics_page(
+        &self,
+        namespace: Option<&NamespaceName>,
+        after: Option<&TopicCursor>,
+        limit: usize,
+    ) -> Result<TopicPage, ProposeError> {
+        Ok(self.machine.topics_page(namespace, after, limit)?)
     }
 
     /// Stamps `kind` with the current time and applies it.
