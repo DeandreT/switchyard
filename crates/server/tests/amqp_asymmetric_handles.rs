@@ -1,0 +1,572 @@
+//! Independently owned link handles within independently owned session channels.
+
+use std::{cell::Cell, error::Error};
+
+use amqp::{End, EngineError, Frame, Message, Performative, Role, encode_message};
+use tokio::time::timeout;
+
+#[path = "support/asymmetric_handle_fixture.rs"]
+mod fixture;
+
+use fixture::{
+    CASE_TIMEOUT, IO_TIMEOUT, Link, Node, Session, TestResult, attach, channels, detach, transfer,
+};
+
+fn only_session_flow(frames: &[Frame], outgoing: u16) {
+    assert!(
+        frames.iter().all(|frame| matches!(frame, Frame::Amqp {
+        channel, performative: Some(Performative::Flow(flow)), ..
+    } if *channel == outgoing && flow.handle.is_none())),
+        "unpublished or refused link must not emit traffic: {frames:?}"
+    );
+}
+
+async fn both_roles(server: bool) -> TestResult {
+    let mut node = Node::new(server).await?;
+    let channels = channels(server, 0);
+    let mut session = node.session(channels, 1).await?;
+    let receiving = Link {
+        channels,
+        peer: 55,
+        local: 0,
+    };
+    let sending = Link {
+        channels,
+        peer: 56,
+        local: 1,
+    };
+    let mut receiver = node.receiver(&mut session, receiving).await?;
+    let mut sender = node.sender(&mut session, sending).await?;
+    node.incoming_message(&mut receiver, receiving, 0, 1)
+        .await?;
+    node.outgoing_message(&mut sender, sending, 2).await?;
+
+    let mut echo = node.peer.flow(channels);
+    echo.handle = Some(receiving.peer);
+    echo.delivery_count = Some(1);
+    echo.echo = true;
+    node.peer
+        .send(channels.incoming, Performative::Flow(echo), Vec::new())
+        .await?;
+    let frames = node.peer.barrier(channels).await?;
+    assert!(frames.iter().any(|frame| matches!(frame, Frame::Amqp {
+        channel, performative: Some(Performative::Flow(flow)), ..
+    } if *channel == channels.outgoing && flow.handle == Some(receiving.local))));
+    assert!(frames.iter().all(|frame| matches!(frame, Frame::Amqp {
+        channel, performative: Some(Performative::Flow(flow)), ..
+    } if *channel == channels.outgoing && (flow.handle.is_none() || flow.handle == Some(receiving.local)))));
+
+    node.close_receiver(&receiver, receiving).await?;
+    node.peer
+        .send(
+            channels.incoming,
+            Performative::Detach(detach(sending.peer)),
+            Vec::new(),
+        )
+        .await?;
+    node.peer.detach(sending).await?;
+    node.peer.barrier(channels).await?;
+    let replacement = Link {
+        channels,
+        peer: 57,
+        local: 0,
+    };
+    let mut receiver = node.receiver(&mut session, replacement).await?;
+    node.incoming_message(&mut receiver, replacement, 1, 3)
+        .await?;
+    node.shutdown().await;
+    Ok(())
+}
+
+async fn crossed_handles_and_closing_ownership(server: bool) -> TestResult {
+    let mut node = Node::new(server).await?;
+    let channels = channels(server, 0);
+    let mut session = node.session(channels, 1).await?;
+    let first = Link {
+        channels,
+        peer: 55,
+        local: 0,
+    };
+    let second = Link {
+        channels,
+        peer: 0,
+        local: 1,
+    };
+    let mut receiver_a = node.receiver(&mut session, first).await?;
+    let mut receiver_b = node.receiver(&mut session, second).await?;
+    node.incoming_message(&mut receiver_b, second, 0, 4).await?;
+    node.incoming_message(&mut receiver_a, first, 1, 5).await?;
+    node.peer.barrier(channels).await?;
+
+    let first_close_finished = Cell::new(false);
+    let closing = async {
+        receiver_a.close().await?;
+        first_close_finished.set(true);
+        Ok::<_, Box<dyn Error>>(())
+    };
+    let replacement = Link {
+        channels,
+        peer: 7,
+        local: 1,
+    };
+    let ((), mut receiver_c) = tokio::try_join!(closing, async {
+        node.peer.detach(first).await?;
+        node.peer
+            .send(
+                channels.incoming,
+                Performative::Detach(detach(second.peer)),
+                Vec::new(),
+            )
+            .await?;
+        node.peer.detach(second).await?;
+        node.peer.barrier(channels).await?;
+        if !server {
+            assert!(
+                !first_close_finished.get(),
+                "peer handle0 must not acknowledge own handle0 bound to peer55"
+            );
+        }
+        assert!(matches!(
+            timeout(IO_TIMEOUT, receiver_b.recv()).await?,
+            Err(EngineError::RemoteDetached)
+        ));
+        let mut receiver_c = node.receiver(&mut session, replacement).await?;
+        node.incoming_message(&mut receiver_c, replacement, 2, 6)
+            .await?;
+        node.peer.barrier(channels).await?;
+        if !server {
+            assert!(
+                !first_close_finished.get(),
+                "other-link activity must retain the exact pending close"
+            );
+        }
+        node.peer
+            .send(
+                channels.incoming,
+                Performative::Detach(detach(first.peer)),
+                Vec::new(),
+            )
+            .await?;
+        Ok::<_, Box<dyn Error>>(receiver_c)
+    })?;
+    assert!(first_close_finished.get());
+    node.peer.barrier(channels).await?;
+    let reused = Link {
+        channels,
+        peer: 55,
+        local: 0,
+    };
+    let mut sender = node.sender(&mut session, reused).await?;
+    node.outgoing_message(&mut sender, reused, 7).await?;
+    node.incoming_message(&mut receiver_c, replacement, 3, 8)
+        .await?;
+    node.shutdown().await;
+    Ok(())
+}
+
+async fn server_pending_echo_waits_for_own_attach() -> TestResult {
+    let mut node = Node::new(true).await?;
+    let main = channels(true, 0);
+    let sibling = channels(true, 1);
+    let mut session = node.session(main, 0).await?;
+    let mut sibling_session = node.session(sibling, 0).await?;
+    let sibling_link = Link {
+        channels: sibling,
+        peer: 77,
+        local: 0,
+    };
+    let mut sibling_receiver = node.receiver(&mut sibling_session, sibling_link).await?;
+    let pending = Link {
+        channels: main,
+        peer: 55,
+        local: 0,
+    };
+    let incoming = node.pending(&mut session, pending, Role::Sender).await?;
+    let mut echo = node.peer.flow(main);
+    echo.handle = Some(pending.peer);
+    echo.delivery_count = Some(0);
+    echo.echo = true;
+    node.peer
+        .send(main.incoming, Performative::Flow(echo), Vec::new())
+        .await?;
+    only_session_flow(&node.peer.barrier(sibling).await?, sibling.outgoing);
+    let mut receiver = node.approve_receiver(&session, incoming, pending).await?;
+    node.incoming_message(&mut receiver, pending, 0, 9).await?;
+    node.incoming_message(&mut sibling_receiver, sibling_link, 0, 10)
+        .await?;
+    node.shutdown().await;
+    Ok(())
+}
+
+async fn server_pending_detach_publishes_own_handle_before_acknowledging() -> TestResult {
+    let mut node = Node::new(true).await?;
+    let main = channels(true, 0);
+    let sibling = channels(true, 1);
+    let mut session = node.session(main, 0).await?;
+    let mut sibling_session = node.session(sibling, 0).await?;
+    let sibling_link = Link {
+        channels: sibling,
+        peer: 77,
+        local: 0,
+    };
+    let mut sibling_receiver = node.receiver(&mut sibling_session, sibling_link).await?;
+    let pending = Link {
+        channels: main,
+        peer: 55,
+        local: 0,
+    };
+    let incoming = node.pending(&mut session, pending, Role::Sender).await?;
+    assert_eq!(incoming.attach().handle, 55);
+    node.peer
+        .send(
+            main.incoming,
+            Performative::Detach(detach(pending.peer)),
+            Vec::new(),
+        )
+        .await?;
+    let own = node.peer.own_attach(pending, Role::Receiver).await?;
+    assert_eq!(own.name, incoming.attach().name);
+    assert!(own.source.is_none());
+    assert!(own.target.is_none());
+    node.peer.detach(pending).await?;
+    only_session_flow(&node.peer.barrier(sibling).await?, sibling.outgoing);
+    let Session::Server(server_session) = &session else {
+        panic!("server session")
+    };
+    assert!(matches!(
+        timeout(IO_TIMEOUT, server_session.accept_attach(incoming, 4096)).await?,
+        Err(EngineError::RemoteDetached)
+    ));
+    only_session_flow(&node.peer.barrier(sibling).await?, sibling.outgoing);
+    let replacement = Link {
+        channels: main,
+        peer: 0,
+        local: 0,
+    };
+    let mut receiver = node.receiver(&mut session, replacement).await?;
+    node.incoming_message(&mut receiver, replacement, 0, 11)
+        .await?;
+    node.incoming_message(&mut sibling_receiver, sibling_link, 0, 12)
+        .await?;
+    node.shutdown().await;
+    Ok(())
+}
+
+async fn client_unpublished_peer_handle_ends_only_its_session() -> TestResult {
+    let mut node = Node::new(false).await?;
+    let main = channels(false, 0);
+    let sibling = channels(false, 1);
+    let mut session = node.session(main, 0).await?;
+    let mut sibling_session = node.session(sibling, 0).await?;
+    let sibling_link = Link {
+        channels: sibling,
+        peer: 77,
+        local: 0,
+    };
+    let mut sibling_receiver = node.receiver(&mut sibling_session, sibling_link).await?;
+    let Session::Client(client_session) = &mut session else {
+        panic!("client session")
+    };
+    let unpublished = Link {
+        channels: main,
+        peer: 55,
+        local: 0,
+    };
+    let (result, wire) = tokio::join!(
+        client_session.attach_receiver("unpublished", "queue"),
+        async {
+            node.peer.own_attach(unpublished, Role::Receiver).await?;
+            let mut flow = node.peer.flow(main);
+            flow.handle = Some(unpublished.local);
+            flow.delivery_count = Some(0);
+            node.peer
+                .send(main.incoming, Performative::Flow(flow), Vec::new())
+                .await?;
+            node.peer
+                .end(main, "amqp:session:unattached-handle")
+                .await?;
+            node.peer
+                .send(main.incoming, Performative::End(End::default()), Vec::new())
+                .await
+        }
+    );
+    wire?;
+    assert!(
+        result.is_err(),
+        "no peer handle was published by an Attach response"
+    );
+    node.peer.barrier(sibling).await?;
+    node.incoming_message(&mut sibling_receiver, sibling_link, 0, 13)
+        .await?;
+    node.shutdown().await;
+    Ok(())
+}
+
+async fn zero_maximum_accepts_high_peer_handles_for_both_roles(server: bool) -> TestResult {
+    for receiving in [true, false] {
+        let mut node = Node::new(server).await?;
+        let channels = channels(server, 0);
+        let mut session = node.session(channels, 0).await?;
+        let link = Link {
+            channels,
+            peer: 55,
+            local: 0,
+        };
+        if receiving {
+            let mut receiver = node.receiver(&mut session, link).await?;
+            node.incoming_message(&mut receiver, link, 0, 14).await?;
+            node.close_receiver(&receiver, link).await?;
+        } else {
+            let mut sender = node.sender(&mut session, link).await?;
+            node.outgoing_message(&mut sender, link, 15).await?;
+            node.peer
+                .send(
+                    channels.incoming,
+                    Performative::Detach(detach(link.peer)),
+                    Vec::new(),
+                )
+                .await?;
+            node.peer.detach(link).await?;
+        }
+        node.shutdown().await;
+    }
+    Ok(())
+}
+
+async fn server_handle_range_exhaustion_preserves_sibling() -> TestResult {
+    let mut node = Node::new(true).await?;
+    let main = channels(true, 0);
+    let sibling = channels(true, 1);
+    let mut session = node.session(main, 0).await?;
+    let mut sibling_session = node.session(sibling, 0).await?;
+    let existing = Link {
+        channels: main,
+        peer: 55,
+        local: 0,
+    };
+    let mut receiver = node.receiver(&mut session, existing).await?;
+    let sibling_link = Link {
+        channels: sibling,
+        peer: 77,
+        local: 0,
+    };
+    let mut sibling_receiver = node.receiver(&mut sibling_session, sibling_link).await?;
+    let overflow = Link {
+        channels: main,
+        peer: 56,
+        local: 0,
+    };
+    node.peer
+        .send(
+            main.incoming,
+            Performative::Attach(Box::new(attach(overflow, Role::Sender))),
+            Vec::new(),
+        )
+        .await?;
+    node.peer.end(main, "amqp:resource-limit-exceeded").await?;
+    let Session::Server(server_session) = &mut session else {
+        panic!("server session")
+    };
+    assert!(
+        timeout(IO_TIMEOUT, server_session.next_incoming_attach())
+            .await?
+            .is_none(),
+        "overflow owns no approval receipt"
+    );
+    assert!(matches!(
+        timeout(IO_TIMEOUT, receiver.recv()).await?,
+        Err(EngineError::RemoteDetached)
+    ));
+    node.peer
+        .send(main.incoming, Performative::End(End::default()), Vec::new())
+        .await?;
+    node.peer.barrier(sibling).await?;
+    node.incoming_message(&mut sibling_receiver, sibling_link, 0, 16)
+        .await?;
+    node.shutdown().await;
+    Ok(())
+}
+
+async fn client_handle_range_refusal_and_retry_preserve_sibling() -> TestResult {
+    let mut node = Node::new(false).await?;
+    let main = channels(false, 0);
+    let sibling = channels(false, 1);
+    let mut session = node.session(main, 0).await?;
+    let mut sibling_session = node.session(sibling, 0).await?;
+    let existing = Link {
+        channels: main,
+        peer: 55,
+        local: 0,
+    };
+    let mut receiver = node.receiver(&mut session, existing).await?;
+    let sibling_link = Link {
+        channels: sibling,
+        peer: 77,
+        local: 0,
+    };
+    let mut sibling_receiver = node.receiver(&mut sibling_session, sibling_link).await?;
+    let Session::Client(client_session) = &mut session else {
+        panic!("client session")
+    };
+    assert!(matches!(
+        timeout(
+            IO_TIMEOUT,
+            client_session.attach_receiver("overflow", "queue")
+        )
+        .await?,
+        Err(EngineError::InvalidState(_))
+    ));
+    only_session_flow(&node.peer.barrier(sibling).await?, sibling.outgoing);
+    node.incoming_message(&mut receiver, existing, 0, 17)
+        .await?;
+    node.close_receiver(&receiver, existing).await?;
+    node.peer.barrier(main).await?;
+    let replacement = Link {
+        channels: main,
+        peer: 56,
+        local: 0,
+    };
+    let mut receiver = node.receiver(&mut session, replacement).await?;
+    node.incoming_message(&mut receiver, replacement, 1, 18)
+        .await?;
+    node.incoming_message(&mut sibling_receiver, sibling_link, 0, 19)
+        .await?;
+    node.shutdown().await;
+    Ok(())
+}
+
+async fn numeric_local_handle_is_not_a_peer_alias(server: bool) -> TestResult {
+    let mut node = Node::new(server).await?;
+    let main = channels(server, 0);
+    let sibling = channels(server, 1);
+    let mut session = node.session(main, 0).await?;
+    let mut sibling_session = node.session(sibling, 0).await?;
+    let existing = Link {
+        channels: main,
+        peer: 55,
+        local: 0,
+    };
+    let _receiver = node.receiver(&mut session, existing).await?;
+    let sibling_link = Link {
+        channels: sibling,
+        peer: 77,
+        local: 0,
+    };
+    let mut sibling_receiver = node.receiver(&mut sibling_session, sibling_link).await?;
+    node.peer
+        .send(
+            main.incoming,
+            Performative::Transfer(transfer(existing.local, 0)),
+            encode_message(&Message::data(vec![20]))?,
+        )
+        .await?;
+    node.peer
+        .end(main, "amqp:session:unattached-handle")
+        .await?;
+    node.peer
+        .send(main.incoming, Performative::End(End::default()), Vec::new())
+        .await?;
+    node.peer.barrier(sibling).await?;
+    node.incoming_message(&mut sibling_receiver, sibling_link, 0, 21)
+        .await?;
+    node.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn server_routes_both_link_roles_with_distinct_channels_and_handles() -> TestResult {
+    timeout(CASE_TIMEOUT, both_roles(true)).await?
+}
+
+#[tokio::test]
+async fn client_routes_both_link_roles_with_distinct_channels_and_handles() -> TestResult {
+    timeout(CASE_TIMEOUT, both_roles(false)).await?
+}
+
+#[tokio::test]
+async fn server_crossed_handles_keep_exact_closing_and_reused_link_owners() -> TestResult {
+    timeout(CASE_TIMEOUT, crossed_handles_and_closing_ownership(true)).await?
+}
+
+#[tokio::test]
+async fn client_crossed_handles_keep_exact_closing_and_reused_link_owners() -> TestResult {
+    timeout(CASE_TIMEOUT, crossed_handles_and_closing_ownership(false)).await?
+}
+
+#[tokio::test]
+async fn server_pending_echo_is_deferred_until_its_own_attach_publishes_the_handle() -> TestResult {
+    timeout(CASE_TIMEOUT, server_pending_echo_waits_for_own_attach()).await?
+}
+
+#[tokio::test]
+async fn server_pending_cancel_publishes_own_attach_then_detach_and_retires_receipt() -> TestResult
+{
+    timeout(
+        CASE_TIMEOUT,
+        server_pending_detach_publishes_own_handle_before_acknowledging(),
+    )
+    .await?
+}
+
+#[tokio::test]
+async fn client_flow_before_peer_attach_ends_only_the_unpublished_link_session() -> TestResult {
+    timeout(
+        CASE_TIMEOUT,
+        client_unpublished_peer_handle_ends_only_its_session(),
+    )
+    .await?
+}
+
+#[tokio::test]
+async fn server_zero_handle_maximum_still_receives_high_peer_handles_for_both_roles() -> TestResult
+{
+    timeout(
+        CASE_TIMEOUT,
+        zero_maximum_accepts_high_peer_handles_for_both_roles(true),
+    )
+    .await?
+}
+
+#[tokio::test]
+async fn client_zero_handle_maximum_still_receives_high_peer_handles_for_both_roles() -> TestResult
+{
+    timeout(
+        CASE_TIMEOUT,
+        zero_maximum_accepts_high_peer_handles_for_both_roles(false),
+    )
+    .await?
+}
+
+#[tokio::test]
+async fn server_output_handle_exhaustion_refuses_its_session_without_harming_a_sibling()
+-> TestResult {
+    timeout(
+        CASE_TIMEOUT,
+        server_handle_range_exhaustion_preserves_sibling(),
+    )
+    .await?
+}
+
+#[tokio::test]
+async fn client_output_handle_exhaustion_is_local_and_retries_after_exact_detach_ack() -> TestResult
+{
+    timeout(
+        CASE_TIMEOUT,
+        client_handle_range_refusal_and_retry_preserve_sibling(),
+    )
+    .await?
+}
+
+#[tokio::test]
+async fn server_local_handle_number_is_not_an_incoming_peer_alias() -> TestResult {
+    timeout(CASE_TIMEOUT, numeric_local_handle_is_not_a_peer_alias(true)).await?
+}
+
+#[tokio::test]
+async fn client_local_handle_number_is_not_an_incoming_peer_alias() -> TestResult {
+    timeout(
+        CASE_TIMEOUT,
+        numeric_local_handle_is_not_a_peer_alias(false),
+    )
+    .await?
+}
