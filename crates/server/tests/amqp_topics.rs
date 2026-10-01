@@ -385,8 +385,11 @@ async fn a_subscription_dead_letters_only_its_own_copy_and_drains_the_reason<P: 
 mod batch;
 #[path = "amqp_topics/management.rs"]
 mod management;
+
 #[path = "amqp_topics/routing.rs"]
 mod routing;
+#[path = "amqp_topics/scheduling.rs"]
+mod scheduling;
 
 macro_rules! for_each_backend {
     ($($case:ident,)+) => {

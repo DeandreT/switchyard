@@ -527,6 +527,8 @@ await BatchCases.RunAsync(client, queue + "-batches", sessionQueue + "-batches",
 await TopicCases.RunAsync(client, queue + "-topics", "Alpha", "beta");
 await TopicSessionCases.RunAsync(client, queue + "-topic-sessions", "Alpha", "beta", "ordinary");
 await SessionPeekCases.RunAsync(client, sessionQueue + "-peek");
+await TopicSchedulingCases.RunAsync(client, queue + "-topic-scheduling",
+    queue + "-topic-scheduling-sessions");
 
 Console.WriteLine(
     "official .NET Service Bus client send/batch/peek/receive/settlement updates/defer/dead-letter/expiry/renew/complete/schedule/cancel/duplicate and session renew/state/deferred receive passed");

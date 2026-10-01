@@ -180,6 +180,42 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
             },
         )?;
     }
+    let scheduling_topic = domain::EntityPath::new("orders-topic-scheduling")?;
+    let scheduling_session_topic = domain::EntityPath::new("orders-topic-scheduling-sessions")?;
+    for (parent, has_sessions) in [
+        (&scheduling_topic, false),
+        (&scheduling_session_topic, true),
+    ] {
+        broker.handle().submit_blocking(
+            namespace.clone(),
+            parent.clone(),
+            CommandKind::CreateTopic {
+                config: TopicConfig {
+                    requires_duplicate_detection: !has_sessions,
+                    duplicate_detection_history_time_window_millis: 300_000,
+                    ..TopicConfig::default()
+                },
+            },
+        )?;
+        let names: &[&str] = if has_sessions {
+            &["Alpha", "beta", "ordinary"]
+        } else {
+            &["Alpha", "beta"]
+        };
+        for &name in names {
+            broker.handle().submit_blocking(
+                namespace.clone(),
+                parent.clone(),
+                CommandKind::CreateSubscription {
+                    name: SubscriptionName::new(name)?,
+                    config: SubscriptionConfig {
+                        requires_session: has_sessions && name != "ordinary",
+                        ..SubscriptionConfig::default()
+                    },
+                },
+            )?;
+        }
+    }
     let _timer = TestTimer::start(broker.handle());
 
     let rule = SharedAccessRule::new(
@@ -277,6 +313,8 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
     for marker in [
         "required subscription management-only global/session-filtered peek passed",
         "required queue management-only global/session-filtered peek passed",
+        "topic schedule/cancel/parent browse/timer/TTL/new sequence/dedup passed",
+        "scheduled topic session/ordinary/independent SDLQ copies passed",
     ] {
         assert!(
             String::from_utf8_lossy(&output.stdout).contains(marker),
@@ -380,5 +418,42 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
             .is_empty(),
         "session queue browse cleanup left an active hold"
     );
+    for (parent, has_sessions) in [
+        (&scheduling_topic, false),
+        (&scheduling_session_topic, true),
+    ] {
+        let namespace = domain::NamespaceName::new("tenant")?;
+        for prefix in [
+            domain::keys::message_prefix(&namespace, parent),
+            domain::keys::scheduled_prefix(&namespace, parent),
+        ] {
+            assert!(
+                store.scan_prefix(&prefix, 1)?.is_empty(),
+                "scheduled topic SDK workflow left parent retention in {parent}"
+            );
+        }
+        let names: &[&str] = if has_sessions {
+            &["Alpha", "beta", "ordinary"]
+        } else {
+            &["Alpha", "beta"]
+        };
+        for &name in names {
+            let entity = parent.subscription(&SubscriptionName::new(name)?)?;
+            for target in [entity.clone(), entity.dead_letter_queue()?] {
+                assert!(
+                    store
+                        .scan_prefix(&domain::keys::message_prefix(&namespace, &target), 1)?
+                        .is_empty(),
+                    "scheduled topic SDK workflow left retained messages in {target}"
+                );
+                assert!(
+                    store
+                        .scan_prefix(&domain::keys::session_lock_prefix(&namespace, &target), 1)?
+                        .is_empty(),
+                    "scheduled topic SDK cleanup left an active hold in {target}"
+                );
+            }
+        }
+    }
     Ok(())
 }
