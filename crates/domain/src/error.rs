@@ -2,9 +2,10 @@ use storage::StorageError;
 use thiserror::Error;
 
 use crate::{
-    CodecError, EntityDeleteLimit, IdentifierError, IngressBatchLimit, NamespaceName,
-    QueueConfigError, QueueCounterKind, QueueImmutableProperty, RuleMatchLimit, SequenceNumber,
-    SessionId, SqlCompileError, SubscriptionImmutableProperty, Timestamp, TopicImmutableProperty,
+    AtomicMessagingLimit, CodecError, EntityDeleteLimit, IdentifierError, IngressBatchLimit,
+    NamespaceName, QueueConfigError, QueueCounterKind, QueueImmutableProperty, RuleMatchLimit,
+    SequenceNumber, SessionId, SqlCompileError, SubscriptionImmutableProperty, Timestamp,
+    TopicImmutableProperty,
 };
 
 /// Every rejection the state machine can produce.
@@ -13,6 +14,17 @@ use crate::{
 /// command rejects it exactly where the leader did.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum BrokerError {
+    #[error("atomic messaging commands must have one exact scope and timestamp")]
+    InvalidAtomicMessagingCommand,
+    #[error(
+        "atomic messaging supports only immediate sends and held settlements on a non-session primary queue"
+    )]
+    AtomicMessagingOperationNotSupported,
+    #[error("atomic messaging {limit} exceeds the maximum of {maximum}")]
+    AtomicMessagingTooLarge {
+        limit: AtomicMessagingLimit,
+        maximum: usize,
+    },
     #[error("the entity binding has been deleted or replaced")]
     EntityBindingStale,
     #[error("the entity binding does not match the requested operation")]

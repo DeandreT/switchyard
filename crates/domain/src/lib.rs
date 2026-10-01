@@ -10,6 +10,7 @@
 pub mod codec;
 pub mod keys;
 
+mod atomic_messaging;
 mod command;
 mod entity_binding;
 mod error;
@@ -24,6 +25,15 @@ mod sql_filter;
 mod time;
 mod topic;
 
+pub use atomic_messaging::{
+    AtomicMessagingApplication, AtomicMessagingCommand, AtomicMessagingLimit,
+    MAX_ATOMIC_MESSAGING_ACTIONS, MAX_ATOMIC_MESSAGING_CONTENT_BYTES,
+    MAX_ATOMIC_MESSAGING_MESSAGES, MAX_ATOMIC_MESSAGING_MUTATION_KEY_BYTES,
+    MAX_ATOMIC_MESSAGING_MUTATION_KEYS, MAX_ATOMIC_MESSAGING_MUTATION_VALUE_BYTES,
+    MAX_ATOMIC_MESSAGING_READ_KEY_BYTES, MAX_ATOMIC_MESSAGING_READ_OPERATIONS,
+    MAX_ATOMIC_MESSAGING_READ_VALUE_BYTES, MAX_ATOMIC_MESSAGING_VALUE_ITEMS,
+    validate_atomic_messaging_kinds,
+};
 pub use codec::CodecError;
 pub use command::{
     Command, CommandKind, CommandOutcome, DeleteEntityTarget, DeliveryBudget, EntityDeleteLimit,

@@ -24,6 +24,7 @@ use crate::{
     SessionLock, SessionRecord, SettlementDisposition, Timestamp, codec, keys,
 };
 
+mod atomic_messaging;
 mod entity_deletion;
 mod incarnations;
 mod message_retention;
@@ -174,6 +175,11 @@ struct ResponseBudget {
     used: u64,
 }
 
+struct PreparedCommand {
+    batch: WriteBatch,
+    application: CommandApplication,
+}
+
 impl ResponseBudget {
     fn new(limits: DeliveryBudget) -> Self {
         Self { limits, used: 0 }
@@ -211,8 +217,9 @@ impl<S: StateStore> StateMachine<S> {
 
     /// Applies one replicated command.
     ///
-    /// On error nothing is written, so a rejection leaves state untouched on
-    /// every replica.
+    /// Preparation errors leave state untouched. A final storage error can
+    /// leave the atomic commit decision unknown; it never produces a successful
+    /// application result. See [`StateStore::apply`].
     pub fn apply(&self, command: &Command) -> Result<CommandOutcome, BrokerError> {
         Ok(self.apply_with_effects(command)?.outcome)
     }
@@ -220,6 +227,14 @@ impl<S: StateStore> StateMachine<S> {
     /// Applies one command and reports its committed enqueue destinations
     /// without additional store reads or changes to ordinary outcomes.
     pub fn apply_with_effects(&self, command: &Command) -> Result<CommandApplication, BrokerError> {
+        let prepared = self.prepare_command(command)?;
+        if !prepared.batch.is_empty() {
+            self.store.apply(prepared.batch)?;
+        }
+        Ok(prepared.application)
+    }
+
+    fn prepare_command(&self, command: &Command) -> Result<PreparedCommand, BrokerError> {
         let last_applied = self.last_applied_time()?;
         if command.issued_at < last_applied {
             return Err(BrokerError::ClockRegression {
@@ -540,13 +555,15 @@ impl<S: StateStore> StateMachine<S> {
             // Advancing the clock in the same batch keeps the applied timestamp
             // and the state it produced consistent under a crash.
             batch.push_put(keys::clock(), codec::encode(&command.issued_at)?);
-            self.store.apply(batch)?;
         }
-        Ok(CommandApplication {
-            outcome,
-            dead_letters_enqueued,
-            subscription_enqueues,
-            entity_deletions,
+        Ok(PreparedCommand {
+            batch,
+            application: CommandApplication {
+                outcome,
+                dead_letters_enqueued,
+                subscription_enqueues,
+                entity_deletions,
+            },
         })
     }
 

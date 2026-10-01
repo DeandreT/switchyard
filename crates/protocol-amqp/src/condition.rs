@@ -48,6 +48,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::RuleLimitExceeded { .. }
         | BrokerError::EntityDeleteTooLarge { .. }
         | BrokerError::EntityIncarnationExhausted
+        | BrokerError::AtomicMessagingTooLarge { .. }
         | BrokerError::TopicRuleMatchTooLarge { .. } => RESOURCE_LIMIT_EXCEEDED,
         BrokerError::TopicDataPlaneNotImplemented => NOT_IMPLEMENTED,
         BrokerError::SqlRuleCompilation(error) => match error {
@@ -79,6 +80,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         // no retry fixes.
         BrokerError::SessionRequired
         | BrokerError::SessionNotSupported
+        | BrokerError::AtomicMessagingOperationNotSupported
         | BrokerError::DeadLetterQueueIsReserved
         | BrokerError::SubscriptionPathIsReserved => NOT_ALLOWED,
 
@@ -93,6 +95,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::InvalidRule { .. }
         | BrokerError::EntityKindMismatch
         | BrokerError::InvalidEntityBinding
+        | BrokerError::InvalidAtomicMessagingCommand
         | BrokerError::QueuePageLimitExceeded { .. }
         | BrokerError::QueueCursorNamespaceMismatch { .. }
         | BrokerError::TopicPageLimitExceeded { .. }
@@ -137,6 +140,36 @@ mod tests {
     use domain::{QueueCounterKind, QueueImmutableProperty, SequenceNumber, SessionId, Timestamp};
 
     use super::*;
+
+    #[test]
+    fn atomic_group_refusals_have_nonretryable_conditions() {
+        for (error, expected) in [
+            (BrokerError::InvalidAtomicMessagingCommand, INVALID_FIELD),
+            (
+                BrokerError::AtomicMessagingOperationNotSupported,
+                NOT_ALLOWED,
+            ),
+        ] {
+            assert_eq!(condition_for(&error), expected);
+            assert!(!is_retryable(&error));
+        }
+        for limit in [
+            domain::AtomicMessagingLimit::Actions,
+            domain::AtomicMessagingLimit::Messages,
+            domain::AtomicMessagingLimit::ContentBytes,
+            domain::AtomicMessagingLimit::ValueItems,
+            domain::AtomicMessagingLimit::ReadOperations,
+            domain::AtomicMessagingLimit::ReadKeyBytes,
+            domain::AtomicMessagingLimit::ReadValueBytes,
+            domain::AtomicMessagingLimit::MutationKeys,
+            domain::AtomicMessagingLimit::MutationKeyBytes,
+            domain::AtomicMessagingLimit::MutationValueBytes,
+        ] {
+            let error = BrokerError::AtomicMessagingTooLarge { limit, maximum: 1 };
+            assert_eq!(condition_for(&error), RESOURCE_LIMIT_EXCEEDED);
+            assert!(!is_retryable(&error));
+        }
+    }
 
     fn session() -> SessionId {
         SessionId::new("cart-1").expect("a valid session id")

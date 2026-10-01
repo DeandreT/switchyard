@@ -34,6 +34,7 @@ use tracing::debug;
 use crate::{AdminTarget, Clock, LocalProposer, ProposeError};
 
 mod admin_reads;
+mod atomic_messaging;
 mod bindings;
 mod protocol;
 
@@ -45,6 +46,11 @@ mod protocol;
 const COMMAND_QUEUE_DEPTH: usize = 1_024;
 
 enum Request {
+    ApplyAtomicMessaging {
+        binding: EntityBinding,
+        kinds: Vec<CommandKind>,
+        reply: flume::Sender<Result<domain::AtomicMessagingApplication, ProposeError>>,
+    },
     Apply {
         namespace: NamespaceName,
         entity: EntityPath,
@@ -517,6 +523,19 @@ impl Broker {
             .spawn(move || {
                 while let Ok(request) = incoming.recv() {
                     match request {
+                        Request::ApplyAtomicMessaging {
+                            binding,
+                            kinds,
+                            reply,
+                        } => {
+                            let application = proposer.propose_atomic_messaging(&binding, kinds);
+                            if let Ok(applied) = &application {
+                                for target in &applied.enqueue_targets {
+                                    watching.notify(binding.namespace(), target);
+                                }
+                            }
+                            let _ = reply.send(application);
+                        }
                         Request::Apply {
                             namespace,
                             entity,

@@ -155,7 +155,7 @@ impl<S: StateStore> StateMachine<S> {
         self.rules(namespace, topic, subscription)
     }
 
-    fn validate_binding_target(
+    pub(super) fn validate_binding_target(
         &self,
         binding: &EntityBinding,
         namespace: &NamespaceName,

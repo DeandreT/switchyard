@@ -91,6 +91,11 @@ pub trait StateStore: Clone + Send + Sync + 'static {
     /// again after the process died mid-commit. A durable backend has persisted
     /// the batch before this returns, so nothing is acknowledged that a power
     /// failure could take back.
+    ///
+    /// An error does not prove the batch is absent. A complete journal entry
+    /// can reach storage before a persistence error is reported, and reopening
+    /// can recover the entire batch. Such a commit decision is unknown to the
+    /// caller: publish no success effects and do not assume retry idempotence.
     fn apply(&self, batch: WriteBatch) -> Result<(), StorageError>;
 
     /// Returns every entry in the store, in ascending key order, read at a
