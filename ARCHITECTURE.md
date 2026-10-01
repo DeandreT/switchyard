@@ -26,8 +26,9 @@ subscriptions retain session identifiers without session-affine delivery.
 Read-only management browsing can inspect all sessions without acquiring a hold.
 Committed delivery notifications wake all registered entity waiters, including
 independent session receivers; registration precedes each receive attempt.
-Boolean and scalar correlation rules are persisted and managed through AMQP;
-general SQL, actions, and Azure administration remain unimplemented. Native
+Boolean, scalar correlation, and bounded SQL rules are persisted and managed
+through AMQP. SQL error routing has an explicit subscription policy; actions
+and Azure administration remain unimplemented. Native
 administration creates and reads topology, lists topics and subscriptions, and
 updates queues; the timer worker covers
 scheduled activation and the four expiry indexes that exist,
@@ -254,7 +255,7 @@ overlays, making follower application deterministic. One encrypted payload can
 be referenced by multiple subscriptions and is removed after the final
 reference disappears.
 
-The implementation currently evaluates Boolean and scalar correlation rules
+The implementation currently evaluates Boolean, scalar correlation, and SQL rules
 inside the deterministic state machine, using its validated bounded membership,
 complete rule sets, and one atomic batch. Subscription creation persists an
 explicit `$Default` true rule; removing the final rule selects nothing. Conditions
@@ -268,7 +269,14 @@ assigns a new shared active sequence, and starts each copy's TTL. Late-member
 participation and rule timing are local policies, not cloud-verified guarantees. Session-required
 subscriptions own sessions independently; missing identifiers route copies to
 their respective dead-letter shadows only when their rules select the publication.
-General SQL and actions remain unimplemented.
+SQL rules retain original source and a semantic version, never a parser AST.
+Ephemeral compilation shares one allowance across the complete topic load;
+correlation and SQL evaluation shares one command allowance. Finite SQL errors
+override matches within one subscription. By default they route one session-free,
+lifetime-free copy to its shadow with fixed local error fields; disabling the
+subscription option drops only that copy. Resource limits instead refuse the
+entire command atomically, including limits found after a finite error. Actions
+remain unimplemented. Detailed SQL policies are in [SQL Rules](docs/sql-rules.md).
 Fanout admission bounds retained copies, content, and typed value items before
 cloning; committed application effects name only actual ready destinations.
 Topic activation commits a fitting due prefix of at most 256 inspected sources,

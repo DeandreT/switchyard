@@ -32,7 +32,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
 | Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list, Rust clients on both backends and both pinned .NET clients; Azure administration not implemented |
-| Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean and scalar correlation rules through AMQP; general SQL and actions not implemented |
+| Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP; actions not implemented |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Dead-letter | Pre-1.0 | State machine, AMQP mapping |
@@ -218,8 +218,9 @@ OR together and emit at most one copy per matching subscription. Removing the
 final rule selects nothing, with no implicit default fallback. These Boolean,
 default, and combination semantics follow Microsoft's
 [topic filter documentation](https://learn.microsoft.com/en-us/azure/service-bus-messaging/topic-filters).
-General SQL expressions, actions, and compound correlation predicates are
-explicitly unsupported rather than treated as successful matches.
+Bounded SQL predicates are supported alongside those filters. Actions and
+compound correlation predicates remain explicitly unsupported rather than
+treated as successful matches.
 
 Correlation rules select the eight retained system string properties and scalar
 application properties. `label` maps to subject; message and session identifiers
@@ -255,82 +256,22 @@ due prefix, or leaves the first unfit publication pending and cancelable. Rule
 matching precedes missing-session routing, so an excluded publication creates
 no dead-letter copy on that subscription.
 
-### SQL Predicate Foundation
+### SQL Rules
 
-The domain library exposes an ephemeral `SqlProgram` compiler and evaluator.
-It is not yet a persisted `RuleFilter` variant or an AMQP rule-management
-capability: general SQL rule requests remain explicitly unsupported. This
-foundation does not change publication routing or either durable format.
+SQL rules retain their original expression and semantic version, not a parser
+AST or compiled program. The complete topic rule load shares one compilation
+allowance; all correlation and SQL evaluation shares one command allowance.
+Only true selects a copy. A finite SQL error overrides a matching rule on the
+same subscription, but does not prevent delivery to healthy siblings.
 
-Expression syntax is parsed by the pinned SQL parser, then lowered to a flat
-postorder program with backward-only child indexes. Neither the dependency AST
-nor the native program is serialized. The compiler permits Boolean logic,
-comparisons, numeric arithmetic, `IS NULL`, `IN`, `LIKE`, and property existence;
-queries, actions, casts, and nondeterministic functions remain unsupported.
-`p('literal')` and `property('literal')` address literal user-property names,
-including periods. Dynamic property-name expressions are unsupported. Explicit
-`sys` scope supports the same eight retained properties as correlation rules;
-unknown system names and scopes are rejected at compilation.
-User-property names must be nonempty and contain no control characters.
-
-SQL predicates distinguish true, false, and unknown; only true selects a
-message. Missing user properties are unknown, while present Null and absent
-known optional system properties are Null. `IS NULL` accepts either missing
-or Null. The Boolean truth tables and missing-user behavior follow the
-[SQL filter specification](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-messaging-sql-filter).
-Known-system absence is an explicit local choice, not cloud-verified behavior.
-Existence distinguishes missing user properties from present Null, and treats
-unset known system properties as absent. Null comparisons and null/unknown
-`IN` operands propagate unknown locally; a successful `IN` comparison wins over
-unknown candidates, but incompatible candidates remain errors. Those additional
-choices have not been compared with a cloud namespace.
-Authoritative ingress message/session identifiers are borrowed from the caller.
-
-User-property lookup compares allocation-free Unicode lowercase streams and
-refuses case-colliding keys rather than selecting one by map order. Regular
-identifiers use Unicode alphabetic starts and alphanumeric/underscore
-continuations; quoted names preserve other characters. These Unicode policies
-are local, not claims of exact .NET culture or character-category parity.
-String equality and `LIKE` are case-sensitive; string ordering is unsupported.
-`LIKE` uses a bounded regular-expression engine with escaped literals, full
-string anchors, newline-aware wildcards, and one Unicode scalar per `_`.
-The scalar-width choice is local and has not been compared with Azure.
-
-Integer literals retain Int64 semantics and floating literals use Double.
-Numeric comparison preserves integer precision instead of converting every
-value to floating point. Supported numeric promotions distinguish signed and
-unsigned widths. Nonnegative constant-only integral expressions can convert
-to Ulong, while signed runtime properties cannot; this constant-binding choice
-is local, not a cloud-verified interpretation of the SDK's Int64 literals.
-Integral overflow and zero divisors
-are finite evaluation errors; floating arithmetic retains IEEE-754 results.
-SQL values currently support Boolean, string, and integer/floating numeric
-constructors. Decimal, character, timestamp, UUID, binary, symbol, and compound
-values remain unsupported for scalar operators, but existence/null checks do
-not traverse or reject an otherwise present value.
-Unsupported message scalar types, incompatible operands, ambiguous names,
-and invalid `LIKE` escapes are errors, not false matches. Resource-limit
-refusals are separately typed and must not become dead-letter events when
-the evaluator is integrated into publication routing.
-
-Local compilation limits are 1,024 UTF-16 units, 4,096 UTF-8 bytes, 128 physical
-tokens, parser depth 32, 128 native nodes, native depth 32, and 32 `IN` items per
-expression. Source bounds apply before tokenization; the token bound applies
-before parsing and also bounds recursive AST destruction for flat chains.
-The tokenizer's temporary allocation is source-bounded, not token-capped during
-allocation. A shared compile allowance bounds a complete caller-defined rule
-load to 1 MiB source, 32,768 tokens, and 32,768 native nodes.
-
-Evaluation has a separate shared allowance of 1,048,576 work units and 32 MiB
-comparison bytes. Property scans and potential comparisons are charged before
-the corresponding work. Programs evaluate their flat nodes without Boolean
-shortcuts. Generated `LIKE` patterns are limited to 16 KiB, with 1 MiB compiled
-engine and DFA-cache limits; these are not total process-memory guarantees.
-The native evaluator owns no recursive message values and copies no producer
-payloads.
-The parser dependency's debug logs can contain rule source, so embedders must
-disable its logging targets. Public compiler/evaluator errors contain no rule
-source or producer values; the evaluator itself emits no logs.
+`dead_lettering_on_filter_evaluation_exceptions` defaults to true. Such errors
+then create one session-free, lifetime-free shadow copy with the local reason
+`SwitchyardSqlFilterError` and a fixed description containing no rule text or
+producer values. Setting the flag false drops only that subscription's copy.
+Resource exhaustion instead refuses the complete command atomically and never
+creates these dead letters. Current rules are evaluated again at scheduled
+activation. The supported grammar, local semantic choices, resource accounting,
+and wire contract are detailed in [SQL Rules](sql-rules.md).
 
 Topic publications may carry session identifiers, including mixed-session
 batches. Session-required subscriptions use session-affine ready indexes and
@@ -444,6 +385,9 @@ the normal atomic stamped-command path. Enumeration accepts `top` 1 through 100
 and a nonnegative `skip` against the complete bounded, sorted rule set. A requested
 page that exceeds the response allowance fails rather than returning a shortened
 successful page, which could prematurely stop the SDK's enumeration loop.
+SQL enumeration returns the exact stored source and SDK compatibility level 20.
+Malformed syntax returns status 400; unsupported constructs return 501; compile
+and evaluation resource limits return 403. None are simulated successful rules.
 
 Identifier allocation refuses exhaustion instead of saturating and reusing a
 stored identity. Sequence numbers are limited to `i64::MAX`, preserving exact
@@ -1005,8 +949,12 @@ gates cover the local shared-sequence policy, not cloud parity for that policy.
 Both pins also cover independent subscription sessions and management-only
 session browsing, plus parent topic scheduled browsing, cancellation, annotated
 send, and timer activation. Boolean/correlation rule creation, removal,
-enumeration, and delivery selection are also exercised. General SQL, actions,
-and Azure administration remain ungated.
+enumeration, and delivery selection are also exercised. SQL gates cover exact
+source enumeration, numeric and case-aware selection, missing/null properties,
+correlation overlap, both batch APIs, current-rule scheduled activation, and
+filter-error dead-letter/drop policies. Actions and Azure administration remain
+ungated. These checks establish local interoperability, not cloud parity for
+the documented SQL semantic choices.
 
 The SDK gates build into separate temporary directories and run the resulting
 assemblies directly. Run them explicitly with
@@ -1095,6 +1043,10 @@ paths and remain case-sensitive; AMQP scope conversion is not applied here.
 Read-only topology queries run on the owner without consulting the clock or
 stamping commands, validate complete metadata before returning a result, and
 refuse corrupt or dangling topology without partial responses.
+The presence-aware subscription setting
+`dead_lettering_on_filter_evaluation_exceptions` preserves an explicit false;
+omission uses the default true. Get/list and `switchyardctl` JSON report the
+committed value. It is not a backing-queue setting.
 
 List defaults to queues only, preserving existing queue clients and their `v1.`
 tokens. Explicit topic and subscription kinds use separate tokens bound to the
@@ -1134,16 +1086,18 @@ token. Command-line settings preserve omitted, false, zero, and unlimited TTL.
 
 ## Durable Format
 
-The current value format is version 9 and durable store layout is version 11.
-The value format appends the missing-session dead-letter reason without changing
-existing reason tags or message fields. Version 8 messages with earlier reasons
-and version 8 queue configurations remain decodable. A missing-session reason
-cannot be relabeled as an earlier message version. The layout protects the new
-policy-dependent ready indexes for session-bearing ordinary subscription copies
-and parent-retained topic schedules. It also protects explicit subscription
-rules, including an empty rule set after deletion. An older build would choose
-the wrong index when releasing those copies, leave pending topic publications
-unactivated, or deliver publications excluded by the new rules.
+The current value format is version 10 and durable store layout is version 12.
+The value format appends the subscription filter-error policy and a source-only
+SQL rule variant with semantic version 1. Legacy subscription configurations
+decode with the default true; relabeling the new shape as an older value format
+is refused. SQL rules likewise cannot be relabeled as pre-version-10 records.
+Message and queue shapes are unchanged, and existing reason tags stay intact;
+the missing-session reason retains its version-9 rollback guard.
+The layout protects SQL rule interpretation and the new subscription policy,
+in addition to explicit rules, session-bearing ordinary subscription indexes,
+and parent-retained topic schedules. An older build could otherwise decode the
+wrong configuration shape, fail to interpret SQL, or route publications under
+an older contract.
 Earlier message and queue-configuration shapes have tested decoders, but an
 earlier store directory is refused at open because its broker contract differs.
 There is no directory migration tooling yet; development directories
