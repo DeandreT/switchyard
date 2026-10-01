@@ -1155,7 +1155,7 @@ async fn detached_pending_attach_rejects_late_approval_before_the_handle_can_be_
 }
 
 #[tokio::test]
-async fn pending_handle_reuse_before_stale_approval_is_refused_without_affecting_other_sessions() {
+async fn pending_handle_reuse_before_stale_approval_is_safe_without_affecting_other_sessions() {
     let (mut connection, mut peer) = server_pair(512).await;
     let mut session = begin(&mut connection, &mut peer, 0, Begin::default()).await;
     write_amqp(
@@ -1196,19 +1196,34 @@ async fn pending_handle_reuse_before_stale_approval_is_refused_without_affecting
         Vec::new(),
     )
     .await
-    .expect("premature same-name handle reuse");
-    let Frame::Amqp {
-        performative: Some(Performative::End(end)),
-        ..
-    } = next_frame(&mut peer).await
-    else {
-        panic!("local canceled-approval policy refuses premature reuse");
-    };
-    assert_eq!(
-        end.error.expect("handle reuse error").condition.as_symbol(),
-        Symbol::from("amqp:session:handle-in-use")
-    );
-    assert!(session.accept_attach(incoming, 1024).await.is_err());
+    .expect("fresh same-name handle reuse");
+    let replacement = timeout(DEADLINE, session.next_incoming_attach())
+        .await
+        .expect("fresh reused handle is dispatched promptly")
+        .expect("fresh receipt");
+    assert!(matches!(
+        session.accept_attach(incoming, 1024).await,
+        Err(EngineError::RemoteDetached)
+    ));
+    let endpoint = session
+        .accept_attach(replacement, 1024)
+        .await
+        .expect("replacement approval remains live");
+    assert!(matches!(endpoint, LinkEndpoint::Sender(_)));
+    assert!(matches!(
+        next_frame(&mut peer).await,
+        Frame::Amqp {
+            channel: 0,
+            performative: Some(Performative::Attach(_)),
+            ..
+        }
+    ));
+    echo(
+        &mut peer,
+        0,
+        peer_flow(0, SESSION_WINDOW, 0, None, None, None, true),
+    )
+    .await;
     let _healthy = begin(&mut connection, &mut peer, 1, Begin::default()).await;
     echo(
         &mut peer,

@@ -368,9 +368,14 @@ async fn serve_session<B: Broker>(
                 attach.initial_delivery_count = Some(0);
             }
             debug!(?attach, "accepting CBS link");
-            let endpoint = session
+            let endpoint = match session
                 .accept_attach(attach, crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64)
-                .await?;
+                .await
+            {
+                Ok(endpoint) => endpoint,
+                Err(EngineError::RemoteDetached) => continue,
+                Err(error) => return Err(error.into()),
+            };
             let authorization = Arc::clone(authorization);
             match (target_address.as_str(), source_address.as_str(), endpoint) {
                 (crate::CBS_NODE, _, LinkEndpoint::Receiver(receiver)) => {
@@ -431,12 +436,17 @@ async fn serve_session<B: Broker>(
                                 resource,
                             )),
                             Err(_) => {
-                                let endpoint = session
+                                let endpoint = match session
                                     .accept_attach(
                                         attach,
                                         crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64,
                                     )
-                                    .await?;
+                                    .await
+                                {
+                                    Ok(endpoint) => endpoint,
+                                    Err(EngineError::RemoteDetached) => continue,
+                                    Err(error) => return Err(error.into()),
+                                };
                                 detach_with(
                                     endpoint,
                                     unauthorized_error(format!(
@@ -455,9 +465,14 @@ async fn serve_session<B: Broker>(
             };
 
             debug!(%address, ?attach, "accepting management link");
-            let endpoint = session
+            let endpoint = match session
                 .accept_attach(attach, crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64)
-                .await?;
+                .await
+            {
+                Ok(endpoint) => endpoint,
+                Err(EngineError::RemoteDetached) => continue,
+                Err(error) => return Err(error.into()),
+            };
             let (entity, link_authorization) = match plan {
                 Ok(plan) => plan,
                 Err(error) => {
@@ -576,6 +591,9 @@ async fn serve_session<B: Broker>(
                 if let Ok((entity, Some(accepted), _)) = &plan {
                     let hold = accepted.hold();
                     release_session(&broker, &namespace, entity, Some(&hold)).await;
+                }
+                if matches!(error, EngineError::RemoteDetached) {
+                    continue;
                 }
                 return Err(error.into());
             }
@@ -1178,6 +1196,9 @@ fn rejection_error(rejection: &BrokerRejection) -> AmqpProtocolError {
 
 #[cfg(test)]
 mod session_startup_tests;
+
+#[cfg(test)]
+mod session_provenance_tests;
 
 #[cfg(test)]
 mod tests {

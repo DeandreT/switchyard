@@ -29,6 +29,7 @@ mod idle;
 mod incoming_ledger;
 mod outgoing_identity;
 mod receive_credit;
+mod session_identity;
 
 use flow_control::{LinkCredit, LinkSnapshot, SessionWindow};
 pub use format_registry::MessageFormatDecoders;
@@ -42,6 +43,8 @@ use incoming_ledger::{
 };
 use outgoing_identity::AckIdentity;
 use receive_credit::{Consumption, ReceiveCredit};
+pub use session_identity::IncomingAttach;
+use session_identity::{AttachApproval, AttachApprovalError, SessionIdentity};
 
 const LINK_CREDIT: u32 = 32;
 const SESSION_WINDOW: u32 = 2_048;
@@ -267,6 +270,7 @@ struct ConnectionSettings {
     remote_max_frame_size: u32,
     local_max_frame_size: u32,
     channel_max: u16,
+    remote_channel_max: u16,
     options: ConnectionOptions,
     peer_idle_millis: u32,
 }
@@ -342,13 +346,15 @@ impl Drop for ConnectionReader {
 
 pub struct IncomingSession {
     channel: u16,
+    identity: SessionIdentity,
     pub begin: Begin,
 }
 
 pub struct ServerSession {
     channel: u16,
+    identity: SessionIdentity,
     commands: mpsc::Sender<Command>,
-    incoming_attaches: mpsc::Receiver<Attach>,
+    incoming_attaches: mpsc::Receiver<IncomingAttach>,
     consumed: Arc<Notify>,
 }
 
@@ -534,6 +540,7 @@ impl ServerConnection {
                     remote_max_frame_size,
                     local_max_frame_size,
                     channel_max,
+                    remote_channel_max: remote_open.channel_max,
                     options,
                     peer_idle_millis,
                 },
@@ -567,22 +574,32 @@ impl ServerConnection {
     }
 
     pub async fn next_incoming_session(&mut self) -> Option<IncomingSession> {
-        self.incoming_sessions.recv().await
+        while let Some(incoming) = self.incoming_sessions.recv().await {
+            if !incoming.identity.is_retired() {
+                return Some(incoming);
+            }
+        }
+        None
     }
 
     pub async fn accept_session(
         &self,
         incoming: IncomingSession,
     ) -> Result<ServerSession, EngineError> {
+        if incoming.identity.is_retired() {
+            return Err(EngineError::RemoteDetached);
+        }
         let (attach_tx, incoming_attaches) = mpsc::channel(32);
         request(&self.commands, |reply| Command::AcceptSession {
             channel: incoming.channel,
+            identity: incoming.identity.clone(),
             attach_tx,
             reply,
         })
         .await?;
         Ok(ServerSession {
             channel: incoming.channel,
+            identity: incoming.identity,
             commands: self.commands.clone(),
             incoming_attaches,
             consumed: self.consumed.clone(),
@@ -625,13 +642,18 @@ impl ServerConnection {
 }
 
 impl ServerSession {
-    pub async fn next_incoming_attach(&mut self) -> Option<Attach> {
-        self.incoming_attaches.recv().await
+    pub async fn next_incoming_attach(&mut self) -> Option<IncomingAttach> {
+        while let Some(attach) = self.incoming_attaches.recv().await {
+            if !self.identity.is_retired() && !attach.approval().link_identity().is_retired() {
+                return Some(attach);
+            }
+        }
+        None
     }
 
     pub async fn accept_attach(
         &self,
-        attach: Attach,
+        attach: IncomingAttach,
         max_message_size: u64,
     ) -> Result<LinkEndpoint, EngineError> {
         self.accept_attach_with_properties(attach, max_message_size, None)
@@ -640,7 +662,7 @@ impl ServerSession {
 
     pub async fn accept_attach_with_properties(
         &self,
-        attach: Attach,
+        attach: IncomingAttach,
         max_message_size: u64,
         properties: Option<Fields>,
     ) -> Result<LinkEndpoint, EngineError> {
@@ -655,11 +677,14 @@ impl ServerSession {
 
     pub async fn accept_attach_with_decoders(
         &self,
-        attach: Attach,
+        attach: IncomingAttach,
         max_message_size: u64,
         properties: Option<Fields>,
         decoders: MessageFormatDecoders,
     ) -> Result<LinkEndpoint, EngineError> {
+        attach
+            .validate_request(&self.identity)
+            .map_err(attach_approval_error)?;
         if has_recovery_state(&attach) {
             return Err(invalid_state(RECOVERY_NOT_IMPLEMENTED));
         }
@@ -670,7 +695,7 @@ impl ServerSession {
         }
         let (deliveries_tx, deliveries) = mpsc::channel(DELIVERY_QUEUE_CAPACITY);
         let consumption = Arc::new(Consumption::new(self.consumed.clone()));
-        let identity = LinkIdentity::new();
+        let identity = attach.approval().link_identity().clone();
         let (detached_tx, detached) = watch::channel(false);
         let role = attach.role.clone();
         let name = attach.name.clone();
@@ -678,6 +703,7 @@ impl ServerSession {
         let handle = attach.handle;
         request(&self.commands, |reply| Command::AcceptLink {
             channel: self.channel,
+            session: self.identity.clone(),
             attach: Box::new(attach),
             max_message_size,
             properties,
@@ -685,7 +711,6 @@ impl ServerSession {
             deliveries_tx,
             detached_tx,
             consumption: consumption.clone(),
-            identity: identity.clone(),
             reply,
         })
         .await?;
@@ -916,19 +941,20 @@ async fn request<T>(
 enum Command {
     AcceptSession {
         channel: u16,
-        attach_tx: mpsc::Sender<Attach>,
+        identity: SessionIdentity,
+        attach_tx: mpsc::Sender<IncomingAttach>,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
     AcceptLink {
         channel: u16,
-        attach: Box<Attach>,
+        session: SessionIdentity,
+        attach: Box<IncomingAttach>,
         max_message_size: u64,
         properties: Option<Fields>,
         decoders: MessageFormatDecoders,
         deliveries_tx: mpsc::Sender<Delivery>,
         detached_tx: watch::Sender<bool>,
         consumption: Arc<Consumption>,
-        identity: LinkIdentity,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
     Send {
@@ -984,13 +1010,13 @@ fn reject_closed_command(command: Command) {
 }
 
 struct SessionState {
-    attach_tx: Option<mpsc::Sender<Attach>>,
+    identity: SessionIdentity,
+    attach_tx: Option<mpsc::Sender<IncomingAttach>>,
     local_begin_sent: bool,
     links: HashMap<u32, LinkState>,
     closing_handles: HashSet<u32>,
     pending_attaches: HashMap<u32, PendingLinkFlow>,
-    cancelled_pending_attaches: HashSet<u32>,
-    pending_attach_events: VecDeque<Attach>,
+    pending_attach_events: VecDeque<IncomingAttach>,
     flow: SessionWindow,
     next_delivery_id: u32,
     ending: bool,
@@ -998,6 +1024,7 @@ struct SessionState {
 }
 
 struct PendingLinkFlow {
+    approval: Option<Arc<AttachApproval>>,
     peer_role: Role,
     initial_sender_count: Option<u32>,
     credit: LinkCredit,
@@ -1008,11 +1035,24 @@ struct PendingLinkFlow {
 impl PendingLinkFlow {
     fn new(peer_role: Role, initial_sender_count: Option<u32>) -> Self {
         Self {
+            approval: None,
             peer_role,
             initial_sender_count,
             credit: LinkCredit::new(0),
             latest: None,
             recovery_refusal: false,
+        }
+    }
+
+    fn incoming(attach: &IncomingAttach) -> Self {
+        let mut pending = Self::new(attach.role.clone(), attach.initial_delivery_count);
+        pending.approval = Some(attach.approval().clone());
+        pending
+    }
+
+    fn retire(&self) {
+        if let Some(approval) = &self.approval {
+            approval.retire();
         }
     }
 
@@ -1047,12 +1087,12 @@ impl PendingLinkFlow {
 impl SessionState {
     fn new(peer: &Begin) -> Self {
         Self {
+            identity: SessionIdentity::new(),
             attach_tx: None,
             local_begin_sent: false,
             links: HashMap::new(),
             closing_handles: HashSet::new(),
             pending_attaches: HashMap::new(),
-            cancelled_pending_attaches: HashSet::new(),
             pending_attach_events: VecDeque::new(),
             flow: SessionWindow::new(
                 0,
@@ -1340,9 +1380,7 @@ async fn run_connection<Io>(
     reader_task.shutdown().await;
 
     for session in sessions.values_mut() {
-        for link in session.links.values_mut() {
-            stop_link(link);
-        }
+        stop_session(session);
     }
     for reply in closing_replies {
         let _ = reply.send(Err(EngineError::RemoteClosed));
@@ -1386,7 +1424,11 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
             }
             sessions.insert(channel, SessionState::new(&begin));
             if incoming_sessions
-                .try_send(IncomingSession { channel, begin })
+                .try_send(IncomingSession {
+                    channel,
+                    identity: sessions[&channel].identity.clone(),
+                    begin,
+                })
                 .is_err()
             {
                 refuse_session(
@@ -1406,7 +1448,6 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
             let handle = attach.handle;
             if session.links.contains_key(&handle)
                 || session.pending_attaches.contains_key(&handle)
-                || session.cancelled_pending_attaches.contains(&handle)
                 || session.closing_handles.contains(&handle)
             {
                 refuse_session(
@@ -1417,9 +1458,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                     sessions,
                 )
                 .await?;
-            } else if session.pending_attaches.len() + session.cancelled_pending_attaches.len()
-                == MAX_PENDING_ATTACHES
-            {
+            } else if session.pending_attaches.len() == MAX_PENDING_ATTACHES {
                 refuse_session(
                     channel,
                     "amqp:resource-limit-exceeded",
@@ -1432,19 +1471,19 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                 if session.attach_tx.is_some() {
                     refuse_recovery_attach(channel, &attach, session, writer).await?;
                 } else {
-                    let mut pending =
-                        PendingLinkFlow::new(attach.role.clone(), attach.initial_delivery_count);
+                    let attach = IncomingAttach::new(*attach, session.identity.clone());
+                    let mut pending = PendingLinkFlow::incoming(&attach);
                     pending.recovery_refusal = true;
                     session.pending_attaches.insert(handle, pending);
-                    session.pending_attach_events.push_back(*attach);
+                    session.pending_attach_events.push_back(attach);
                 }
             } else {
-                session.pending_attaches.insert(
-                    handle,
-                    PendingLinkFlow::new(attach.role.clone(), attach.initial_delivery_count),
-                );
+                let attach = IncomingAttach::new(*attach, session.identity.clone());
+                session
+                    .pending_attaches
+                    .insert(handle, PendingLinkFlow::incoming(&attach));
                 if let Some(attach_tx) = &session.attach_tx {
-                    if attach_tx.try_send(*attach).is_err() {
+                    if attach_tx.try_send(attach).is_err() {
                         refuse_session(
                             channel,
                             "amqp:resource-limit-exceeded",
@@ -1455,7 +1494,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                         .await?;
                     }
                 } else {
-                    session.pending_attach_events.push_back(*attach);
+                    session.pending_attach_events.push_back(attach);
                 }
             }
         }
@@ -1471,16 +1510,11 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
         Performative::Detach(detach) => {
             if let Some(session) = sessions.get_mut(&channel) {
                 let locally_closing = session.closing_handles.remove(&detach.handle);
-                if session.pending_attaches.remove(&detach.handle).is_some() {
-                    if session.attach_tx.is_some() {
-                        // Approval may already be outside the driver. Do not let
-                        // handle reuse make that stale approval attach a new link.
-                        session.cancelled_pending_attaches.insert(detach.handle);
-                    } else {
-                        session
-                            .pending_attach_events
-                            .retain(|attach| attach.handle != detach.handle);
-                    }
+                if let Some(pending) = session.pending_attaches.remove(&detach.handle) {
+                    pending.retire();
+                    session
+                        .pending_attach_events
+                        .retain(|attach| attach.handle != detach.handle);
                     if !locally_closing {
                         ensure_local_begin(channel, session, writer).await?;
                         writer
@@ -1524,9 +1558,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                 ensure_local_begin(channel, session, writer).await?;
             }
             if let Some(mut session) = sessions.remove(&channel) {
-                for link in session.links.values_mut() {
-                    stop_link(link);
-                }
+                stop_session(&mut session);
             }
             if acknowledge {
                 writer
@@ -1561,6 +1593,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
     match command {
         Command::AcceptSession {
             channel,
+            identity,
             attach_tx,
             reply,
         } => {
@@ -1568,8 +1601,14 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 let _ = reply.send(Err(EngineError::RemoteDetached));
                 return Ok(CommandAction::Continue);
             };
-            if session.ending {
+            if identity.is_retired() || session.ending || session.identity.is_retired() {
                 let _ = reply.send(Err(EngineError::RemoteDetached));
+                return Ok(CommandAction::Continue);
+            }
+            if !session.identity.same_session(&identity) {
+                let _ = reply.send(Err(invalid_state(
+                    "session approval belongs to a different generation",
+                )));
                 return Ok(CommandAction::Continue);
             }
             if session.attach_tx.is_some() {
@@ -1578,6 +1617,9 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             }
             ensure_local_begin(channel, session, writer).await?;
             for attach in std::mem::take(&mut session.pending_attach_events) {
+                if attach.approval().link_identity().is_retired() {
+                    continue;
+                }
                 if has_recovery_state(&attach) {
                     refuse_recovery_attach(channel, &attach, session, writer).await?;
                 } else {
@@ -1591,6 +1633,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
         }
         Command::AcceptLink {
             channel,
+            session: owner,
             attach,
             max_message_size,
             properties,
@@ -1598,10 +1641,44 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             deliveries_tx,
             detached_tx,
             consumption,
-            identity,
             reply,
         } => {
             let attach = *attach;
+            if owner.is_retired() {
+                let _ = reply.send(Err(EngineError::RemoteDetached));
+                return Ok(CommandAction::Continue);
+            }
+            let Some(session) = sessions.get_mut(&channel) else {
+                let _ = reply.send(Err(EngineError::RemoteDetached));
+                return Ok(CommandAction::Continue);
+            };
+            if session.ending || session.identity.is_retired() {
+                let _ = reply.send(Err(EngineError::RemoteDetached));
+                return Ok(CommandAction::Continue);
+            }
+            if !session.identity.same_session(&owner) {
+                let _ = reply.send(Err(invalid_state(
+                    "attach approval belongs to a different session generation",
+                )));
+                return Ok(CommandAction::Continue);
+            }
+            if let Err(error) = attach.validate_request(&owner) {
+                let _ = reply.send(Err(attach_approval_error(error)));
+                return Ok(CommandAction::Continue);
+            }
+            let handle = attach.handle;
+            let Some(approval) = session
+                .pending_attaches
+                .get(&handle)
+                .and_then(|pending| pending.approval.as_ref())
+            else {
+                let _ = reply.send(Err(EngineError::RemoteDetached));
+                return Ok(CommandAction::Continue);
+            };
+            if let Err(error) = attach.validate(&session.identity, approval) {
+                let _ = reply.send(Err(attach_approval_error(error)));
+                return Ok(CommandAction::Continue);
+            }
             if has_recovery_state(&attach) {
                 let _ = reply.send(Err(invalid_state(RECOVERY_NOT_IMPLEMENTED)));
                 return Ok(CommandAction::Continue);
@@ -1612,21 +1689,12 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 )));
                 return Ok(CommandAction::Continue);
             }
-            let Some(session) = sessions.get_mut(&channel) else {
-                let _ = reply.send(Err(EngineError::RemoteDetached));
-                return Ok(CommandAction::Continue);
-            };
-            let handle = attach.handle;
-            if session.cancelled_pending_attaches.remove(&handle)
-                || !session.pending_attaches.contains_key(&handle)
-            {
-                let _ = reply.send(Err(EngineError::RemoteDetached));
-                return Ok(CommandAction::Continue);
-            }
             if session.pending_attaches[&handle].recovery_refusal {
                 let _ = reply.send(Err(invalid_state(RECOVERY_NOT_IMPLEMENTED)));
                 return Ok(CommandAction::Continue);
             }
+            let (attach, approval) = attach.into_parts();
+            let identity = approval.link_identity().clone();
             if session.ending
                 || session.links.contains_key(&handle)
                 || session.closing_handles.contains(&handle)
@@ -2443,14 +2511,7 @@ async fn refuse_session<W: AsyncWrite + Unpin>(
         }
         ensure_local_begin(channel, session, writer).await?;
         session.ending = true;
-        session.attach_tx = None;
-        session.pending_attaches.clear();
-        session.cancelled_pending_attaches.clear();
-        session.pending_attach_events.clear();
-        for link in session.links.values_mut() {
-            stop_link(link);
-        }
-        session.links.clear();
+        stop_session(session);
     }
     writer
         .write_amqp(
@@ -2718,7 +2779,9 @@ fn remember_closing_handle(session: &mut SessionState, handle: u32) -> Result<()
         ));
     }
     session.closing_handles.insert(handle);
-    session.pending_attaches.remove(&handle);
+    if let Some(pending) = session.pending_attaches.remove(&handle) {
+        pending.retire();
+    }
     Ok(())
 }
 
@@ -3233,6 +3296,30 @@ fn stop_link(link: &mut LinkState) {
     }
 }
 
+fn stop_session(session: &mut SessionState) {
+    session.identity.retire();
+    session.attach_tx = None;
+    for pending in session.pending_attaches.values() {
+        pending.retire();
+    }
+    session.pending_attaches.clear();
+    session.pending_attach_events.clear();
+    for link in session.links.values_mut() {
+        stop_link(link);
+    }
+    session.links.clear();
+    session.incoming = IncomingLedger::new();
+}
+
+fn attach_approval_error(error: AttachApprovalError) -> EngineError {
+    match error {
+        AttachApprovalError::RetiredSession | AttachApprovalError::RetiredApproval => {
+            EngineError::RemoteDetached
+        }
+        _ => invalid_state(error.to_string()),
+    }
+}
+
 #[cfg(test)]
 async fn write_amqp<W: AsyncWrite + Unpin>(
     writer: &mut W,
@@ -3295,9 +3382,28 @@ mod tests {
         let mut session = SessionState::new(&Begin::default());
         session.local_begin_sent = true;
         session.attach_tx = Some(attach_tx);
+        let receipt = IncomingAttach::new(
+            Attach {
+                name: String::from("response"),
+                handle,
+                role: Role::Receiver,
+                snd_settle_mode: SenderSettleMode::Settled,
+                rcv_settle_mode: ReceiverSettleMode::First,
+                source: Some(Source::new("node")),
+                target: Some(Target::new("reply-to")),
+                unsettled: None,
+                incomplete_unsettled: false,
+                initial_delivery_count: None,
+                max_message_size: None,
+                offered_capabilities: None,
+                desired_capabilities: None,
+                properties: None,
+            },
+            session.identity.clone(),
+        );
         session
             .pending_attaches
-            .insert(handle, PendingLinkFlow::new(Role::Receiver, None));
+            .insert(handle, PendingLinkFlow::incoming(&receipt));
         let mut sessions = HashMap::from([(channel, session)]);
         let (wire, _peer) = tokio::io::duplex(64 * 1024);
         let mut wire = FrameWriter::new(wire, u32::MAX).expect("frame writer");
@@ -3331,29 +3437,14 @@ mod tests {
         handle_command(
             Command::AcceptLink {
                 channel,
-                attach: Box::new(Attach {
-                    name: String::from("response"),
-                    handle,
-                    role: Role::Receiver,
-                    snd_settle_mode: SenderSettleMode::Settled,
-                    rcv_settle_mode: ReceiverSettleMode::First,
-                    source: Some(Source::new("node")),
-                    target: Some(Target::new("reply-to")),
-                    unsettled: None,
-                    incomplete_unsettled: false,
-                    initial_delivery_count: None,
-                    max_message_size: None,
-                    offered_capabilities: None,
-                    desired_capabilities: None,
-                    properties: None,
-                }),
+                session: sessions[&channel].identity.clone(),
+                attach: Box::new(receipt),
                 max_message_size: 1024,
                 properties: None,
                 decoders: MessageFormatDecoders::default(),
                 deliveries_tx,
                 detached_tx,
                 consumption: Arc::new(Consumption::new(Arc::new(Notify::new()))),
-                identity: LinkIdentity::new(),
                 reply,
             },
             &mut wire,
@@ -3407,3 +3498,6 @@ mod session_startup_tests;
 
 #[cfg(test)]
 mod outgoing_settlement_tests;
+
+#[cfg(test)]
+mod session_provenance_tests;

@@ -14,7 +14,7 @@ pub use crate::{
         read_frame_with_max_size, read_protocol_header, write_frame, write_protocol_header,
     },
     server::{
-        ConnectionOptions, Delivery, EngineError, IncomingSession, LinkEndpoint,
+        ConnectionOptions, Delivery, EngineError, IncomingAttach, IncomingSession, LinkEndpoint,
         MessageFormatDecoders, PendingSettlement, Receiver, SaslAuthenticator, Sender,
         ServerConnection, ServerSession,
     },

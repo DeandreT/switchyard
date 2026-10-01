@@ -4,8 +4,8 @@ use std::{collections::HashMap, error::Error, time::Duration};
 
 use amqp::{
     Accepted, Attach, Begin, ClientConnection, ClientReceiver, ClientSession, ConnectionOptions,
-    DeliveryState, Detach, EngineError, Flow, Frame, LinkEndpoint, Message, Open, OrderedMap,
-    Performative, ProtocolHeader, Receiver, ReceiverSettleMode, Role, SenderSettleMode,
+    DeliveryState, Detach, EngineError, Flow, Frame, IncomingAttach, LinkEndpoint, Message, Open,
+    OrderedMap, Performative, ProtocolHeader, Receiver, ReceiverSettleMode, Role, SenderSettleMode,
     ServerConnection, ServerSession, Source, Symbol, Target, Transfer, encode_message, read_frame,
     read_protocol_header, write_frame, write_protocol_header,
 };
@@ -244,7 +244,7 @@ impl ServerPeer {
         &mut self,
         session: &mut ServerSession,
         attach: Attach,
-    ) -> TestResult<Attach> {
+    ) -> TestResult<IncomingAttach> {
         self.peer
             .send(
                 0,
@@ -260,7 +260,11 @@ impl ServerPeer {
         Ok(received)
     }
 
-    async fn approve(&mut self, session: &ServerSession, attach: Attach) -> TestResult<Receiver> {
+    async fn approve(
+        &mut self,
+        session: &ServerSession,
+        attach: IncomingAttach,
+    ) -> TestResult<Receiver> {
         let handle = attach.handle;
         let LinkEndpoint::Receiver(receiver) =
             timeout(IO_TIMEOUT, session.accept_attach(attach, 4 * 1024 * 1024)).await??

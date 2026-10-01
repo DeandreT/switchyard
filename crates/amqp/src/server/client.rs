@@ -16,6 +16,7 @@ pub struct ClientConnection {
 
 pub struct ClientSession {
     channel: u16,
+    identity: SessionIdentity,
     commands: mpsc::Sender<ClientCommand>,
     consumed: Arc<Notify>,
 }
@@ -168,6 +169,7 @@ impl ClientConnection {
                     remote_max_frame_size,
                     local_max_frame_size,
                     channel_max,
+                    remote_channel_max: remote_open.channel_max,
                     options,
                     peer_idle_millis,
                 },
@@ -189,10 +191,11 @@ impl ClientConnection {
     }
 
     pub async fn begin(&mut self) -> Result<ClientSession, EngineError> {
-        let channel =
+        let (channel, identity) =
             client_request(&self.commands, |reply| ClientCommand::Begin { reply }).await?;
         Ok(ClientSession {
             channel,
+            identity,
             commands: self.commands.clone(),
             consumed: self.consumed.clone(),
         })
@@ -332,12 +335,16 @@ impl ClientSession {
         name: impl Into<String>,
         target: Target,
     ) -> Result<ClientSender, EngineError> {
+        if self.identity.is_retired() {
+            return Err(EngineError::RemoteDetached);
+        }
         let name = name.into();
         let (deliveries_tx, _) = mpsc::channel(1);
         let (detached_tx, detached) = watch::channel(false);
         let identity = LinkIdentity::new();
         let (handle, _) = client_request(&self.commands, |reply| ClientCommand::Attach {
             channel: self.channel,
+            session: self.identity.clone(),
             request: Box::new(AttachRequest {
                 name,
                 role: Role::Sender,
@@ -405,6 +412,9 @@ impl ClientSession {
         receiver_settle_mode: ReceiverSettleMode,
         max_message_size: Option<u64>,
     ) -> Result<ClientReceiver, EngineError> {
+        if self.identity.is_retired() {
+            return Err(EngineError::RemoteDetached);
+        }
         let name = name.into();
         let (deliveries_tx, deliveries) = mpsc::channel(DELIVERY_QUEUE_CAPACITY);
         let consumption = Arc::new(Consumption::new(self.consumed.clone()));
@@ -412,6 +422,7 @@ impl ClientSession {
         let (detached_tx, detached) = watch::channel(false);
         let (handle, response) = client_request(&self.commands, |reply| ClientCommand::Attach {
             channel: self.channel,
+            session: self.identity.clone(),
             request: Box::new(AttachRequest {
                 name,
                 role: Role::Receiver,
@@ -441,8 +452,12 @@ impl ClientSession {
     }
 
     pub async fn end(&self) -> Result<(), EngineError> {
+        if self.identity.is_retired() {
+            return Err(EngineError::RemoteDetached);
+        }
         client_request(&self.commands, |reply| ClientCommand::End {
             channel: self.channel,
+            identity: self.identity.clone(),
             reply,
         })
         .await
@@ -674,10 +689,11 @@ struct AttachRequest {
 
 enum ClientCommand {
     Begin {
-        reply: oneshot::Sender<Result<u16, EngineError>>,
+        reply: oneshot::Sender<Result<(u16, SessionIdentity), EngineError>>,
     },
     Attach {
         channel: u16,
+        session: SessionIdentity,
         request: Box<AttachRequest>,
         deliveries_tx: mpsc::Sender<Delivery>,
         detached_tx: watch::Sender<bool>,
@@ -709,6 +725,7 @@ enum ClientCommand {
     },
     End {
         channel: u16,
+        identity: SessionIdentity,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
     Close {
@@ -738,20 +755,40 @@ fn reject_closed_client_command(command: ClientCommand) {
 
 struct PendingAttach {
     channel: u16,
+    session: SessionIdentity,
     handle: u32,
     reply: oneshot::Sender<Result<(u32, Attach), EngineError>>,
     link: LinkState,
     consumption: Arc<Consumption>,
 }
 
+struct PendingBegin {
+    identity: SessionIdentity,
+    reply: oneshot::Sender<Result<(u16, SessionIdentity), EngineError>>,
+}
+
+struct PendingEnd {
+    identity: SessionIdentity,
+    reply: oneshot::Sender<Result<(), EngineError>>,
+}
+
+fn vacant_channel(start: u16, maximum: u16, sessions: &HashMap<u16, SessionState>) -> Option<u16> {
+    let count = u32::from(maximum) + 1;
+    (0..count)
+        .map(|offset| ((u32::from(start) + offset) % count) as u16)
+        .find(|channel| !sessions.contains_key(channel))
+}
+
 fn fail_pending_session(
     channel: u16,
-    pending_begins: &mut HashMap<u16, oneshot::Sender<Result<u16, EngineError>>>,
+    pending_begins: &mut HashMap<u16, PendingBegin>,
     pending_attaches: &mut HashMap<String, PendingAttach>,
     pending_detaches: &mut HashMap<(u16, u32), oneshot::Sender<Result<(), EngineError>>>,
+    pending_ends: &mut HashMap<u16, PendingEnd>,
 ) {
-    if let Some(reply) = pending_begins.remove(&channel) {
-        let _ = reply.send(Err(EngineError::RemoteDetached));
+    if let Some(pending) = pending_begins.remove(&channel) {
+        pending.identity.retire();
+        let _ = pending.reply.send(Err(EngineError::RemoteDetached));
     }
     let names: Vec<_> = pending_attaches
         .iter()
@@ -773,6 +810,10 @@ fn fail_pending_session(
         if let Some(reply) = pending_detaches.remove(&handle) {
             let _ = reply.send(Err(EngineError::RemoteDetached));
         }
+    }
+    if let Some(pending) = pending_ends.remove(&channel) {
+        pending.identity.retire();
+        let _ = pending.reply.send(Err(EngineError::RemoteDetached));
     }
 }
 
@@ -834,7 +875,8 @@ where
     let mut sessions = HashMap::<u16, SessionState>::new();
     let mut next_channel = 0_u16;
     let mut next_handles = HashMap::<u16, u32>::new();
-    let mut pending_begins = HashMap::<u16, oneshot::Sender<Result<u16, EngineError>>>::new();
+    let mut pending_begins = HashMap::<u16, PendingBegin>::new();
+    let mut pending_ends = HashMap::<u16, PendingEnd>::new();
     let mut pending_attaches = HashMap::<String, PendingAttach>::new();
     let mut pending_detaches =
         HashMap::<(u16, u32), oneshot::Sender<Result<(), EngineError>>>::new();
@@ -884,16 +926,29 @@ where
                         { continue; }
                             let result = match performative {
                                 Performative::Begin(begin) => {
-                                    if let Some(reply) = pending_begins.remove(&channel) {
-                                        if let Some(session) = sessions.get_mut(&channel) {
-                                            session.flow = SessionWindow::new(0, begin.next_outgoing_id, begin.incoming_window, begin.outgoing_window, SESSION_WINDOW);
-                                        }
-                                        let _ = reply.send(Ok(channel));
+                                    let matches = pending_begins.get(&channel).is_some_and(|pending| {
+                                        sessions.get(&channel).is_some_and(|session| {
+                                            !session.ending && !pending.identity.is_retired()
+                                                && session.identity.same_session(&pending.identity)
+                                        })
+                                    });
+                                    if matches {
+                                        let pending = pending_begins.remove(&channel).expect("matching pending begin");
+                                        let session = sessions.get_mut(&channel).expect("matching initiated session");
+                                        session.flow = SessionWindow::new(0, begin.next_outgoing_id, begin.incoming_window, begin.outgoing_window, SESSION_WINDOW);
+                                        let _ = pending.reply.send(Ok((channel, pending.identity)));
                                     }
                                     Ok(false)
                                 }
                                 Performative::Attach(attach) => {
                                     let attach = *attach;
+                                    let matches = pending_attaches.get(&attach.name).is_some_and(|pending| {
+                                        pending.channel == channel && sessions.get(&channel).is_some_and(|session| {
+                                            !session.ending && !pending.session.is_retired()
+                                                && session.identity.same_session(&pending.session)
+                                        })
+                                    });
+                                    if !matches { continue; }
                                     if let Some(pending) = pending_attaches.remove(&attach.name) {
                                         let pending_flow = sessions
                                             .get_mut(&channel)
@@ -922,26 +977,29 @@ where
                                                     link.credit = pending_flow.credit.clone();
                                                 }
                                             },
-                                            LinkState::Receiving(link) if attach.role == Role::Sender => {
+                                            LinkState::Receiving(receiving) if attach.role == Role::Sender => {
                                                 let Some(initial) = attach.initial_delivery_count else {
+                                                    stop_link(&mut link);
                                                     let _ = pending.reply.send(Err(invalid_state("sender attach has no initial delivery count")));
                                                     refuse_session(channel, "amqp:invalid-field", "sender attach has no initial delivery count", &mut writer, &mut sessions).await?;
-                                                    fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches);
+                                                    fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
                                                     continue;
                                                 };
                                                 if pending_flow.as_ref().and_then(|flow| flow.initial_sender_count).is_some_and(|count| count != initial) {
+                                                    stop_link(&mut link);
                                                     let _ = pending.reply.send(Err(invalid_state("sender attach disagrees with the pending delivery count")));
                                                     refuse_session(channel, "amqp:invalid-field", "sender attach disagrees with the pending delivery count", &mut writer, &mut sessions).await?;
-                                                    fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches);
+                                                    fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
                                                     continue;
                                                 }
-                                                link.credit = ReceiveCredit::new(initial, LINK_CREDIT, pending.consumption);
-                                                link.sender_settle_mode = attach.snd_settle_mode.clone();
+                                                receiving.credit = ReceiveCredit::new(initial, LINK_CREDIT, pending.consumption);
+                                                receiving.sender_settle_mode = attach.snd_settle_mode.clone();
                                             }
                                             _ => {
+                                                stop_link(&mut link);
                                                 let _ = pending.reply.send(Err(invalid_state("attach response has the wrong role")));
                                                 refuse_session(channel, "amqp:invalid-field", "attach response has the wrong role", &mut writer, &mut sessions).await?;
-                                                fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches);
+                                                fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
                                                 continue;
                                             }
                                         }
@@ -1010,15 +1068,21 @@ where
                                 }
                                 Performative::End(_) => {
                                     let mut acknowledge = false;
+                                    let mut completed = None;
                                     if let Some(mut session) = sessions.remove(&channel) {
                                         acknowledge = !session.ending;
-                                        for link in session.links.values_mut() {
-                                            stop_link(link);
+                                        if pending_ends.get(&channel).is_some_and(|pending| session.identity.same_session(&pending.identity)) {
+                                            completed = pending_ends.remove(&channel);
                                         }
+                                        stop_session(&mut session);
                                     }
-                                    fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches);
+                                    next_handles.remove(&channel);
+                                    fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
                                     if acknowledge {
                                         writer.write_amqp(channel, Performative::End(End::default()), Vec::new()).await?;
+                                    }
+                                    if let Some(pending) = completed {
+                                        let _ = pending.reply.send(Ok(()));
                                     }
                                     Ok(false)
                                 }
@@ -1048,8 +1112,10 @@ where
                             match result {
                                 Ok(true) => break,
                                 Ok(false) => {
-                                    if sessions.get(&channel).is_some_and(|session| session.ending) {
-                                        fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches);
+                                    if sessions.get(&channel).is_some_and(|session| session.ending)
+                                        && !pending_ends.contains_key(&channel)
+                                    {
+                                        fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
                                     }
                                     pump_ready = !activity.is_closing();
                                 }
@@ -1068,20 +1134,28 @@ where
                         };
                             let result: Result<(), EngineError> = match command {
                                 ClientCommand::Begin { reply } => {
-                                    let channel = next_channel;
-                                    next_channel = next_channel.wrapping_add(1);
-                                    sessions.insert(channel, SessionState::new(&Begin { incoming_window: 0, outgoing_window: 0, ..Begin::default() }));
+                                    let Some(channel) = vacant_channel(next_channel, settings.remote_channel_max, &sessions) else {
+                                        let _ = reply.send(Err(invalid_state("peer session channel limit reached")));
+                                        continue;
+                                    };
+                                    let frame = Frame::Amqp { channel, performative: Some(Performative::Begin(Begin::default())), payload: Vec::new() };
+                                    if let Err(error) = writer.encoded_frame(&frame) {
+                                        let _ = reply.send(Err(error.into()));
+                                        continue;
+                                    }
+                                    let session = SessionState::new(&Begin { incoming_window: 0, outgoing_window: 0, ..Begin::default() });
+                                    let identity = session.identity.clone();
+                                    sessions.insert(channel, session);
                                     next_handles.insert(channel, 0);
-                                    pending_begins.insert(channel, reply);
-                                    writer.write_amqp(channel,
-                                        Performative::Begin(Begin::default()),
-                                        Vec::new(),
-                                    ).await?;
+                                    pending_begins.insert(channel, PendingBegin { identity, reply });
+                                    next_channel = if channel == settings.remote_channel_max { 0 } else { channel + 1 };
+                                    writer.write_frame(&frame).await?;
                                     sessions.get_mut(&channel).expect("initiated session exists").local_begin_sent = true;
                                     Ok(())
                                 }
                                 ClientCommand::Attach {
                                     channel,
+                                    session: owner,
                                     request,
                                     deliveries_tx,
                                     detached_tx,
@@ -1089,12 +1163,27 @@ where
                                     identity,
                                     reply,
                                 } => {
+                                    if owner.is_retired() {
+                                        let _ = reply.send(Err(EngineError::RemoteDetached));
+                                        continue;
+                                    }
+                                    let Some(session) = sessions.get_mut(&channel) else {
+                                        let _ = reply.send(Err(EngineError::RemoteDetached));
+                                        continue;
+                                    };
+                                    if session.ending || session.identity.is_retired() {
+                                        let _ = reply.send(Err(EngineError::RemoteDetached));
+                                        continue;
+                                    }
+                                    if !session.identity.same_session(&owner) {
+                                        let _ = reply.send(Err(invalid_state("attach belongs to a different session generation")));
+                                        continue;
+                                    }
                                     let request = *request;
                                     let next_handle = next_handles
                                         .get_mut(&channel)
-                                        .ok_or_else(|| invalid_state("attach on an unknown session"))?;
+                                        .expect("live initiated session has a handle counter");
                                     let handle = *next_handle;
-                                    *next_handle = next_handle.wrapping_add(1);
                                     let attach = Attach {
                                         name: request.name.clone(),
                                         handle,
@@ -1111,14 +1200,11 @@ where
                                         desired_capabilities: None,
                                         properties: None,
                                     };
-                                    let session = sessions
-                                        .get_mut(&channel)
-                                        .ok_or_else(|| invalid_state("attach on an unknown session"))?;
                                     if session.links.contains_key(&handle) || session.closing_handles.contains(&handle) {
                                         let _ = reply.send(Err(invalid_state("link handle is attached or awaiting detach acknowledgement")));
                                         continue;
                                     }
-                                    if session.ending || session.pending_attaches.len() == MAX_PENDING_ATTACHES || pending_attaches.contains_key(&request.name) {
+                                    if session.pending_attaches.contains_key(&handle) || session.pending_attaches.len() == MAX_PENDING_ATTACHES || pending_attaches.contains_key(&request.name) {
                                         let _ = reply.send(Err(invalid_state("pending attach limit reached or name is already assigned")));
                                         continue;
                                     }
@@ -1128,6 +1214,7 @@ where
                                         let _ = reply.send(Err(error.into()));
                                         continue;
                                     }
+                                    *next_handle = next_handle.wrapping_add(1);
                                     let link = match request.role {
                                         Role::Sender => {
                                             LinkState::Sending(Box::new(SendingLink {
@@ -1160,7 +1247,7 @@ where
                                         }
                                     };
                                     session.pending_attaches.insert(handle, PendingLinkFlow::new(peer_role, None));
-                                    pending_attaches.insert(request.name, PendingAttach { channel, handle, reply, link, consumption });
+                                    pending_attaches.insert(request.name, PendingAttach { channel, session: owner, handle, reply, link, consumption });
                                     writer.write_frame(&attach_frame).await.map_err(Into::into)
                                 }
                                 ClientCommand::Send {
@@ -1239,24 +1326,33 @@ where
                                     pending_detaches.insert((channel, handle), reply);
                                     writer.write_frame(&frame).await.map_err(Into::into)
                                 }
-                                ClientCommand::End { channel, reply } => {
-                                    let result = writer.write_amqp(channel,
-                                        Performative::End(End::default()),
-                                        Vec::new(),
-                                    ).await;
-                                    if let Some(session) = sessions.get_mut(&channel) {
-                                        session.ending = true;
-                                        for link in session.links.values_mut() {
-                                            stop_link(link);
-                                        }
-                                        session.links.clear();
-                                        session.pending_attaches.clear();
+                                ClientCommand::End { channel, identity, reply } => {
+                                    if identity.is_retired() {
+                                        let _ = reply.send(Err(EngineError::RemoteDetached));
+                                        continue;
                                     }
-                                    fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches);
-                                    let _ = reply.send(result.as_ref().map(|_| ()).map_err(|error| {
-                                        EngineError::InvalidState(error.to_string())
-                                    }));
-                                    result.map_err(Into::into)
+                                    let Some(session) = sessions.get_mut(&channel) else {
+                                        let _ = reply.send(Err(EngineError::RemoteDetached));
+                                        continue;
+                                    };
+                                    if session.ending || session.identity.is_retired() {
+                                        let _ = reply.send(Err(EngineError::RemoteDetached));
+                                        continue;
+                                    }
+                                    if !session.identity.same_session(&identity) {
+                                        let _ = reply.send(Err(invalid_state("end belongs to a different session generation")));
+                                        continue;
+                                    }
+                                    let frame = Frame::Amqp { channel, performative: Some(Performative::End(End::default())), payload: Vec::new() };
+                                    if let Err(error) = writer.encoded_frame(&frame) {
+                                        let _ = reply.send(Err(error.into()));
+                                        continue;
+                                    }
+                                    session.ending = true;
+                                    stop_session(session);
+                                    fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
+                                    pending_ends.insert(channel, PendingEnd { identity, reply });
+                                    writer.write_frame(&frame).await.map_err(Into::into)
                                 }
                             ClientCommand::Close { reply } => {
                                 let send_close = !activity.is_closing();
@@ -1314,18 +1410,22 @@ where
     reader_task.shutdown().await;
 
     for session in sessions.values_mut() {
-        for link in session.links.values_mut() {
-            stop_link(link);
-        }
+        stop_session(session);
     }
-    for (_, reply) in pending_begins {
-        let _ = reply.send(Err(EngineError::Stopped));
+    for (_, pending) in pending_begins {
+        pending.identity.retire();
+        let _ = pending.reply.send(Err(EngineError::Stopped));
     }
-    for (_, pending) in pending_attaches {
+    for (_, mut pending) in pending_attaches {
+        stop_link(&mut pending.link);
         let _ = pending.reply.send(Err(EngineError::Stopped));
     }
     for (_, reply) in pending_detaches {
         let _ = reply.send(Err(EngineError::Stopped));
+    }
+    for (_, pending) in pending_ends {
+        pending.identity.retire();
+        let _ = pending.reply.send(Err(EngineError::RemoteClosed));
     }
     for reply in closing {
         let _ = reply.send(Err(EngineError::RemoteClosed));

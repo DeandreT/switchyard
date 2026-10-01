@@ -336,6 +336,7 @@ async fn custom_registry_cannot_be_attached_to_a_local_sender_or_enqueue_a_comma
     let (_, incoming_attaches) = mpsc::channel(1);
     let session = ServerSession {
         channel: 0,
+        identity: SessionIdentity::new(),
         commands,
         incoming_attaches,
         consumed: Arc::new(Notify::new()),
@@ -359,6 +360,7 @@ async fn custom_registry_cannot_be_attached_to_a_local_sender_or_enqueue_a_comma
     let registry = MessageFormatDecoders::default()
         .with_decoder(CUSTOM_FORMAT, raw_decoder)
         .expect("registry");
+    let attach = IncomingAttach::new(attach, session.identity.clone());
     assert!(matches!(
         session
             .accept_attach_with_decoders(attach, 1024, None, registry)

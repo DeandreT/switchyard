@@ -73,19 +73,20 @@ async fn accept_sender(
     let (_, incoming_attaches) = mpsc::channel(1);
     let session = ServerSession {
         channel: CHANNEL,
+        identity: sessions[&CHANNEL].identity.clone(),
         commands,
         incoming_attaches,
         consumed: Arc::new(Notify::new()),
     };
-    let requested = receiver_attach(handle, maximum, mode);
+    let requested = IncomingAttach::new(
+        receiver_attach(handle, maximum, mode),
+        session.identity.clone(),
+    );
     sessions
         .get_mut(&CHANNEL)
         .expect("session fixture")
         .pending_attaches
-        .insert(
-            handle,
-            PendingLinkFlow::new(requested.role.clone(), requested.initial_delivery_count),
-        );
+        .insert(handle, PendingLinkFlow::incoming(&requested));
     let accepting = session.accept_attach(requested, 1_024);
     let applying = async {
         let command = command_rx.recv().await.expect("accept command");
@@ -464,14 +465,17 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
     handle_command(
         Command::AcceptLink {
             channel: CHANNEL,
-            attach: Box::new(receiver_attach(0, None, SenderSettleMode::Settled)),
+            session: sessions[&CHANNEL].identity.clone(),
+            attach: Box::new(IncomingAttach::new(
+                receiver_attach(0, None, SenderSettleMode::Settled),
+                sessions[&CHANNEL].identity.clone(),
+            )),
             max_message_size: 1_024,
             properties: None,
             decoders: MessageFormatDecoders::default(),
             deliveries_tx,
             detached_tx,
             consumption: Arc::new(Consumption::new(Arc::new(Notify::new()))),
-            identity: LinkIdentity::new(),
             reply,
         },
         &mut wire,

@@ -10,7 +10,7 @@ struct Fixture {
     writer: FrameWriter<DuplexStream>,
     peer: DuplexStream,
     incoming_sessions: mpsc::Sender<IncomingSession>,
-    incoming_attaches: mpsc::Receiver<Attach>,
+    incoming_attaches: mpsc::Receiver<IncomingAttach>,
     affected: mpsc::Receiver<Delivery>,
     healthy: mpsc::Receiver<Delivery>,
     detached: watch::Receiver<bool>,
@@ -257,7 +257,6 @@ async fn retained_or_incomplete_attach_state_is_refused_before_application_appro
                 Err(mpsc::error::TryRecvError::Empty)
             ));
             assert!(fixture.sessions[&0].pending_attaches.is_empty());
-            assert!(fixture.sessions[&0].cancelled_pending_attaches.is_empty());
             assert_eq!(fixture.sessions[&0].flow.snapshot().next_incoming_id, 0);
             fixture.assert_healthy().await;
         }
@@ -275,8 +274,9 @@ async fn complete_empty_unsettled_map_is_safe_for_fresh_attach_approval() {
             fixture
                 .incoming_attaches
                 .try_recv()
-                .expect("fresh attach approval"),
-            request
+                .expect("fresh attach approval")
+                .attach(),
+            &request
         );
         assert!(fixture.sessions[&0].pending_attaches.contains_key(&2));
         assert!(!fixture.sessions[&0].ending);
@@ -299,6 +299,7 @@ async fn caller_mutated_recovery_state_is_rejected_before_queueing_acceptance() 
             let (_, incoming_attaches) = mpsc::channel(1);
             let session = ServerSession {
                 channel: 0,
+                identity: fixture.sessions[&0].identity.clone(),
                 commands,
                 incoming_attaches,
                 consumed: Arc::new(Notify::new()),
@@ -317,7 +318,6 @@ async fn caller_mutated_recovery_state_is_rejected_before_queueing_acceptance() 
                 Err(mpsc::error::TryRecvError::Empty)
             ));
             assert!(fixture.sessions[&0].pending_attaches.contains_key(&2));
-            assert!(fixture.sessions[&0].cancelled_pending_attaches.is_empty());
             assert!(fixture.sessions[&0].closing_handles.is_empty());
             assert_eq!(fixture.sessions[&0].links.len(), 2);
             assert_eq!(fixture.sessions[&0].flow.snapshot().next_incoming_id, 0);
@@ -378,7 +378,6 @@ async fn forged_actor_acceptance_with_recovery_state_preserves_pending_approval(
             let (deliveries_tx, _deliveries) = mpsc::channel(DELIVERY_QUEUE_CAPACITY);
             let (detached_tx, _detached) = watch::channel(false);
             let consumption = Arc::new(Consumption::new(Arc::new(Notify::new())));
-            let identity = LinkIdentity::new();
             for mutated in [true, false] {
                 let mut request = original.clone();
                 if mutated {
@@ -387,6 +386,7 @@ async fn forged_actor_acceptance_with_recovery_state_preserves_pending_approval(
                 let (reply, result) = oneshot::channel();
                 let command = Command::AcceptLink {
                     channel: 0,
+                    session: fixture.sessions[&0].identity.clone(),
                     attach: Box::new(request),
                     max_message_size: 262_144,
                     properties: None,
@@ -394,7 +394,6 @@ async fn forged_actor_acceptance_with_recovery_state_preserves_pending_approval(
                     deliveries_tx: deliveries_tx.clone(),
                     detached_tx: detached_tx.clone(),
                     consumption: consumption.clone(),
-                    identity: identity.clone(),
                     reply,
                 };
                 let action = timeout(
@@ -412,7 +411,6 @@ async fn forged_actor_acceptance_with_recovery_state_preserves_pending_approval(
                         Err(EngineError::InvalidState(reason)) if reason == RECOVERY_NOT_IMPLEMENTED
                     ));
                     assert!(fixture.sessions[&0].pending_attaches.contains_key(&2));
-                    assert!(fixture.sessions[&0].cancelled_pending_attaches.is_empty());
                     assert!(fixture.sessions[&0].closing_handles.is_empty());
                     assert_eq!(fixture.sessions[&0].links.len(), 2);
                     assert_eq!(fixture.sessions[&0].flow.snapshot().next_incoming_id, 0);

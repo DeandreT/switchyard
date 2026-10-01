@@ -13,6 +13,7 @@ const DEADLINE: Duration = Duration::from_secs(2);
 
 struct Fixture {
     sessions: HashMap<u16, SessionState>,
+    identities: HashMap<u16, SessionIdentity>,
     writer: FrameWriter<DuplexStream>,
     peer: DuplexStream,
     incoming_tx: mpsc::Sender<IncomingSession>,
@@ -25,6 +26,7 @@ impl Fixture {
         let (incoming_tx, incoming) = mpsc::channel(capacity);
         Self {
             sessions: HashMap::new(),
+            identities: HashMap::new(),
             writer: FrameWriter::new(wire, 512).expect("frame writer"),
             peer,
             incoming_tx,
@@ -45,7 +47,8 @@ impl Fixture {
         channel: u16,
         performative: Performative,
     ) -> Result<FrameAction, EngineError> {
-        timeout(
+        let begins = matches!(&performative, Performative::Begin(_));
+        let result = timeout(
             DEADLINE,
             handle_frame(
                 Frame::Amqp {
@@ -61,7 +64,11 @@ impl Fixture {
             ),
         )
         .await
-        .expect("session response is prompt")
+        .expect("session response is prompt");
+        if begins && let Some(session) = self.sessions.get(&channel) {
+            self.identities.insert(channel, session.identity.clone());
+        }
+        result
     }
 
     async fn begin(&mut self, channel: u16) {
@@ -73,7 +80,10 @@ impl Fixture {
         assert!(self.sessions[&channel].attach_tx.is_none());
     }
 
-    async fn approve(&mut self, channel: u16) -> (Result<(), EngineError>, mpsc::Receiver<Attach>) {
+    async fn approve(
+        &mut self,
+        channel: u16,
+    ) -> (Result<(), EngineError>, mpsc::Receiver<IncomingAttach>) {
         let (attach_tx, attaches) = mpsc::channel(MAX_PENDING_ATTACHES);
         let (reply, result) = oneshot::channel();
         let action = timeout(
@@ -81,6 +91,7 @@ impl Fixture {
             handle_command(
                 Command::AcceptSession {
                     channel,
+                    identity: self.identities[&channel].clone(),
                     attach_tx,
                     reply,
                 },
@@ -273,7 +284,6 @@ async fn pending_detach_starts_wire_session_then_cancels_only_that_approval() {
         assert!(fixture.sessions[&5].local_begin_sent);
         assert!(fixture.sessions[&5].pending_attaches.is_empty());
         assert!(fixture.sessions[&5].pending_attach_events.is_empty());
-        assert!(fixture.sessions[&5].cancelled_pending_attaches.is_empty());
         assert!(!fixture.sessions[&5].ending);
         fixture.assert_silent().await;
 
@@ -402,7 +412,7 @@ async fn preapproval_refusals_start_wire_session_then_end_without_publishing_pen
         assert!(state.attach_tx.is_none());
         assert!(state.pending_attach_events.is_empty());
         assert!(state.pending_attaches.is_empty());
-        assert!(state.cancelled_pending_attaches.is_empty());
+        assert!(state.identity.is_retired());
         assert!(state.links.is_empty());
         let (result, mut approvals) = fixture.approve(9).await;
         assert!(matches!(result, Err(EngineError::RemoteDetached)));
