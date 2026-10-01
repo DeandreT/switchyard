@@ -35,12 +35,16 @@ impl LinkIdentity {
         self.0.retired.store(true, Ordering::Release);
     }
 
+    pub(super) fn is_retired(&self) -> bool {
+        self.0.retired.load(Ordering::Acquire)
+    }
+
     fn key(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
     }
 
     fn check_live(&self) -> Result<(), IncomingLedgerError> {
-        if self.0.retired.load(Ordering::Acquire) {
+        if self.is_retired() {
             Err(IncomingLedgerError::RetiredLink)
         } else {
             Ok(())

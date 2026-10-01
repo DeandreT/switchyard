@@ -26,6 +26,7 @@ pub struct ClientSender {
     next_tag: u64,
     commands: mpsc::Sender<ClientCommand>,
     detached: watch::Receiver<bool>,
+    identity: LinkIdentity,
 }
 
 pub struct ClientReceiver {
@@ -334,6 +335,7 @@ impl ClientSession {
         let name = name.into();
         let (deliveries_tx, _) = mpsc::channel(1);
         let (detached_tx, detached) = watch::channel(false);
+        let identity = LinkIdentity::new();
         let (handle, _) = client_request(&self.commands, |reply| ClientCommand::Attach {
             channel: self.channel,
             request: Box::new(AttachRequest {
@@ -348,7 +350,7 @@ impl ClientSession {
             deliveries_tx,
             detached_tx,
             consumption: Arc::new(Consumption::new(self.consumed.clone())),
-            identity: LinkIdentity::new(),
+            identity: identity.clone(),
             reply,
         })
         .await?;
@@ -358,6 +360,7 @@ impl ClientSession {
             next_tag: 0,
             commands: self.commands.clone(),
             detached,
+            identity,
         })
     }
 
@@ -464,6 +467,9 @@ impl ClientSender {
         message: Message,
         message_format: u32,
     ) -> Result<Outcome, EngineError> {
+        if self.identity.is_retired() {
+            return Err(EngineError::RemoteDetached);
+        }
         let tag = self.next_tag.to_be_bytes().to_vec().into();
         self.next_tag = self.next_tag.wrapping_add(1);
         let (reply, outcome) = oneshot::channel();
@@ -471,6 +477,7 @@ impl ClientSender {
             .send(ClientCommand::Send {
                 channel: self.channel,
                 handle: self.handle,
+                identity: self.identity.clone(),
                 message: Box::new(message),
                 delivery_tag: tag,
                 message_format,
@@ -482,9 +489,13 @@ impl ClientSender {
     }
 
     pub async fn close(&self) -> Result<(), EngineError> {
+        if self.identity.is_retired() {
+            return Ok(());
+        }
         client_request(&self.commands, |reply| ClientCommand::Detach {
             channel: self.channel,
             handle: self.handle,
+            identity: self.identity.clone(),
             reply,
         })
         .await
@@ -580,9 +591,13 @@ impl ClientReceiver {
     }
 
     pub async fn close(&self) -> Result<(), EngineError> {
+        if self.identity.is_retired() {
+            return Ok(());
+        }
         client_request(&self.commands, |reply| ClientCommand::Detach {
             channel: self.channel,
             handle: self.handle,
+            identity: self.identity.clone(),
             reply,
         })
         .await
@@ -673,6 +688,7 @@ enum ClientCommand {
     Send {
         channel: u16,
         handle: u32,
+        identity: LinkIdentity,
         message: Box<Message>,
         delivery_tag: DeliveryTag,
         message_format: u32,
@@ -688,6 +704,7 @@ enum ClientCommand {
     Detach {
         channel: u16,
         handle: u32,
+        identity: LinkIdentity,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
     End {
@@ -1114,6 +1131,8 @@ where
                                     let link = match request.role {
                                         Role::Sender => {
                                             LinkState::Sending(Box::new(SendingLink {
+                                                identity,
+                                                auto_acknowledge: true,
                                                 max_message_size: None,
                                                 receiver_settle_mode: request.receiver_settle_mode,
                                                 settle_mode: request.sender_settle_mode,
@@ -1121,7 +1140,7 @@ where
                                                 queued: VecDeque::new(),
                                                 active: None,
                                                 unsettled: HashMap::new(),
-                                                pending_acknowledgements: HashSet::new(),
+                                                pending_acknowledgements: HashMap::new(),
                                                 detached: detached_tx,
                                             }))
                                         }
@@ -1147,6 +1166,7 @@ where
                                 ClientCommand::Send {
                                     channel,
                                     handle,
+                                    identity,
                                     message,
                                     delivery_tag,
                                     message_format,
@@ -1160,6 +1180,7 @@ where
                                         channel,
                                         handle,
                                         session,
+                                        &identity,
                                         *message,
                                         delivery_tag,
                                         message_format,
@@ -1177,22 +1198,46 @@ where
                                 } => {
                                     settle_incoming(channel, handle, identity, state, reply, &mut sessions, &mut writer).await
                                 }
-                                ClientCommand::Detach { channel, handle, reply } => {
-                                    if let Some(session) = sessions.get_mut(&channel) {
-                                        if let Some(link) = session.links.get(&handle) {
-                                            forget_incoming_link(&mut session.incoming, link);
-                                        }
-                                        remember_closing_handle(session, handle)?;
+                                ClientCommand::Detach { channel, handle, identity, reply } => {
+                                    if identity.is_retired() {
+                                        let _ = reply.send(Ok(()));
+                                        continue;
                                     }
-                                    pending_detaches.insert((channel, handle), reply);
-                                    writer.write_amqp(channel,
-                                        Performative::Detach(Detach {
+                                    let Some(session) = sessions.get_mut(&channel) else {
+                                        let _ = reply.send(Err(EngineError::RemoteDetached));
+                                        continue;
+                                    };
+                                    let Some(link) = session.links.get(&handle) else {
+                                        let _ = reply.send(Err(EngineError::RemoteDetached));
+                                        continue;
+                                    };
+                                    if !link.identity().same_link(&identity) {
+                                        let _ = reply.send(Err(invalid_state("close belongs to a different link generation")));
+                                        continue;
+                                    }
+                                    if session.ending {
+                                        let _ = reply.send(Err(EngineError::RemoteDetached));
+                                        continue;
+                                    }
+                                    let frame = Frame::Amqp {
+                                        channel,
+                                        performative: Some(Performative::Detach(Detach {
                                             handle,
                                             closed: true,
                                             error: None,
-                                        }),
-                                        Vec::new(),
-                                    ).await.map_err(Into::into)
+                                        })),
+                                        payload: Vec::new(),
+                                    };
+                                    if let Err(error) = writer.encoded_frame(&frame) {
+                                        let _ = reply.send(Err(error.into()));
+                                        continue;
+                                    }
+                                    remember_closing_handle(session, handle)?;
+                                    let mut link = session.links.remove(&handle).expect("validated close endpoint");
+                                    forget_incoming_link(&mut session.incoming, &link);
+                                    stop_link(&mut link);
+                                    pending_detaches.insert((channel, handle), reply);
+                                    writer.write_frame(&frame).await.map_err(Into::into)
                                 }
                                 ClientCommand::End { channel, reply } => {
                                     let result = writer.write_amqp(channel,

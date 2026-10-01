@@ -124,10 +124,12 @@ async fn send_with_frame_limit(
     maximum_frame_size: u32,
 ) -> oneshot::Receiver<Result<SendOutcome, EngineError>> {
     let (reply, response) = oneshot::channel();
+    let identity = sessions[&CHANNEL].links[&handle].identity().clone();
     handle_command(
         Command::Send {
             channel: CHANNEL,
             handle,
+            identity,
             message: Box::new(message),
             delivery_tag: vec![handle as u8].into(),
             reply,

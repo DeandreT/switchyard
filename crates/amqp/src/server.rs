@@ -27,6 +27,7 @@ mod format_registry;
 mod frame_writer;
 mod idle;
 mod incoming_ledger;
+mod outgoing_identity;
 mod receive_credit;
 
 use flow_control::{LinkCredit, LinkSnapshot, SessionWindow};
@@ -39,6 +40,7 @@ use incoming_ledger::Completion;
 use incoming_ledger::{
     DeliveryIdentity, IncomingLedger, IncomingLedgerError, LinkIdentity, SettlementAction,
 };
+use outgoing_identity::AckIdentity;
 use receive_credit::{Consumption, ReceiveCredit};
 
 const LINK_CREDIT: u32 = 32;
@@ -362,12 +364,14 @@ pub struct Sender {
     handle: u32,
     commands: mpsc::Sender<Command>,
     detached: watch::Receiver<bool>,
+    identity: LinkIdentity,
 }
 
 /// A receiver's outcome whose second-mode acknowledgement is still pending.
 pub struct PendingSettlement {
     outcome: Outcome,
-    delivery_id: Option<u32>,
+    identity: LinkIdentity,
+    acknowledgement: Option<AckIdentity>,
     channel: u16,
     handle: u32,
     commands: mpsc::Sender<Command>,
@@ -378,25 +382,23 @@ impl PendingSettlement {
         &self.outcome
     }
 
-    pub async fn accept(self) -> Result<(), EngineError> {
+    pub async fn accept(&self) -> Result<(), EngineError> {
         self.finish(DeliveryState::Accepted(Accepted)).await
     }
 
-    pub async fn reject(self, error: Error) -> Result<(), EngineError> {
+    pub async fn reject(&self, error: Error) -> Result<(), EngineError> {
         self.finish(DeliveryState::Rejected(crate::Rejected {
             error: Some(error),
         }))
         .await
     }
 
-    async fn finish(self, state: DeliveryState) -> Result<(), EngineError> {
-        let Some(delivery_id) = self.delivery_id else {
-            return Ok(());
-        };
+    async fn finish(&self, state: DeliveryState) -> Result<(), EngineError> {
         request(&self.commands, |reply| Command::SettleOutgoing {
             channel: self.channel,
             handle: self.handle,
-            delivery_id,
+            owner: self.identity.clone(),
+            identity: self.acknowledgement.clone(),
             state,
             reply,
         })
@@ -705,6 +707,7 @@ impl ServerSession {
                 handle,
                 commands: self.commands.clone(),
                 detached,
+                identity,
             }),
         })
     }
@@ -747,6 +750,7 @@ impl Sender {
             .send(Command::Send {
                 channel: self.channel,
                 handle: self.handle,
+                identity: self.identity.clone(),
                 message: Box::new(message),
                 delivery_tag,
                 reply,
@@ -756,7 +760,8 @@ impl Sender {
         let outcome = outcome.await.map_err(|_| EngineError::Stopped)??;
         Ok(PendingSettlement {
             outcome: outcome.outcome,
-            delivery_id: outcome.delivery_id,
+            identity: self.identity.clone(),
+            acknowledgement: outcome.acknowledgement,
             channel: self.channel,
             handle: self.handle,
             commands: self.commands.clone(),
@@ -776,9 +781,13 @@ impl Sender {
     }
 
     async fn close_inner(&self, error: Option<Error>) -> Result<(), EngineError> {
+        if self.identity.is_retired() {
+            return Ok(());
+        }
         request(&self.commands, |reply| Command::Detach {
             channel: self.channel,
             handle: self.handle,
+            identity: self.identity.clone(),
             error,
             reply,
         })
@@ -856,9 +865,13 @@ impl Receiver {
     }
 
     async fn close_inner(&self, error: Option<Error>) -> Result<(), EngineError> {
+        if self.identity.is_retired() {
+            return Ok(());
+        }
         request(&self.commands, |reply| Command::Detach {
             channel: self.channel,
             handle: self.handle,
+            identity: self.identity.clone(),
             error,
             reply,
         })
@@ -921,6 +934,7 @@ enum Command {
     Send {
         channel: u16,
         handle: u32,
+        identity: LinkIdentity,
         message: Box<Message>,
         delivery_tag: DeliveryTag,
         reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
@@ -935,13 +949,15 @@ enum Command {
     SettleOutgoing {
         channel: u16,
         handle: u32,
-        delivery_id: u32,
+        owner: LinkIdentity,
+        identity: Option<AckIdentity>,
         state: DeliveryState,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
     Detach {
         channel: u16,
         handle: u32,
+        identity: LinkIdentity,
         error: Option<Error>,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
@@ -1057,7 +1073,18 @@ enum LinkState {
     Receiving(ReceivingLink),
 }
 
+impl LinkState {
+    fn identity(&self) -> &LinkIdentity {
+        match self {
+            Self::Sending(link) => &link.identity,
+            Self::Receiving(link) => &link.identity,
+        }
+    }
+}
+
 struct SendingLink {
+    identity: LinkIdentity,
+    auto_acknowledge: bool,
     max_message_size: Option<u64>,
     receiver_settle_mode: ReceiverSettleMode,
     settle_mode: SenderSettleMode,
@@ -1065,7 +1092,7 @@ struct SendingLink {
     queued: VecDeque<QueuedSend>,
     active: Option<ActiveSend>,
     unsettled: HashMap<u32, OutgoingDelivery>,
-    pending_acknowledgements: HashSet<u32>,
+    pending_acknowledgements: HashMap<u32, AckIdentity>,
     detached: watch::Sender<bool>,
 }
 
@@ -1094,7 +1121,7 @@ struct OutgoingDelivery {
 
 struct SendOutcome {
     outcome: Outcome,
-    delivery_id: Option<u32>,
+    acknowledgement: Option<AckIdentity>,
 }
 
 struct ReceivingLink {
@@ -1695,6 +1722,8 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                     session.links.insert(
                         handle,
                         LinkState::Sending(Box::new(SendingLink {
+                            identity,
+                            auto_acknowledge: false,
                             max_message_size: normalized_message_size(attach.max_message_size),
                             settle_mode: attach.snd_settle_mode,
                             receiver_settle_mode: attach.rcv_settle_mode,
@@ -1702,7 +1731,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                             queued: VecDeque::new(),
                             active: None,
                             unsettled: HashMap::new(),
-                            pending_acknowledgements: HashSet::new(),
+                            pending_acknowledgements: HashMap::new(),
                             detached: detached_tx,
                         })),
                     );
@@ -1720,6 +1749,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
         Command::Send {
             channel,
             handle,
+            identity,
             message,
             delivery_tag,
             reply,
@@ -1732,6 +1762,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 channel,
                 handle,
                 session,
+                &identity,
                 *message,
                 delivery_tag,
                 0,
@@ -1753,62 +1784,67 @@ async fn handle_command<W: AsyncWrite + Unpin>(
         Command::SettleOutgoing {
             channel,
             handle,
-            delivery_id,
+            owner,
+            identity,
             state,
             reply,
         } => {
-            let Some(LinkState::Sending(link)) = sessions
-                .get_mut(&channel)
-                .and_then(|session| session.links.get_mut(&handle))
-            else {
-                let _ = reply.send(Err(EngineError::RemoteDetached));
-                return Ok(CommandAction::Continue);
-            };
-            if !link.pending_acknowledgements.remove(&delivery_id) {
-                let _ = reply.send(Err(invalid_state("settlement is not pending")));
-                return Ok(CommandAction::Continue);
-            }
-            writer
-                .write_amqp(
-                    channel,
-                    Performative::Disposition(Disposition {
-                        role: Role::Sender,
-                        first: delivery_id,
-                        last: None,
-                        settled: true,
-                        state: Some(state),
-                        batchable: false,
-                    }),
-                    Vec::new(),
-                )
-                .await?;
-            let _ = reply.send(Ok(()));
+            settle_outgoing(
+                channel, handle, owner, identity, state, reply, sessions, writer,
+            )
+            .await?;
         }
         Command::Detach {
             channel,
             handle,
+            identity,
             error,
             reply,
         } => {
-            if let Some(session) = sessions.get_mut(&channel)
-                && let Some(mut link) = session.links.remove(&handle)
-            {
-                forget_incoming_link(&mut session.incoming, &link);
-                ensure_local_begin(channel, session, writer).await?;
-                remember_closing_handle(session, handle)?;
-                writer
-                    .write_amqp(
-                        channel,
-                        Performative::Detach(Detach {
-                            handle,
-                            closed: true,
-                            error,
-                        }),
-                        Vec::new(),
-                    )
-                    .await?;
-                stop_link(&mut link);
+            if identity.is_retired() {
+                let _ = reply.send(Ok(()));
+                return Ok(CommandAction::Continue);
             }
+            let Some(session) = sessions.get_mut(&channel) else {
+                let _ = reply.send(Err(EngineError::RemoteDetached));
+                return Ok(CommandAction::Continue);
+            };
+            let Some(link) = session.links.get(&handle) else {
+                let _ = reply.send(Err(EngineError::RemoteDetached));
+                return Ok(CommandAction::Continue);
+            };
+            if !link.identity().same_link(&identity) {
+                let _ = reply.send(Err(invalid_state(
+                    "close belongs to a different link generation",
+                )));
+                return Ok(CommandAction::Continue);
+            }
+            if session.ending {
+                let _ = reply.send(Err(EngineError::RemoteDetached));
+                return Ok(CommandAction::Continue);
+            }
+            let frame = Frame::Amqp {
+                channel,
+                performative: Some(Performative::Detach(Detach {
+                    handle,
+                    closed: true,
+                    error,
+                })),
+                payload: Vec::new(),
+            };
+            if let Err(error) = writer.encoded_frame(&frame) {
+                let _ = reply.send(Err(error.into()));
+                return Ok(CommandAction::Continue);
+            }
+            ensure_local_begin(channel, session, writer).await?;
+            remember_closing_handle(session, handle)?;
+            let mut link = session
+                .links
+                .remove(&handle)
+                .expect("validated close endpoint");
+            forget_incoming_link(&mut session.incoming, &link);
+            stop_link(&mut link);
+            writer.write_frame(&frame).await?;
             let _ = reply.send(Ok(()));
         }
         Command::Close { error, reply } => {
@@ -1871,6 +1907,123 @@ async fn settle_incoming<W: AsyncWrite + Unpin>(
         .incoming
         .commit_settlement(&owner, &identity)
         .map_err(|error| invalid_state(error.to_string()))?;
+    let _ = reply.send(Ok(()));
+    Ok(())
+}
+
+fn outgoing_acknowledgement(
+    channel: u16,
+    link: &SendingLink,
+    owner: &LinkIdentity,
+    identity: Option<&AckIdentity>,
+    state: Option<DeliveryState>,
+) -> Result<Option<Frame>, EngineError> {
+    if owner.is_retired() {
+        return Err(EngineError::RemoteDetached);
+    }
+    if !link.identity.same_link(owner) {
+        return Err(invalid_state(
+            "acknowledgement belongs to a different sending link generation",
+        ));
+    }
+    let Some(identity) = identity else {
+        return Ok(None);
+    };
+    identity
+        .validate_owner(owner)
+        .map_err(|error| invalid_state(error.to_string()))?;
+    if identity.is_settled() {
+        return Ok(None);
+    }
+    if !link
+        .pending_acknowledgements
+        .get(&identity.id())
+        .is_some_and(|pending| pending.same_ack(identity))
+    {
+        return Err(invalid_state(
+            "acknowledgement is not pending for this delivery generation",
+        ));
+    }
+    Ok(Some(Frame::Amqp {
+        channel,
+        performative: Some(Performative::Disposition(Disposition {
+            role: Role::Sender,
+            first: identity.id(),
+            last: None,
+            settled: true,
+            state,
+            batchable: false,
+        })),
+        payload: Vec::new(),
+    }))
+}
+
+async fn write_outgoing_acknowledgement<W: AsyncWrite + Unpin>(
+    link: &mut SendingLink,
+    identity: &AckIdentity,
+    frame: &Frame,
+    writer: &mut FrameWriter<W>,
+) -> Result<(), EngineError> {
+    writer.write_frame(frame).await?;
+    let pending = link
+        .pending_acknowledgements
+        .remove(&identity.id())
+        .expect("the actor retains the validated acknowledgement through its write");
+    debug_assert!(pending.same_ack(identity));
+    identity.mark_settled();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn settle_outgoing<W: AsyncWrite + Unpin>(
+    channel: u16,
+    handle: u32,
+    owner: LinkIdentity,
+    identity: Option<AckIdentity>,
+    state: DeliveryState,
+    reply: oneshot::Sender<Result<(), EngineError>>,
+    sessions: &mut HashMap<u16, SessionState>,
+    writer: &mut FrameWriter<W>,
+) -> Result<(), EngineError> {
+    if owner.is_retired() {
+        let _ = reply.send(Err(EngineError::RemoteDetached));
+        return Ok(());
+    }
+    let Some(session) = sessions.get_mut(&channel) else {
+        let _ = reply.send(Err(EngineError::RemoteDetached));
+        return Ok(());
+    };
+    if session.ending || session.closing_handles.contains(&handle) {
+        let _ = reply.send(Err(EngineError::RemoteDetached));
+        return Ok(());
+    }
+    let Some(LinkState::Sending(link)) = session.links.get_mut(&handle) else {
+        let _ = reply.send(Err(EngineError::RemoteDetached));
+        return Ok(());
+    };
+    let frame =
+        match outgoing_acknowledgement(channel, link, &owner, identity.as_ref(), Some(state)) {
+            Ok(frame) => frame,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return Ok(());
+            }
+        };
+    if let Some(frame) = frame {
+        if let Err(error) = writer.encoded_frame(&frame) {
+            let _ = reply.send(Err(error.into()));
+            return Ok(());
+        }
+        write_outgoing_acknowledgement(
+            link,
+            identity
+                .as_ref()
+                .expect("a pending acknowledgement produced the frame"),
+            &frame,
+            writer,
+        )
+        .await?;
+    }
     let _ = reply.send(Ok(()));
     Ok(())
 }
@@ -2574,6 +2727,7 @@ async fn queue_send<W: AsyncWrite + Unpin>(
     channel: u16,
     handle: u32,
     session: &mut SessionState,
+    identity: &LinkIdentity,
     message: Message,
     delivery_tag: DeliveryTag,
     message_format: u32,
@@ -2581,10 +2735,20 @@ async fn queue_send<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     _remote_max_frame_size: u32,
 ) -> Result<(), EngineError> {
+    if identity.is_retired() || session.ending || session.closing_handles.contains(&handle) {
+        let _ = reply.send(Err(EngineError::RemoteDetached));
+        return Ok(());
+    }
     let Some(LinkState::Sending(link)) = session.links.get(&handle) else {
         let _ = reply.send(Err(EngineError::RemoteDetached));
         return Ok(());
     };
+    if !link.identity.same_link(identity) {
+        let _ = reply.send(Err(invalid_state(
+            "send belongs to a different link generation",
+        )));
+        return Ok(());
+    }
     if delivery_tag.len() > MAX_DELIVERY_TAG_BYTES {
         let _ = reply.send(Err(invalid_state("delivery tag exceeds 32 bytes")));
         return Ok(());
@@ -2757,7 +2921,7 @@ fn fragment_frame<W: AsyncWrite + Unpin>(
 }
 
 fn delivery_id_in_use(session: &SessionState, id: u32) -> bool {
-    session.links.values().any(|link| matches!(link, LinkState::Sending(link) if link.unsettled.contains_key(&id) || link.pending_acknowledgements.contains(&id) || link.active.as_ref().is_some_and(|active| active.delivery_id == id)))
+    session.links.values().any(|link| matches!(link, LinkState::Sending(link) if link.unsettled.contains_key(&id) || link.pending_acknowledgements.contains_key(&id) || link.active.as_ref().is_some_and(|active| active.delivery_id == id)))
 }
 
 fn can_pump(session: &SessionState, link: &SendingLink) -> bool {
@@ -2935,45 +3099,63 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
         if let Some(reply) = active.settled_reply {
             let _ = reply.send(Ok(SendOutcome {
                 outcome: Outcome::Accepted(Accepted),
-                delivery_id: None,
+                acknowledgement: None,
             }));
         } else {
-            resolve_outgoing(link, active.delivery_id);
+            resolve_outgoing(channel, link, active.delivery_id, writer).await?;
         }
     }
     Ok(())
 }
 
-fn resolve_outgoing(link: &mut SendingLink, id: u32) {
+async fn resolve_outgoing<W: AsyncWrite + Unpin>(
+    channel: u16,
+    link: &mut SendingLink,
+    id: u32,
+    writer: &mut FrameWriter<W>,
+) -> Result<(), EngineError> {
+    if link.identity.is_retired() {
+        return Err(EngineError::RemoteDetached);
+    }
     if link
         .active
         .as_ref()
         .is_some_and(|active| active.delivery_id == id)
     {
-        return;
+        return Ok(());
     }
     if !link
         .unsettled
         .get(&id)
         .is_some_and(|delivery| delivery.outcome.is_some())
     {
-        return;
+        return Ok(());
     }
     let delivery = link.unsettled.remove(&id).expect("latched outcome exists");
     let (outcome, acknowledge) = delivery.outcome.expect("latched outcome exists");
-    if acknowledge {
-        link.pending_acknowledgements.insert(id);
+    let mut acknowledgement = acknowledge.then(|| AckIdentity::new(&link.identity, id));
+    if let Some(identity) = &acknowledgement {
+        link.pending_acknowledgements.insert(id, identity.clone());
+        if link.auto_acknowledge {
+            let frame =
+                outgoing_acknowledgement(channel, link, &link.identity, Some(identity), None)?
+                    .expect("a fresh pending acknowledgement requires a frame");
+            writer.encoded_frame(&frame)?;
+            write_outgoing_acknowledgement(link, identity, &frame, writer).await?;
+            acknowledgement = None;
+        }
     }
     let _ = delivery.reply.send(Ok(SendOutcome {
         outcome,
-        delivery_id: acknowledge.then_some(id),
+        acknowledgement,
     }));
+    Ok(())
 }
 
 async fn apply_disposition<W: AsyncWrite + Unpin>(
     channel: u16,
     disposition: Disposition,
-    _writer: &mut FrameWriter<W>,
+    writer: &mut FrameWriter<W>,
     sessions: &mut HashMap<u16, SessionState>,
 ) -> Result<(), EngineError> {
     if disposition.role == Role::Sender {
@@ -3013,7 +3195,7 @@ async fn apply_disposition<W: AsyncWrite + Unpin>(
                 if delivery.outcome.is_none() {
                     delivery.outcome = Some((outcome.clone(), acknowledge));
                 }
-                resolve_outgoing(link, id);
+                resolve_outgoing(channel, link, id, writer).await?;
             }
         }
     }
@@ -3029,6 +3211,8 @@ fn forget_incoming_link(incoming: &mut IncomingLedger, link: &LinkState) {
 fn stop_link(link: &mut LinkState) {
     match link {
         LinkState::Sending(link) => {
+            link.identity.retire();
+            link.pending_acknowledgements.clear();
             let _ = link.detached.send(true);
             for queued in link.queued.drain(..) {
                 let _ = queued.reply.send(Err(EngineError::RemoteDetached));
@@ -3220,3 +3404,6 @@ mod recovery_tests;
 
 #[cfg(test)]
 mod session_startup_tests;
+
+#[cfg(test)]
+mod outgoing_settlement_tests;

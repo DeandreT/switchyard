@@ -343,9 +343,12 @@ async fn oversized_outbound_tag_is_refused_before_credit_and_delivery_or_frame_i
         .update_peer(Some(0), 1, false)
         .expect("one delivery grant");
     let (detached, detached_rx) = watch::channel(false);
+    let identity = LinkIdentity::new();
     session.links.insert(
         0,
         LinkState::Sending(Box::new(SendingLink {
+            identity: identity.clone(),
+            auto_acknowledge: false,
             max_message_size: None,
             receiver_settle_mode: ReceiverSettleMode::First,
             settle_mode: SenderSettleMode::Settled,
@@ -353,7 +356,7 @@ async fn oversized_outbound_tag_is_refused_before_credit_and_delivery_or_frame_i
             queued: VecDeque::new(),
             active: None,
             unsettled: HashMap::new(),
-            pending_acknowledgements: HashSet::new(),
+            pending_acknowledgements: HashMap::new(),
             detached,
         })),
     );
@@ -364,6 +367,7 @@ async fn oversized_outbound_tag_is_refused_before_credit_and_delivery_or_frame_i
             Command::Send {
                 channel: 0,
                 handle: 0,
+                identity: identity.clone(),
                 message: Box::new(message()),
                 delivery_tag: vec![3; length].into(),
                 reply,
@@ -395,6 +399,7 @@ async fn oversized_outbound_tag_is_refused_before_credit_and_delivery_or_frame_i
         Command::Send {
             channel: 0,
             handle: 0,
+            identity,
             message: Box::new(message()),
             delivery_tag: vec![3; 32].into(),
             reply,

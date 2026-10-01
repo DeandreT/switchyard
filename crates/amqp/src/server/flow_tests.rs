@@ -264,17 +264,16 @@ async fn echo(peer: &mut DuplexStream, channel: u16, flow: Flow) -> Flow {
 }
 
 async fn enqueue(
-    connection: &ServerConnection,
-    channel: u16,
-    handle: u32,
+    sender: &Sender,
     message: Message,
 ) -> oneshot::Receiver<Result<SendOutcome, EngineError>> {
     let (reply, response) = oneshot::channel();
-    connection
+    sender
         .commands
         .send(Command::Send {
-            channel,
-            handle,
+            channel: sender.channel,
+            handle: sender.handle,
+            identity: sender.identity.clone(),
             message: Box::new(message),
             delivery_tag: vec![1, 2, 3].into(),
             reply,
@@ -300,7 +299,7 @@ async fn one_message_credit_resumes_fragments_on_handleless_session_flow_and_lat
     .await;
     let (endpoint, _) =
         accept_link(&mut session, &mut peer, attach(0, Role::Receiver, true, 0)).await;
-    let LinkEndpoint::Sender(_sender) = endpoint else {
+    let LinkEndpoint::Sender(sender) = endpoint else {
         panic!("local sender");
     };
     write_amqp(
@@ -313,7 +312,7 @@ async fn one_message_credit_resumes_fragments_on_handleless_session_flow_and_lat
     .expect("one delivery grant");
     let message = Message::data(vec![7; 1_600]);
     let encoded = encode_message(&message).expect("message encoding");
-    let mut response = enqueue(&connection, 0, 0, message).await;
+    let mut response = enqueue(&sender, message).await;
     let Frame::Amqp {
         performative: Some(Performative::Transfer(first)),
         payload,
@@ -382,14 +381,18 @@ async fn one_message_credit_resumes_fragments_on_handleless_session_flow_and_lat
         .expect("latched outcome resolves after the final frame")
         .expect("send reply")
         .expect("accepted delivery");
-    assert_eq!(outcome.delivery_id, Some(0));
+    assert_eq!(
+        outcome.acknowledgement.as_ref().map(AckIdentity::id),
+        Some(0)
+    );
     let (reply, acknowledged) = oneshot::channel();
     connection
         .commands
         .send(Command::SettleOutgoing {
             channel: 0,
             handle: 0,
-            delivery_id: 0,
+            owner: sender.identity.clone(),
+            identity: outcome.acknowledgement,
             state: DeliveryState::Accepted(Accepted),
             reply,
         })
@@ -421,7 +424,7 @@ async fn one_message_credit_resumes_fragments_on_handleless_session_flow_and_lat
     )
     .await
     .expect("next delivery grant");
-    let next = enqueue(&connection, 0, 0, Message::data(vec![9])).await;
+    let next = enqueue(&sender, Message::data(vec![9])).await;
     assert!(matches!(
         next_frame(&mut peer).await,
         Frame::Amqp {
@@ -652,9 +655,12 @@ async fn wrapping_disposition_resolves_existing_ids_without_reusing_an_outstandi
         .expect("wrapped link grant");
     let (old_reply, mut old_outcome) = oneshot::channel();
     let (detached, _) = watch::channel(false);
+    let identity = LinkIdentity::new();
     session.links.insert(
         0,
         LinkState::Sending(Box::new(SendingLink {
+            identity: identity.clone(),
+            auto_acknowledge: false,
             max_message_size: None,
             receiver_settle_mode: ReceiverSettleMode::First,
             settle_mode: SenderSettleMode::Unsettled,
@@ -668,7 +674,7 @@ async fn wrapping_disposition_resolves_existing_ids_without_reusing_an_outstandi
                     outcome: None,
                 },
             )]),
-            pending_acknowledgements: HashSet::new(),
+            pending_acknowledgements: HashMap::new(),
             detached,
         })),
     );
@@ -680,6 +686,7 @@ async fn wrapping_disposition_resolves_existing_ids_without_reusing_an_outstandi
             Command::Send {
                 channel: 0,
                 handle: 0,
+                identity: identity.clone(),
                 message: Box::new(Message::data(vec![value])),
                 delivery_tag: vec![value].into(),
                 reply,
@@ -815,7 +822,7 @@ async fn unknown_link_flow_ends_only_its_session_and_does_not_allocate_pending_s
     let mut healthy = begin(&mut connection, &mut peer, 1, Begin::default()).await;
     let (endpoint, _) =
         accept_link(&mut healthy, &mut peer, attach(0, Role::Receiver, false, 0)).await;
-    let LinkEndpoint::Sender(_sender) = endpoint else {
+    let LinkEndpoint::Sender(sender) = endpoint else {
         panic!("healthy sender");
     };
     write_amqp(
@@ -834,7 +841,7 @@ async fn unknown_link_flow_ends_only_its_session_and_does_not_allocate_pending_s
     )
     .await
     .expect("healthy grant");
-    let _outcome = enqueue(&connection, 1, 0, Message::data(vec![3])).await;
+    let _outcome = enqueue(&sender, Message::data(vec![3])).await;
     assert!(matches!(
         next_frame(&mut peer).await,
         Frame::Amqp {
@@ -892,7 +899,7 @@ async fn pending_attach_coalesces_omitted_credit_without_erasing_grants_echo_or_
         .accept_attach(incoming, 1024)
         .await
         .expect("accept after flows");
-    let LinkEndpoint::Sender(_sender) = endpoint else {
+    let LinkEndpoint::Sender(sender) = endpoint else {
         panic!("local sender");
     };
     assert!(matches!(
@@ -912,8 +919,8 @@ async fn pending_attach_coalesces_omitted_credit_without_erasing_grants_echo_or_
     assert!(!link_echo.echo);
     assert_eq!(link_echo.delivery_count, Some(0));
     assert_eq!(link_echo.link_credit, Some(10));
-    let _first = enqueue(&connection, 0, 0, Message::data(vec![1])).await;
-    let _second = enqueue(&connection, 0, 0, Message::data(vec![2])).await;
+    let _first = enqueue(&sender, Message::data(vec![1])).await;
+    let _second = enqueue(&sender, Message::data(vec![2])).await;
     assert!(matches!(
         next_frame(&mut peer).await,
         Frame::Amqp {
@@ -1114,7 +1121,7 @@ async fn detached_pending_attach_rejects_late_approval_before_the_handle_can_be_
     .await;
     let (endpoint, _) =
         accept_link(&mut session, &mut peer, attach(0, Role::Receiver, false, 0)).await;
-    let LinkEndpoint::Sender(_sender) = endpoint else {
+    let LinkEndpoint::Sender(sender) = endpoint else {
         panic!("fresh approved sender");
     };
     write_amqp(
@@ -1133,7 +1140,7 @@ async fn detached_pending_attach_rejects_late_approval_before_the_handle_can_be_
     )
     .await
     .expect("fresh grant");
-    let _outcome = enqueue(&connection, 0, 0, Message::data(vec![5])).await;
+    let _outcome = enqueue(&sender, Message::data(vec![5])).await;
     assert!(matches!(
         next_frame(&mut peer).await,
         Frame::Amqp {
