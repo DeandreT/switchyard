@@ -306,8 +306,21 @@ settled sender acknowledgement before reporting a second-mode send outcome,
 even if the caller has dropped its waiting future. An early receiver outcome
 waits for the final Transfer before that acknowledgement. First-mode, pre-settled,
 and initially receiver-settled outcomes do not emit redundant acknowledgements.
-Later state-less receiver settlement and source default-outcome handling remain
-unfinished.
+Receiver settlement is tracked independently from its first terminal outcome.
+A later settled disposition with absent or nonterminal `Received` state preserves
+that outcome and cancels any still-pending sender acknowledgement. A fragmented
+send still waits for its final Transfer to be written and flushed; the first
+terminal outcome received before completion takes precedence over a default.
+When the receiver settles without a terminal outcome, the actual selected
+Source's explicit default is used. Defaults must be
+[terminal outcomes](https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-messaging-v1.0-os.html#type-source)
+on both encoding and decoding. Invalid application-edited defaults are refused
+locally without consuming the original approval or writing a response.
+An absent default produces the delivery-level `RemoteSettledWithoutOutcome`
+error instead of manufacturing Accepted or closing the link. A nonterminal,
+unsettled update does not use the default or complete the send. Remote-settled
+manual acknowledgement receipts become owned no-ops without another wire
+response; the application remains responsible for its broker settlement.
 Local client Detach retires the endpoint before waiting for the peer's reply;
 repeated closes are local no-ops and cannot enqueue another Detach.
 The negotiated sender mode is enforced at completion, with aborted transfers
