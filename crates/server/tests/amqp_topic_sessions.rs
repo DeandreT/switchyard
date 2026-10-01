@@ -561,3 +561,6 @@ mod refusal;
 
 #[path = "amqp_topic_sessions/global_peek.rs"]
 mod global_peek;
+
+#[path = "amqp_topic_sessions/wakeups.rs"]
+mod wakeups;

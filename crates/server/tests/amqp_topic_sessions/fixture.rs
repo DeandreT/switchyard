@@ -214,6 +214,30 @@ impl<P: StoreProvider> Node<P> {
         Ok(())
     }
 
+    pub(super) async fn wait_waiter_count(
+        &self,
+        entity: &EntityPath,
+        expected: usize,
+    ) -> TestResult {
+        timeout(DEADLINE, async {
+            loop {
+                let count = self
+                    .waiting
+                    .lock()
+                    .expect("waiting receivers")
+                    .iter()
+                    .filter(|waiting| *waiting == entity)
+                    .count();
+                if count == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
     pub(super) fn record(
         &self,
         entity: &EntityPath,

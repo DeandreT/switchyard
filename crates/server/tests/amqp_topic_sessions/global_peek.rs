@@ -2,6 +2,10 @@ use amqp::decode_message;
 
 use super::*;
 
+fn at_stage<T, E: std::fmt::Display>(stage: &str, result: Result<T, E>) -> TestResult<T> {
+    result.map_err(|error| std::io::Error::other(format!("{stage}: {error}")).into())
+}
+
 fn peek_body(from: u64, count: i32, session: Option<Value>) -> OrderedMap<Value, Value> {
     let mut body = map([
         (
@@ -80,13 +84,16 @@ async fn browse<P: StoreProvider>(
 ) -> TestResult<Vec<Message>> {
     let snapshot = node.snapshot()?;
     let submissions = node.submissions();
-    let response = management
-        .request_unassociated(
-            stage,
-            protocol_amqp::PEEK_MESSAGE_OPERATION,
-            peek_body(from, count, session),
-        )
-        .await?;
+    let response = at_stage(
+        stage,
+        management
+            .request_unassociated(
+                stage,
+                protocol_amqp::PEEK_MESSAGE_OPERATION,
+                peek_body(from, count, session),
+            )
+            .await,
+    )?;
     let messages = peeked(&response)?;
     assert_eq!(
         node.snapshot()?,
@@ -105,29 +112,41 @@ async fn required_entity_management_only_browse<P: StoreProvider>(
     provider: P,
     subscription: bool,
 ) -> TestResult {
-    let node = Node::start_for_peek(provider, !subscription).await?;
+    let node = at_stage(
+        "start-node",
+        Node::start_for_peek(provider, !subscription).await,
+    )?;
     let entity = if subscription {
         node.alpha.clone()
     } else {
         EntityPath::new("Sessions")?
     };
     let publisher = if subscription { &node.topic } else { &entity };
-    let mut connection = node.connect().await?;
-    let mut session = timeout(DEADLINE, connection.begin()).await??;
-    let mut sender = timeout(
-        DEADLINE,
-        ClientSender::attach(&mut session, "browse-publisher", publisher.as_str()),
-    )
-    .await??;
+    let mut connection = at_stage("connect", node.connect().await)?;
+    let mut session = at_stage("begin-session", timeout(DEADLINE, connection.begin()).await)??;
+    let mut sender = at_stage(
+        "attach-publisher",
+        timeout(
+            DEADLINE,
+            ClientSender::attach(&mut session, "browse-publisher", publisher.as_str()),
+        )
+        .await,
+    )??;
     for (text, id) in [("A-first", "A"), ("B", "B"), ("A-second", "A")] {
-        accepted(timeout(DEADLINE, sender.send(message(text, Some(id)))).await??);
+        accepted(at_stage(
+            &format!("publish-{text}"),
+            timeout(DEADLINE, sender.send(message(text, Some(id)))).await,
+        )??);
     }
-    let mut management = Management::attach(
-        &mut session,
-        "global-browser",
-        &format!("{entity}/$Management"),
-    )
-    .await?;
+    let mut management = at_stage(
+        "attach-global-browser",
+        Management::attach(
+            &mut session,
+            "global-browser",
+            &format!("{entity}/$Management"),
+        )
+        .await,
+    )?;
     // No data receiver, associated link, or held session is needed to browse.
     contents(
         &browse(&node, &mut management, 1, 2, None, "first-global-page").await?,
@@ -159,41 +178,56 @@ async fn required_entity_management_only_browse<P: StoreProvider>(
         .await?,
         &[(1, "A-first", "A", 0), (3, "A-second", "A", 0)],
     );
-    for malformed in [
+    for (index, malformed) in [
         Value::Null,
         Value::Int(1),
         Value::String(String::new()),
         Value::String("x".repeat(129)),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let snapshot = node.snapshot()?;
         let submissions = node.submissions();
-        let response = management
-            .request_unassociated(
-                "malformed-session",
-                protocol_amqp::PEEK_MESSAGE_OPERATION,
-                peek_body(1, 8, Some(malformed)),
-            )
-            .await?;
+        let response = at_stage(
+            &format!("malformed-session-{index}"),
+            management
+                .request_unassociated(
+                    "malformed-session",
+                    protocol_amqp::PEEK_MESSAGE_OPERATION,
+                    peek_body(1, 8, Some(malformed)),
+                )
+                .await,
+        )?;
         status(&response, 400);
         assert_eq!(node.submissions(), submissions);
         assert_eq!(node.snapshot()?, snapshot);
     }
-    let mut owner = receiving(&mut session, "A-owner", entity.as_str(), Some("A")).await?;
-    let first = recv(&mut owner).await?;
+    let mut owner = at_stage(
+        "attach-A-owner",
+        receiving(&mut session, "A-owner", entity.as_str(), Some("A")).await,
+    )?;
+    let first = at_stage("receive-A-first", recv(&mut owner).await)?;
     assert_eq!(sequence(first.message()), 1);
-    timeout(
-        DEADLINE,
-        owner.modify(
-            &first,
-            Modified {
-                undeliverable_here: Some(true),
-                ..Modified::default()
-            },
-        ),
-    )
-    .await??;
-    node.wait_deferred(&entity, 1).await?;
-    let second = recv(&mut owner).await?;
+    at_stage(
+        "defer-A-first",
+        timeout(
+            DEADLINE,
+            owner.modify(
+                &first,
+                Modified {
+                    undeliverable_here: Some(true),
+                    ..Modified::default()
+                },
+            ),
+        )
+        .await,
+    )??;
+    at_stage(
+        "wait-A-first-deferred",
+        node.wait_deferred(&entity, 1).await,
+    )?;
+    let second = at_stage("receive-A-second", recv(&mut owner).await)?;
     assert_eq!(sequence(second.message()), 3);
     let before_hold = node.session(&entity, "A")?;
     node.clock.set(2_000);
@@ -235,12 +269,15 @@ async fn required_entity_management_only_browse<P: StoreProvider>(
     } else {
         EntityPath::new("healthy")?
     };
-    let mut sibling = Management::attach(
-        &mut session,
-        "other-browser",
-        &format!("{other}/$management"),
-    )
-    .await?;
+    let mut sibling = at_stage(
+        "attach-other-browser",
+        Management::attach(
+            &mut session,
+            "other-browser",
+            &format!("{other}/$management"),
+        )
+        .await,
+    )?;
     let other_messages = browse(&node, &mut sibling, 1, 8, None, "other-entity").await?;
     if subscription {
         contents(
@@ -262,57 +299,84 @@ async fn required_entity_management_only_browse<P: StoreProvider>(
             "entity-wide browse crossed into another queue"
         );
     }
-    timeout(DEADLINE, owner.accept(&second)).await??;
-    node.wait_removed(&entity, 3).await?;
-    node.wait_waiting(&entity).await?;
-    let deferred = management
-        .request(
-            "retrieve-A",
-            protocol_amqp::RECEIVE_BY_SEQUENCE_NUMBER_OPERATION,
-            "A-owner",
-            sequences(1, "A"),
-        )
-        .await?;
+    at_stage(
+        "complete-A-second",
+        timeout(DEADLINE, owner.accept(&second)).await,
+    )??;
+    at_stage("wait-A-second-removed", node.wait_removed(&entity, 3).await)?;
+    at_stage("wait-A-owner-idle", node.wait_waiting(&entity).await)?;
+    let deferred = at_stage(
+        "retrieve-A-first",
+        management
+            .request(
+                "retrieve-A",
+                protocol_amqp::RECEIVE_BY_SEQUENCE_NUMBER_OPERATION,
+                "A-owner",
+                sequences(1, "A"),
+            )
+            .await,
+    )?;
     status(&deferred, 200);
     let Some(Value::Uuid(lock)) =
         first_entry(&deferred).get(&Value::String(protocol_amqp::LOCK_TOKEN.into()))
     else {
         panic!("deferred receipt")
     };
-    let response = management
-        .request(
-            "complete-A",
-            protocol_amqp::UPDATE_DISPOSITION_OPERATION,
-            "A-owner",
-            map([
-                (
-                    protocol_amqp::LOCK_TOKENS,
-                    Value::Array(Array::from(vec![Value::Uuid(lock.clone())])),
-                ),
-                (
-                    protocol_amqp::DISPOSITION_STATUS,
-                    Value::String("completed".into()),
-                ),
-            ]),
-        )
-        .await?;
+    let response = at_stage(
+        "complete-A-first",
+        management
+            .request(
+                "complete-A",
+                protocol_amqp::UPDATE_DISPOSITION_OPERATION,
+                "A-owner",
+                map([
+                    (
+                        protocol_amqp::LOCK_TOKENS,
+                        Value::Array(Array::from(vec![Value::Uuid(lock.clone())])),
+                    ),
+                    (
+                        protocol_amqp::DISPOSITION_STATUS,
+                        Value::String("completed".into()),
+                    ),
+                ]),
+            )
+            .await,
+    )?;
     status(&response, 200);
-    node.wait_removed(&entity, 1).await?;
-    timeout(DEADLINE, owner.close()).await??;
-    node.wait_released(&entity, "A").await?;
-    let mut other_session = receiving(&mut session, "B-owner", entity.as_str(), Some("B")).await?;
-    let delivery = recv(&mut other_session).await?;
+    at_stage("wait-A-first-removed", node.wait_removed(&entity, 1).await)?;
+    at_stage("close-A-owner", timeout(DEADLINE, owner.close()).await)??;
+    at_stage(
+        "wait-A-hold-released",
+        node.wait_released(&entity, "A").await,
+    )?;
+    let mut other_session = at_stage(
+        "attach-B-owner",
+        receiving(&mut session, "B-owner", entity.as_str(), Some("B")).await,
+    )?;
+    let delivery = at_stage("receive-B", recv(&mut other_session).await)?;
     assert_eq!(body(delivery.message()), b"B");
-    timeout(DEADLINE, other_session.accept(&delivery)).await??;
-    node.wait_removed(&entity, 2).await?;
-    timeout(DEADLINE, other_session.close()).await??;
-    node.wait_released(&entity, "B").await?;
+    at_stage(
+        "complete-B",
+        timeout(DEADLINE, other_session.accept(&delivery)).await,
+    )??;
+    at_stage("wait-B-removed", node.wait_removed(&entity, 2).await)?;
+    at_stage(
+        "close-B-owner",
+        timeout(DEADLINE, other_session.close()).await,
+    )??;
+    at_stage(
+        "wait-B-hold-released",
+        node.wait_released(&entity, "B").await,
+    )?;
     assert!(
         browse(&node, &mut management, 1, 8, None, "empty-after-release")
             .await?
             .is_empty()
     );
-    timeout(DEADLINE, connection.close()).await??;
+    at_stage(
+        "close-connection",
+        timeout(DEADLINE, connection.close()).await,
+    )??;
     Ok(())
 }
 
