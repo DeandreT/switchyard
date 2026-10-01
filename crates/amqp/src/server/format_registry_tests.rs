@@ -69,6 +69,7 @@ impl Harness {
     fn new(decoders: MessageFormatDecoders) -> Self {
         let (wire, peer) = tokio::io::duplex(64 * 1024);
         let mut session = SessionState::new(&Begin::default());
+        session.local_begin_sent = true;
         let mut receivers = Vec::new();
         for handle in 0..2 {
             let (deliveries, receiver) = mpsc::channel(DELIVERY_QUEUE_CAPACITY);

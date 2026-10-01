@@ -12,6 +12,7 @@ impl Fixture {
     fn new(sender_mode: SenderSettleMode, receiver_mode: ReceiverSettleMode) -> Self {
         let (wire, peer) = tokio::io::duplex(1024 * 1024);
         let mut session = SessionState::new(&Begin::default());
+        session.local_begin_sent = true;
         let consumed: [Arc<Consumption>; 2] =
             std::array::from_fn(|_| Arc::new(Consumption::new(Arc::new(Notify::new()))));
         let mut received = Vec::new();

@@ -313,7 +313,11 @@ async fn serve_open_connection<B: Broker>(
         };
         let Some(incoming) = incoming else { break };
 
-        let session = connection.accept_session(incoming).await?;
+        let session = match connection.accept_session(incoming).await {
+            Ok(session) => session,
+            Err(EngineError::RemoteDetached) => continue,
+            Err(error) => return Err(error.into()),
+        };
         let broker = broker.clone();
         let namespace = namespace.clone();
         let authorization = authorization.clone();
@@ -1171,6 +1175,9 @@ fn rejection_error(rejection: &BrokerRejection) -> AmqpProtocolError {
         None,
     )
 }
+
+#[cfg(test)]
+mod session_startup_tests;
 
 #[cfg(test)]
 mod tests {

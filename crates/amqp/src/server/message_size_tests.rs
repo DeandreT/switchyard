@@ -24,7 +24,9 @@ fn transfer(handle: u32, id: Option<u32>, more: bool) -> Transfer {
 }
 
 fn session_state() -> SessionState {
-    SessionState::new(&Begin::default())
+    let mut session = SessionState::new(&Begin::default());
+    session.local_begin_sent = true;
+    session
 }
 
 fn receiving_credit() -> ReceiveCredit {

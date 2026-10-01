@@ -5,6 +5,73 @@ use crate::{Source, Target};
 
 const DEADLINE: Duration = Duration::from_secs(5);
 
+#[tokio::test]
+async fn queued_consumption_does_not_publish_credit_after_local_detach() {
+    let (wire, mut peer) = tokio::io::duplex(64 * 1024);
+    let mut writer = FrameWriter::new(wire, 512).expect("writer");
+    let mut session = SessionState::new(&Begin::default());
+    session.local_begin_sent = true;
+    let mut delivery_queues = Vec::new();
+    for handle in 0..2 {
+        let consumption = Arc::new(Consumption::new(Arc::new(Notify::new())));
+        let mut credit = ReceiveCredit::new(0, LINK_CREDIT, consumption.clone());
+        credit.take_refill().expect("initial grant");
+        credit.try_begin_delivery().expect("reserved delivery");
+        consumption.consumed();
+        let (deliveries, receiver) = mpsc::channel(DELIVERY_QUEUE_CAPACITY);
+        delivery_queues.push(receiver);
+        let (detached, _) = watch::channel(false);
+        session.links.insert(
+            handle,
+            LinkState::Receiving(ReceivingLink {
+                max_message_size: u64::MAX,
+                deliveries,
+                partial: None,
+                detached,
+                credit,
+                decoders: MessageFormatDecoders::default(),
+                identity: LinkIdentity::new(),
+                sender_settle_mode: SenderSettleMode::Mixed,
+                receiver_settle_mode: ReceiverSettleMode::First,
+            }),
+        );
+    }
+    remember_closing_handle(&mut session, 0).expect("local detach already sent");
+    let mut sessions = HashMap::from([(0, session)]);
+    refresh_consumed(&mut writer, &mut sessions)
+        .await
+        .expect("queued consumption remains valid");
+    refill_link(0, 0, sessions.get_mut(&0).expect("session"), &mut writer)
+        .await
+        .expect("closing-link transfer refill remains valid");
+    writer
+        .write_amqp(
+            0,
+            Performative::Flow(sessions[&0].flow.snapshot().flow(None, None)),
+            Vec::new(),
+        )
+        .await
+        .expect("ordered barrier");
+    let Frame::Amqp {
+        performative: Some(Performative::Flow(healthy)),
+        ..
+    } = next_frame(&mut peer).await
+    else {
+        panic!("healthy link receives credit");
+    };
+    assert_eq!(healthy.handle, Some(1));
+    assert_eq!(healthy.delivery_count, Some(1));
+    assert_eq!(healthy.link_credit, Some(LINK_CREDIT));
+    assert!(matches!(
+        next_frame(&mut peer).await,
+        Frame::Amqp {
+            performative: Some(Performative::Flow(Flow { handle: None, .. })),
+            ..
+        }
+    ));
+    assert!(!sessions[&0].ending);
+}
+
 async fn next_frame(peer: &mut DuplexStream) -> Frame {
     timeout(DEADLINE, read_frame(peer))
         .await
@@ -576,6 +643,7 @@ async fn wrapping_disposition_resolves_existing_ids_without_reusing_an_outstandi
     let (wire, mut peer) = tokio::io::duplex(64 * 1024);
     let mut writer = FrameWriter::new(wire, 512).expect("frame writer");
     let mut session = SessionState::new(&Begin::default());
+    session.local_begin_sent = true;
     session.flow = SessionWindow::new(u32::MAX, 0, SESSION_WINDOW, SESSION_WINDOW, SESSION_WINDOW);
     session.next_delivery_id = u32::MAX;
     let mut credit = LinkCredit::new(u32::MAX);

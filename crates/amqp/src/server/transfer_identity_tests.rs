@@ -15,6 +15,7 @@ impl Harness {
     fn new() -> Self {
         let (wire, peer) = tokio::io::duplex(64 * 1024);
         let mut session = SessionState::new(&Begin::default());
+        session.local_begin_sent = true;
         let mut receivers = Vec::new();
         let mut affected_detached = None;
         for handle in 0..2 {
@@ -336,6 +337,7 @@ async fn oversized_outbound_tag_is_refused_before_credit_and_delivery_or_frame_i
     let (wire, mut peer) = tokio::io::duplex(64 * 1024);
     let mut writer = FrameWriter::new(wire, 512).expect("frame writer");
     let mut session = SessionState::new(&Begin::default());
+    session.local_begin_sent = true;
     let mut credit = LinkCredit::new(0);
     credit
         .update_peer(Some(0), 1, false)

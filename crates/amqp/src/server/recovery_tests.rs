@@ -23,6 +23,7 @@ impl Fixture {
         let (incoming_sessions, _) = mpsc::channel(32);
         let (attaches, incoming_attaches) = mpsc::channel(32);
         let mut session = SessionState::new(&Begin::default());
+        session.local_begin_sent = true;
         session.attach_tx = Some(attaches);
         let mut receivers = Vec::new();
         let mut affected_detached = None;

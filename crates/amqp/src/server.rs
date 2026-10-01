@@ -969,6 +969,7 @@ fn reject_closed_command(command: Command) {
 
 struct SessionState {
     attach_tx: Option<mpsc::Sender<Attach>>,
+    local_begin_sent: bool,
     links: HashMap<u32, LinkState>,
     closing_handles: HashSet<u32>,
     pending_attaches: HashMap<u32, PendingLinkFlow>,
@@ -1031,6 +1032,7 @@ impl SessionState {
     fn new(peer: &Begin) -> Self {
         Self {
             attach_tx: None,
+            local_begin_sent: false,
             links: HashMap::new(),
             closing_handles: HashSet::new(),
             pending_attaches: HashMap::new(),
@@ -1233,7 +1235,10 @@ async fn run_connection<Io>(
                                     }
                                     break;
                                 }
-                                Err(_) => break,
+                                Err(error) => {
+                                    tracing::debug!(%error, "AMQP server frame handling failed");
+                                    break;
+                                }
                             }
                         }
                         command = commands.recv() => {
@@ -1260,7 +1265,10 @@ async fn run_connection<Io>(
                                     pump_ready = false;
                                     closing_replies.push(reply);
                                 }
-                                Err(_) => break,
+                                Err(error) => {
+                                    tracing::debug!(%error, "AMQP server command handling failed");
+                                    break;
+                                }
                             }
                         }
                         () = consumed.notified(), if !activity.is_closing() => {
@@ -1354,16 +1362,6 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                 .try_send(IncomingSession { channel, begin })
                 .is_err()
             {
-                writer
-                    .write_amqp(
-                        channel,
-                        Performative::Begin(Begin {
-                            remote_channel: Some(channel),
-                            ..Begin::default()
-                        }),
-                        Vec::new(),
-                    )
-                    .await?;
                 refuse_session(
                     channel,
                     "amqp:resource-limit-exceeded",
@@ -1457,6 +1455,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                             .retain(|attach| attach.handle != detach.handle);
                     }
                     if !locally_closing {
+                        ensure_local_begin(channel, session, writer).await?;
                         writer
                             .write_amqp(
                                 channel,
@@ -1473,6 +1472,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                     forget_incoming_link(&mut session.incoming, &link);
                     stop_link(&mut link);
                     if !locally_closing {
+                        ensure_local_begin(channel, session, writer).await?;
                         writer
                             .write_amqp(
                                 channel,
@@ -1489,9 +1489,14 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
             }
         }
         Performative::End(_) => {
-            let mut acknowledge = true;
+            let session = sessions
+                .get_mut(&channel)
+                .ok_or_else(|| invalid_state("end on an unknown session"))?;
+            let acknowledge = !session.ending;
+            if acknowledge {
+                ensure_local_begin(channel, session, writer).await?;
+            }
             if let Some(mut session) = sessions.remove(&channel) {
-                acknowledge = !session.ending;
                 for link in session.links.values_mut() {
                     stop_link(link);
                 }
@@ -1533,23 +1538,18 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             reply,
         } => {
             let Some(session) = sessions.get_mut(&channel) else {
-                let _ = reply.send(Err(invalid_state("session begin is not pending")));
+                let _ = reply.send(Err(EngineError::RemoteDetached));
                 return Ok(CommandAction::Continue);
             };
-            if session.attach_tx.is_some() || session.ending {
+            if session.ending {
+                let _ = reply.send(Err(EngineError::RemoteDetached));
+                return Ok(CommandAction::Continue);
+            }
+            if session.attach_tx.is_some() {
                 let _ = reply.send(Err(invalid_state("session channel is already open")));
                 return Ok(CommandAction::Continue);
             }
-            writer
-                .write_amqp(
-                    channel,
-                    Performative::Begin(Begin {
-                        remote_channel: Some(channel),
-                        ..Begin::default()
-                    }),
-                    Vec::new(),
-                )
-                .await?;
+            ensure_local_begin(channel, session, writer).await?;
             for attach in std::mem::take(&mut session.pending_attach_events) {
                 if has_recovery_state(&attach) {
                     refuse_recovery_attach(channel, &attach, session, writer).await?;
@@ -1622,6 +1622,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 response.source = None;
                 response.target = None;
                 response.properties = None;
+                ensure_local_begin(channel, session, writer).await?;
                 writer
                     .write_amqp(
                         channel,
@@ -1648,6 +1649,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 let _ = reply.send(Err(error.into()));
                 return Ok(CommandAction::Continue);
             }
+            ensure_local_begin(channel, session, writer).await?;
             writer.write_frame(&response_frame).await?;
             match attach.role {
                 Role::Sender => {
@@ -1792,6 +1794,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 && let Some(mut link) = session.links.remove(&handle)
             {
                 forget_incoming_link(&mut session.incoming, &link);
+                ensure_local_begin(channel, session, writer).await?;
                 remember_closing_handle(session, handle)?;
                 writer
                     .write_amqp(
@@ -2192,10 +2195,12 @@ async fn refill_link<W: AsyncWrite + Unpin>(
 ) -> Result<(), EngineError> {
     let session_refilled = session.flow.refill_incoming();
     let link = match session.links.get_mut(&handle) {
+        _ if session.closing_handles.contains(&handle) => None,
         Some(LinkState::Receiving(link)) => link.credit.take_refill(),
         _ => None,
     };
     if let Some(link) = link {
+        ensure_local_begin(channel, session, writer).await?;
         writer
             .write_amqp(
                 channel,
@@ -2211,6 +2216,7 @@ async fn refill_link<W: AsyncWrite + Unpin>(
             )
             .await?;
     } else if session_refilled {
+        ensure_local_begin(channel, session, writer).await?;
         writer
             .write_amqp(
                 channel,
@@ -2248,6 +2254,27 @@ async fn refresh_consumed<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+async fn ensure_local_begin<W: AsyncWrite + Unpin>(
+    channel: u16,
+    session: &mut SessionState,
+    writer: &mut FrameWriter<W>,
+) -> Result<(), EngineError> {
+    if !session.local_begin_sent {
+        writer
+            .write_amqp(
+                channel,
+                Performative::Begin(Begin {
+                    remote_channel: Some(channel),
+                    ..Begin::default()
+                }),
+                Vec::new(),
+            )
+            .await?;
+        session.local_begin_sent = true;
+    }
+    Ok(())
+}
+
 async fn refuse_session<W: AsyncWrite + Unpin>(
     channel: u16,
     condition: &str,
@@ -2255,10 +2282,13 @@ async fn refuse_session<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     sessions: &mut HashMap<u16, SessionState>,
 ) -> Result<(), EngineError> {
+    let description = description.into();
+    tracing::debug!(channel, condition, %description, "refusing AMQP session");
     if let Some(session) = sessions.get_mut(&channel) {
         if session.ending {
             return Ok(());
         }
+        ensure_local_begin(channel, session, writer).await?;
         session.ending = true;
         session.attach_tx = None;
         session.pending_attaches.clear();
@@ -2330,6 +2360,7 @@ async fn apply_flow<W: AsyncWrite + Unpin>(
             .await;
         }
         if flow.echo {
+            ensure_local_begin(channel, session, writer).await?;
             writer
                 .write_amqp(
                     channel,
@@ -2390,6 +2421,7 @@ async fn apply_link_flow<W: AsyncWrite + Unpin>(
                     }
                 };
                 if let Some(snapshot) = snapshot {
+                    ensure_local_begin(channel, session, writer).await?;
                     writer
                         .write_amqp(
                             channel,
@@ -2467,6 +2499,7 @@ async fn apply_link_flow<W: AsyncWrite + Unpin>(
         }
     };
     if flow.echo {
+        ensure_local_begin(channel, session, writer).await?;
         writer
             .write_amqp(
                 channel,
@@ -2516,6 +2549,7 @@ async fn refuse_recovery_attach<W: AsyncWrite + Unpin>(
     };
     writer.encoded_frame(&response)?;
     writer.encoded_frame(&refusal)?;
+    ensure_local_begin(channel, session, writer).await?;
     remember_closing_handle(session, attach.handle)?;
     writer.write_frame(&response).await?;
     writer.write_frame(&refusal).await?;
@@ -2654,6 +2688,7 @@ async fn detach_link_error<W: AsyncWrite + Unpin>(
         payload: Vec::new(),
     };
     writer.encoded_frame(&frame)?;
+    ensure_local_begin(channel, session, writer).await?;
     remember_closing_handle(session, handle)?;
     if let Some(mut link) = session.links.remove(&handle) {
         forget_incoming_link(&mut session.incoming, &link);
@@ -3074,6 +3109,7 @@ mod tests {
         let handle = 1;
         let (attach_tx, _attaches) = mpsc::channel(1);
         let mut session = SessionState::new(&Begin::default());
+        session.local_begin_sent = true;
         session.attach_tx = Some(attach_tx);
         session
             .pending_attaches
@@ -3181,3 +3217,6 @@ mod incoming_settlement_tests;
 
 #[cfg(test)]
 mod recovery_tests;
+
+#[cfg(test)]
+mod session_startup_tests;

@@ -1059,7 +1059,9 @@ where
                                     writer.write_amqp(channel,
                                         Performative::Begin(Begin::default()),
                                         Vec::new(),
-                                    ).await.map_err(Into::into)
+                                    ).await?;
+                                    sessions.get_mut(&channel).expect("initiated session exists").local_begin_sent = true;
+                                    Ok(())
                                 }
                                 ClientCommand::Attach {
                                     channel,
