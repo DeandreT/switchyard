@@ -851,7 +851,7 @@ where
         settings.peer_idle_millis,
         activity.clone(),
     );
-    let (frames_tx, mut frames) = mpsc::channel(256);
+    let (frames_tx, mut frames) = mpsc::channel(MAX_QUEUED_FRAMES);
     let reader_activity = activity.clone();
     let mut reader_task = ConnectionReader(Some(tokio::spawn(async move {
         loop {

@@ -51,6 +51,7 @@ use session_identity::{AttachApproval, AttachApprovalError, SessionIdentity};
 const LINK_CREDIT: u32 = 32;
 const SESSION_WINDOW: u32 = 2_048;
 const DELIVERY_QUEUE_CAPACITY: usize = LINK_CREDIT as usize;
+const MAX_QUEUED_FRAMES: usize = 16;
 const MAX_PENDING_ATTACHES: usize = 32;
 const SEND_FRAME_QUANTUM: usize = 16;
 const MAX_DELIVERY_TAG_BYTES: usize = 32;
@@ -1251,7 +1252,7 @@ async fn run_connection<Io>(
         settings.peer_idle_millis,
         activity.clone(),
     );
-    let (frames_tx, mut frames) = mpsc::channel(256);
+    let (frames_tx, mut frames) = mpsc::channel(MAX_QUEUED_FRAMES);
     let reader_activity = activity.clone();
     let mut reader_task = ConnectionReader(Some(tokio::spawn(async move {
         loop {
