@@ -223,6 +223,18 @@ four-byte size prefix before allocating or reading their bodies; an open
 connection returns the framing-error Close condition. The test client can
 configure its own receive maximum between 512 bytes and the codec's 4 MiB
 ceiling. SASL reads use the local receive maximum as a resource policy.
+Receiving links additionally enforce a 4 MiB encoded-message ceiling across all
+fragments and advertise the actual effective `max-message-size` in Attach.
+Omission, zero, or a larger requested receive limit selects that local ceiling;
+smaller positive limits remain exact. This applies to both the server acceptance
+API and the test client's receiver builder, replacing their unlimited receive
+default. Exceeding the limit detaches only the offending link with
+`amqp:link:message-size-exceeded`, before appending the excess fragment or decoding
+the message, even if every Transfer still has `more=true`. Aborting an admitted
+partial delivery releases its content and aliases for reuse. The broker's
+smaller producer-link limit is unchanged. An absent or zero peer-advertised
+outgoing limit still means no peer limit; this receive policy does not bound
+temporary send encoding, combined connection content, or exact heap usage.
 Frames on channels above the locally advertised limit receive a framing-error
 Close without refreshing receive activity. Asymmetric channel/handle routing
 remains a separate unfinished feature.
