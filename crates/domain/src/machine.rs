@@ -24,6 +24,8 @@ use crate::{
     SessionLock, SessionRecord, SettlementDisposition, Timestamp, codec, keys,
 };
 
+mod topic_topology;
+
 /// Ready entries a single receive may walk past while discarding expired
 /// messages. Bounds the work one command performs so a large backlog of
 /// expired messages cannot stall the group.
@@ -189,6 +191,12 @@ impl<S: StateStore> StateMachine<S> {
         let outcome = match &command.kind {
             CommandKind::CreateQueue { config } => {
                 self.create_queue(command, *config, &mut batch)?
+            }
+            CommandKind::CreateTopic { config } => {
+                self.create_topic(command, *config, &mut batch)?
+            }
+            CommandKind::CreateSubscription { name, config } => {
+                self.create_subscription(command, name, *config, &mut batch)?
             }
             CommandKind::UpdateQueue { update } => {
                 self.update_queue(command, *update, &mut batch)?
@@ -728,9 +736,19 @@ impl<S: StateStore> StateMachine<S> {
         if command.entity.is_dead_letter_queue() {
             return Err(BrokerError::DeadLetterQueueIsReserved);
         }
+        if command.entity.is_subscription_path() {
+            return Err(BrokerError::SubscriptionPathIsReserved);
+        }
         let key = keys::queue_config(&command.namespace, &command.entity);
         if self.store.get(&key)?.is_some() {
             return Err(BrokerError::QueueAlreadyExists);
+        }
+        if self
+            .store
+            .get(&keys::topic_config(&command.namespace, &command.entity))?
+            .is_some()
+        {
+            return Err(BrokerError::EntityPathAlreadyExists);
         }
         let config = config.validate()?;
 
@@ -739,6 +757,17 @@ impl<S: StateStore> StateMachine<S> {
         // Failing here, rather than at the first dead-lettering, is why a
         // parent whose shadow path would be too long cannot be created.
         let dead_letter_queue = command.entity.dead_letter_queue()?;
+        if self
+            .store
+            .get(&keys::queue_config(&command.namespace, &dead_letter_queue))?
+            .is_some()
+            || self
+                .store
+                .get(&keys::topic_config(&command.namespace, &dead_letter_queue))?
+                .is_some()
+        {
+            return Err(BrokerError::EntityPathAlreadyExists);
+        }
         let shadow = config.dead_letter_shadow();
         batch.push_put(key, codec::encode(&config)?);
         batch.push_put(
@@ -756,6 +785,9 @@ impl<S: StateStore> StateMachine<S> {
     ) -> Result<CommandOutcome, BrokerError> {
         if command.entity.is_dead_letter_queue() {
             return Err(BrokerError::DeadLetterQueueIsReserved);
+        }
+        if command.entity.is_subscription_path() {
+            return Err(BrokerError::SubscriptionPathIsReserved);
         }
         let current = self.load_config(command)?;
         let config = update.apply_to(current)?;
@@ -780,9 +812,7 @@ impl<S: StateStore> StateMachine<S> {
         message: MessageInput<'_>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
-        if command.entity.is_dead_letter_queue() {
-            return Err(BrokerError::DeadLetterQueueIsReserved);
-        }
+        self.require_queue_ingress_target(command)?;
         let config = self.load_config(command)?;
         validate_message_input(&config, message)?;
 
@@ -813,9 +843,7 @@ impl<S: StateStore> StateMachine<S> {
         messages: &[IngressEnvelope],
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
-        if command.entity.is_dead_letter_queue() {
-            return Err(BrokerError::DeadLetterQueueIsReserved);
-        }
+        self.require_queue_ingress_target(command)?;
         let config = self.load_config(command)?;
         validate_ingress_batch(&config, messages)?;
         if messages.is_empty() {
@@ -910,9 +938,7 @@ impl<S: StateStore> StateMachine<S> {
         messages: impl ExactSizeIterator<Item = ScheduledInput<'a>>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
-        if command.entity.is_dead_letter_queue() {
-            return Err(BrokerError::DeadLetterQueueIsReserved);
-        }
+        self.require_queue_ingress_target(command)?;
         let config = self.load_config(command)?;
         let mut counters = self.load_counters(command)?;
         let namespace = &command.namespace;

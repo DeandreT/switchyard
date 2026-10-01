@@ -16,6 +16,7 @@ pub const PRECONDITION_FAILED: &str = "amqp:precondition-failed";
 pub const RESOURCE_LOCKED: &str = "amqp:resource-locked";
 pub const RESOURCE_LIMIT_EXCEEDED: &str = "amqp:resource-limit-exceeded";
 pub const MESSAGE_SIZE_EXCEEDED: &str = "amqp:link:message-size-exceeded";
+pub const NOT_IMPLEMENTED: &str = "amqp:not-implemented";
 
 pub const MESSAGE_LOCK_LOST: &str = "com.microsoft:message-lock-lost";
 pub const MESSAGE_NOT_FOUND: &str = "com.microsoft:message-not-found";
@@ -28,12 +29,19 @@ pub const TIMEOUT: &str = "com.microsoft:timeout";
 /// The condition symbol to report `error` as.
 pub fn condition_for(error: &BrokerError) -> &'static str {
     match error {
-        BrokerError::QueueNotFound | BrokerError::MessageNotScheduled { .. } => NOT_FOUND,
+        BrokerError::QueueNotFound
+        | BrokerError::TopicNotFound
+        | BrokerError::MessageNotScheduled { .. } => NOT_FOUND,
         BrokerError::MessageNotFound { .. } | BrokerError::MessageNotDeferred { .. } => {
             MESSAGE_NOT_FOUND
         }
-        BrokerError::QueueAlreadyExists => ENTITY_ALREADY_EXISTS,
-        BrokerError::QueueCounterExhausted { .. } => RESOURCE_LIMIT_EXCEEDED,
+        BrokerError::QueueAlreadyExists
+        | BrokerError::TopicAlreadyExists
+        | BrokerError::SubscriptionAlreadyExists
+        | BrokerError::EntityPathAlreadyExists => ENTITY_ALREADY_EXISTS,
+        BrokerError::QueueCounterExhausted { .. }
+        | BrokerError::SubscriptionLimitExceeded { .. } => RESOURCE_LIMIT_EXCEEDED,
+        BrokerError::TopicDataPlaneNotImplemented => NOT_IMPLEMENTED,
         BrokerError::IngressBatchLimitExceeded { limit, .. } => match limit {
             IngressBatchLimit::ContentBytes => MESSAGE_SIZE_EXCEEDED,
             IngressBatchLimit::Messages | IngressBatchLimit::ValueItems => RESOURCE_LIMIT_EXCEEDED,
@@ -57,7 +65,8 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         // no retry fixes.
         BrokerError::SessionRequired
         | BrokerError::SessionNotSupported
-        | BrokerError::DeadLetterQueueIsReserved => NOT_ALLOWED,
+        | BrokerError::DeadLetterQueueIsReserved
+        | BrokerError::SubscriptionPathIsReserved => NOT_ALLOWED,
 
         BrokerError::MessageTooLarge { .. }
         | BrokerError::MessagePropertyTooLarge { .. }
@@ -66,9 +75,10 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::InvalidMessageContent { .. }
         | BrokerError::QueuePageLimitExceeded { .. }
         | BrokerError::QueueCursorNamespaceMismatch { .. } => INVALID_FIELD,
-        BrokerError::QueueConfig(_) | BrokerError::QueuePropertyIsImmutable { .. } => {
-            PRECONDITION_FAILED
-        }
+        BrokerError::QueueConfig(_)
+        | BrokerError::TopicConfig(_)
+        | BrokerError::SubscriptionConfig(_)
+        | BrokerError::QueuePropertyIsImmutable { .. } => PRECONDITION_FAILED,
 
         // The node's clock disagrees with what it already applied. A client
         // retry can succeed once it settles, so this is locked rather than
@@ -78,6 +88,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         // Nothing a client did. Corrupt indexes, unreadable records, and storage
         // failures are the broker's problem and are reported as its fault.
         BrokerError::DanglingIndexEntry { .. }
+        | BrokerError::DanglingSubscriptionMetadata
         | BrokerError::MalformedIndexKey
         | BrokerError::Codec(_)
         | BrokerError::Identifier(_)
@@ -145,6 +156,29 @@ mod tests {
             let error = BrokerError::QueuePropertyIsImmutable { property };
             assert_eq!(condition_for(&error), PRECONDITION_FAILED);
             assert!(!is_retryable(&error));
+        }
+    }
+
+    #[test]
+    fn typed_topology_failures_keep_distinct_non_retryable_conditions() {
+        for (error, condition) in [
+            (BrokerError::TopicNotFound, NOT_FOUND),
+            (BrokerError::TopicAlreadyExists, ENTITY_ALREADY_EXISTS),
+            (
+                BrokerError::SubscriptionAlreadyExists,
+                ENTITY_ALREADY_EXISTS,
+            ),
+            (BrokerError::EntityPathAlreadyExists, ENTITY_ALREADY_EXISTS),
+            (BrokerError::SubscriptionPathIsReserved, NOT_ALLOWED),
+            (BrokerError::TopicDataPlaneNotImplemented, NOT_IMPLEMENTED),
+            (
+                BrokerError::SubscriptionLimitExceeded { maximum: 32 },
+                RESOURCE_LIMIT_EXCEEDED,
+            ),
+            (BrokerError::DanglingSubscriptionMetadata, INTERNAL_ERROR),
+        ] {
+            assert_eq!(condition_for(&error), condition, "{error}");
+            assert!(!is_retryable(&error), "{error}");
         }
     }
 

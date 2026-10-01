@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AcceptedSession, Delivery, EntityPath, LockToken, MessageEnvelope, MessageValue, NamespaceName,
-    QueueConfig, QueueConfigUpdate, ReceiveMode, SequenceNumber, SessionHold, SessionId, Timestamp,
+    QueueConfig, QueueConfigUpdate, ReceiveMode, SequenceNumber, SessionHold, SessionId,
+    SubscriptionConfig, SubscriptionName, Timestamp, TopicConfig,
 };
 
 /// One replicated instruction for the broker state machine.
@@ -279,6 +280,15 @@ pub enum CommandKind {
     SendBatch {
         messages: Vec<IngressEnvelope>,
     },
+    /// Creates a topic at Command.entity without enabling its data plane.
+    CreateTopic {
+        config: TopicConfig,
+    },
+    /// Creates one subscription under the parent topic named by Command.entity.
+    CreateSubscription {
+        name: SubscriptionName,
+        config: SubscriptionConfig,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -339,4 +349,6 @@ pub enum CommandOutcome {
     BatchSent {
         sequences: Vec<SequenceNumber>,
     },
+    TopicCreated,
+    SubscriptionCreated,
 }

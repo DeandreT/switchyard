@@ -20,7 +20,7 @@
 //! [`crate::SessionId`] reject control characters, so no name can contain a zero
 //! byte and forge another scope's prefix.
 
-use crate::{EntityPath, NamespaceName, SequenceNumber, SessionId, Timestamp};
+use crate::{EntityPath, NamespaceName, SequenceNumber, SessionId, SubscriptionName, Timestamp};
 
 const TAG_CLOCK: u8 = 0x00;
 const TAG_QUEUE_CONFIG: u8 = 0x01;
@@ -37,6 +37,8 @@ const TAG_SESSION_LOCK: u8 = 0x0A;
 const TAG_SCHEDULED: u8 = 0x0B;
 const TAG_DUPLICATE_HISTORY: u8 = 0x0C;
 const TAG_DUPLICATE_HISTORY_EXPIRY: u8 = 0x0D;
+const TAG_TOPIC_CONFIG: u8 = 0x0E;
+const TAG_TOPIC_SUBSCRIPTION: u8 = 0x0F;
 
 const SEPARATOR: u8 = 0x00;
 
@@ -90,6 +92,48 @@ pub fn namespace_queue_config_prefix(namespace: &NamespaceName) -> Vec<u8> {
     prefix.extend_from_slice(namespace.as_str().as_bytes());
     prefix.push(SEPARATOR);
     prefix
+}
+
+pub fn topic_config(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_TOPIC_CONFIG, namespace, entity)
+}
+
+pub fn topic_config_prefix() -> Vec<u8> {
+    vec![TAG_TOPIC_CONFIG]
+}
+
+pub fn namespace_topic_config_prefix(namespace: &NamespaceName) -> Vec<u8> {
+    let mut prefix = topic_config_prefix();
+    prefix.extend_from_slice(namespace.as_str().as_bytes());
+    prefix.push(SEPARATOR);
+    prefix
+}
+
+/// Membership records scoped to exactly one parent topic.
+pub fn subscription_prefix(namespace: &NamespaceName, topic: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_TOPIC_SUBSCRIPTION, namespace, topic)
+}
+
+pub fn subscription(
+    namespace: &NamespaceName,
+    topic: &EntityPath,
+    name: &SubscriptionName,
+) -> Vec<u8> {
+    let mut key = subscription_prefix(namespace, topic);
+    key.extend_from_slice(name.as_str().as_bytes());
+    key.push(SEPARATOR);
+    key
+}
+
+/// Requires a complete membership key with a valid single name and no extra tail.
+pub fn subscription_name_parts<'a>(prefix: &[u8], key: &'a [u8]) -> Option<&'a str> {
+    if prefix.first().copied()? != TAG_TOPIC_SUBSCRIPTION {
+        return None;
+    }
+    let rest = key.strip_prefix(prefix)?.strip_suffix(&[SEPARATOR])?;
+    let name = std::str::from_utf8(rest).ok()?;
+    SubscriptionName::validate(name).ok()?;
+    Some(name)
 }
 
 /// Reads the namespace and entity path back out of an entity-scoped key.
@@ -450,6 +494,95 @@ mod tests {
         let short_prefix = ready_prefix(&namespace(), &short);
         let long_prefix = ready_prefix(&namespace(), &long);
         assert!(!long_prefix.starts_with(&short_prefix));
+    }
+
+    #[test]
+    fn topology_keyspaces_have_distinct_tags_and_exact_scope_boundaries() {
+        let namespace = namespace();
+        let topic = entity();
+        assert_eq!(topic_config(&namespace, &topic), b"\x0etenant\0orders\0");
+        assert_eq!(topic_config_prefix(), [0x0e]);
+        assert_eq!(namespace_topic_config_prefix(&namespace), b"\x0etenant\0");
+        assert_eq!(
+            subscription_prefix(&namespace, &topic),
+            b"\x0ftenant\0orders\0"
+        );
+        assert_ne!(
+            topic_config(&namespace, &topic),
+            queue_config(&namespace, &topic)
+        );
+        let neighbor_namespace = NamespaceName::new("tenant-a").expect("valid namespace");
+        let neighbor_topic = EntityPath::new("orders-a").expect("valid topic path");
+        assert!(
+            !topic_config(&neighbor_namespace, &topic)
+                .starts_with(&namespace_topic_config_prefix(&namespace))
+        );
+        assert!(
+            !subscription_prefix(&namespace, &neighbor_topic)
+                .starts_with(&subscription_prefix(&namespace, &topic))
+        );
+    }
+
+    #[test]
+    fn subscription_membership_keys_sort_by_name_and_parse_exactly() {
+        let prefix = subscription_prefix(&namespace(), &entity());
+        let mut keys = ["z", "a-2", "a-1"].map(|name| {
+            subscription(
+                &namespace(),
+                &entity(),
+                &SubscriptionName::new(name).expect("valid name"),
+            )
+        });
+        keys.sort();
+        assert_eq!(
+            keys.iter()
+                .filter_map(|key| subscription_name_parts(&prefix, key))
+                .collect::<Vec<_>>(),
+            ["a-1", "a-2", "z"]
+        );
+        assert_eq!(keys[0], b"\x0ftenant\0orders\0a-1\0");
+    }
+
+    #[test]
+    fn subscription_membership_parser_rejects_malformed_or_foreign_keys() {
+        let prefix = subscription_prefix(&namespace(), &entity());
+        for suffix in [
+            b"".as_slice(),
+            b"a".as_slice(),
+            b"\0".as_slice(),
+            b"a\0tail".as_slice(),
+            b"a\0\0".as_slice(),
+            b"a/b\0".as_slice(),
+            b"..\0".as_slice(),
+            b"_a\0".as_slice(),
+            b"a-\0".as_slice(),
+            b"\xff\0".as_slice(),
+        ] {
+            let mut key = prefix.clone();
+            key.extend_from_slice(suffix);
+            assert_eq!(subscription_name_parts(&prefix, &key), None, "{suffix:?}");
+        }
+        let mut overlong = prefix.clone();
+        overlong.extend_from_slice(&[b'a'; crate::MAX_SUBSCRIPTION_NAME_BYTES + 1]);
+        overlong.push(SEPARATOR);
+        assert_eq!(subscription_name_parts(&prefix, &overlong), None);
+        let name = SubscriptionName::new("accounting").expect("valid name");
+        let key = subscription(&namespace(), &entity(), &name);
+        assert_eq!(
+            subscription_name_parts(&topic_config(&namespace(), &entity()), &key),
+            None
+        );
+        assert_eq!(subscription_name_parts(&[], &key), None);
+        assert_eq!(
+            subscription_name_parts(
+                &subscription_prefix(
+                    &NamespaceName::new("tenant-a").expect("valid namespace"),
+                    &entity()
+                ),
+                &key
+            ),
+            None
+        );
     }
 
     fn session_id(value: &str) -> SessionId {

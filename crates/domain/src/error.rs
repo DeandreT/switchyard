@@ -108,4 +108,24 @@ pub enum BrokerError {
     Identifier(#[from] IdentifierError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error("topic does not exist")]
+    TopicNotFound,
+    #[error("topic already exists")]
+    TopicAlreadyExists,
+    #[error("subscription already exists")]
+    SubscriptionAlreadyExists,
+    #[error("subscription paths are reserved for topic-owned topology")]
+    SubscriptionPathIsReserved,
+    #[error("topic subscription count exceeds its maximum of {maximum}")]
+    SubscriptionLimitExceeded { maximum: usize },
+    #[error("entity path is already occupied by another entity kind")]
+    EntityPathAlreadyExists,
+    #[error("topic data-plane operations are not implemented")]
+    TopicDataPlaneNotImplemented,
+    #[error("invalid topic configuration: {0}")]
+    TopicConfig(QueueConfigError),
+    #[error("invalid subscription configuration: {0}")]
+    SubscriptionConfig(QueueConfigError),
+    #[error("subscription metadata has a missing or mismatched topology component")]
+    DanglingSubscriptionMetadata,
 }

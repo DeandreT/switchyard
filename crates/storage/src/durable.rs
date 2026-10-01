@@ -44,13 +44,17 @@ pub const STORE_FORMAT_V6: u32 = 6;
 /// Earlier builds cannot read the appended policy or enforce it.
 pub const STORE_FORMAT_V7: u32 = 7;
 
+/// Version 8: topic metadata and bounded subscription membership reserve
+/// receive-only queue paths. Earlier builds could overwrite their topology.
+pub const STORE_FORMAT_V8: u32 = 8;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V7;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V8;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
@@ -342,6 +346,20 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V6,
+                expected: ACTIVE_STORE_FORMAT,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_store_from_before_typed_topic_topology() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        stamp_format(directory.path(), &STORE_FORMAT_V7.to_be_bytes())?;
+        assert_eq!(
+            FjallStore::open(directory.path()).err(),
+            Some(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V7,
                 expected: ACTIVE_STORE_FORMAT,
             })
         );

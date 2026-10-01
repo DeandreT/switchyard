@@ -19,6 +19,7 @@ mod message_content;
 mod queue;
 mod session;
 mod time;
+mod topic;
 
 pub use codec::CodecError;
 pub use command::{
@@ -28,8 +29,9 @@ pub use command::{
 pub use error::BrokerError;
 pub use identifier::{
     DEAD_LETTER_QUEUE_SUFFIX, EntityPath, IdentifierError, MAX_ENTITY_PATH_BYTES,
-    MAX_NAMESPACE_NAME_BYTES, MAX_PLACEMENT_GROUP_ID_BYTES, MAX_SESSION_ID_BYTES, NamespaceName,
-    PlacementGroupId, SessionId,
+    MAX_NAMESPACE_NAME_BYTES, MAX_PLACEMENT_GROUP_ID_BYTES, MAX_SESSION_ID_BYTES,
+    MAX_SUBSCRIPTION_NAME_BYTES, NamespaceName, PlacementGroupId, SUBSCRIPTION_PATH_SEGMENT,
+    SessionId, SubscriptionName,
 };
 pub use machine::{
     BROKER_HEADER_RESERVE_BYTES, CommandApplication, MAX_DEAD_LETTER_DETAIL_LENGTH,
@@ -54,3 +56,4 @@ pub use queue::{
 };
 pub use session::{AcceptedSession, SessionHold, SessionLock, SessionRecord};
 pub use time::Timestamp;
+pub use topic::{MAX_TOPIC_SUBSCRIPTIONS, SubscriptionConfig, SubscriptionDefinition, TopicConfig};

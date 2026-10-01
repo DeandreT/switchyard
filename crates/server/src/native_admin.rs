@@ -120,6 +120,11 @@ impl NativeAdminService {
                 "dead-letter queues are not administrable entities",
             ));
         }
+        if path.is_subscription_path() {
+            return Err(Status::invalid_argument(
+                "subscription paths are not administrable through the queue API",
+            ));
+        }
         Ok(path)
     }
 
@@ -256,7 +261,7 @@ impl EntityService for NativeAdminService {
                 .await
                 .map_err(submit_status)?;
             for (_, path) in &page.queues {
-                if path.is_dead_letter_queue() {
+                if path.is_dead_letter_queue() || path.is_subscription_path() {
                     continue;
                 }
                 if paths.len() == page_size {
@@ -442,17 +447,29 @@ fn submit_status(error: SubmitError) -> Status {
             Status::unavailable("broker clock is unavailable")
         }
         SubmitError::Propose(ProposeError::Broker(error)) => match error {
-            BrokerError::QueueNotFound => Status::not_found("queue does not exist"),
-            BrokerError::QueueAlreadyExists => Status::already_exists("queue already exists"),
+            BrokerError::QueueNotFound | BrokerError::TopicNotFound => {
+                Status::not_found(error.to_string())
+            }
+            BrokerError::QueueAlreadyExists
+            | BrokerError::TopicAlreadyExists
+            | BrokerError::SubscriptionAlreadyExists
+            | BrokerError::EntityPathAlreadyExists => Status::already_exists(error.to_string()),
             BrokerError::QueuePropertyIsImmutable { .. } => {
                 Status::failed_precondition(error.to_string())
             }
             BrokerError::QueueConfig(_)
+            | BrokerError::TopicConfig(_)
+            | BrokerError::SubscriptionConfig(_)
             | BrokerError::Identifier(_)
             | BrokerError::DeadLetterQueueIsReserved
+            | BrokerError::SubscriptionPathIsReserved
             | BrokerError::QueuePageLimitExceeded { .. }
             | BrokerError::QueueCursorNamespaceMismatch { .. } => {
                 Status::invalid_argument(error.to_string())
+            }
+            BrokerError::TopicDataPlaneNotImplemented => Status::unimplemented(error.to_string()),
+            BrokerError::SubscriptionLimitExceeded { .. } => {
+                Status::resource_exhausted(error.to_string())
             }
             _ => Status::internal("broker operation failed"),
         },
