@@ -17,9 +17,10 @@ SAS, carries messages and sessions across that edge, and sweeps scheduled
 activation, lock, time-to-live, session-lock, and duplicate-history expiry.
 JWT/OIDC, mTLS, policy administration,
 Raft, and compliance implementations remain to be built. Within the semantics
-below, topics have persisted definitions and bounded subscription topology but
-no publish or protocol implementation yet; the timer worker covers scheduled
-activation and the four expiry indexes that exist,
+below, topics have persisted definitions, bounded subscription topology, and
+atomic immediate default-true fanout. Topic sessions, scheduling, subscription
+protocol routing, and administration remain unimplemented; the timer worker covers
+scheduled activation and the four expiry indexes that exist,
 and the storage keyspace layout under [Storage](#storage) is still a single
 record keyspace rather than the split listed there.
 
@@ -212,24 +213,29 @@ pause timers and fail readiness until an operator resolves the condition.
 The worker that exists today sweeps scheduled activation, lock-expiry, TTL,
 session-lock, and duplicate-history indexes. Activation gives a scheduled
 message a new active sequence, records the actual enqueue time, and starts its TTL at that time.
-Each sweep visits at most 1,024 queue configurations, including dead-letter
-shadows, in exclusive key order. The worker retains its cursor between sweeps
-and wraps after the final page, so later queues are not starved by earlier ones.
+Each sweep visits at most 1,024 queue configurations, including subscription
+backing queues and dead-letter shadows, and independently at most 1,024 topic
+configurations in exclusive key order. The worker retains separate cursors
+between sweeps and wraps after each final page, so later entities are not starved
+by earlier ones. Topics receive only duplicate-history cleanup commands.
 One sweep command processes a bounded number of entries, and the worker
 re-proposes at most eight times per index before moving on. It advances past a
 queue before attempting its commands; a failed queue is revisited after the
-cursor wraps rather than preventing every later queue from being swept.
+cursor wraps rather than preventing every later queue from being swept. Both
+queue and topic phases are attempted even if the first fails; the first error
+is reported after both phases.
 Time reaches the state machine only through the proposer, which stamps each
 command: a host clock that steps back a little holds the applied timestamp still
 rather than regressing it, and one that steps back further has the command
 refused. Refusal is not yet wired to a readiness signal — the sweep is logged and
 retried on the next tick.
 
-Duplicate detection is an opt-in queue setting. Its history records the original
+Duplicate detection is an opt-in queue or topic setting. Its history records the original
 submission deadline by message ID and expires independently of settlement or
-schedule cancellation. Both send and schedule check the same history, including
-earlier entries in an atomic scheduling batch; activation only makes a previously
-accepted schedule ready. History cleanup is bounded, and overdue cleanup never
+schedule cancellation. Queue send and schedule check the same history, including
+earlier entries in an atomic batch; topic publishing checks topic-owned history
+once before fanout. Activation only makes a previously accepted queue schedule
+ready. History cleanup is bounded, and overdue cleanup never
 extends the detection window because submissions check deadlines directly.
 
 Topic sends evaluate the current subscription rule revision before proposing
@@ -237,6 +243,16 @@ fanout. The command records the matched subscriptions and encrypted property
 overlays, making follower application deterministic. One encrypted payload can
 be referenced by multiple subscriptions and is removed after the final
 reference disappears.
+
+The implementation currently applies immediate default-true fanout directly
+inside the deterministic state machine, using its validated bounded membership
+and one atomic batch. Topic ingress owns sequence allocation and duplicate
+history; subscription copies share that sequence but have independent receive
+and settlement state. It stores separate payload records rather than shared
+encrypted payloads. No rules, actions, topic scheduling, or topic session
+routing exist yet. Fanout admission bounds retained copies, content, and typed
+value items before cloning; committed application effects name only the
+subscriptions that received ready messages.
 
 ## Transactions And Forwarding
 

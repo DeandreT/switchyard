@@ -31,7 +31,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | State-machine topology only; publishing, protocol routing and administration not implemented |
+| Topics and subscriptions | Pre-1.0 | State-machine topology and atomic immediate default-true fanout; sessions, scheduling, subscription protocol routing and administration not implemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -172,10 +172,39 @@ The control segment is reserved case-insensitively, while topic and member
 spelling stays case-sensitive.
 Membership reads are bounded and refuse malformed or dangling topology instead
 of silently omitting it. The queue timer discovers the backing queues and their
-shadows through its existing queue index. Topic publishing and scheduling are
-explicitly unimplemented, and subscriptions cannot be sent to or updated through
-queue commands. These persisted definitions do not yet enable topic or
-subscription links, native topic administration, rules, or SDK workflows.
+shadows through its existing queue index. Subscriptions cannot be sent to or
+updated through queue commands.
+
+Immediate topic send, envelope send, and batch send copy each accepted message
+to every currently registered subscription in one storage commit. This is the
+[default-true subscription model](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-queues-topics-subscriptions),
+without filters or actions. Duplicate detection runs once at topic ingress;
+duplicate publications consume a sequence but create no copies. A topic with
+no subscriptions acknowledges publications without retaining messages, and a
+later subscription sees only later publications. Each copy preserves its body
+and typed envelope, takes the shortest requested/topic/subscription TTL, and has
+independent receive, settlement, lock expiry, deferral, and dead-letter state.
+All input and destination validation precedes commit, including duplicate inputs;
+one invalid destination or exhausted topic sequence rejects the whole command.
+
+Copies share their publication's topic-assigned sequence. This local policy is
+inferred from Microsoft's
+[topic-scoped sequencing description](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sequencing),
+not a cloud-verified cross-subscription guarantee. A late subscription does not
+restart numbering; its sequence gaps reflect earlier publications and duplicate
+discard. Subscription lock tokens remain independently allocated. Fanout is
+bounded before retained content is cloned: at most 1,024 copies, 4 MiB of
+aggregate retained typed content, compatibility bodies and normalized IDs, and
+65,536 typed value items. These are local resource policies, not Azure quotas.
+Only committed destinations are notified, without a post-commit topology read.
+
+Topic scheduling and all session-bearing publications are explicitly
+unimplemented. A topic with any session-enabled subscription refuses the whole
+publication, including a duplicate-only or empty batch. Batch publications with
+any scheduled timestamp are refused, even when that timestamp is already due.
+Plain producer addresses use the same send commands, but topic SDK workflows
+are not yet gated. Subscription link routing, native topic administration, and
+rules remain unimplemented.
 
 Identifier allocation refuses exhaustion instead of saturating and reusing a
 stored identity. Sequence numbers are limited to `i64::MAX`, preserving exact
@@ -195,11 +224,15 @@ is signed, while Azure documents rollover in its
 The `server` crate's timer worker proposes scheduled activation, lock,
 time-to-live, session-lock, and duplicate-history sweeps on an interval, so a
 running node activates what is due and releases or prunes what has elapsed.
-Queue discovery uses exclusive keyset pages of at most 1,024 configurations,
-including dead-letter shadows. A retained cursor visits later pages on later
-sweeps and wraps at the end; one queue's failed command does not permanently
-pin the worker ahead of all following queues. Each queue index gets at most
-eight bounded command rounds per sweep.
+Queue and topic discovery use independent exclusive keyset pages of at most
+1,024 configurations each. Queue pages include subscription backing queues and
+dead-letter shadows; topic pages use their distinct metadata index. Retained
+cursors visit later pages on later sweeps and wrap at the end. An attempted
+entity advances its cursor before its commands, and both entity families are
+attempted even if one fails, so a failing queue cannot starve topic history
+cleanup or vice versa. Topics receive only duplicate-history expiry commands.
+Each index gets at most eight bounded command rounds per sweep. Discovery reads
+do not stamp commands or advance the applied clock.
 
 An AMQP 1.0 client can reach a queue. The node accepts AMQP over TLS with the
 socket secured before the protocol handshake, as Service Bus port 5671
