@@ -86,7 +86,9 @@ behavior it currently enforces:
   settlements on one non-session primary queue, with shared limits, a bounded
   read-your-writes view, one commit, and committed-only wakeups. This does not
   expose AMQP transactions or retry idempotency; see
-  [Atomic Queue Operations](atomic-queue-operations.md).
+  [Atomic Queue Operations](atomic-queue-operations.md). Its separate
+  [guarded commit API](atomic-commit-permits.md) adds owner-claimed, pending-only
+  cancellation and an explicit indeterminate result for storage uncertainty.
 - A queue can enable duplicate detection by message ID, with a 10-minute
   default history window bounded to 20 seconds through 7 days. A duplicate
   send is accepted and dropped, and history survives completion, dead-lettering,

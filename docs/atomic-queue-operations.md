@@ -3,7 +3,7 @@
 The deterministic core and trusted broker API can apply a bounded group of
 messaging operations on one primary non-session queue. This is a foundation
 for transactions, not AMQP transaction compatibility. Coordinator links,
-Declare/Discharge, transaction IDs, staged wire acknowledgments, timeouts,
+Declare/Discharge, transaction IDs, staged wire acknowledgments, wire timeouts,
 cross-entity transactions, and successful-request retry deduplication are not
 implemented by this API.
 The separate [AMQP transaction types](amqp-transaction-types.md) are decoded but
@@ -114,8 +114,11 @@ within a transaction; see its
 
 ## Cancellation And Replay
 
-Dropping a caller's future or reply receiver does not cancel an admitted owner
-operation. The group can still commit and wake receivers. Retrying after an
+For the original `submit_atomic_messaging` API, dropping a caller's future or
+reply receiver does not cancel an admitted owner operation. The group can still
+commit and wake receivers. A separate [guarded commit API](atomic-commit-permits.md)
+adds pending-only cancellation and a compact runtime decision, without changing
+this original behavior. Retrying after an
 unknown result can therefore apply it again; there is no request ID or terminal
 decision record in this foundation. An explicitly injected failure before the
 backing apply leaves a group unchanged and can be retried; an arbitrary physical
