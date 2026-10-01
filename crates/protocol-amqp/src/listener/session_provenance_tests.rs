@@ -31,6 +31,7 @@ enum Observation {
 #[derive(Clone)]
 struct PausedBroker {
     grant_session: bool,
+    subscription: bool,
     proceed: Arc<Semaphore>,
     observed: mpsc::Sender<Observation>,
 }
@@ -41,12 +42,32 @@ impl Broker for PausedBroker {
         namespace: NamespaceName,
         target: Attachment,
     ) -> Result<Option<EntityMetadata>, BrokerRejection> {
-        Ok((namespace.as_str() == "tenant"
-            && matches!(target, Attachment::Queue(entity) if entity.as_str() == "orders"))
-        .then_some(EntityMetadata::Queue(domain::QueueConfig {
-            requires_session: true,
-            ..domain::QueueConfig::default()
-        })))
+        assert_eq!(namespace.as_str(), "tenant");
+        Ok(match target {
+            Attachment::Queue(entity) if entity.as_str() == "orders" => {
+                Some(if self.subscription {
+                    EntityMetadata::Topic(domain::TopicConfig::default())
+                } else {
+                    EntityMetadata::Queue(domain::QueueConfig {
+                        requires_session: true,
+                        ..domain::QueueConfig::default()
+                    })
+                })
+            }
+            Attachment::Subscription {
+                topic,
+                subscription,
+            } if self.subscription
+                && topic.as_str() == "orders"
+                && subscription.as_str() == "Alpha" =>
+            {
+                Some(EntityMetadata::Subscription(domain::SubscriptionConfig {
+                    requires_session: true,
+                    ..domain::SubscriptionConfig::default()
+                }))
+            }
+            _ => None,
+        })
     }
 
     async fn submit(
@@ -56,9 +77,16 @@ impl Broker for PausedBroker {
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         assert_eq!(namespace.as_str(), "tenant");
-        assert_eq!(entity.as_str(), "orders");
         match kind {
             CommandKind::AcceptSession { session_id, .. } => {
+                assert_eq!(
+                    entity.as_str(),
+                    if self.subscription {
+                        "orders/subscriptions/Alpha"
+                    } else {
+                        "orders"
+                    }
+                );
                 assert_eq!(session_id, Some(SessionId::new("cart-1").unwrap()));
                 self.observed.send(Observation::Planning).await.unwrap();
                 self.proceed.acquire().await.unwrap().forget();
@@ -74,6 +102,14 @@ impl Broker for PausedBroker {
                 )))
             }
             CommandKind::ReleaseSession { session } => {
+                assert_eq!(
+                    entity.as_str(),
+                    if self.subscription {
+                        "orders/subscriptions/Alpha"
+                    } else {
+                        "orders"
+                    }
+                );
                 assert!(self.grant_session);
                 assert_eq!(session.session_id.as_str(), "cart-1");
                 assert_eq!(session.token, LockToken::new(77));
@@ -81,6 +117,7 @@ impl Broker for PausedBroker {
                 Ok(CommandOutcome::SessionReleased)
             }
             CommandKind::SendEnvelope { body, .. } => {
+                assert_eq!(entity.as_str(), "orders");
                 assert_eq!(body, b"healthy after cancelled approval");
                 self.observed.send(Observation::Sent).await.unwrap();
                 Ok(CommandOutcome::Sent {
@@ -157,9 +194,13 @@ async fn open() -> TestResult<(ServerConnection, Peer)> {
     Ok((timeout(IO_TIMEOUT, accepting).await???, peer))
 }
 
-fn request(role: Role) -> Attach {
+fn request(role: Role, subscription: bool) -> Attach {
     let source = if role == Role::Receiver {
-        let mut source = Source::new("orders");
+        let mut source = Source::new(if subscription {
+            "orders/Subscriptions/Alpha"
+        } else {
+            "orders"
+        });
         stamp_session_filter(&mut source, &SessionId::new("cart-1").unwrap());
         Some(source)
     } else {
@@ -183,12 +224,16 @@ fn request(role: Role) -> Attach {
     }
 }
 
-async fn cancelled_planning_preserves_session(grant_session: bool) -> TestResult {
+async fn cancelled_planning_preserves_session(
+    grant_session: bool,
+    subscription: bool,
+) -> TestResult {
     let (mut connection, mut peer) = open().await?;
     let (observed, mut observations) = mpsc::channel(4);
     let proceed = Arc::new(Semaphore::new(0));
     let broker = PausedBroker {
         grant_session,
+        subscription,
         proceed: Arc::clone(&proceed),
         observed,
     };
@@ -209,7 +254,7 @@ async fn cancelled_planning_preserves_session(grant_session: bool) -> TestResult
         channel: 0, performative: Some(Performative::Begin(begin)), ..
     } if begin.remote_channel == Some(0)));
     peer.send(
-        Performative::Attach(Box::new(request(Role::Receiver))),
+        Performative::Attach(Box::new(request(Role::Receiver, subscription))),
         Vec::new(),
     )
     .await?;
@@ -239,7 +284,7 @@ async fn cancelled_planning_preserves_session(grant_session: bool) -> TestResult
     // The Detach acknowledgement fences engine cancellation while the domain
     // decision remains paused. Its replacement can already reuse the handle.
     peer.send(
-        Performative::Attach(Box::new(request(Role::Sender))),
+        Performative::Attach(Box::new(request(Role::Sender, subscription))),
         Vec::new(),
     )
     .await?;
@@ -346,10 +391,20 @@ async fn cancelled_planning_preserves_session(grant_session: bool) -> TestResult
 #[tokio::test]
 async fn cancelled_receiver_approval_releases_its_granted_hold_and_keeps_session_live() -> TestResult
 {
-    cancelled_planning_preserves_session(true).await
+    cancelled_planning_preserves_session(true, false).await
 }
 
 #[tokio::test]
 async fn cancelled_refused_approval_keeps_the_replacement_link_live() -> TestResult {
-    cancelled_planning_preserves_session(false).await
+    cancelled_planning_preserves_session(false, false).await
+}
+
+#[tokio::test]
+async fn cancelled_subscription_approval_releases_its_exact_child_hold() -> TestResult {
+    cancelled_planning_preserves_session(true, true).await
+}
+
+#[tokio::test]
+async fn cancelled_refused_subscription_approval_preserves_the_topic_sender() -> TestResult {
+    cancelled_planning_preserves_session(false, true).await
 }

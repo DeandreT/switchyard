@@ -11,7 +11,7 @@ use domain::{
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use server::{Broker, BrokerHandle, LocalProposer, Shutdown, SystemClock, TimerWorker};
-use storage::MemoryStore;
+use storage::{MemoryStore, StateStore};
 use tokio::net::TcpListener;
 
 const HOST: &str = "tenant.servicebus.windows.net";
@@ -67,8 +67,9 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
+    let store = MemoryStore::default();
     let broker = Broker::spawn(LocalProposer::new(
-        StateMachine::new(MemoryStore::default()),
+        StateMachine::new(store.clone()),
         SystemClock,
     ));
     let namespace = domain::NamespaceName::new("tenant")?;
@@ -144,6 +145,27 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
             CommandKind::CreateSubscription {
                 name: SubscriptionName::new(name)?,
                 config: SubscriptionConfig::default(),
+            },
+        )?;
+    }
+    let session_topic = domain::EntityPath::new("orders-topic-sessions")?;
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        session_topic.clone(),
+        CommandKind::CreateTopic {
+            config: TopicConfig::default(),
+        },
+    )?;
+    for (name, requires_session) in [("Alpha", true), ("beta", true), ("ordinary", false)] {
+        broker.handle().submit_blocking(
+            namespace.clone(),
+            session_topic.clone(),
+            CommandKind::CreateSubscription {
+                name: SubscriptionName::new(name)?,
+                config: SubscriptionConfig {
+                    requires_session,
+                    ..SubscriptionConfig::default()
+                },
             },
         )?;
     }
@@ -236,6 +258,11 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
         ),
         "the client exited without completing topic workflows"
     );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("topic session accept/next/FIFO/renew/state/deferred/SDLQ/isolation passed"),
+        "the client exited without completing topic session workflows"
+    );
     assert_eq!(
         broker.handle().submit_blocking(
             domain::NamespaceName::new("tenant")?,
@@ -277,6 +304,35 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
                 )?,
                 CommandOutcome::Peeked(vec![]),
                 "topic SDK workflow left retained messages in {target}"
+            );
+        }
+    }
+    for name in ["Alpha", "beta", "ordinary"] {
+        let entity = session_topic.subscription(&SubscriptionName::new(name)?)?;
+        for target in [entity.clone(), entity.dead_letter_queue()?] {
+            assert!(
+                store
+                    .scan_prefix(
+                        &domain::keys::message_prefix(
+                            &domain::NamespaceName::new("tenant")?,
+                            &target
+                        ),
+                        1
+                    )?
+                    .is_empty(),
+                "topic session SDK workflow left retained messages in {target}"
+            );
+            assert!(
+                store
+                    .scan_prefix(
+                        &domain::keys::session_lock_prefix(
+                            &domain::NamespaceName::new("tenant")?,
+                            &target
+                        ),
+                        1
+                    )?
+                    .is_empty(),
+                "topic session SDK cleanup left an active hold in {target}"
             );
         }
     }
