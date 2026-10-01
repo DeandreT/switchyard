@@ -321,6 +321,16 @@ session End, retires all local session and link owners before the Close write,
 and fails pending client operations with a closed-connection error after a
 successful flush. Failed or cancelled reply I/O retains the existing teardown
 error classifications. The bounded Close handshake controls connection shutdown.
+Local error Detach replies mark the exact closing link generation after frame
+preflight and before reply I/O. While that peer alias is still reserved, a late
+Flow or Transfer ends its session with `amqp:session:errant-link` before changing
+session windows, link credit, delivery ownership, or retained message content.
+The marker survives failed or cancelled Detach flushes. Normal closing links
+continue to tolerate crossing traffic, and a mapped peer Detach acknowledgement
+releases the exact alias for reuse. This covers in-flight handle references,
+not all link-error recovery: destroyed delivery-ID references, pipelined
+same-name re-Attach classification, and post-acknowledgement error history remain
+unfinished.
 Session windows count Transfer frames independently of link delivery counts.
 Incoming windows replenish after bounded frame processing; receive links grant
 32 message slots and return credit only as the application consumes a delivery
