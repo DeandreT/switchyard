@@ -310,11 +310,11 @@ installed, and closing links reserve their local handles; a matching Detach
 acknowledgement releases the closing binding. Exhausting the peer's output range
 ends the requesting server session with `amqp:resource-limit-exceeded`, without
 creating a link or approval event. A local client Attach instead returns retryable
-`InvalidState` without advancing its cursor or writing bytes. Flow, Transfer, or
-Detach on an unpublished peer handle ends only its session with
-`amqp:session:unattached-handle`.
-A duplicate Attach on a bound peer handle, including a pending approval or a
-normal close awaiting acknowledgement, instead receives an immediate connection
+`InvalidState` without advancing its cursor or writing bytes. Unless a retained
+error-link record applies, Flow, Transfer, or Detach on an unpublished peer
+handle ends only its session with `amqp:session:unattached-handle`.
+A duplicate Attach on a normally bound peer handle, including a pending approval
+or a normal close awaiting acknowledgement, instead receives an immediate connection
 Close with `amqp:session:handle-in-use`. That refusal precedes link-name matching,
 approval publication, and handle-capacity checks. It publishes no lazy Begin or
 session End, retires all local session and link owners before the Close write,
@@ -327,7 +327,39 @@ Flow or Transfer ends its session with `amqp:session:errant-link` before changin
 session windows, link credit, delivery ownership, or retained message content.
 The marker survives failed or cancelled Detach flushes. Normal closing links
 continue to tolerate crossing traffic, and a mapped peer Detach acknowledgement
-releases the exact alias for reuse.
+releases the exact alias for reuse. A separate session index retains at most 128
+error-detached peer handles through that acknowledgement. An unbound retained
+handle still refuses Flow or Transfer with `amqp:session:errant-link`, while a
+historical Detach is ignored. A structurally valid, admitted fresh peer binding
+supersedes its old numeric record; an exact current binding takes priority over
+history. Reusing only the local output handle does not reassign the old peer
+handle. These handle records clear when the session ends.
+Each connection also retains exact, case-sensitive error-link names separately
+for each local link direction, across Detach acknowledgement and session End.
+The registry holds at most 256 name/direction keys and 1 MiB of summed UTF-8 name
+bytes. Name, peer-handle, and delivery-ID history admission and required reply
+frame preflights all precede error-history publication. Exhaustion ends only the
+affected session with `amqp:resource-limit-exceeded`, without publishing an
+unrecorded error Detach or partially adding a global name record. Committed
+history survives failed or cancelled reply I/O; names clear when the connection
+is destroyed. Normal closes create no error-name or error-handle records.
+An incoming Attach for a known error name and direction with a null unsettled
+field receives scoped `amqp:session:errant-link`, including on another session.
+A non-null field, including an empty map, instead identifies an unsupported
+resume in this context. A server can publish its own Attach followed by an
+`amqp:not-implemented` error Detach; an unsolicited client-side request with no
+pending local endpoint receives session End with `amqp:not-implemented`.
+Fresh unknown empty maps retain their existing behavior. A local client attempt
+to freshly attach a known error name in the same direction returns `InvalidState`
+before advancing its cursor or publishing bytes; the opposite direction remains
+independent.
+Normally bound duplicate handles retain immediate Close priority, even if the
+request names a historical error link. For a still-reserved error alias, a null
+or unrelated-name Attach receives scoped errant-link End; a non-null request for
+its known error name receives scoped not-implemented End without replacement
+allocation. This is the native conservative policy for the overlapping
+[link-error and duplicate-handle rules](https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html),
+not an implementation of link resumption.
 Error Detach also retains the exact owners of known live delivery IDs in separate
 incoming and outgoing session indexes. Each direction holds at most 4,096 IDs;
 admitting more ends only that session with `amqp:resource-limit-exceeded` rather
@@ -340,10 +372,9 @@ reuse, and clear when the session ends. The outgoing allocator skips retained
 error IDs. A fresh incoming delivery replaces an old incoming error record only
 after header and format validation, exact ledger reservation, and successful
 credit admission; rejected attempts and continuations do not reassign it.
-Normal closes do not create these records. This is not yet complete link-error
-recovery: IDs already released by successful settlement or pre-settled delivery,
-pipelined same-name re-Attach classification, and error-handle history after
-Detach acknowledgement remain unfinished.
+Normal closes do not create these records. Already released successful or
+pre-settled delivery IDs are not tracked. Link and delivery resumption,
+general live-link name uniqueness and stealing remain unfinished.
 Session windows count Transfer frames independently of link delivery counts.
 Incoming windows replenish after bounded frame processing; receive links grant
 32 message slots and return credit only as the application consumes a delivery
