@@ -31,7 +31,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | Not implemented |
+| Topics and subscriptions | Pre-1.0 | State-machine topology only; publishing, protocol routing and administration not implemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -155,6 +155,27 @@ limits govern new ingress or newly allocated deadlines. Expiration disposition
 and maximum delivery count use the current queue policy. A no-op patch does not
 write storage or advance the applied clock. The adjustable per-message size cap
 is a Switchyard policy, not a verified Azure queue-update property.
+
+The state machine can create and read distinct topic definitions and bounded,
+sorted subscription membership. Queue and topic names cannot occupy the same
+namespace path. Subscription creation names its parent topic and atomically
+stores the member, its receive-only backing queue, and its dead-letter shadow;
+invalid settings, path collisions, composed path limits, or storage failure
+leave all of them and the applied clock unchanged. Topics have no queue or
+dead-letter shadow of their own. Membership is limited to 32 subscriptions per
+topic, a local resource policy rather than an Azure quota.
+Subscription names use a conservative ASCII subset of the
+[Service Bus naming rules](https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/resource-name-rules):
+1 through 50 letters, digits, periods, hyphens, or underscores, starting and
+ending with a letter or digit. Their canonical path is `topic/subscriptions/name`.
+The control segment is reserved case-insensitively, while topic and member
+spelling stays case-sensitive.
+Membership reads are bounded and refuse malformed or dangling topology instead
+of silently omitting it. The queue timer discovers the backing queues and their
+shadows through its existing queue index. Topic publishing and scheduling are
+explicitly unimplemented, and subscriptions cannot be sent to or updated through
+queue commands. These persisted definitions do not yet enable topic or
+subscription links, native topic administration, rules, or SDK workflows.
 
 Identifier allocation refuses exhaustion instead of saturating and reusing a
 stored identity. Sequence numbers are limited to `i64::MAX`, preserving exact
@@ -746,10 +767,10 @@ through the broker owner. It is a separate HTTP/2 listener and reuses the AMQP
 TLS identity and shared-access policy when configured. Authenticated requests
 require TLS and a SAS token in `authorization` metadata with Manage permission
 for the requested entity; listing needs namespace scope. The configured namespace
-is the only namespace accessible through that endpoint. Dead-letter shadows are
-hidden and cannot be administered independently. Entity capacity and usage fields
-are absent because quota accounting is not implemented; they are not reported as
-zero-byte measurements.
+is the only namespace accessible through that endpoint. Dead-letter shadows and
+subscription backing queues are hidden and cannot be administered through the
+queue API. Entity capacity and usage fields are absent because quota accounting
+is not implemented; they are not reported as zero-byte measurements.
 
 Pages are ordered, exclusive, namespace-bound, and limited to 1,024 parent queues.
 Local defaults admit 128 sockets and 128 concurrent requests across service clones,
@@ -768,7 +789,9 @@ token. Command-line settings preserve omitted, false, zero, and unlimited TTL.
 
 ## Durable Format
 
-The current value format is version 8 and durable store layout is version 7.
+The current value format is version 8 and durable store layout is version 8.
+The layout reserves distinct topic metadata and subscription membership keys;
+existing queue and message value shapes are unchanged.
 Earlier message and queue-configuration shapes have tested decoders, but an
 earlier store directory is refused at open because its broker contract differs.
 There is no directory migration tooling yet; development directories
