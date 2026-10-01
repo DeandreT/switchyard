@@ -31,7 +31,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update, Rust clients on both backends and both pinned .NET clients; Azure administration not implemented |
+| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; Azure administration not implemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP; actions not implemented |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -1090,7 +1090,7 @@ subscriptions and shadows, and retains counter tombstones across recreation.
 Missing targets return NotFound; oversized plans return ResourceExhausted with
 all state unchanged. The successful native `Operation` is synchronous, not a
 pollable job. Receiver wakeups, exact ownership validation, cleanup limits, and
-the remaining live-link incarnation boundary are defined in
+live-link incarnation fencing are defined in
 [Entity Deletion](entity-deletion.md). No Azure administration endpoint or
 immediate global link-retirement parity is claimed.
 
@@ -1139,14 +1139,16 @@ as `queue update`.
 
 ## Durable Format
 
-The current value format is version 10 and durable store layout is version 12.
+The current value format is version 10 and durable store layout is version 13.
 The value format appends the subscription filter-error policy and a source-only
 SQL rule variant with semantic version 1. Legacy subscription configurations
 decode with the default true; relabeling the new shape as an older value format
 is refused. SQL rules likewise cannot be relabeled as pre-version-10 records.
 Message and queue shapes are unchanged, and existing reason tags stay intact;
 the missing-session reason retains its version-9 rollback guard.
-The layout protects SQL rule interpretation and the new subscription policy,
+The layout also requires retained [entity incarnations](entity-incarnations.md),
+which prevent old admitted endpoints from addressing recreated names. The
+layout protects SQL rule interpretation and the new subscription policy,
 in addition to explicit rules, session-bearing ordinary subscription indexes,
 and parent-retained topic schedules. An older build could otherwise decode the
 wrong configuration shape, fail to interpret SQL, or route publications under

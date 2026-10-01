@@ -62,8 +62,10 @@ bytes, counting owned metadata and runtime together. Its purge/discovery scans
 have a 16 MiB accounted value-byte allowance. Every returned row is charged,
 including refusing overflow probes and repeated discovery of rows subsequently
 scanned for removal. Fixed bounded configuration
-and counter validation reads are additional. Retained counter tombstones and the
-global clock are not deletion keys.
+and counter validation reads are additional. Retained counter and incarnation
+tombstones and the global clock are not deletion keys. Incarnation retirement
+adds at most 33 fixed owner-record reads and Puts to a topic cascade, outside
+the deletion-key budget; those writes share the same atomic batch.
 
 Runtime, rule, and orphan-discovery walks fetch one row at a time. Values are
 discarded after accounting; only deletion keys are retained. A returned value
@@ -96,22 +98,25 @@ their first lock. Missing fences are never silently reconstructed. This is not
 a guarantee against arbitrary manual counter tampering: a used empty entity
 whose counter was externally erased cannot be distinguished from an untouched
 lazy entity. Counter tombstones currently have no garbage collection and may
-accumulate as names are deleted. Value format 10 and store layout 12 are
-unchanged.
+accumulate as names are deleted. Value format 10 remains unchanged; store layout
+13 additionally requires retained incarnation records.
 
 ## Live Links
 
 Only a committed deletion reports exact removed destinations to the broker.
 All registered receivers waiting on those backings and shadows are notified;
-their next broker operation discovers the missing configuration and closes the
-link. Failed or refused deletion emits no wakeup. Unrelated receivers and the
-connection remain usable.
+their next broker operation refuses the retired identity and closes the link,
+even if the same name was already recreated. Failed or refused deletion emits
+no wakeup. Unrelated receivers and the connection remain usable.
+
+Each admitted data or management endpoint retains its exact entity identity.
+Deletion retires that identity; recreation allocates a new one. An old endpoint
+cannot make fresh operations against the replacement, including pure rule reads,
+management operations, cleanup, and session acceptance. Management associated
+links and reply routes must have the same admitted identity as their request
+endpoint. See [Entity Incarnations](entity-incarnations.md) for the fence contract.
 
 There is no global entity-link retirement registry. An idle producer or a link
 currently delivering a locked message discovers deletion on its next operation,
-not through a promised immediate global detach. If the same name is recreated
-before an old still-open endpoint makes a fresh operation, that endpoint may
-address the recreated entity. Counter fencing protects stale receipts and
-holds, not live endpoint incarnations. Applications requiring that stronger
-boundary must close old links before recreating a name; incarnation-based link
-retirement remains unfinished.
+not through a promised immediate global detach. Replies already committed for
+the old incarnation can still drain; no replacement operation is performed.
