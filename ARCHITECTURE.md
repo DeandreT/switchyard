@@ -29,8 +29,10 @@ independent session receivers; registration precedes each receive attempt.
 Boolean, scalar correlation, and bounded SQL rules are persisted and managed
 through AMQP. SQL error routing has an explicit subscription policy; actions
 and Azure administration remain unimplemented. Native
-administration creates, reads, lists, and partially updates queues, topics, and
-subscriptions; the timer worker covers
+administration creates, reads, lists, partially updates, and atomically deletes
+queues, topics, and subscriptions. Deletion purges owned state under explicit
+work limits while retaining counters as recreation fences; see
+[Entity Deletion](docs/entity-deletion.md). The timer worker covers
 scheduled activation and the four expiry indexes that exist,
 and the storage keyspace layout under [Storage](#storage) is still a single
 record keyspace rather than the split listed there.

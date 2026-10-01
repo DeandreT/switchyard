@@ -42,7 +42,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API |
 | Same-placement-group transactions | Pre-1.0 | Not implemented |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
-| Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update over HTTP/2 and authenticated TLS; other services and deletion not implemented |
+| Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete over HTTP/2 and authenticated TLS; other services not implemented |
 | Partitioned entities | Later | Out of initial scope |
 | Cross-placement-group transactions | Later | Out of initial scope |
 | Geo-replication | Later | Out of initial scope |
@@ -373,8 +373,8 @@ granted identifier; their session-free dead-letter queues
 remain receivable. Topic management links support scheduled browsing,
 scheduling, and cancellation with operation-specific authorization; ordinary
 topic data receivers remain refused.
-Native administration can create, get, list, and partially update topics and
-subscriptions. Subscription
+Native administration can create, get, list, partially update, and delete topics
+and subscriptions. Subscription
 management links support `com.microsoft:add-rule`, `com.microsoft:remove-rule`,
 and `com.microsoft:enumerate-rules`. All three use Listen authorization on the
 complete endpoint scope, consistent with the SDK's
@@ -1019,8 +1019,8 @@ parity remain unverified.
 
 ## Native Administration
 
-The optional `--admin-listen` endpoint serves native queue create/get/list/update
-and topic/subscription create/get/list/update through the broker owner. It is a
+The optional `--admin-listen` endpoint serves native queue/topic/subscription
+create/get/list/update/delete through the broker owner. It is a
 separate HTTP/2 listener and reuses the AMQP
 TLS identity and shared-access policy when configured. Authenticated requests
 require TLS and a SAS token in `authorization` metadata with Manage permission
@@ -1075,15 +1075,24 @@ with at most 32 HTTP/2 streams per connection, a 10-second TLS handshake deadlin
 30-second request deadlines, 64 KiB decoded requests, and 1 MiB encoded replies.
 HTTP/2 connections send keepalive pings after 30 seconds, allow 10 seconds for an
 acknowledgment, and retire after five minutes with a 30-second graceful deadline.
-These are local resource policies. Entity deletion and the cluster, namespace,
+These are local resource policies. The cluster, namespace,
 backup, and audit services return unimplemented
 rather than simulated success.
 This endpoint is not Azure Atom/XML administration compatibility.
-`switchyardctl queue create|get|list|update` exposes these operations with JSON
+`switchyardctl queue create|get|list|update|delete` exposes these operations with JSON
 responses and nonzero errors. It reads SAS tokens only from bounded regular
 files, marks their metadata sensitive, and verifies TLS against explicitly
 supplied CA certificates. Plaintext is opt-in, loopback-only, and cannot carry a
 token. Command-line settings preserve omitted, false, zero, and unlimited TTL.
+
+Entity deletion commits one bounded atomic purge, cascades topic-owned
+subscriptions and shadows, and retains counter tombstones across recreation.
+Missing targets return NotFound; oversized plans return ResourceExhausted with
+all state unchanged. The successful native `Operation` is synchronous, not a
+pollable job. Receiver wakeups, exact ownership validation, cleanup limits, and
+the remaining live-link incarnation boundary are defined in
+[Entity Deletion](entity-deletion.md). No Azure administration endpoint or
+immediate global link-retirement parity is claimed.
 
 ### Configuration Updates
 

@@ -114,6 +114,9 @@ cargo run -p switchyardctl -- \
 cargo run -p switchyardctl -- \
   --endpoint http://127.0.0.1:9080 --allow-insecure \
   subscription update events audit --dead-letter-on-filter-exceptions false
+cargo run -p switchyardctl -- \
+  --endpoint http://127.0.0.1:9080 --allow-insecure \
+  subscription delete events audit
 ```
 
 Listing is exhausted only when `next_page_token` is empty. Queue discovery has a
@@ -123,8 +126,10 @@ next list request with `--page-token` to continue.
 HTTPS requires `--ca-certificate`; use `--tls-server-name` when connecting through a
 local address that differs from the certificate name. Supply a Manage SAS token
 with `--token-file`, never on the command line. Authenticated administration
-requires TLS and uses the node's existing shared-access policy. Entity deletion,
-other native services, and Azure administration compatibility remain unfinished.
+requires TLS and uses the node's existing shared-access policy. Queue, topic, and
+subscription deletion is synchronous and destructive, with atomic cleanup limits
+and retained recreation fences described in [Entity Deletion](docs/entity-deletion.md).
+Other native services and Azure administration compatibility remain unfinished.
 
 ## Production Contract
 
