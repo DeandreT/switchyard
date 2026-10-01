@@ -139,6 +139,8 @@ Other native services and Azure administration compatibility remain unfinished.
 The trusted Rust broker API also provides bounded, same-queue atomic sends and
 settlements. This is a transaction foundation, not wire transaction support;
 scope and retry boundaries are in [Atomic Queue Operations](docs/atomic-queue-operations.md).
+The [native transaction types](docs/amqp-transaction-types.md) are represented
+explicitly but refused by connection drivers until the wire lifecycle is built.
 
 ## Production Contract
 

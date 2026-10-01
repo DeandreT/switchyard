@@ -6,6 +6,8 @@ for transactions, not AMQP transaction compatibility. Coordinator links,
 Declare/Discharge, transaction IDs, staged wire acknowledgments, timeouts,
 cross-entity transactions, and successful-request retry deduplication are not
 implemented by this API.
+The separate [AMQP transaction types](amqp-transaction-types.md) are decoded but
+refused by the connection drivers; they do not expose this trusted API on the wire.
 
 ## Scope And Admission
 
