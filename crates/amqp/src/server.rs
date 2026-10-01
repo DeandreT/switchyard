@@ -23,6 +23,7 @@ use crate::{
 use crate::{decode_message, encode_message, read_frame};
 
 mod content_budget;
+mod error_deliveries;
 mod flow_control;
 mod format_registry;
 mod frame_writer;
@@ -35,6 +36,9 @@ mod session_channels;
 mod session_identity;
 
 use content_budget::ContentLease;
+use error_deliveries::{
+    ErrorDeliveryHistory, ErrorDeliveryHistoryError, MAX_RETIRED_DELIVERIES_PER_DIRECTION,
+};
 use flow_control::{LinkCredit, LinkSnapshot, SessionWindow};
 pub use format_registry::MessageFormatDecoders;
 use frame_writer::FrameWriter;
@@ -1044,6 +1048,7 @@ struct SessionState {
     next_delivery_id: u32,
     ending: bool,
     incoming: IncomingLedger,
+    error_deliveries: ErrorDeliveryHistory,
 }
 
 struct PendingLinkFlow {
@@ -1130,6 +1135,7 @@ impl SessionState {
             next_delivery_id: 0,
             ending: false,
             incoming: IncomingLedger::new(),
+            error_deliveries: ErrorDeliveryHistory::default(),
         }
     }
 }
@@ -2087,6 +2093,25 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 return Ok(CommandAction::Continue);
             }
             let error_detached = error.is_some();
+            let error_snapshot = if error_detached {
+                match snapshot_error_deliveries(session, handle, &identity) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        refuse_session_state(
+                            channel,
+                            "amqp:resource-limit-exceeded",
+                            error.to_string(),
+                            session,
+                            writer,
+                        )
+                        .await?;
+                        let _ = reply.send(Ok(()));
+                        return Ok(CommandAction::Continue);
+                    }
+                }
+            } else {
+                None
+            };
             let frame = Frame::Amqp {
                 channel,
                 performative: Some(Performative::Detach(Detach {
@@ -2099,6 +2124,15 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             if let Err(error) = writer.encoded_frame(&frame) {
                 let _ = reply.send(Err(error.into()));
                 return Ok(CommandAction::Continue);
+            }
+            if let Some((role, ids)) = &error_snapshot {
+                if !session.local_begin_sent {
+                    writer.encoded_frame(&local_begin_frame(channel, session)?)?;
+                }
+                session
+                    .error_deliveries
+                    .record(role, &identity, ids)
+                    .map_err(|error| invalid_state(error.to_string()))?;
             }
             ensure_local_begin(channel, session, writer).await?;
             remember_closing_handle(session, handle)?;
@@ -2461,6 +2495,10 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         )
         .await?;
         return refill_link(channel, transfer.handle, session, writer).await;
+    }
+    if link.partial.is_none() {
+        // A fresh ID supersedes error history only after ledger and credit admission.
+        session.error_deliveries.reassign_incoming(identity.id());
     }
     if transfer.aborted {
         link.partial = None;
@@ -3198,6 +3236,63 @@ fn remember_closing_handle(session: &mut SessionState, handle: u32) -> Result<()
     Ok(())
 }
 
+fn collect_error_delivery_ids(
+    ids: impl IntoIterator<Item = u32>,
+) -> Result<HashSet<u32>, ErrorDeliveryHistoryError> {
+    let mut owned = HashSet::new();
+    for id in ids {
+        owned.insert(id);
+        if owned.len() > MAX_RETIRED_DELIVERIES_PER_DIRECTION {
+            return Err(ErrorDeliveryHistoryError::LimitReached {
+                maximum: MAX_RETIRED_DELIVERIES_PER_DIRECTION,
+            });
+        }
+    }
+    Ok(owned)
+}
+
+fn snapshot_error_deliveries(
+    session: &SessionState,
+    handle: u32,
+    owner: &LinkIdentity,
+) -> Result<Option<(Role, HashSet<u32>)>, ErrorDeliveryHistoryError> {
+    if session.ending || session.identity.is_retired() || owner.is_retired() {
+        return Ok(None);
+    }
+    let Some(link) = session
+        .links
+        .get(&handle)
+        .filter(|link| link.identity().same_link(owner))
+    else {
+        return Ok(None);
+    };
+    let (role, ids) = match link {
+        LinkState::Receiving(_) => (
+            Role::Sender,
+            collect_error_delivery_ids(session.incoming.owned_live_ids(owner))?,
+        ),
+        LinkState::Sending(link) => (
+            Role::Receiver,
+            collect_error_delivery_ids(
+                link.unsettled
+                    .keys()
+                    .copied()
+                    .chain(link.active.as_ref().map(|active| active.delivery_id))
+                    .chain(
+                        link.pending_acknowledgements
+                            .iter()
+                            .filter_map(|(&id, token)| {
+                                (id == token.id() && token.belongs_to(owner) && !token.is_settled())
+                                    .then_some(id)
+                            }),
+                    ),
+            )?,
+        ),
+    };
+    session.error_deliveries.check_record(&role, &ids)?;
+    Ok(Some((role, ids)))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn queue_send<W: AsyncWrite + Unpin>(
     channel: u16,
@@ -3359,6 +3454,27 @@ async fn detach_link_error<W: AsyncWrite + Unpin>(
     condition: &str,
     description: impl Into<String>,
 ) -> Result<(), EngineError> {
+    let owner = session
+        .links
+        .get(&handle)
+        .map(|link| link.identity().clone());
+    let error_snapshot = if let Some(owner) = &owner {
+        match snapshot_error_deliveries(session, handle, owner) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return refuse_session_state(
+                    channel,
+                    "amqp:resource-limit-exceeded",
+                    error.to_string(),
+                    session,
+                    writer,
+                )
+                .await;
+            }
+        }
+    } else {
+        None
+    };
     let frame = Frame::Amqp {
         channel,
         performative: Some(Performative::Detach(Detach {
@@ -3373,11 +3489,18 @@ async fn detach_link_error<W: AsyncWrite + Unpin>(
         payload: Vec::new(),
     };
     writer.encoded_frame(&frame)?;
+    if !session.local_begin_sent {
+        writer.encoded_frame(&local_begin_frame(channel, session)?)?;
+    }
+    if let Some((role, ids)) = &error_snapshot
+        && let Some(owner) = &owner
+    {
+        session
+            .error_deliveries
+            .record(role, owner, ids)
+            .map_err(|error| invalid_state(error.to_string()))?;
+    }
     ensure_local_begin(channel, session, writer).await?;
-    let owner = session
-        .links
-        .get(&handle)
-        .map(|link| link.identity().clone());
     remember_closing_handle(session, handle)?;
     if let Some(owner) = &owner {
         mark_error_detached(session, handle, owner);
@@ -3449,7 +3572,8 @@ fn fragment_frame<W: AsyncWrite + Unpin>(
 }
 
 fn delivery_id_in_use(session: &SessionState, id: u32) -> bool {
-    session.links.values().any(|link| matches!(link, LinkState::Sending(link) if link.unsettled.contains_key(&id) || link.pending_acknowledgements.contains_key(&id) || link.active.as_ref().is_some_and(|active| active.delivery_id == id)))
+    session.error_deliveries.outgoing_contains(id)
+        || session.links.values().any(|link| matches!(link, LinkState::Sending(link) if link.unsettled.contains_key(&id) || link.pending_acknowledgements.contains_key(&id) || link.active.as_ref().is_some_and(|active| active.delivery_id == id)))
 }
 
 fn vacant_delivery_id(session: &SessionState) -> Option<u32> {
@@ -3475,8 +3599,9 @@ fn vacant_delivery_id(session: &SessionState) -> Option<u32> {
             }
         }
     }
-    // The admission bound guarantees a vacancy within this many candidates.
-    (1..=MAX_OUTGOING_DELIVERIES_PER_SESSION)
+    occupied.extend(session.error_deliveries.outgoing_ids());
+    // Independent live and retired bounds guarantee a vacancy in this union.
+    (1..=MAX_OUTGOING_DELIVERIES_PER_SESSION + MAX_RETIRED_DELIVERIES_PER_DIRECTION)
         .map(|offset| start.wrapping_add(offset as u32))
         .find(|id| !occupied.contains(id))
 }
@@ -3757,10 +3882,28 @@ async fn apply_disposition<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     sessions: &mut HashMap<u16, SessionState>,
 ) -> Result<(), EngineError> {
+    let Some(session) = sessions.get_mut(&channel) else {
+        return Ok(());
+    };
+    if session.ending || session.identity.is_retired() {
+        return Ok(());
+    }
+    if session.error_deliveries.contains_range(
+        &disposition.role,
+        disposition.first,
+        disposition.last,
+    ) {
+        return refuse_session_state(
+            channel,
+            "amqp:session:errant-link",
+            "disposition on an error-detached delivery",
+            session,
+            writer,
+        )
+        .await;
+    }
     if disposition.role == Role::Sender {
-        if disposition.settled
-            && let Some(session) = sessions.get_mut(&channel)
-        {
+        if disposition.settled {
             session
                 .incoming
                 .sender_settled_range(disposition.first, disposition.last);
@@ -3771,12 +3914,6 @@ async fn apply_disposition<W: AsyncWrite + Unpin>(
         .state
         .and_then(|state| Outcome::try_from(state).ok());
     let last = disposition.last.unwrap_or(disposition.first);
-    let Some(session) = sessions.get_mut(&channel) else {
-        return Ok(());
-    };
-    if session.ending || session.identity.is_retired() {
-        return Ok(());
-    }
     for link in session.links.values_mut() {
         let LinkState::Sending(link) = link else {
             continue;
@@ -3877,6 +4014,7 @@ fn stop_session(session: &mut SessionState) {
     }
     session.handle_aliases.clear();
     session.incoming = IncomingLedger::new();
+    session.error_deliveries.clear();
 }
 
 fn attach_approval_error(error: AttachApprovalError) -> EngineError {
@@ -4116,3 +4254,6 @@ mod link_handle_tests;
 
 #[cfg(test)]
 mod error_closing_tests;
+
+#[cfg(test)]
+mod error_delivery_tests;

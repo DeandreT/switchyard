@@ -8,6 +8,10 @@ use std::{
 
 use crate::ReceiverSettleMode;
 
+#[cfg(test)]
+#[path = "incoming_ledger/error_history_tests.rs"]
+mod error_history_tests;
+
 pub(super) const MAX_INCOMING_DELIVERIES_PER_LINK: usize = 1_024;
 pub(super) const MAX_INCOMING_DELIVERIES_PER_SESSION: usize = 4_096;
 const MAX_TAG_BYTES: usize = 32;
@@ -392,6 +396,19 @@ impl IncomingLedger {
             delivery.identity.mark_terminal(Terminal::Invalidated);
         }
         removed
+    }
+
+    pub(super) fn owned_live_ids<'a>(
+        &'a self,
+        owner: &'a LinkIdentity,
+    ) -> impl Iterator<Item = u32> + 'a {
+        self.deliveries.iter().filter_map(move |(&id, delivery)| {
+            (!owner.is_retired()
+                && id == delivery.identity.id()
+                && delivery.identity.belongs_to(owner)
+                && delivery.identity.terminal() == Terminal::Live)
+                .then_some(id)
+        })
     }
 
     fn live_delivery(
