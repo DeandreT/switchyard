@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AcceptedSession, Delivery, EntityPath, LockToken, MessageEnvelope, MessageValue, NamespaceName,
     QueueConfig, QueueConfigUpdate, ReceiveMode, RuleFilter, RuleName, SequenceNumber, SessionHold,
-    SessionId, SubscriptionConfig, SubscriptionName, Timestamp, TopicConfig,
+    SessionId, SubscriptionConfig, SubscriptionConfigUpdate, SubscriptionName, Timestamp,
+    TopicConfig, TopicConfigUpdate,
 };
 
 /// One replicated instruction for the broker state machine.
@@ -299,6 +300,15 @@ pub enum CommandKind {
         subscription: SubscriptionName,
         name: RuleName,
     },
+    /// Replaces mutable topic settings without rewriting retained state.
+    UpdateTopic {
+        update: TopicConfigUpdate,
+    },
+    /// Updates one subscription under the parent topic at `Command::entity`.
+    UpdateSubscription {
+        name: SubscriptionName,
+        update: SubscriptionConfigUpdate,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -363,4 +373,6 @@ pub enum CommandOutcome {
     SubscriptionCreated,
     RuleCreated,
     RuleDeleted,
+    TopicUpdated,
+    SubscriptionUpdated,
 }

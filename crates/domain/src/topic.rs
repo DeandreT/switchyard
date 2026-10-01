@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CodecError, EntityPath, QueueConfig, QueueConfigError, SubscriptionName, codec};
 
+mod updates;
+
+pub use updates::{
+    SubscriptionConfigUpdate, SubscriptionImmutableProperty, TopicConfigUpdate,
+    TopicImmutableProperty,
+};
+
 /// Bounds topology reads and the eventual fanout of a single topic submission.
 pub const MAX_TOPIC_SUBSCRIPTIONS: usize = 32;
 

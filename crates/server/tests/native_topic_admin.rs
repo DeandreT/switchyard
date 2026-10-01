@@ -169,6 +169,15 @@ impl<P: StoreProvider> Node<P> {
         .expect("bounded get")?
         .into_inner())
     }
+
+    async fn update(&self, request: UpdateEntityRequest) -> Result<Entity, tonic::Status> {
+        Ok(
+            tokio::time::timeout(DEADLINE, self.service.update_entity(Request::new(request)))
+                .await
+                .expect("bounded update")?
+                .into_inner(),
+        )
+    }
 }
 
 fn topic(path: &str, config: Option<TopicConfiguration>) -> CreateEntityRequest {
@@ -408,6 +417,8 @@ async fn native_primary_paths_and_final_subscription_markers_preserve_literal_by
 mod failures;
 #[path = "native_topic_admin/paging.rs"]
 mod paging;
+#[path = "native_topic_admin/updates.rs"]
+mod updates;
 
 macro_rules! for_each_backend {
     ($($case:ident,)+) => {

@@ -284,6 +284,9 @@ fn code<T>(result: Result<T, tonic::Status>, expected: Code) {
     }
 }
 
+#[path = "native_topic_authorization/updates.rs"]
+mod updates;
+
 async fn exact_child_manage_can_create_and_get_but_cannot_list_siblings<P: StoreProvider>(
     provider: P,
 ) -> TestResult {

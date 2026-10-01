@@ -95,7 +95,9 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         BrokerError::QueueConfig(_)
         | BrokerError::TopicConfig(_)
         | BrokerError::SubscriptionConfig(_)
-        | BrokerError::QueuePropertyIsImmutable { .. } => PRECONDITION_FAILED,
+        | BrokerError::QueuePropertyIsImmutable { .. }
+        | BrokerError::TopicPropertyIsImmutable { .. }
+        | BrokerError::SubscriptionPropertyIsImmutable { .. } => PRECONDITION_FAILED,
 
         // The node's clock disagrees with what it already applied. A client
         // retry can succeed once it settles, so this is locked rather than
@@ -173,6 +175,21 @@ mod tests {
             QueueImmutableProperty::RequiresDuplicateDetection,
         ] {
             let error = BrokerError::QueuePropertyIsImmutable { property };
+            assert_eq!(condition_for(&error), PRECONDITION_FAILED);
+            assert!(!is_retryable(&error));
+        }
+    }
+
+    #[test]
+    fn immutable_topology_property_changes_are_not_retryable() {
+        for error in [
+            BrokerError::TopicPropertyIsImmutable {
+                property: domain::TopicImmutableProperty::RequiresDuplicateDetection,
+            },
+            BrokerError::SubscriptionPropertyIsImmutable {
+                property: domain::SubscriptionImmutableProperty::RequiresSession,
+            },
+        ] {
             assert_eq!(condition_for(&error), PRECONDITION_FAILED);
             assert!(!is_retryable(&error));
         }

@@ -503,8 +503,8 @@ struct CompatibilityOutput {
     transport: &'static str,
     version: &'static str,
     queue_operations: [&'static str; 4],
-    topic_operations: [&'static str; 3],
-    subscription_operations: [&'static str; 3],
+    topic_operations: [&'static str; 4],
+    subscription_operations: [&'static str; 4],
 }
 
 fn write_output(output: &impl Serialize) -> Result<(), CliError> {
@@ -521,8 +521,8 @@ async fn execute(arguments: Arguments) -> Result<(), CliError> {
                 transport: "grpc",
                 version: env!("CARGO_PKG_VERSION"),
                 queue_operations: ["create", "get", "list", "update"],
-                topic_operations: ["create", "get", "list"],
-                subscription_operations: ["create", "get", "list"],
+                topic_operations: ["create", "get", "list", "update"],
+                subscription_operations: ["create", "get", "list", "update"],
             });
         }
         Command::Topic { command } => return topology::execute_topic(&arguments, command).await,
@@ -581,6 +581,7 @@ async fn execute(arguments: Arguments) -> Result<(), CliError> {
                         namespace,
                         path: input.path.clone(),
                         queue_config: Some(input.configuration.protobuf()),
+                        ..UpdateEntityRequest::default()
                     }))
                     .await
                     .map_err(|status| CliError::Request(status.code()))?;

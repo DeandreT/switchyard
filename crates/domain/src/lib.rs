@@ -75,4 +75,7 @@ pub use sql_filter::{
     SqlTruth,
 };
 pub use time::Timestamp;
-pub use topic::{MAX_TOPIC_SUBSCRIPTIONS, SubscriptionConfig, SubscriptionDefinition, TopicConfig};
+pub use topic::{
+    MAX_TOPIC_SUBSCRIPTIONS, SubscriptionConfig, SubscriptionConfigUpdate, SubscriptionDefinition,
+    SubscriptionImmutableProperty, TopicConfig, TopicConfigUpdate, TopicImmutableProperty,
+};

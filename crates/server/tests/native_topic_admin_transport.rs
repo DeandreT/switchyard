@@ -4,8 +4,8 @@ use std::{error::Error, time::Duration};
 
 use admin_api::v1::{
     CreateEntityRequest, Entity, EntityKind, GetEntityRequest, ListEntitiesRequest,
-    SubscriptionConfiguration, TopicConfiguration, UnlimitedTimeToLive,
-    entity_service_client::EntityServiceClient,
+    QueueConfiguration, SubscriptionConfiguration, TopicConfiguration, UnlimitedTimeToLive,
+    UpdateEntityRequest, entity_service_client::EntityServiceClient,
     subscription_configuration::DefaultTimeToLive as SubscriptionTtl,
     topic_configuration::DefaultTimeToLive as TopicTtl,
 };
@@ -300,6 +300,94 @@ async fn typed_topology_round_trip<P: StoreProvider>(provider: P, tls: bool) -> 
             .dead_lettering_on_filter_evaluation_exceptions,
         Some(true)
     );
+    let created_topic = timeout(
+        DEADLINE,
+        client.update_entity(node.request(UpdateEntityRequest {
+            namespace: "tenant".into(),
+            path: "Orders".into(),
+            topic_config: Some(TopicConfiguration {
+                default_time_to_live: Some(TopicTtl::DefaultTtlUnlimited(UnlimitedTimeToLive {})),
+                max_message_bytes: Some(2_048),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })),
+    )
+    .await??
+    .into_inner();
+    topic_only(&created_topic);
+    let config = created_topic.topic_config.as_ref().expect("updated topic");
+    assert_eq!(config.max_message_bytes, Some(2_048));
+    assert_eq!(config.requires_duplicate_detection, Some(true));
+    assert_eq!(
+        config.duplicate_detection_history_time_window_millis,
+        Some(300_000)
+    );
+    assert!(matches!(
+        config.default_time_to_live,
+        Some(TopicTtl::DefaultTtlUnlimited(_))
+    ));
+    let created_sub = timeout(
+        DEADLINE,
+        client.update_entity(node.request(UpdateEntityRequest {
+            namespace: "tenant".into(),
+            path: "Orders/SUBSCRIPTIONS/Alpha".into(),
+            subscription_config: Some(SubscriptionConfiguration {
+                lock_duration_millis: Some(19_000),
+                default_time_to_live: Some(SubscriptionTtl::DefaultTtlMillis(45_000)),
+                dead_lettering_on_message_expiration: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })),
+    )
+    .await??
+    .into_inner();
+    subscription_only(&created_sub);
+    let config = created_sub
+        .subscription_config
+        .as_ref()
+        .expect("updated subscription");
+    assert_eq!(config.lock_duration_millis, Some(19_000));
+    assert_eq!(config.max_delivery_count, Some(4));
+    assert_eq!(config.requires_session, Some(true));
+    assert_eq!(config.dead_lettering_on_message_expiration, Some(false));
+    assert_eq!(
+        config.dead_lettering_on_filter_evaluation_exceptions,
+        Some(false)
+    );
+    assert!(matches!(
+        config.default_time_to_live,
+        Some(SubscriptionTtl::DefaultTtlMillis(45_000))
+    ));
+    for input in [
+        UpdateEntityRequest {
+            namespace: "tenant".into(),
+            path: "Orders".into(),
+            topic_config: Some(TopicConfiguration {
+                requires_duplicate_detection: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        UpdateEntityRequest {
+            namespace: "tenant".into(),
+            path: "Orders/subscriptions/Alpha".into(),
+            subscription_config: Some(SubscriptionConfiguration {
+                requires_session: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    ] {
+        assert_eq!(
+            timeout(DEADLINE, client.update_entity(node.request(input)))
+                .await?
+                .expect_err("creation-only setting cannot change")
+                .code(),
+            Code::FailedPrecondition
+        );
+    }
     node.clock.set(0);
     assert_eq!(
         timeout(
@@ -405,6 +493,29 @@ async fn typed_topology_round_trip<P: StoreProvider>(provider: P, tls: bool) -> 
     assert!(queue.queue_config.is_some());
     assert!(queue.topic_config.is_none());
     assert!(queue.subscription_config.is_none());
+    let queue = timeout(
+        DEADLINE,
+        client.update_entity(node.request(UpdateEntityRequest {
+            namespace: "tenant".into(),
+            path: "Healthy".into(),
+            queue_config: Some(QueueConfiguration {
+                lock_duration_millis: Some(29_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })),
+    )
+    .await??
+    .into_inner();
+    assert_eq!(queue.kind, EntityKind::Queue as i32);
+    assert_eq!(
+        queue
+            .queue_config
+            .as_ref()
+            .expect("legacy queue update")
+            .lock_duration_millis,
+        Some(29_000)
+    );
     assert_eq!(
         timeout(DEADLINE, client.get_entity(node.request(get("Healthy"))))
             .await??
@@ -428,7 +539,7 @@ async fn typed_topology_round_trip<P: StoreProvider>(provider: P, tls: bool) -> 
         panic!("typed topic creation committed")
     };
     assert!(config.requires_duplicate_detection);
-    assert_eq!(config.max_message_bytes, 1_024);
+    assert_eq!(config.max_message_bytes, 2_048);
     Ok(())
 }
 
@@ -462,6 +573,41 @@ async fn tls_exact_child_token_cannot_list_or_access_neighbor_entities<P: StoreP
     .into_inner();
     assert_eq!(child.path, exact);
     subscription_only(&child);
+    node.clock.set(10_001);
+    let child = timeout(
+        DEADLINE,
+        client.update_entity(request(
+            UpdateEntityRequest {
+                namespace: "tenant".into(),
+                path: "Orders/SUBSCRIPTIONS/Private".into(),
+                subscription_config: Some(SubscriptionConfiguration {
+                    max_delivery_count: Some(4),
+                    dead_lettering_on_filter_evaluation_exceptions: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Some(sas(exact)),
+        )),
+    )
+    .await??
+    .into_inner();
+    assert_eq!(
+        child
+            .subscription_config
+            .as_ref()
+            .expect("updated child")
+            .max_delivery_count,
+        Some(4)
+    );
+    assert_eq!(
+        child
+            .subscription_config
+            .as_ref()
+            .expect("updated child")
+            .dead_lettering_on_filter_evaluation_exceptions,
+        Some(false)
+    );
     node.clock.set(0);
     for denied in [
         "Orders",
@@ -475,6 +621,24 @@ async fn tls_exact_child_token_cannot_list_or_access_neighbor_entities<P: StoreP
             )
             .await?
             .expect_err("exact child token cannot access sibling or parent")
+            .code(),
+            Code::PermissionDenied
+        );
+        assert_eq!(
+            timeout(
+                DEADLINE,
+                client.update_entity(request(
+                    UpdateEntityRequest {
+                        namespace: "tenant".into(),
+                        path: denied.into(),
+                        subscription_config: Some(SubscriptionConfiguration::default()),
+                        ..Default::default()
+                    },
+                    Some(sas(exact))
+                ))
+            )
+            .await?
+            .expect_err("exact child token cannot update sibling or parent")
             .code(),
             Code::PermissionDenied
         );

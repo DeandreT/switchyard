@@ -153,6 +153,8 @@ message UpdateEntityRequest {
   string namespace = 1;
   string path = 2;
   QueueConfiguration queue_config = 3;
+  TopicConfiguration topic_config = 4;
+  SubscriptionConfiguration subscription_config = 5;
 }
 
 message GetEntityRequest {

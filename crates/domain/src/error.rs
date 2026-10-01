@@ -4,7 +4,7 @@ use thiserror::Error;
 use crate::{
     CodecError, IdentifierError, IngressBatchLimit, NamespaceName, QueueConfigError,
     QueueCounterKind, QueueImmutableProperty, RuleMatchLimit, SequenceNumber, SessionId,
-    SqlCompileError, Timestamp,
+    SqlCompileError, SubscriptionImmutableProperty, Timestamp, TopicImmutableProperty,
 };
 
 /// Every rejection the state machine can produce.
@@ -168,4 +168,10 @@ pub enum BrokerError {
     },
     #[error("entity metadata has a missing or mismatched topology component")]
     DanglingEntityMetadata,
+    #[error("topic property {property} cannot be changed after creation")]
+    TopicPropertyIsImmutable { property: TopicImmutableProperty },
+    #[error("subscription property {property} cannot be changed after creation")]
+    SubscriptionPropertyIsImmutable {
+        property: SubscriptionImmutableProperty,
+    },
 }

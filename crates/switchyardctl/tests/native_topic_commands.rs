@@ -377,6 +377,31 @@ async fn topology_path_and_flag_errors_are_local_and_never_need_a_listener() -> 
             + 1,
     );
     let commands = [
+        vec!["topic", "update", "Orders", "--requires-session"],
+        vec!["topic", "update", "Orders/subscriptions/Alpha"],
+        vec!["subscription", "update", "Orders", "bad_"],
+        vec![
+            "subscription",
+            "update",
+            "Orders/subscriptions/nested",
+            "Alpha",
+        ],
+        vec![
+            "subscription",
+            "update",
+            "Orders",
+            "Alpha",
+            "--requires-duplicate-detection",
+        ],
+        vec![
+            "subscription",
+            "update",
+            "Orders",
+            "Alpha",
+            "--default-ttl-millis",
+            "1",
+            "--ttl-unlimited",
+        ],
         vec!["topic", "create", "Orders", "--requires-session"],
         vec![
             "topic",
@@ -466,4 +491,244 @@ async fn topology_commands_use_tls_token_files_without_disclosing_credentials() 
     assert!(!error.contains(invalid));
     assert_eq!(node.store.snapshot()?, before);
     Ok(())
+}
+
+async fn topology_updates_roundtrip(tls: bool) -> TestResult {
+    let node = Node::start(tls).await?;
+    let compatibility = node.json(&["compatibility"]).await?;
+    assert_eq!(
+        compatibility["topic_operations"],
+        serde_json::json!(["create", "get", "list", "update"])
+    );
+    assert_eq!(
+        compatibility["subscription_operations"],
+        serde_json::json!(["create", "get", "list", "update"])
+    );
+    node.json(&[
+        "topic",
+        "create",
+        "Mutable",
+        "--default-ttl-millis",
+        "20000",
+        "--max-message-bytes",
+        "16384",
+        "--requires-duplicate-detection=false",
+        "--duplicate-detection-window-millis",
+        "60000",
+    ])
+    .await?;
+    node.json(&[
+        "subscription",
+        "create",
+        "Mutable",
+        "Alpha",
+        "--default-ttl-millis",
+        "50000",
+        "--lock-duration-millis",
+        "30000",
+        "--max-delivery-count",
+        "7",
+        "--max-message-bytes",
+        "8192",
+        "--requires-session=false",
+        "--dead-letter-on-expiration",
+        "--dead-letter-on-filter-exceptions=false",
+    ])
+    .await?;
+    node.clock.set(1_001);
+    let parent = node
+        .json(&[
+            "topic",
+            "update",
+            "Mutable",
+            "--ttl-unlimited",
+            "--requires-duplicate-detection=false",
+            "--duplicate-detection-window-millis",
+            "120000",
+        ])
+        .await?;
+    assert_eq!(parent["kind"], "topic");
+    assert!(parent["topic_config"]["default_time_to_live_millis"].is_null());
+    assert_eq!(parent["topic_config"]["max_message_bytes"], 16_384);
+    assert_eq!(
+        parent["topic_config"]["requires_duplicate_detection"],
+        false
+    );
+    assert_eq!(
+        parent["topic_config"]["duplicate_detection_history_time_window_millis"],
+        120_000
+    );
+    assert_eq!(node.json(&["topic", "get", "Mutable"]).await?, parent);
+    let child = node
+        .json(&[
+            "subscription",
+            "update",
+            "Mutable",
+            "Alpha",
+            "--lock-duration-millis",
+            "50000",
+        ])
+        .await?;
+    assert_eq!(child["kind"], "subscription");
+    assert_eq!(child["path"], "Mutable/subscriptions/Alpha");
+    assert_eq!(child["subscription_config"]["lock_duration_millis"], 50_000);
+    assert_eq!(
+        child["subscription_config"]["default_time_to_live_millis"],
+        50_000
+    );
+    assert_eq!(child["subscription_config"]["max_delivery_count"], 7);
+    assert_eq!(child["subscription_config"]["max_message_bytes"], 8_192);
+    assert_eq!(child["subscription_config"]["requires_session"], false);
+    assert_eq!(
+        child["subscription_config"]["dead_lettering_on_message_expiration"],
+        true
+    );
+    assert_eq!(
+        child["subscription_config"]["dead_lettering_on_filter_evaluation_exceptions"],
+        false
+    );
+    let child = node
+        .json(&[
+            "subscription",
+            "update",
+            "Mutable",
+            "Alpha",
+            "--ttl-unlimited",
+            "--dead-letter-on-expiration=false",
+            "--dead-letter-on-filter-exceptions=false",
+            "--max-delivery-count",
+            "9",
+            "--requires-session=false",
+        ])
+        .await?;
+    assert!(child["subscription_config"]["default_time_to_live_millis"].is_null());
+    assert_eq!(child["subscription_config"]["lock_duration_millis"], 50_000);
+    assert_eq!(child["subscription_config"]["max_delivery_count"], 9);
+    assert_eq!(
+        child["subscription_config"]["dead_lettering_on_message_expiration"],
+        false
+    );
+    assert_eq!(
+        child["subscription_config"]["dead_lettering_on_filter_evaluation_exceptions"],
+        false
+    );
+    let enabled = node
+        .json(&[
+            "subscription",
+            "update",
+            "Mutable",
+            "Alpha",
+            "--dead-letter-on-filter-exceptions",
+        ])
+        .await?;
+    assert_eq!(
+        enabled["subscription_config"]["dead_lettering_on_filter_evaluation_exceptions"],
+        true
+    );
+    assert_eq!(
+        enabled["subscription_config"]["dead_lettering_on_message_expiration"],
+        false
+    );
+    let before = node.store.snapshot()?;
+    let applied = node.broker.handle().last_applied_blocking()?;
+    node.clock.set(1_002);
+    assert_eq!(node.json(&["topic", "update", "Mutable"]).await?, parent);
+    assert_eq!(
+        node.json(&["subscription", "update", "Mutable", "Alpha"])
+            .await?,
+        enabled
+    );
+    assert_eq!(node.store.snapshot()?, before);
+    assert_eq!(node.broker.handle().last_applied_blocking()?, applied);
+    for command in [
+        vec![
+            "topic",
+            "update",
+            "Mutable",
+            "--requires-duplicate-detection",
+        ],
+        vec![
+            "subscription",
+            "update",
+            "Mutable",
+            "Alpha",
+            "--requires-session",
+        ],
+        vec!["topic", "update", "Mutable", "--max-message-bytes", "0"],
+        vec![
+            "subscription",
+            "update",
+            "Mutable",
+            "Alpha",
+            "--default-ttl-millis",
+            "0",
+        ],
+        vec!["queue", "update", "Mutable"],
+        vec!["subscription", "update", "Mutable", "Missing"],
+        vec!["topic", "update", "Missing"],
+    ] {
+        failed(&node.run(&command).await?);
+        assert_eq!(node.store.snapshot()?, before);
+        assert_eq!(node.broker.handle().last_applied_blocking()?, applied);
+    }
+    node.json(&["queue", "create", "work"]).await?;
+    let ordinary = node
+        .json(&["queue", "update", "work", "--max-delivery-count", "8"])
+        .await?;
+    assert_eq!(ordinary["kind"], "queue");
+    assert_eq!(ordinary["queue_config"]["max_delivery_count"], 8);
+    assert_eq!(node.json(&["queue", "get", "work"]).await?, ordinary);
+    let before = node.store.snapshot()?;
+    let applied = node.broker.handle().last_applied_blocking()?;
+    node.clock.set(0);
+    assert_eq!(node.json(&["topic", "get", "Mutable"]).await?, parent);
+    assert_eq!(
+        node.json(&["subscription", "get", "Mutable", "Alpha"])
+            .await?,
+        enabled
+    );
+    assert_eq!(node.json(&["topic", "list"]).await?["entities"][0], parent);
+    assert_eq!(
+        node.json(&["subscription", "list", "Mutable"]).await?["entities"][0],
+        enabled
+    );
+    failed(
+        &node
+            .run(&["topic", "update", "Mutable", "--max-message-bytes", "32768"])
+            .await?,
+    );
+    assert_eq!(node.store.snapshot()?, before);
+    assert_eq!(node.broker.handle().last_applied_blocking()?, applied);
+    if tls {
+        let invalid = "SharedAccessSignature update-secret-that-must-not-be-disclosed";
+        std::fs::write(node.credentials.path().join("token"), invalid)?;
+        for command in [
+            vec!["topic", "update", "Mutable", "--max-message-bytes", "65536"],
+            vec![
+                "subscription",
+                "update",
+                "Mutable",
+                "Alpha",
+                "--dead-letter-on-filter-exceptions=false",
+            ],
+        ] {
+            let output = node.run(&command).await?;
+            failed(&output);
+            let error = String::from_utf8(output.stderr)?;
+            assert!(!error.contains(KEY));
+            assert!(!error.contains(invalid));
+            assert_eq!(node.store.snapshot()?, before);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn topology_updates_roundtrip_plaintext_and_preserve_legacy_queue_commands() -> TestResult {
+    timeout(DEADLINE * 4, topology_updates_roundtrip(false)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn topology_updates_roundtrip_tls_and_preserve_scoped_credential_handling() -> TestResult {
+    timeout(DEADLINE * 4, topology_updates_roundtrip(true)).await?
 }

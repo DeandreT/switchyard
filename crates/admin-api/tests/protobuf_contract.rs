@@ -56,6 +56,16 @@ fn existing_entity_fields_keep_their_wire_numbers() {
                 ("parent_topic", 5),
             ],
         ),
+        (
+            "UpdateEntityRequest",
+            vec![
+                ("namespace", 1),
+                ("path", 2),
+                ("queue_config", 3),
+                ("topic_config", 4),
+                ("subscription_config", 5),
+            ],
+        ),
     ] {
         let message = descriptor
             .message_type
@@ -398,9 +408,68 @@ fn generated_contract_includes_update_without_removing_existing_methods() {
             max_delivery_count: Some(4),
             ..v1::QueueConfiguration::default()
         }),
+        ..v1::UpdateEntityRequest::default()
     };
     assert_eq!(
         v1::UpdateEntityRequest::decode(update.encode_to_vec().as_slice()).expect("update"),
         update
     );
+}
+
+#[test]
+fn additive_update_families_preserve_legacy_queue_bytes_and_presence() {
+    let queue = v1::UpdateEntityRequest {
+        queue_config: Some(v1::QueueConfiguration {
+            max_delivery_count: Some(4),
+            ..v1::QueueConfiguration::default()
+        }),
+        ..v1::UpdateEntityRequest::default()
+    };
+    assert_eq!(queue.encode_to_vec(), [0x1a, 2, 0x10, 4]);
+    let decoded = v1::UpdateEntityRequest::decode([0x1a, 2, 0x10, 4].as_slice()).unwrap();
+    assert_eq!(decoded, queue);
+    assert!(decoded.topic_config.is_none());
+    assert!(decoded.subscription_config.is_none());
+    for (request, expected) in [
+        (
+            v1::UpdateEntityRequest {
+                topic_config: Some(v1::TopicConfiguration {
+                    requires_duplicate_detection: Some(false),
+                    ..v1::TopicConfiguration::default()
+                }),
+                ..v1::UpdateEntityRequest::default()
+            },
+            vec![0x22, 2, 0x18, 0],
+        ),
+        (
+            v1::UpdateEntityRequest {
+                subscription_config: Some(v1::SubscriptionConfiguration {
+                    dead_lettering_on_filter_evaluation_exceptions: Some(false),
+                    ..v1::SubscriptionConfiguration::default()
+                }),
+                ..v1::UpdateEntityRequest::default()
+            },
+            vec![0x2a, 2, 0x40, 0],
+        ),
+        (
+            v1::UpdateEntityRequest {
+                topic_config: Some(v1::TopicConfiguration::default()),
+                ..v1::UpdateEntityRequest::default()
+            },
+            vec![0x22, 0],
+        ),
+        (
+            v1::UpdateEntityRequest {
+                subscription_config: Some(v1::SubscriptionConfiguration::default()),
+                ..v1::UpdateEntityRequest::default()
+            },
+            vec![0x2a, 0],
+        ),
+    ] {
+        assert_eq!(request.encode_to_vec(), expected);
+        assert_eq!(
+            v1::UpdateEntityRequest::decode(expected.as_slice()).unwrap(),
+            request
+        );
+    }
 }

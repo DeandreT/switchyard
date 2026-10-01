@@ -164,10 +164,11 @@ async fn local_validation_missing_parents_and_occupancy_never_mutate_topology<P:
                         namespace: "tenant".into(),
                         path: path.into(),
                         queue_config: Some(QueueConfiguration::default()),
+                        ..Default::default()
                     })),
             )
             .await?,
-            Code::Unimplemented,
+            Code::InvalidArgument,
         );
         code(
             tokio::time::timeout(

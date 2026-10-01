@@ -30,6 +30,7 @@ mod topic_fanout;
 mod topic_paging;
 mod topic_scheduling;
 mod topic_topology;
+mod topology_updates;
 
 use message_retention::message_record;
 
@@ -241,6 +242,12 @@ impl<S: StateStore> StateMachine<S> {
             }
             CommandKind::UpdateQueue { update } => {
                 self.update_queue(command, *update, &mut batch)?
+            }
+            CommandKind::UpdateTopic { update } => {
+                self.update_topic(command, *update, &mut batch)?
+            }
+            CommandKind::UpdateSubscription { name, update } => {
+                self.update_subscription(command, name, *update, &mut batch)?
             }
             CommandKind::Send {
                 message_id,

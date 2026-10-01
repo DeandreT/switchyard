@@ -306,37 +306,86 @@ impl EntityService for NativeAdminService {
         let input = request.get_ref();
         let resource = topology::requested_resource(&input.path);
         let _permit = self.begin_request(&request, &input.namespace, Some(&resource))?;
-        let AdminTarget::Primary(path) = topology::target(&input.path)? else {
-            return Err(Status::unimplemented(
-                "subscription updates are not implemented",
+        let target = topology::target(&input.path)?;
+        let kind = topology::update_kind(input)?;
+        if matches!(&target, AdminTarget::Subscription { .. }) != (kind == EntityKind::Subscription)
+        {
+            return Err(Status::invalid_argument(
+                "configuration does not match the entity path",
             ));
-        };
+        }
         let metadata = self
             .broker
-            .admin_entity_metadata(self.namespace.clone(), AdminTarget::Primary(path.clone()))
+            .admin_entity_metadata(self.namespace.clone(), target.clone())
             .await
             .map_err(read_status)?;
-        if matches!(metadata, Some(protocol_amqp::EntityMetadata::Topic(_))) {
-            return Err(Status::unimplemented("topic updates are not implemented"));
+        let wrong_kind = matches!(
+            (kind, metadata),
+            (
+                EntityKind::Queue,
+                Some(protocol_amqp::EntityMetadata::Topic(_))
+            ) | (
+                EntityKind::Topic,
+                Some(protocol_amqp::EntityMetadata::Queue(_))
+            )
+        );
+        if wrong_kind {
+            return Err(Status::invalid_argument(
+                "configuration does not match the entity kind",
+            ));
         }
-        let config = input
-            .queue_config
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("queue configuration patch is required"))?;
-        let update = configuration_update(config)?;
+        let (path, command, expected) = match (&target, kind) {
+            (AdminTarget::Primary(path), EntityKind::Queue) => (
+                path.clone(),
+                CommandKind::UpdateQueue {
+                    update: configuration_update(input.queue_config.as_ref().ok_or_else(
+                        || Status::invalid_argument("queue configuration patch is required"),
+                    )?)?,
+                },
+                CommandOutcome::QueueUpdated,
+            ),
+            (AdminTarget::Primary(path), EntityKind::Topic) => (
+                path.clone(),
+                CommandKind::UpdateTopic {
+                    update: topology::topic_configuration_update(
+                        input.topic_config.as_ref().ok_or_else(|| {
+                            Status::invalid_argument("topic configuration patch is required")
+                        })?,
+                    )?,
+                },
+                CommandOutcome::TopicUpdated,
+            ),
+            (AdminTarget::Subscription { topic, name }, EntityKind::Subscription) => (
+                topic.clone(),
+                CommandKind::UpdateSubscription {
+                    name: name.clone(),
+                    update: topology::subscription_configuration_update(
+                        input.subscription_config.as_ref().ok_or_else(|| {
+                            Status::invalid_argument("subscription configuration patch is required")
+                        })?,
+                    )?,
+                },
+                CommandOutcome::SubscriptionUpdated,
+            ),
+            _ => {
+                return Err(Status::invalid_argument(
+                    "configuration does not match the entity path",
+                ));
+            }
+        };
         let outcome = self
             .broker
-            .submit(
-                self.namespace.clone(),
-                path.clone(),
-                CommandKind::UpdateQueue { update },
-            )
+            .submit(self.namespace.clone(), path, command)
             .await
             .map_err(submit_status)?;
-        if outcome != CommandOutcome::QueueUpdated {
-            return Err(Status::internal("unexpected queue update result"));
+        if outcome != expected {
+            return Err(Status::internal("unexpected entity update result"));
         }
-        Ok(Response::new(self.read_entity(path).await?))
+        let entity = self.read_target(target).await?;
+        if entity.kind != kind as i32 {
+            return Err(Status::internal("unexpected updated entity metadata"));
+        }
+        Ok(Response::new(entity))
     }
 
     async fn delete_entity(
@@ -472,14 +521,16 @@ fn submit_status(error: SubmitError) -> Status {
             Status::unavailable("broker clock is unavailable")
         }
         SubmitError::Propose(ProposeError::Broker(error)) => match error {
-            BrokerError::QueueNotFound | BrokerError::TopicNotFound => {
-                Status::not_found(error.to_string())
-            }
+            BrokerError::QueueNotFound
+            | BrokerError::TopicNotFound
+            | BrokerError::SubscriptionNotFound => Status::not_found(error.to_string()),
             BrokerError::QueueAlreadyExists
             | BrokerError::TopicAlreadyExists
             | BrokerError::SubscriptionAlreadyExists
             | BrokerError::EntityPathAlreadyExists => Status::already_exists(error.to_string()),
-            BrokerError::QueuePropertyIsImmutable { .. } => {
+            BrokerError::QueuePropertyIsImmutable { .. }
+            | BrokerError::TopicPropertyIsImmutable { .. }
+            | BrokerError::SubscriptionPropertyIsImmutable { .. } => {
                 Status::failed_precondition(error.to_string())
             }
             BrokerError::QueueConfig(_)

@@ -148,6 +148,7 @@ fn patch(path: &str, config: QueueConfiguration) -> UpdateEntityRequest {
         namespace: "tenant".to_owned(),
         path: path.to_owned(),
         queue_config: Some(config),
+        ..Default::default()
     }
 }
 
@@ -429,6 +430,7 @@ async fn legacy_configuration_and_errors<P: StoreProvider>(provider: P) -> TestR
                 namespace: "tenant".to_owned(),
                 path: "legacy".to_owned(),
                 queue_config: None,
+                ..Default::default()
             }))
             .await,
         Code::InvalidArgument,
@@ -876,7 +878,7 @@ async fn queue_administration_keeps_subscription_backings_out_of_legacy_listing<
             node.service
                 .update_entity(Request::new(patch(path, QueueConfiguration::default())))
                 .await,
-            Code::Unimplemented,
+            Code::InvalidArgument,
         );
         assert_eq!(node.reads(), reads, "reserved paths never reach the owner");
     }

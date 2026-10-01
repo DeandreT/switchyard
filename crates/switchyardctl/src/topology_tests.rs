@@ -32,6 +32,100 @@ fn subscription_config(options: &[&str]) -> SubscriptionConfiguration {
     input.configuration.protobuf()
 }
 
+fn topic_patch(options: &[&str]) -> TopicConfiguration {
+    let mut argv = vec!["topic", "update", "Orders"];
+    argv.extend_from_slice(options);
+    let Command::Topic {
+        command: TopicCommand::Update(input),
+    } = arguments(&argv).command
+    else {
+        panic!("topic update")
+    };
+    input.configuration.protobuf()
+}
+
+fn subscription_patch(options: &[&str]) -> SubscriptionConfiguration {
+    let mut argv = vec!["subscription", "update", "Orders", "Alpha"];
+    argv.extend_from_slice(options);
+    let Command::Subscription {
+        command: SubscriptionCommand::Update(input),
+    } = arguments(&argv).command
+    else {
+        panic!("subscription update")
+    };
+    input.configuration.protobuf()
+}
+
+#[test]
+fn updates_share_presence_preserving_arguments_without_defaults() {
+    assert_eq!(topic_patch(&[]), TopicConfiguration::default());
+    assert_eq!(
+        subscription_patch(&[]),
+        SubscriptionConfiguration::default()
+    );
+    let options = [
+        "--ttl-unlimited",
+        "--requires-duplicate-detection=false",
+        "--max-message-bytes",
+        "0",
+    ];
+    assert_eq!(topic_patch(&options), topic_config(&options));
+    assert_eq!(
+        topic_patch(&options).requires_duplicate_detection,
+        Some(false)
+    );
+    let options = [
+        "--lock-duration-millis",
+        "0",
+        "--max-delivery-count",
+        "0",
+        "--requires-session=false",
+        "--dead-letter-on-expiration=false",
+        "--dead-letter-on-filter-exceptions=false",
+    ];
+    assert_eq!(subscription_patch(&options), subscription_config(&options));
+    let patch = subscription_patch(&options);
+    assert_eq!(patch.default_time_to_live, None);
+    assert_eq!(patch.requires_session, Some(false));
+    assert_eq!(patch.dead_lettering_on_message_expiration, Some(false));
+    assert_eq!(
+        patch.dead_lettering_on_filter_evaluation_exceptions,
+        Some(false)
+    );
+    let patch = subscription_patch(&["--dead-letter-on-filter-exceptions"]);
+    assert_eq!(
+        patch.dead_lettering_on_filter_evaluation_exceptions,
+        Some(true)
+    );
+    assert_eq!(patch.dead_lettering_on_message_expiration, None);
+    assert_eq!(patch.requires_session, None);
+    assert_eq!(patch.default_time_to_live, None);
+}
+
+#[test]
+fn update_commands_preserve_topic_and_member_spelling() {
+    assert!(matches!(
+        arguments(&["topic", "update", "/Orders/$Management"]).command,
+        Command::Topic { command: TopicCommand::Update(input) } if input.path == "/Orders/$Management"
+    ));
+    let Command::Subscription {
+        command: SubscriptionCommand::Update(input),
+    } = arguments(&[
+        "subscription",
+        "update",
+        "/Orders/$Management",
+        "Subscriptions",
+    ])
+    .command
+    else {
+        panic!("subscription update")
+    };
+    assert_eq!(
+        subscription_path(&input.topic, &input.name).unwrap(),
+        "/Orders/$Management/subscriptions/Subscriptions"
+    );
+}
+
 #[test]
 fn omitted_configuration_preserves_presence() {
     assert_eq!(topic_config(&[]), TopicConfiguration::default());
@@ -120,6 +214,37 @@ fn filter_error_dead_letter_option_preserves_omitted_false_and_true() {
 #[test]
 fn wrong_kind_flags_and_conflicting_ttl_are_local_parse_errors() {
     for argv in [
+        vec!["topic", "update", "Orders", "--requires-session"],
+        vec![
+            "topic",
+            "update",
+            "Orders",
+            "--dead-letter-on-filter-exceptions",
+        ],
+        vec![
+            "subscription",
+            "update",
+            "Orders",
+            "Alpha",
+            "--requires-duplicate-detection",
+        ],
+        vec![
+            "topic",
+            "update",
+            "Orders",
+            "--ttl-unlimited",
+            "--default-ttl-millis",
+            "50",
+        ],
+        vec![
+            "subscription",
+            "update",
+            "Orders",
+            "Alpha",
+            "--ttl-unlimited",
+            "--default-ttl-millis",
+            "50",
+        ],
         vec!["topic", "create", "Orders", "--requires-session"],
         vec![
             "topic",

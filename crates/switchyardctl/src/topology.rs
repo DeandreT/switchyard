@@ -1,7 +1,7 @@
 use admin_api::v1::{
     CreateEntityRequest, Entity, EntityKind, GetEntityRequest, ListEntitiesRequest,
     ListEntitiesResponse, SubscriptionConfiguration, TopicConfiguration, UnlimitedTimeToLive,
-    subscription_configuration::DefaultTimeToLive as SubscriptionTimeToLive,
+    UpdateEntityRequest, subscription_configuration::DefaultTimeToLive as SubscriptionTimeToLive,
     topic_configuration::DefaultTimeToLive as TopicTimeToLive,
 };
 use clap::{Args, Subcommand};
@@ -15,6 +15,7 @@ use super::{
 #[derive(Debug, Subcommand)]
 pub(super) enum TopicCommand {
     Create(TopicMutation),
+    Update(TopicMutation),
     Get {
         path: String,
     },
@@ -72,6 +73,7 @@ impl TopicConfigurationArguments {
 #[derive(Debug, Subcommand)]
 pub(super) enum SubscriptionCommand {
     Create(SubscriptionMutation),
+    Update(SubscriptionMutation),
     Get {
         topic: String,
         name: String,
@@ -145,7 +147,9 @@ pub(super) async fn execute_topic(
     command: &TopicCommand,
 ) -> Result<(), CliError> {
     match command {
-        TopicCommand::Create(input) => validate_primary_path(&input.path)?,
+        TopicCommand::Create(input) | TopicCommand::Update(input) => {
+            validate_primary_path(&input.path)?
+        }
         TopicCommand::Get { path } => validate_primary_path(path)?,
         TopicCommand::List {
             page_size,
@@ -165,6 +169,18 @@ pub(super) async fn execute_topic(
                         kind: EntityKind::Topic as i32,
                         topic_config: Some(input.configuration.protobuf()),
                         ..CreateEntityRequest::default()
+                    }))
+                    .await
+                    .map_err(|status| CliError::Request(status.code()))?;
+                write_entity(response.into_inner(), EntityKind::Topic)
+            }
+            TopicCommand::Update(input) => {
+                let response = client
+                    .update_entity(settings.request(UpdateEntityRequest {
+                        namespace,
+                        path: input.path.clone(),
+                        topic_config: Some(input.configuration.protobuf()),
+                        ..UpdateEntityRequest::default()
                     }))
                     .await
                     .map_err(|status| CliError::Request(status.code()))?;
@@ -208,7 +224,9 @@ pub(super) async fn execute_subscription(
     command: &SubscriptionCommand,
 ) -> Result<(), CliError> {
     let path = match command {
-        SubscriptionCommand::Create(input) => subscription_path(&input.topic, &input.name)?,
+        SubscriptionCommand::Create(input) | SubscriptionCommand::Update(input) => {
+            subscription_path(&input.topic, &input.name)?
+        }
         SubscriptionCommand::Get { topic, name } => subscription_path(topic, name)?,
         SubscriptionCommand::List {
             topic,
@@ -233,6 +251,18 @@ pub(super) async fn execute_subscription(
                         kind: EntityKind::Subscription as i32,
                         subscription_config: Some(input.configuration.protobuf()),
                         ..CreateEntityRequest::default()
+                    }))
+                    .await
+                    .map_err(|status| CliError::Request(status.code()))?;
+                write_entity(response.into_inner(), EntityKind::Subscription)
+            }
+            SubscriptionCommand::Update(input) => {
+                let response = client
+                    .update_entity(settings.request(UpdateEntityRequest {
+                        namespace,
+                        path,
+                        subscription_config: Some(input.configuration.protobuf()),
+                        ..UpdateEntityRequest::default()
                     }))
                     .await
                     .map_err(|status| CliError::Request(status.code()))?;

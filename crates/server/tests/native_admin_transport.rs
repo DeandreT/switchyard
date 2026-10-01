@@ -183,6 +183,7 @@ async fn plaintext_round_trip<P: StoreProvider>(provider: P) -> TestResult {
                 )),
                 ..Default::default()
             }),
+            ..Default::default()
         })
         .await?
         .into_inner();
