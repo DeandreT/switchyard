@@ -8,7 +8,7 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Queue and topic send, both batch-send APIs, ordinary/session subscription workflows, queue scheduling/cancellation, duplicate detection and message properties; queue session renew/state/scheduling | Planned | Experimental gate on 7.21.0 |
+| Official .NET SDK, current stable | Queue and topic send, both batch-send APIs, ordinary/session subscription workflows, queue/topic scheduling/cancellation, duplicate detection and message properties; queue session renew/state/scheduling | Planned | Experimental gate on 7.21.0 |
 | Official .NET SDK, previous stable | Same gated workflows as current | Planned | Experimental gate on 7.20.2 |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
@@ -31,7 +31,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | Atomic immediate default-true fanout, ordinary/session subscription and dead-letter routing, native create/get/list, Rust clients on both backends and both pinned .NET clients; topic scheduling, rules and Azure administration not implemented |
+| Topics and subscriptions | Pre-1.0 | Atomic default-true fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list, Rust clients on both backends and both pinned .NET clients; rules and Azure administration not implemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Not implemented |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -244,8 +244,47 @@ registration does not inherit an earlier broadcast. Cancellation and completion
 remove registrations, with no retained payload or session history. Wake work
 and memory remain proportional to live waiters, not a fixed process-wide bound.
 
-Topic scheduling remains explicitly unimplemented. Batch publications with any
-scheduled timestamp are refused, even when that timestamp is already due.
+Future topic publications, including management scheduling and individually
+timestamped batch members, retain one scheduled record and deadline index on
+the parent topic. They do not create subscription copies, dead letters, or
+session ownership before activation. Parent management browsing returns these
+pending records without opening a receiving data link, consistent with the
+[documented location of scheduled topic messages](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-troubleshooting-guide#how-to-browse-scheduled-or-deferred-messages).
+Topic browsing uses the same bounded physical scan and response budgets as queue
+browsing, but returns only pending schedules; explicit session filters remain
+unsupported on the parent. Subscriptions cannot schedule publications directly.
+
+Activation removes the parent schedule and fans out atomically to current,
+validated membership. Late-created subscriptions participate in this local
+policy; that behavior has not been compared with a live Azure namespace. Each
+logical publication receives a new shared topic sequence after earlier active
+work. Its actual activation timestamp becomes enqueue time and starts the
+shortest requested/topic/current-subscription lifetime. These sequence and TTL
+rules follow Microsoft's [scheduled sequencing](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sequencing#scheduled-messages)
+and [scheduled expiration](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-expiration#scheduled-messages)
+descriptions. Session and missing-session dead-letter routing use the same
+per-subscription policy as immediate fanout. A timestamp already due at admission
+publishes immediately rather than retaining a pending parent record.
+
+Duplicate detection runs once at admission, shared by immediate and scheduled
+topic publications. Activation does not recheck or extend history, even if its
+window has expired. Canceling a pending schedule removes its parent record and
+deadline atomically but retains duplicate history. A multi-handle cancellation
+rejects the whole command if any handle is absent or no longer scheduled; a
+cancellation handle cannot remove activated subscription copies. Switchyard
+serializes activation and cancellation, unlike Azure's documented race between
+those operations.
+
+Scheduled batches budget one retained parent copy per accepted future input.
+Every future input must also fit an individual fanout against current membership
+before retention. Activation processes a fitting due prefix within the existing
+ingress budgets and at most 256 inspected scheduling entries, 1,024 copies,
+4 MiB retained content, and 65,536 projected values. A later input that would
+overflow remains pending for another command. If later membership makes the
+first input unfit, activation rejects without mutation and the schedule remains
+cancelable; it is not silently skipped or partially delivered. These bounds and
+head-of-line behavior are local resource policies, not Azure quotas.
+
 Plain producer addresses resolve committed metadata and permit queue or topic
 send. Ordinary topic receivers and senders to subscriptions or dead-letter
 queues are refused. Subscription receivers use
@@ -267,9 +306,9 @@ metadata lookup. A session-required subscription receiver without a session
 filter is refused before any command or session hold. Named and next-available
 filters then acquire a hold through the existing session command and echo the
 granted identifier; their session-free dead-letter queues
-remain receivable. Topic management links can attach, but topic peek currently
-returns the existing queue-not-found refusal and topic scheduling returns
-`amqp:not-implemented`; neither claims a topic workflow.
+remain receivable. Topic management links support scheduled browsing,
+scheduling, and cancellation with operation-specific authorization; ordinary
+topic data receivers remain refused.
 Native administration can create, get, and list topics and subscriptions;
 configuration updates for those entity kinds and rules remain unimplemented.
 
@@ -297,8 +336,13 @@ dead-letter shadows; topic pages use their distinct metadata index. Retained
 cursors visit later pages on later sweeps and wrap at the end. An attempted
 entity advances its cursor before its commands, and both entity families are
 attempted even if one fails, so a failing queue cannot starve topic history
-cleanup or vice versa. Topics receive only duplicate-history expiry commands.
-Each index gets at most eight bounded command rounds per sweep. Discovery reads
+activation/history cleanup or vice versa. Topics activate schedules before
+expiring duplicate history. Queue activation stops after a partial 256-entry
+page; topic activation continues while a command makes positive progress because
+fanout can fill its budget earlier. Each index gets at most eight bounded command
+rounds per sweep. A visited topic can therefore retain up to eight 4 MiB fanout
+budgets across its activation commands, not only 4 MiB for the entire sweep.
+Discovery reads
 do not stamp commands or advance the applied clock.
 
 An AMQP 1.0 client can reach queues, topic producers, and subscription receivers.
@@ -798,8 +842,13 @@ can also schedule through the `x-opt-scheduled-enqueue-time` timestamp
 annotation. Peek returns active, deferred, and scheduled state annotations.
 A receiving link's `com.microsoft:session-filter` names a session or, with a
 null value, asks for the next available one; the attach response echoes the
-granted identifier and the initial session-lock deadline. The session is
-released when that link closes; renewing its lock and reading or writing its
+granted identifier and the initial session-lock deadline. The receiving task
+releases its exact session hold when that link closes, including delivery or
+settlement error exits. A first-mode disposition followed immediately by detach
+can race native receipt finalization; cleanup neither reverses a committed
+settlement nor relaxes the retired-link ownership checks. The detach
+acknowledgment is not itself a barrier for committed domain cleanup. Renewing
+the session lock and reading or writing its
 state use the entity's `$management` request/reply links, as does message-lock
 renewal. Scheduling and cancellation require Send authorization; receiving,
 peeking, settlement, and lock or session operations require Listen. Management
@@ -820,7 +869,10 @@ both also exercise immediate topic fanout, independent subscription settlement,
 peek, lock renewal, deferral, deferred receive, dead-letter reasons and property
 updates, and both topic batch-send APIs with ingress duplicate detection. These
 gates cover the local shared-sequence policy, not cloud parity for that policy.
-Topic sessions, scheduling, filters/actions, and administration remain ungated.
+Both pins also cover independent subscription sessions and management-only
+session browsing, plus parent topic scheduled browsing, cancellation, annotated
+send, and timer activation. Topic filters/actions and Azure administration remain
+ungated.
 
 The SDK gates build into separate temporary directories and run the resulting
 assemblies directly. Run them explicitly with
@@ -948,13 +1000,14 @@ token. Command-line settings preserve omitted, false, zero, and unlimited TTL.
 
 ## Durable Format
 
-The current value format is version 9 and durable store layout is version 9.
+The current value format is version 9 and durable store layout is version 10.
 The value format appends the missing-session dead-letter reason without changing
 existing reason tags or message fields. Version 8 messages with earlier reasons
 and version 8 queue configurations remain decodable. A missing-session reason
 cannot be relabeled as an earlier message version. The layout protects the new
-policy-dependent ready indexes for session-bearing ordinary subscription copies;
-an older build would choose the wrong index when releasing those copies.
+policy-dependent ready indexes for session-bearing ordinary subscription copies
+and parent-retained topic schedules. An older build would choose the wrong index
+when releasing those copies or leave pending topic publications unactivated.
 Earlier message and queue-configuration shapes have tested decoders, but an
 earlier store directory is refused at open because its broker contract differs.
 There is no directory migration tooling yet; development directories

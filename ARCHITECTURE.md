@@ -18,7 +18,7 @@ activation, lock, time-to-live, session-lock, and duplicate-history expiry.
 JWT/OIDC, mTLS, policy administration,
 Raft, and compliance implementations remain to be built. Within the semantics
 below, topics have persisted definitions, bounded subscription topology, and
-atomic immediate default-true fanout, AMQP subscription and dead-letter routing,
+atomic default-true fanout, parent-retained topic scheduling, AMQP subscription and dead-letter routing,
 and subscription management operations. Both pinned .NET gates cover immediate
 topic publications and independent subscription workflows. Session-required
 subscriptions reuse entity-local session ownership and state, while ordinary
@@ -26,7 +26,7 @@ subscriptions retain session identifiers without session-affine delivery.
 Read-only management browsing can inspect all sessions without acquiring a hold.
 Committed delivery notifications wake all registered entity waiters, including
 independent session receivers; registration precedes each receive attempt.
-Topic scheduling, rules, and Azure administration remain unimplemented. Native
+Topic rules and Azure administration remain unimplemented. Native
 administration creates and reads topology, lists topics and subscriptions, and
 updates queues; the timer worker covers
 scheduled activation and the four expiry indexes that exist,
@@ -226,11 +226,11 @@ Each sweep visits at most 1,024 queue configurations, including subscription
 backing queues and dead-letter shadows, and independently at most 1,024 topic
 configurations in exclusive key order. The worker retains separate cursors
 between sweeps and wraps after each final page, so later entities are not starved
-by earlier ones. Topics receive only duplicate-history cleanup commands.
+by earlier ones. Topics receive scheduled activation before duplicate-history cleanup.
 One sweep command processes a bounded number of entries, and the worker
 re-proposes at most eight times per index before moving on. It advances past a
-queue before attempting its commands; a failed queue is revisited after the
-cursor wraps rather than preventing every later queue from being swept. Both
+entity before attempting its commands; a failed entity is revisited after the
+cursor wraps rather than preventing every later entity from being swept. Both
 queue and topic phases are attempted even if the first fails; the first error
 is reported after both phases.
 Time reaches the state machine only through the proposer, which stamps each
@@ -243,8 +243,8 @@ Duplicate detection is an opt-in queue or topic setting. Its history records the
 submission deadline by message ID and expires independently of settlement or
 schedule cancellation. Queue send and schedule check the same history, including
 earlier entries in an atomic batch; topic publishing checks topic-owned history
-once before fanout. Activation only makes a previously accepted queue schedule
-ready. History cleanup is bounded, and overdue cleanup never
+once at immediate or scheduled admission. Activation makes previously accepted
+work ready without rechecking or extending duplicate history. History cleanup is bounded, and overdue cleanup never
 extends the detection window because submissions check deadlines directly.
 
 Topic sends evaluate the current subscription rule revision before proposing
@@ -253,15 +253,24 @@ overlays, making follower application deterministic. One encrypted payload can
 be referenced by multiple subscriptions and is removed after the final
 reference disappears.
 
-The implementation currently applies immediate default-true fanout directly
+The implementation currently applies default-true fanout directly
 inside the deterministic state machine, using its validated bounded membership
 and one atomic batch. Topic ingress owns sequence allocation and duplicate
 history; subscription copies share that sequence but have independent receive
 and settlement state. It stores separate payload records rather than shared
-encrypted payloads. No rules, actions, topic scheduling, or topic session
-routing exist yet. Fanout admission bounds retained copies, content, and typed
-value items before cloning; committed application effects name only the
-subscriptions that received ready messages.
+encrypted payloads. Future publications retain one scheduled record on the topic,
+not copies in its subscriptions. Activation uses current validated membership,
+assigns a new shared active sequence, and starts each copy's TTL. Late-member
+participation is a local policy, not a cloud-verified guarantee. Session-required
+subscriptions own sessions independently; missing identifiers route copies to
+their respective dead-letter shadows. Rules and actions remain unimplemented.
+Fanout admission bounds retained copies, content, and typed value items before
+cloning; committed application effects name only actual ready destinations.
+Topic activation commits a fitting due prefix of at most 256 inspected sources,
+1,024 copies, 4 MiB retained content, and 65,536 projected values per command.
+The timer continues positive prefixes for at most eight rounds per visited
+topic, so the sweep bound is eight command budgets, not one. An unfit first
+publication remains pending and cancelable rather than partially fanning out.
 
 ## Transactions And Forwarding
 
