@@ -13,7 +13,7 @@ use domain::{
     StateMachine, SubscriptionConfig, SubscriptionName, Timestamp, TopicConfig, codec, keys,
 };
 use protocol_amqp::{Attachment, EntityMetadata};
-use server::{Broker, Clock, LocalProposer, ManualClock, ProposeError, SubmitError};
+use server::{AdminTarget, Broker, Clock, LocalProposer, ManualClock, ProposeError, SubmitError};
 use storage::{StateStore, StorageError, StoreSnapshot, WriteBatch};
 use testkit::StoreProvider;
 
@@ -492,6 +492,147 @@ fn numeric_config_and_storage_failures_preserve_their_source_and_state<P: StoreP
     Ok(())
 }
 
+async fn native_reads_preserve_literal_names_without_relaxing_wire_targets<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    let node = Node::new(provider)?;
+    node.queue("/legacy/$Management", QueueConfig::default())?;
+    let config = SubscriptionConfig {
+        max_delivery_count: 7,
+        ..SubscriptionConfig::default()
+    };
+    for topic in ["a/Subscriptions", "a/$Management"] {
+        node.topic(topic, TopicConfig::default())?;
+        node.subscription(topic, "Subscriptions", config)?;
+    }
+    let snapshot = node.store.snapshot()?;
+    let clock_reads = node.clock.reads.load(Ordering::SeqCst);
+    node.clock.inner.set(0);
+    node.clock.forbidden.store(true, Ordering::SeqCst);
+    let handle = node.broker.handle();
+    let queue = AdminTarget::Primary(EntityPath::new("/legacy/$Management")?);
+    assert_eq!(
+        handle.admin_entity_metadata_blocking(namespace(), queue.clone())?,
+        Some(EntityMetadata::Queue(QueueConfig::default()))
+    );
+    assert_eq!(
+        handle.admin_entity_metadata(namespace(), queue).await?,
+        Some(EntityMetadata::Queue(QueueConfig::default()))
+    );
+    for topic in ["a/Subscriptions", "a/$Management"] {
+        let parent = EntityPath::new(topic)?;
+        let name = SubscriptionName::new("Subscriptions")?;
+        let target = AdminTarget::Subscription {
+            topic: parent.clone(),
+            name: name.clone(),
+        };
+        assert_eq!(
+            handle.admin_entity_metadata_blocking(namespace(), target.clone())?,
+            Some(EntityMetadata::Subscription(config))
+        );
+        assert_eq!(
+            handle.admin_entity_metadata(namespace(), target).await?,
+            Some(EntityMetadata::Subscription(config))
+        );
+        let expected = vec![domain::SubscriptionDefinition {
+            name: name.clone(),
+            entity: parent.subscription(&name)?,
+            config,
+        }];
+        assert_eq!(
+            handle.subscriptions_blocking(namespace(), parent.clone())?,
+            expected
+        );
+        assert_eq!(handle.subscriptions(namespace(), parent).await?, expected);
+    }
+    assert_eq!(node.clock.reads.load(Ordering::SeqCst), clock_reads);
+    assert_eq!(node.store.snapshot()?, snapshot);
+    {
+        let limits = node
+            .store
+            .observed
+            .membership_limits
+            .lock()
+            .expect("scan limits");
+        assert!(!limits.is_empty());
+        assert!(
+            limits
+                .iter()
+                .all(|&limit| limit == MAX_TOPIC_SUBSCRIPTIONS + 1)
+        );
+    }
+    for target in [
+        primary("/legacy/$Management"),
+        subscription("a/$Management", "Subscriptions", false),
+    ] {
+        node.store.observed.reads.store(0, Ordering::SeqCst);
+        assert_eq!(
+            refused(node.query(target)),
+            BrokerError::DanglingEntityMetadata
+        );
+        assert_eq!(node.store.observed.reads.load(Ordering::SeqCst), 0);
+    }
+    drop(node.broker);
+    let target = AdminTarget::Primary(EntityPath::new("/legacy/$Management")?);
+    assert_eq!(
+        handle.admin_entity_metadata_blocking(namespace(), target.clone()),
+        Err(SubmitError::BrokerStopped)
+    );
+    assert_eq!(
+        handle.admin_entity_metadata(namespace(), target).await,
+        Err(SubmitError::BrokerStopped)
+    );
+    let parent = EntityPath::new("a/Subscriptions")?;
+    assert_eq!(
+        handle.subscriptions_blocking(namespace(), parent.clone()),
+        Err(SubmitError::BrokerStopped)
+    );
+    assert_eq!(
+        handle.subscriptions(namespace(), parent).await,
+        Err(SubmitError::BrokerStopped)
+    );
+    Ok(())
+}
+
+fn native_typed_requests_reject_reserved_shapes_before_store_reads<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    let node = Node::new(provider)?;
+    for target in [
+        AdminTarget::Primary(EntityPath::new("orders/$deadletterqueue")?),
+        AdminTarget::Primary(EntityPath::new("orders/Subscriptions/Alpha")?),
+        AdminTarget::Subscription {
+            topic: EntityPath::new("orders/Subscriptions/Alpha")?,
+            name: SubscriptionName::new("beta")?,
+        },
+    ] {
+        node.store.observed.reads.store(0, Ordering::SeqCst);
+        let error = refused(
+            node.broker
+                .handle()
+                .admin_entity_metadata_blocking(namespace(), target),
+        );
+        assert!(matches!(
+            error,
+            BrokerError::DeadLetterQueueIsReserved | BrokerError::SubscriptionPathIsReserved
+        ));
+        assert_eq!(node.store.observed.reads.load(Ordering::SeqCst), 0);
+    }
+    for parent in ["orders/$deadletterqueue", "orders/Subscriptions/Alpha"] {
+        node.store.observed.reads.store(0, Ordering::SeqCst);
+        assert!(matches!(
+            node.broker
+                .handle()
+                .subscriptions_blocking(namespace(), EntityPath::new(parent)?),
+            Err(SubmitError::Propose(ProposeError::Broker(
+                BrokerError::DeadLetterQueueIsReserved | BrokerError::SubscriptionPathIsReserved
+            )))
+        ));
+        assert_eq!(node.store.observed.reads.load(Ordering::SeqCst), 0);
+    }
+    Ok(())
+}
+
 macro_rules! for_each_backend {
     ($($case:ident,)+) => {
         mod memory { $(#[test] fn $case() -> super::TestResult { super::$case(::testkit::MemoryProvider::new()) })+ }
@@ -505,6 +646,7 @@ for_each_backend! {
     topic_and_subscription_queries_validate_complete_stored_topology,
     malformed_typed_requests_fail_before_store_reads,
     numeric_config_and_storage_failures_preserve_their_source_and_state,
+    native_typed_requests_reject_reserved_shapes_before_store_reads,
 }
 
 #[tokio::test]
@@ -516,6 +658,19 @@ async fn memory_all_kinds_are_clock_free() -> TestResult {
 async fn durable_all_kinds_are_clock_free() -> TestResult {
     all_entity_kinds_are_read_without_stamping_or_clock_access(
         testkit::DurableProvider::temporary()?
+    )
+    .await
+}
+
+#[tokio::test]
+async fn memory_native_reads_are_clock_free() -> TestResult {
+    native_reads_preserve_literal_names_without_relaxing_wire_targets(testkit::MemoryProvider::new()).await
+}
+
+#[tokio::test]
+async fn durable_native_reads_are_clock_free() -> TestResult {
+    native_reads_preserve_literal_names_without_relaxing_wire_targets(
+        testkit::DurableProvider::temporary()?,
     )
     .await
 }
