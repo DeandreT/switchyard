@@ -18,7 +18,10 @@ use admin_api::v1::{
 };
 use auth::{PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use domain::{EntityPath, NamespaceName, QueueConfig, StateMachine, keys};
+use domain::{
+    CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueConfig, StateMachine,
+    SubscriptionConfig, SubscriptionName, TopicConfig, keys,
+};
 use hmac::{Hmac, Mac};
 use server::{Broker, LocalProposer, ManualClock, NativeAdminService};
 use sha2::Sha256;
@@ -784,6 +787,98 @@ async fn sas_authentication_and_scope<P: StoreProvider>(provider: P) -> TestResu
     Ok(())
 }
 
+async fn subscription_backing_queues_are_not_administrable<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    let node = Node::start(provider)?;
+    for path in ["alpha", "omega"] {
+        node.service
+            .create_entity(Request::new(create(path, None)))
+            .await?;
+    }
+    let namespace = NamespaceName::new("tenant")?;
+    let topic = EntityPath::new("m-events")?;
+    let handle = node.broker.handle();
+    assert_eq!(
+        handle
+            .submit(
+                namespace.clone(),
+                topic.clone(),
+                CommandKind::CreateTopic {
+                    config: TopicConfig::default(),
+                },
+            )
+            .await?,
+        CommandOutcome::TopicCreated
+    );
+    for name in ["accounting", "audit"] {
+        assert_eq!(
+            handle
+                .submit(
+                    namespace.clone(),
+                    topic.clone(),
+                    CommandKind::CreateSubscription {
+                        name: SubscriptionName::new(name)?,
+                        config: SubscriptionConfig::default(),
+                    },
+                )
+                .await?,
+            CommandOutcome::SubscriptionCreated
+        );
+    }
+    let before = node.store.snapshot()?;
+    let writes = node.writes();
+    let mut token = String::new();
+    let mut listed = Vec::new();
+    loop {
+        let page = node
+            .service
+            .list_entities(Request::new(list(1, token)))
+            .await?
+            .into_inner();
+        assert_eq!(page.entities.len(), 1);
+        assert_eq!(page.entities[0].kind, EntityKind::Queue as i32);
+        listed.push(page.entities[0].path.clone());
+        token = page.next_page_token;
+        if token.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(listed, ["alpha", "omega"]);
+    for path in [
+        "m-events/subscriptions/accounting",
+        "m-events/Subscriptions/audit",
+        "m-events/subscriptions/accounting/$deadletterqueue",
+    ] {
+        let reads = node.reads();
+        assert_code(
+            node.service.get_entity(Request::new(get(path))).await,
+            Code::InvalidArgument,
+        );
+        assert_code(
+            node.service
+                .create_entity(Request::new(create(path, None)))
+                .await,
+            Code::InvalidArgument,
+        );
+        assert_code(
+            node.service
+                .update_entity(Request::new(patch(path, QueueConfiguration::default())))
+                .await,
+            Code::InvalidArgument,
+        );
+        assert_eq!(node.reads(), reads, "reserved paths never reach the owner");
+    }
+    assert_code(
+        node.service
+            .create_entity(Request::new(create("m-events", None)))
+            .await,
+        Code::AlreadyExists,
+    );
+    node.assert_unchanged(&before, writes);
+    Ok(())
+}
+
 async fn stopped_owner<P: StoreProvider>(provider: P) -> TestResult {
     let node = Node::start(provider)?;
     node.service
@@ -895,6 +990,10 @@ macro_rules! suite {
             #[tokio::test]
             async fn ordered_parent_only_pagination() -> TestResult {
                 ordered_bounded_pagination($provider).await
+            }
+            #[tokio::test]
+            async fn typed_subscription_queues_remain_hidden_and_reserved() -> TestResult {
+                subscription_backing_queues_are_not_administrable($provider).await
             }
             #[tokio::test]
             async fn per_request_sas_authentication_and_scoping() -> TestResult {
