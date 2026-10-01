@@ -808,7 +808,7 @@ async fn serve_receiving_client<B: Broker>(
 
         match fetched {
             Ok(delivery) => {
-                if !settle(
+                let settled = match settle(
                     &mut sender,
                     &namespace,
                     &entity,
@@ -817,8 +817,15 @@ async fn serve_receiving_client<B: Broker>(
                     authorization.as_ref(),
                     &management,
                 )
-                .await?
+                .await
                 {
+                    Ok(settled) => settled,
+                    Err(error) => {
+                        release_session(&broker, &namespace, &entity, session.as_ref()).await;
+                        return Err(error);
+                    }
+                };
+                if !settled {
                     release_session(&broker, &namespace, &entity, session.as_ref()).await;
                     sender
                         .close_with_error(unauthorized_error(

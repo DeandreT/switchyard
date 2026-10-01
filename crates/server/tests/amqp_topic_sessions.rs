@@ -564,3 +564,6 @@ mod global_peek;
 
 #[path = "amqp_topic_sessions/wakeups.rs"]
 mod wakeups;
+
+#[path = "amqp_topic_sessions/close_cleanup.rs"]
+mod close_cleanup;
