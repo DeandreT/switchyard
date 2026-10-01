@@ -294,6 +294,22 @@ returns after writing its outcome, not after that acknowledgement. A sender
 settling before the application finishes suppresses an unnecessary response;
 partial deliveries retain their aliases until completion or abort. Completing
 sender-settled deliveries need no outcome or retained alias.
+Outgoing tags are reserved per sending link when a send enters its local queue,
+and remain reserved through active fragments, unresolved outcomes, and pending
+second-mode acknowledgements. This implements the transport's
+[live-tag uniqueness rule](https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html).
+An identical tag on another link is independent. A duplicate on the same link,
+more than 32 tag bytes, a full 32-entry outgoing queue, or admission beyond 1,024
+outstanding deliveries on one sending link or 4,096 across a session is a local
+`InvalidState` refusal. These checks precede message encoding, credit consumption,
+delivery-ID allocation, and wire output, leaving the endpoint usable for retry.
+Each delivery counts once even while both active and unsettled. Tags are released
+after a successful final pre-settled Transfer flush, completion without a required
+acknowledgement, or exact local or remote acknowledgement settlement. A dropped
+send waiter does not release a tag; a failed or cancelled final Transfer or
+acknowledgement flush retains it until teardown. An old terminal receipt cannot
+release a later send's reused tag or numeric ID. These are metadata allowances,
+not a connection-wide content or heap limit.
 Outgoing sends and explicit second-mode acknowledgement receipts also retain
 their original link generation. A stale sender cannot send or close a
 replacement link, and a receipt cannot acknowledge a different delivery that
