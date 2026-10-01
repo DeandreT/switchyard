@@ -310,6 +310,13 @@ exposes these operations.
 
 ## Transactions And Forwarding
 
+The current core has a trusted atomic-messaging foundation for immediate sends
+and held settlements on one primary non-session queue. A bounded point-read
+overlay prepares an ordered group and commits one normalized batch, publishing
+only committed ready-index effects. It has no wire coordinator or staged
+transaction lifecycle yet; see [Atomic Queue Operations](docs/atomic-queue-operations.md).
+The following lifecycle remains the production design.
+
 AMQP transactions are represented by replicated begin, stage, commit, and
 abort commands. Staged operations remain invisible until one atomic commit
 batch applies. Connection loss causes an explicit or lease-expiry abort.

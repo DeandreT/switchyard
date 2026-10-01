@@ -40,7 +40,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Duplicate detection | Pre-1.0 | State machine, AMQP send/scheduling mappings, Rust and current .NET clients end to end |
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API |
-| Same-placement-group transactions | Pre-1.0 | Not implemented |
+| Same-placement-group transactions | Pre-1.0 | Wire transactions not implemented; trusted same-queue atomic messaging foundation described in [Atomic Queue Operations](atomic-queue-operations.md) |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete over HTTP/2 and authenticated TLS; other services not implemented |
 | Partitioned entities | Later | Out of initial scope |
@@ -82,6 +82,11 @@ behavior it currently enforces:
   Session queues require every member to name the same session. An empty batch
   validates its target but writes nothing. These are local resource bounds,
   not Azure batch quotas.
+- A separate trusted atomic-messaging envelope groups immediate sends and held
+  settlements on one non-session primary queue, with shared limits, a bounded
+  read-your-writes view, one commit, and committed-only wakeups. This does not
+  expose AMQP transactions or retry idempotency; see
+  [Atomic Queue Operations](atomic-queue-operations.md).
 - A queue can enable duplicate detection by message ID, with a 10-minute
   default history window bounded to 20 seconds through 7 days. A duplicate
   send is accepted and dropped, and history survives completion, dead-lettering,

@@ -136,6 +136,10 @@ subscription deletion is synchronous and destructive, with atomic cleanup limits
 and retained recreation fences described in [Entity Deletion](docs/entity-deletion.md).
 Other native services and Azure administration compatibility remain unfinished.
 
+The trusted Rust broker API also provides bounded, same-queue atomic sends and
+settlements. This is a transaction foundation, not wire transaction support;
+scope and retry boundaries are in [Atomic Queue Operations](docs/atomic-queue-operations.md).
+
 ## Production Contract
 
 A production cluster has at least three odd-numbered voters and stores three
