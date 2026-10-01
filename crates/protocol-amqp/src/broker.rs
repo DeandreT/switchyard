@@ -9,7 +9,7 @@ use std::future::Future;
 
 use domain::{
     BrokerError, CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueConfig,
-    SubscriptionConfig, TopicConfig,
+    RuleDefinition, SubscriptionConfig, SubscriptionName, TopicConfig,
 };
 
 use crate::Attachment;
@@ -60,6 +60,14 @@ impl BrokerRejection {
 }
 
 pub trait Broker: Clone + Send + Sync + 'static {
+    /// Reads a subscription's complete bounded rule set without stamping a command.
+    fn rules(
+        &self,
+        namespace: NamespaceName,
+        topic: EntityPath,
+        subscription: SubscriptionName,
+    ) -> impl Future<Output = Result<Vec<RuleDefinition>, BrokerRejection>> + Send;
+
     /// Reads and validates committed topology without stamping a command.
     fn entity_metadata(
         &self,

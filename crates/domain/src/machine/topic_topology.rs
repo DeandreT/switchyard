@@ -1,6 +1,6 @@
 use crate::{
-    MAX_TOPIC_SUBSCRIPTIONS, SubscriptionConfig, SubscriptionDefinition, SubscriptionName,
-    TopicConfig,
+    MAX_TOPIC_SUBSCRIPTIONS, RuleDefinition, RuleFilter, RuleName, SubscriptionConfig,
+    SubscriptionDefinition, SubscriptionName, TopicConfig,
 };
 
 use super::*;
@@ -157,6 +157,16 @@ impl<S: StateStore> StateMachine<S> {
                 return Err(BrokerError::EntityPathAlreadyExists);
             }
         }
+        if !self
+            .store
+            .scan_prefix(
+                &keys::rule_prefix(&command.namespace, &command.entity, name),
+                1,
+            )?
+            .is_empty()
+        {
+            return Err(BrokerError::DanglingRuleMetadata);
+        }
         if self
             .subscriptions(&command.namespace, &command.entity)?
             .len()
@@ -176,10 +186,19 @@ impl<S: StateStore> StateMachine<S> {
             keys::queue_config(&command.namespace, &shadow),
             codec::encode(&backing.dead_letter_shadow())?,
         );
+        let default = RuleDefinition {
+            name: RuleName::new("$Default")?,
+            filter: RuleFilter::True,
+            created_at: command.issued_at,
+        };
+        batch.push_put(
+            keys::rule(&command.namespace, &command.entity, name, &default.name),
+            codec::encode(&default)?,
+        );
         Ok(CommandOutcome::SubscriptionCreated)
     }
 
-    fn require_primary_entity_path(entity: &EntityPath) -> Result<(), BrokerError> {
+    pub(super) fn require_primary_entity_path(entity: &EntityPath) -> Result<(), BrokerError> {
         if entity.is_dead_letter_queue() {
             return Err(BrokerError::DeadLetterQueueIsReserved);
         }

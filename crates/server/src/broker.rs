@@ -46,7 +46,7 @@ enum Request {
     Apply {
         namespace: NamespaceName,
         entity: EntityPath,
-        kind: CommandKind,
+        kind: Box<CommandKind>,
         reply: flume::Sender<Result<CommandOutcome, ProposeError>>,
     },
     /// Reading which queues exist does not race the way applying does, but it
@@ -87,6 +87,12 @@ enum Request {
         namespace: NamespaceName,
         topic: EntityPath,
         reply: flume::Sender<Result<Vec<domain::SubscriptionDefinition>, ProposeError>>,
+    },
+    ListRules {
+        namespace: NamespaceName,
+        topic: EntityPath,
+        subscription: domain::SubscriptionName,
+        reply: flume::Sender<Result<Vec<domain::RuleDefinition>, ProposeError>>,
     },
     /// The highest timestamp the machine has applied. Readiness and
     /// diagnostics need it, and it is what a caller compares its own clock
@@ -244,7 +250,7 @@ impl BrokerHandle {
             .send(Request::Apply {
                 namespace,
                 entity,
-                kind,
+                kind: Box::new(kind),
                 reply,
             })
             .map_err(|_| SubmitError::BrokerStopped)?;
@@ -266,7 +272,7 @@ impl BrokerHandle {
             .send_async(Request::Apply {
                 namespace,
                 entity,
-                kind,
+                kind: Box::new(kind),
                 reply,
             })
             .await
@@ -507,7 +513,7 @@ impl Broker {
                             reply,
                         } => {
                             let application =
-                                proposer.propose_with_effects(&namespace, &entity, kind);
+                                proposer.propose_with_effects(&namespace, &entity, *kind);
                             if let Ok(applied) = &application {
                                 if let Some(targets) = &applied.subscription_enqueues {
                                     for target in targets {
@@ -586,6 +592,14 @@ impl Broker {
                         } => {
                             let _ = reply.send(proposer.subscriptions(&namespace, &topic));
                         }
+                        Request::ListRules {
+                            namespace,
+                            topic,
+                            subscription,
+                            reply,
+                        } => {
+                            let _ = reply.send(proposer.rules(&namespace, &topic, &subscription));
+                        }
                         Request::LastApplied { reply } => {
                             let _ = reply.send(
                                 proposer
@@ -634,6 +648,22 @@ impl Drop for Broker {
 /// Separating a refusal from an unreachable broker is what lets the edge report
 /// a condition the client can act on instead of a generic failure.
 impl protocol_amqp::Broker for BrokerHandle {
+    async fn rules(
+        &self,
+        namespace: NamespaceName,
+        topic: EntityPath,
+        subscription: domain::SubscriptionName,
+    ) -> Result<Vec<domain::RuleDefinition>, protocol_amqp::BrokerRejection> {
+        BrokerHandle::rules(self, namespace, topic, subscription)
+            .await
+            .map_err(|error| match error {
+                SubmitError::Propose(ProposeError::Broker(refused)) => {
+                    protocol_amqp::BrokerRejection::Refused(refused)
+                }
+                other => protocol_amqp::BrokerRejection::Unavailable(other.to_string()),
+            })
+    }
+
     async fn entity_metadata(
         &self,
         namespace: NamespaceName,

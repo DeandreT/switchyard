@@ -17,6 +17,7 @@ mod machine;
 mod message;
 mod message_content;
 mod queue;
+mod rule;
 mod session;
 mod time;
 mod topic;
@@ -55,6 +56,11 @@ pub use queue::{
     MAX_LOCK_DURATION_MILLIS, MAX_SEQUENCE_NUMBER, MIN_DUPLICATE_DETECTION_WINDOW_MILLIS,
     QueueConfig, QueueConfigError, QueueConfigUpdate, QueueCounterKind, QueueCounters,
     QueueImmutableProperty, QueueTimeToLiveUpdate,
+};
+pub use rule::{
+    CorrelationFilter, MAX_CORRELATION_RULE_CONDITIONS, MAX_RULE_BYTES, MAX_RULE_NAME_LENGTH,
+    MAX_SUBSCRIPTION_RULE_BYTES, MAX_SUBSCRIPTION_RULES, MAX_TOPIC_RULE_COMPARISON_BYTES,
+    MAX_TOPIC_RULE_MATCH_WORK, RuleDefinition, RuleFilter, RuleMatchLimit, RuleName,
 };
 pub use session::{AcceptedSession, SessionHold, SessionLock, SessionRecord};
 pub use time::Timestamp;

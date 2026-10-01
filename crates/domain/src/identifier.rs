@@ -188,8 +188,10 @@ pub enum IdentifierError {
     TooLong { kind: &'static str, maximum: usize },
     #[error("{kind} contains a control character")]
     ControlCharacter { kind: &'static str },
-    #[error("{kind} contains a character outside its permitted ASCII subset")]
+    #[error("{kind} contains a forbidden character")]
     InvalidCharacter { kind: &'static str },
+    #[error("{kind} exceeds its {maximum}-UTF-16-unit limit")]
+    TooLongUtf16 { kind: &'static str, maximum: usize },
 }
 
 /// Rejecting control characters is what lets the storage key encoding use a

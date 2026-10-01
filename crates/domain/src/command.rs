@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AcceptedSession, Delivery, EntityPath, LockToken, MessageEnvelope, MessageValue, NamespaceName,
-    QueueConfig, QueueConfigUpdate, ReceiveMode, SequenceNumber, SessionHold, SessionId,
-    SubscriptionConfig, SubscriptionName, Timestamp, TopicConfig,
+    QueueConfig, QueueConfigUpdate, ReceiveMode, RuleFilter, RuleName, SequenceNumber, SessionHold,
+    SessionId, SubscriptionConfig, SubscriptionName, Timestamp, TopicConfig,
 };
 
 /// One replicated instruction for the broker state machine.
@@ -289,6 +289,16 @@ pub enum CommandKind {
         name: SubscriptionName,
         config: SubscriptionConfig,
     },
+    /// Creates a no-action rule on a subscription of `Command::entity`.
+    CreateRule {
+        subscription: SubscriptionName,
+        name: RuleName,
+        filter: RuleFilter,
+    },
+    DeleteRule {
+        subscription: SubscriptionName,
+        name: RuleName,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -351,4 +361,6 @@ pub enum CommandOutcome {
     },
     TopicCreated,
     SubscriptionCreated,
+    RuleCreated,
+    RuleDeleted,
 }

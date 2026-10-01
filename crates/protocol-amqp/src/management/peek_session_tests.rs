@@ -32,6 +32,15 @@ impl ObservedBroker {
 }
 
 impl Broker for ObservedBroker {
+    async fn rules(
+        &self,
+        _namespace: NamespaceName,
+        _topic: EntityPath,
+        _subscription: domain::SubscriptionName,
+    ) -> Result<Vec<domain::RuleDefinition>, BrokerRejection> {
+        Err(BrokerRejection::Unavailable("unexpected rule read".into()))
+    }
+
     async fn entity_metadata(
         &self,
         _: NamespaceName,

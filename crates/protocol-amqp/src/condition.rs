@@ -31,6 +31,8 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
     match error {
         BrokerError::QueueNotFound
         | BrokerError::TopicNotFound
+        | BrokerError::SubscriptionNotFound
+        | BrokerError::RuleNotFound
         | BrokerError::MessageNotScheduled { .. } => NOT_FOUND,
         BrokerError::MessageNotFound { .. } | BrokerError::MessageNotDeferred { .. } => {
             MESSAGE_NOT_FOUND
@@ -38,9 +40,12 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         BrokerError::QueueAlreadyExists
         | BrokerError::TopicAlreadyExists
         | BrokerError::SubscriptionAlreadyExists
+        | BrokerError::RuleAlreadyExists
         | BrokerError::EntityPathAlreadyExists => ENTITY_ALREADY_EXISTS,
         BrokerError::QueueCounterExhausted { .. }
-        | BrokerError::SubscriptionLimitExceeded { .. } => RESOURCE_LIMIT_EXCEEDED,
+        | BrokerError::SubscriptionLimitExceeded { .. }
+        | BrokerError::RuleLimitExceeded { .. }
+        | BrokerError::TopicRuleMatchTooLarge { .. } => RESOURCE_LIMIT_EXCEEDED,
         BrokerError::TopicDataPlaneNotImplemented => NOT_IMPLEMENTED,
         BrokerError::IngressBatchLimitExceeded { limit, .. }
         | BrokerError::TopicFanoutTooLarge { limit, .. } => match limit {
@@ -72,8 +77,12 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         BrokerError::MessageTooLarge { .. }
         | BrokerError::MessagePropertyTooLarge { .. }
         | BrokerError::MessageHeaderTooLarge { .. } => MESSAGE_SIZE_EXCEEDED,
+        BrokerError::RuleTooLarge { .. } | BrokerError::RuleSetTooLarge { .. } => {
+            MESSAGE_SIZE_EXCEEDED
+        }
         BrokerError::MessageIdTooLong { .. }
         | BrokerError::InvalidMessageContent { .. }
+        | BrokerError::InvalidRule { .. }
         | BrokerError::QueuePageLimitExceeded { .. }
         | BrokerError::QueueCursorNamespaceMismatch { .. }
         | BrokerError::TopicPageLimitExceeded { .. }
@@ -93,6 +102,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         BrokerError::DanglingIndexEntry { .. }
         | BrokerError::DanglingSubscriptionMetadata
         | BrokerError::DanglingEntityMetadata
+        | BrokerError::DanglingRuleMetadata
         | BrokerError::MalformedIndexKey
         | BrokerError::Codec(_)
         | BrokerError::Identifier(_)

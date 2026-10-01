@@ -23,6 +23,7 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 struct Observations {
     reads: AtomicUsize,
     membership_limits: Mutex<Vec<usize>>,
+    rule_limits: Mutex<Vec<usize>>,
     fail_get: Mutex<Option<Vec<u8>>>,
 }
 
@@ -69,9 +70,19 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
                 .expect("scan limits")
                 .push(limit);
         }
+        if prefix.first() == Some(&0x10) {
+            self.observed
+                .rule_limits
+                .lock()
+                .expect("rule scan limits")
+                .push(limit);
+        }
         self.inner.scan_from(prefix, start, limit)
     }
 }
+
+#[path = "entity_metadata/rules.rs"]
+mod rule_reads;
 
 #[derive(Clone)]
 struct ProbeClock {

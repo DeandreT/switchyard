@@ -388,6 +388,8 @@ mod management;
 
 #[path = "amqp_topics/routing.rs"]
 mod routing;
+#[path = "amqp_topics/rules.rs"]
+mod rules;
 #[path = "amqp_topics/scheduling.rs"]
 mod scheduling;
 

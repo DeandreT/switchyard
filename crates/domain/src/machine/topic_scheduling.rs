@@ -1,3 +1,4 @@
+use super::rules::RuleMatchBudget;
 use super::topic_fanout::{TopicBudget, TopicEmission, topic_message_cost};
 use super::*;
 
@@ -5,6 +6,7 @@ struct ScheduledTopicMessage {
     key: Vec<u8>,
     record: MessageRecord,
     time_to_live_millis: Option<u64>,
+    matches: u32,
 }
 
 impl ScheduledTopicMessage {
@@ -35,6 +37,7 @@ impl<S: StateStore> StateMachine<S> {
             .scan_prefix(&keys::scheduled_prefix(namespace, entity), TIMER_SCAN_LIMIT)?;
         let mut selected = Vec::new();
         let mut budget = TopicBudget::default();
+        let mut match_budget = RuleMatchBudget::default();
 
         for (key, _) in scheduled {
             let (enqueue_at, sequence) =
@@ -60,26 +63,35 @@ impl<S: StateStore> StateMachine<S> {
                 }
                 _ => return Err(BrokerError::MalformedIndexKey),
             };
-            let candidate = ScheduledTopicMessage {
+            let mut candidate = ScheduledTopicMessage {
                 key,
                 record,
                 time_to_live_millis,
+                matches: 0,
             };
             let message = candidate.input();
             let cost = topic_message_cost(message)?;
             let mut next_budget = budget;
-            let admission = next_budget
-                .charge_input(cost)
-                .and_then(|()| next_budget.charge_fanout(cost, message, &targets));
-            if let Err(error) = admission {
-                if selected.is_empty() {
-                    return Err(error);
+            let mut next_match_budget = match_budget;
+            let admission = (|| {
+                next_budget.charge_input(cost)?;
+                let matches = self.topic_matches(message, &targets, &mut next_match_budget)?;
+                next_budget.charge_fanout(cost, message, &targets, matches)?;
+                Ok(matches)
+            })();
+            candidate.matches = match admission {
+                Ok(matches) => matches,
+                Err(error) => {
+                    if selected.is_empty() {
+                        return Err(error);
+                    }
+                    // The first item outside this command's envelope remains
+                    // at the head for a later activation.
+                    break;
                 }
-                // The first item outside this command's envelope remains at
-                // the head of the scheduled index for a later activation.
-                break;
-            }
+            };
             budget = next_budget;
+            match_budget = next_match_budget;
             selected.push(candidate);
         }
 
@@ -105,6 +117,7 @@ impl<S: StateStore> StateMachine<S> {
                     message: candidate.input(),
                     sequence,
                     scheduled_enqueue_time: candidate.record.scheduled_enqueue_time,
+                    matches: candidate.matches,
                 },
                 batch,
                 &mut enqueued,

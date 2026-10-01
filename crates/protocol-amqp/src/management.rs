@@ -24,6 +24,12 @@ use crate::{
     settlement::{dead_letter_disposition, read_properties_to_modify},
 };
 
+mod rules;
+pub use rules::{
+    ADD_RULE_OPERATION, ENUMERATE_RULES_OPERATION, REMOVE_RULE_OPERATION, RULE_DESCRIPTION,
+    RULE_NAME, RULES,
+};
+
 pub const PEEK_MESSAGE_OPERATION: &str = "com.microsoft:peek-message";
 pub const SCHEDULE_MESSAGE_OPERATION: &str = "com.microsoft:schedule-message";
 pub const CANCEL_SCHEDULED_MESSAGE_OPERATION: &str = "com.microsoft:cancel-scheduled-message";
@@ -318,6 +324,7 @@ impl ManagementResponse {
         let status_code = match condition {
             crate::MESSAGE_LOCK_LOST | crate::SESSION_LOCK_LOST => 410,
             crate::NOT_FOUND | crate::condition::MESSAGE_NOT_FOUND => 404,
+            crate::ENTITY_ALREADY_EXISTS => 409,
             crate::MESSAGE_SIZE_EXCEEDED | crate::RESOURCE_LIMIT_EXCEEDED => 403,
             crate::INVALID_FIELD | crate::NOT_ALLOWED | crate::PRECONDITION_FAILED => 400,
             crate::RESOURCE_LOCKED => 503,
@@ -610,6 +617,19 @@ async fn process_request<B: Broker>(
         return ManagementResponse::unauthorized(message_id, tracking_id);
     }
     match operation {
+        ADD_RULE_OPERATION | REMOVE_RULE_OPERATION | ENUMERATE_RULES_OPERATION => {
+            rules::process(
+                operation,
+                message,
+                message_id,
+                tracking_id,
+                namespace,
+                entity,
+                broker,
+                budget,
+            )
+            .await
+        }
         SCHEDULE_MESSAGE_OPERATION => {
             schedule_messages(
                 message,

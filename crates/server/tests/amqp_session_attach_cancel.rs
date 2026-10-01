@@ -46,6 +46,16 @@ struct ControlledBroker {
 }
 
 impl protocol_amqp::Broker for ControlledBroker {
+    fn rules(
+        &self,
+        namespace: NamespaceName,
+        topic: EntityPath,
+        subscription: domain::SubscriptionName,
+    ) -> impl std::future::Future<Output = Result<Vec<domain::RuleDefinition>, BrokerRejection>> + Send
+    {
+        protocol_amqp::Broker::rules(&self.inner, namespace, topic, subscription)
+    }
+
     fn entity_metadata(
         &self,
         namespace: NamespaceName,

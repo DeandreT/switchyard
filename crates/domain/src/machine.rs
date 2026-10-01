@@ -25,6 +25,7 @@ use crate::{
 };
 
 mod message_retention;
+mod rules;
 mod topic_fanout;
 mod topic_paging;
 mod topic_scheduling;
@@ -229,6 +230,14 @@ impl<S: StateStore> StateMachine<S> {
             }
             CommandKind::CreateSubscription { name, config } => {
                 self.create_subscription(command, name, *config, &mut batch)?
+            }
+            CommandKind::CreateRule {
+                subscription,
+                name,
+                filter,
+            } => self.create_rule(command, subscription, name, filter, &mut batch)?,
+            CommandKind::DeleteRule { subscription, name } => {
+                self.delete_rule(command, subscription, name, &mut batch)?
             }
             CommandKind::UpdateQueue { update } => {
                 self.update_queue(command, *update, &mut batch)?
@@ -758,6 +767,13 @@ impl<S: StateStore> StateMachine<S> {
 
     fn load_browsable_config(&self, command: &Command) -> Result<(QueueConfig, bool), BrokerError> {
         if let Some(config) = self.queue_config(&command.namespace, &command.entity)? {
+            if self
+                .store
+                .get(&keys::topic_config(&command.namespace, &command.entity))?
+                .is_some()
+            {
+                return Err(BrokerError::DanglingEntityMetadata);
+            }
             return Ok((config, false));
         }
         self.topic_config(&command.namespace, &command.entity)?

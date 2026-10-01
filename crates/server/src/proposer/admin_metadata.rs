@@ -43,6 +43,19 @@ fn validate_primary(entity: &EntityPath) -> Result<(), BrokerError> {
 }
 
 impl<S: StateStore, C: Clock> LocalProposer<S, C> {
+    /// Reads complete subscription rules without consulting the host clock.
+    pub fn rules(
+        &self,
+        namespace: &NamespaceName,
+        topic: &EntityPath,
+        subscription: &SubscriptionName,
+    ) -> Result<Vec<domain::RuleDefinition>, ProposeError> {
+        NamespaceName::new(namespace.as_str()).map_err(BrokerError::from)?;
+        validate_primary(topic)?;
+        SubscriptionName::new(subscription.as_str()).map_err(BrokerError::from)?;
+        Ok(self.machine.rules(namespace, topic, subscription)?)
+    }
+
     /// Reads native topology in one owner turn, without AMQP address restrictions.
     pub fn admin_entity_metadata(
         &self,

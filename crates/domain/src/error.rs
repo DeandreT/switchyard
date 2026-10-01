@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::{
     CodecError, IdentifierError, IngressBatchLimit, NamespaceName, QueueConfigError,
-    QueueCounterKind, QueueImmutableProperty, SequenceNumber, SessionId, Timestamp,
+    QueueCounterKind, QueueImmutableProperty, RuleMatchLimit, SequenceNumber, SessionId, Timestamp,
 };
 
 /// Every rejection the state machine can produce.
@@ -29,6 +29,27 @@ pub enum BrokerError {
     #[error("topic fanout {limit} exceeds the maximum of {maximum}")]
     TopicFanoutTooLarge {
         limit: IngressBatchLimit,
+        maximum: usize,
+    },
+    #[error("subscription does not exist")]
+    SubscriptionNotFound,
+    #[error("rule already exists")]
+    RuleAlreadyExists,
+    #[error("rule does not exist")]
+    RuleNotFound,
+    #[error("subscription permits at most {maximum} rules")]
+    RuleLimitExceeded { maximum: usize },
+    #[error("rule exceeds its {maximum_bytes}-byte stored-value limit")]
+    RuleTooLarge { maximum_bytes: usize },
+    #[error("subscription rules exceed their {maximum_bytes}-byte stored-value limit")]
+    RuleSetTooLarge { maximum_bytes: usize },
+    #[error("invalid rule: {reason}")]
+    InvalidRule { reason: String },
+    #[error("stored rule metadata is inconsistent")]
+    DanglingRuleMetadata,
+    #[error("topic rule matching {limit:?} exceeds the maximum of {maximum}")]
+    TopicRuleMatchTooLarge {
+        limit: RuleMatchLimit,
         maximum: usize,
     },
     #[error("every message in a session queue batch must name the same session")]

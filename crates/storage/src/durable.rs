@@ -57,13 +57,18 @@ pub const STORE_FORMAT_V9: u32 = 9;
 /// fan out only when activated. Earlier builds cannot activate those records.
 pub const STORE_FORMAT_V10: u32 = 10;
 
+/// Version 11: subscription rules explicitly select publication targets,
+/// including subscriptions whose last rule was removed. Earlier builds would
+/// ignore those rules and deliver excluded publications.
+pub const STORE_FORMAT_V11: u32 = 11;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V10;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V11;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
@@ -397,6 +402,20 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V9,
+                expected: ACTIVE_STORE_FORMAT,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_store_from_before_subscription_rules() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        stamp_format(directory.path(), &STORE_FORMAT_V10.to_be_bytes())?;
+        assert_eq!(
+            FjallStore::open(directory.path()).err(),
+            Some(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V10,
                 expected: ACTIVE_STORE_FORMAT,
             })
         );

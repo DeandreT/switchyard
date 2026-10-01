@@ -465,7 +465,7 @@ pub(crate) fn read_value(value: &Value) -> MessageValue {
     }
 }
 
-fn write_value(value: &MessageValue) -> Value {
+pub(crate) fn write_value(value: &MessageValue) -> Value {
     match value {
         MessageValue::Null => Value::Null,
         MessageValue::Bool(value) => Value::Bool(*value),

@@ -412,7 +412,22 @@ fn independent_pages_wrap_without_starving_either_entity_kind<P: StoreProvider>(
     assert_eq!(first.topics_swept, MAX_TOPICS_PER_SWEEP);
     assert_eq!(first.queues_swept, MAX_QUEUES_PER_SWEEP);
     assert!(first.is_idle());
-    assert_eq!(node.store.topic_reads().len(), MAX_TOPICS_PER_SWEEP * 3);
+    let reads = node.store.topic_reads();
+    assert_eq!(reads.len(), MAX_TOPICS_PER_SWEEP * 3 + MAX_QUEUES_PER_SWEEP);
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|read| read.entity.as_str().starts_with("queue-"))
+            .count(),
+        MAX_QUEUES_PER_SWEEP
+    );
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|read| read.entity.as_str().starts_with("topic-"))
+            .count(),
+        MAX_TOPICS_PER_SWEEP * 3
+    );
     assert_eq!(node.store.pages(14).len(), 1);
     assert_eq!(node.store.pages(1).len(), 1);
     let scans = node
@@ -436,10 +451,18 @@ fn independent_pages_wrap_without_starving_either_entity_kind<P: StoreProvider>(
     let tail = worker.sweep_once()?;
     assert_eq!(tail.topics_swept, 1);
     assert_eq!(tail.queues_swept, 2);
-    assert_eq!(
-        node.store.topic_reads(),
-        vec![cursor(&format!("topic-{:04}", MAX_TOPICS_PER_SWEEP)); 3]
-    );
+    let mut expected = vec![
+        cursor(&format!("queue-{:04}", MAX_QUEUES_PER_SWEEP / 2)),
+        cursor(&format!(
+            "queue-{:04}/$deadletterqueue",
+            MAX_QUEUES_PER_SWEEP / 2
+        )),
+    ];
+    expected.extend(vec![
+        cursor(&format!("topic-{:04}", MAX_TOPICS_PER_SWEEP));
+        3
+    ]);
+    assert_eq!(node.store.topic_reads(), expected);
     node.store.clear();
     let wrapped = worker.sweep_once()?;
     assert_eq!(wrapped.topics_swept, MAX_TOPICS_PER_SWEEP);
@@ -512,7 +535,14 @@ fn corrupt_topic_and_transient_discovery_advance_only_the_attempted_cursor<P: St
     let worker = TimerWorker::new(&handle);
     node.store.clear();
     assert!(worker.sweep_once().is_err());
-    assert_eq!(node.store.topic_reads(), vec![cursor("a-poison")]);
+    assert_eq!(
+        node.store.topic_reads(),
+        vec![
+            cursor("queue"),
+            cursor("queue/$deadletterqueue"),
+            cursor("a-poison")
+        ]
+    );
     assert_eq!(node.history("queue", "first")?, None);
     assert!(node.history("z-due", "due")?.is_some());
     node.seed_history("queue", "second", 1_000)?;
@@ -532,7 +562,16 @@ fn corrupt_topic_and_transient_discovery_advance_only_the_attempted_cursor<P: St
     assert_eq!(resumed.topics_swept, 1);
     assert_eq!(resumed.duplicate_history_expired, 1);
     assert_eq!(node.store.pages(14)[0].start, failed_start);
-    assert_eq!(node.store.topic_reads(), vec![cursor("z-due"); 3]);
+    assert_eq!(
+        node.store.topic_reads(),
+        vec![
+            cursor("queue"),
+            cursor("queue/$deadletterqueue"),
+            cursor("z-due"),
+            cursor("z-due"),
+            cursor("z-due")
+        ]
+    );
     assert_eq!(node.history("z-due", "due")?, None);
     Ok(())
 }

@@ -22,6 +22,15 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 struct ObservedBroker(mpsc::Sender<()>);
 
 impl Broker for ObservedBroker {
+    async fn rules(
+        &self,
+        _namespace: NamespaceName,
+        _topic: EntityPath,
+        _subscription: domain::SubscriptionName,
+    ) -> Result<Vec<domain::RuleDefinition>, BrokerRejection> {
+        Err(BrokerRejection::Unavailable("unexpected rule read".into()))
+    }
+
     async fn entity_metadata(
         &self,
         namespace: NamespaceName,

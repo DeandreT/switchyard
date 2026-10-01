@@ -20,7 +20,9 @@
 //! [`crate::SessionId`] reject control characters, so no name can contain a zero
 //! byte and forge another scope's prefix.
 
-use crate::{EntityPath, NamespaceName, SequenceNumber, SessionId, SubscriptionName, Timestamp};
+use crate::{
+    EntityPath, NamespaceName, RuleName, SequenceNumber, SessionId, SubscriptionName, Timestamp,
+};
 
 const TAG_CLOCK: u8 = 0x00;
 const TAG_QUEUE_CONFIG: u8 = 0x01;
@@ -39,6 +41,7 @@ const TAG_DUPLICATE_HISTORY: u8 = 0x0C;
 const TAG_DUPLICATE_HISTORY_EXPIRY: u8 = 0x0D;
 const TAG_TOPIC_CONFIG: u8 = 0x0E;
 const TAG_TOPIC_SUBSCRIPTION: u8 = 0x0F;
+const TAG_SUBSCRIPTION_RULE: u8 = 0x10;
 
 const SEPARATOR: u8 = 0x00;
 
@@ -133,6 +136,39 @@ pub fn subscription_name_parts<'a>(prefix: &[u8], key: &'a [u8]) -> Option<&'a s
     let rest = key.strip_prefix(prefix)?.strip_suffix(&[SEPARATOR])?;
     let name = std::str::from_utf8(rest).ok()?;
     SubscriptionName::validate(name).ok()?;
+    Some(name)
+}
+
+pub fn rule_prefix(
+    namespace: &NamespaceName,
+    topic: &EntityPath,
+    subscription: &SubscriptionName,
+) -> Vec<u8> {
+    let mut prefix = entity_scope(TAG_SUBSCRIPTION_RULE, namespace, topic);
+    prefix.extend_from_slice(subscription.as_str().as_bytes());
+    prefix.push(SEPARATOR);
+    prefix
+}
+
+pub fn rule(
+    namespace: &NamespaceName,
+    topic: &EntityPath,
+    subscription: &SubscriptionName,
+    name: &RuleName,
+) -> Vec<u8> {
+    let mut key = rule_prefix(namespace, topic, subscription);
+    key.extend_from_slice(name.as_str().as_bytes());
+    key.push(SEPARATOR);
+    key
+}
+
+pub fn rule_name_parts<'a>(prefix: &[u8], key: &'a [u8]) -> Option<&'a str> {
+    if prefix.first().copied()? != TAG_SUBSCRIPTION_RULE {
+        return None;
+    }
+    let rest = key.strip_prefix(prefix)?.strip_suffix(&[SEPARATOR])?;
+    let name = std::str::from_utf8(rest).ok()?;
+    RuleName::validate(name).ok()?;
     Some(name)
 }
 

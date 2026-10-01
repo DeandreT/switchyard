@@ -1,5 +1,6 @@
 use crate::TopicConfig;
 
+use super::rules::{RuleMatchBudget, matching_subscriptions};
 use super::*;
 
 /// Copies retained by one topic publication or scheduled activation.
@@ -17,6 +18,7 @@ struct TopicMessagePlan<'a> {
     cost: TopicMessageCost,
     duplicate: bool,
     previous_history: Option<Timestamp>,
+    matches: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -28,12 +30,14 @@ pub(super) struct TopicMessageCost {
 pub(super) struct TopicTargets {
     subscriptions: Vec<crate::SubscriptionDefinition>,
     shadows: Vec<EntityPath>,
+    rules: Vec<Vec<crate::RuleDefinition>>,
 }
 
 pub(super) struct TopicEmission<'a> {
     pub(super) message: MessageInput<'a>,
     pub(super) sequence: SequenceNumber,
     pub(super) scheduled_enqueue_time: Option<Timestamp>,
+    pub(super) matches: u32,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -98,8 +102,12 @@ impl TopicBudget {
         cost: TopicMessageCost,
         message: MessageInput<'_>,
         targets: &TopicTargets,
+        matches: u32,
     ) -> Result<(), BrokerError> {
-        for subscription in &targets.subscriptions {
+        for (index, subscription) in targets.subscriptions.iter().enumerate() {
+            if matches & (1_u32 << index) == 0 {
+                continue;
+            }
             let missing_session =
                 subscription.config.requires_session && message.session_id.is_none();
             self.charge_copy(TopicMessageCost {
@@ -150,7 +158,16 @@ impl<S: StateStore> StateMachine<S> {
         if command.entity.is_subscription_path() {
             return Err(BrokerError::SubscriptionPathIsReserved);
         }
-        self.topic_config(&command.namespace, &command.entity)
+        let config = self.topic_config(&command.namespace, &command.entity)?;
+        if config.is_some()
+            && self
+                .store
+                .get(&keys::queue_config(&command.namespace, &command.entity))?
+                .is_some()
+        {
+            return Err(BrokerError::DanglingEntityMetadata);
+        }
+        Ok(config)
     }
 
     pub(super) fn publish_topic<'a>(
@@ -172,17 +189,21 @@ impl<S: StateStore> StateMachine<S> {
         let queue_config = config.to_queue_config();
         let mut plans = Vec::with_capacity(messages.len());
         let mut budget = TopicBudget::default();
+        let mut match_budget = RuleMatchBudget::default();
         // The admission plan borrows every payload. Even compound map-key
         // validation waits until input and retained-copy budgets are known.
         for (message, scheduled_enqueue_time) in messages {
             let cost = topic_message_cost(message)?;
             budget.charge_input(cost)?;
+            match_budget.charge(message, &targets.rules)?;
+            let matches = matching_subscriptions(message, &targets.rules);
             plans.push(TopicMessagePlan {
                 message,
                 scheduled_enqueue_time,
                 cost,
                 duplicate: false,
                 previous_history: None,
+                matches,
             });
         }
 
@@ -209,7 +230,12 @@ impl<S: StateStore> StateMachine<S> {
             if future {
                 // A future batch need not fit one activation, but each item
                 // must be activatable against the topology known at admission.
-                TopicBudget::default().charge_fanout(plan.cost, plan.message, &targets)?;
+                TopicBudget::default().charge_fanout(
+                    plan.cost,
+                    plan.message,
+                    &targets,
+                    plan.matches,
+                )?;
             }
             if !plan.duplicate {
                 if deduplicate {
@@ -218,7 +244,7 @@ impl<S: StateStore> StateMachine<S> {
                 if future {
                     budget.charge_copy(plan.cost)?;
                 } else {
-                    budget.charge_fanout(plan.cost, plan.message, &targets)?;
+                    budget.charge_fanout(plan.cost, plan.message, &targets, plan.matches)?;
                 }
             }
         }
@@ -267,6 +293,7 @@ impl<S: StateStore> StateMachine<S> {
                         message: plan.message,
                         sequence,
                         scheduled_enqueue_time: plan.scheduled_enqueue_time,
+                        matches: plan.matches,
                     },
                     batch,
                     &mut enqueued,
@@ -289,10 +316,25 @@ impl<S: StateStore> StateMachine<S> {
             .iter()
             .map(|subscription| subscription.entity.dead_letter_queue())
             .collect::<Result<Vec<_>, _>>()?;
+        let rules = subscriptions
+            .iter()
+            .map(|subscription| self.rules(&command.namespace, &command.entity, &subscription.name))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(TopicTargets {
             subscriptions,
             shadows,
+            rules,
         })
+    }
+
+    pub(super) fn topic_matches(
+        &self,
+        message: MessageInput<'_>,
+        targets: &TopicTargets,
+        budget: &mut RuleMatchBudget,
+    ) -> Result<u32, BrokerError> {
+        budget.charge(message, &targets.rules)?;
+        Ok(matching_subscriptions(message, &targets.rules))
     }
 
     pub(super) fn validate_topic_message(
@@ -330,7 +372,15 @@ impl<S: StateStore> StateMachine<S> {
             ),
             ..emission.message
         };
-        for (subscription, shadow) in targets.subscriptions.iter().zip(&targets.shadows) {
+        for (index, (subscription, shadow)) in targets
+            .subscriptions
+            .iter()
+            .zip(&targets.shadows)
+            .enumerate()
+        {
+            if emission.matches & (1_u32 << index) == 0 {
+                continue;
+            }
             let subscription_config = subscription.config.to_queue_config();
             if subscription.config.requires_session && message.session_id.is_none() {
                 let scope = EnqueueScope {

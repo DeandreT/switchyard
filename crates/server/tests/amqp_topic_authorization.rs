@@ -1,5 +1,8 @@
 //! Scoped topic/subscription credentials are checked before topology discovery.
 
+#[path = "amqp_topic_authorization/rules.rs"]
+mod rules;
+
 use std::{
     error::Error,
     future::Future,
@@ -54,6 +57,16 @@ struct CountingBroker {
 }
 
 impl protocol_amqp::Broker for CountingBroker {
+    fn rules(
+        &self,
+        namespace: NamespaceName,
+        topic: EntityPath,
+        subscription: domain::SubscriptionName,
+    ) -> impl std::future::Future<Output = Result<Vec<domain::RuleDefinition>, BrokerRejection>> + Send
+    {
+        protocol_amqp::Broker::rules(&self.inner, namespace, topic, subscription)
+    }
+
     fn submit(
         &self,
         namespace: NamespaceName,
