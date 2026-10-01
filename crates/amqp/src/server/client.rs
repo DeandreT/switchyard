@@ -1136,6 +1136,10 @@ where
                         };
                             let result: Result<(), EngineError> = match command {
                                 ClientCommand::Begin { reply } => {
+                                    if sessions.len() >= MAX_SESSIONS_PER_CONNECTION {
+                                        let _ = reply.send(Err(invalid_state("connection session limit reached")));
+                                        continue;
+                                    }
                                     let Some(channel) = vacant_channel(next_channel, settings.remote_channel_max, &sessions) else {
                                         let _ = reply.send(Err(invalid_state("peer session channel limit reached")));
                                         continue;
@@ -1169,6 +1173,7 @@ where
                                         let _ = reply.send(Err(EngineError::RemoteDetached));
                                         continue;
                                     }
+                                    let connection_slots = connection_link_slot_count(&sessions);
                                     let Some(session) = sessions.get_mut(&channel) else {
                                         let _ = reply.send(Err(EngineError::RemoteDetached));
                                         continue;
@@ -1208,6 +1213,10 @@ where
                                     }
                                     if session.pending_attaches.contains_key(&handle) || session.pending_attaches.len() == MAX_PENDING_ATTACHES || pending_attaches.contains_key(&request.name) {
                                         let _ = reply.send(Err(invalid_state("pending attach limit reached or name is already assigned")));
+                                        continue;
+                                    }
+                                    if link_slot_count(session) >= MAX_LINKS_PER_SESSION || connection_slots >= MAX_LINKS_PER_CONNECTION {
+                                        let _ = reply.send(Err(invalid_state("link lifecycle slot limit reached")));
                                         continue;
                                     }
                                     let peer_role = attach.role.opposite();

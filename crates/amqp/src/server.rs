@@ -54,6 +54,9 @@ const SEND_FRAME_QUANTUM: usize = 16;
 const MAX_DELIVERY_TAG_BYTES: usize = 32;
 const MAX_OUTGOING_DELIVERIES_PER_LINK: usize = 1_024;
 const MAX_OUTGOING_DELIVERIES_PER_SESSION: usize = 4_096;
+const MAX_SESSIONS_PER_CONNECTION: usize = 32;
+const MAX_LINKS_PER_SESSION: usize = 128;
+const MAX_LINKS_PER_CONNECTION: usize = 256;
 const RECOVERY_NOT_IMPLEMENTED: &str = "link recovery is not implemented";
 const MAX_CLOSING_HANDLES: usize = 65_536;
 const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1113,6 +1116,29 @@ impl SessionState {
     }
 }
 
+fn link_slot_count(session: &SessionState) -> usize {
+    session.links.len()
+        + session
+            .pending_attaches
+            .keys()
+            .filter(|handle| !session.links.contains_key(*handle))
+            .count()
+        + session
+            .closing_handles
+            .iter()
+            .filter(|handle| {
+                !session.links.contains_key(*handle)
+                    && !session.pending_attaches.contains_key(*handle)
+            })
+            .count()
+}
+
+fn connection_link_slot_count(sessions: &HashMap<u16, SessionState>) -> usize {
+    sessions.values().fold(0, |count, session| {
+        count.saturating_add(link_slot_count(session))
+    })
+}
+
 enum LinkState {
     Sending(Box<SendingLink>),
     Receiving(ReceivingLink),
@@ -1431,6 +1457,25 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
             if sessions.contains_key(&channel) {
                 return Err(invalid_state("duplicate AMQP begin"));
             }
+            if sessions.len() >= MAX_SESSIONS_PER_CONNECTION {
+                let frame = Frame::Amqp {
+                    channel: 0,
+                    performative: Some(Performative::Close(Close {
+                        error: Some(Error::new(
+                            crate::AmqpError::ResourceLimitExceeded,
+                            "connection session limit reached",
+                            None,
+                        )),
+                    })),
+                    payload: Vec::new(),
+                };
+                writer.encoded_frame(&frame)?;
+                for session in sessions.values_mut() {
+                    stop_session(session);
+                }
+                writer.write_frame(&frame).await?;
+                return Ok(FrameAction::Continue);
+            }
             sessions.insert(channel, SessionState::new(&begin));
             if incoming_sessions
                 .try_send(IncomingSession {
@@ -1451,6 +1496,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
             }
         }
         Performative::Attach(attach) => {
+            let connection_slots = connection_link_slot_count(sessions);
             let session = sessions
                 .get_mut(&channel)
                 .ok_or_else(|| invalid_state("attach on an unknown session"))?;
@@ -1463,6 +1509,17 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                     channel,
                     "amqp:session:handle-in-use",
                     "link handle is already assigned",
+                    writer,
+                    sessions,
+                )
+                .await?;
+            } else if link_slot_count(session) >= MAX_LINKS_PER_SESSION
+                || connection_slots >= MAX_LINKS_PER_CONNECTION
+            {
+                refuse_session(
+                    channel,
+                    "amqp:resource-limit-exceeded",
+                    "link lifecycle slot limit reached",
                     writer,
                     sessions,
                 )
@@ -3654,3 +3711,6 @@ mod outgoing_tag_tests;
 
 #[cfg(test)]
 mod outgoing_id_tests;
+
+#[cfg(test)]
+mod lifecycle_limit_tests;
