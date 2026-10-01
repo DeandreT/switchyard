@@ -1,11 +1,24 @@
+use std::sync::Arc;
+
+use crate::Role;
+
 use super::{SessionState, incoming_ledger::LinkIdentity, link_slot_count};
 
 #[derive(Debug)]
 pub(super) struct HandleAlias {
     pub identity: LinkIdentity,
+    pub name: Arc<str>,
+    pub role: Role,
     pub peer_handle: Option<u32>,
     pub own_attach_sent: bool,
     pub error_detached: bool,
+}
+
+pub(super) fn current_alias(handle: u32, session: &SessionState) -> Option<&HandleAlias> {
+    session
+        .handle_aliases
+        .get(&handle)
+        .filter(|alias| alias_is_current(handle, alias, session))
 }
 
 fn alias_is_current(handle: u32, alias: &HandleAlias, session: &SessionState) -> bool {

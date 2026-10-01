@@ -92,6 +92,8 @@ async fn accept_sender(
             handle,
             super::link_handles::HandleAlias {
                 identity: requested.approval().link_identity().clone(),
+                name: Arc::clone(requested.approval().name()),
+                role: requested.approval().local_role(),
                 peer_handle: Some(handle),
                 own_attach_sent: false,
                 error_detached: false,
@@ -448,6 +450,8 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
             handle,
             super::link_handles::HandleAlias {
                 identity: session.links[&handle].identity().clone(),
+                name: format!("inbound-size-{handle}").into(),
+                role: Role::Receiver,
                 peer_handle: Some(handle),
                 own_attach_sent: true,
                 error_detached: false,

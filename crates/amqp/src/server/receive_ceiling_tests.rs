@@ -87,6 +87,8 @@ impl Fixture {
             handle,
             super::link_handles::HandleAlias {
                 identity: receipt.approval().link_identity().clone(),
+                name: Arc::clone(receipt.approval().name()),
+                role: receipt.approval().local_role(),
                 peer_handle: Some(handle),
                 own_attach_sent: false,
                 error_detached: false,

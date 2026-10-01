@@ -121,6 +121,8 @@ impl Fixture {
             handle,
             super::link_handles::HandleAlias {
                 identity: identity.clone(),
+                name: Arc::clone(attach.approval().name()),
+                role: attach.approval().local_role(),
                 peer_handle: Some(handle),
                 own_attach_sent: false,
                 error_detached: false,

@@ -154,6 +154,7 @@ struct Fixture {
     node: Node,
     peer: Peer,
     next_handle: u32,
+    next_link_name: u64,
 }
 
 impl Fixture {
@@ -207,6 +208,7 @@ impl Fixture {
             },
             peer,
             next_handle: 0,
+            next_link_name: 0,
         })
     }
 
@@ -254,17 +256,20 @@ impl Fixture {
             },
             peer,
             next_handle: 0,
+            next_link_name: 0,
         })
     }
 
     async fn receiver(&mut self) -> TestResult<(Endpoint, u32)> {
         let handle = self.next_handle;
         self.next_handle += 1;
+        let name = format!("retained-link-{}", self.next_link_name);
+        self.next_link_name += 1;
         let endpoint = match &mut self.node {
             Node::Server { session, .. } => {
                 self.peer
                     .send(
-                        Performative::Attach(Box::new(sender_attach(handle))),
+                        Performative::Attach(Box::new(sender_attach(handle, name))),
                         Vec::new(),
                     )
                     .await?;
@@ -287,9 +292,7 @@ impl Fixture {
                 Endpoint::Server(receiver)
             }
             Node::Client { session, .. } => {
-                let builder = ClientReceiver::builder()
-                    .name(format!("client-{handle}"))
-                    .source("queue");
+                let builder = ClientReceiver::builder().name(name).source("queue");
                 let (receiver, ()) = timeout(IO_TIMEOUT, async {
                     tokio::try_join!(
                         async { Ok::<_, Box<dyn Error>>(builder.attach(session).await?) },
@@ -394,9 +397,9 @@ async fn begin_client_session(
     Ok(session)
 }
 
-fn sender_attach(handle: u32) -> Attach {
+fn sender_attach(handle: u32, name: String) -> Attach {
     Attach {
-        name: format!("peer-{handle}"),
+        name,
         handle,
         role: Role::Sender,
         snd_settle_mode: SenderSettleMode::Mixed,

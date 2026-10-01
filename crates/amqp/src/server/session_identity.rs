@@ -35,7 +35,7 @@ pub(super) struct AttachApproval {
     link: LinkIdentity,
     handle: u32,
     local_handle: u32,
-    name: String,
+    name: Arc<str>,
     role: Role,
     sender_settle_mode: SenderSettleMode,
     receiver_settle_mode: ReceiverSettleMode,
@@ -50,9 +50,17 @@ impl AttachApproval {
         self.local_handle
     }
 
+    pub(super) fn name(&self) -> &Arc<str> {
+        &self.name
+    }
+
+    pub(super) fn local_role(&self) -> Role {
+        self.role.opposite()
+    }
+
     pub(super) fn refusal_attach(&self) -> Attach {
         Attach {
-            name: self.name.clone(),
+            name: self.name.to_string(),
             handle: self.local_handle,
             role: self.role.opposite(),
             snd_settle_mode: self.sender_settle_mode.clone(),
@@ -88,7 +96,7 @@ impl IncomingAttach {
             link: LinkIdentity::new(),
             handle: attach.handle,
             local_handle,
-            name: attach.name.clone(),
+            name: Arc::from(attach.name.as_str()),
             role: attach.role.clone(),
             sender_settle_mode: attach.snd_settle_mode.clone(),
             receiver_settle_mode: attach.rcv_settle_mode.clone(),
@@ -131,7 +139,7 @@ impl IncomingAttach {
         if self.attach.handle != self.approval.handle {
             return Err(AttachApprovalError::ChangedHandle);
         }
-        if self.attach.name != self.approval.name {
+        if self.attach.name != self.approval.name.as_ref() {
             return Err(AttachApprovalError::ChangedName);
         }
         if self.attach.role != self.approval.role {

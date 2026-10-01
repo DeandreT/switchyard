@@ -6,7 +6,9 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::{Frame, Performative, codec};
 
-use super::{ConnectionOptions, content_budget::ContentBudget, idle::Activity};
+use super::{
+    ConnectionOptions, content_budget::ContentBudget, error_links::ErrorLinkNames, idle::Activity,
+};
 
 const MIN_FRAME_SIZE: u32 = 512;
 
@@ -24,6 +26,7 @@ pub(super) struct FrameWriter<W> {
     peer_idle_millis: u32,
     activity: Activity,
     content_budget: ContentBudget,
+    error_link_names: ErrorLinkNames,
 }
 
 impl<W> FrameWriter<W> {
@@ -41,11 +44,20 @@ impl<W> FrameWriter<W> {
             peer_idle_millis: 0,
             activity: Activity::new(),
             content_budget: ContentBudget::default(),
+            error_link_names: ErrorLinkNames::default(),
         })
     }
 
     pub fn content_budget(&self) -> &ContentBudget {
         &self.content_budget
+    }
+
+    pub fn error_link_names(&self) -> &ErrorLinkNames {
+        &self.error_link_names
+    }
+
+    pub fn error_link_names_mut(&mut self) -> &mut ErrorLinkNames {
+        &mut self.error_link_names
     }
 
     #[cfg(test)]

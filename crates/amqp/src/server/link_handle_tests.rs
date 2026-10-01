@@ -153,6 +153,8 @@ impl Fixture {
             local,
             HandleAlias {
                 identity: receipt.approval().link_identity().clone(),
+                name: Arc::clone(receipt.approval().name()),
+                role: receipt.approval().local_role(),
                 peer_handle: Some(peer),
                 own_attach_sent: false,
                 error_detached: false,
@@ -176,6 +178,8 @@ impl Fixture {
             0,
             HandleAlias {
                 identity: receipt.approval().link_identity().clone(),
+                name: Arc::clone(receipt.approval().name()),
+                role: receipt.approval().local_role(),
                 peer_handle: Some(88),
                 own_attach_sent: false,
                 error_detached: false,
@@ -318,6 +322,8 @@ fn local_allocator_counts_the_lifecycle_union_and_wraps_the_full_u32_range() {
         0,
         HandleAlias {
             identity: LinkIdentity::new(),
+            name: Arc::from("allocator-zero"),
+            role: Role::Sender,
             peer_handle: None,
             own_attach_sent: false,
             error_detached: false,
@@ -337,6 +343,8 @@ fn local_allocator_counts_the_lifecycle_union_and_wraps_the_full_u32_range() {
         u32::MAX,
         HandleAlias {
             identity: LinkIdentity::new(),
+            name: Arc::from("allocator-maximum"),
+            role: Role::Sender,
             peer_handle: Some(42),
             own_attach_sent: true,
             error_detached: false,

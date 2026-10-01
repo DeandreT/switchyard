@@ -428,10 +428,16 @@ async fn exhausted_locks<P: StoreProvider>(provider: P) -> TestResult {
     .await?;
     let mut connection = bounded("connect", node.connect()).await?;
     let mut session = bounded("begin", ClientSession::begin(&mut connection)).await?;
+    // Automatic credit can cross the immediate error Detach and end its session.
+    let mut refused_session = bounded(
+        "begin exhausted receiver session",
+        ClientSession::begin(&mut connection),
+    )
+    .await?;
     let before = node.snapshot()?;
     let mut receiver = bounded(
         "attach exhausted receiver",
-        ClientReceiver::attach(&mut session, "counter-receiver", "orders"),
+        ClientReceiver::attach(&mut refused_session, "counter-receiver", "orders"),
     )
     .await?;
     let error = timeout(DEADLINE, receiver.recv())

@@ -131,6 +131,8 @@ impl Fixture {
                     handle,
                     HandleAlias {
                         identity: owner.clone(),
+                        name: format!("delivery-{channel}-{handle}").into(),
+                        role,
                         peer_handle: Some(peer),
                         own_attach_sent: true,
                         error_detached: false,

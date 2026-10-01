@@ -24,6 +24,7 @@ use crate::{decode_message, encode_message, read_frame};
 
 mod content_budget;
 mod error_deliveries;
+mod error_links;
 mod flow_control;
 mod format_registry;
 mod frame_writer;
@@ -39,6 +40,7 @@ use content_budget::ContentLease;
 use error_deliveries::{
     ErrorDeliveryHistory, ErrorDeliveryHistoryError, MAX_RETIRED_DELIVERIES_PER_DIRECTION,
 };
+use error_links::ErrorPeerHandles;
 use flow_control::{LinkCredit, LinkSnapshot, SessionWindow};
 pub use format_registry::MessageFormatDecoders;
 use frame_writer::FrameWriter;
@@ -50,7 +52,7 @@ use incoming_ledger::{
     DeliveryIdentity, IncomingLedger, IncomingLedgerError, LinkIdentity, SettlementAction,
 };
 use link_handles::{
-    HandleAlias, is_error_detached, local_handle_for_peer, mark_error_detached,
+    HandleAlias, current_alias, is_error_detached, local_handle_for_peer, mark_error_detached,
     preferred_vacant_handle,
 };
 use outgoing_identity::AckIdentity;
@@ -1049,6 +1051,7 @@ struct SessionState {
     ending: bool,
     incoming: IncomingLedger,
     error_deliveries: ErrorDeliveryHistory,
+    error_peer_handles: ErrorPeerHandles,
 }
 
 struct PendingLinkFlow {
@@ -1136,6 +1139,7 @@ impl SessionState {
             ending: false,
             incoming: IncomingLedger::new(),
             error_deliveries: ErrorDeliveryHistory::default(),
+            error_peer_handles: ErrorPeerHandles::default(),
         }
     }
 }
@@ -1569,10 +1573,24 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
             .get(&channel)
             .and_then(|session| local_handle_for_peer(peer_handle, session))
         else {
+            let historical = sessions
+                .get(&channel)
+                .is_some_and(|session| session.error_peer_handles.contains(peer_handle));
+            if historical && matches!(&performative, Performative::Detach(_)) {
+                return Ok(FrameAction::Continue);
+            }
             refuse_session(
                 channel,
-                "amqp:session:unattached-handle",
-                "frame on an unassigned peer link handle",
+                if historical {
+                    "amqp:session:errant-link"
+                } else {
+                    "amqp:session:unattached-handle"
+                },
+                if historical {
+                    "frame on an error-detached peer link handle"
+                } else {
+                    "frame on an unassigned peer link handle"
+                },
                 writer,
                 sessions,
             )
@@ -1621,6 +1639,34 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                 .values()
                 .any(|alias| alias.peer_handle == Some(peer_handle))
             {
+                if let Some(handle) = local_handle_for_peer(peer_handle, session)
+                    && is_error_detached(session, handle)
+                {
+                    let local_role = attach.role.opposite();
+                    let known_resume = session.handle_aliases.get(&handle).is_some_and(|alias| {
+                        alias.name.as_ref() == attach.name && alias.role == local_role
+                    }) && writer
+                        .error_link_names()
+                        .contains(&attach.name, &local_role)
+                        && attach.unsettled.is_some();
+                    refuse_session_state(
+                        channel,
+                        if known_resume {
+                            "amqp:not-implemented"
+                        } else {
+                            "amqp:session:errant-link"
+                        },
+                        if known_resume {
+                            RECOVERY_NOT_IMPLEMENTED
+                        } else {
+                            "attach on an error-detached peer link handle"
+                        },
+                        session,
+                        writer,
+                    )
+                    .await?;
+                    return Ok(FrameAction::Continue);
+                }
                 refuse_connection(
                     "amqp:session:handle-in-use",
                     "link handle is already assigned",
@@ -1629,7 +1675,38 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                 )
                 .await?;
                 return Ok(FrameAction::CloseSent);
-            } else if link_slot_count(session) >= MAX_LINKS_PER_SESSION
+            }
+            let known_error = writer
+                .error_link_names()
+                .contains(&attach.name, &attach.role.opposite());
+            if known_error && attach.unsettled.is_none() {
+                refuse_session_state(
+                    channel,
+                    "amqp:session:errant-link",
+                    "pipelined attach for an error-detached link",
+                    session,
+                    writer,
+                )
+                .await?;
+                return Ok(FrameAction::Continue);
+            }
+            // Ordinary approvals may normalize control-link fields; historical
+            // handle reassignment must instead validate before replacing authority.
+            if session.error_peer_handles.contains(peer_handle)
+                && attach.role == Role::Sender
+                && attach.initial_delivery_count.is_none()
+            {
+                refuse_session_state(
+                    channel,
+                    "amqp:invalid-field",
+                    "sender attach has no initial delivery count",
+                    session,
+                    writer,
+                )
+                .await?;
+                return Ok(FrameAction::Continue);
+            }
+            if link_slot_count(session) >= MAX_LINKS_PER_SESSION
                 || connection_slots >= MAX_LINKS_PER_CONNECTION
             {
                 refuse_session(
@@ -1668,15 +1745,19 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                     handle,
                     HandleAlias {
                         identity: attach.approval().link_identity().clone(),
+                        name: Arc::clone(attach.approval().name()),
+                        role: attach.approval().local_role(),
                         peer_handle: Some(peer_handle),
                         own_attach_sent: false,
                         error_detached: false,
                     },
                 );
+                session.error_peer_handles.reassign(peer_handle);
                 let mut pending = PendingLinkFlow::incoming(&attach);
-                pending.recovery_refusal = has_recovery_state(&attach);
+                pending.recovery_refusal = has_recovery_state(&attach) || known_error;
+                let recovery_refusal = pending.recovery_refusal;
                 session.pending_attaches.insert(handle, pending);
-                if has_recovery_state(&attach) && session.attach_tx.is_some() {
+                if recovery_refusal && session.attach_tx.is_some() {
                     refuse_recovery_attach(channel, &attach, session, writer).await?;
                 } else if let Some(attach_tx) = &session.attach_tx {
                     if attach_tx.try_send(attach).is_err() {
@@ -1810,13 +1891,27 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 if attach.approval().link_identity().is_retired() {
                     continue;
                 }
-                if has_recovery_state(&attach) {
+                let recovery_refusal = session
+                    .pending_attaches
+                    .get(&attach.approval().local_handle())
+                    .is_some_and(|pending| {
+                        pending.recovery_refusal
+                            && pending
+                                .approval
+                                .as_ref()
+                                .is_some_and(|approval| Arc::ptr_eq(approval, attach.approval()))
+                    });
+                if has_recovery_state(&attach) || recovery_refusal {
                     refuse_recovery_attach(channel, &attach, session, writer).await?;
                 } else {
                     attach_tx
                         .try_send(attach)
                         .map_err(|_| invalid_state("pending attach queue is full"))?;
                 }
+            }
+            if session.ending {
+                let _ = reply.send(Err(EngineError::RemoteDetached));
+                return Ok(CommandAction::Continue);
             }
             session.attach_tx = Some(attach_tx);
             let _ = reply.send(Ok(()));
@@ -2094,8 +2189,8 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             }
             let error_detached = error.is_some();
             let error_snapshot = if error_detached {
-                match snapshot_error_deliveries(session, handle, &identity) {
-                    Ok(snapshot) => snapshot,
+                match snapshot_error_histories(session, handle, &identity, None, writer) {
+                    Ok(snapshot) => Some(snapshot),
                     Err(error) => {
                         refuse_session_state(
                             channel,
@@ -2125,14 +2220,11 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 let _ = reply.send(Err(error.into()));
                 return Ok(CommandAction::Continue);
             }
-            if let Some((role, ids)) = &error_snapshot {
+            if let Some(snapshot) = &error_snapshot {
                 if !session.local_begin_sent {
                     writer.encoded_frame(&local_begin_frame(channel, session)?)?;
                 }
-                session
-                    .error_deliveries
-                    .record(role, &identity, ids)
-                    .map_err(|error| invalid_state(error.to_string()))?;
+                commit_error_histories(session, snapshot, writer)?;
             }
             ensure_local_begin(channel, session, writer).await?;
             remember_closing_handle(session, handle)?;
@@ -3147,6 +3239,23 @@ async fn close_pending_link<W: AsyncWrite + Unpin>(
         .ok_or_else(|| invalid_state("pending link has no matching handle alias"))?;
     let error_detached = error.is_some();
     let needs_attach = !alias.own_attach_sent;
+    let error_snapshot = if error_detached {
+        match snapshot_error_histories(session, handle, approval.link_identity(), None, writer) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                return refuse_session_state(
+                    channel,
+                    "amqp:resource-limit-exceeded",
+                    error.to_string(),
+                    session,
+                    writer,
+                )
+                .await;
+            }
+        }
+    } else {
+        None
+    };
     let response = Frame::Amqp {
         channel,
         performative: Some(Performative::Attach(Box::new(approval.refusal_attach()))),
@@ -3174,6 +3283,9 @@ async fn close_pending_link<W: AsyncWrite + Unpin>(
     writer.encoded_frame(&detach)?;
     if !session.local_begin_sent {
         writer.encoded_frame(&local_begin_frame(channel, session)?)?;
+    }
+    if let Some(snapshot) = &error_snapshot {
+        commit_error_histories(session, snapshot, writer)?;
     }
     if peer_detached {
         approval.retire();
@@ -3291,6 +3403,101 @@ fn snapshot_error_deliveries(
     };
     session.error_deliveries.check_record(&role, &ids)?;
     Ok(Some((role, ids)))
+}
+
+#[derive(Debug)]
+struct ErrorLinkSnapshot {
+    owner: LinkIdentity,
+    alias: Option<(Arc<str>, Role, Option<u32>)>,
+    deliveries: Option<(Role, HashSet<u32>)>,
+}
+
+fn snapshot_error_histories<W>(
+    session: &SessionState,
+    handle: u32,
+    owner: &LinkIdentity,
+    peer_override: Option<u32>,
+    writer: &FrameWriter<W>,
+) -> Result<ErrorLinkSnapshot, EngineError> {
+    if owner.is_retired() || session.identity.is_retired() || session.ending {
+        return Ok(ErrorLinkSnapshot {
+            owner: owner.clone(),
+            alias: None,
+            deliveries: None,
+        });
+    }
+    let alias = current_alias(handle, session)
+        .filter(|alias| alias.identity.same_link(owner))
+        .map(|alias| {
+            (
+                Arc::clone(&alias.name),
+                alias.role.clone(),
+                peer_override.or(alias.peer_handle),
+            )
+        });
+    let deliveries = snapshot_error_deliveries(session, handle, owner)
+        .map_err(|error| invalid_state(error.to_string()))?;
+    let snapshot = ErrorLinkSnapshot {
+        owner: owner.clone(),
+        alias,
+        deliveries,
+    };
+    check_error_histories(session, &snapshot, writer)?;
+    Ok(snapshot)
+}
+
+fn check_error_histories<W>(
+    session: &SessionState,
+    snapshot: &ErrorLinkSnapshot,
+    writer: &FrameWriter<W>,
+) -> Result<(), EngineError> {
+    if let Some((name, role, peer_handle)) = &snapshot.alias {
+        writer
+            .error_link_names()
+            .check_record(name, role)
+            .map_err(|error| invalid_state(error.to_string()))?;
+        if let Some(peer_handle) = peer_handle {
+            session
+                .error_peer_handles
+                .check_record(*peer_handle)
+                .map_err(|error| invalid_state(error.to_string()))?;
+        }
+    }
+    if let Some((role, ids)) = &snapshot.deliveries {
+        session
+            .error_deliveries
+            .check_record(role, ids)
+            .map_err(|error| invalid_state(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn commit_error_histories<W>(
+    session: &mut SessionState,
+    snapshot: &ErrorLinkSnapshot,
+    writer: &mut FrameWriter<W>,
+) -> Result<(), EngineError> {
+    // Admission for every index precedes the first publication; no await can intervene.
+    check_error_histories(session, snapshot, writer)?;
+    if let Some((name, role, peer_handle)) = &snapshot.alias {
+        writer
+            .error_link_names_mut()
+            .record(Arc::clone(name), role, &snapshot.owner)
+            .map_err(|error| invalid_state(error.to_string()))?;
+        if let Some(peer_handle) = peer_handle {
+            session
+                .error_peer_handles
+                .record(*peer_handle, &snapshot.owner)
+                .map_err(|error| invalid_state(error.to_string()))?;
+        }
+    }
+    if let Some((role, ids)) = &snapshot.deliveries {
+        session
+            .error_deliveries
+            .record(role, &snapshot.owner, ids)
+            .map_err(|error| invalid_state(error.to_string()))?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3459,8 +3666,8 @@ async fn detach_link_error<W: AsyncWrite + Unpin>(
         .get(&handle)
         .map(|link| link.identity().clone());
     let error_snapshot = if let Some(owner) = &owner {
-        match snapshot_error_deliveries(session, handle, owner) {
-            Ok(snapshot) => snapshot,
+        match snapshot_error_histories(session, handle, owner, None, writer) {
+            Ok(snapshot) => Some(snapshot),
             Err(error) => {
                 return refuse_session_state(
                     channel,
@@ -3492,13 +3699,8 @@ async fn detach_link_error<W: AsyncWrite + Unpin>(
     if !session.local_begin_sent {
         writer.encoded_frame(&local_begin_frame(channel, session)?)?;
     }
-    if let Some((role, ids)) = &error_snapshot
-        && let Some(owner) = &owner
-    {
-        session
-            .error_deliveries
-            .record(role, owner, ids)
-            .map_err(|error| invalid_state(error.to_string()))?;
+    if let Some(snapshot) = &error_snapshot {
+        commit_error_histories(session, snapshot, writer)?;
     }
     ensure_local_begin(channel, session, writer).await?;
     remember_closing_handle(session, handle)?;
@@ -4015,6 +4217,7 @@ fn stop_session(session: &mut SessionState) {
     session.handle_aliases.clear();
     session.incoming = IncomingLedger::new();
     session.error_deliveries.clear();
+    session.error_peer_handles.clear();
 }
 
 fn attach_approval_error(error: AttachApprovalError) -> EngineError {
@@ -4122,6 +4325,8 @@ mod tests {
             handle,
             HandleAlias {
                 identity: receipt.approval().link_identity().clone(),
+                name: Arc::clone(receipt.approval().name()),
+                role: receipt.approval().local_role(),
                 peer_handle: Some(handle),
                 own_attach_sent: false,
                 error_detached: false,
@@ -4257,3 +4462,6 @@ mod error_closing_tests;
 
 #[cfg(test)]
 mod error_delivery_tests;
+
+#[cfg(test)]
+mod error_link_tests;

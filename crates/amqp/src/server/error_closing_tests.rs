@@ -141,6 +141,8 @@ impl Fixture {
             handle,
             HandleAlias {
                 identity: identity.clone(),
+                name: format!("closing-{channel}-{handle}").into(),
+                role,
                 peer_handle: Some(peer_handle),
                 own_attach_sent: true,
                 error_detached: false,
@@ -156,6 +158,8 @@ impl Fixture {
             0,
             HandleAlias {
                 identity: receipt.approval().link_identity().clone(),
+                name: Arc::clone(receipt.approval().name()),
+                role: receipt.approval().local_role(),
                 peer_handle: Some(42),
                 own_attach_sent: false,
                 error_detached: false,

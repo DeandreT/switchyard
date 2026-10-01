@@ -60,6 +60,8 @@ impl Fixture {
                 handle,
                 super::link_handles::HandleAlias {
                     identity: session.links[&handle].identity().clone(),
+                    name: format!("recovery-{handle}").into(),
+                    role: Role::Receiver,
                     peer_handle: Some(handle),
                     own_attach_sent: true,
                     error_detached: false,

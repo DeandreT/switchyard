@@ -989,7 +989,9 @@ where
                             let Some(handle) = sessions.get(&channel)
                                 .and_then(|session| local_handle_for_peer(peer_handle, session))
                             else {
-                                refuse_session(channel, "amqp:session:unattached-handle", "frame on an unassigned peer link handle", &mut writer, &mut sessions).await?;
+                                let historical = sessions.get(&channel).is_some_and(|session| session.error_peer_handles.contains(peer_handle));
+                                if historical && matches!(&performative, Performative::Detach(_)) { continue; }
+                                refuse_session(channel, if historical { "amqp:session:errant-link" } else { "amqp:session:unattached-handle" }, if historical { "frame on an error-detached peer link handle" } else { "frame on an unassigned peer link handle" }, &mut writer, &mut sessions).await?;
                                 fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
                                 continue;
                             };
@@ -1012,10 +1014,24 @@ where
                                 }
                                 Performative::Attach(attach) => {
                                     let attach = *attach;
+                                    let local_role = attach.role.opposite();
+                                    let known_error = writer.error_link_names().contains(&attach.name, &local_role);
                                     if sessions.get(&channel).is_some_and(|session| session.handle_aliases.values().any(|alias| alias.peer_handle == Some(attach.handle))) {
+                                        let error_alias = sessions.get(&channel).and_then(|session| local_handle_for_peer(attach.handle, session).filter(|handle| is_error_detached(session, *handle)).and_then(|handle| session.handle_aliases.get(&handle)));
+                                        if let Some(alias) = error_alias {
+                                            let known_resume = known_error && alias.name.as_ref() == attach.name && alias.role == local_role && attach.unsettled.is_some();
+                                            refuse_session(channel, if known_resume { "amqp:not-implemented" } else { "amqp:session:errant-link" }, if known_resume { RECOVERY_NOT_IMPLEMENTED } else { "attach on an error-detached peer link handle" }, &mut writer, &mut sessions).await?;
+                                            fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
+                                            continue;
+                                        }
                                         refuse_connection("amqp:session:handle-in-use", "peer link handle is already assigned", &mut writer, &mut sessions).await?;
                                         fail_pending_connection(&mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
                                         pump_ready = false;
+                                        continue;
+                                    }
+                                    if known_error && attach.unsettled.is_none() {
+                                        refuse_session(channel, "amqp:session:errant-link", "pipelined attach for an error-detached link", &mut writer, &mut sessions).await?;
+                                        fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
                                         continue;
                                     }
                                     let matches = pending_attaches.get(&attach.name).is_some_and(|pending| {
@@ -1027,7 +1043,13 @@ where
                                                 })
                                         })
                                     });
-                                    if !matches { continue; }
+                                    if !matches {
+                                        if known_error {
+                                            refuse_session(channel, "amqp:not-implemented", RECOVERY_NOT_IMPLEMENTED, &mut writer, &mut sessions).await?;
+                                            fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
+                                        }
+                                        continue;
+                                    }
                                     let pending = pending_attaches.get(&attach.name).expect("validated pending attach");
                                     let role_matches = matches!((&pending.link, &attach.role), (LinkState::Sending(_), Role::Receiver) | (LinkState::Receiving(_), Role::Sender));
                                     if !role_matches {
@@ -1041,24 +1063,41 @@ where
                                         continue;
                                     }
                                     let default_outcome = source_default_outcome(attach.source.as_ref())?;
+                                    let recovery_reply = if has_recovery_state(&attach) || known_error {
+                                        let pending = pending_attaches.get(&attach.name).expect("validated pending attach");
+                                        let session = sessions.get(&channel).expect("validated pending session");
+                                        let snapshot = match snapshot_error_histories(session, pending.handle, pending.link.identity(), Some(attach.handle), &writer) {
+                                            Ok(snapshot) => snapshot,
+                                            Err(error) => {
+                                                refuse_session(channel, "amqp:resource-limit-exceeded", error.to_string(), &mut writer, &mut sessions).await?;
+                                                fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
+                                                continue;
+                                            }
+                                        };
+                                        let refusal = Frame::Amqp {
+                                            channel,
+                                            performative: Some(Performative::Detach(Detach {
+                                                handle: pending.handle,
+                                                closed: true,
+                                                error: Some(Error::new(crate::AmqpError::NotImplemented, RECOVERY_NOT_IMPLEMENTED, None)),
+                                            })),
+                                            payload: Vec::new(),
+                                        };
+                                        writer.encoded_frame(&refusal)?;
+                                        if !session.local_begin_sent { writer.encoded_frame(&local_begin_frame(channel, session)?)?; }
+                                        Some((refusal, snapshot))
+                                    } else { None };
                                     if let Some(pending) = pending_attaches.remove(&attach.name) {
-                                        sessions.get_mut(&channel).expect("validated pending session").handle_aliases.get_mut(&pending.handle).expect("validated pending handle alias").peer_handle = Some(attach.handle);
+                                        let session = sessions.get_mut(&channel).expect("validated pending session");
+                                        session.handle_aliases.get_mut(&pending.handle).expect("validated pending handle alias").peer_handle = Some(attach.handle);
+                                        session.error_peer_handles.reassign(attach.handle);
+                                        if let Some((_, snapshot)) = &recovery_reply { commit_error_histories(session, snapshot, &mut writer)?; }
                                         let pending_flow = sessions
                                             .get_mut(&channel)
                                             .and_then(|session| session.pending_attaches.remove(&pending.handle));
                                         let mut link = pending.link;
-                                        if has_recovery_state(&attach) {
+                                        if let Some((refusal, _)) = recovery_reply {
                                             let identity = link.identity().clone();
-                                            let refusal = Frame::Amqp {
-                                                channel,
-                                                performative: Some(Performative::Detach(Detach {
-                                                    handle: pending.handle,
-                                                    closed: true,
-                                                    error: Some(Error::new(crate::AmqpError::NotImplemented, RECOVERY_NOT_IMPLEMENTED, None)),
-                                                })),
-                                                payload: Vec::new(),
-                                            };
-                                            writer.encoded_frame(&refusal)?;
                                             stop_link(&mut link);
                                             let session = sessions.get_mut(&channel).ok_or_else(|| invalid_state("attach on an unknown session"))?;
                                             remember_closing_handle(session, pending.handle)?;
@@ -1290,6 +1329,10 @@ where
                                         continue;
                                     }
                                     let request = *request;
+                                    if writer.error_link_names().contains(&request.name, &request.role) {
+                                        let _ = reply.send(Err(invalid_state(RECOVERY_NOT_IMPLEMENTED)));
+                                        continue;
+                                    }
                                     let receive_maximum = effective_receive_maximum(request.max_message_size);
                                     let next_handle = next_handles
                                         .get_mut(&channel)
@@ -1329,7 +1372,7 @@ where
                                         continue;
                                     }
                                     *next_handle = if handle == session.remote_handle_max { 0 } else { handle + 1 };
-                                    session.handle_aliases.insert(handle, HandleAlias { identity: identity.clone(), peer_handle: None, own_attach_sent: false, error_detached: false });
+                                    session.handle_aliases.insert(handle, HandleAlias { identity: identity.clone(), name: Arc::from(request.name.as_str()), role: request.role.clone(), peer_handle: None, own_attach_sent: false, error_detached: false });
                                     let link = match request.role {
                                         Role::Sender => {
                                             LinkState::Sending(Box::new(SendingLink {
@@ -1559,3 +1602,7 @@ mod channel_tests;
 #[cfg(test)]
 #[path = "link_handle_client_tests.rs"]
 mod handle_tests;
+
+#[cfg(test)]
+#[path = "error_link_client_tests.rs"]
+mod error_link_tests;
