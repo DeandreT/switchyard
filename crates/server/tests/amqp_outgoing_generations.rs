@@ -251,7 +251,7 @@ impl Node {
                         ReceiverSettleMode::First
                     },
                     source: Some(Source::new("orders")),
-                    target: Some(Target::new("orders")),
+                    target: Some(Target::new("orders").into()),
                     unsettled: None,
                     incomplete_unsettled: false,
                     initial_delivery_count: (role == Role::Sender).then_some(0),

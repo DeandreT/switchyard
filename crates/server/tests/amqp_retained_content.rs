@@ -405,7 +405,7 @@ fn sender_attach(handle: u32, name: String) -> Attach {
         snd_settle_mode: SenderSettleMode::Mixed,
         rcv_settle_mode: ReceiverSettleMode::First,
         source: Some(Source::new("queue")),
-        target: Some(Target::new("queue")),
+        target: Some(Target::new("queue").into()),
         unsettled: None,
         incomplete_unsettled: false,
         initial_delivery_count: Some(0),

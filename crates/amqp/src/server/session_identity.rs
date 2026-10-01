@@ -234,7 +234,7 @@ mod tests {
             snd_settle_mode: SenderSettleMode::Mixed,
             rcv_settle_mode: ReceiverSettleMode::First,
             source: Some(Source::new("queue")),
-            target: Some(Target::new("queue")),
+            target: Some(Target::new("queue").into()),
             unsettled: None,
             incomplete_unsettled: false,
             initial_delivery_count: None,
@@ -375,7 +375,7 @@ mod tests {
         receipt.initial_delivery_count = Some(0);
         receipt.max_message_size = Some(262_144);
         receipt.rcv_settle_mode = ReceiverSettleMode::Second;
-        receipt.target = Some(Target::new("approved-queue"));
+        receipt.target = Some(Target::new("approved-queue").into());
         assert_eq!(receipt.validate_request(&session), Ok(()));
         assert_eq!(receipt.validate(&session, receipt.approval()), Ok(()));
         assert_eq!(receipt.attach().initial_delivery_count, Some(0));

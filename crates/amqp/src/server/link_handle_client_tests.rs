@@ -116,7 +116,7 @@ async fn attach_command(session: &ClientSession, name: &str, role: Role) -> Pend
                 sender_settle_mode: SenderSettleMode::Mixed,
                 receiver_settle_mode: ReceiverSettleMode::First,
                 source: Some(Source::new("queue")),
-                target: Some(Target::new("queue")),
+                target: Some(Target::new("queue").into()),
                 max_message_size: None,
             }),
             deliveries_tx,

@@ -1463,10 +1463,13 @@ async fn attaching_to_a_queue_that_does_not_exist_is_refused() -> Result<(), Box
                     snd_settle_mode: amqp::SenderSettleMode::Unsettled,
                     rcv_settle_mode: amqp::ReceiverSettleMode::First,
                     source: None,
-                    target: Some(Target {
-                        address: Some("invoices".into()),
-                        ..Target::default()
-                    }),
+                    target: Some(
+                        Target {
+                            address: Some("invoices".into()),
+                            ..Target::default()
+                        }
+                        .into(),
+                    ),
                     initial_delivery_count: Some(0),
                     unsettled: None,
                     incomplete_unsettled: false,

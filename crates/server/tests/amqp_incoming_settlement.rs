@@ -266,7 +266,7 @@ impl Harness {
                     snd_settle_mode: sender_mode,
                     rcv_settle_mode: mode.clone(),
                     source: None,
-                    target: Some(Target::new("queue")),
+                    target: Some(Target::new("queue").into()),
                     unsettled: None,
                     incomplete_unsettled: false,
                     initial_delivery_count: Some(0),

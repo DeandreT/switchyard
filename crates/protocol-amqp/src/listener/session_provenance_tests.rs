@@ -220,7 +220,7 @@ fn request(role: Role, subscription: bool) -> Attach {
     Attach {
         name: String::from("reused-link"),
         handle: 0,
-        target: (role == Role::Sender).then(|| Target::new("orders")),
+        target: (role == Role::Sender).then(|| Target::new("orders").into()),
         initial_delivery_count: (role == Role::Sender).then_some(0),
         role,
         snd_settle_mode: SenderSettleMode::Mixed,
@@ -319,7 +319,11 @@ async fn cancelled_planning_preserves_session(
                 assert_eq!(attach.handle, 0);
                 assert_eq!(attach.role, Role::Receiver);
                 assert_eq!(
-                    attach.target.as_ref().and_then(|t| t.address.as_deref()),
+                    attach
+                        .target
+                        .as_ref()
+                        .and_then(amqp::TargetTerminus::as_target)
+                        .and_then(|target| target.address.as_deref()),
                     Some("orders")
                 );
                 attached = true;

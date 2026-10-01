@@ -74,7 +74,7 @@ impl Peer {
                 snd_settle_mode: amqp::SenderSettleMode::Unsettled,
                 rcv_settle_mode: amqp::ReceiverSettleMode::First,
                 source,
-                target: (role == Role::Sender).then(|| Target::new("healthy")),
+                target: (role == Role::Sender).then(|| Target::new("healthy").into()),
                 initial_delivery_count: (role == Role::Sender).then_some(0),
                 unsettled: None,
                 incomplete_unsettled: false,

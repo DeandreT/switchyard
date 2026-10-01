@@ -124,13 +124,16 @@ impl Peer {
             snd_settle_mode: SenderSettleMode::Unsettled,
             rcv_settle_mode: ReceiverSettleMode::First,
             source: (role == Role::Receiver).then(|| Source::new(path)),
-            target: Some(Target::new(reply.unwrap_or(
-                if path == protocol_amqp::CBS_NODE && role == Role::Receiver {
-                    REPLY
-                } else {
-                    path
-                },
-            ))),
+            target: Some(
+                Target::new(reply.unwrap_or(
+                    if path == protocol_amqp::CBS_NODE && role == Role::Receiver {
+                        REPLY
+                    } else {
+                        path
+                    },
+                ))
+                .into(),
+            ),
             unsettled: None,
             incomplete_unsettled: false,
             initial_delivery_count: (role == Role::Sender).then_some(0),

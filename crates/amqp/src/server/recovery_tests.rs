@@ -214,7 +214,7 @@ fn attach(handle: u32, role: Role) -> Attach {
         snd_settle_mode: SenderSettleMode::Mixed,
         rcv_settle_mode: ReceiverSettleMode::First,
         source: Some(Source::new("source")),
-        target: Some(Target::new("target")),
+        target: Some(Target::new("target").into()),
         unsettled: None,
         incomplete_unsettled: false,
         initial_delivery_count: (role == Role::Sender).then_some(0),

@@ -14,7 +14,10 @@ use crate::types::*;
 use crate::value_codec::{MessageDecodeBudget, ValueDecoder, decode_value};
 
 mod message_encoder;
+mod transactions;
 mod value_encoder;
+
+use transactions::{target_terminus_from_value, target_terminus_to_value};
 
 pub(crate) use message_encoder::prepare_message;
 pub use message_encoder::{MessageSizeError, encode_message_with_max_size};
@@ -58,6 +61,11 @@ const RELEASED: u64 = 0x26;
 const MODIFIED: u64 = 0x27;
 const SOURCE: u64 = 0x28;
 const TARGET: u64 = 0x29;
+const COORDINATOR: u64 = 0x30;
+const DECLARE: u64 = 0x31;
+const DISCHARGE: u64 = 0x32;
+const DECLARED: u64 = 0x33;
+const TRANSACTIONAL_STATE: u64 = 0x34;
 
 const HEADER: u64 = 0x70;
 const DELIVERY_ANNOTATIONS: u64 = 0x71;
@@ -473,7 +481,8 @@ fn performative_to_value(performative: &Performative) -> io::Result<Value> {
                 attach
                     .target
                     .as_ref()
-                    .map(target_to_value)
+                    .map(target_terminus_to_value)
+                    .transpose()?
                     .unwrap_or(Value::Null),
                 unsettled_to_value(&attach.unsettled)?,
                 Value::Bool(attach.incomplete_unsettled),
@@ -629,7 +638,7 @@ fn performative_from_value(value: Value) -> io::Result<Performative> {
             },
             target: match field(&fields, 6) {
                 Value::Null => None,
-                value => Some(target_from_value(value)?),
+                value => Some(target_terminus_from_value(value)?),
             },
             unsettled: unsettled_from_value(field(&fields, 7))?,
             incomplete_unsettled: bool_field(&fields, 8)?.unwrap_or(false),
@@ -892,12 +901,7 @@ fn target_to_value(target: &Target) -> Value {
     )
 }
 
-fn target_from_value(value: Value) -> io::Result<Target> {
-    let (descriptor, value) = take_described(value)?;
-    if descriptor != TARGET {
-        return Err(invalid_data("terminus is not an AMQP target"));
-    }
-    let fields = take_list(value)?;
+fn target_from_fields(fields: Vec<Value>) -> io::Result<Target> {
     Ok(Target {
         address: string_field(&fields, 0)?,
         durable: u32_field(&fields, 1)?.unwrap_or(0),
@@ -947,12 +951,18 @@ fn delivery_state_to_value(state: &DeliveryState) -> io::Result<Value> {
                 fields_to_value(&modified.message_annotations),
             ]),
         ),
+        DeliveryState::Declared(declared) => transactions::declared_to_value(declared),
+        DeliveryState::Transactional(state) => transactions::transactional_state_to_value(state),
     })
 }
 
 fn delivery_state_from_value(value: Value) -> io::Result<DeliveryState> {
     let (descriptor, value) = take_described(value)?;
     let fields = take_list(value)?;
+    delivery_state_from_fields(descriptor, fields)
+}
+
+fn delivery_state_from_fields(descriptor: u64, fields: Vec<Value>) -> io::Result<DeliveryState> {
     Ok(match descriptor {
         RECEIVED => DeliveryState::Received {
             section_number: required_u32(&fields, 0, "received.section-number")?,
@@ -968,6 +978,10 @@ fn delivery_state_from_value(value: Value) -> io::Result<DeliveryState> {
             undeliverable_here: bool_field(&fields, 1)?,
             message_annotations: fields_field(&fields, 2)?,
         }),
+        DECLARED => DeliveryState::Declared(transactions::declared_from_fields(&fields)?),
+        TRANSACTIONAL_STATE => {
+            DeliveryState::Transactional(transactions::transactional_state_from_fields(fields)?)
+        }
         other => return Err(invalid_data(format!("unknown delivery state {other:#x}"))),
     })
 }
@@ -1320,6 +1334,11 @@ fn take_described(value: Value) -> io::Result<(u64, Value)> {
             "amqp:modified:list" => MODIFIED,
             "amqp:source:list" => SOURCE,
             "amqp:target:list" => TARGET,
+            "amqp:coordinator:list" => COORDINATOR,
+            "amqp:declare:list" => DECLARE,
+            "amqp:discharge:list" => DISCHARGE,
+            "amqp:declared:list" => DECLARED,
+            "amqp:transactional-state:list" => TRANSACTIONAL_STATE,
             "amqp:header:list" => HEADER,
             "amqp:delivery-annotations:map" => DELIVERY_ANNOTATIONS,
             "amqp:message-annotations:map" => MESSAGE_ANNOTATIONS,
@@ -1801,7 +1820,7 @@ mod tests {
             snd_settle_mode: SenderSettleMode::Unsettled,
             rcv_settle_mode: ReceiverSettleMode::Second,
             source: Some(source),
-            target: Some(Target::new("orders")),
+            target: Some(Target::new("orders").into()),
             unsettled: None,
             incomplete_unsettled: false,
             initial_delivery_count: Some(0),
@@ -1924,7 +1943,7 @@ mod tests {
             snd_settle_mode: SenderSettleMode::Unsettled,
             rcv_settle_mode: ReceiverSettleMode::Second,
             source: Some(Source::new("orders")),
-            target: Some(Target::new("client")),
+            target: Some(Target::new("client").into()),
             unsettled: None,
             incomplete_unsettled: false,
             initial_delivery_count: None,

@@ -209,7 +209,7 @@ async fn stale_session_does_not_close_the_listener(refused: bool) -> TestResult 
             snd_settle_mode: SenderSettleMode::Mixed,
             rcv_settle_mode: ReceiverSettleMode::First,
             source: None,
-            target: Some(Target::new("orders")),
+            target: Some(Target::new("orders").into()),
             unsettled: None,
             incomplete_unsettled: false,
             initial_delivery_count: Some(0),

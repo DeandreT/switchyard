@@ -73,9 +73,12 @@ impl Peer {
                     address: Some(address.into()),
                     ..Source::default()
                 }),
-                target: (role == Role::Sender).then(|| Target {
-                    address: Some(address.into()),
-                    ..Target::default()
+                target: (role == Role::Sender).then(|| {
+                    Target {
+                        address: Some(address.into()),
+                        ..Target::default()
+                    }
+                    .into()
                 }),
                 initial_delivery_count: (role == Role::Sender).then_some(0),
                 unsettled: None,

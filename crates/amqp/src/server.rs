@@ -35,6 +35,7 @@ mod outgoing_identity;
 mod receive_credit;
 mod session_channels;
 mod session_identity;
+mod transactions;
 
 use content_budget::ContentLease;
 use error_deliveries::{
@@ -60,6 +61,10 @@ use receive_credit::{Consumption, ReceiveCredit};
 use session_channels::{local_channel_for_peer, preferred_vacant_channel};
 pub use session_identity::IncomingAttach;
 use session_identity::{AttachApproval, AttachApprovalError, SessionIdentity};
+use transactions::{
+    TRANSACTIONS_NOT_IMPLEMENTED, attach_uses_transactions, refuse_transaction_flow,
+    source_uses_transactions, transaction_state,
+};
 
 const LINK_CREDIT: u32 = 32;
 const SESSION_WINDOW: u32 = 2_048;
@@ -712,6 +717,9 @@ impl ServerSession {
         if has_recovery_state(&attach) {
             return Err(invalid_state(RECOVERY_NOT_IMPLEMENTED));
         }
+        if attach_uses_transactions(&attach) {
+            return Err(invalid_state(TRANSACTIONS_NOT_IMPLEMENTED));
+        }
         source_default_outcome(attach.source.as_ref())?;
         if attach.role == Role::Receiver && !decoders.is_default() {
             return Err(invalid_state(
@@ -785,6 +793,7 @@ impl Sender {
             Outcome::Rejected(value) => DeliveryState::Rejected(value),
             Outcome::Released(value) => DeliveryState::Released(value),
             Outcome::Modified(value) => DeliveryState::Modified(value),
+            Outcome::Declared(_) => return Err(invalid_state(TRANSACTIONS_NOT_IMPLEMENTED)),
         };
         settlement.finish(state).await?;
         Ok(outcome)
@@ -1705,6 +1714,29 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                 .await?;
                 return Ok(FrameAction::Continue);
             }
+            let historical_recovery = known_error && attach.unsettled.is_some();
+            if !historical_recovery && attach_uses_transactions(&attach) {
+                refuse_session_state(
+                    channel,
+                    "amqp:not-implemented",
+                    TRANSACTIONS_NOT_IMPLEMENTED,
+                    session,
+                    writer,
+                )
+                .await?;
+                return Ok(FrameAction::Continue);
+            }
+            if !historical_recovery && source_default_outcome(attach.source.as_ref()).is_err() {
+                refuse_session_state(
+                    channel,
+                    "amqp:invalid-field",
+                    "source default outcome must be an ordinary terminal outcome",
+                    session,
+                    writer,
+                )
+                .await?;
+                return Ok(FrameAction::Continue);
+            }
             // Ordinary approvals may normalize control-link fields; historical
             // handle reassignment must instead validate before replacing authority.
             if session.error_peer_handles.contains(peer_handle)
@@ -1992,6 +2024,10 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 let _ = reply.send(Err(invalid_state(RECOVERY_NOT_IMPLEMENTED)));
                 return Ok(CommandAction::Continue);
             }
+            if attach_uses_transactions(&attach) {
+                let _ = reply.send(Err(invalid_state(TRANSACTIONS_NOT_IMPLEMENTED)));
+                return Ok(CommandAction::Continue);
+            }
             if attach.role == Role::Receiver && !decoders.is_default() {
                 let _ = reply.send(Err(invalid_state(
                     "custom message-format decoders require a local receiving endpoint",
@@ -2274,6 +2310,10 @@ async fn settle_incoming<W: AsyncWrite + Unpin>(
     sessions: &mut HashMap<u16, SessionState>,
     writer: &mut FrameWriter<W>,
 ) -> Result<(), EngineError> {
+    if transaction_state(Some(&state)) {
+        let _ = reply.send(Err(invalid_state(TRANSACTIONS_NOT_IMPLEMENTED)));
+        return Ok(());
+    }
     let Some(session) = sessions.get_mut(&channel) else {
         let _ = reply.send(Err(EngineError::RemoteDetached));
         return Ok(());
@@ -2326,6 +2366,9 @@ fn outgoing_acknowledgement(
     identity: Option<&AckIdentity>,
     state: Option<DeliveryState>,
 ) -> Result<Option<Frame>, EngineError> {
+    if transaction_state(state.as_ref()) {
+        return Err(invalid_state(TRANSACTIONS_NOT_IMPLEMENTED));
+    }
     if owner.is_retired() {
         return Err(EngineError::RemoteDetached);
     }
@@ -2452,6 +2495,22 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
             channel,
             "amqp:session:errant-link",
             "transfer on an error-detached link",
+            session,
+            writer,
+        )
+        .await;
+    }
+    if !session.closing_handles.contains(&transfer.handle)
+        && matches!(
+            session.links.get(&transfer.handle),
+            Some(LinkState::Receiving(_))
+        )
+        && transaction_state(transfer.state.as_ref())
+    {
+        return refuse_session_state(
+            channel,
+            "amqp:not-implemented",
+            TRANSACTIONS_NOT_IMPLEMENTED,
             session,
             writer,
         )
@@ -2992,6 +3051,9 @@ async fn apply_flow<W: AsyncWrite + Unpin>(
         )
         .await;
     }
+    if refuse_transaction_flow(channel, &flow, session, writer).await? {
+        return Ok(());
+    }
     if let Err(error) = session.flow.update_peer(
         flow.next_incoming_id,
         flow.incoming_window,
@@ -3050,6 +3112,9 @@ async fn apply_link_flow<W: AsyncWrite + Unpin>(
     let session = sessions
         .get_mut(&channel)
         .ok_or_else(|| invalid_state("flow on an unknown session"))?;
+    if session.ending {
+        return Ok(());
+    }
     if is_error_detached(session, handle) {
         return refuse_session_state(
             channel,
@@ -3061,6 +3126,9 @@ async fn apply_link_flow<W: AsyncWrite + Unpin>(
         .await;
     }
     if session.closing_handles.contains(&handle) {
+        return Ok(());
+    }
+    if refuse_transaction_flow(channel, &flow, session, writer).await? {
         return Ok(());
     }
     let snapshot = match session.links.get_mut(&handle) {
@@ -4121,6 +4189,16 @@ async fn apply_disposition<W: AsyncWrite + Unpin>(
         )
         .await;
     }
+    if transaction_state(disposition.state.as_ref()) {
+        return refuse_session_state(
+            channel,
+            "amqp:not-implemented",
+            TRANSACTIONS_NOT_IMPLEMENTED,
+            session,
+            writer,
+        )
+        .await;
+    }
     if disposition.role == Role::Sender {
         if disposition.settled {
             session
@@ -4247,6 +4325,9 @@ fn attach_approval_error(error: AttachApprovalError) -> EngineError {
 }
 
 fn source_default_outcome(source: Option<&crate::Source>) -> Result<Option<Outcome>, EngineError> {
+    if source_uses_transactions(source) {
+        return Err(invalid_state(TRANSACTIONS_NOT_IMPLEMENTED));
+    }
     source
         .and_then(|source| source.default_outcome.clone())
         .map(|state| {
@@ -4326,7 +4407,7 @@ mod tests {
                 snd_settle_mode: SenderSettleMode::Settled,
                 rcv_settle_mode: ReceiverSettleMode::First,
                 source: Some(Source::new("node")),
-                target: Some(Target::new("reply-to")),
+                target: Some(Target::new("reply-to").into()),
                 unsettled: None,
                 incomplete_unsettled: false,
                 initial_delivery_count: None,

@@ -44,7 +44,7 @@ fn receiver_attach(handle: u32, maximum: Option<u64>, mode: SenderSettleMode) ->
         snd_settle_mode: mode,
         rcv_settle_mode: ReceiverSettleMode::First,
         source: Some(Source::new("queue")),
-        target: Some(Target::new("reply")),
+        target: Some(Target::new("reply").into()),
         unsettled: None,
         incomplete_unsettled: false,
         initial_delivery_count: None,

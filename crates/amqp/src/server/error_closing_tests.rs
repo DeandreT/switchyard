@@ -298,7 +298,7 @@ fn request(role: Role) -> Attach {
         snd_settle_mode: SenderSettleMode::Mixed,
         rcv_settle_mode: ReceiverSettleMode::First,
         source: Some(Source::new("queue")),
-        target: Some(Target::new("queue")),
+        target: Some(Target::new("queue").into()),
         unsettled: None,
         incomplete_unsettled: false,
         initial_delivery_count: (role == Role::Sender).then_some(0),

@@ -6,7 +6,7 @@ use url::Url;
 use super::link_handles::vacant_handle;
 use super::session_channels::vacant_channel;
 use super::*;
-use crate::{Source, Target};
+use crate::{Source, Target, TargetTerminus};
 
 #[path = "client_pending_attaches.rs"]
 mod client_pending_attaches;
@@ -358,7 +358,7 @@ impl ClientSession {
                 sender_settle_mode: SenderSettleMode::Mixed,
                 receiver_settle_mode: ReceiverSettleMode::First,
                 source: None,
-                target: Some(target),
+                target: Some(target.into()),
                 max_message_size: None,
             }),
             deliveries_tx,
@@ -422,6 +422,7 @@ impl ClientSession {
         if self.identity.is_retired() {
             return Err(EngineError::RemoteDetached);
         }
+        source_default_outcome(Some(&source))?;
         let name = name.into();
         let (deliveries_tx, deliveries) = mpsc::channel(DELIVERY_QUEUE_CAPACITY);
         let consumption = Arc::new(Consumption::new(self.consumed.clone()));
@@ -436,7 +437,7 @@ impl ClientSession {
                 sender_settle_mode,
                 receiver_settle_mode,
                 source: Some(source),
-                target,
+                target: target.map(Into::into),
                 max_message_size,
             }),
             deliveries_tx,
@@ -692,7 +693,7 @@ struct AttachRequest {
     sender_settle_mode: SenderSettleMode,
     receiver_settle_mode: ReceiverSettleMode,
     source: Option<Source>,
-    target: Option<Target>,
+    target: Option<TargetTerminus>,
     max_message_size: Option<u64>,
 }
 
@@ -1083,7 +1084,20 @@ where
                                         fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
                                         continue;
                                     }
-                                    let default_outcome = source_default_outcome(attach.source.as_ref())?;
+                                    let historical_recovery = known_error && attach.unsettled.is_some();
+                                    if !historical_recovery && attach_uses_transactions(&attach) {
+                                        refuse_session(channel, "amqp:not-implemented", TRANSACTIONS_NOT_IMPLEMENTED, &mut writer, &mut sessions).await?;
+                                        fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
+                                        continue;
+                                    }
+                                    let default_outcome = match if historical_recovery { Ok(None) } else { source_default_outcome(attach.source.as_ref()) } {
+                                        Ok(outcome) => outcome,
+                                        Err(_) => {
+                                            refuse_session(channel, "amqp:invalid-field", "source default outcome must be an ordinary terminal outcome", &mut writer, &mut sessions).await?;
+                                            fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
+                                            continue;
+                                        }
+                                    };
                                     let recovery_reply = if has_recovery_state(&attach) || known_error {
                                         let pending = pending_attaches.get(&attach.name, &local_role).expect("validated pending attach");
                                         let session = sessions.get(&channel).expect("validated pending session");
@@ -1357,6 +1371,14 @@ where
                                     }
                                     if name_in_use {
                                         let _ = reply.send(Err(invalid_state("link name is already assigned")));
+                                        continue;
+                                    }
+                                    if request.target.as_ref().is_some_and(|target| target.as_coordinator().is_some()) {
+                                        let _ = reply.send(Err(invalid_state(TRANSACTIONS_NOT_IMPLEMENTED)));
+                                        continue;
+                                    }
+                                    if let Err(error) = source_default_outcome(request.source.as_ref()) {
+                                        let _ = reply.send(Err(error));
                                         continue;
                                     }
                                     let receive_maximum = effective_receive_maximum(request.max_message_size);
@@ -1636,3 +1658,7 @@ mod error_link_tests;
 #[cfg(test)]
 #[path = "live_name_client_tests.rs"]
 mod live_name_tests;
+
+#[cfg(test)]
+#[path = "transaction_client_tests.rs"]
+mod transaction_tests;

@@ -797,7 +797,7 @@ pub(super) fn attach(link: Link, role: Role) -> Attach {
         snd_settle_mode: SenderSettleMode::Unsettled,
         rcv_settle_mode: ReceiverSettleMode::First,
         source: Some(Source::new("queue")),
-        target: Some(Target::new("queue")),
+        target: Some(Target::new("queue").into()),
         unsettled: None,
         incomplete_unsettled: false,
         max_message_size: None,

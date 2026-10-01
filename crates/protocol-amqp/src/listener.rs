@@ -232,6 +232,7 @@ async fn serve_session<B: Broker>(
         let target_address = attach
             .target
             .as_ref()
+            .and_then(amqp::TargetTerminus::as_target)
             .and_then(|target| target.address.clone())
             .unwrap_or_default();
 

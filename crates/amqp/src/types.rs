@@ -5,6 +5,9 @@ use serde_amqp::{
     primitives::{Array, Binary, OrderedMap, Symbol, Uuid},
 };
 
+mod transactions;
+pub use transactions::*;
+
 pub type DeliveryTag = Binary;
 pub type Fields = OrderedMap<Symbol, Value>;
 pub type FilterSet = OrderedMap<Symbol, Value>;
@@ -295,7 +298,7 @@ pub struct Attach {
     pub snd_settle_mode: SenderSettleMode,
     pub rcv_settle_mode: ReceiverSettleMode,
     pub source: Option<Source>,
-    pub target: Option<Target>,
+    pub target: Option<TargetTerminus>,
     pub unsettled: Option<OrderedMap<DeliveryTag, Option<DeliveryState>>>,
     pub incomplete_unsettled: bool,
     pub initial_delivery_count: Option<u32>,
@@ -306,7 +309,7 @@ pub struct Attach {
 }
 
 impl Attach {
-    pub fn response(&self, source: Option<Source>, target: Option<Target>) -> Self {
+    pub fn response(&self, source: Option<Source>, target: Option<TargetTerminus>) -> Self {
         Self {
             name: self.name.clone(),
             handle: self.handle,
@@ -522,11 +525,20 @@ pub enum DeliveryState {
     Rejected(Rejected),
     Released(Released),
     Modified(Modified),
+    Declared(Declared),
+    Transactional(TransactionalState),
 }
 
 impl DeliveryState {
     pub fn is_terminal(&self) -> bool {
-        !matches!(self, Self::Received { .. })
+        matches!(
+            self,
+            Self::Accepted(_)
+                | Self::Rejected(_)
+                | Self::Released(_)
+                | Self::Modified(_)
+                | Self::Declared(_)
+        )
     }
 }
 
@@ -536,6 +548,7 @@ pub enum Outcome {
     Rejected(Rejected),
     Released(Released),
     Modified(Modified),
+    Declared(Declared),
 }
 
 impl TryFrom<DeliveryState> for Outcome {
@@ -547,7 +560,20 @@ impl TryFrom<DeliveryState> for Outcome {
             DeliveryState::Rejected(value) => Ok(Self::Rejected(value)),
             DeliveryState::Released(value) => Ok(Self::Released(value)),
             DeliveryState::Modified(value) => Ok(Self::Modified(value)),
+            DeliveryState::Declared(value) => Ok(Self::Declared(value)),
             other => Err(other),
+        }
+    }
+}
+
+impl From<Outcome> for DeliveryState {
+    fn from(value: Outcome) -> Self {
+        match value {
+            Outcome::Accepted(value) => Self::Accepted(value),
+            Outcome::Rejected(value) => Self::Rejected(value),
+            Outcome::Released(value) => Self::Released(value),
+            Outcome::Modified(value) => Self::Modified(value),
+            Outcome::Declared(value) => Self::Declared(value),
         }
     }
 }

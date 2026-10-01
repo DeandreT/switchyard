@@ -26,6 +26,12 @@ pub(crate) fn settlement_command(
     outcome: Outcome,
 ) -> Result<CommandKind, SettlementError> {
     let (disposition, properties_to_modify) = match outcome {
+        Outcome::Declared(_) => {
+            return Err(SettlementError::InvalidField {
+                field: "state",
+                expected: "an ordinary messaging outcome",
+            });
+        }
         Outcome::Accepted(_) => (SettlementDisposition::Complete, BTreeMap::new()),
         Outcome::Released(_) => (SettlementDisposition::Abandon, BTreeMap::new()),
         Outcome::Modified(modified) => {
@@ -146,8 +152,8 @@ fn read_fields(fields: Option<Fields>) -> BTreeMap<String, MessageValue> {
 #[cfg(test)]
 mod tests {
     use amqp::{
-        Accepted, AmqpError, Described, Descriptor, Error as AmqpErrorValue, ErrorCondition,
-        Modified, OrderedMap, Rejected, Released, Symbol,
+        Accepted, AmqpError, Declared, Described, Descriptor, Error as AmqpErrorValue,
+        ErrorCondition, Modified, OrderedMap, Rejected, Released, Symbol, TransactionId,
     };
     use domain::MessageDescriptor;
 
@@ -194,6 +200,20 @@ mod tests {
             assert_eq!(actual, expected);
             assert!(properties.is_empty());
         }
+    }
+
+    #[test]
+    fn a_declared_transaction_is_not_an_ordinary_message_settlement() {
+        let outcome = Outcome::Declared(Declared {
+            txn_id: TransactionId::new([1]).expect("bounded transaction identifier"),
+        });
+        assert_eq!(
+            settlement_command(SequenceNumber::new(7), LockToken::new(11), outcome),
+            Err(SettlementError::InvalidField {
+                field: "state",
+                expected: "an ordinary messaging outcome",
+            })
+        );
     }
 
     #[test]
