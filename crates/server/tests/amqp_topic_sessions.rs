@@ -558,3 +558,6 @@ for_each_backend!(
 
 #[path = "amqp_topic_sessions/refusal.rs"]
 mod refusal;
+
+#[path = "amqp_topic_sessions/global_peek.rs"]
+mod global_peek;

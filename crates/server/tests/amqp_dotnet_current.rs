@@ -90,6 +90,17 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
             },
         },
     )?;
+    let session_peek_queue = domain::EntityPath::new("sessions-peek")?;
+    broker.handle().submit_blocking(
+        namespace.clone(),
+        session_peek_queue.clone(),
+        CommandKind::CreateQueue {
+            config: QueueConfig {
+                requires_session: true,
+                ..QueueConfig::default()
+            },
+        },
+    )?;
 
     broker.handle().submit_blocking(
         namespace.clone(),
@@ -263,6 +274,15 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
             .contains("topic session accept/next/FIFO/renew/state/deferred/SDLQ/isolation passed"),
         "the client exited without completing topic session workflows"
     );
+    for marker in [
+        "required subscription management-only global/session-filtered peek passed",
+        "required queue management-only global/session-filtered peek passed",
+    ] {
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(marker),
+            "the client exited without completing {marker}"
+        );
+    }
     assert_eq!(
         broker.handle().submit_blocking(
             domain::NamespaceName::new("tenant")?,
@@ -336,5 +356,29 @@ async fn run_client_gate(sdk_version: &'static str) -> Result<(), Box<dyn Error>
             );
         }
     }
+    assert!(
+        store
+            .scan_prefix(
+                &domain::keys::message_prefix(
+                    &domain::NamespaceName::new("tenant")?,
+                    &session_peek_queue
+                ),
+                1
+            )?
+            .is_empty(),
+        "session queue browse workflow left retained messages"
+    );
+    assert!(
+        store
+            .scan_prefix(
+                &domain::keys::session_lock_prefix(
+                    &domain::NamespaceName::new("tenant")?,
+                    &session_peek_queue
+                ),
+                1
+            )?
+            .is_empty(),
+        "session queue browse cleanup left an active hold"
+    );
     Ok(())
 }

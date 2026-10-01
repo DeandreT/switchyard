@@ -19,6 +19,22 @@ struct CountedBroker {
     waiting: Arc<Mutex<Vec<EntityPath>>>,
 }
 
+struct PendingWait {
+    waiting: Arc<Mutex<Vec<EntityPath>>>,
+    entity: EntityPath,
+}
+
+impl Drop for PendingWait {
+    fn drop(&mut self) {
+        let mut waiting = self.waiting.lock().expect("waiting receivers");
+        let position = waiting
+            .iter()
+            .position(|entity| entity == &self.entity)
+            .expect("registered receiver wait");
+        waiting.remove(position);
+    }
+}
+
 impl protocol_amqp::Broker for CountedBroker {
     async fn submit(
         &self,
@@ -38,12 +54,22 @@ impl protocol_amqp::Broker for CountedBroker {
         protocol_amqp::Broker::entity_metadata(&self.inner, namespace, target)
     }
 
-    async fn deliverable(&self, namespace: &NamespaceName, entity: &EntityPath) {
-        self.waiting
-            .lock()
-            .expect("waiting receivers")
-            .push(entity.clone());
-        protocol_amqp::Broker::deliverable(&self.inner, namespace, entity).await
+    fn deliverable(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+    ) -> impl Future<Output = ()> + Send {
+        let wait = protocol_amqp::Broker::deliverable(&self.inner, namespace, entity);
+        let waiting = Arc::clone(&self.waiting);
+        let entity = entity.clone();
+        async move {
+            waiting
+                .lock()
+                .expect("waiting receivers")
+                .push(entity.clone());
+            let _pending = PendingWait { waiting, entity };
+            wait.await;
+        }
     }
 }
 
@@ -65,6 +91,10 @@ pub(super) struct Node<P: StoreProvider> {
 
 impl<P: StoreProvider> Node<P> {
     pub(super) async fn start(provider: P) -> TestResult<Self> {
+        Self::start_for_peek(provider, false).await
+    }
+
+    pub(super) async fn start_for_peek(provider: P, session_queue: bool) -> TestResult<Self> {
         let store = provider.open()?;
         let namespace = NamespaceName::new("tenant")?;
         let topic = EntityPath::new("Orders")?;
@@ -77,6 +107,20 @@ impl<P: StoreProvider> Node<P> {
                 config: TopicConfig::default(),
             },
         ))?;
+        if session_queue {
+            machine.apply(&Command::new(
+                namespace.clone(),
+                EntityPath::new("Sessions")?,
+                Timestamp::from_millis(1_000),
+                CommandKind::CreateQueue {
+                    config: domain::QueueConfig {
+                        requires_session: true,
+                        lock_duration_millis: 30_000,
+                        ..domain::QueueConfig::default()
+                    },
+                },
+            ))?;
+        }
         for (name, requires_session) in [("Alpha", true), ("beta", true), ("ordinary", false)] {
             machine.apply(&Command::new(
                 namespace.clone(),
@@ -183,6 +227,25 @@ impl<P: StoreProvider> Node<P> {
             ))?
             .map(|bytes| domain::MessageRecord::decode(&bytes).map_err(Into::into))
             .transpose()
+    }
+
+    pub(super) async fn wait_released(&self, entity: &EntityPath, id: &str) -> TestResult {
+        let session_id = domain::SessionId::new(id)?;
+        timeout(DEADLINE, async {
+            loop {
+                let session = StateMachine::new(self.store.clone()).session(
+                    &self.namespace,
+                    entity,
+                    &session_id,
+                )?;
+                if session.is_none_or(|session| session.lock.is_none()) {
+                    return Ok::<(), Box<dyn Error>>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        Ok(())
     }
 
     pub(super) async fn wait_removed(&self, entity: &EntityPath, number: u64) -> TestResult {
@@ -418,13 +481,34 @@ impl Management {
         link: &str,
         body: OrderedMap<Value, Value>,
     ) -> TestResult<Message> {
-        let properties = ApplicationProperties::builder()
+        self.request_inner(id, operation, Some(link), body).await
+    }
+
+    pub(super) async fn request_unassociated(
+        &mut self,
+        id: &str,
+        operation: &str,
+        body: OrderedMap<Value, Value>,
+    ) -> TestResult<Message> {
+        self.request_inner(id, operation, None, body).await
+    }
+
+    async fn request_inner(
+        &mut self,
+        id: &str,
+        operation: &str,
+        link: Option<&str>,
+        body: OrderedMap<Value, Value>,
+    ) -> TestResult<Message> {
+        let mut properties = ApplicationProperties::builder()
             .insert(protocol_amqp::OPERATION_PROPERTY, operation.to_owned())
-            .insert(
-                protocol_amqp::ASSOCIATED_LINK_NAME_PROPERTY,
-                link.to_owned(),
-            )
             .build();
+        if let Some(link) = link {
+            properties.0.insert(
+                protocol_amqp::ASSOCIATED_LINK_NAME_PROPERTY.into(),
+                Value::String(link.to_owned()),
+            );
+        }
         accepted(
             timeout(
                 DEADLINE,

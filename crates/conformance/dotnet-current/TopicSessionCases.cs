@@ -29,6 +29,10 @@ internal static class TopicSessionCases
         ServiceBusReceiver secondDeadLetters = client.CreateReceiver(topic, secondSubscription,
             new ServiceBusReceiverOptions { SubQueue = SubQueue.DeadLetter });
         resources.Add(secondDeadLetters);
+        ServiceBusReceiver firstBrowser = client.CreateReceiver(topic, firstSubscription);
+        resources.Add(firstBrowser);
+        ServiceBusReceiver secondBrowser = client.CreateReceiver(topic, secondSubscription);
+        resources.Add(secondBrowser);
         try
         {
             foreach (bool safeBatch in new[] { false, true })
@@ -46,6 +50,9 @@ internal static class TopicSessionCases
                 // A null first member leaves the outer batch session absent;
                 // each nested message remains the authority for its own copy.
                 await SendBatchAsync(sender, messages, safeBatch, token);
+                ServiceBusMessage[] sessionMessages = messages.Where(message => message.SessionId is not null).ToArray();
+                await AssertBrowseAsync(firstBrowser, sessionMessages, null, token);
+                await AssertBrowseAsync(secondBrowser, sessionMessages, null, token);
                 ServiceBusSessionReceiver first = await BoundedAsync(
                     ct => client.AcceptSessionAsync(topic, firstSubscription, sessionA,
                         cancellationToken: ct), token);
@@ -79,6 +86,8 @@ internal static class TopicSessionCases
                 long firstSequence = a.SequenceNumber;
                 var updates = new Dictionary<string, object> { ["stage"] = "topic-session-deferred" };
                 await BoundedAsync(ct => first.DeferMessageAsync(a, updates, ct), token);
+                await AssertBrowseAsync(firstBrowser, sessionMessages, messages[1].MessageId, token);
+                await AssertBrowseAsync(secondBrowser, sessionMessages, null, token);
                 ServiceBusReceivedMessage deferred = await BoundedAsync(
                     ct => first.ReceiveDeferredMessageAsync(a.SequenceNumber, ct), token);
                 CheckContent(deferred, messages[1]);
@@ -163,6 +172,8 @@ internal static class TopicSessionCases
                 resources.Remove(nextFirst);
                 await DisposeBoundedAsync(nextSecond);
                 resources.Remove(nextSecond);
+                await AssertEmptyAsync(firstBrowser, token);
+                await AssertEmptyAsync(secondBrowser, token);
 
                 foreach ((string subscription, string state) in new[]
                     { (firstSubscription, firstState), (secondSubscription, secondState) })
@@ -184,6 +195,7 @@ internal static class TopicSessionCases
                 }
             }
             Console.WriteLine("official .NET topic session accept/next/FIFO/renew/state/deferred/SDLQ/isolation passed");
+            Console.WriteLine("official .NET required subscription management-only global/session-filtered peek passed");
         }
         finally
         {
@@ -248,6 +260,39 @@ internal static class TopicSessionCases
         IReadOnlyList<ServiceBusReceivedMessage> messages = await BoundedAsync(
             ct => receiver.PeekMessagesAsync(1, fromSequenceNumber: 1, cancellationToken: ct), token);
         Require(messages.Count == 0, "the topic session workflow left a retained copy");
+    }
+
+    private static async Task AssertBrowseAsync(ServiceBusReceiver browser,
+        IReadOnlyList<ServiceBusMessage> expected, string? deferredMessageId, CancellationToken token)
+    {
+        var browsed = new List<ServiceBusReceivedMessage>();
+        long nextSequence = 1;
+        bool exhausted = false;
+        for (int page = 0; page < 4; page++)
+        {
+            IReadOnlyList<ServiceBusReceivedMessage> messages = await BoundedAsync(
+                ct => browser.PeekMessagesAsync(2, fromSequenceNumber: nextSequence, cancellationToken: ct), token);
+            Require(messages.Count <= 2, "global browse exceeded its requested page size");
+            if (messages.Count == 0)
+            {
+                exhausted = true;
+                break;
+            }
+            foreach (ServiceBusReceivedMessage message in messages)
+            {
+                Require(message.SequenceNumber >= nextSequence, "global browse repeated or reordered a sequence");
+                nextSequence = message.SequenceNumber + 1;
+                browsed.Add(message);
+            }
+        }
+        Require(exhausted && browsed.Count == expected.Count, "global browse lost or repeated a subscription copy");
+        for (int index = 0; index < expected.Count; index++)
+        {
+            CheckContent(browsed[index], expected[index]);
+            ServiceBusMessageState state = expected[index].MessageId == deferredMessageId
+                ? ServiceBusMessageState.Deferred : ServiceBusMessageState.Active;
+            Require(browsed[index].State == state, "global browse crossed sibling state or omitted a deferred copy");
+        }
     }
 
     private static async Task BoundedAsync(Func<CancellationToken, Task> operation, CancellationToken token)
