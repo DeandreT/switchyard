@@ -136,8 +136,11 @@ source, and an AMQP `int` compatibility level of 20; that wire level is distinct
 from the stored semantic version. Full-page response overflow fails instead of
 returning a truncated successful enumeration.
 
-The native subscription create/get/list API and `switchyardctl` preserve an
-explicit false filter-error policy; an omitted setting uses true. The option
-does not change backing-queue or shadow configuration projections. The value
-format and store-layout rollback guards are described in
+The native subscription create/get/list/update API and `switchyardctl` preserve
+an explicit false filter-error policy. Creation defaults to true; update omission
+preserves the committed policy. The option does not change backing-queue or
+shadow configuration projections.
+An update changes policy only for new publication copies and current scheduled
+activation; existing active, locked, deferred, and dead-letter copies are unchanged.
+The value format and store-layout rollback guards are described in
 [Durable Format](compatibility.md#durable-format).

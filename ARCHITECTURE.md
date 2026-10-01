@@ -29,8 +29,8 @@ independent session receivers; registration precedes each receive attempt.
 Boolean, scalar correlation, and bounded SQL rules are persisted and managed
 through AMQP. SQL error routing has an explicit subscription policy; actions
 and Azure administration remain unimplemented. Native
-administration creates and reads topology, lists topics and subscriptions, and
-updates queues; the timer worker covers
+administration creates, reads, lists, and partially updates queues, topics, and
+subscriptions; the timer worker covers
 scheduled activation and the four expiry indexes that exist,
 and the storage keyspace layout under [Storage](#storage) is still a single
 record keyspace rather than the split listed there.
@@ -289,6 +289,17 @@ every input precharges all possible rule work and comparison bytes before
 payload cloning. Duplicate and nonmatching inputs do not bypass those limits.
 Detailed scalar semantics and local limits are recorded in
 [compatibility.md](docs/compatibility.md).
+
+Configuration patches preserve omitted values and reject changes to
+creation-only session and duplicate-detection enablement. A topic update writes
+one metadata record; a subscription update commits its membership, backing
+queue, and dead-letter projection together. Equal patches stage nothing and do
+not advance the applied clock. Updates validate existing topology without
+repairing it, compiling rules, or rewriting retained messages, indexes, locks,
+sessions, or duplicate history. Captured deadlines remain intact; later receives,
+renewals, expiry, rule evaluation, and scheduled activation consult the applicable
+current settings. Native administration, not Azure Atom/XML administration,
+exposes these operations.
 
 ## Transactions And Forwarding
 

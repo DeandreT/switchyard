@@ -99,7 +99,7 @@ cargo run -p switchyardctl -- \
 ```
 
 The CLI also supports `queue list` and `queue update`, and emits JSON. Topics
-and subscriptions have separate create/get/list commands:
+and subscriptions have separate create/get/list/update commands:
 
 ```sh
 cargo run -p switchyardctl -- \
@@ -111,6 +111,9 @@ cargo run -p switchyardctl -- \
 cargo run -p switchyardctl -- \
   --endpoint http://127.0.0.1:9080 --allow-insecure \
   subscription list events
+cargo run -p switchyardctl -- \
+  --endpoint http://127.0.0.1:9080 --allow-insecure \
+  subscription update events audit --dead-letter-on-filter-exceptions false
 ```
 
 Listing is exhausted only when `next_page_token` is empty. Queue discovery has a
@@ -121,8 +124,7 @@ HTTPS requires `--ca-certificate`; use `--tls-server-name` when connecting throu
 local address that differs from the certificate name. Supply a Manage SAS token
 with `--token-file`, never on the command line. Authenticated administration
 requires TLS and uses the node's existing shared-access policy. Entity deletion,
-topic/subscription updates, other native services, and Azure administration
-compatibility remain unfinished.
+other native services, and Azure administration compatibility remain unfinished.
 
 ## Production Contract
 

@@ -31,7 +31,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list, Rust clients on both backends and both pinned .NET clients; Azure administration not implemented |
+| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update, Rust clients on both backends and both pinned .NET clients; Azure administration not implemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP; actions not implemented |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -39,10 +39,10 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Dead-letter receive and resubmit | Pre-1.0 | Receive: state machine, AMQP mapping. Resubmit: not implemented |
 | Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Duplicate detection | Pre-1.0 | State machine, AMQP send/scheduling mappings, Rust and current .NET clients end to end |
-| Queue configuration updates | Pre-1.0 | Atomic state-machine patches; native queue API |
+| Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API |
 | Same-placement-group transactions | Pre-1.0 | Not implemented |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
-| Native gRPC administration | Pre-1.0 | Queue create/get/list/update and topic/subscription create/get/list over HTTP/2 and authenticated TLS; other services, topic/subscription updates and deletion not implemented |
+| Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update over HTTP/2 and authenticated TLS; other services and deletion not implemented |
 | Partitioned entities | Later | Out of initial scope |
 | Cross-placement-group transactions | Later | Out of initial scope |
 | Geo-replication | Later | Out of initial scope |
@@ -373,8 +373,8 @@ granted identifier; their session-free dead-letter queues
 remain receivable. Topic management links support scheduled browsing,
 scheduling, and cancellation with operation-specific authorization; ordinary
 topic data receivers remain refused.
-Native administration can create, get, and list topics and subscriptions;
-configuration updates for those entity kinds remain unimplemented. Subscription
+Native administration can create, get, list, and partially update topics and
+subscriptions. Subscription
 management links support `com.microsoft:add-rule`, `com.microsoft:remove-rule`,
 and `com.microsoft:enumerate-rules`. All three use Listen authorization on the
 complete endpoint scope, consistent with the SDK's
@@ -1020,7 +1020,7 @@ parity remain unverified.
 ## Native Administration
 
 The optional `--admin-listen` endpoint serves native queue create/get/list/update
-and topic/subscription create/get/list through the broker owner. It is a
+and topic/subscription create/get/list/update through the broker owner. It is a
 separate HTTP/2 listener and reuses the AMQP
 TLS identity and shared-access policy when configured. Authenticated requests
 require TLS and a SAS token in `authorization` metadata with Manage permission
@@ -1045,7 +1045,8 @@ stamping commands, validate complete metadata before returning a result, and
 refuse corrupt or dangling topology without partial responses.
 The presence-aware subscription setting
 `dead_lettering_on_filter_evaluation_exceptions` preserves an explicit false;
-omission uses the default true. Get/list and `switchyardctl` JSON report the
+creation omission uses the default true, while update omission preserves the
+committed value. Get/list and `switchyardctl` JSON report the
 committed value. It is not a backing-queue setting.
 
 List defaults to queues only, preserving existing queue clients and their `v1.`
@@ -1074,8 +1075,8 @@ with at most 32 HTTP/2 streams per connection, a 10-second TLS handshake deadlin
 30-second request deadlines, 64 KiB decoded requests, and 1 MiB encoded replies.
 HTTP/2 connections send keepalive pings after 30 seconds, allow 10 seconds for an
 acknowledgment, and retire after five minutes with a 30-second graceful deadline.
-These are local resource policies. Entity deletion, topic/subscription updates,
-and the cluster, namespace, backup, and audit services return unimplemented
+These are local resource policies. Entity deletion and the cluster, namespace,
+backup, and audit services return unimplemented
 rather than simulated success.
 This endpoint is not Azure Atom/XML administration compatibility.
 `switchyardctl queue create|get|list|update` exposes these operations with JSON
@@ -1083,6 +1084,49 @@ responses and nonzero errors. It reads SAS tokens only from bounded regular
 files, marks their metadata sensitive, and verifies TLS against explicitly
 supplied CA certificates. Plaintext is opt-in, loopback-only, and cannot carry a
 token. Command-line settings preserve omitted, false, zero, and unlimited TTL.
+
+### Configuration Updates
+
+Updates use independent presence-aware patch fields: queue remains protobuf
+tag 3, with topic and subscription appended at tags 4 and 5. Exactly one family
+is required, and it must match the target kind. Authorization precedes path,
+patch, and owner access. Omitted settings stay unchanged; explicit false and
+unlimited lifetime are distinct from omission. Empty or equal patches stage
+nothing and do not advance the applied clock, but still validate topology and
+pass the ordinary proposer clock check.
+
+Topics allow changes to default lifetime, message size, and duplicate-history
+window; subscriptions allow lock duration, delivery count, default lifetime,
+message size, and both dead-letter policies. Topic duplicate-detection enablement
+and subscription session enablement are creation-only, consistent with the
+documented [duplicate-detection](https://learn.microsoft.com/en-us/azure/service-bus-messaging/enable-duplicate-detection)
+and [session](https://learn.microsoft.com/en-us/azure/service-bus-messaging/enable-message-sessions)
+constraints. Restating the same value is allowed; a change returns native
+`FailedPrecondition` without committing any part of the patch.
+
+A topic update validates complete bounded membership and changes one metadata
+key. A subscription update validates its target and parent, then commits
+membership, backing queue, and shadow configurations together. Neither repairs
+corruption, compiles rules, or scans and rewrites messages, indexes, counters,
+sessions, locks, or duplicate history. Existing deadlines remain captured.
+New receive/renew operations use the current lock default; later expiry,
+delivery-count decisions, and SQL error routing use current policy. Existing
+dead letters are not moved or changed. Changing a history window affects newly
+accepted IDs, not existing history deadlines.
+
+A pending topic publication retains its admission-clamped topic lifetime, so
+raising that default cannot extend it. Activation applies any shorter current
+topic ceiling and the current subscription ceiling. A raised subscription
+ceiling can therefore change a future copy's lifetime at activation, but not
+an existing copy. New size ceilings apply at activation too; a failed activation
+leaves the original schedule pending and cancelable. Already-attached AMQP
+producer links keep their advertised maximum size until reopened. These are
+local update policies, not cloud-verified timing guarantees. The value format
+and store layout remain unchanged by configuration updates.
+
+`switchyardctl topic update` and `subscription update` expose the same partial
+patches, scoped credentials, typed JSON responses, and nonzero refusal behavior
+as `queue update`.
 
 ## Durable Format
 
