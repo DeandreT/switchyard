@@ -83,7 +83,9 @@ Development defaults to plaintext AMQP on `127.0.0.1:5672`. Supplying
 default port to 5671. A shared-access policy is configured with
 `--shared-access-key-name` and `--shared-access-key-file`; it enables SASL PLAIN
 and CBS SAS authorization. Production mode refuses to start without both TLS
-and a shared-access policy.
+and a shared-access policy. Even with those prerequisites, durable production
+startup is refused until quorum replication and a replicated command proposer
+are implemented. Development with Fjall remains locally durable, not replicated.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
@@ -183,6 +185,10 @@ combines their prepared receipts with postings. It does not enable transactional
 receiving by default or SDK transaction scopes.
 
 ## Production Contract
+
+This is a design contract, not an available deployment profile. Production
+startup currently fails before opening storage or binding listeners; a valid
+voter count and a durable directory cannot make the local writer a quorum.
 
 A production cluster has at least three odd-numbered voters and stores three
 replicas of every metadata or entity placement group. A mutation succeeds only

@@ -17,9 +17,13 @@ policy through SASL PLAIN or CBS SAS, carries messages and sessions across that
 edge, and sweeps scheduled
 activation, lock, time-to-live, session-lock, and duplicate-history expiry.
 JWT/OIDC, mTLS, policy administration,
-Raft, and compliance implementations remain to be built. Within the semantics
-below, topics have persisted definitions, bounded subscription topology, and
-atomic rule-selected fanout, parent-retained topic scheduling, AMQP subscription and dead-letter routing,
+Raft, and compliance implementations remain to be built. Production startup
+is refused before storage is opened because no replicated command proposer
+exists. Development with Fjall provides local persistence only.
+
+Within the semantics below, topics have persisted definitions, bounded
+subscription topology, and atomic rule-selected fanout, parent-retained topic
+scheduling, AMQP subscription and dead-letter routing,
 and subscription management operations. Both pinned .NET gates cover immediate
 topic publications and independent subscription workflows. Session-required
 subscriptions reuse entity-local session ownership and state, while ordinary
