@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use amqp::{
-    CoordinatorEndpoint, EngineError, Error as AmqpProtocolError, ErrorCondition, RetainedDelivery,
-    TransactionalIngress, TransactionalReceiver,
+    CoordinatorEndpoint, CoordinatorRequest, EngineError, Error as AmqpProtocolError,
+    ErrorCondition, RetainedDelivery, TransactionalIngress, TransactionalReceiver,
 };
 use serde_amqp::primitives::Symbol;
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 
-use super::{Event, IngressError, QueueAdmission, WorkerClose, WorkerIdentity};
+use super::{Event, IngressError, IngressMode, QueueAdmission, WorkerClose, WorkerIdentity};
 use crate::{
     NativeAtomicBroker,
     authorization::ConnectionAuthorization,
@@ -122,6 +122,7 @@ pub(super) async fn controller(
     authorization: Option<Arc<ConnectionAuthorization>>,
     events: mpsc::Sender<Event>,
     _permit: OwnedSemaphorePermit,
+    mode: IngressMode,
 ) -> Result<(), IngressError> {
     let identity = endpoint.controller_identity().clone();
     let (close, mut closing) = mpsc::channel(1);
@@ -136,7 +137,7 @@ pub(super) async fn controller(
         };
         let sent = tokio::select! {
             biased;
-            () = controller_expired(authorization.as_ref()) => {
+            () = controller_expired(authorization.as_ref(), mode) => {
                 return Ok(Some(unauthorized_error("the coordinator's authorization has expired")));
             }
             result = events.send(registration) => result,
@@ -145,7 +146,7 @@ pub(super) async fn controller(
         let registered = tokio::select! {
             biased;
             close = closing.recv() => return Ok(close_error(close)),
-            () = controller_expired(authorization.as_ref()) => {
+            () = controller_expired(authorization.as_ref(), mode) => {
                 return Ok(Some(unauthorized_error("the coordinator's authorization has expired")));
             }
             result = registered => result,
@@ -159,7 +160,7 @@ pub(super) async fn controller(
             let request = tokio::select! {
                 biased;
                 close = closing.recv() => return Ok(close_error(close)),
-                () = controller_expired(authorization.as_ref()) => {
+                () = controller_expired(authorization.as_ref(), mode) => {
                     return Ok(Some(unauthorized_error("the coordinator's authorization has expired")));
                 }
                 request = endpoint.recv() => request,
@@ -170,19 +171,26 @@ pub(super) async fn controller(
                 Err(error) => return Err(error.into()),
             });
             if let Some(authorization) = authorization.as_ref()
-                && !authorization.has_valid_grant().await
+                && let Some(request) = pending_control.as_ref()
+                && !controller_request_authorized(authorization, mode, request).await
             {
                 return Ok(Some(unauthorized_error("the coordinator's authorization has expired")));
             }
             let capacity = tokio::select! {
                 biased;
                 close = closing.recv() => return Ok(close_error(close)),
-                () = controller_expired(authorization.as_ref()) => {
+                () = controller_expired(authorization.as_ref(), mode) => {
                     return Ok(Some(unauthorized_error("the coordinator's authorization has expired")));
                 }
                 result = events.reserve() => result,
             };
             let Ok(capacity) = capacity else { return Ok(None) };
+            if let Some(authorization) = authorization.as_ref()
+                && let Some(request) = pending_control.as_ref()
+                && !controller_request_authorized(authorization, mode, request).await
+            {
+                return Ok(Some(unauthorized_error("the coordinator's authorization has expired")));
+            }
             if let Some(request) = pending_control.take() {
                 capacity.send(Event::Control { source: identity.clone(), request });
             }
@@ -262,8 +270,32 @@ async fn producer_expired(authorization: Option<&LinkAuthorization>) {
     }
 }
 
-async fn controller_expired(authorization: Option<&Arc<ConnectionAuthorization>>) {
+async fn controller_request_authorized(
+    authorization: &ConnectionAuthorization,
+    mode: IngressMode,
+    request: &CoordinatorRequest,
+) -> bool {
+    let metadata_only = match request {
+        CoordinatorRequest::Declare(_) => true,
+        CoordinatorRequest::Discharge(receipt) => receipt.fail(),
+    };
+    if mode == IngressMode::Messaging && metadata_only {
+        authorization.can_control_metadata().await
+    } else if mode == IngressMode::Messaging {
+        authorization.can_control_commit().await
+    } else {
+        authorization.has_valid_grant().await
+    }
+}
+
+async fn controller_expired(
+    authorization: Option<&Arc<ConnectionAuthorization>>,
+    mode: IngressMode,
+) {
     match authorization {
+        Some(authorization) if mode == IngressMode::Messaging => {
+            authorization.wait_until_control_unauthorized().await;
+        }
         Some(authorization) => authorization.wait_until_no_valid_grant().await,
         None => std::future::pending().await,
     }

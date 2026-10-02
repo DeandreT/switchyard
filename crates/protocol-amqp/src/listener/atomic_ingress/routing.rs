@@ -67,7 +67,10 @@ pub(super) async fn serve_session<B: NativeAtomicBroker>(
                 .is_some()
             {
                 if let Some(authorization) = authorization.as_ref()
-                    && !authorization.has_valid_grant().await
+                    && !match mode {
+                        IngressMode::Posting => authorization.has_valid_grant().await,
+                        IngressMode::Messaging => authorization.can_control_metadata().await,
+                    }
                 {
                     refuse(
                         &session,
@@ -93,6 +96,7 @@ pub(super) async fn serve_session<B: NativeAtomicBroker>(
                     authorization.clone(),
                     events.clone(),
                     permit,
+                    mode,
                 ));
                 continue;
             }

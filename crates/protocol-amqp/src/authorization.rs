@@ -11,6 +11,11 @@ use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 
 use crate::cbs::CbsResponse;
 
+mod initial;
+
+use initial::InitialControlGrace;
+pub(crate) use initial::InitialControlState;
+
 const DEFAULT_CBS_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(20);
 const CBS_REPLY_ROUTE_TIMEOUT: Duration = Duration::from_secs(2);
 const CBS_REPLY_BUFFER: usize = 16;
@@ -61,6 +66,7 @@ pub(crate) struct ConnectionAuthorization {
     audience_host: String,
     authorization_timeout: Duration,
     grants: RwLock<Vec<AccessGrant>>,
+    initial_control: Mutex<InitialControlGrace>,
     grant_changed: Notify,
     routes: Mutex<ReplyRoutes>,
     route_changed: Notify,
@@ -71,6 +77,7 @@ impl ConnectionAuthorization {
         config: SharedAccessAuthentication,
         initial_grant: Option<AccessGrant>,
     ) -> Arc<Self> {
+        let previously_authorized = initial_grant.is_some();
         Arc::new(Self {
             policy: config.policy,
             audience_host: config.audience_host,
@@ -81,6 +88,7 @@ impl ConnectionAuthorization {
                     .map(AccessGrant::into_amqp_scope)
                     .collect(),
             ),
+            initial_control: Mutex::new(InitialControlGrace::new(previously_authorized)),
             grant_changed: Notify::new(),
             routes: Mutex::new(ReplyRoutes {
                 senders: HashMap::new(),
@@ -91,6 +99,72 @@ impl ConnectionAuthorization {
 
     pub(crate) fn authorization_timeout(&self) -> Duration {
         self.authorization_timeout
+    }
+
+    /// Installs the explicit Messaging deadline once; other listeners do not call this.
+    pub(crate) async fn enable_initial_control_grace(&self, deadline: tokio::time::Instant) {
+        let _grants = self.grants.read().await;
+        self.initial_control
+            .lock()
+            .await
+            .enable(deadline, tokio::time::Instant::now());
+    }
+
+    pub(crate) async fn initial_control_state(&self) -> InitialControlState {
+        self.initial_control
+            .lock()
+            .await
+            .state(tokio::time::Instant::now())
+    }
+
+    /// Declaration metadata grace does not authorize queue access or commit.
+    pub(crate) async fn can_control_metadata(&self) -> bool {
+        let grants = self.grants.read().await;
+        let state = self
+            .initial_control
+            .lock()
+            .await
+            .state(tokio::time::Instant::now());
+        match state {
+            InitialControlState::Initial { .. } => true,
+            InitialControlState::InitialExpired => false,
+            InitialControlState::Disabled | InitialControlState::Authorized => {
+                any_grant_claim_expiry_epoch_seconds_at(&grants, SystemTime::now()).is_ok()
+            }
+        }
+    }
+
+    pub(crate) async fn can_control_commit(&self) -> bool {
+        let grants = self.grants.read().await;
+        let state = self
+            .initial_control
+            .lock()
+            .await
+            .state(tokio::time::Instant::now());
+        // A late token cannot revive a coordinator after initial expiry.
+        state != InitialControlState::InitialExpired
+            && any_grant_claim_expiry_epoch_seconds_at(&grants, SystemTime::now()).is_ok()
+    }
+
+    pub(crate) async fn wait_until_control_unauthorized(&self) {
+        loop {
+            let changed = self.grant_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            match self.initial_control_state().await {
+                InitialControlState::Initial { deadline } => {
+                    tokio::select! {
+                        () = tokio::time::sleep_until(deadline) => {}
+                        () = &mut changed => {}
+                    }
+                }
+                InitialControlState::InitialExpired => return,
+                InitialControlState::Disabled | InitialControlState::Authorized => {
+                    self.wait_until_no_valid_grant().await;
+                    return;
+                }
+            }
+        }
     }
 
     pub(crate) async fn has_valid_grant(&self) -> bool {
@@ -145,10 +219,13 @@ impl ConnectionAuthorization {
     ) -> Result<(), auth::SasError> {
         let grant = self.policy.validate_sas(token, audience, epoch_seconds())?;
         let mut grants = self.grants.write().await;
+        let mut initial_control = self.initial_control.lock().await;
         grants.retain(|existing| {
             existing.subject() != grant.subject() || existing.scope() != grant.scope()
         });
         grants.push(grant);
+        initial_control.authorized(tokio::time::Instant::now());
+        drop(initial_control);
         drop(grants);
         self.grant_changed.notify_waiters();
         Ok(())

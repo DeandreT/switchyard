@@ -223,6 +223,12 @@ async fn run_driver<B: crate::NativeAtomicBroker>(
         )
         .into());
     }
+    if driver.mode == IngressMode::Messaging
+        && let (Some(authorization), Some(deadline)) =
+            (authorization.as_ref(), authorization_deadline)
+    {
+        authorization.enable_initial_control_grace(deadline).await;
+    }
     let mut awaiting_authorization = authorization.is_some();
 
     loop {
@@ -275,7 +281,26 @@ async fn run_driver<B: crate::NativeAtomicBroker>(
                 if !connection.connection_identity().is_active() {
                     break;
                 }
-                if awaiting_authorization {
+                let initial_expired = if driver.mode == IngressMode::Messaging {
+                    if let Some(authorization) = authorization.as_ref() {
+                        matches!(
+                            authorization.initial_control_state().await,
+                            crate::authorization::InitialControlState::InitialExpired,
+                        )
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if initial_expired {
+                    driver.owner.close();
+                    connection.close_with_error(super::unauthorized_error(
+                        "no CBS token was supplied before the authorization deadline",
+                    )).await?;
+                    return Ok(());
+                }
+                if driver.mode == IngressMode::Posting && awaiting_authorization {
                     if let Some(authorization) = authorization.as_ref()
                         && authorization.has_valid_grant().await
                     {

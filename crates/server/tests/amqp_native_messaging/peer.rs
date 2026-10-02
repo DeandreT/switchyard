@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "peer/cbs.rs"]
+mod cbs;
 #[path = "peer/decisions.rs"]
 mod decisions;
 
@@ -135,6 +137,14 @@ impl Peer {
     }
 
     pub(super) async fn begin(&mut self, channel: u16) -> TestResult {
+        self.begin_with_handle_max(channel, 0).await
+    }
+
+    pub(super) async fn begin_with_handle_max(
+        &mut self,
+        channel: u16,
+        handle_max: u32,
+    ) -> TestResult {
         let expected = (0..=3)
             .find(|candidate| !self.channels.values().any(|known| known == candidate))
             .expect("test native channel available");
@@ -143,7 +153,7 @@ impl Peer {
         self.send(
             channel,
             Performative::Begin(Begin {
-                handle_max: 0,
+                handle_max,
                 ..Begin::default()
             }),
             vec![],
@@ -612,7 +622,10 @@ impl Peer {
             }
             assert_eq!(actual, self.local(channel));
             let Performative::Detach(detach) = frame else {
-                return Err("scoped Detach missing; no successful settlement allowed".into());
+                return Err(format!(
+                    "scoped Detach missing; no successful settlement allowed: {frame:?}",
+                )
+                .into());
             };
             assert_eq!(detach.handle, 0);
             assert!(detach.closed);

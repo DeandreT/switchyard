@@ -57,6 +57,8 @@ mod peer;
 use peer::*;
 #[path = "amqp_native_messaging/atomicity.rs"]
 mod atomicity;
+#[path = "amqp_native_messaging/cold_first.rs"]
+mod cold_first;
 #[path = "amqp_native_messaging/lifecycle.rs"]
 mod lifecycle;
 #[path = "amqp_native_messaging/refusals.rs"]
@@ -68,6 +70,26 @@ macro_rules! backend_cases {
     ($module:ident, $provider:expr) => {
         mod $module {
             use super::*;
+            #[tokio::test]
+            async fn initial_declare_then_cbs_commits_the_same_group() -> TestResult {
+                cold_first::initial_declare_then_cbs_commits_the_same_group($provider).await
+            }
+            #[tokio::test]
+            async fn initial_rollback_is_inert_but_empty_commit_detaches() -> TestResult {
+                cold_first::initial_rollback_is_inert_but_empty_commit_detaches($provider).await
+            }
+            #[tokio::test]
+            async fn cbs_failures_and_unrelated_grants_cannot_bind_orders() -> TestResult {
+                cold_first::cbs_failures_and_unrelated_grants_cannot_bind_orders($provider).await
+            }
+            #[tokio::test]
+            async fn initial_declarations_are_bounded_without_broker_work() -> TestResult {
+                cold_first::initial_declarations_are_bounded_without_broker_work($provider).await
+            }
+            #[tokio::test]
+            async fn initial_authorization_deadline_is_a_real_close() -> TestResult {
+                cold_first::initial_authorization_deadline_is_a_real_close($provider).await
+            }
             #[tokio::test]
             async fn sdk_defaults_rearm_the_same_canonical_original_before_mixed_commit()
             -> TestResult {
