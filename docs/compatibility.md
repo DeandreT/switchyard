@@ -716,6 +716,12 @@ granted Service Bus session filter. A foreign or altered receipt is refused
 locally without consuming the rightful approval or writing bytes. Clones can
 approve only once. Raw Attach content cannot be converted back into approval authority.
 This is a source-level change for callers of the in-tree transport API.
+Additive [native connection identities](native-connection-identity.md) bind
+negotiated session and link generations to their exact actor. Retained receipts
+expose that origin independently of link settlement and retirement. Observer
+clones are inert; the actor retires its identity before publishing termination,
+including cancellation and unwinding. Activity is only an observation, not
+authorization, a live delivery guarantee, or transaction admission.
 An End on an unmapped channel is refused without manufacturing a session reply.
 Client Begin searches only vacant channels within the peer's inclusive channel
 limit. Pending, live, and ending sessions cannot be overwritten. Client End

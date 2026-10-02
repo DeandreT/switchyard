@@ -60,10 +60,11 @@ Declared can round-trip structurally in the codec but cannot become an ordinary
 link's settlement default. The Service Bus adapter independently refuses Declared
 as a domain settlement.
 
-There is no transaction registry, Declare/Discharge execution, staged message
+There is no wire transaction registry, Declare/Discharge execution, staged message
 visibility, provisional acknowledgement exchange, transaction timeout, or wire
 retry contract in this increment. The separate trusted same-queue foundation is
-described in [Atomic Queue Operations](atomic-queue-operations.md). Its uncertain
+described in [Atomic Queue Operations](atomic-queue-operations.md), with a
+separate trusted [local registry](transaction-registry.md). Its uncertain
 physical commit result must not be reported as guaranteed wire rollback.
 
 ## Verification

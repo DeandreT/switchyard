@@ -9,6 +9,8 @@ their content charge is released before the message reaches application code.
 ## Receipt Lifetime
 
 Retained receipts expose borrowed `message()` and `message_format()` accessors.
+Their [native connection origin](native-connection-identity.md) is available
+separately from content accounting and ordinary settlement authority.
 Their underlying ordinary delivery and content lease are private. Debug output
 does not disclose payloads. A receipt cannot be cloned or converted into an
 ordinary delivery that carries its lease. Application code can still explicitly
