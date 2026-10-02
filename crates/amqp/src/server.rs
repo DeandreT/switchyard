@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    future::Future,
     io,
     sync::Arc,
     time::Duration,
@@ -680,28 +681,35 @@ impl ServerConnection {
         None
     }
 
-    pub async fn accept_session(
+    /// Returns an owned admission future. Creating or dropping it before its
+    /// first poll performs no I/O; dropping it after enqueue does not cancel
+    /// native session acceptance already in progress.
+    pub fn accept_session(
         &self,
         incoming: IncomingSession,
-    ) -> Result<ServerSession, EngineError> {
-        if incoming.identity.is_retired() {
-            return Err(EngineError::RemoteDetached);
+    ) -> impl Future<Output = Result<ServerSession, EngineError>> + Send + 'static + use<> {
+        let commands = self.commands.clone();
+        let consumed = self.consumed.clone();
+        async move {
+            if incoming.identity.is_retired() {
+                return Err(EngineError::RemoteDetached);
+            }
+            let (attach_tx, incoming_attaches) = mpsc::channel(32);
+            request(&commands, |reply| Command::AcceptSession {
+                channel: incoming.channel,
+                identity: incoming.identity.clone(),
+                attach_tx,
+                reply,
+            })
+            .await?;
+            Ok(ServerSession {
+                channel: incoming.channel,
+                identity: incoming.identity,
+                commands,
+                incoming_attaches,
+                consumed,
+            })
         }
-        let (attach_tx, incoming_attaches) = mpsc::channel(32);
-        request(&self.commands, |reply| Command::AcceptSession {
-            channel: incoming.channel,
-            identity: incoming.identity.clone(),
-            attach_tx,
-            reply,
-        })
-        .await?;
-        Ok(ServerSession {
-            channel: incoming.channel,
-            identity: incoming.identity,
-            commands: self.commands.clone(),
-            incoming_attaches,
-            consumed: self.consumed.clone(),
-        })
     }
 
     pub async fn close(&self) -> Result<(), EngineError> {
@@ -5093,6 +5101,9 @@ mod recovery_tests;
 
 #[cfg(test)]
 mod session_startup_tests;
+
+#[cfg(test)]
+mod owned_session_admission_tests;
 
 #[cfg(test)]
 mod outgoing_settlement_tests;
