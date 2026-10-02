@@ -3,7 +3,7 @@
 The optional `--admin-listen` gRPC listener serves `RuleService` alongside
 `EntityService`. It creates, gets, lists, and deletes subscription rules through
 the existing broker owner. It does not provide Azure Atom/XML administration,
-rule actions, updates, upserts, or a rule CLI.
+rule actions, updates, or upserts.
 
 ## Requests and Authorization
 
@@ -93,3 +93,62 @@ semantic versions return Unimplemented; domain and compilation limits return
 ResourceExhausted. Missing or stale targets return NotFound. A stopped owner or
 unavailable applied clock returns Unavailable. No refusal is represented as a
 successful rule mutation.
+
+## Command Line
+
+`switchyardctl` exposes the same four operations:
+
+```text
+rule create <topic> <subscription> <name> --filter-file <path>
+rule get <topic> <subscription> <name>
+rule list <topic> <subscription>
+rule delete <topic> <subscription> <name>
+```
+
+Connection options, explicit CA verification, bounded token files, sensitive
+authorization metadata, and timeouts are shared with entity commands. Insecure
+HTTP remains opt-in, loopback-only, and cannot carry a token. Rule lists are
+complete; there are no paging options. Create/delete emit
+`{namespace, subscription_path, name, completed: true}` after the successful RPC,
+not a fetched definition or an asynchronous operation. Get/list validate the
+complete reply before writing JSON. Creation timestamps are decimal strings to
+preserve the full unsigned 64-bit range.
+
+Filter files are bounded regular files of at most 512 KiB. Symlinks to regular
+files retain the existing file-helper behavior; FIFOs and other nonregular
+opened files are refused. The complete encoded protobuf request is checked
+against 64 KiB before connecting. Filter-file and conversion errors, and remote
+RPC statuses, produce nonzero exits and static errors without echoing file paths,
+filter contents, tokens, or remote diagnostic text. SQL is not compiled locally:
+the server remains authoritative for syntax, semantic versions, and compilation
+budgets.
+
+Filters use an explicit `type` field. True and false are `{"type":"true"}` and
+`{"type":"false"}`. SQL uses `expression` and optional `semantic_version`; the
+checked-in [red filter](../examples/rules/red.json) is a complete example.
+Correlation uses the eight optional system strings and repeated `properties`
+entries with `name` and a typed `value`:
+
+```json
+{
+  "type": "correlation",
+  "subject": "",
+  "properties": [
+    {"name": "priority", "value": {"type": "uint", "value": 3}},
+    {"name": "absent", "value": {"type": "null"}},
+    {"name": "bits", "value": {"type": "float_bits", "value": "80000000"}}
+  ]
+}
+```
+
+Unknown and duplicate JSON fields, duplicate property names, missing
+constructors/values, invalid widths, and more than 32 conditions are refused.
+Null has no `value`; it is not a missing constructor. The `ulong`, `long`, and
+`timestamp` constructors use canonical decimal strings, not JSON numbers.
+`float_bits` and `double_bits` use exactly 8 and 16 lowercase hex digits.
+`decimal32`, `decimal64`, `decimal128`, and `uuid` use exactly 8, 16, 32, and 32
+lowercase hex digits; `binary` uses any even-length lowercase hex string,
+including empty. Hex has no prefix. `char` is a numeric Unicode codepoint.
+Other integer widths and Boolean values use JSON numbers and Boolean values;
+`string` and ASCII `symbol` use strings. Output filters use the same typed shape,
+preserving empty strings, explicit null, octets, and floating-point bit payloads.

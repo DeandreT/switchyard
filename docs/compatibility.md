@@ -1172,6 +1172,11 @@ responses and nonzero errors. It reads SAS tokens only from bounded regular
 files, marks their metadata sensitive, and verifies TLS against explicitly
 supplied CA certificates. Plaintext is opt-in, loopback-only, and cannot carry a
 token. Command-line settings preserve omitted, false, zero, and unlimited TTL.
+`switchyardctl rule create|get|list|delete` addresses a topic/subscription member
+and uses a bounded typed filter file for creation. Its JSON preserves scalar
+constructors, exact floating-point bits and octets, and 64-bit values as strings.
+It validates complete replies before emitting them and does not add rule actions,
+updates, or retries; see [Native Rule Administration](native-rules.md).
 
 Entity deletion commits one bounded atomic purge, cascades topic-owned
 subscriptions and shadows, and retains counter tombstones across recreation.

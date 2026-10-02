@@ -123,6 +123,12 @@ cargo run -p switchyardctl -- \
   subscription update events audit --dead-letter-on-filter-exceptions false
 cargo run -p switchyardctl -- \
   --endpoint http://127.0.0.1:9080 --allow-insecure \
+  rule create events audit Red --filter-file examples/rules/red.json
+cargo run -p switchyardctl -- \
+  --endpoint http://127.0.0.1:9080 --allow-insecure \
+  rule list events audit
+cargo run -p switchyardctl -- \
+  --endpoint http://127.0.0.1:9080 --allow-insecure \
   subscription delete events audit
 ```
 
@@ -138,8 +144,10 @@ subscription deletion is synchronous and destructive, with atomic cleanup limits
 and retained recreation fences described in [Entity Deletion](docs/entity-deletion.md).
 The same endpoint also exposes typed subscription rule create/get/list/delete
 through [Native Rule Administration](docs/native-rules.md), without rule actions
-or a rule CLI. Other native services and Azure administration compatibility
-remain unfinished.
+or upserts. The rule CLI uses bounded, typed JSON filter files and preserves
+scalar widths and bits. Subscription creation keeps an explicit `$Default`
+true rule; delete that rule when selection should depend only on custom filters.
+Other native services and Azure administration compatibility remain unfinished.
 
 The trusted Rust broker API also provides bounded, same-queue atomic sends and
 settlements. These primitives underpin the separate opt-in native listeners;
