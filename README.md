@@ -146,7 +146,9 @@ reservations through queueing, cancellation, and owner completion.
 The [local registry](docs/transaction-registry.md) adds bounded declarations,
 controller lifetimes, and one-time discharge without enabling wire transactions.
 The [native transaction types](docs/amqp-transaction-types.md) are represented
-explicitly but refused by connection drivers until the wire lifecycle is built.
+explicitly. An opt-in [native posting lifecycle](docs/native-transactional-ingress.md)
+adds coordinator receipts and an ordered owner handoff, but the Service Bus
+listeners still refuse transactions until the broker bridge is implemented.
 The sender-side listener uses [retained ingress receipts](docs/retained-ingress.md)
 to preserve native content accounting through broker replies and acknowledgment flush.
 [Native connection identities](docs/native-connection-identity.md) preserve exact

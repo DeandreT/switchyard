@@ -1,9 +1,10 @@
 # AMQP Transaction Types
 
 The native AMQP crate represents transaction control markers without silently
-discarding their meaning. This is wire-type coverage, not an implemented transaction
-lifecycle. Official client transaction scopes cannot yet commit or roll back
-messaging operations through coordinator links.
+discarding their meaning. These types also support an explicitly opt-in
+[native posting lifecycle](native-transactional-ingress.md), separate from the
+Service Bus listeners. Official client transaction scopes cannot yet commit or
+roll back messaging operations through coordinator links.
 
 ## Representation
 
@@ -35,7 +36,7 @@ These types follow [AMQP 1.0 Part 4](https://docs.oasis-open.org/amqp/core/v1.0/
 
 ## Unsupported Lifecycle
 
-Both native connection drivers explicitly refuse coordinator admission,
+By default, both native connection drivers explicitly refuse coordinator admission,
 transactional transfers, transactional dispositions, and transactional acquisition
 through Flow properties. These control markers cannot silently enqueue a normal
 message, settle a held message, consume a pending ordinary acknowledgement, or fall back
@@ -60,9 +61,10 @@ Declared can round-trip structurally in the codec but cannot become an ordinary
 link's settlement default. The Service Bus adapter independently refuses Declared
 as a domain settlement.
 
-There is no wire transaction registry, Declare/Discharge execution, staged message
-visibility, provisional acknowledgement exchange, transaction timeout, or wire
-retry contract in this increment. The separate trusted same-queue foundation is
+The Service Bus listener has no wire transaction registry, Declare/Discharge
+execution, staged message visibility, transaction timeout, or wire retry contract.
+The opt-in native API adds control receipts and provisional acknowledgments,
+but not the broker bridge. The separate trusted same-queue foundation is
 described in [Atomic Queue Operations](atomic-queue-operations.md), with a
 separate trusted [local registry](transaction-registry.md). Its uncertain
 physical commit result must not be reported as guaranteed wire rollback.

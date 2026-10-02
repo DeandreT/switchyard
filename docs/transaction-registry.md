@@ -2,8 +2,10 @@
 
 `protocol-amqp::AtomicTransactionRegistry` supplies a bounded, serialized local
 lifecycle for future connection transactions. It is a trusted Rust API, not an
-enabled AMQP coordinator: listeners and connection drivers still
-[refuse transaction traffic](amqp-transaction-types.md).
+enabled AMQP coordinator: Service Bus listeners and default connection drivers
+still [refuse transaction traffic](amqp-transaction-types.md). The separate
+opt-in [native posting lifecycle](native-transactional-ingress.md) is not yet
+bound to this registry or the broker owner.
 
 ## Ownership And Identity
 

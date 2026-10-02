@@ -56,5 +56,6 @@ comparison, but `belongs_to_connection()` is false.
 These identities are process-local observations, not durable IDs, native
 controller admission, transaction receipts, or a connection ordering barrier.
 They do not bind the trusted [local transaction registry](transaction-registry.md)
-to a wire coordinator. Transaction traffic remains
-[explicitly unsupported](amqp-transaction-types.md).
+to a wire coordinator. The separate opt-in
+[native posting lifecycle](native-transactional-ingress.md) supplies its own
+receipt and claim authority; Service Bus transaction traffic remains unsupported.

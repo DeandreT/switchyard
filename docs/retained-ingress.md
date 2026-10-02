@@ -55,9 +55,10 @@ The allowance remains a logical encoded-content tally, not decoded allocation,
 custom-decoder expansion, transient copies, or a complete memory quota. CBS and
 management receives retain their ordinary API and are not changed by this slice.
 
-No transaction receipt, provisional acknowledgment, connection ordering barrier,
-or successful wire Declare/Discharge is added here. Future transaction handoff
-must move native obligations and content reservations into the same owner work
-as staged commands; retaining them only in the local registry would not protect
-queued or started work from registry cleanup. Wire transaction traffic remains
-[explicitly unsupported](amqp-transaction-types.md).
+Ordinary retained receives do not become transaction receipts or ordering
+barriers. The separate opt-in [native posting lifecycle](native-transactional-ingress.md)
+uses dedicated receipts and provisional acknowledgments. Its future broker
+handoff must move native obligations and content reservations into the same
+owner work as staged commands; retaining them only in the local registry would
+not protect queued or started work from registry cleanup. Service Bus transaction
+traffic remains unsupported.
