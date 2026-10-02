@@ -44,6 +44,9 @@ mod native_work;
 #[path = "tests/native_protocol.rs"]
 mod native_protocol;
 
+#[path = "tests/native_claim_expiry.rs"]
+mod native_claim_expiry;
+
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const DEADLINE: Duration = Duration::from_secs(5);
 const NO_WAKE: Duration = Duration::from_millis(30);

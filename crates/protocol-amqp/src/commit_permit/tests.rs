@@ -8,6 +8,8 @@ use std::{
 
 use super::*;
 
+mod expiry;
+
 fn pending() -> (Instant, AtomicCommitPermit, AtomicCommitTicket) {
     let now = Instant::now();
     let deadline = now.checked_add(Duration::from_secs(120)).expect("deadline");
@@ -202,6 +204,7 @@ fn defensive_duplicate_ticket_cannot_start_or_overwrite_a_known_decision() {
     // Public constructors never issue this duplicate; the CAS still rejects it.
     let duplicate = AtomicCommitTicket {
         permit: permit.clone(),
+        claim_expiry_epoch_seconds: None,
     };
     let claim = ticket.try_claim_at(now).expect("only execution authority");
     assert_eq!(
@@ -212,6 +215,7 @@ fn defensive_duplicate_ticket_cannot_start_or_overwrite_a_known_decision() {
     claim.finish(AtomicCommitDecision::Committed);
     let expired_duplicate = AtomicCommitTicket {
         permit: permit.clone(),
+        claim_expiry_epoch_seconds: None,
     };
     assert_eq!(
         expired_duplicate

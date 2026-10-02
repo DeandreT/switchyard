@@ -14,6 +14,8 @@ use domain::{
 use super::*;
 use crate::{AtomicCommitDecision, AtomicCommitState};
 
+mod expiry;
+
 fn binding() -> EntityBinding {
     let entity = EntityPath::new("orders").expect("entity");
     EntityBinding::new(

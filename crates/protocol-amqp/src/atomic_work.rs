@@ -271,6 +271,11 @@ impl OwnedAtomicMessagingSubmission {
         self.ticket.permit()
     }
 
+    /// Tightens only the unique ticket's sampled owner-claim horizon.
+    pub fn restrict_claim_expiry_epoch_seconds(&mut self, expiry: u64) {
+        self.ticket.restrict_claim_expiry_epoch_seconds(expiry);
+    }
+
     /// The owner retains the returned work through its entire commit scope.
     pub fn into_owner_parts(self) -> (EntityBinding, AtomicCommitTicket, AtomicMessagingOwnerWork) {
         (
@@ -322,6 +327,11 @@ pub struct OwnedEmptyAtomicMessagingSubmission {
 impl OwnedEmptyAtomicMessagingSubmission {
     pub fn permit(&self) -> &AtomicCommitPermit {
         self.ticket.permit()
+    }
+
+    /// Tightens only the unique ticket's sampled owner-claim horizon.
+    pub fn restrict_claim_expiry_epoch_seconds(&mut self, expiry: u64) {
+        self.ticket.restrict_claim_expiry_epoch_seconds(expiry);
     }
 
     pub fn into_owner_parts(self) -> (AtomicCommitTicket, AtomicMessagingOwnerWork) {

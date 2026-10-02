@@ -132,6 +132,15 @@ impl AtomicTransactionSubmission {
             Self::Empty(submission) => submission.permit(),
         }
     }
+
+    /// Tightens the unique handoff ticket without retaining an expiry on its
+    /// payload-free permit observers.
+    pub fn restrict_claim_expiry_epoch_seconds(&mut self, expiry: u64) {
+        match self {
+            Self::Bound(submission) => submission.restrict_claim_expiry_epoch_seconds(expiry),
+            Self::Empty(submission) => submission.restrict_claim_expiry_epoch_seconds(expiry),
+        }
+    }
 }
 
 impl fmt::Debug for AtomicTransactionSubmission {

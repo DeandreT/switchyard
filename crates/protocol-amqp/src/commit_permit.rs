@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicU8, Ordering},
     },
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// A runtime decision, not a durable transaction record or retry token.
@@ -60,6 +60,7 @@ impl AtomicCommitPermit {
         }));
         let ticket = AtomicCommitTicket {
             permit: permit.clone(),
+            claim_expiry_epoch_seconds: None,
         };
         (permit, ticket)
     }
@@ -112,6 +113,7 @@ impl AtomicCommitPermit {
 #[derive(Debug)]
 pub struct AtomicCommitTicket {
     permit: AtomicCommitPermit,
+    claim_expiry_epoch_seconds: Option<u64>,
 }
 
 impl AtomicCommitTicket {
@@ -119,14 +121,45 @@ impl AtomicCommitTicket {
         &self.permit
     }
 
-    /// The owner calls this once, before validation, stamping, or external I/O.
-    /// The deadline is sampled here using the runtime's monotonic clock.
-    pub fn try_claim(self) -> Result<AtomicCommitClaim, AtomicCommitClaimError> {
-        self.try_claim_at(Instant::now())
+    /// Tightens the owner-claim horizon without sampling clocks or changing
+    /// permit state. A later restriction can never extend or remove it.
+    pub fn restrict_claim_expiry_epoch_seconds(&mut self, expiry: u64) {
+        self.claim_expiry_epoch_seconds = Some(
+            self.claim_expiry_epoch_seconds
+                .map_or(expiry, |current| current.min(expiry)),
+        );
     }
 
+    /// The owner calls this once, before validation, stamping, or external I/O.
+    /// The monotonic deadline and any epoch horizon are sampled at acquisition;
+    /// neither can revoke a started commit. An invalid epoch sample fails closed.
+    pub fn try_claim(self) -> Result<AtomicCommitClaim, AtomicCommitClaimError> {
+        let now = Instant::now();
+        let epoch = if now < self.permit.0.deadline && self.claim_expiry_epoch_seconds.is_some() {
+            Some(SystemTime::now())
+        } else {
+            None
+        };
+        self.try_claim_with_samples(now, epoch)
+    }
+
+    #[cfg(test)]
     fn try_claim_at(self, now: Instant) -> Result<AtomicCommitClaim, AtomicCommitClaimError> {
-        if now >= self.permit.0.deadline {
+        self.try_claim_with_samples(now, None)
+    }
+
+    fn try_claim_with_samples(
+        self,
+        now: Instant,
+        epoch: Option<SystemTime>,
+    ) -> Result<AtomicCommitClaim, AtomicCommitClaimError> {
+        let epoch_live = match self.claim_expiry_epoch_seconds {
+            None => true,
+            Some(expiry) => epoch
+                .and_then(|sample| sample.duration_since(UNIX_EPOCH).ok())
+                .is_some_and(|sample| sample.as_secs() < expiry),
+        };
+        if now >= self.permit.0.deadline || !epoch_live {
             self.permit.abort();
         } else if self
             .permit

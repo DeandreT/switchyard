@@ -11,6 +11,9 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 #[path = "tests/abort_pending.rs"]
 mod abort_pending;
 
+#[path = "tests/expiry.rs"]
+mod expiry;
+
 fn fresh() -> (AtomicTransactionRegistry, AtomicTransactionRegistryHandle) {
     AtomicTransactionRegistry::with_ids(Arc::new(AtomicU64::new(0)))
 }
