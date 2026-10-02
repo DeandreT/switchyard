@@ -91,6 +91,8 @@ behavior it currently enforces:
   cancellation and an explicit indeterminate result for storage uncertainty.
   Optional [owned work reservations](atomic-work-reservations.md) preserve shared
   resource accounting while commands are queued, cancelled, or being applied.
+  The [local transaction registry](transaction-registry.md) bounds declarations
+  and controller lifetimes but does not enable wire transaction traffic.
 - A queue can enable duplicate detection by message ID, with a 10-minute
   default history window bounded to 20 seconds through 7 days. A duplicate
   send is accepted and dropped, and history survives completion, dead-lettering,

@@ -78,3 +78,5 @@ No storage format, replicated command, broker-trait wire contract, controller
 identity, transaction ID, provisional acknowledgment, or native ordering barrier
 is added here. AMQP transaction traffic remains
 [explicitly unsupported](amqp-transaction-types.md).
+The separate [local registry](transaction-registry.md) builds a bounded lifecycle
+on these reservations, including unbound declarations and empty owner work.

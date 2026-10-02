@@ -143,6 +143,8 @@ The optional [guarded commit API](docs/atomic-commit-permits.md) adds pending-on
 cancellation and a runtime commit decision.
 The [owned work API](docs/atomic-work-reservations.md) carries shared resource
 reservations through queueing, cancellation, and owner completion.
+The [local registry](docs/transaction-registry.md) adds bounded declarations,
+controller lifetimes, and one-time discharge without enabling wire transactions.
 The [native transaction types](docs/amqp-transaction-types.md) are represented
 explicitly but refused by connection drivers until the wire lifecycle is built.
 
