@@ -28,6 +28,10 @@ mod websocket;
 #[path = "amqp_dotnet_current/atomic_messaging.rs"]
 mod atomic_messaging;
 
+#[cfg(target_os = "linux")]
+#[path = "amqp_dotnet_current/rule_actions.rs"]
+mod rule_actions;
+
 struct TestTimer {
     shutdown: Arc<Shutdown>,
     thread: Option<JoinHandle<()>>,

@@ -58,7 +58,9 @@ impl Broker for ObservedBroker {
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         let outcome = match &kind {
-            CommandKind::CreateRule { .. } => CommandOutcome::RuleCreated,
+            CommandKind::CreateRule { .. } | CommandKind::CreateRuleWithAction { .. } => {
+                CommandOutcome::RuleCreated
+            }
             CommandKind::DeleteRule { .. } => CommandOutcome::RuleDeleted,
             _ => panic!("unexpected rule command: {kind:?}"),
         };
@@ -161,17 +163,12 @@ fn definition(name: &str, filter: RuleFilter) -> RuleDefinition {
 }
 
 #[tokio::test]
-async fn action_metadata_cannot_be_silently_reported_as_an_empty_action() {
+async fn action_metadata_is_represented_without_changing_plain_or_empty_pages() {
     let broker = ObservedBroker::default();
     let plain = definition("plain", RuleFilter::True);
     let mut action = definition("annotated", RuleFilter::True);
     action.action = Some(domain::SqlAction::new("REMOVE [private-action]").expect("action"));
-    assert!(matches!(
-        encoded_rule(&action),
-        Err(RuleRequestError::Unsupported(_))
-    ));
     *broker.definitions.lock().expect("rules") = vec![action, plain];
-    // Even a page that would otherwise omit the action rule must fail closed.
     for skip in [0, 1, 2] {
         let response = process_request_for(
             &enumeration(Value::Int(1), Value::Int(skip)),
@@ -181,10 +178,36 @@ async fn action_metadata_cannot_be_silently_reported_as_an_empty_action() {
             BUDGET,
         )
         .await;
-        assert_eq!(response.status_code, 501);
-        assert_eq!(response.error_condition, Some(crate::NOT_IMPLEMENTED));
-        assert_eq!(response.body, Value::Null);
-        assert!(!response.status_description.contains("private-action"));
+        assert_eq!(response.status_code, 200);
+        assert_eq!(response.error_condition, None);
+        let Value::Map(body) = &response.body else {
+            panic!("rule body")
+        };
+        let Some(Value::List(entries)) = get(body, RULES) else {
+            panic!("rule entries")
+        };
+        if skip == 2 {
+            assert!(entries.is_empty());
+            continue;
+        }
+        let [Value::Map(entry)] = entries.as_slice() else {
+            panic!("one rule")
+        };
+        let rule = fields(
+            get(entry, RULE_DESCRIPTION).expect("description"),
+            RULE_DESCRIPTION_CODE,
+        );
+        if skip == 0 {
+            assert_eq!(
+                fields(&rule[1], SQL_ACTION_CODE),
+                [
+                    Value::String("REMOVE [private-action]".into()),
+                    Value::Int(20)
+                ]
+            );
+        } else {
+            assert!(fields(&rule[1], EMPTY_ACTION_CODE).is_empty());
+        }
     }
     assert!(broker.submissions.lock().expect("commands").is_empty());
     assert_eq!(broker.reads.lock().expect("reads").len(), 3);
@@ -376,6 +399,7 @@ async fn malformed_and_unsupported_inputs_never_reach_the_owner() {
     }
 }
 
+mod actions;
 mod sql;
 
 #[tokio::test]

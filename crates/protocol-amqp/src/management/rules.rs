@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use domain::{
-    BrokerError, CorrelationFilter, RuleDefinition, RuleFilter, RuleName, SqlCompileError,
-    SqlCompileLimit, SqlFilter, SubscriptionName, Timestamp,
+    BrokerError, CorrelationFilter, RuleDefinition, RuleFilter, RuleName, SqlAction,
+    SqlCompileError, SqlCompileLimit, SqlFilter, SubscriptionName, Timestamp,
 };
 use serde_amqp::{described::Described, descriptor::Descriptor};
 
@@ -36,6 +36,7 @@ const MAX_RULE_PAGE_SIZE: i32 = 100;
 // rule-description/action and filter codecs.
 const RULE_DESCRIPTION_CODE: u64 = 0x0000013700000004;
 const EMPTY_ACTION_CODE: u64 = 0x0000013700000005;
+const SQL_ACTION_CODE: u64 = 0x0000013700000006;
 const TRUE_FILTER_CODE: u64 = 0x000001370000007;
 const FALSE_FILTER_CODE: u64 = 0x000001370000008;
 const SQL_FILTER_CODE: u64 = 0x000001370000006;
@@ -236,7 +237,9 @@ fn correlation_filter(value: &Value) -> Result<RuleFilter, RuleRequestError> {
     Ok(filter)
 }
 
-fn create_rule(message: &Message) -> Result<(RuleName, RuleFilter), RuleRequestError> {
+fn create_rule(
+    message: &Message,
+) -> Result<(RuleName, RuleFilter, Option<SqlAction>), RuleRequestError> {
     let body = body_map(message)?;
     known_fields(body, &[RULE_NAME, RULE_DESCRIPTION])?;
     let rule_name = name(body)?;
@@ -252,25 +255,23 @@ fn create_rule(message: &Message) -> Result<(RuleName, RuleFilter), RuleRequestE
             "the outer and described rule names must agree",
         ));
     }
-    match get(description, SQL_ACTION) {
-        None | Some(Value::Null) => {}
+    let action = match get(description, SQL_ACTION) {
+        None | Some(Value::Null) => None,
         Some(Value::Map(action)) => {
             known_fields(action, &[EXPRESSION])?;
-            if !matches!(get(action, EXPRESSION), Some(Value::String(_))) {
+            let Some(Value::String(expression)) = get(action, EXPRESSION) else {
                 return Err(RuleRequestError::invalid(
                     "sql-rule-action requires a string expression",
                 ));
-            }
-            return Err(RuleRequestError::Unsupported(
-                "SQL rule actions are not implemented",
-            ));
+            };
+            Some(sql_action(expression)?)
         }
         _ => {
             return Err(RuleRequestError::invalid(
                 "sql-rule-action must be a map or null",
             ));
         }
-    }
+    };
     let filter = match (
         get(description, SQL_FILTER),
         get(description, CORRELATION_FILTER),
@@ -299,13 +300,13 @@ fn create_rule(message: &Message) -> Result<(RuleName, RuleFilter), RuleRequestE
         name: rule_name,
         filter,
         created_at: Timestamp::UNIX_EPOCH,
-        action: None,
+        action,
     };
     rule.encoded_size()?;
-    Ok((rule.name, rule.filter))
+    Ok((rule.name, rule.filter, rule.action))
 }
 
-fn sql_filter(expression: &str) -> Result<RuleFilter, RuleRequestError> {
+fn sql_source_limits(expression: &str) -> Result<(), SqlCompileError> {
     // Refuse an impossible borrowed source before the typed constructor copies it.
     for (actual, maximum, kind) in [
         (
@@ -323,14 +324,22 @@ fn sql_filter(expression: &str) -> Result<RuleFilter, RuleRequestError> {
         ),
     ] {
         if actual > maximum {
-            return Err(
-                BrokerError::SqlRuleCompilation(SqlCompileError::Limit { kind, maximum }).into(),
-            );
+            return Err(SqlCompileError::Limit { kind, maximum });
         }
     }
+    Ok(())
+}
+
+fn sql_filter(expression: &str) -> Result<RuleFilter, RuleRequestError> {
+    sql_source_limits(expression).map_err(BrokerError::SqlRuleCompilation)?;
     SqlFilter::new(expression)
         .map(RuleFilter::Sql)
         .map_err(|error| BrokerError::SqlRuleCompilation(error).into())
+}
+
+fn sql_action(expression: &str) -> Result<SqlAction, RuleRequestError> {
+    sql_source_limits(expression).map_err(BrokerError::SqlActionCompilation)?;
+    SqlAction::new(expression).map_err(|error| BrokerError::SqlActionCompilation(error).into())
 }
 
 fn remove_rule(message: &Message) -> Result<RuleName, RuleRequestError> {
@@ -404,11 +413,6 @@ fn encoded_filter(filter: &RuleFilter) -> Value {
 }
 
 fn encoded_rule(rule: &RuleDefinition) -> Result<Value, RuleRequestError> {
-    if rule.action.is_some() {
-        return Err(RuleRequestError::Unsupported(
-            "AMQP rule responses cannot represent SQL actions yet",
-        ));
-    }
     let created = i64::try_from(rule.created_at.as_millis()).map_err(|_| {
         RuleRequestError::Internal("rule creation timestamp cannot be represented on AMQP")
     })?;
@@ -419,7 +423,16 @@ fn encoded_rule(rule: &RuleDefinition) -> Result<Value, RuleRequestError> {
                 RULE_DESCRIPTION_CODE,
                 vec![
                     encoded_filter(&rule.filter),
-                    described(EMPTY_ACTION_CODE, vec![]),
+                    match &rule.action {
+                        Some(action) => described(
+                            SQL_ACTION_CODE,
+                            vec![
+                                Value::String(action.expression().to_owned()),
+                                Value::Int(20),
+                            ],
+                        ),
+                        None => described(EMPTY_ACTION_CODE, vec![]),
+                    },
                     Value::String(rule.name.as_str().to_owned()),
                     Value::Timestamp(created.into()),
                 ],
@@ -447,10 +460,18 @@ pub(super) async fn process<B: Broker>(
     };
     let kind = match operation {
         ADD_RULE_OPERATION => match create_rule(message) {
-            Ok((name, filter)) => CommandKind::CreateRule {
-                subscription,
-                name,
-                filter,
+            Ok((name, filter, action)) => match action {
+                Some(action) => CommandKind::CreateRuleWithAction {
+                    subscription,
+                    name,
+                    filter,
+                    action,
+                },
+                None => CommandKind::CreateRule {
+                    subscription,
+                    name,
+                    filter,
+                },
             },
             Err(error) => return error.response(message_id, tracking_id),
         },
@@ -469,12 +490,6 @@ pub(super) async fn process<B: Broker>(
                     return ManagementResponse::from_rejection(message_id, tracking_id, &error);
                 }
             };
-            if rules.iter().any(|rule| rule.action.is_some()) {
-                return RuleRequestError::Unsupported(
-                    "AMQP rule responses cannot represent SQL actions yet",
-                )
-                .response(message_id, tracking_id);
-            }
             let entries = match rules
                 .iter()
                 .skip(skip)

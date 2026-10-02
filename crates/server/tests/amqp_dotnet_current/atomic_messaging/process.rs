@@ -22,10 +22,10 @@ const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const DIAGNOSTIC_TAIL_BYTES: usize = 16 * 1024;
 
 #[derive(Debug)]
-pub(super) struct Output {
-    pub(super) status: ExitStatus,
-    pub(super) stdout: String,
-    pub(super) stderr: String,
+pub(crate) struct Output {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -295,6 +295,38 @@ pub(super) async fn run_client(
     run(
         command,
         "official warmed transaction client",
+        RUN_DEADLINE,
+        MAX_OUTPUT_BYTES,
+    )
+    .await
+}
+
+pub(crate) async fn build_rule_action_client(sdk_version: &str) -> TestResult<tempfile::TempDir> {
+    build_client(sdk_version).await
+}
+
+pub(crate) async fn run_rule_action_client(
+    dll: &Path,
+    endpoint: &str,
+    topic: &str,
+    ca_file: &Path,
+    ca_directory: &Path,
+) -> TestResult<Output> {
+    let mut command = Command::new("dotnet");
+    command
+        .env("DOTNET_PROCESSOR_COUNT", "2")
+        .env("SSL_CERT_FILE", ca_file)
+        .env("SSL_CERT_DIR", ca_directory)
+        .arg(dll)
+        .arg("rule-actions")
+        .arg(HOST)
+        .arg(endpoint)
+        .arg(topic)
+        .arg(RULE)
+        .arg(KEY);
+    run(
+        command,
+        "official SQL REMOVE action client",
         RUN_DEADLINE,
         MAX_OUTPUT_BYTES,
     )

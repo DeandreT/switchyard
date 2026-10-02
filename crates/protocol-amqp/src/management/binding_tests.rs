@@ -3,6 +3,8 @@ use auth::{PermissionSet, SharedAccessKey, SharedAccessPolicy, SharedAccessRule}
 use super::*;
 use crate::{Attachment, EntityMetadata, authorization::SharedAccessAuthentication};
 
+mod action_bindings;
+
 const ENTITY: &str = "Orders/subscriptions/Alpha";
 const HOST: &str = "tenant.servicebus.windows.net";
 const BUDGET: DeliveryBudget = DeliveryBudget {

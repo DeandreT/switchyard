@@ -9,7 +9,7 @@ mod fixture;
 #[path = "atomic_messaging/postconditions.rs"]
 mod postconditions;
 #[path = "atomic_messaging/process.rs"]
-mod process;
+pub(super) mod process;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 

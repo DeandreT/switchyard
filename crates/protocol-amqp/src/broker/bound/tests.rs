@@ -7,6 +7,8 @@ use domain::{EntityIncarnationKind, RuleFilter, RuleName};
 
 use super::*;
 
+mod action_bindings;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Call {
     Submit(EntityBinding, EntityPath, Box<CommandKind>),
