@@ -147,6 +147,8 @@ The [local registry](docs/transaction-registry.md) adds bounded declarations,
 controller lifetimes, and one-time discharge without enabling wire transactions.
 The [native transaction types](docs/amqp-transaction-types.md) are represented
 explicitly but refused by connection drivers until the wire lifecycle is built.
+The sender-side listener uses [retained ingress receipts](docs/retained-ingress.md)
+to preserve native content accounting through broker replies and acknowledgment flush.
 
 ## Production Contract
 

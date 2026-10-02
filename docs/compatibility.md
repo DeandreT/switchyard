@@ -507,9 +507,13 @@ Each connection also shares a 64 MiB retained encoded-content allowance across
 all sessions and both directions. Incoming partials are charged before append;
 completed deliveries keep their original encoded-byte charge while queued in a
 receiver's inbox. Detach or End does not refund an unread inbox, and replacing
-every session does not reset the connection allowance. Both receiving APIs
+every session does not reset the connection allowance. Both ordinary `recv` APIs
 refund a delivery's charge before returning it to the application, independently
-of settlement; dropping an inbox also refunds its queued messages. Incoming
+of settlement. Additive [retained receives](retained-ingress.md) keep that charge
+with a non-clonable receipt until it is destroyed, without delaying dequeue
+credit. The sender-side data listener uses these receipts through ingress parsing,
+broker replies, and disposition flush. Settlement does not refund a retained
+receipt; dropping an inbox still refunds its queued messages. Incoming
 exhaustion detaches only the offending link with `amqp:resource-limit-exceeded`.
 Outgoing queued and active payloads keep their full encoded-byte charge through
 the final Transfer flush. Failed or cancelled flushes retain it until teardown;
@@ -520,7 +524,8 @@ unavailable inboxes, and actor-owned teardown refund their actual leases.
 This allowance counts logical retained content, not exact heap usage. Decoded
 object overhead, custom decoder expansion, the bounded reader-frame backlog,
 unencoded command messages, transient encoding/decoding and frame copies, and
-application-owned messages are outside it. Outgoing message encoding now measures
+ordinary application-owned messages and explicit clones are outside it. Outgoing
+message encoding now measures
 and validates borrowed sections before content admission, applies the peer's
 limit with the exact encoded length, reserves the content allowance, and only
 then creates one fallibly reserved output buffer. Metadata and bodies are not
