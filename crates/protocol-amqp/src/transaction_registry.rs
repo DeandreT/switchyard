@@ -172,6 +172,7 @@ struct Entry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AbortCause {
     Requested,
+    StagingRefused,
     TimedOut,
     ControllerClosed,
     ConnectionClosed,
@@ -499,6 +500,48 @@ impl AtomicTransactionRegistry {
             })
             .map(|terminal| terminal.state)
             .ok_or(AtomicTransactionRegistryError::UnknownId)
+    }
+
+    /// Aborts only this controller's still-pending group and reports its state.
+    ///
+    /// This trusted cleanup does not manufacture a discharge request or change
+    /// its first fail flag. Started work and final decisions are not reversed.
+    /// Exact provenance remains required after controller or connection close.
+    /// Queued work retains its outside owner's lease until that work is dropped.
+    /// Normal deadline reaping still applies to other groups.
+    pub fn abort_pending(
+        &mut self,
+        controller: &AtomicTransactionController,
+        id: &TransactionId,
+    ) -> Result<AtomicCommitState, AtomicTransactionRegistryError> {
+        self.abort_pending_at(controller, id, Instant::now())
+    }
+
+    fn abort_pending_at(
+        &mut self,
+        controller: &AtomicTransactionController,
+        id: &TransactionId,
+        now: Instant,
+    ) -> Result<AtomicCommitState, AtomicTransactionRegistryError> {
+        self.require_provenance(controller)?;
+        self.reap_at(now);
+        let id = Self::id_key(id)?;
+        if let Some(terminal) = self.terminals.iter().find(|terminal| {
+            terminal.id == id && terminal.controller == controller.inner.generation
+        }) {
+            return Ok(terminal.state);
+        }
+        let entry = self
+            .entries
+            .get_mut(&id)
+            .filter(|entry| entry.controller == controller.inner.generation)
+            .ok_or(AtomicTransactionRegistryError::UnknownId)?;
+        if entry.permit.abort() {
+            entry.abort_cause = Some(AbortCause::StagingRefused);
+        }
+        let state = entry.permit.state();
+        self.reap_at(now);
+        Ok(state)
     }
 
     /// Reaps completed or expired transactions, returning the number retired.
