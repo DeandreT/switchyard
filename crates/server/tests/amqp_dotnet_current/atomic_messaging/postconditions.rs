@@ -11,6 +11,8 @@ use super::*;
 const EXPECTED_SEND: &[(u64, &str, &str)] = &[
     (1, "atomic-send-commit-a", "send-commit-a"),
     (2, "atomic-send-commit-b", "send-commit-b"),
+    (3, "atomic-cold-send-commit-a", "cold-send-commit-a"),
+    (4, "atomic-cold-send-commit-b", "cold-send-commit-b"),
 ];
 const EXPECTED_HELD: &[(u64, &str, &str)] = &[(2, "atomic-held-commit", "held-commit")];
 

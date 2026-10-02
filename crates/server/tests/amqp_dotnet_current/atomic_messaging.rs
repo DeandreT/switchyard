@@ -1,4 +1,4 @@
-//! Warmed, same-queue ambient transactions on the explicit raw TLS endpoint.
+//! Warmed and cold-first same-queue transactions on the explicit raw TLS endpoint.
 
 use std::{error::Error, path::Path, time::Duration};
 
@@ -17,16 +17,33 @@ const SEND_QUEUE: &str = "atomic-sdk-send";
 const HELD_QUEUE: &str = "atomic-sdk-held";
 const CONTROL_QUEUE: &str = "atomic-sdk-control";
 const SUCCESS: &str = "official .NET warmed same-queue transaction batch/rollback/complete/rearm/default refusal passed";
+const COLD_SUCCESS: &str = "official .NET cold-first same-queue transaction rollback/commit passed";
+
+fn success_markers_present(stdout: &str) -> bool {
+    let mut warmed = false;
+    let mut cold = false;
+    for line in stdout.split_inclusive('\n') {
+        let Some(line) = line.strip_suffix('\n') else {
+            continue;
+        };
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        warmed |= line == SUCCESS;
+        cold |= line == COLD_SUCCESS;
+    }
+    warmed && cold
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires dotnet and a NuGet restore"]
-async fn current_stable_dotnet_client_completes_warmed_same_queue_transactions() -> TestResult {
+async fn current_stable_dotnet_client_completes_warmed_and_cold_same_queue_transactions()
+-> TestResult {
     run_gate(CURRENT_SDK).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires dotnet and a NuGet restore"]
-async fn previous_stable_dotnet_client_completes_warmed_same_queue_transactions() -> TestResult {
+async fn previous_stable_dotnet_client_completes_warmed_and_cold_same_queue_transactions()
+-> TestResult {
     run_gate(PREVIOUS_SDK).await
 }
 
@@ -64,7 +81,7 @@ async fn run_backend<P: testkit::StoreProvider>(
             &fixture.ca_file,
             &fixture.ca_directory,
         ).await?;
-        if !output.status.success() || !output.stdout.lines().any(|line| line == SUCCESS) {
+        if !output.status.success() || !success_markers_present(&output.stdout) {
             return Err(std::io::Error::other(format!(
                 "official .NET {sdk_version} {backend} atomic gate failed ({})\nstdout:\n{}\nstderr:\n{}",
                 output.status, output.stdout, output.stderr,
@@ -87,4 +104,54 @@ async fn run_backend<P: testkit::StoreProvider>(
     );
     postconditions::check(&reopened, &namespace)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    #[test]
+    fn both_exact_completed_markers_are_required() {
+        assert!(success_markers_present(&format!(
+            "{SUCCESS}\n{COLD_SUCCESS}\n"
+        )));
+        assert!(success_markers_present(&format!(
+            "diagnostic\r\n{SUCCESS}\r\n{COLD_SUCCESS}\r\n"
+        )));
+        assert!(!success_markers_present(&format!("{SUCCESS}\n")));
+        assert!(!success_markers_present(&format!("{COLD_SUCCESS}\n")));
+        assert!(!success_markers_present(&format!(
+            "{COLD_SUCCESS}\n{COLD_SUCCESS}\n"
+        )));
+    }
+
+    #[test]
+    fn marker_substrings_and_decorated_lines_do_not_succeed() {
+        assert!(!success_markers_present(&format!(
+            "prefix {SUCCESS}\n{COLD_SUCCESS}\n"
+        )));
+        assert!(!success_markers_present(&format!(
+            "{SUCCESS}\n{COLD_SUCCESS} suffix\n"
+        )));
+        assert!(!success_markers_present(&format!(
+            "{SUCCESS}\n {COLD_SUCCESS}\n"
+        )));
+        assert!(!success_markers_present(&format!(
+            "{SUCCESS} {COLD_SUCCESS}\n"
+        )));
+    }
+
+    #[test]
+    fn truncated_or_unterminated_markers_do_not_succeed() {
+        let truncated = &COLD_SUCCESS[..COLD_SUCCESS.len() - 1];
+        assert!(!success_markers_present(&format!(
+            "{SUCCESS}\n{truncated}\n"
+        )));
+        assert!(!success_markers_present(&format!(
+            "{SUCCESS}\n{COLD_SUCCESS}"
+        )));
+        assert!(!success_markers_present(&format!(
+            "{SUCCESS}\n{COLD_SUCCESS}\r"
+        )));
+    }
 }

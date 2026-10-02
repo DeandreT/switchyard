@@ -3,7 +3,7 @@ using Azure.Messaging.ServiceBus;
 using Microsoft.Azure.Amqp;
 using System.Transactions;
 
-internal static class AtomicMessagingCases
+internal static partial class AtomicMessagingCases
 {
     private static readonly TimeSpan OperationTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan ScopeTimeout = TimeSpan.FromSeconds(30);
@@ -42,6 +42,7 @@ internal static class AtomicMessagingCases
             await SendBatchesAsync(sends, sendPeek);
             await CompleteAndSendAsync(heldSends, held, heldPeek);
             await OrdinaryRefusalAsync(controlSends, control);
+            await ColdSendsAsync(args[1], args[2], args[4], credential, sendPeek);
         }
         catch (Exception exception)
         {
@@ -70,6 +71,7 @@ internal static class AtomicMessagingCases
         }
 
         Console.WriteLine(Success);
+        Console.WriteLine(ColdSuccess);
         return 0;
     }
 
