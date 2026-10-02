@@ -340,6 +340,25 @@ impl<P: StoreProvider> Node<P> {
         Ok(())
     }
 
+    pub(super) async fn wait_release_committed(&self, entity: &EntityPath, id: &str) -> TestResult {
+        self.wait_released(entity, id).await?;
+        // A point read can observe release while its owner apply is still returning.
+        // Queue a pure owner read before taking a whole-store snapshot.
+        let config = timeout(
+            DEADLINE,
+            self._broker
+                .handle()
+                .queue_config(self.namespace.clone(), entity.clone()),
+        )
+        .await??;
+        assert!(config.is_some(), "the browsed queue remains configured");
+        assert!(
+            self.session(entity, id)?.lock.is_none(),
+            "the exact session release committed before the owner read"
+        );
+        Ok(())
+    }
+
     pub(super) async fn wait_removed(&self, entity: &EntityPath, number: u64) -> TestResult {
         timeout(DEADLINE, async {
             loop {

@@ -347,7 +347,7 @@ async fn required_entity_management_only_browse<P: StoreProvider>(
     at_stage("close-A-owner", timeout(DEADLINE, owner.close()).await)??;
     at_stage(
         "wait-A-hold-released",
-        node.wait_released(&entity, "A").await,
+        node.wait_release_committed(&entity, "A").await,
     )?;
     let mut other_session = at_stage(
         "attach-B-owner",
@@ -366,7 +366,7 @@ async fn required_entity_management_only_browse<P: StoreProvider>(
     )??;
     at_stage(
         "wait-B-hold-released",
-        node.wait_released(&entity, "B").await,
+        node.wait_release_committed(&entity, "B").await,
     )?;
     assert!(
         browse(&node, &mut management, 1, 8, None, "empty-after-release")
