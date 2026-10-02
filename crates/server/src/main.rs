@@ -62,6 +62,11 @@ struct Arguments {
     #[arg(long)]
     websocket_listen: Option<SocketAddr>,
 
+    /// Enable experimental same-queue atomic messaging on a separate raw
+    /// TCP/TLS address. Development only; SDK transaction scopes are unsupported.
+    #[arg(long)]
+    experimental_atomic_messaging_listen: Option<SocketAddr>,
+
     /// PEM certificate chain for the configured TLS listeners.
     #[arg(long, value_name = "PATH")]
     tls_certificate: Option<PathBuf>,
@@ -98,6 +103,16 @@ impl From<ModeArgument> for DeploymentMode {
             ModeArgument::Production => Self::Production,
         }
     }
+}
+
+fn validate_experimental_atomic_messaging_listener(
+    mode: DeploymentMode,
+    address: Option<SocketAddr>,
+) -> Result<(), StartupError> {
+    if mode == DeploymentMode::Production && address.is_some() {
+        return Err(StartupError::ExperimentalAtomicMessagingInProduction);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -238,9 +253,15 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), StartupError> {
     logging::initialize()?;
+    run_with_arguments(Arguments::parse())
+}
 
-    let arguments = Arguments::parse();
+fn run_with_arguments(arguments: Arguments) -> Result<(), StartupError> {
     let mode = DeploymentMode::from(arguments.mode);
+    validate_experimental_atomic_messaging_listener(
+        mode,
+        arguments.experimental_atomic_messaging_listen,
+    )?;
     let cluster = ClusterConfig {
         mode,
         voters: arguments.voters,
@@ -316,6 +337,23 @@ fn run() -> Result<(), StartupError> {
         } else {
             None
         };
+        let experimental = if let Some(address) = arguments.experimental_atomic_messaging_listen {
+            let socket = tokio::net::TcpListener::bind(address)
+                .await
+                .map_err(|error| StartupError::Listen {
+                    address: address.to_string(),
+                    detail: error.to_string(),
+                })?;
+            let listener = amqp_listener(
+                broker.handle(),
+                namespace.clone(),
+                tls.as_ref(),
+                shared_access_authentication.as_ref(),
+            );
+            Some((listener, socket))
+        } else {
+            None
+        };
         let native = if let Some(address) = arguments.admin_listen {
             let socket = tokio::net::TcpListener::bind(address)
                 .await
@@ -343,6 +381,9 @@ fn run() -> Result<(), StartupError> {
         if let Some((_, socket)) = &websocket {
             info!(address = %socket.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, namespace = %namespace, tls = tls.is_some(), "accepting AMQP WebSocket connections");
         }
+        if let Some((_, socket)) = &experimental {
+            info!(address = %socket.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, namespace = %namespace, tls = tls.is_some(), sdk_transaction_scopes = false, "accepting experimental atomic messaging connections");
+        }
         let amqp = amqp_listener(
             broker.handle(),
             namespace,
@@ -362,6 +403,14 @@ fn run() -> Result<(), StartupError> {
                 None => std::future::pending().await,
             }
         };
+        let serve_experimental = async {
+            match experimental {
+                Some((experimental, socket)) => {
+                    experimental.serve_atomic_messaging_ingress(socket).await
+                }
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             result = amqp.serve(listener) => {
                 result.map_err(|error| StartupError::Runtime(error.to_string()))
@@ -370,6 +419,9 @@ fn run() -> Result<(), StartupError> {
                 result.map_err(|error| StartupError::Runtime(error.to_string()))
             }
             result = serve_websocket => {
+                result.map_err(|error| StartupError::Runtime(error.to_string()))
+            }
+            result = serve_experimental => {
                 result.map_err(|error| StartupError::Runtime(error.to_string()))
             }
         }
@@ -438,6 +490,122 @@ mod tests {
         assert_eq!(
             configured.admin_listen.expect("admin listener").port(),
             9080
+        );
+    }
+
+    #[test]
+    fn experimental_atomic_messaging_listener_is_opt_in_and_independent() {
+        let defaults = Arguments::try_parse_from(["switchyard"]).expect("default arguments");
+        assert!(defaults.experimental_atomic_messaging_listen.is_none());
+        let configured = Arguments::try_parse_from([
+            "switchyard",
+            "--listen",
+            "127.0.0.1:5672",
+            "--websocket-listen",
+            "127.0.0.1:8080",
+            "--admin-listen",
+            "127.0.0.1:9080",
+            "--experimental-atomic-messaging-listen",
+            "127.0.0.1:5673",
+        ])
+        .expect("separate experimental listener arguments");
+        assert_eq!(configured.listen.expect("ordinary listener").port(), 5672);
+        assert_eq!(
+            configured
+                .websocket_listen
+                .expect("WebSocket listener")
+                .port(),
+            8080
+        );
+        assert_eq!(
+            configured.admin_listen.expect("admin listener").port(),
+            9080
+        );
+        assert_eq!(
+            configured
+                .experimental_atomic_messaging_listen
+                .expect("experimental listener")
+                .port(),
+            5673
+        );
+        assert!(
+            validate_experimental_atomic_messaging_listener(
+                DeploymentMode::Development,
+                configured.experimental_atomic_messaging_listen,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn malformed_experimental_listener_address_is_refused_by_the_parser() {
+        assert!(
+            Arguments::try_parse_from([
+                "switchyard",
+                "--experimental-atomic-messaging-listen",
+                "not-a-socket-address",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn production_without_experimental_listener_retains_its_existing_validation() {
+        assert!(
+            validate_experimental_atomic_messaging_listener(DeploymentMode::Production, None,)
+                .is_ok()
+        );
+        let arguments = Arguments::try_parse_from(["switchyard", "--mode", "production"])
+            .expect("ordinary production arguments");
+        assert_eq!(
+            run_with_arguments(arguments),
+            Err(StartupError::TlsRequiredInProduction)
+        );
+    }
+
+    #[test]
+    fn experimental_listener_is_refused_before_credentials_or_storage_are_opened() {
+        let directory = tempfile::TempDir::new().expect("temporary startup directory");
+        let store = directory.path().join("unopened-store");
+        let certificate = directory.path().join("missing-certificate.pem");
+        let private_key = directory.path().join("missing-private-key.pem");
+        let shared_key = directory.path().join("missing-shared-key");
+        let arguments = Arguments::try_parse_from([
+            "switchyard",
+            "--mode",
+            "production",
+            "--voters",
+            "2",
+            "--experimental-atomic-messaging-listen",
+            "127.0.0.1:0",
+            "--storage",
+            "fjall",
+            "--data-dir",
+            store.to_str().expect("test store path"),
+            "--tls-certificate",
+            certificate.to_str().expect("test certificate path"),
+            "--tls-private-key",
+            private_key.to_str().expect("test private-key path"),
+            "--shared-access-key-name",
+            "rule",
+            "--shared-access-key-file",
+            shared_key.to_str().expect("test shared-key path"),
+        ])
+        .expect("unsupported production listener arguments");
+        assert_eq!(
+            run_with_arguments(arguments),
+            Err(StartupError::ExperimentalAtomicMessagingInProduction)
+        );
+        assert!(!store.exists());
+        assert_eq!(
+            std::fs::read_dir(directory.path())
+                .expect("startup directory")
+                .count(),
+            0
+        );
+        assert_eq!(
+            StartupError::ExperimentalAtomicMessagingInProduction.to_string(),
+            "--experimental-atomic-messaging-listen is only available in development mode"
         );
     }
 

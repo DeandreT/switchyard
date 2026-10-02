@@ -85,6 +85,8 @@ pub enum StartupError {
     LoggingInitialization,
     #[error("production mode cannot run on in-memory storage")]
     MemoryStorageInProduction,
+    #[error("--experimental-atomic-messaging-listen is only available in development mode")]
+    ExperimentalAtomicMessagingInProduction,
     #[error("the durable backend needs a data directory")]
     MissingDataDirectory,
     #[error("could not listen on {address}: {detail}")]
