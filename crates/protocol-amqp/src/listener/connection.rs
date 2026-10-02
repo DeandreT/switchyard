@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 use amqp::ServerConnection;
 use domain::NamespaceName;
@@ -9,9 +9,9 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
-use super::{AmqpListener, serve_open_connection, websocket};
+use super::{AmqpListener, atomic_ingress, serve_open_connection, websocket};
 use crate::{
-    Broker, SharedAccessAuthentication,
+    Broker, NativeAtomicBroker, SharedAccessAuthentication,
     authorization::{ConnectionAuthorization, SharedAccessSaslAcceptor},
 };
 
@@ -21,6 +21,14 @@ impl<B: Broker> AmqpListener<B> {
     /// A connection that fails takes only itself down: one client's protocol
     /// error is not the node's.
     pub async fn serve(self, listener: TcpListener) -> std::io::Result<()> {
+        self.serve_with_driver(listener, OrdinaryDriver).await
+    }
+
+    async fn serve_with_driver<D: ConnectionDriver<B>>(
+        self,
+        listener: TcpListener,
+        driver: D,
+    ) -> std::io::Result<()> {
         self.connection_options
             .validate()
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
@@ -75,6 +83,7 @@ impl<B: Broker> AmqpListener<B> {
                                         connection_options,
                                         deadline,
                                     },
+                                    driver,
                                 )
                                 .await
                             }
@@ -94,6 +103,7 @@ impl<B: Broker> AmqpListener<B> {
                                 connection_options,
                                 deadline,
                             },
+                            driver,
                         )
                         .await
                     }
@@ -106,6 +116,74 @@ impl<B: Broker> AmqpListener<B> {
     }
 }
 
+impl<B: NativeAtomicBroker> AmqpListener<B> {
+    /// Explicitly serves coordinator and primary non-session queue posting links.
+    /// Ordinary `serve` remains transaction-disabled. This endpoint does not
+    /// support transactional receiving, management links, or SDK transaction scopes.
+    pub async fn serve_atomic_posting_ingress(self, listener: TcpListener) -> std::io::Result<()> {
+        self.serve_with_driver(listener, AtomicPostingDriver).await
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AdmissionMode {
+    Ordinary,
+    AtomicPosting,
+}
+
+trait ConnectionDriver<B: Broker>: Copy + Send + 'static {
+    const ADMISSION: AdmissionMode;
+
+    fn serve_open<'a>(
+        self,
+        connection: &'a mut ServerConnection,
+        namespace: NamespaceName,
+        broker: B,
+        authorization: Option<Arc<ConnectionAuthorization>>,
+    ) -> impl Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a;
+}
+
+#[derive(Clone, Copy)]
+struct OrdinaryDriver;
+
+impl<B: Broker> ConnectionDriver<B> for OrdinaryDriver {
+    const ADMISSION: AdmissionMode = AdmissionMode::Ordinary;
+
+    fn serve_open<'a>(
+        self,
+        connection: &'a mut ServerConnection,
+        namespace: NamespaceName,
+        broker: B,
+        authorization: Option<Arc<ConnectionAuthorization>>,
+    ) -> impl Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a
+    {
+        serve_open_connection(connection, namespace, broker, authorization)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AtomicPostingDriver;
+
+impl<B: NativeAtomicBroker> ConnectionDriver<B> for AtomicPostingDriver {
+    const ADMISSION: AdmissionMode = AdmissionMode::AtomicPosting;
+
+    fn serve_open<'a>(
+        self,
+        connection: &'a mut ServerConnection,
+        namespace: NamespaceName,
+        broker: B,
+        authorization: Option<Arc<ConnectionAuthorization>>,
+    ) -> impl Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a
+    {
+        atomic_ingress::serve_atomic_posting_connection(
+            connection,
+            namespace,
+            broker,
+            authorization,
+        )
+    }
+}
+
 struct ConnectionSettings<B> {
     container_id: String,
     namespace: NamespaceName,
@@ -115,26 +193,19 @@ struct ConnectionSettings<B> {
     deadline: tokio::time::Instant,
 }
 
-async fn serve_transport_connection<Io, B>(
+async fn serve_transport_connection<Io, B, D>(
     stream: Io,
     websocket: bool,
     settings: ConnectionSettings<B>,
+    driver: D,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     B: Broker,
+    D: ConnectionDriver<B>,
 {
     if !websocket {
-        return serve_connection(
-            stream,
-            settings.container_id,
-            settings.namespace,
-            settings.broker,
-            settings.shared_access_authentication,
-            settings.connection_options,
-            settings.deadline,
-        )
-        .await;
+        return serve_connection(stream, settings, driver).await;
     }
     let (stream, close) = tokio::time::timeout_at(
         settings.deadline,
@@ -142,33 +213,29 @@ where
     )
     .await
     .map_err(|_| handshake_timeout_error())??;
-    let result = serve_connection(
-        stream,
-        settings.container_id,
-        settings.namespace,
-        settings.broker,
-        settings.shared_access_authentication,
-        settings.connection_options,
-        settings.deadline,
-    )
-    .await;
+    let result = serve_connection(stream, settings, driver).await;
     let closed = close.finish().await;
     result.and(closed)
 }
 
-async fn serve_connection<Io, B>(
+async fn serve_connection<Io, B, D>(
     stream: Io,
-    container_id: String,
-    namespace: NamespaceName,
-    broker: B,
-    shared_access_authentication: Option<SharedAccessAuthentication>,
-    connection_options: amqp::ConnectionOptions,
-    deadline: tokio::time::Instant,
+    settings: ConnectionSettings<B>,
+    driver: D,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     B: Broker,
+    D: ConnectionDriver<B>,
 {
+    let ConnectionSettings {
+        container_id,
+        namespace,
+        broker,
+        shared_access_authentication,
+        connection_options,
+        deadline,
+    } = settings;
     if deadline <= tokio::time::Instant::now() {
         return Err(handshake_timeout_error());
     }
@@ -176,7 +243,7 @@ where
         let (connection, authorization) = match shared_access_authentication {
             Some(config) => {
                 let sasl_acceptor = SharedAccessSaslAcceptor::new(&config);
-                let connection = ServerConnection::accept_with_options(
+                let connection = accept_connection::<Io, B, D>(
                     stream,
                     container_id,
                     Some(Arc::new(sasl_acceptor.clone())),
@@ -187,13 +254,8 @@ where
                 (connection, Some(authorization))
             }
             None => (
-                ServerConnection::accept_with_options(
-                    stream,
-                    container_id,
-                    None,
-                    connection_options,
-                )
-                .await?,
+                accept_connection::<Io, B, D>(stream, container_id, None, connection_options)
+                    .await?,
                 None,
             ),
         };
@@ -206,11 +268,35 @@ where
         connection.shutdown().await;
         return Err(handshake_timeout_error());
     }
-    let result = serve_open_connection(&mut connection, namespace, broker, authorization).await;
+    let result = driver
+        .serve_open(&mut connection, namespace, broker, authorization)
+        .await;
     // Dropping a connection initiates cancellation, but admission is not freed
     // until both engine tasks have relinquished their halves of the socket.
     connection.shutdown().await;
     result
+}
+
+async fn accept_connection<Io, B, D>(
+    stream: Io,
+    container_id: String,
+    sasl: Option<Arc<dyn amqp::SaslAuthenticator>>,
+    options: amqp::ConnectionOptions,
+) -> Result<ServerConnection, amqp::EngineError>
+where
+    Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    B: Broker,
+    D: ConnectionDriver<B>,
+{
+    match D::ADMISSION {
+        AdmissionMode::Ordinary => {
+            ServerConnection::accept_with_options(stream, container_id, sasl, options).await
+        }
+        AdmissionMode::AtomicPosting => {
+            ServerConnection::accept_with_transactional_ingress(stream, container_id, sasl, options)
+                .await
+        }
+    }
 }
 
 fn handshake_timeout_error() -> Box<dyn std::error::Error + Send + Sync> {

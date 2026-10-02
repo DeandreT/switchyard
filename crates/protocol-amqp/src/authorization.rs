@@ -112,6 +112,32 @@ impl ConnectionAuthorization {
         }
     }
 
+    pub(crate) async fn wait_until_no_valid_grant(&self) {
+        loop {
+            let changed = self.grant_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let now = epoch_seconds();
+            let expiry = self
+                .grants
+                .read()
+                .await
+                .iter()
+                .map(AccessGrant::expires_at_epoch_seconds)
+                .filter(|expiry| *expiry > now)
+                .max();
+            let Some(expiry) = expiry else { return };
+            if expiry == u64::MAX {
+                changed.await;
+                continue;
+            }
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(expiry.saturating_sub(now))) => {}
+                () = &mut changed => {}
+            }
+        }
+    }
+
     pub(crate) async fn validate_and_add(
         &self,
         token: &str,
@@ -568,5 +594,29 @@ mod tests {
         )
         .await
         .expect("an empty permission set does not wait");
+    }
+
+    #[tokio::test]
+    async fn coordinator_wait_ends_only_after_the_last_valid_grant_is_gone() {
+        let connection = connection(PermissionSet::LISTEN);
+        let grant = connection.grants.read().await[0].clone();
+        connection.grants.write().await.push(grant);
+        let mut waiting = Box::pin(connection.wait_until_no_valid_grant());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(waiting.as_mut(), &mut context).is_pending());
+        let _ = connection.grants.write().await.pop();
+        connection.grant_changed.notify_waiters();
+        assert!(std::future::Future::poll(waiting.as_mut(), &mut context).is_pending());
+        connection.grants.write().await.clear();
+        connection.grant_changed.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the registered watcher observes grant removal");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            connection.wait_until_no_valid_grant(),
+        )
+        .await
+        .expect("a connection without grants is immediately unauthorized");
     }
 }

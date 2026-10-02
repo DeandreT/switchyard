@@ -37,6 +37,7 @@ use crate::{
     stamp_session_filter,
 };
 
+mod atomic_ingress;
 mod connection;
 mod routing;
 mod websocket;
