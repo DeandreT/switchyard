@@ -66,6 +66,11 @@ submission error means that the owner response and its resources are
 unavailable. A refused queue admission recovers the original job and returns its
 resources in a completion when possible.
 
+The optional [portable broker extension](native-atomic-broker.md) exposes this
+same handoff to protocol adapters without depending on server or backend error
+types. It preserves unique resources on known failures and the existing
+pre-first-poll cancellation guard; it does not add another owner decision.
+
 The synchronous broker owner performs no native wire I/O. The caller consumes
 the completion and finishes its resources asynchronously using the already
 recorded decision. Losing the reply does not undo a commit; a failed wire flush

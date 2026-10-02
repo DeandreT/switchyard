@@ -20,8 +20,9 @@ The response uses Rejected only if the original coordinator source advertised
 it; otherwise it detaches that coordinator. This follows
 [AMQP Part 4, section 4.2](https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transactions-v1.0-os.html).
 A successfully flushed Rejected leaves the controller and its other groups
-active. A scoped detach retires that controller's pending groups, not unrelated
-controllers or sessions. The adapter remains responsible for any logical
+active. The normal scoped detach retires that controller's pending groups, not
+unrelated controllers or sessions; the error-history fallback described below
+can instead close its session. The adapter remains responsible for any logical
 reservation it created before declining the native declaration.
 
 ## Staging
@@ -37,8 +38,9 @@ Committed, Rejected, Indeterminate, and terminal replay receipts cannot use this
 path. In particular, an owner-issued Rejected decision is not relabeled as a
 pre-owner abort. These refusals make no storage calls.
 
-Original complete or provisionally acknowledged postings receive no-outcome
-cleanup dispositions before the control response is sent. Cleanup uses bounded
+Still-live original complete or provisionally acknowledged postings that have
+not already been sender-settled receive no-outcome cleanup dispositions before
+the control response is sent. Cleanup uses bounded
 original delivery proofs, including their exact link and delivery generations;
 reused numeric IDs and tags cannot authorize dispositions against replacements.
 First settlement retires the original alias; Second leaves it awaiting sender
@@ -74,3 +76,26 @@ metadata-history limits. They add no storage format or recovery log. The
 [paired broker handoff](native-atomic-owner-handoff.md) still needs a serialized,
 authorized connection adapter; faulted owner-completion resources do not gain a
 new guaranteed negative wire response from these pre-owner receipt methods.
+
+## Scoped Link Errors
+
+Both native endpoints expose `close_with_error()` using the existing exact
+link-generation Detach path. A transactional receiver can therefore report a
+posting-stage failure promptly, before a controller sends Discharge, without
+counterfeiting provisional Accepted or applying an ordinary posting outcome.
+Closing a coordinator retires its pending groups; closing a receiver faults the
+pending groups that posted through it. The normal scoped path leaves unrelated
+endpoints independent. Existing error-history limits still apply: inability to
+retain the required original-delivery history closes that session rather than
+discarding exact-generation protection, and can retire its other pending links.
+
+Retirement and pending native faults occur before Detach write and flush. A
+started claim keeps its authority and recorded decision. Error close is not a
+successful discharge or proof of physical rollback. For a live route, its
+response observes local write and flush, not the peer's Detach acknowledgment.
+An already retired original route instead succeeds as a no-op without wire I/O.
+An unpolled close future
+does nothing; a queued close can finish after its waiter is canceled. Actual I/O
+failure can terminate the connection. Caller-held original receipts keep their
+payload charges until destruction, and a stale route cannot close a replacement
+that reused its numeric handle or name.

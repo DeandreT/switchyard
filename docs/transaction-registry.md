@@ -68,6 +68,16 @@ the owner destroys it, even if the registry observes that it has been aborted.
 The exact flag-conflict behavior is a local foundation policy, not a claim that
 wire rollback Discharge behavior is implemented.
 
+`abort_pending()` is a trusted, targeted cancellation operation, not a synthetic
+wire Discharge. It checks exact controller provenance and changes only that
+group's Pending permit to Aborted. It does not record a fail flag, close the
+controller, cancel siblings, or reverse Started or terminal work. The first
+actual discharge still establishes its original flag and replay policy. An own
+closed controller can use this operation for retained-state cleanup, not new
+admission. Locally staged work is destroyed when reaped; a queued submission
+keeps its outside work lease until its real owner drops it.
+Normal deadline expiry processing still applies during this operation.
+
 A group with no staged actions has no queue binding. Its distinct empty owned
 submission uses the broker owner to claim and publish a commit decision without
 entity validation, clock sampling, storage access, or receiver wakeups. It still
@@ -77,7 +87,7 @@ queue or controller address is used as a binding.
 Each declaration has an immutable two-minute monotonic deadline starting at
 declaration. This is an explicit local policy, not Azure's documented
 [first-operation timeout](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-transactions).
-Declare, stage, discharge, state, and explicit expiry processing retire expired
+Declare, stage, discharge, targeted abort, state, and explicit expiry processing retire expired
 pending work;
 there is no registry-owned background timer. The owner also checks the deadline
 when claiming a submission. Expiry, controller retirement, and connection close
