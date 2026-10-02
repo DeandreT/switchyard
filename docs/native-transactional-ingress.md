@@ -27,6 +27,9 @@ Ordinary native senders separately expose a
 [sending-link observer](native-sender-provenance.md). Its settlement-origin check
 does not grant original-delivery or retirement authority; transactional receiver
 dispositions remain unsupported even on this posting-only native path.
+The separate [original outgoing observer](native-outgoing-delivery-provenance.md)
+preserves an exact delivery generation, but its getter follows ordinary outcome
+resolution. It adds no pre-outcome endpoint or transactional retirement path.
 
 Coordinators support local transactions, multiple transactions per session, and
 posting across sessions on the same connection. Distributed/global declarations,

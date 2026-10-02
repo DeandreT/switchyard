@@ -39,11 +39,13 @@ proof that the delivery remains usable. Settlement still performs its original
 exact-identity and liveness checks.
 
 This is link provenance, not an original outgoing-delivery generation. Different
-deliveries on the same active sender share that link origin. The existing
-`AckIdentity` is created only after an ordinary terminal outcome is resolved;
-it is not a proof covering the delivery's entire outgoing lifetime. Reusing an
-ID or tag cannot turn these comparisons into authority over a replacement
-delivery.
+deliveries on the same active sender share that link origin. The separate
+[original outgoing observer](native-outgoing-delivery-provenance.md) distinguishes
+those generations, but is exposed only after outcome resolution and grants no
+live-delivery or retirement authority. The existing `AckIdentity` is created only
+after an ordinary terminal outcome is resolved; it remains a distinct late
+acknowledgment token. Reusing an ID or tag cannot turn these comparisons into
+authority over a replacement delivery.
 
 Transactional receiver dispositions are still refused before ordinary settlement
 mutation, on both ordinary native connections and the opted-in

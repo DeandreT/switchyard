@@ -734,6 +734,12 @@ checks exact active link and connection origin, including First-mode outcomes
 without an acknowledgment token. This does not prove an original outgoing
 delivery generation or settlement usability, and changes no ordinary settlement
 or transactional-disposition refusal behavior.
+Additive [original outgoing delivery identities](native-outgoing-delivery-provenance.md)
+preserve an actor-minted generation through send completion and later
+acknowledgment metadata. `PendingSettlement::delivery_identity()` is historical
+provenance after outcome resolution, not a pre-outcome handle or proof of an
+unsettled delivery. Observer clones retain metadata only; settlement and
+transactional-retirement support are unchanged.
 An End on an unmapped channel is refused without manufacturing a session reply.
 Client Begin searches only vacant channels within the peer's inclusive channel
 limit. Pending, live, and ending sessions cannot be overwritten. Client End

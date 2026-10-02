@@ -163,6 +163,9 @@ replaced receiving-link generations; decoder-aware acceptance remains opt-in
 per link and does not stage logical batch work.
 [Native sender identities](docs/native-sender-provenance.md) check active
 sending-link origin without granting delivery settlement or retirement authority.
+[Original outgoing delivery identities](docs/native-outgoing-delivery-provenance.md)
+preserve exact historical generations after outcome resolution, without reporting
+live delivery state or granting settlement authority.
 
 ## Production Contract
 
