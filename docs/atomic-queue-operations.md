@@ -7,7 +7,11 @@ Declare/Discharge, transaction IDs, staged wire acknowledgments, wire timeouts,
 cross-entity transactions, and successful-request retry deduplication are not
 implemented by this API.
 The separate [AMQP transaction types](amqp-transaction-types.md) are decoded but
-refused by the connection drivers; they do not expose this trusted API on the wire.
+refused on ordinary/default listener paths. The explicit
+[posting-only ingress](atomic-posting-ingress.md) joins native receipts to this
+foundation for one primary non-session queue; its wire control and lifetime
+machinery is separate from these trusted core APIs. It does not establish
+general AMQP or SDK transaction compatibility.
 
 ## Scope And Admission
 

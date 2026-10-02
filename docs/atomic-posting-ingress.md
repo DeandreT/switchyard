@@ -55,8 +55,9 @@ also cannot establish whether work started or committed.
 
 ## Lifetime And Limits
 
-The connection supervises at most 32 session collectors and 128 live links,
-with a 256-event owner channel. The owner bounds controllers and retained groups
+The connection shares 32 slots between pending session admissions and running
+session collectors, and supervises at most 128 live links with a 256-event owner
+channel. The transaction owner separately bounds controllers and retained groups
 to 32, original postings per group to 100, and owned I/O operations to 128.
 Logical message, action, content, and value-item budgets still apply independently
 of outer native posting counts. These are local limits, not Azure quotas or an
@@ -65,15 +66,23 @@ exact process-memory guarantee.
 Normal worker cleanup waits for the owner's logical pending-cancellation
 acknowledgment before releasing held original receipts and waiting for Detach.
 Connection-owner destruction closes logical pending authority before dropping
-its owned operations and aborting collectors. Unexpected worker failures stop
-the connection rather than silently abandoning its other collectors. Native
+its owned operations, releasing queued native receipts, or aborting collectors.
+Unexpected worker failures stop the connection rather than silently abandoning
+its other collectors. Native
 retirement hooks independently fault pending authority; started decisions remain
 irreversible.
 
-Session Begin admission still awaits the native write path inline and can pause
-owner event and timer processing until that path completes or its configured
-write timeout fires. Logical tickets independently check the monotonic deadline
-at claim; this pause is not an extension of commit authority.
+Session admissions are owned futures in a bounded pool, polled alongside
+transaction events, operation completions, and deadline ticks. Waiting for a
+Begin write and flush does not hold up the connection owner's ready work. The
+native actor still serializes its writes: a blocked Begin can delay other native
+commands, and a failed flush can terminate the actor.
+
+Dropping an admission future cancels its caller's wait, not an already queued
+AcceptSession command. It does not add a wire End or admission-rollback
+guarantee. Shutdown closes logical pending authority before draining queued
+native events, dropping admission futures, or aborting collectors. Logical
+tickets independently check their monotonic deadline at claim.
 
 The local 120-second deadline runs from Declare. Expiry closes the exact native
 coordinator with `amqp:transaction:timeout` and closes its logical controller,
