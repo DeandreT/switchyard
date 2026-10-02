@@ -73,6 +73,10 @@ pub(super) fn sas_token(audience: &str, rule: &str) -> TestResult<String> {
         .as_secs()
         .checked_add(600)
         .ok_or("SAS expiry overflow")?;
+    sas_token_with_expiry(audience, rule, expiry)
+}
+
+pub(super) fn sas_token_with_expiry(audience: &str, rule: &str, expiry: u64) -> TestResult<String> {
     let resource: String = byte_serialize(audience.as_bytes()).collect();
     let mut hmac = Hmac::<Sha256>::new_from_slice(KEY.as_bytes())?;
     hmac.update(format!("{resource}\n{expiry}").as_bytes());

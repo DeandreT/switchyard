@@ -3,6 +3,9 @@ use super::*;
 #[path = "cold_first/security.rs"]
 mod security;
 use security::{Security, sas_token};
+#[path = "cold_first/reauthorization.rs"]
+mod reauthorization;
+pub(super) use reauthorization::expired_authorization_then_same_connection_regrant_commits;
 
 const AUDIENCE: &str = "amqps://tenant.servicebus.windows.net/orders";
 

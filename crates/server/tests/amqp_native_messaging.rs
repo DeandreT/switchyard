@@ -91,6 +91,11 @@ macro_rules! backend_cases {
                 cold_first::initial_authorization_deadline_is_a_real_close($provider).await
             }
             #[tokio::test]
+            async fn expired_authorization_then_same_connection_regrant_commits() -> TestResult {
+                cold_first::expired_authorization_then_same_connection_regrant_commits($provider)
+                    .await
+            }
+            #[tokio::test]
             async fn sdk_defaults_rearm_the_same_canonical_original_before_mixed_commit()
             -> TestResult {
                 sdk_defaults::sdk_defaults_rearm_the_same_canonical_original_before_mixed_commit(
