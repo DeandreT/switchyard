@@ -1,8 +1,9 @@
 //! An encoded frame is checked against the peer's limit before any socket write.
 
-use std::io;
+use std::{io, sync::Arc};
 
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::Notify;
 
 use crate::{Frame, Performative, codec};
 
@@ -27,6 +28,7 @@ pub(super) struct FrameWriter<W> {
     activity: Activity,
     content_budget: ContentBudget,
     error_link_names: ErrorLinkNames,
+    reservation_cleanup: Arc<Notify>,
 }
 
 impl<W> FrameWriter<W> {
@@ -45,11 +47,16 @@ impl<W> FrameWriter<W> {
             activity: Activity::new(),
             content_budget: ContentBudget::default(),
             error_link_names: ErrorLinkNames::default(),
+            reservation_cleanup: Arc::new(Notify::new()),
         })
     }
 
     pub fn content_budget(&self) -> &ContentBudget {
         &self.content_budget
+    }
+
+    pub fn reservation_cleanup(&self) -> Arc<Notify> {
+        Arc::clone(&self.reservation_cleanup)
     }
 
     pub fn error_link_names(&self) -> &ErrorLinkNames {

@@ -355,6 +355,7 @@ async fn oversized_outbound_tag_is_refused_before_credit_and_delivery_or_frame_i
             outstanding_tags: HashSet::new(),
             settle_mode: SenderSettleMode::Settled,
             credit,
+            reservations: Default::default(),
             queued: VecDeque::new(),
             active: None,
             unsettled: HashMap::new(),

@@ -196,11 +196,13 @@ async fn paused_receiver<P: StoreProvider>(provider: P) -> TestResult {
         .attach(&mut session)
         .await?;
 
-    // The edge acquires the next receive-delete message before awaiting link
-    // credit. Seeing sequence 34 (or later) proves the 32 delivery slots filled.
+    // Exactly 32 credited deliveries can be deleted while the client is
+    // paused. The next original stays ready until consumption returns credit.
     timeout(DEADLINE, async {
         loop {
-            if node.head("orders").await?.is_none_or(|head| head >= 34) {
+            let head = node.head("orders").await?;
+            assert!(head.is_some_and(|head| head <= 33));
+            if head == Some(33) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -228,6 +230,30 @@ async fn paused_receiver<P: StoreProvider>(provider: P) -> TestResult {
     })
     .await
     .expect("a paused receiver cannot block unrelated attach, transfer, or settlement")?;
+
+    assert_eq!(node.head("orders").await?, Some(33));
+    let CommandOutcome::Peeked(remaining) = node
+        .broker
+        .handle()
+        .submit(
+            node.namespace.clone(),
+            EntityPath::new("orders")?,
+            CommandKind::Peek {
+                from_sequence: SequenceNumber::new(33),
+                max_messages: 64,
+                session_id: None,
+            },
+        )
+        .await?
+    else {
+        panic!("paused originals remain available to peek");
+    };
+    assert_eq!(remaining.len(), 64);
+    for (message, index) in remaining.iter().zip(33_u32..=96) {
+        assert_eq!(message.sequence.as_u64(), u64::from(index));
+        assert_eq!(message.delivery_count, 0);
+        assert_eq!(message.body, index.to_be_bytes());
+    }
 
     timeout(DEADLINE, async {
         for index in 1_u32..=96 {

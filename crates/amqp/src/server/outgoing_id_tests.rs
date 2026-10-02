@@ -49,6 +49,7 @@ fn sending() -> SendingLink {
         outstanding_tags: HashSet::new(),
         settle_mode: SenderSettleMode::Unsettled,
         credit,
+        reservations: Default::default(),
         queued: VecDeque::new(),
         active: None,
         unsettled: HashMap::new(),
@@ -675,6 +676,7 @@ async fn defensive_overcapacity_scan_does_not_advance_or_overwrite_an_alias() {
     let link = fixture.link_mut(HANDLE);
     link.outstanding_tags.insert(b"queued".to_vec());
     link.queued.push_back(QueuedSend {
+        credit_reserved: false,
         payload,
         content_lease,
         delivery_tag: b"queued".to_vec().into(),

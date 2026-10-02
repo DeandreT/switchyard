@@ -96,6 +96,7 @@ fn sending(
         receiver_settle_mode: ReceiverSettleMode::Second,
         settle_mode: SenderSettleMode::Unsettled,
         credit: LinkCredit::new(0),
+        reservations: Default::default(),
         queued: VecDeque::new(),
         active: None,
         unsettled: HashMap::new(),

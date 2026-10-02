@@ -150,6 +150,7 @@ pub(in crate::server) async fn accept_native_sender<W: AsyncWrite + Unpin>(
             default_outcome,
             outstanding_tags: HashSet::new(),
             credit,
+            reservations: Default::default(),
             queued: VecDeque::new(),
             active: None,
             unsettled: HashMap::new(),

@@ -117,6 +117,7 @@ impl ActorHarness {
             outstanding_tags: HashSet::new(),
             settle_mode: SenderSettleMode::Unsettled,
             credit,
+            reservations: Default::default(),
             queued: VecDeque::new(),
             active: None,
             unsettled: HashMap::new(),

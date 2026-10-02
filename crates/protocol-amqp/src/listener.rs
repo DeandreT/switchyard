@@ -32,16 +32,16 @@ use crate::{
         ConnectionManagement, ManagementAuthorization, serve_management_replies,
         serve_management_requests,
     },
-    parse_attachment, read_session_filter,
-    settlement::settlement_command,
-    stamp_session_filter,
+    parse_attachment, read_session_filter, stamp_session_filter,
 };
 
 mod atomic_ingress;
 mod connection;
+mod receiving;
 mod routing;
 mod websocket;
 
+use receiving::serve_receiving_client;
 use routing::{management_target, plan_link, plan_management};
 
 #[cfg(test)]
@@ -649,95 +649,6 @@ async fn serve_sending_client<B: Broker>(
     }
 }
 
-/// Drives a link the client receives on: fetch, deliver, then settle as the
-/// client's disposition says.
-async fn serve_receiving_client<B: Broker>(
-    mut sender: Sender,
-    namespace: NamespaceName,
-    entity: EntityPath,
-    broker: BoundBroker<B>,
-    mode: ReceiveMode,
-    session: Option<SessionHold>,
-    protocol: ReceivingLinkProtocol,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ReceivingLinkProtocol {
-        authorization,
-        management,
-    } = protocol;
-
-    loop {
-        // The link is watched the whole time a message is being waited for. A
-        // client that detaches while the queue is empty is waiting for an
-        // answer, and a task that only polls the broker would never send one.
-        let fetched = tokio::select! {
-            biased;
-            _ = sender.on_detach() => {
-                release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                let _ = sender.close().await;
-                return Ok(());
-            }
-            () = wait_until_link_unauthorized(authorization.as_ref()), if authorization.is_some() => {
-                release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                sender
-                    .close_with_error(unauthorized_error("the link's authorization has expired"))
-                    .await?;
-                return Ok(());
-            }
-            fetched = next_delivery(
-                &broker,
-                &namespace,
-                &entity,
-                mode,
-                session.as_ref(),
-                authorization.as_ref(),
-            ) => fetched,
-        };
-
-        match fetched {
-            Ok(delivery) => {
-                let settled = match settle(
-                    &mut sender,
-                    &namespace,
-                    &entity,
-                    &broker,
-                    delivery,
-                    authorization.as_ref(),
-                    &management,
-                )
-                .await
-                {
-                    Ok(settled) => settled,
-                    Err(error) => {
-                        release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                        return Err(error);
-                    }
-                };
-                if !settled {
-                    release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                    sender
-                        .close_with_error(unauthorized_error(
-                            "the link's authorization expired before settlement",
-                        ))
-                        .await?;
-                    return Ok(());
-                }
-            }
-            Err(NextDeliveryError::Broker(rejection)) => {
-                release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                sender.close_with_error(rejection_error(&rejection)).await?;
-                return Ok(());
-            }
-            Err(NextDeliveryError::Unauthorized) => {
-                release_session(&broker, &namespace, &entity, session.as_ref()).await;
-                sender
-                    .close_with_error(unauthorized_error("the link's authorization has expired"))
-                    .await?;
-                return Ok(());
-            }
-        }
-    }
-}
-
 async fn wait_until_link_unauthorized(authorization: Option<&LinkAuthorization>) {
     match authorization {
         Some(authorization) => authorization.wait_until_unauthorized().await,
@@ -824,108 +735,10 @@ enum NextDeliveryError {
     Unauthorized,
 }
 
-/// Hands one message to the client and applies whatever it said about it.
-///
-/// The lock is already committed, so a client that never answers costs a
-/// redelivery rather than a lost message.
-async fn settle<B: Broker>(
-    sender: &mut Sender,
-    namespace: &NamespaceName,
-    entity: &EntityPath,
-    broker: &BoundBroker<B>,
-    delivery: Delivery,
-    authorization: Option<&LinkAuthorization>,
-    management: &ConnectionManagement,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let Some(lock) = delivery.lock else {
-        let delivery_tag = sequence_delivery_tag(delivery.sequence);
-        // Receive-and-delete: the message is already gone, so there is nothing
-        // to settle after the transfer.
-        let sent = match authorization {
-            Some(authorization) => {
-                tokio::select! {
-                    outcome = sender.send(crate::write_delivery(&delivery), delivery_tag.clone()) => {
-                        outcome?;
-                        true
-                    }
-                    () = authorization.wait_until_unauthorized() => false,
-                }
-            }
-            None => {
-                sender
-                    .send(crate::write_delivery(&delivery), delivery_tag)
-                    .await?;
-                true
-            }
-        };
-        return Ok(sent);
-    };
-    let sequence = delivery.sequence;
-    let delivery_tag = lock_delivery_tag(lock.token);
-    let link_name = sender.name().to_owned();
-    management
-        .register_delivery(
-            &link_name,
-            entity.clone(),
-            sequence,
-            lock.token,
-            broker.binding().clone(),
-        )
-        .await;
-    let outcome = match authorization {
-        Some(authorization) => {
-            tokio::select! {
-                outcome = sender.send_with_settlement(crate::write_delivery(&delivery), delivery_tag.clone()) => Some(outcome),
-                () = authorization.wait_until_unauthorized() => None,
-            }
-        }
-        None => Some(
-            sender
-                .send_with_settlement(crate::write_delivery(&delivery), delivery_tag)
-                .await,
-        ),
-    };
-    management
-        .unregister_delivery(&link_name, lock.token, broker.binding())
-        .await;
-    let Some(outcome) = outcome else {
-        return Ok(false);
-    };
-    let settlement = outcome?;
-    if let Some(authorization) = authorization
-        && authorization.ensure().await.is_err()
-    {
-        return Ok(false);
-    }
-
-    let kind = match settlement_command(sequence, lock.token, settlement.outcome().clone()) {
-        Ok(kind) => kind,
-        Err(error) => {
-            let error = error_for(AmqpError::InvalidField, error.to_string());
-            settlement.reject(error.clone()).await?;
-            sender.close_with_error(error).await?;
-            return Ok(true);
-        }
-    };
-
-    if let Err(rejection) = broker.submit(namespace.clone(), entity.clone(), kind).await {
-        warn!(%sequence, %rejection, "settlement refused, leaving the lock to expire");
-        settlement.reject(rejection_error(&rejection)).await?;
-        sender.close_with_error(rejection_error(&rejection)).await?;
-    } else {
-        settlement.accept().await?;
-    }
-    Ok(true)
-}
-
 fn lock_delivery_tag(token: LockToken) -> DeliveryTag {
     let mut tag = [0_u8; 16];
     tag[8..].copy_from_slice(&token.as_u64().to_be_bytes());
     tag.to_vec().into()
-}
-
-fn sequence_delivery_tag(sequence: domain::SequenceNumber) -> DeliveryTag {
-    sequence.as_u64().to_be_bytes().to_vec().into()
 }
 
 async fn detach_with(endpoint: LinkEndpoint, error: AmqpProtocolError) {

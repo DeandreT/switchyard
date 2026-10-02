@@ -99,6 +99,7 @@ fn sending_link(identity: LinkIdentity, auto_acknowledge: bool) -> SendingLink {
         outstanding_tags: HashSet::new(),
         settle_mode: SenderSettleMode::Unsettled,
         credit: LinkCredit::new(0),
+        reservations: Default::default(),
         queued: VecDeque::new(),
         active: None,
         unsettled: HashMap::new(),

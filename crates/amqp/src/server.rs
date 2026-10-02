@@ -36,6 +36,7 @@ mod link_handles;
 mod native_transactions;
 mod outgoing_delivery_identity;
 mod outgoing_identity;
+mod outgoing_reservation;
 mod receive_credit;
 mod retained_delivery;
 mod sender_identity;
@@ -78,6 +79,8 @@ pub use native_transactions::{
 use native_transactions::{NativeIngressPolicy, NativeTransactionBook};
 pub use outgoing_delivery_identity::NativeOutgoingDeliveryIdentity;
 use outgoing_identity::AckIdentity;
+pub use outgoing_reservation::{ClaimedOutgoingSendReservation, OutgoingSendReservation};
+use outgoing_reservation::{OutgoingReservations, ReservationRequest};
 use receive_credit::{Consumption, ReceiveCredit};
 pub use retained_delivery::RetainedDelivery;
 pub use sender_identity::NativeSenderIdentity;
@@ -296,6 +299,8 @@ pub enum EngineError {
     RemoteDetached,
     #[error("the remote peer settled the delivery without reporting an outcome")]
     RemoteSettledWithoutOutcome,
+    #[error("the outgoing send reservation was revoked")]
+    SendReservationRevoked,
     #[error("the AMQP engine stopped")]
     Stopped,
     #[error("invalid AMQP state: {0}")]
@@ -1129,6 +1134,7 @@ async fn request<T>(
 
 enum Command {
     NativeTransactions(native_transactions::NativeCommand),
+    ReserveSend(ReservationRequest),
     AcceptSession {
         channel: u16,
         identity: SessionIdentity,
@@ -1151,6 +1157,15 @@ enum Command {
         channel: u16,
         handle: u32,
         identity: LinkIdentity,
+        message: Box<Message>,
+        delivery_tag: DeliveryTag,
+        reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
+    },
+    SendReserved {
+        channel: u16,
+        handle: u32,
+        identity: LinkIdentity,
+        reservation: ClaimedOutgoingSendReservation,
         message: Box<Message>,
         delivery_tag: DeliveryTag,
         reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
@@ -1186,7 +1201,8 @@ enum Command {
 fn reject_closed_command(command: Command) {
     match command {
         Command::NativeTransactions(command) => command.reject(EngineError::RemoteClosed),
-        Command::Send { reply, .. } => {
+        Command::ReserveSend(request) => request.reject(EngineError::RemoteClosed),
+        Command::Send { reply, .. } | Command::SendReserved { reply, .. } => {
             let _ = reply.send(Err(EngineError::RemoteClosed));
         }
         Command::AcceptSession { reply, .. }
@@ -1373,6 +1389,7 @@ struct SendingLink {
     outstanding_tags: HashSet<Vec<u8>>,
     settle_mode: SenderSettleMode,
     credit: LinkCredit,
+    reservations: OutgoingReservations,
     queued: VecDeque<QueuedSend>,
     active: Option<ActiveSend>,
     unsettled: HashMap<u32, OutgoingDelivery>,
@@ -1381,6 +1398,7 @@ struct SendingLink {
 }
 
 struct QueuedSend {
+    credit_reserved: bool,
     payload: Vec<u8>,
     content_lease: ContentLease,
     delivery_tag: DeliveryTag,
@@ -1474,6 +1492,7 @@ async fn run_connection<Io>(
     let Ok(mut writer) = FrameWriter::new(writer, remote_max_frame_size) else {
         return;
     };
+    let reservation_cleanup = writer.reservation_cleanup();
     writer.configure_activity(
         settings.options,
         settings.peer_idle_millis,
@@ -1510,6 +1529,7 @@ async fn run_connection<Io>(
         let stopped = {
             let processing = async {
                 loop {
+                    outgoing_reservation::refresh_all(&mut sessions);
                     if native_policy.supports_retirement()
                         && reconcile_native_retirements(&mut sessions, &mut writer)
                             .await
@@ -1530,6 +1550,10 @@ async fn run_connection<Io>(
                         break;
                     }
                     tokio::select! {
+                        () = reservation_cleanup.notified(), if !activity.is_closing() => {
+                            outgoing_reservation::refresh_all(&mut sessions);
+                            pump_ready = true;
+                        }
                         () = native_cleanup.notified(), if native_policy.supports_retirement() => {
                             if reconcile_native_retirements(&mut sessions, &mut writer).await.is_err() {
                                 break;
@@ -1550,6 +1574,7 @@ async fn run_connection<Io>(
                                 Ok(frame) => frame,
                                 Err(error) => {
                                     native_transactions.close_all();
+                                    outgoing_reservation::close_all(&mut sessions);
                                     if !activity.is_closing() {
                                         notify_framing_error(&mut writer, &error).await;
                                     }
@@ -1655,6 +1680,7 @@ async fn run_connection<Io>(
             }
         };
         native_transactions.close_all();
+        outgoing_reservation::close_all(&mut sessions);
         if let Some(reason @ (ActivityTimeout::Receive | ActivityTimeout::Peer)) = stopped
             && !activity.is_tainted()
             && !activity.is_closing()
@@ -2185,6 +2211,7 @@ async fn handle_frame_scoped<W: AsyncWrite + Unpin>(
         }
         Performative::Close(_) => {
             native_transactions.close_all();
+            outgoing_reservation::close_all(sessions);
             if !locally_closing {
                 writer
                     .write_amqp(0, Performative::Close(Close::default()), Vec::new())
@@ -2632,6 +2659,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                             default_outcome,
                             outstanding_tags: HashSet::new(),
                             credit,
+                            reservations: OutgoingReservations::default(),
                             queued: VecDeque::new(),
                             active: None,
                             unsettled: HashMap::new(),
@@ -2649,6 +2677,36 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 apply_link_flow(channel, flow, writer, sessions).await?;
             }
             let _ = reply.send(Ok(()));
+        }
+        Command::ReserveSend(request) => {
+            outgoing_reservation::handle_reserve(request, sessions, writer.reservation_cleanup());
+        }
+        Command::SendReserved {
+            channel,
+            handle,
+            identity,
+            reservation,
+            message,
+            delivery_tag,
+            reply,
+        } => {
+            let Some(session) = sessions.get_mut(&channel) else {
+                let _ = reply.send(Err(EngineError::SendReservationRevoked));
+                return Ok(CommandAction::Continue);
+            };
+            queue_send_inner(
+                channel,
+                handle,
+                session,
+                &identity,
+                *message,
+                delivery_tag,
+                0,
+                reply,
+                Some(reservation),
+                writer,
+            )
+            .await?;
         }
         Command::Send {
             channel,
@@ -2781,6 +2839,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             let _ = reply.send(Ok(()));
         }
         Command::Close { error, reply } => {
+            outgoing_reservation::close_all(sessions);
             writer
                 .write_amqp(0, Performative::Close(Close { error }), Vec::new())
                 .await?;
@@ -3832,7 +3891,12 @@ async fn apply_link_flow<W: AsyncWrite + Unpin>(
                 )
                 .await;
             }
-            if link.active.is_none() && link.queued.is_empty() && link.credit.drain_requested() {
+            outgoing_reservation::refresh_link(link);
+            if link.active.is_none()
+                && link.queued.is_empty()
+                && !link.reservations.blocks_drain()
+                && link.credit.drain_requested()
+            {
                 let snapshot = match link.credit.drain_unused() {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
@@ -4284,7 +4348,44 @@ async fn queue_send<W: AsyncWrite + Unpin>(
     writer: &mut FrameWriter<W>,
     _remote_max_frame_size: u32,
 ) -> Result<(), EngineError> {
+    queue_send_inner(
+        channel,
+        handle,
+        session,
+        identity,
+        message,
+        delivery_tag,
+        message_format,
+        reply,
+        None,
+        writer,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn queue_send_inner<W: AsyncWrite + Unpin>(
+    channel: u16,
+    handle: u32,
+    session: &mut SessionState,
+    identity: &LinkIdentity,
+    message: Message,
+    delivery_tag: DeliveryTag,
+    message_format: u32,
+    reply: impl Into<OutgoingReply>,
+    reservation: Option<ClaimedOutgoingSendReservation>,
+    writer: &mut FrameWriter<W>,
+) -> Result<(), EngineError> {
     let reply = reply.into();
+    if let Some(reservation) = &reservation
+        && !matches!(session.links.get(&handle), Some(LinkState::Sending(link))
+            if !session.ending
+                && !session.closing_handles.contains(&handle)
+                && link.reservations.validates(reservation, identity))
+    {
+        let _ = reply.send(Err(EngineError::SendReservationRevoked));
+        return Ok(());
+    }
     if identity.is_retired() || session.ending || session.closing_handles.contains(&handle) {
         let _ = reply.send(Err(EngineError::RemoteDetached));
         return Ok(());
@@ -4309,7 +4410,9 @@ async fn queue_send<W: AsyncWrite + Unpin>(
         )));
         return Ok(());
     }
-    if link.outstanding_tags.len() >= MAX_OUTGOING_DELIVERIES_PER_LINK {
+    let reused_reservation = usize::from(reservation.is_some());
+    let reservations = link.reservations.count().saturating_sub(reused_reservation);
+    if link.outstanding_tags.len() + reservations >= MAX_OUTGOING_DELIVERIES_PER_LINK {
         let _ = reply.send(Err(invalid_state(
             "outgoing delivery limit reached on this link",
         )));
@@ -4319,17 +4422,19 @@ async fn queue_send<W: AsyncWrite + Unpin>(
         .links
         .values()
         .filter_map(|link| match link {
-            LinkState::Sending(link) => Some(link.outstanding_tags.len()),
+            LinkState::Sending(link) => {
+                Some(link.outstanding_tags.len() + link.reservations.count())
+            }
             _ => None,
         })
         .sum::<usize>();
-    if outstanding >= MAX_OUTGOING_DELIVERIES_PER_SESSION {
+    if outstanding.saturating_sub(reused_reservation) >= MAX_OUTGOING_DELIVERIES_PER_SESSION {
         let _ = reply.send(Err(invalid_state(
             "outgoing delivery limit reached on this session",
         )));
         return Ok(());
     }
-    if link.queued.len() >= DELIVERY_QUEUE_CAPACITY {
+    if link.queued.len() + reservations >= DELIVERY_QUEUE_CAPACITY {
         let _ = reply.send(Err(invalid_state("outgoing delivery queue is full")));
         return Ok(());
     }
@@ -4403,8 +4508,17 @@ async fn queue_send<W: AsyncWrite + Unpin>(
         let _ = reply.send(Err(error.into()));
         return Ok(());
     }
+    if let Some(reservation) = &reservation
+        && !link.reservations.consume(reservation)
+    {
+        drop(payload);
+        drop(content_lease);
+        let _ = reply.send(Err(EngineError::SendReservationRevoked));
+        return Ok(());
+    }
     link.outstanding_tags.insert(delivery_tag.as_ref().to_vec());
     link.queued.push_back(QueuedSend {
+        credit_reserved: reservation.is_some(),
         payload,
         content_lease,
         delivery_tag,
@@ -4585,8 +4699,7 @@ fn can_pump(session: &SessionState, link: &SendingLink) -> bool {
         && !link.identity.is_retired()
         && session.flow.outgoing_allowance() != 0
         && (link.active.is_some()
-            || (!link.queued.is_empty()
-                && link.credit.allowance() != 0
+            || (outgoing_reservation::queued_candidate(link).is_some()
                 && vacant_delivery_id(session).is_some()))
 }
 
@@ -4620,7 +4733,7 @@ async fn pump_connection<W: AsyncWrite + Unpin>(
         if session.ending {
             continue;
         }
-        let handles: Vec<_> = session.links.iter().filter_map(|(&handle, link)| matches!(link, LinkState::Sending(link) if link.active.is_none() && link.queued.is_empty() && link.credit.drain_requested()).then_some(handle)).collect();
+        let handles: Vec<_> = session.links.iter().filter_map(|(&handle, link)| matches!(link, LinkState::Sending(link) if link.active.is_none() && link.queued.is_empty() && !link.reservations.blocks_drain() && link.credit.drain_requested()).then_some(handle)).collect();
         for handle in handles {
             let Some(LinkState::Sending(link)) = session.links.get_mut(&handle) else {
                 continue;
@@ -4673,10 +4786,13 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
         return Ok(());
     }
     let starting = link.active.is_none();
+    let queued_index = starting
+        .then(|| outgoing_reservation::queued_candidate(link))
+        .flatten();
     let delivery_id = if let Some(active) = &link.active {
         active.delivery_id
     } else {
-        if link.queued.is_empty() || link.credit.allowance() == 0 {
+        if queued_index.is_none() {
             return Ok(());
         }
         let Some(id) = vacant_delivery_id(session) else {
@@ -4698,7 +4814,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
             writer,
         )?
     } else {
-        let Some(queued) = link.queued.front() else {
+        let Some(queued) = queued_index.and_then(|index| link.queued.get(index)) else {
             return Ok(());
         };
         fragment_frame(
@@ -4734,7 +4850,10 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
                 "delivery lost link credit before its first frame",
             ));
         }
-        let queued = link.queued.pop_front().expect("queued delivery exists");
+        let queued = link
+            .queued
+            .remove(queued_index.expect("starting candidate exists"))
+            .expect("queued delivery exists");
         let id = delivery_id;
         let delivery_identity = NativeOutgoingDeliveryIdentity::for_delivery(&link.identity, id);
         session.next_delivery_id = id.wrapping_add(1);
@@ -4968,6 +5087,7 @@ fn forget_incoming_link(incoming: &mut IncomingLedger, link: &LinkState) {
 fn stop_link(link: &mut LinkState) {
     match link {
         LinkState::Sending(link) => {
+            link.reservations.close();
             link.identity.retire();
             link.pending_acknowledgements.clear();
             link.outstanding_tags.clear();
@@ -4993,6 +5113,11 @@ fn stop_link(link: &mut LinkState) {
 }
 
 fn stop_session(session: &mut SessionState) {
+    for link in session.links.values_mut() {
+        if let LinkState::Sending(link) = link {
+            link.reservations.close();
+        }
+    }
     session.identity.retire();
     session.attach_tx = None;
     for pending in session.pending_attaches.values() {

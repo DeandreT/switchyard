@@ -86,6 +86,7 @@ fn sending() -> SendingLink {
         receiver_settle_mode: ReceiverSettleMode::Second,
         settle_mode: SenderSettleMode::Unsettled,
         credit,
+        reservations: Default::default(),
         queued: VecDeque::new(),
         active: None,
         unsettled: HashMap::new(),

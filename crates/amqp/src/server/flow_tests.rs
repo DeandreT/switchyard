@@ -668,6 +668,7 @@ async fn wrapping_disposition_resolves_existing_ids_without_reusing_an_outstandi
             outstanding_tags: HashSet::from([vec![0]]),
             settle_mode: SenderSettleMode::Unsettled,
             credit,
+            reservations: Default::default(),
             queued: VecDeque::new(),
             active: None,
             unsettled: HashMap::from([(

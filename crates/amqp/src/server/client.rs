@@ -1479,6 +1479,7 @@ where
                                                 outstanding_tags: HashSet::new(),
                                                 settle_mode: request.sender_settle_mode,
                                                 credit: LinkCredit::new(0),
+                                                reservations: Default::default(),
                                                 queued: VecDeque::new(),
                                                 active: None,
                                                 unsettled: HashMap::new(),

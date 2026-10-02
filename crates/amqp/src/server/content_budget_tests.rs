@@ -178,6 +178,7 @@ impl Fixture {
             outstanding_tags: HashSet::new(),
             settle_mode: mode,
             credit,
+            reservations: Default::default(),
             queued: VecDeque::new(),
             active: None,
             unsettled: HashMap::new(),

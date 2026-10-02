@@ -96,6 +96,7 @@ impl Fixture {
                 outstanding_tags: HashSet::new(),
                 settle_mode: SenderSettleMode::Mixed,
                 credit,
+                reservations: Default::default(),
                 queued: VecDeque::new(),
                 active: None,
                 unsettled: HashMap::new(),
@@ -447,6 +448,7 @@ fn installed_snapshots_collect_exact_incoming_phases_and_the_outgoing_live_union
     drop(result);
     let link = fixture.sender(0, 2);
     link.queued.push_back(QueuedSend {
+        credit_reserved: false,
         payload: vec![1],
         content_lease: queued_lease,
         delivery_tag: vec![77].into(),

@@ -511,6 +511,7 @@ fn wrapper_entry(channel: u16, role: Role) -> WrapperEntry {
             outstanding_tags: HashSet::new(),
             settle_mode: SenderSettleMode::Mixed,
             credit: LinkCredit::new(0),
+            reservations: Default::default(),
             queued: VecDeque::new(),
             active: None,
             unsettled: HashMap::new(),
