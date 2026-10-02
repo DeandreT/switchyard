@@ -142,7 +142,7 @@ async fn run_websocket_gate(sdk_version: &'static str) -> Result<(), Box<dyn Err
     Ok(())
 }
 
-fn signed_localhost_config() -> Result<(rustls::ServerConfig, String), Box<dyn Error>> {
+pub(super) fn signed_localhost_config() -> Result<(rustls::ServerConfig, String), Box<dyn Error>> {
     let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params

@@ -24,6 +24,10 @@ const PREVIOUS_SDK: &str = "7.20.2";
 #[path = "amqp_dotnet_current/websocket.rs"]
 mod websocket;
 
+#[cfg(target_os = "linux")]
+#[path = "amqp_dotnet_current/atomic_messaging.rs"]
+mod atomic_messaging;
+
 struct TestTimer {
     shutdown: Arc<Shutdown>,
     thread: Option<JoinHandle<()>>,

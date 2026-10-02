@@ -1,6 +1,11 @@
 using Azure;
 using Azure.Messaging.ServiceBus;
 
+if (args.Length > 0 && args[0] == "atomic-messaging")
+{
+    return await AtomicMessagingCases.RunAsync(args);
+}
+
 if (args.Length == 8 && args[0] is "websocket" or "websocket-untrusted")
 {
     return await WebSocketCases.RunAsync(args);
