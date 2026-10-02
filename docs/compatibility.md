@@ -728,6 +728,12 @@ expose that origin independently of link settlement and retirement. Observer
 clones are inert; the actor retires its identity before publishing termination,
 including cancellation and unwinding. Activity is only an observation, not
 authorization, a live delivery guarantee, or transaction admission.
+Additive [native sender identities](native-sender-provenance.md) identify an
+actor-accepted sending-link generation. `PendingSettlement::belongs_to_sender()`
+checks exact active link and connection origin, including First-mode outcomes
+without an acknowledgment token. This does not prove an original outgoing
+delivery generation or settlement usability, and changes no ordinary settlement
+or transactional-disposition refusal behavior.
 An End on an unmapped channel is refused without manufacturing a session reply.
 Client Begin searches only vacant channels within the peer's inclusive channel
 limit. Pending, live, and ending sessions cannot be overwritten. Client End

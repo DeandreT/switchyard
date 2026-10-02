@@ -161,6 +161,8 @@ receipt origin and expose actor retirement without granting transaction authorit
 [Native receiver identities](docs/native-receiver-provenance.md) distinguish
 replaced receiving-link generations; decoder-aware acceptance remains opt-in
 per link and does not stage logical batch work.
+[Native sender identities](docs/native-sender-provenance.md) check active
+sending-link origin without granting delivery settlement or retirement authority.
 
 ## Production Contract
 

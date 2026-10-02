@@ -23,6 +23,11 @@ explicit link-local message formats; batch expansion and authorization still
 belong to an application adapter. The explicit
 [posting-only listener](atomic-posting-ingress.md) supplies that bounded path.
 
+Ordinary native senders separately expose a
+[sending-link observer](native-sender-provenance.md). Its settlement-origin check
+does not grant original-delivery or retirement authority; transactional receiver
+dispositions remain unsupported even on this posting-only native path.
+
 Coordinators support local transactions, multiple transactions per session, and
 posting across sessions on the same connection. Distributed/global declarations,
 transactional acquisition and retirement, and recovered links remain unsupported.
