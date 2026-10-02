@@ -33,6 +33,7 @@ mod incoming_ledger;
 mod link_handles;
 mod outgoing_identity;
 mod receive_credit;
+mod retained_delivery;
 mod session_channels;
 mod session_identity;
 mod transactions;
@@ -58,6 +59,7 @@ use link_handles::{
 };
 use outgoing_identity::AckIdentity;
 use receive_credit::{Consumption, ReceiveCredit};
+pub use retained_delivery::RetainedDelivery;
 use session_channels::{local_channel_for_peer, preferred_vacant_channel};
 pub use session_identity::IncomingAttach;
 use session_identity::{AttachApproval, AttachApprovalError, SessionIdentity};

@@ -941,3 +941,6 @@ async fn teardown_refunds_actor_content_but_keeps_external_inboxes_charged() {
     drop(inbox);
     assert_eq!(fixture.budget.retained_bytes(), 0);
 }
+
+#[path = "content_budget_tests/retained_ingress.rs"]
+mod retained_ingress;

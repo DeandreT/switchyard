@@ -566,6 +566,44 @@ impl ClientReceiver {
         Ok(delivery)
     }
 
+    /// Keeps the native content reservation until the returned receipt is dropped.
+    /// Credit consumption still occurs exactly once at dequeue.
+    pub async fn recv_retained(&mut self) -> Result<RetainedDelivery, EngineError> {
+        let delivery = self.deliveries.recv().await.ok_or_else(|| {
+            if *self.detached.borrow() {
+                EngineError::RemoteDetached
+            } else {
+                EngineError::Stopped
+            }
+        })?;
+        self.consumption.consumed();
+        Ok(RetainedDelivery::new(delivery))
+    }
+
+    pub async fn accept_retained(&self, receipt: &RetainedDelivery) -> Result<(), EngineError> {
+        self.accept(receipt.inner()).await
+    }
+
+    pub async fn reject_retained(
+        &self,
+        receipt: &RetainedDelivery,
+        error: Option<Error>,
+    ) -> Result<(), EngineError> {
+        self.reject(receipt.inner(), error).await
+    }
+
+    pub async fn release_retained(&self, receipt: &RetainedDelivery) -> Result<(), EngineError> {
+        self.release(receipt.inner()).await
+    }
+
+    pub async fn modify_retained(
+        &self,
+        receipt: &RetainedDelivery,
+        modified: crate::Modified,
+    ) -> Result<(), EngineError> {
+        self.modify(receipt.inner(), modified).await
+    }
+
     pub async fn accept(&self, delivery: &ClientDelivery) -> Result<(), EngineError> {
         self.settle(delivery, DeliveryState::Accepted(Accepted))
             .await

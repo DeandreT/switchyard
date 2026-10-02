@@ -577,11 +577,11 @@ async fn serve_sending_client<B: Broker>(
             match authorization.as_ref() {
                 Some(authorization) => {
                     tokio::select! {
-                        result = receiver.recv() => Some(result),
+                        result = receiver.recv_retained() => Some(result),
                         () = authorization.wait_until_unauthorized() => None,
                     }
                 }
-                None => Some(receiver.recv().await),
+                None => Some(receiver.recv_retained().await),
             }
         }
         .await;
@@ -613,7 +613,7 @@ async fn serve_sending_client<B: Broker>(
                 // The client's message, the client's fault: reject this transfer
                 // and keep the link.
                 receiver
-                    .reject(
+                    .reject_retained(
                         &delivery,
                         Some(AmqpProtocolError::new(
                             ErrorCondition::Custom(Symbol::from(error.condition())),
@@ -631,10 +631,10 @@ async fn serve_sending_client<B: Broker>(
         // Accepting only after the command committed is what makes the
         // acknowledgement mean the message is durable.
         match outcome {
-            Ok(_) => receiver.accept(&delivery).await?,
+            Ok(_) => receiver.accept_retained(&delivery).await?,
             Err(rejection) => {
                 receiver
-                    .reject(&delivery, Some(rejection_error(&rejection)))
+                    .reject_retained(&delivery, Some(rejection_error(&rejection)))
                     .await?
             }
         }
@@ -957,6 +957,9 @@ mod session_provenance_tests;
 
 #[cfg(test)]
 mod binding_tests;
+
+#[cfg(test)]
+mod retained_tests;
 
 #[cfg(test)]
 mod tests {
