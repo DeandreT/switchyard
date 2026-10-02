@@ -199,6 +199,11 @@ impl TransactionPostingReceipt {
         &self.data.group.controller
     }
 
+    /// Tests active exact receiving-link origin, not commit authority.
+    pub fn belongs_to_receiver(&self, receiver: &NativeReceiverIdentity) -> bool {
+        receiver.owns_delivery(&self.data.delivery.inner().identity)
+    }
+
     pub(in crate::server) fn dequeued(&self) {
         self.data.obligation.held();
     }
@@ -234,6 +239,11 @@ impl PreparedPosting {
     }
     pub fn transaction_id(&self) -> &TransactionId {
         &self.data.group.id
+    }
+
+    /// Remains independent of numeric delivery aliases after provisional ACK.
+    pub fn belongs_to_receiver(&self, receiver: &NativeReceiverIdentity) -> bool {
+        receiver.owns_delivery(&self.data.delivery.inner().identity)
     }
     pub(in crate::server) fn matches(&self, group: &Group, obligation: &Arc<Obligation>) -> bool {
         std::ptr::eq(self.data.group.as_ref(), group)

@@ -8,6 +8,7 @@ mod control_refusal;
 mod endpoints;
 mod group;
 mod handler;
+mod receiver_identity;
 
 pub(super) use book::NativeTransactionBook;
 pub(super) use control_refusal::NativeControlRefusal;
@@ -23,6 +24,7 @@ pub use group::{
     SealedDischargeReceipt, TransactionPostingReceipt,
 };
 pub(super) use handler::{handle_control_refusal, handle_native_command};
+pub use receiver_identity::NativeReceiverIdentity;
 
 pub const MAX_NATIVE_TRANSACTIONS: usize = 32;
 pub const MAX_NATIVE_TRANSACTION_POSTINGS: usize = 100;

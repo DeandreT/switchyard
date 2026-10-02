@@ -65,7 +65,7 @@ pub use native_transactions::{
     CoordinatorEndpoint, CoordinatorRequest, MAX_NATIVE_TRANSACTION_CONTROL_BYTES,
     MAX_NATIVE_TRANSACTION_POSTINGS, MAX_NATIVE_TRANSACTIONS, NativeClaim,
     NativeControllerIdentity, NativeDeclarationRefusal, NativeFault, NativeReadySubmission,
-    NativeReadyTicket, NativeTransactionDecision, NativeTransactionError,
+    NativeReadyTicket, NativeReceiverIdentity, NativeTransactionDecision, NativeTransactionError,
     NativeTransactionIdentity, NativeTransactionResources, NativeTransactionState,
     PendingDeclareReceipt, PreparedPosting, SealedDischargeReceipt, TransactionPostingReceipt,
     TransactionalIngress, TransactionalReceiver,
@@ -2100,6 +2100,7 @@ async fn accept_native_receiving<W: AsyncWrite + Unpin>(
     owner: SessionIdentity,
     attach: IncomingAttach,
     max_message_size: u64,
+    decoders: MessageFormatDecoders,
     deliveries: ReceivingSink,
     detached: watch::Sender<bool>,
     consumption: Arc<Consumption>,
@@ -2136,6 +2137,15 @@ async fn accept_native_receiving<W: AsyncWrite + Unpin>(
         }
     };
     native_transactions::validate_accept_kind(&attach, expected)?;
+    if matches!(
+        expected,
+        native_transactions::NativeAttachKind::Coordinator(_)
+    ) && !decoders.is_default()
+    {
+        return Err(invalid_state(
+            "custom message-format decoders require a transactional receiving endpoint",
+        ));
+    }
     if attach.role != Role::Sender {
         return Err(invalid_state(
             "native ingress requires a peer sending endpoint",
@@ -2234,7 +2244,7 @@ async fn accept_native_receiving<W: AsyncWrite + Unpin>(
             partial: None,
             detached,
             credit: ReceiveCredit::new(initial_count, LINK_CREDIT, consumption),
-            decoders: MessageFormatDecoders::default(),
+            decoders,
             identity: identity.clone(),
             sender_settle_mode: attach.snd_settle_mode,
             receiver_settle_mode: attach.rcv_settle_mode,

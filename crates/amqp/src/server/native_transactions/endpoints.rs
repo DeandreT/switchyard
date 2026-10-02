@@ -62,6 +62,10 @@ pub struct TransactionalReceiver {
 }
 
 impl TransactionalReceiver {
+    pub fn receiver_identity(&self) -> NativeReceiverIdentity {
+        NativeReceiverIdentity::for_accepted_receiver(&self.route.owner)
+    }
+
     pub async fn recv(&mut self) -> Result<TransactionalIngress, EngineError> {
         let delivery = self.deliveries.recv().await.ok_or_else(|| {
             if *self.detached.borrow() {
@@ -123,6 +127,10 @@ impl TransactionalReceiver {
         .await
     }
 
+    pub async fn on_detach(&mut self) {
+        wait_for_detach(&mut self.detached).await;
+    }
+
     pub async fn close(&self) -> Result<(), EngineError> {
         request(&self.route.commands, |reply| Command::Detach {
             channel: self.route.channel,
@@ -140,6 +148,7 @@ pub(in crate::server) struct NativeAcceptance {
     pub(in crate::server) session: SessionIdentity,
     pub(in crate::server) attach: IncomingAttach,
     pub(in crate::server) maximum: u64,
+    pub(in crate::server) decoders: MessageFormatDecoders,
     pub(in crate::server) sink: ReceivingSink,
     pub(in crate::server) detached: watch::Sender<bool>,
     pub(in crate::server) consumption: Arc<Consumption>,
@@ -233,6 +242,7 @@ impl ServerSession {
             session: self.identity.clone(),
             attach,
             maximum: max_message_size,
+            decoders: MessageFormatDecoders::default(),
             sink: ReceivingSink::Coordinator(requests_tx),
             detached: detached_tx,
             consumption: consumption.clone(),
@@ -261,6 +271,21 @@ impl ServerSession {
         attach: IncomingAttach,
         max_message_size: u64,
     ) -> Result<TransactionalReceiver, EngineError> {
+        self.accept_transactional_receiver_with_decoders(
+            attach,
+            max_message_size,
+            MessageFormatDecoders::default(),
+        )
+        .await
+    }
+
+    /// Accepts explicit message formats without changing transaction policy.
+    pub async fn accept_transactional_receiver_with_decoders(
+        &self,
+        attach: IncomingAttach,
+        max_message_size: u64,
+        decoders: MessageFormatDecoders,
+    ) -> Result<TransactionalReceiver, EngineError> {
         attach
             .validate_request(&self.identity)
             .map_err(attach_approval_error)?;
@@ -284,6 +309,7 @@ impl ServerSession {
             session: self.identity.clone(),
             attach,
             maximum: max_message_size,
+            decoders,
             sink: ReceivingSink::Transactional(deliveries_tx),
             detached: detached_tx,
             consumption: consumption.clone(),

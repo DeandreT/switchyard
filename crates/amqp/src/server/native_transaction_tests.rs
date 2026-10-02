@@ -21,6 +21,12 @@ mod faults;
 #[path = "native_transaction_tests/refusals.rs"]
 mod refusals;
 
+#[path = "native_transaction_tests/receiver_provenance.rs"]
+mod receiver_provenance;
+
+#[path = "native_transaction_tests/formats.rs"]
+mod formats;
+
 #[tokio::test]
 async fn default_connection_refuses_coordinator_without_publishing_approval() {
     let mut fixture = Fixture::new(false).await;

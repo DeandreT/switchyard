@@ -378,17 +378,26 @@ impl RawPeer {
     }
 
     pub(super) async fn attached(&mut self, channel: u16) -> Attach {
-        let Frame::Amqp {
-            channel: actual,
-            performative: Some(Performative::Attach(attach)),
-            payload,
-        } = self.frame().await
-        else {
-            panic!("own Attach response")
-        };
-        assert_eq!(actual, channel);
-        assert!(payload.is_empty());
-        *attach
+        for _ in 0..8 {
+            match self.frame().await {
+                Frame::Amqp {
+                    channel: actual,
+                    performative: Some(Performative::Attach(attach)),
+                    payload,
+                } => {
+                    assert_eq!(actual, channel);
+                    assert!(payload.is_empty());
+                    return *attach;
+                }
+                Frame::Amqp {
+                    performative: Some(Performative::Flow(_)),
+                    payload,
+                    ..
+                } if payload.is_empty() => {}
+                frame => panic!("unexpected Attach response: {frame:?}"),
+            }
+        }
+        panic!("no Attach within bounded response count");
     }
 
     async fn begin(&mut self, channel: u16) -> Begin {
@@ -706,6 +715,22 @@ impl Fixture {
         &mut self,
         mode: ReceiverSettleMode,
     ) -> (ServerSession, TransactionalReceiver) {
+        self.receiver_approved(mode, None).await
+    }
+
+    pub(super) async fn receiver_with_decoders(
+        &mut self,
+        mode: ReceiverSettleMode,
+        decoders: MessageFormatDecoders,
+    ) -> (ServerSession, TransactionalReceiver) {
+        self.receiver_approved(mode, Some(decoders)).await
+    }
+
+    async fn receiver_approved(
+        &mut self,
+        mode: ReceiverSettleMode,
+        decoders: Option<MessageFormatDecoders>,
+    ) -> (ServerSession, TransactionalReceiver) {
         let mut session = self.session(POST_CHANNEL).await;
         let mut attach = ordinary_attach(POST_HANDLE);
         attach.rcv_settle_mode = mode;
@@ -729,10 +754,17 @@ impl Fixture {
             );
             self.peer.credit(POST_CHANNEL, POST_HANDLE).await;
         };
-        let (endpoint, ()) = tokio::join!(
-            session.accept_transactional_receiver(incoming, 0),
-            responses
-        );
+        let accepting = async {
+            match decoders {
+                Some(decoders) => {
+                    session
+                        .accept_transactional_receiver_with_decoders(incoming, 0, decoders)
+                        .await
+                }
+                None => session.accept_transactional_receiver(incoming, 0).await,
+            }
+        };
+        let (endpoint, ()) = tokio::join!(accepting, responses);
         (session, endpoint.expect("accepted transactional receiver"))
     }
 
