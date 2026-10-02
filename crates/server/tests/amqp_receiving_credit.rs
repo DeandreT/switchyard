@@ -6,7 +6,7 @@ use std::{
     future::Future,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -50,6 +50,8 @@ use peer::*;
 mod auth;
 #[path = "amqp_receiving_credit/lifecycle.rs"]
 mod lifecycle;
+#[path = "amqp_receiving_credit/pipeline.rs"]
+mod pipeline;
 
 macro_rules! backend_cases {
     ($module:ident, $provider:expr) => {
@@ -89,6 +91,40 @@ macro_rules! backend_cases {
             #[tokio::test]
             async fn listen_expiry_before_credit_does_not_claim_a_message() -> TestResult {
                 auth::listen_expiry_before_credit_does_not_claim_a_message($provider).await
+            }
+
+            #[tokio::test]
+            async fn three_held_originals_settle_in_reverse_without_replayed_credit() -> TestResult {
+                pipeline::three_held_originals_settle_in_reverse_without_replayed_credit($provider)
+                    .await
+            }
+
+            #[tokio::test]
+            async fn thirty_two_held_jobs_bound_a_thirty_three_credit_grant() -> TestResult {
+                pipeline::thirty_two_held_jobs_bound_a_thirty_three_credit_grant($provider).await
+            }
+
+            #[tokio::test]
+            async fn an_empty_lookup_drains_unused_credit_while_jobs_remain_held() -> TestResult {
+                pipeline::an_empty_lookup_drains_unused_credit_while_jobs_remain_held($provider)
+                    .await
+            }
+
+            #[tokio::test]
+            async fn detach_preserves_held_locks_until_explicit_expiry_and_redelivery() -> TestResult {
+                pipeline::detach_preserves_held_locks_until_explicit_expiry_and_redelivery($provider)
+                    .await
+            }
+
+            #[tokio::test]
+            async fn authorization_loss_preserves_several_locks_until_expiry() -> TestResult {
+                auth::pipeline::authorization_loss_preserves_several_locks_until_expiry($provider)
+                    .await
+            }
+
+            #[tokio::test]
+            async fn a_started_receive_survives_another_jobs_final_ack() -> TestResult {
+                pipeline::a_started_receive_survives_another_jobs_final_ack($provider).await
             }
         }
     };

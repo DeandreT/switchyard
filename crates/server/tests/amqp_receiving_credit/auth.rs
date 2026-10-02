@@ -6,6 +6,9 @@ use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::form_urlencoded::byte_serialize;
 
+#[path = "auth/pipeline.rs"]
+pub(super) mod pipeline;
+
 const HOST: &str = "tenant.servicebus.windows.net";
 const AUDIENCE: &str = "amqps://tenant.servicebus.windows.net/orders";
 const RULE: &str = "receive-credit-listen";

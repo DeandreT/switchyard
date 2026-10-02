@@ -174,7 +174,7 @@ async fn absent_or_string_session_identifier_submits_without_an_associated_link_
         assert_eq!(response.body, map_body(MESSAGES, Value::List(Vec::new())));
         assert_eq!(broker.submissions(), [expected_submission(session_id)]);
         assert!(management.sessions.read().await.is_empty());
-        assert!(management.deliveries.read().await.is_empty());
+        assert!(management.deliveries.is_empty());
     }
 }
 
@@ -199,7 +199,7 @@ async fn present_nonstring_session_identifier_is_bad_request_before_submission()
         assert_eq!(response.body, Value::Null);
         assert!(broker.submissions().is_empty());
         assert!(management.sessions.read().await.is_empty());
-        assert!(management.deliveries.read().await.is_empty());
+        assert!(management.deliveries.is_empty());
     }
 }
 

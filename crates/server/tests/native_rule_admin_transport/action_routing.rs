@@ -187,25 +187,14 @@ pub(super) async fn round_trip<P: StoreProvider>(provider: P) -> TestResult {
         Some(&domain::MessageValue::String("producer-name".into()))
     );
 
-    // Ordinary receiving links each retain one copy until it is settled.
-    let mut base_receiver = timeout(
+    let mut receiver = timeout(
         DEADLINE,
         ClientReceiver::attach(&mut session, "native-action-base", CHILD),
     )
     .await??;
-    let base = timeout(DEADLINE, base_receiver.recv()).await??;
-    let mut first_receiver = timeout(
-        DEADLINE,
-        ClientReceiver::attach(&mut session, "native-action-first", CHILD),
-    )
-    .await??;
-    let first = timeout(DEADLINE, first_receiver.recv()).await??;
-    let mut second_receiver = timeout(
-        DEADLINE,
-        ClientReceiver::attach(&mut session, "native-action-second", CHILD),
-    )
-    .await??;
-    let second = timeout(DEADLINE, second_receiver.recv()).await??;
+    let base = timeout(DEADLINE, receiver.recv()).await??;
+    let first = timeout(DEADLINE, receiver.recv()).await??;
+    let second = timeout(DEADLINE, receiver.recv()).await??;
     for (delivery, name) in [
         (&base, None),
         (&first, Some("a-remove")),
@@ -220,7 +209,8 @@ pub(super) async fn round_trip<P: StoreProvider>(provider: P) -> TestResult {
         assert_eq!(delivery.message().body, original.body);
         assert_eq!(delivery.message().footer, original.footer);
     }
-    timeout(DEADLINE, first_receiver.accept(&first)).await??;
+    // Settle the second transported copy before the first and third.
+    timeout(DEADLINE, receiver.accept(&first)).await??;
     timeout(DEADLINE, async {
         loop {
             let remaining = node.peek(CHILD).await?;
@@ -246,16 +236,10 @@ pub(super) async fn round_trip<P: StoreProvider>(provider: P) -> TestResult {
         second.message().application_properties,
         expected(&original, Some("b-remove")).application_properties
     );
-    timeout(DEADLINE, base_receiver.accept(&base)).await??;
-    timeout(DEADLINE, second_receiver.accept(&second)).await??;
+    timeout(DEADLINE, receiver.accept(&base)).await??;
+    timeout(DEADLINE, receiver.accept(&second)).await??;
     node.wait_empty(CHILD).await?;
-    for receiver in [
-        &mut base_receiver,
-        &mut first_receiver,
-        &mut second_receiver,
-    ] {
-        timeout(DEADLINE, receiver.close()).await??;
-    }
+    timeout(DEADLINE, receiver.close()).await??;
     timeout(DEADLINE, sender.close()).await??;
     timeout(DEADLINE, session.end()).await??;
     timeout(DEADLINE, connection.close()).await??;

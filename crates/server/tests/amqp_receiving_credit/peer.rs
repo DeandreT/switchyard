@@ -305,6 +305,16 @@ impl Peer {
         if delivery.settled {
             return Ok(());
         }
+        self.settle(delivery, DeliveryState::Accepted(Accepted))
+            .await
+    }
+
+    pub(super) async fn settle(
+        &mut self,
+        delivery: &WireDelivery,
+        state: DeliveryState,
+    ) -> TestResult {
+        assert!(!delivery.settled, "second-mode original is unsettled");
         self.send(
             CHANNEL,
             Performative::Disposition(Disposition {
@@ -312,7 +322,7 @@ impl Peer {
                 first: delivery.id,
                 last: None,
                 settled: false,
-                state: Some(DeliveryState::Accepted(Accepted)),
+                state: Some(state),
                 batchable: false,
             }),
             vec![],

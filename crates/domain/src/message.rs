@@ -398,32 +398,13 @@ impl MessageRecord {
     /// Rich content is authoritative; its compatibility body is not counted
     /// twice. The response's enclosing entry and wrapper are not included.
     pub fn delivery_size_upper_bound(&self) -> u64 {
-        let mut size = self.envelope.as_deref().map_or_else(
-            || {
-                self.body
-                    .len()
-                    .saturating_add(self.message_id.len())
-                    .saturating_add(5)
-            },
-            MessageEnvelope::content_size,
-        );
-        size = size.saturating_add(BROKER_HEADER_RESERVE_BYTES);
-        if let Some(session_id) = &self.session_id {
-            size = size
-                .saturating_add(5)
-                .saturating_add(session_id.as_str().len());
-        }
-        if let Some(info) = &self.dead_letter {
-            // A described application-properties map plus two string entries.
-            // Count canonical additions even if a producer used the same keys.
-            size = size
-                .saturating_add(19)
-                .saturating_add(10 + "DeadLetterReason".len())
-                .saturating_add(info.reason.as_str().len())
-                .saturating_add(10 + "DeadLetterErrorDescription".len())
-                .saturating_add(info.description.len());
-        }
-        u64::try_from(size).unwrap_or(u64::MAX)
+        delivery_size_upper_bound(
+            &self.message_id,
+            &self.body,
+            self.envelope.as_deref(),
+            self.session_id.as_ref(),
+            self.dead_letter.as_ref(),
+        )
     }
 
     pub fn status(&self) -> MessageStatus {
@@ -472,6 +453,54 @@ pub struct Delivery {
     /// Why the message was dead-lettered, when it came from a dead-letter
     /// queue.
     pub dead_letter: Option<DeadLetterInfo>,
+}
+
+impl Delivery {
+    /// Conservative outbound content estimate, including broker metadata.
+    /// This borrows the acquired delivery without cloning or encoding it and
+    /// does not bound the allocation already performed by Receive.
+    pub fn delivery_size_upper_bound(&self) -> u64 {
+        delivery_size_upper_bound(
+            &self.message_id,
+            &self.body,
+            self.envelope.as_deref(),
+            self.session_id.as_ref(),
+            self.dead_letter.as_ref(),
+        )
+    }
+}
+
+fn delivery_size_upper_bound(
+    message_id: &str,
+    body: &[u8],
+    envelope: Option<&MessageEnvelope>,
+    session_id: Option<&SessionId>,
+    dead_letter: Option<&DeadLetterInfo>,
+) -> u64 {
+    let mut size = envelope.map_or_else(
+        || {
+            body.len()
+                .saturating_add(message_id.len())
+                .saturating_add(5)
+        },
+        MessageEnvelope::content_size,
+    );
+    size = size.saturating_add(BROKER_HEADER_RESERVE_BYTES);
+    if let Some(session_id) = session_id {
+        size = size
+            .saturating_add(5)
+            .saturating_add(session_id.as_str().len());
+    }
+    if let Some(info) = dead_letter {
+        // Charge canonical additions even when producer keys are overwritten.
+        size = size
+            .saturating_add(19)
+            .saturating_add(10 + "DeadLetterReason".len())
+            .saturating_add(info.reason.as_str().len())
+            .saturating_add(10 + "DeadLetterErrorDescription".len())
+            .saturating_add(info.description.len());
+    }
+    u64::try_from(size).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -26,7 +26,9 @@ use crate::{
     settlement::{dead_letter_disposition, read_properties_to_modify},
 };
 
+mod delivery_registration;
 mod rules;
+pub(crate) use delivery_registration::{DeliveryRegistration, DeliveryRegistrationError};
 pub use rules::{
     ADD_RULE_OPERATION, ENUMERATE_RULES_OPERATION, REMOVE_RULE_OPERATION, RULE_DESCRIPTION,
     RULE_NAME, RULES,
@@ -129,7 +131,7 @@ struct ReplyRoute {
 /// replicated broker state, and both disappear when the connection does.
 #[derive(Debug, Default)]
 pub(crate) struct ConnectionManagement {
-    deliveries: RwLock<HashMap<DeliveryKey, ManagedDelivery>>,
+    deliveries: delivery_registration::DeliveryRegistry,
     sessions: RwLock<HashMap<String, ManagedSession>>,
     routes: Mutex<ReplyRoutes>,
     route_changed: Notify,
@@ -148,7 +150,7 @@ impl ConnectionManagement {
         lock_token: LockToken,
         binding: EntityBinding,
     ) {
-        self.deliveries.write().await.insert(
+        self.deliveries.register(
             DeliveryKey {
                 link_name: link_name.to_owned(),
                 lock_token,
@@ -161,6 +163,28 @@ impl ConnectionManagement {
         );
     }
 
+    pub(crate) fn register_delivery_owned(
+        self: &Arc<Self>,
+        link_name: &str,
+        entity: EntityPath,
+        sequence: SequenceNumber,
+        lock_token: LockToken,
+        binding: EntityBinding,
+    ) -> Result<DeliveryRegistration, DeliveryRegistrationError> {
+        self.deliveries.register_owned(
+            Arc::clone(self),
+            DeliveryKey {
+                link_name: link_name.to_owned(),
+                lock_token,
+            },
+            ManagedDelivery {
+                entity,
+                sequence,
+                binding,
+            },
+        )
+    }
+
     pub(crate) async fn unregister_delivery(
         &self,
         link_name: &str,
@@ -171,24 +195,24 @@ impl ConnectionManagement {
             link_name: link_name.to_owned(),
             lock_token,
         };
-        let mut deliveries = self.deliveries.write().await;
-        if deliveries
-            .get(&key)
-            .is_some_and(|delivery| &delivery.binding == binding)
-        {
-            deliveries.remove(&key);
-        }
+        self.deliveries.unregister(&key, binding);
     }
 
     async fn delivery(&self, link_name: &str, lock_token: LockToken) -> Option<ManagedDelivery> {
+        self.deliveries.get(&DeliveryKey {
+            link_name: link_name.to_owned(),
+            lock_token,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_delivery_registration(&self, link_name: &str, lock_token: LockToken) -> bool {
         self.deliveries
-            .read()
-            .await
             .get(&DeliveryKey {
                 link_name: link_name.to_owned(),
                 lock_token,
             })
-            .cloned()
+            .is_some()
     }
 
     pub(crate) async fn register_session(

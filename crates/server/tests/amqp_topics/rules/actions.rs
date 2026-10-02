@@ -182,19 +182,8 @@ async fn create_list_delete_and_three_private_copies_preserve_original_and_legac
     )
     .await??;
     let base = recv(&mut receiver).await?;
-    // Each ordinary link holds one unsettled copy before fetching another.
-    let mut first_receiver = timeout(
-        DEADLINE,
-        ClientReceiver::attach(&mut session, "first-action-copy", alpha.as_str()),
-    )
-    .await??;
-    let first = recv(&mut first_receiver).await?;
-    let mut second_receiver = timeout(
-        DEADLINE,
-        ClientReceiver::attach(&mut session, "second-action-copy", alpha.as_str()),
-    )
-    .await??;
-    let second = recv(&mut second_receiver).await?;
+    let first = recv(&mut receiver).await?;
+    let second = recv(&mut receiver).await?;
     for (delivery, expected_sequence, name, removed) in [
         (&base, 1, None, &[][..]),
         (
@@ -234,7 +223,8 @@ async fn create_list_delete_and_three_private_copies_preserve_original_and_legac
             Some(&Value::String("capital".into()))
         );
     }
-    timeout(DEADLINE, first_receiver.accept(&first)).await??;
+    // Settle the second transported copy before the first and third.
+    timeout(DEADLINE, receiver.accept(&first)).await??;
     node.wait_len(&alpha, 2).await?;
     assert_eq!(
         node.peek(&alpha)
@@ -246,10 +236,8 @@ async fn create_list_delete_and_three_private_copies_preserve_original_and_legac
     );
     timeout(DEADLINE, receiver.accept(&base)).await??;
     node.wait_len(&alpha, 1).await?;
-    timeout(DEADLINE, second_receiver.accept(&second)).await??;
+    timeout(DEADLINE, receiver.accept(&second)).await??;
     node.wait_len(&alpha, 0).await?;
-    timeout(DEADLINE, first_receiver.close()).await??;
-    timeout(DEADLINE, second_receiver.close()).await??;
     assert_eq!(
         node.submit(
             &node.topic,

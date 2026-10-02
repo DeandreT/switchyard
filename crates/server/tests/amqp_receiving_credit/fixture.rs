@@ -2,15 +2,36 @@ use super::*;
 
 #[derive(Default)]
 pub(super) struct Controls {
+    now: AtomicU64,
     pub(super) receives: AtomicUsize,
     pub(super) completed: AtomicUsize,
     pub(super) writes: AtomicUsize,
     pub(super) clocks: AtomicUsize,
     deliveries: Mutex<Vec<domain::Delivery>>,
+    response_gate: Mutex<Option<Arc<ReceiveResponseGateState>>>,
     changed: Notify,
 }
 
 impl Controls {
+    pub(super) fn pause_receive_response(&self, ordinal: usize) -> ReceiveResponseGate {
+        let state = Arc::new(ReceiveResponseGateState {
+            ordinal,
+            reached: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            changed: Notify::new(),
+            release: Notify::new(),
+        });
+        let mut gate = self.response_gate.lock().expect("receive response gate");
+        assert!(gate.is_none(), "the receive response gate is one-shot");
+        *gate = Some(Arc::clone(&state));
+        ReceiveResponseGate(state)
+    }
+
+    pub(super) fn advance_to(&self, millis: u64) {
+        let previous = self.now.swap(millis, Ordering::SeqCst);
+        assert!(millis >= previous, "the test clock only advances");
+    }
+
     pub(super) fn reset(&self) {
         self.receives.store(0, Ordering::SeqCst);
         self.completed.store(0, Ordering::SeqCst);
@@ -39,6 +60,61 @@ impl Controls {
 
     pub(super) fn delivery(&self, index: usize) -> domain::Delivery {
         self.deliveries.lock().expect("observed deliveries")[index].clone()
+    }
+}
+
+struct ReceiveResponseGateState {
+    ordinal: usize,
+    reached: AtomicBool,
+    released: AtomicBool,
+    changed: Notify,
+    release: Notify,
+}
+
+pub(super) struct ReceiveResponseGate(Arc<ReceiveResponseGateState>);
+
+impl ReceiveResponseGate {
+    pub(super) async fn wait(&self) -> TestResult {
+        timeout(DEADLINE, async {
+            loop {
+                let changed = self.0.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.0.reached.load(Ordering::SeqCst) {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub(super) fn release(&self) {
+        self.0.released.store(true, Ordering::SeqCst);
+        self.0.release.notify_waiters();
+    }
+}
+
+impl Drop for ReceiveResponseGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl ReceiveResponseGateState {
+    async fn park(&self) {
+        assert!(!self.reached.swap(true, Ordering::SeqCst));
+        self.changed.notify_waiters();
+        loop {
+            let release = self.release.notified();
+            tokio::pin!(release);
+            release.as_mut().enable();
+            if self.released.load(Ordering::SeqCst) {
+                return;
+            }
+            release.await;
+        }
     }
 }
 
@@ -74,7 +150,7 @@ struct CountingClock(Arc<Controls>);
 impl Clock for CountingClock {
     fn now(&self) -> Timestamp {
         self.0.clocks.fetch_add(1, Ordering::SeqCst);
-        Timestamp::from_millis(1_000)
+        Timestamp::from_millis(self.0.now.load(Ordering::SeqCst))
     }
 }
 
@@ -103,9 +179,7 @@ impl protocol_amqp::Broker for ObservedBroker {
         let controls = self.controls.clone();
         let receive = matches!(kind, CommandKind::Receive { .. });
         async move {
-            if receive {
-                controls.receives.fetch_add(1, Ordering::SeqCst);
-            }
+            let ordinal = receive.then(|| controls.receives.fetch_add(1, Ordering::SeqCst) + 1);
             let result = protocol_amqp::Broker::submit_fenced(&inner, binding, entity, kind).await;
             if receive {
                 if let Ok(CommandOutcome::Received(Some(delivery))) = &result {
@@ -114,6 +188,19 @@ impl protocol_amqp::Broker for ObservedBroker {
                         .lock()
                         .expect("observed deliveries")
                         .push(delivery.clone());
+                }
+                let gate = controls
+                    .response_gate
+                    .lock()
+                    .expect("receive response gate")
+                    .as_ref()
+                    .filter(|gate| Some(gate.ordinal) == ordinal)
+                    .cloned();
+                if let Some(gate) = gate {
+                    // The real broker reply and lock exist before this test-only
+                    // pause; no owner/store mutex is held across the wait.
+                    assert!(matches!(&result, Ok(CommandOutcome::Received(Some(_)))));
+                    gate.park().await;
                 }
                 controls.completed.fetch_add(1, Ordering::SeqCst);
                 controls.changed.notify_waiters();
@@ -187,6 +274,7 @@ impl<P: StoreProvider> Node<P> {
         let store = provider.open()?;
         let namespace = NamespaceName::new("tenant")?;
         let controls = Arc::new(Controls::default());
+        controls.advance_to(1_000);
         let broker = Broker::spawn(LocalProposer::new(
             StateMachine::new(ObservedStore {
                 inner: store.clone(),
@@ -274,6 +362,40 @@ impl<P: StoreProvider> Node<P> {
         )
         .await??;
         assert!(config.is_some());
+        Ok(())
+    }
+
+    pub(super) async fn expire_locks(&self, returned: u32) -> TestResult {
+        let deadline = (0..returned as usize)
+            .map(|index| {
+                self.controls
+                    .delivery(index)
+                    .lock
+                    .expect("held lock")
+                    .locked_until
+                    .as_millis()
+            })
+            .max()
+            .ok_or("at least one held lock is required")?;
+        self.controls
+            .advance_to(deadline.checked_add(1).ok_or("lock deadline overflow")?);
+        let outcome = timeout(
+            DEADLINE,
+            self.broker.handle().submit(
+                self.namespace.clone(),
+                EntityPath::new("orders")?,
+                CommandKind::ExpireLocks,
+            ),
+        )
+        .await??;
+        assert_eq!(
+            outcome,
+            CommandOutcome::LocksExpired {
+                returned_to_ready: returned,
+                dead_lettered: 0,
+                dropped: 0,
+            }
+        );
         Ok(())
     }
 
