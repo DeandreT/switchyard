@@ -148,6 +148,9 @@ or upserts. The rule CLI uses bounded, typed JSON filter files and preserves
 scalar widths and bits. Subscription creation keeps an explicit `$Default`
 true rule; delete that rule when selection should depend only on custom filters.
 Other native services and Azure administration compatibility remain unfinished.
+The trusted domain also provides bounded [REMOVE rule actions](docs/sql-actions.md)
+with independent selected copies. Wire and CLI action creation are not enabled;
+their rule reads refuse definitions whose actions they cannot represent.
 
 The trusted Rust broker API also provides bounded, same-queue atomic sends and
 settlements. These primitives underpin the separate opt-in native listeners;

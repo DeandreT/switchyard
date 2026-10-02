@@ -4,6 +4,8 @@ Switchyard supports a bounded, action-free SQL predicate subset through the
 domain state machine and AMQP rule management. This is not complete Azure SQL
 filter or action compatibility. The exact Boolean aliases `1=1` and `1=0` keep
 their existing filter representation.
+The trusted domain separately supports bounded [REMOVE actions](sql-actions.md);
+wire and CLI action creation remain unavailable.
 
 ## Storage And Compilation
 
@@ -66,9 +68,10 @@ otherwise present value.
 
 ## Error Routing
 
-Correlation and SQL rules OR together and retain at most one copy per
-subscription. Every rule is evaluated, without Boolean match shortcuts. A
-finite SQL error overrides a successful match on the same subscription,
+Action-free correlation and SQL rules OR together and retain at most one copy
+per subscription; matching action rules retain independent copies as described
+in [SQL Actions](sql-actions.md). Every rule is evaluated without Boolean match
+shortcuts. A finite SQL error overrides successful matches on the same subscription,
 independently of rule order. The first finite error in sorted rule/node order
 determines its fixed description. Healthy sibling subscriptions remain usable.
 This error precedence is an explicit local policy, not cloud-verified behavior.
@@ -80,7 +83,7 @@ that option enabled, a finite error creates one direct dead-letter copy with
 reason `SwitchyardSqlFilterError`. This is a local reason, not a claim of Azure's
 exact reason text. The description is a fixed error-class string: it contains
 no expression, property names, or producer values. With the option false, only
-that subscription's copy is dropped. SQL errors precede missing-session routing.
+that subscription's copies are dropped. SQL errors precede missing-session routing.
 Unsupported scalar types, incompatible operands, integer overflow or division
 by zero, ambiguous property names, invalid escapes, unsupported string ordering,
 and non-Boolean results are finite errors.

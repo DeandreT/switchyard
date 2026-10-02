@@ -32,7 +32,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
 | Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; Azure administration not implemented |
-| Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD; actions not implemented |
+| Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD; trusted REMOVE actions with independent copies, wire action CRUD pending |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Dead-letter | Pre-1.0 | State machine, AMQP mapping |
@@ -244,7 +244,8 @@ OR together and emit at most one copy per matching subscription. Removing the
 final rule selects nothing, with no implicit default fallback. These Boolean,
 default, and combination semantics follow Microsoft's
 [topic filter documentation](https://learn.microsoft.com/en-us/azure/service-bus-messaging/topic-filters).
-Bounded SQL predicates are supported alongside those filters. Actions and
+Bounded SQL predicates are supported alongside those filters. Trusted
+[REMOVE actions](sql-actions.md) add independent copies; wire action creation and
 compound correlation predicates remain explicitly unsupported rather than
 treated as successful matches.
 
@@ -1232,16 +1233,20 @@ as `queue update`.
 
 ## Durable Format
 
-The current value format is version 10 and durable store layout is version 13.
-The value format appends the subscription filter-error policy and a source-only
-SQL rule variant with semantic version 1. Legacy subscription configurations
-decode with the default true; relabeling the new shape as an older value format
-is refused. SQL rules likewise cannot be relabeled as pre-version-10 records.
+The current value format is version 11 and durable store layout is version 14.
+Value format 11 appends optional source-only [SQL actions](sql-actions.md) with
+semantic version 1; legacy rule definitions decode with no action. Maximum-sized
+old rules are validated and charged by their actual stored envelopes, not a
+larger rewritten shape. Relabeling the new rule shape as an older format is
+refused. Value format 10 introduced the subscription filter-error policy and a
+source-only SQL filter variant with semantic version 1. Legacy subscription
+configurations decode with the default true; relabeling the new shape as an older
+value format is refused. SQL rules likewise cannot be relabeled as pre-version-10 records.
 Message and queue shapes are unchanged, and existing reason tags stay intact;
 the missing-session reason retains its version-9 rollback guard.
 The layout also requires retained [entity incarnations](entity-incarnations.md),
 which prevent old admitted endpoints from addressing recreated names. The
-layout protects SQL rule interpretation and the new subscription policy,
+layout protects SQL filter/action interpretation and the subscription policy,
 in addition to explicit rules, session-bearing ordinary subscription indexes,
 and parent-retained topic schedules. An older build could otherwise decode the
 wrong configuration shape, fail to interpret SQL, or route publications under

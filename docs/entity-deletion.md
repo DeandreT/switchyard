@@ -98,8 +98,9 @@ their first lock. Missing fences are never silently reconstructed. This is not
 a guarantee against arbitrary manual counter tampering: a used empty entity
 whose counter was externally erased cannot be distinguished from an untouched
 lazy entity. Counter tombstones currently have no garbage collection and may
-accumulate as names are deleted. Value format 10 remains unchanged; store layout
-13 additionally requires retained incarnation records.
+accumulate as names are deleted. Deletion changes no record shape; incarnation
+records were introduced in store layout 13. The current
+[durable format](compatibility.md#durable-format) also protects rule actions.
 
 ## Live Links
 

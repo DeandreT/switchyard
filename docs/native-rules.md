@@ -5,6 +5,11 @@ The optional `--admin-listen` gRPC listener serves `RuleService` alongside
 the existing broker owner. It does not provide Azure Atom/XML administration,
 rule actions, updates, or upserts.
 
+The separate trusted [SQL action command](sql-actions.md) can create
+action-bearing definitions. Until this API can represent them, Get returns
+Unimplemented for such a rule and List returns Unimplemented for a set containing
+one; neither silently emits an action-free definition. Delete remains available.
+
 ## Requests and Authorization
 
 Every request names the configured namespace and a subscription path such as

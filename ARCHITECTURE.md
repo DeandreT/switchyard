@@ -33,8 +33,9 @@ Committed delivery notifications wake all registered entity waiters, including
 independent session receivers; registration precedes each receive attempt.
 Boolean, scalar correlation, and bounded SQL rules are persisted and managed
 through AMQP and the native gRPC [rule API](docs/native-rules.md).
-SQL error routing has an explicit subscription policy; actions
-and Azure administration remain unimplemented. Native
+SQL error routing has an explicit subscription policy. Trusted domain
+[REMOVE actions](docs/sql-actions.md) create independently transformed copies;
+wire action creation and Azure administration remain unimplemented. Native
 administration creates, reads, lists, partially updates, and atomically deletes
 queues, topics, and subscriptions. Deletion purges owned state under explicit
 work limits while retaining counters and entity identities as recreation fences; see
@@ -273,11 +274,11 @@ complete rule sets, and one atomic batch. Subscription creation persists an
 explicit `$Default` true rule; removing the final rule selects nothing. Conditions
 AND within a correlation rule and action-free rules OR without extra copies.
 Topic ingress owns sequence allocation and duplicate
-history; subscription copies share that sequence but have independent receive
+history; action-free subscription copies share that sequence but have independent receive
 and settlement state. It stores separate payload records rather than shared
 encrypted payloads. Future publications retain one scheduled record on the topic,
 not copies in its subscriptions. Activation uses current validated membership and rules,
-assigns a new shared active sequence, and starts each copy's TTL. Late-member
+assigns a new shared action-free sequence, and starts each copy's TTL. Late-member
 participation and rule timing are local policies, not cloud-verified guarantees. Session-required
 subscriptions own sessions independently; missing identifiers route copies to
 their respective dead-letter shadows only when their rules select the publication.
@@ -287,8 +288,13 @@ correlation and SQL evaluation shares one command allowance. Finite SQL errors
 override matches within one subscription. By default they route one session-free,
 lifetime-free copy to its shadow with fixed local error fields; disabling the
 subscription option drops only that copy. Resource limits instead refuse the
-entire command atomically, including limits found after a finite error. Actions
-remain unimplemented. Detailed SQL policies are in [SQL Rules](docs/sql-rules.md).
+entire command atomically, including limits found after a finite error.
+The trusted action command adds one independently annotated copy per matching
+REMOVE action, beyond the single OR-combined action-free copy. Those copies use
+additional parent counter sequences after all original input acknowledgements;
+the exact-key removal and final RuleName collision policy are local. Wire and
+native administration refuse actions they cannot represent. Detailed policies
+are in [SQL Rules](docs/sql-rules.md) and [SQL Actions](docs/sql-actions.md).
 Fanout admission bounds retained copies, content, and typed value items before
 cloning; committed application effects name only actual ready destinations.
 Topic activation commits a fitting due prefix of at most 256 inspected sources,
