@@ -1,12 +1,13 @@
 //! Explicit posting-only ingress; ordinary listeners retain their refusal policy.
 
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use amqp::{
     CoordinatorRequest, Error as AmqpProtocolError, NativeConnectionIdentity,
     NativeControllerIdentity, NativeReceiverIdentity, TransactionPostingReceipt,
 };
 use domain::{EntityBinding, QueueConfig};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::{
     sync::{Semaphore, mpsc, oneshot},
     task::JoinSet,
@@ -80,6 +81,8 @@ fn same_connection(
 }
 
 type IngressError = Box<dyn std::error::Error + Send + Sync>;
+type SessionAdmission =
+    Pin<Box<dyn Future<Output = Result<amqp::ServerSession, amqp::EngineError>> + Send>>;
 
 pub(super) async fn serve_atomic_posting_connection<B: crate::NativeAtomicBroker>(
     connection: &mut amqp::ServerConnection,
@@ -93,6 +96,26 @@ pub(super) async fn serve_atomic_posting_connection<B: crate::NativeAtomicBroker
 struct Driver<B: crate::NativeAtomicBroker> {
     owner: owner::Owner<B>,
     sessions: JoinSet<Result<(), IngressError>>,
+    admissions: FuturesUnordered<SessionAdmission>,
+    events: mpsc::Sender<Event>,
+    incoming: mpsc::Receiver<Event>,
+}
+
+impl<B: crate::NativeAtomicBroker> Driver<B> {
+    fn new(connection: NativeConnectionIdentity, broker: B) -> Self {
+        let (events, incoming) = mpsc::channel(EVENT_CAPACITY);
+        Self {
+            owner: owner::Owner::new(connection, broker),
+            sessions: JoinSet::new(),
+            admissions: FuturesUnordered::new(),
+            events,
+            incoming,
+        }
+    }
+
+    fn session_count(&self) -> usize {
+        self.sessions.len() + self.admissions.len()
+    }
 }
 
 impl<B: crate::NativeAtomicBroker> Drop for Driver<B> {
@@ -109,12 +132,18 @@ async fn driver<B: crate::NativeAtomicBroker>(
     broker: B,
     authorization: Option<Arc<crate::authorization::ConnectionAuthorization>>,
 ) -> Result<(), IngressError> {
-    let (events, mut incoming) = mpsc::channel(EVENT_CAPACITY);
+    let driver = Driver::new(connection.connection_identity().clone(), broker.clone());
+    run_driver(connection, namespace, broker, authorization, driver).await
+}
+
+async fn run_driver<B: crate::NativeAtomicBroker>(
+    connection: &mut amqp::ServerConnection,
+    namespace: domain::NamespaceName,
+    broker: B,
+    authorization: Option<Arc<crate::authorization::ConnectionAuthorization>>,
+    mut driver: Driver<B>,
+) -> Result<(), IngressError> {
     let links = Arc::new(Semaphore::new(MAX_LINKS));
-    let mut driver = Driver {
-        owner: owner::Owner::new(connection.connection_identity().clone(), broker.clone()),
-        sessions: JoinSet::new(),
-    };
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let authorization_deadline = authorization.as_ref().and_then(|authorization| {
@@ -131,7 +160,7 @@ async fn driver<B: crate::NativeAtomicBroker>(
 
     loop {
         tokio::select! {
-            event = incoming.recv() => {
+            event = driver.incoming.recv() => {
                 let Some(event) = event else { break };
                 match event {
                     Event::StopConnection { reply } => {
@@ -157,6 +186,22 @@ async fn driver<B: crate::NativeAtomicBroker>(
                     None => {}
                 }
             }
+            result = driver.admissions.next(), if !driver.admissions.is_empty() => {
+                match result {
+                    Some(Ok(session)) => {
+                        driver.sessions.spawn(routing::serve_session(
+                            session,
+                            namespace.clone(),
+                            broker.clone(),
+                            authorization.clone(),
+                            driver.events.clone(),
+                            Arc::clone(&links),
+                        ));
+                    }
+                    Some(Err(amqp::EngineError::RemoteDetached)) | None => {}
+                    Some(Err(error)) => return Err(error.into()),
+                }
+            }
             _ = tick.tick() => {
                 driver.owner.tick();
                 if !connection.connection_identity().is_active() {
@@ -180,7 +225,7 @@ async fn driver<B: crate::NativeAtomicBroker>(
             }
             session = connection.next_incoming_session() => {
                 let Some(session) = session else { break };
-                if driver.sessions.len() >= MAX_SESSIONS {
+                if driver.session_count() >= MAX_SESSIONS {
                     driver.owner.close();
                     connection.close_with_error(super::error_for(
                         amqp::AmqpError::ResourceLimitExceeded,
@@ -188,19 +233,8 @@ async fn driver<B: crate::NativeAtomicBroker>(
                     )).await?;
                     return Ok(());
                 }
-                let session = match connection.accept_session(session).await {
-                    Ok(session) => session,
-                    Err(amqp::EngineError::RemoteDetached) => continue,
-                    Err(error) => return Err(error.into()),
-                };
-                driver.sessions.spawn(routing::serve_session(
-                    session,
-                    namespace.clone(),
-                    broker.clone(),
-                    authorization.clone(),
-                    events.clone(),
-                    Arc::clone(&links),
-                ));
+                // Pending admission shares the collector budget without stalling its owner.
+                driver.admissions.push(Box::pin(connection.accept_session(session)));
             }
         }
     }

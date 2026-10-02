@@ -5,6 +5,8 @@ use tokio::time::timeout;
 
 use super::operations::Operation;
 
+mod admissions;
+mod begin_gate;
 mod fixture;
 mod recorder;
 

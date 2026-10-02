@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use amqp::{
     Attach, Begin, ConnectionOptions, Coordinator, CoordinatorEndpoint, CoordinatorRequest,
@@ -16,6 +16,7 @@ use tokio::{
 };
 
 use super::super::{Event, QueueAdmission, WorkerClose, owner::Owner};
+use super::begin_gate::{BeginGate, GatedIo};
 use super::recorder::Recorder;
 
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -33,6 +34,7 @@ pub(super) struct Fixture {
     pub(super) coordinator: CoordinatorEndpoint,
     pub(super) receiver: TransactionalReceiver,
     pub(super) observer: Option<amqp::NativeTransactionIdentity>,
+    pub(super) begin_gate: Arc<BeginGate>,
     _close: Vec<mpsc::Receiver<WorkerClose>>,
 }
 
@@ -257,6 +259,8 @@ impl Fixture {
     pub(super) async fn new() -> TestResult<Self> {
         timeout(DEADLINE, async {
             let (server, io) = tokio::io::duplex(16_384);
+            let begin_gate = Arc::new(BeginGate::default());
+            let server = GatedIo::new(server, Arc::clone(&begin_gate));
             let mut peer = Peer {
                 io,
                 sent: HashMap::new(),
@@ -374,6 +378,7 @@ impl Fixture {
                 coordinator,
                 receiver,
                 observer: None,
+                begin_gate,
                 _close: vec![controller_commands, producer_commands],
             })
         })

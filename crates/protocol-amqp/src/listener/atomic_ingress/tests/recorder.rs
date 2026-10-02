@@ -9,17 +9,38 @@ use domain::{
 };
 
 use crate::{
-    AtomicCommitDecision, AtomicTransactionSubmission, Attachment, Broker, BrokerRejection,
-    EntityAdmission, EntityMetadata, NativeAtomicBroker, NativeAtomicBrokerCompletion,
-    NativeAtomicOwnerError, NativeAtomicResponseUnavailable, NativeTransactionDecision,
-    OwnedNativeAtomicMessagingSubmission,
+    AtomicCommitDecision, AtomicCommitPermit, AtomicTransactionSubmission, Attachment, Broker,
+    BrokerRejection, EntityAdmission, EntityMetadata, NativeAtomicBroker,
+    NativeAtomicBrokerCompletion, NativeAtomicOwnerError, NativeAtomicResponseUnavailable,
+    NativeTransactionDecision, OwnedNativeAtomicMessagingSubmission,
 };
+use tokio::sync::oneshot;
+
+type HandoffPause = (oneshot::Sender<AtomicCommitPermit>, oneshot::Receiver<()>);
 
 #[derive(Clone, Default)]
 pub(super) struct Recorder {
     pub(super) handoffs: Arc<AtomicUsize>,
     pub(super) claimed: Arc<AtomicUsize>,
     pub(super) bodies: Arc<Mutex<Vec<Vec<Vec<u8>>>>>,
+    pause: Arc<Mutex<Option<HandoffPause>>>,
+}
+
+impl Recorder {
+    pub(super) fn pause_handoff(
+        &self,
+    ) -> (oneshot::Receiver<AtomicCommitPermit>, oneshot::Sender<()>) {
+        let (entered, observed) = oneshot::channel();
+        let (release, resumed) = oneshot::channel();
+        assert!(
+            self.pause
+                .lock()
+                .expect("handoff pause")
+                .replace((entered, resumed))
+                .is_none()
+        );
+        (observed, release)
+    }
 }
 
 impl Broker for Recorder {
@@ -95,8 +116,16 @@ impl NativeAtomicBroker for Recorder {
         let abort = submission.permit().abort_on_drop();
         let recorder = self.clone();
         recorder.handoffs.fetch_add(1, Ordering::Relaxed);
+        let pause = recorder.pause.lock().expect("handoff pause").take();
+        let resume = pause.map(|(entered, resume)| {
+            let _ = entered.send(submission.permit().clone());
+            resume
+        });
         async move {
             let _abort = abort;
+            if let Some(resume) = resume {
+                let _ = resume.await;
+            }
             let (native, logical) = submission.into_submissions();
             let (ticket, mut work) = match logical {
                 AtomicTransactionSubmission::Bound(submission) => {
