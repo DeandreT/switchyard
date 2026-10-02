@@ -168,8 +168,9 @@ impl ClientConnection {
         let (closed_tx, closed) = watch::channel(false);
         let consumed = Arc::new(Notify::new());
         let driver_consumed = consumed.clone();
-        let (lifecycle, cancellation, terminated) = ConnectionLifecycle::new();
+        let (lifecycle, cancellation, actor_exit) = ConnectionLifecycle::new();
         tokio::spawn(async move {
+            let exit_guard = actor_exit;
             let _ = run_client(
                 stream,
                 ConnectionSettings {
@@ -180,13 +181,14 @@ impl ClientConnection {
                     options,
                     peer_idle_millis,
                 },
+                exit_guard.identity(),
                 command_rx,
                 closed_tx,
                 driver_consumed,
                 cancellation,
             )
             .await;
-            let _ = terminated.send(true);
+            drop(exit_guard);
         });
         Ok(Self {
             commands,
@@ -220,6 +222,11 @@ impl ClientConnection {
 
     pub async fn shutdown(&self) {
         self.lifecycle.shutdown().await;
+    }
+
+    /// Observes this connection's provenance and native actor lifetime.
+    pub fn connection_identity(&self) -> &NativeConnectionIdentity {
+        &self.lifecycle.identity
     }
 
     #[cfg(test)]
@@ -348,7 +355,7 @@ impl ClientSession {
         let name = name.into();
         let (deliveries_tx, _) = mpsc::channel(1);
         let (detached_tx, detached) = watch::channel(false);
-        let identity = LinkIdentity::new();
+        let identity = self.identity.new_link();
         let (handle, _) = client_request(&self.commands, |reply| ClientCommand::Attach {
             channel: self.channel,
             session: self.identity.clone(),
@@ -426,7 +433,7 @@ impl ClientSession {
         let name = name.into();
         let (deliveries_tx, deliveries) = mpsc::channel(DELIVERY_QUEUE_CAPACITY);
         let consumption = Arc::new(Consumption::new(self.consumed.clone()));
-        let identity = LinkIdentity::new();
+        let identity = self.identity.new_link();
         let (detached_tx, detached) = watch::channel(false);
         let (handle, response) = client_request(&self.commands, |reply| ClientCommand::Attach {
             channel: self.channel,
@@ -916,9 +923,11 @@ async fn client_request<T>(
     response.await.map_err(|_| EngineError::Stopped)?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_client<Io>(
     stream: Io,
     settings: ConnectionSettings,
+    connection: &NativeConnectionIdentity,
     mut commands: mpsc::Receiver<ClientCommand>,
     closed: watch::Sender<bool>,
     consumed: Arc<Notify>,
@@ -1364,7 +1373,7 @@ where
                                         let _ = reply.send(Err(error.into()));
                                         continue;
                                     }
-                                    let session = SessionState::new(&Begin { incoming_window: 0, outgoing_window: 0, ..Begin::default() });
+                                    let session = SessionState::for_connection(&Begin { incoming_window: 0, outgoing_window: 0, ..Begin::default() }, connection);
                                     let identity = session.identity.clone();
                                     sessions.insert(channel, session);
                                     next_handles.insert(channel, 0);

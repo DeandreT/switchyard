@@ -22,6 +22,7 @@ use crate::{
 #[cfg(test)]
 use crate::{decode_message, encode_message, read_frame};
 
+mod connection_identity;
 mod content_budget;
 mod error_deliveries;
 mod error_links;
@@ -38,6 +39,8 @@ mod session_channels;
 mod session_identity;
 mod transactions;
 
+use connection_identity::ConnectionActorExit;
+pub use connection_identity::NativeConnectionIdentity;
 use content_budget::ContentLease;
 use error_deliveries::{
     ErrorDeliveryHistory, ErrorDeliveryHistoryError, MAX_RETIRED_DELIVERIES_PER_DIRECTION,
@@ -309,19 +312,23 @@ struct ConnectionSettings {
 struct ConnectionLifecycle {
     cancellation: watch::Sender<bool>,
     terminated: watch::Receiver<bool>,
+    identity: NativeConnectionIdentity,
 }
 
 impl ConnectionLifecycle {
-    fn new() -> (Self, watch::Receiver<bool>, watch::Sender<bool>) {
+    fn new() -> (Self, watch::Receiver<bool>, ConnectionActorExit) {
         let (cancellation, cancelled) = watch::channel(false);
         let (terminated_tx, terminated) = watch::channel(false);
+        let identity = NativeConnectionIdentity::new();
+        let actor_exit = ConnectionActorExit::new(identity.clone(), terminated_tx);
         (
             Self {
                 cancellation,
                 terminated,
+                identity,
             },
             cancelled,
-            terminated_tx,
+            actor_exit,
         )
     }
 
@@ -563,8 +570,9 @@ impl ServerConnection {
         let (incoming_session_tx, incoming_sessions) = mpsc::channel(32);
         let consumed = Arc::new(Notify::new());
         let driver_consumed = consumed.clone();
-        let (lifecycle, cancellation, terminated) = ConnectionLifecycle::new();
+        let (lifecycle, cancellation, actor_exit) = ConnectionLifecycle::new();
         tokio::spawn(async move {
+            let exit_guard = actor_exit;
             run_connection(
                 stream,
                 ConnectionSettings {
@@ -575,13 +583,14 @@ impl ServerConnection {
                     options,
                     peer_idle_millis,
                 },
+                exit_guard.identity(),
                 command_rx,
                 incoming_session_tx,
                 driver_consumed,
                 cancellation,
             )
             .await;
-            let _ = terminated.send(true);
+            drop(exit_guard);
         });
         Ok(Self {
             commands,
@@ -602,6 +611,11 @@ impl ServerConnection {
     /// Cancels blocked driver work and waits until both socket tasks terminate.
     pub async fn shutdown(&self) {
         self.lifecycle.shutdown().await;
+    }
+
+    /// Observes this connection's provenance and native actor lifetime.
+    pub fn connection_identity(&self) -> &NativeConnectionIdentity {
+        &self.lifecycle.identity
     }
 
     pub async fn next_incoming_session(&mut self) -> Option<IncomingSession> {
@@ -1127,9 +1141,18 @@ impl PendingLinkFlow {
 }
 
 impl SessionState {
+    #[cfg(test)]
     fn new(peer: &Begin) -> Self {
+        Self::with_identity(peer, SessionIdentity::new())
+    }
+
+    fn for_connection(peer: &Begin, connection: &NativeConnectionIdentity) -> Self {
+        Self::with_identity(peer, SessionIdentity::for_connection(connection))
+    }
+
+    fn with_identity(peer: &Begin, identity: SessionIdentity) -> Self {
         Self {
-            identity: SessionIdentity::new(),
+            identity,
             peer_channel: None,
             remote_handle_max: peer.handle_max,
             handle_aliases: HashMap::new(),
@@ -1276,6 +1299,7 @@ struct PartialDelivery {
 async fn run_connection<Io>(
     stream: Io,
     settings: ConnectionSettings,
+    connection: &NativeConnectionIdentity,
     mut commands: mpsc::Receiver<Command>,
     incoming_sessions: mpsc::Sender<IncomingSession>,
     consumed: Arc<Notify>,
@@ -1365,7 +1389,7 @@ async fn run_connection<Io>(
                             {
                                 continue;
                             }
-                            match handle_frame(
+                            match handle_frame_scoped(
                                 frame,
                                 &mut writer,
                                 &incoming_sessions,
@@ -1373,6 +1397,7 @@ async fn run_connection<Io>(
                                 remote_max_frame_size,
                                 settings.remote_channel_max,
                                 activity.is_closing(),
+                                ConnectionScope::Native(connection),
                             ).await {
                                 Ok(FrameAction::Continue) => pump_ready = true,
                                 Ok(FrameAction::CloseSent) => pump_ready = false,
@@ -1481,6 +1506,13 @@ enum FrameAction {
     Closed,
 }
 
+enum ConnectionScope<'a> {
+    Native(&'a NativeConnectionIdentity),
+    #[cfg(test)]
+    Unbound,
+}
+
+#[cfg(test)]
 async fn handle_frame<W: AsyncWrite + Unpin>(
     frame: Frame,
     writer: &mut FrameWriter<W>,
@@ -1489,6 +1521,30 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
     remote_max_frame_size: u32,
     remote_channel_max: u16,
     locally_closing: bool,
+) -> Result<FrameAction, EngineError> {
+    handle_frame_scoped(
+        frame,
+        writer,
+        incoming_sessions,
+        sessions,
+        remote_max_frame_size,
+        remote_channel_max,
+        locally_closing,
+        ConnectionScope::Unbound,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_frame_scoped<W: AsyncWrite + Unpin>(
+    frame: Frame,
+    writer: &mut FrameWriter<W>,
+    incoming_sessions: &mpsc::Sender<IncomingSession>,
+    sessions: &mut HashMap<u16, SessionState>,
+    remote_max_frame_size: u32,
+    remote_channel_max: u16,
+    locally_closing: bool,
+    connection: ConnectionScope<'_>,
 ) -> Result<FrameAction, EngineError> {
     let Frame::Amqp {
         channel,
@@ -1618,7 +1674,13 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
 
     match performative {
         Performative::Begin(begin) => {
-            let mut session = SessionState::new(&begin);
+            let mut session = match connection {
+                ConnectionScope::Native(connection) => {
+                    SessionState::for_connection(&begin, connection)
+                }
+                #[cfg(test)]
+                ConnectionScope::Unbound => SessionState::new(&begin),
+            };
             session.peer_channel = Some(peer_channel);
             sessions.insert(channel, session);
             if incoming_sessions
@@ -4550,6 +4612,9 @@ mod receive_ceiling_tests;
 
 #[cfg(test)]
 mod content_budget_tests;
+
+#[cfg(test)]
+mod connection_identity_tests;
 
 #[cfg(test)]
 mod session_channel_tests;

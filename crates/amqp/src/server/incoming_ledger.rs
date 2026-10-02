@@ -8,6 +8,8 @@ use std::{
 
 use crate::ReceiverSettleMode;
 
+use super::NativeConnectionIdentity;
+
 #[cfg(test)]
 #[path = "incoming_ledger/error_history_tests.rs"]
 mod error_history_tests;
@@ -22,13 +24,35 @@ pub(super) struct LinkIdentity(Arc<LinkGeneration>);
 #[derive(Debug)]
 struct LinkGeneration {
     retired: AtomicBool,
+    // Only test-only unbound factories can omit connection provenance.
+    connection: Option<NativeConnectionIdentity>,
 }
 
 impl LinkIdentity {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
         Self(Arc::new(LinkGeneration {
             retired: AtomicBool::new(false),
+            connection: None,
         }))
+    }
+
+    pub(super) fn for_connection(connection: &NativeConnectionIdentity) -> Self {
+        Self(Arc::new(LinkGeneration {
+            retired: AtomicBool::new(false),
+            connection: Some(connection.clone()),
+        }))
+    }
+
+    pub(super) fn new_child(&self) -> Self {
+        Self(Arc::new(LinkGeneration {
+            retired: AtomicBool::new(false),
+            connection: self.0.connection.clone(),
+        }))
+    }
+
+    pub(super) fn connection_identity(&self) -> Option<&NativeConnectionIdentity> {
+        self.0.connection.as_ref()
     }
 
     pub(super) fn same_link(&self, other: &Self) -> bool {
@@ -90,6 +114,10 @@ impl DeliveryIdentity {
 
     pub(super) fn belongs_to(&self, owner: &LinkIdentity) -> bool {
         self.0.owner.same_link(owner)
+    }
+
+    pub(super) fn connection_identity(&self) -> Option<&NativeConnectionIdentity> {
+        self.0.owner.connection_identity()
     }
 
     pub(super) fn same_delivery(&self, other: &Self) -> bool {

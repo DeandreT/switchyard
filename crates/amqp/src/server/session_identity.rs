@@ -6,14 +6,24 @@ use std::{
 
 use crate::{Attach, ReceiverSettleMode, Role, SenderSettleMode};
 
+use super::NativeConnectionIdentity;
 use super::incoming_ledger::LinkIdentity;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SessionIdentity(LinkIdentity);
 
 impl SessionIdentity {
+    #[cfg(test)]
     pub(super) fn new() -> Self {
         Self(LinkIdentity::new())
+    }
+
+    pub(super) fn for_connection(connection: &NativeConnectionIdentity) -> Self {
+        Self(LinkIdentity::for_connection(connection))
+    }
+
+    pub(super) fn new_link(&self) -> LinkIdentity {
+        self.0.new_child()
     }
 
     pub(super) fn same_session(&self, other: &Self) -> bool {
@@ -91,9 +101,10 @@ pub struct IncomingAttach {
 
 impl IncomingAttach {
     pub(super) fn new(attach: Attach, session: SessionIdentity, local_handle: u32) -> Self {
+        let link = session.new_link();
         let approval = Arc::new(AttachApproval {
             session,
-            link: LinkIdentity::new(),
+            link,
             handle: attach.handle,
             local_handle,
             name: Arc::from(attach.name.as_str()),

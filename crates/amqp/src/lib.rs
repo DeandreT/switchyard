@@ -16,8 +16,8 @@ pub use crate::{
     },
     server::{
         ConnectionOptions, Delivery, EngineError, IncomingAttach, IncomingSession, LinkEndpoint,
-        MessageFormatDecoders, PendingSettlement, Receiver, RetainedDelivery, SaslAuthenticator,
-        Sender, ServerConnection, ServerSession,
+        MessageFormatDecoders, NativeConnectionIdentity, PendingSettlement, Receiver,
+        RetainedDelivery, SaslAuthenticator, Sender, ServerConnection, ServerSession,
     },
     types::*,
     value_codec::MessageDecodeBudget,

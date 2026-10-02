@@ -2,7 +2,9 @@ use std::{fmt, sync::Arc};
 
 use crate::{Error, Message, Modified};
 
-use super::{Delivery, EngineError, Receiver, content_budget::ContentLease};
+use super::{
+    Delivery, EngineError, NativeConnectionIdentity, Receiver, content_budget::ContentLease,
+};
 
 /// A uniquely owned delivery retaining its native encoded-content reservation.
 ///
@@ -44,6 +46,17 @@ impl RetainedDelivery {
 
     pub fn message_format(&self) -> u32 {
         self.delivery.message_format()
+    }
+
+    /// Returns the proof inherited from the receipt's exact delivery owner.
+    pub fn connection_identity(&self) -> Option<&NativeConnectionIdentity> {
+        self.delivery.identity.connection_identity()
+    }
+
+    /// Tests active connection provenance, not settlement or commit authority.
+    pub fn belongs_to_connection(&self, connection: &NativeConnectionIdentity) -> bool {
+        self.connection_identity()
+            .is_some_and(|owner| owner.same_connection(connection) && owner.is_active())
     }
 
     pub(super) fn inner(&self) -> &Delivery {
