@@ -32,7 +32,8 @@ Read-only management browsing can inspect all sessions without acquiring a hold.
 Committed delivery notifications wake all registered entity waiters, including
 independent session receivers; registration precedes each receive attempt.
 Boolean, scalar correlation, and bounded SQL rules are persisted and managed
-through AMQP. SQL error routing has an explicit subscription policy; actions
+through AMQP and the native gRPC [rule API](docs/native-rules.md).
+SQL error routing has an explicit subscription policy; actions
 and Azure administration remain unimplemented. Native
 administration creates, reads, lists, partially updates, and atomically deletes
 queues, topics, and subscriptions. Deletion purges owned state under explicit
@@ -121,9 +122,9 @@ Switchyard implements the Service Bus-specific layer:
 - AMQP transaction coordinator links and transactional dispositions
 - Compatible errors, status codes, link detach conditions, and retry hints
 
-The HTTPS compatibility endpoint implements the Atom/XML entity and rule
-operations required by Sift and `ServiceBusAdministrationClient`. The native
-control plane is gRPC only.
+An HTTPS compatibility endpoint for the Atom/XML entity and rule operations
+required by Sift and `ServiceBusAdministrationClient` is planned, not implemented.
+The implemented native control plane is gRPC only.
 
 Production listeners require TLS. Plaintext AMQP and HTTP are available only
 when the explicit development profile is active.

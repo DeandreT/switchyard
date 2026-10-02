@@ -32,7 +32,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
 | Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; Azure administration not implemented |
-| Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP; actions not implemented |
+| Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD; actions not implemented |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Dead-letter | Pre-1.0 | State machine, AMQP mapping |
@@ -1156,6 +1156,17 @@ These are local resource policies. The cluster, namespace,
 backup, and audit services return unimplemented
 rather than simulated success.
 This endpoint is not Azure Atom/XML administration compatibility.
+The additive `RuleService` serves create/get/list/delete on a canonical
+subscription path with Manage authorization before filter parsing or store
+access. It preserves exact scalar constructors and SQL source/version, uses an
+in-flight subscription-incarnation fence, and returns complete sorted lists
+under the existing 32-rule limit. Mutations are synchronous, with no rule actions,
+upserts, retry deduplication, or post-commit reread. It shares the entity service's
+admission and transport bounds; see [Native Rule Administration](native-rules.md).
+Native rule binding preserves literal parent/control-name bytes without AMQP
+address parsing. Authenticated paths still require the existing SAS grammar,
+which excludes leading empty segments; no native-name or SAS normalization is
+added by this API.
 `switchyardctl queue create|get|list|update|delete` exposes these operations with JSON
 responses and nonzero errors. It reads SAS tokens only from bounded regular
 files, marks their metadata sensitive, and verifies TLS against explicitly

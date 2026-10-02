@@ -136,7 +136,10 @@ with `--token-file`, never on the command line. Authenticated administration
 requires TLS and uses the node's existing shared-access policy. Queue, topic, and
 subscription deletion is synchronous and destructive, with atomic cleanup limits
 and retained recreation fences described in [Entity Deletion](docs/entity-deletion.md).
-Other native services and Azure administration compatibility remain unfinished.
+The same endpoint also exposes typed subscription rule create/get/list/delete
+through [Native Rule Administration](docs/native-rules.md), without rule actions
+or a rule CLI. Other native services and Azure administration compatibility
+remain unfinished.
 
 The trusted Rust broker API also provides bounded, same-queue atomic sends and
 settlements. These primitives underpin the separate opt-in native listeners;
