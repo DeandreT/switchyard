@@ -356,6 +356,31 @@ impl Group {
         Ok(())
     }
 
+    pub(in crate::server) fn refuse_staging(&self) -> Result<(), NativeTransactionError> {
+        let mut previous = self.phase.load(Ordering::Acquire);
+        loop {
+            match previous {
+                4 => return Ok(()),
+                value if value == 16 + NativeFault::PartialAtSeal as u8 => {
+                    return Err(NativeTransactionError::Faulted(NativeFault::PartialAtSeal));
+                }
+                1 | 2 => {}
+                value if value >= 16 => {}
+                _ => return Err(NativeTransactionError::InvalidDecision),
+            }
+            match self
+                .phase
+                .compare_exchange(previous, 4, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    self.changed.notify_waiters();
+                    return Ok(());
+                }
+                Err(next) => previous = next,
+            }
+        }
+    }
+
     pub(in crate::server) fn refresh_ready(&self) {
         let ready = lock(&self.obligations)
             .iter()

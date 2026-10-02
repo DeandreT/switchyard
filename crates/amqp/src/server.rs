@@ -64,10 +64,11 @@ use link_handles::{
 pub use native_transactions::{
     CoordinatorEndpoint, CoordinatorRequest, MAX_NATIVE_TRANSACTION_CONTROL_BYTES,
     MAX_NATIVE_TRANSACTION_POSTINGS, MAX_NATIVE_TRANSACTIONS, NativeClaim,
-    NativeControllerIdentity, NativeFault, NativeReadySubmission, NativeReadyTicket,
-    NativeTransactionDecision, NativeTransactionError, NativeTransactionIdentity,
-    NativeTransactionResources, NativeTransactionState, PendingDeclareReceipt, PreparedPosting,
-    SealedDischargeReceipt, TransactionPostingReceipt, TransactionalIngress, TransactionalReceiver,
+    NativeControllerIdentity, NativeDeclarationRefusal, NativeFault, NativeReadySubmission,
+    NativeReadyTicket, NativeTransactionDecision, NativeTransactionError,
+    NativeTransactionIdentity, NativeTransactionResources, NativeTransactionState,
+    PendingDeclareReceipt, PreparedPosting, SealedDischargeReceipt, TransactionPostingReceipt,
+    TransactionalIngress, TransactionalReceiver,
 };
 use native_transactions::{NativeIngressPolicy, NativeTransactionBook};
 use outgoing_identity::AckIdentity;

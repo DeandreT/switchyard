@@ -4,11 +4,13 @@ use super::*;
 use crate::{Body, Coordinator, TransactionCommand, TransactionId, TransactionalState};
 
 mod book;
+mod control_refusal;
 mod endpoints;
 mod group;
 mod handler;
 
-pub(super) use book::{NativeControlRefusal, NativeTransactionBook};
+pub(super) use book::NativeTransactionBook;
+pub(super) use control_refusal::NativeControlRefusal;
 pub(super) use endpoints::NativeCommand;
 pub use endpoints::{
     CoordinatorEndpoint, CoordinatorRequest, TransactionalIngress, TransactionalReceiver,
@@ -63,6 +65,13 @@ pub enum NativeTransactionDecision {
     Committed,
     Rejected,
     Indeterminate,
+}
+
+/// A trusted local declaration refusal, without caller-supplied wire text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeDeclarationRefusal {
+    ResourceLimit,
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

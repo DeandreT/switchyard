@@ -79,6 +79,28 @@ impl PendingDeclareReceipt {
         })
         .await
     }
+
+    /// Refuses only this original Declare using its negotiated outcome profile.
+    /// No transaction identifier is allocated or registered.
+    ///
+    /// ```compile_fail
+    /// async fn twice(receipt: amqp::PendingDeclareReceipt) {
+    ///     receipt.refuse(amqp::NativeDeclarationRefusal::ResourceLimit).await;
+    ///     receipt.refuse(amqp::NativeDeclarationRefusal::Unavailable).await;
+    /// }
+    /// ```
+    pub async fn refuse(self, reason: NativeDeclarationRefusal) -> Result<(), EngineError> {
+        let data = self.data;
+        let commands = data.route.commands.clone();
+        request(&commands, |reply| {
+            Command::NativeTransactions(NativeCommand::RefuseDeclare {
+                data: Box::new(data),
+                reason,
+                reply,
+            })
+        })
+        .await
+    }
 }
 
 pub(in crate::server) struct NativePartialPosting {
@@ -282,6 +304,40 @@ impl SealedDischargeReceipt {
         let commands = data.route.commands.clone();
         request(&commands, |reply| {
             Command::NativeTransactions(NativeCommand::Rollback {
+                data: Box::new(data),
+                reply,
+            })
+        })
+        .await
+    }
+
+    /// Refuses an original commit request before an owner can start it.
+    /// Caller-held postings retain their content until they are dropped.
+    ///
+    /// ```compile_fail
+    /// async fn twice(receipt: amqp::SealedDischargeReceipt) {
+    ///     receipt.refuse_staging().await;
+    ///     receipt.refuse_staging().await;
+    /// }
+    /// ```
+    pub async fn refuse_staging(self) -> Result<(), EngineError> {
+        let DischargeStatus::Live(group) = &self.status else {
+            return Err(native_error(NativeTransactionError::InvalidDecision));
+        };
+        if self.data.fail
+            || self.data.terminal_abort
+            || !self
+                .data
+                .group
+                .as_ref()
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, group))
+        {
+            return Err(native_error(NativeTransactionError::InvalidDecision));
+        }
+        let data = self.data;
+        let commands = data.route.commands.clone();
+        request(&commands, |reply| {
+            Command::NativeTransactions(NativeCommand::RefuseStaging {
                 data: Box::new(data),
                 reply,
             })

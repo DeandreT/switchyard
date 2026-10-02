@@ -160,6 +160,15 @@ pub(in crate::server) enum NativeCommand {
         id: TransactionId,
         reply: oneshot::Sender<Result<NativeTransactionIdentity, EngineError>>,
     },
+    RefuseDeclare {
+        data: Box<ControlData>,
+        reason: NativeDeclarationRefusal,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
+    RefuseStaging {
+        data: Box<ControlData>,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
     Provisional {
         data: Box<PostData>,
         reply: oneshot::Sender<Result<PreparedPosting, EngineError>>,
@@ -187,7 +196,10 @@ impl NativeCommand {
             Self::Declare { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
-            Self::Rollback { reply, .. } | Self::Finish { reply, .. } => {
+            Self::RefuseDeclare { reply, .. }
+            | Self::RefuseStaging { reply, .. }
+            | Self::Rollback { reply, .. }
+            | Self::Finish { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
             Self::Provisional { reply, .. } => {

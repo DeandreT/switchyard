@@ -37,8 +37,20 @@ pub(super) struct FlushGate {
 #[derive(Clone, Copy)]
 enum FlushTarget {
     Attach(u16),
-    Declared { channel: u16, id: u32 },
-    Provisional { channel: u16, id: u32 },
+    Declared {
+        channel: u16,
+        id: u32,
+    },
+    Provisional {
+        channel: u16,
+        id: u32,
+    },
+    Refusal {
+        channel: u16,
+        id: u32,
+        handle: u32,
+        rejected: bool,
+    },
 }
 
 impl FlushTarget {
@@ -93,6 +105,45 @@ impl FlushTarget {
                         }))
                     )
             }
+            (
+                Self::Refusal {
+                    channel: expected,
+                    id,
+                    rejected: true,
+                    ..
+                },
+                Frame::Amqp {
+                    channel,
+                    performative: Some(Performative::Disposition(disposition)),
+                    ..
+                },
+            ) => {
+                *channel == expected
+                    && disposition.role == Role::Receiver
+                    && disposition.first == id
+                    && disposition.last.is_none()
+                    && matches!(&disposition.state, Some(DeliveryState::Rejected(crate::Rejected { error: Some(error) })) if error.condition.as_symbol().as_str() == "amqp:transaction:rollback")
+            }
+            (
+                Self::Refusal {
+                    channel: expected,
+                    handle,
+                    rejected: false,
+                    ..
+                },
+                Frame::Amqp {
+                    channel,
+                    performative: Some(Performative::Detach(detach)),
+                    ..
+                },
+            ) => {
+                *channel == expected
+                    && detach.handle == handle
+                    && detach.closed
+                    && detach.error.as_ref().is_some_and(|error| {
+                        error.condition.as_symbol().as_str() == "amqp:transaction:rollback"
+                    })
+            }
             _ => false,
         }
     }
@@ -122,6 +173,30 @@ impl FlushGate {
 
     pub(super) fn fail_provisional(&self, channel: u16, id: u32) {
         self.arm(FlushTarget::Provisional { channel, id }, true);
+    }
+
+    pub(super) fn block_refusal(&self, channel: u16, id: u32, handle: u32, rejected: bool) {
+        self.arm(
+            FlushTarget::Refusal {
+                channel,
+                id,
+                handle,
+                rejected,
+            },
+            false,
+        );
+    }
+
+    pub(super) fn fail_refusal(&self, channel: u16, id: u32, handle: u32, rejected: bool) {
+        self.arm(
+            FlushTarget::Refusal {
+                channel,
+                id,
+                handle,
+                rejected,
+            },
+            true,
+        );
     }
 
     fn matches(&self, bytes: &[u8]) -> bool {
@@ -314,6 +389,30 @@ impl RawPeer {
         assert_eq!(actual, channel);
         assert!(payload.is_empty());
         *attach
+    }
+
+    async fn begin(&mut self, channel: u16) -> Begin {
+        for _ in 0..8 {
+            match self.frame().await {
+                Frame::Amqp {
+                    channel: actual,
+                    performative: Some(Performative::Begin(begin)),
+                    payload,
+                } => {
+                    assert_eq!(actual, channel);
+                    assert_eq!(begin.remote_channel, Some(channel));
+                    assert!(payload.is_empty());
+                    return begin;
+                }
+                Frame::Amqp {
+                    performative: Some(Performative::Flow(_)),
+                    payload,
+                    ..
+                } if payload.is_empty() => {}
+                frame => panic!("unexpected Begin response: {frame:?}"),
+            }
+        }
+        panic!("no Begin within bounded response count");
     }
 
     pub(super) async fn credit(&mut self, channel: u16, handle: u32) {
@@ -543,19 +642,10 @@ impl Fixture {
                 .next_incoming_session()
                 .await
                 .expect("incoming session");
-            let (session, frame) =
-                tokio::join!(self.connection.accept_session(incoming), self.peer.frame());
-            let Frame::Amqp {
-                channel: actual,
-                performative: Some(Performative::Begin(begin)),
-                payload,
-            } = frame
-            else {
-                panic!("own Begin")
-            };
-            assert_eq!(actual, channel);
-            assert_eq!(begin.remote_channel, Some(channel));
-            assert!(payload.is_empty());
+            let (session, _) = tokio::join!(
+                self.connection.accept_session(incoming),
+                self.peer.begin(channel)
+            );
             session.expect("server session")
         })
         .await

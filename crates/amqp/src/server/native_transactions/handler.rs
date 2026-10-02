@@ -142,6 +142,78 @@ pub(in crate::server) async fn handle_native_command<W: AsyncWrite + Unpin>(
                 group.fault(NativeFault::Dropped);
             }
         }
+        NativeCommand::RefuseDeclare {
+            mut data,
+            reason,
+            reply,
+        } => {
+            if data.group.is_some() || data.fail || data.terminal_abort {
+                data.disarm();
+                let _ = reply.send(Err(native_error(NativeTransactionError::InvalidDecision)));
+                return Ok(());
+            }
+            if let Err(error) = preflight_control(&data, sessions) {
+                let _ = reply.send(Err(error));
+                return Ok(());
+            }
+            let refusal = NativeControlRefusal::declaration(reason, data);
+            if let Err(error) = respond_control_refusal(refusal, sessions, writer).await {
+                return reply_failure(reply, error);
+            }
+            let _ = reply.send(Ok(()));
+        }
+        NativeCommand::RefuseStaging { mut data, reply } => {
+            if data.fail || data.terminal_abort {
+                data.disarm();
+                let _ = reply.send(Err(native_error(NativeTransactionError::InvalidDecision)));
+                return Ok(());
+            }
+            let Some(group) = data.group.as_ref().cloned() else {
+                data.disarm();
+                let _ = reply.send(Err(native_error(NativeTransactionError::InvalidDecision)));
+                return Ok(());
+            };
+            if !group.controller.same_controller(&data.controller) {
+                data.disarm();
+                let _ = reply.send(Err(native_error(NativeTransactionError::InvalidDecision)));
+                return Ok(());
+            }
+            if let Err(error) = preflight_control(&data, sessions) {
+                let _ = reply.send(Err(error));
+                return Ok(());
+            }
+            match group.refuse_staging() {
+                Ok(()) => {
+                    for obligation in group.obligations() {
+                        if let Err(error) = abort_post(&obligation, sessions, writer).await {
+                            return reply_failure(reply, error);
+                        }
+                    }
+                }
+                Err(NativeTransactionError::Faulted(NativeFault::PartialAtSeal)) => {
+                    let refusal = NativeControlRefusal::from_data(
+                        NativeTransactionError::Faulted(NativeFault::PartialAtSeal),
+                        data,
+                        true,
+                    );
+                    if let Err(error) = respond_control_refusal(refusal, sessions, writer).await {
+                        return reply_failure(reply, error);
+                    }
+                    let _ = reply.send(Ok(()));
+                    return Ok(());
+                }
+                Err(error) => {
+                    data.disarm();
+                    let _ = reply.send(Err(native_error(error)));
+                    return Ok(());
+                }
+            }
+            let refusal = NativeControlRefusal::staging(data);
+            if let Err(error) = respond_control_refusal(refusal, sessions, writer).await {
+                return reply_failure(reply, error);
+            }
+            let _ = reply.send(Ok(()));
+        }
         NativeCommand::Provisional { data, reply } => {
             if !matches!(
                 data.group.state(),
@@ -305,9 +377,7 @@ pub(in crate::server) async fn handle_control_refusal<W: AsyncWrite + Unpin>(
             .abort_delivery()
             .map_err(|_| invalid_state("native control refusal has no occupied delivery"))?;
     }
-    if !refusal.supports_rejected()
-        || refusal.error == NativeTransactionError::Faulted(NativeFault::PartialAtSeal)
-    {
+    if !refusal.supports_rejected() || refusal.is_partial_at_seal() {
         return detach_link_error(
             refusal.channel,
             refusal.handle,
@@ -350,6 +420,35 @@ pub(in crate::server) async fn handle_control_refusal<W: AsyncWrite + Unpin>(
         .map_err(|_| native_error(NativeTransactionError::Retired))?;
     refusal.disarm();
     Ok(())
+}
+
+async fn respond_control_refusal<W: AsyncWrite + Unpin>(
+    refusal: Box<NativeControlRefusal>,
+    sessions: &mut HashMap<u16, SessionState>,
+    writer: &mut FrameWriter<W>,
+) -> Result<(), NativeIoError> {
+    let session = sessions
+        .get_mut(&refusal.channel)
+        .ok_or(NativeIoError::Local(EngineError::RemoteDetached))?;
+    handle_control_refusal(refusal, session, writer)
+        .await
+        .map_err(|error| match error {
+            EngineError::Io(_) => NativeIoError::Write(error),
+            _ => NativeIoError::Local(error),
+        })
+}
+
+fn preflight_control(
+    data: &ControlData,
+    sessions: &mut HashMap<u16, SessionState>,
+) -> Result<(), EngineError> {
+    if !data.controller.is_active() || !data.controller.0.owner.same_link(&data.route.owner) {
+        return Err(native_error(NativeTransactionError::Retired));
+    }
+    checked_session(&data.route, sessions)?
+        .incoming
+        .preflight_transactional_provisional(&data.route.owner, &data.delivery.inner().identity)
+        .map_err(|_| native_error(NativeTransactionError::Retired))
 }
 
 fn checked_session<'a>(
