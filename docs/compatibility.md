@@ -751,6 +751,11 @@ the same outgoing native delivery without replaying its body or releasing its
 alias. This does not change ordinary sender refusals, the posting-only broker
 listener, or SDK transaction support; broker correspondence to held receive locks
 is supplied only by the separate [atomic messaging listener](atomic-messaging-ingress.md).
+Its explicit [attach-default opt-ins](transaction-attach-defaults.md) negotiate
+Mixed receiver requests to actual Unsettled/Second and interpret an omitted
+fresh coordinator count as zero under an immutable approved exception.
+Existing strict native APIs and ordinary/posting-only listeners are unchanged;
+these wire accommodations are not an SDK transaction-scope gate.
 An End on an unmapped channel is refused without manufacturing a session reply.
 Client Begin searches only vacant channels within the peer's inclusive channel
 limit. Pending, live, and ending sessions cannot be overwritten. Client End

@@ -21,6 +21,11 @@ only after the complete outgoing Transfer has been flushed. Its
 `TransactionRetirementReceipt` derived from an actual peer receiver disposition,
 not a caller-supplied transaction command, delivery ID, or tag.
 
+The separate [attach-default opt-ins](transaction-attach-defaults.md) add an
+explicit Mixed-request negotiation method and a coordinator-count exception.
+The strict constructor and dedicated acceptance method above are unchanged;
+negotiated sending mode is still Unsettled and retirement remains Second-mode.
+
 The initial retirement subset accepts only an Accepted transactional outcome
 with `settled=false` for a fully flushed, live original delivery. First-mode,
 source-settled, peer-settled retirements, nonterminal Received updates,

@@ -9,6 +9,9 @@ ordinary outcomes throughout this path.
 The separate `accept_with_transactional_work()` opt-in adds the bounded
 [native retirement path](native-transactional-retirement.md); the ingress-only
 constructor and listener described here remain posting-only.
+Separate [transaction attach-default opt-ins](transaction-attach-defaults.md)
+are selected only by the explicit atomic messaging adapter; they do not relax
+this posting-only constructor's coordinator admission.
 
 ## Admission And Control
 

@@ -4,9 +4,9 @@
 entry point for [NativeAtomicBroker](native-atomic-broker.md). It joins the
 [posting lifecycle](atomic-posting-ingress.md) to bounded
 [native outgoing retirement](native-transactional-retirement.md) on primary
-non-session queues. Ordinary `serve()`, server configuration, and the existing
-posting-only listener retain their previous policies. This is not an official
-SDK transaction-scope gate or a durable transaction recovery log.
+non-session queues. Ordinary `serve()`, ordinary process listeners, and the
+existing posting-only listener retain their previous policies. This is not an
+official SDK transaction-scope gate or a durable transaction recovery log.
 
 ## Experimental Process Endpoint
 
@@ -38,11 +38,18 @@ management operations.
 The endpoint shares TCP admission, TLS, WebSocket, SASL, CBS, handshake deadlines,
 and engine shutdown with the existing listeners. Producers require exact Send
 authorization; receiving links require exact Listen authorization. Authorization
-precedes queue topology reads. Receiving links must request Unsettled sender
-mode and Second receiver mode on a fixed, non-durable source without filters;
-distribution mode must be absent or `move`. Session queues, topics,
-subscriptions, dead-letter sources, management links, and receive-delete remain
-unsupported here.
+precedes queue topology reads. Receiving links may request Mixed or Unsettled
+sender mode and must request Second receiver mode. The source must be fixed,
+non-durable, and unfiltered; distribution mode must be absent or `move`.
+Session queues, topics, subscriptions, dead-letter sources, management links,
+and receive-delete remain unsupported here.
+
+The endpoint explicitly selects [transaction attach defaults](transaction-attach-defaults.md):
+receivers always negotiate actual Unsettled sender mode, and only a fresh
+coordinator may omit its initial delivery count, interpreted locally as zero.
+The latter is a documented interoperability exception. Strict native APIs,
+ordinary listeners, and the posting-only endpoint retain their previous policies.
+These link accommodations do not establish an official SDK transaction gate.
 
 Each receiving worker acquires one actual PeekLock delivery through its admitted
 queue-incarnation binding. It sends the message through the dedicated native
