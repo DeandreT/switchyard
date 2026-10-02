@@ -1,11 +1,10 @@
 # SQL Rules
 
-Switchyard supports a bounded, action-free SQL predicate subset through the
-domain state machine and AMQP rule management. This is not complete Azure SQL
+Switchyard supports a bounded SQL predicate subset through the domain state
+machine, AMQP rule management, native gRPC, and CLI. This is not complete Azure SQL
 filter or action compatibility. The exact Boolean aliases `1=1` and `1=0` keep
 their existing filter representation.
-The domain and AMQP rule management separately support bounded
-[REMOVE actions](sql-actions.md); native gRPC and CLI action creation remain unavailable.
+The same surfaces separately support bounded [REMOVE actions](sql-actions.md).
 
 ## Storage And Compilation
 

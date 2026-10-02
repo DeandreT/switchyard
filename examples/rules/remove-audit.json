@@ -1,0 +1,5 @@
+{
+  "type": "sql",
+  "expression": "REMOVE user.audit;",
+  "semantic_version": 1
+}

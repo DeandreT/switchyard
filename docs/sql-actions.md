@@ -1,16 +1,15 @@
 # SQL Actions
 
-The domain command `CreateRuleWithAction` and AMQP rule management add a bounded
-SQL action to a subscription rule. This first subset removes user properties
+The domain command `CreateRuleWithAction`, AMQP rule management, native gRPC,
+and `switchyardctl` add a bounded SQL action to a subscription rule.
+This first subset removes user properties
 only. It does not implement `SET`, system-property mutation, dynamic property
 names, arithmetic, functions, parameters, or complete Azure action compatibility.
 
-Native gRPC and `switchyardctl` cannot create actions yet. Their rule reads must
-not discard action metadata: native Get refuses an action-bearing rule, and
-native List refuses any action-bearing member. Those refusals are Unimplemented,
-not successful empty actions. Native deletion can still remove a valid
-action-bearing rule. AMQP enumeration and trusted broker reads retain the
-complete action.
+Rule reads must not discard action metadata. Native Get and List require explicit
+`include_actions` opt-in when returning action-bearing definitions; omission
+retains Unimplemented rather than a successful empty action. The CLI opts in
+automatically. AMQP enumeration and trusted broker reads retain complete actions.
 
 ## AMQP Management
 
@@ -69,6 +68,42 @@ cargo test -p server --test amqp_dotnet_current --locked -j 2 -- rule_actions --
 The new action gates use isolated certificate trust and bounded child-process
 execution. They establish local interoperability, not live-cloud parity for
 the local semantics below.
+
+## Native And CLI
+
+Native `RuleService.CreateRuleWithAction` requires both a filter and a
+`SqlRuleAction` containing exact `expression` text and an optional
+`semantic_version`. Omission selects version 1; other versions return
+Unimplemented before compilation. Returned actions always carry version 1,
+not AMQP compatibility level 20. The original `CreateRule` request and method
+remain action-free. A separate RPC ensures an older server refuses the method
+rather than silently dropping an unknown action field and creating the wrong rule.
+
+Get and List default `include_actions` to false. Get then refuses a selected
+action rule, and List refuses the complete response if any member has an action.
+A plain selected rule remains readable beside valid action siblings. With true,
+the exact source and version are returned; action-free rules have no action.
+All read modes validate the complete stored rule set before representation and
+retain the existing clock-free reads, generation fences, and response bounds.
+Manage authorization precedes action compilation and store access. Syntax,
+unsupported grammar, and limits use InvalidArgument, Unimplemented, and
+ResourceExhausted respectively, with static source-private errors.
+
+Add an optional action file to CLI creation:
+
+```text
+rule create events audit RedWithoutAudit --filter-file examples/rules/red.json --action-file examples/rules/remove-audit.json
+```
+
+The strict JSON shape is `{"type":"sql","expression":"REMOVE user.audit;"}`
+with an optional unsigned `semantic_version`; explicit null and unknown or
+duplicate fields are refused. Action files are bounded regular files of at most
+32 KiB. Both files and the complete encoded request are checked before connecting.
+The CLI forwards well-typed source and versions to the authoritative server,
+uses only the new RPC when an action is supplied, and never falls back to an
+action-free creation. Get/List request complete action metadata automatically
+and validate all output before emitting JSON. See
+[Native Rule Administration](native-rules.md) for the full contract.
 
 ## Grammar And Storage
 

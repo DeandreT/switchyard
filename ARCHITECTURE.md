@@ -33,9 +33,9 @@ Committed delivery notifications wake all registered entity waiters, including
 independent session receivers; registration precedes each receive attempt.
 Boolean, scalar correlation, and bounded SQL rules are persisted and managed
 through AMQP and the native gRPC [rule API](docs/native-rules.md).
-SQL error routing has an explicit subscription policy. AMQP and domain
+SQL error routing has an explicit subscription policy. AMQP, native, CLI, and domain
 [REMOVE actions](docs/sql-actions.md) create independently transformed copies;
-native action creation and Azure administration remain unimplemented. Native
+Azure administration remains unimplemented. Native
 administration creates, reads, lists, partially updates, and atomically deletes
 queues, topics, and subscriptions. Deletion purges owned state under explicit
 work limits while retaining counters and entity identities as recreation fences; see
@@ -293,8 +293,9 @@ The domain action command adds one independently annotated copy per matching
 REMOVE action, beyond the single OR-combined action-free copy. Those copies use
 additional parent counter sequences after all original input acknowledgements;
 the exact-key removal and final RuleName collision policy are local. AMQP
-enumeration preserves complete actions; native administration refuses action
-reads until it can represent them. Detailed policies
+enumeration preserves complete actions; native reads expose actions only with
+explicit opt-in, which the CLI requests automatically. A separate native action
+creation method prevents silent downgrade on older servers. Detailed policies
 are in [SQL Rules](docs/sql-rules.md) and [SQL Actions](docs/sql-actions.md).
 Fanout admission bounds retained copies, content, and typed value items before
 cloning; committed application effects name only actual ready destinations.

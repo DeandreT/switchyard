@@ -32,7 +32,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
 | Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; Azure administration not implemented |
-| Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD; AMQP REMOVE actions with independent copies, native action CRUD pending |
+| Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD/CLI; bounded REMOVE actions with independent copies across these surfaces, not SET/full Azure actions |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Dead-letter | Pre-1.0 | State machine, AMQP mapping |
@@ -42,7 +42,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
-| Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete over HTTP/2 and authenticated TLS; other services not implemented |
+| Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE actions over HTTP/2 and authenticated TLS; other services not implemented |
 | Quorum replication | Pre-1.0 | Not implemented; durable production startup is refused before opening storage or binding listeners. Development Fjall persistence is local only |
 | Partitioned entities | Later | Out of initial scope |
 | Cross-placement-group transactions | Later | Out of initial scope |
@@ -246,9 +246,9 @@ OR together and emit at most one copy per matching subscription. Removing the
 final rule selects nothing, with no implicit default fallback. These Boolean,
 default, and combination semantics follow Microsoft's
 [topic filter documentation](https://learn.microsoft.com/en-us/azure/service-bus-messaging/topic-filters).
-Bounded SQL predicates are supported alongside those filters. AMQP and domain
-[REMOVE actions](sql-actions.md) add independent copies; native action creation and
-compound correlation predicates remain explicitly unsupported rather than
+Bounded SQL predicates are supported alongside those filters. AMQP, native, CLI,
+and domain [REMOVE actions](sql-actions.md) add independent copies; `SET` actions
+and compound correlation predicates remain explicitly unsupported rather than
 treated as successful matches.
 
 Correlation rules select the eight retained system string properties and scalar
@@ -1174,11 +1174,14 @@ backup, and audit services return unimplemented
 rather than simulated success.
 This endpoint is not Azure Atom/XML administration compatibility.
 The additive `RuleService` serves create/get/list/delete on a canonical
-subscription path with Manage authorization before filter parsing or store
+subscription path with Manage authorization before filter/action parsing or store
 access. It preserves exact scalar constructors and SQL source/version, uses an
 in-flight subscription-incarnation fence, and returns complete sorted lists
-under the existing 32-rule limit. Mutations are synchronous, with no rule actions,
-upserts, retry deduplication, or post-commit reread. It shares the entity service's
+under the existing 32-rule limit. Bounded REMOVE actions use a separate
+`CreateRuleWithAction` method; the original `CreateRule` remains action-free.
+Get/List default to refusing action metadata unless `include_actions` is true,
+so older clients do not silently receive incomplete definitions. Mutations are
+synchronous, with no upserts, retry deduplication, or post-commit reread. It shares the entity service's
 admission and transport bounds; see [Native Rule Administration](native-rules.md).
 Native rule binding preserves literal parent/control-name bytes without AMQP
 address parsing. Authenticated paths still require the existing SAS grammar,
@@ -1190,10 +1193,13 @@ files, marks their metadata sensitive, and verifies TLS against explicitly
 supplied CA certificates. Plaintext is opt-in, loopback-only, and cannot carry a
 token. Command-line settings preserve omitted, false, zero, and unlimited TTL.
 `switchyardctl rule create|get|list|delete` addresses a topic/subscription member
-and uses a bounded typed filter file for creation. Its JSON preserves scalar
+and uses a bounded typed filter file plus an optional `--action-file` for creation.
+An action selects only the new RPC, with no action-free retry on older servers.
+Its JSON preserves scalar
 constructors, exact floating-point bits and octets, and 64-bit values as strings.
-It validates complete replies before emitting them and does not add rule actions,
-updates, or retries; see [Native Rule Administration](native-rules.md).
+It requests complete action metadata and validates whole replies before emitting
+them; absent actions keep their original JSON shape. It does not add updates or
+retries; see [Native Rule Administration](native-rules.md).
 
 Entity deletion commits one bounded atomic purge, cascades topic-owned
 subscriptions and shadows, and retains counter tombstones across recreation.

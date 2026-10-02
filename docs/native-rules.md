@@ -2,13 +2,8 @@
 
 The optional `--admin-listen` gRPC listener serves `RuleService` alongside
 `EntityService`. It creates, gets, lists, and deletes subscription rules through
-the existing broker owner. It does not provide Azure Atom/XML administration,
-rule actions, updates, or upserts.
-
-The separate trusted [SQL action command](sql-actions.md) can create
-action-bearing definitions. Until this API can represent them, Get returns
-Unimplemented for such a rule and List returns Unimplemented for a set containing
-one; neither silently emits an action-free definition. Delete remains available.
+the existing broker owner, including bounded [REMOVE actions](sql-actions.md).
+It does not provide Azure Atom/XML administration, `SET` actions, updates, or upserts.
 
 ## Requests and Authorization
 
@@ -40,9 +35,14 @@ recovery guarantee.
 
 ## Operations
 
-`CreateRule` is create-only. Duplicate names return AlreadyExists.
+`CreateRule` is create-only and always action-free; its original request fields
+are unchanged. `CreateRuleWithAction` is a separate create-only RPC requiring
+an action as well as a filter. Duplicate names return AlreadyExists across both
+methods. Neither replaces a plain or action-bearing rule. An older server
+refuses the new method as Unimplemented instead of ignoring an action field;
+clients must not retry it through `CreateRule`.
 `DeleteRule` removes exactly the named rule; missing names return NotFound.
-Both return an empty `RuleMutationResponse` only after the expected mutation
+All mutations return an empty `RuleMutationResponse` only after the expected mutation
 outcome, without rereading after commit. No asynchronous operation is implied.
 
 `GetRule` returns the exact named definition. `ListRules` returns the complete,
@@ -53,8 +53,16 @@ Reads validate the complete rule set before returning a result. Corrupt stored
 metadata or physical storage failures return static Internal errors without a
 partial list, SQL source, or storage diagnostic.
 
+Get and List have a default-false `include_actions` flag. With false, Get refuses
+an action-bearing selected rule and List refuses any action-bearing set as
+Unimplemented; neither emits action-free metadata for an action rule. A plain
+selected Get still succeeds beside valid action siblings. With true, responses
+include every action's exact source and explicit semantic version. Action-free
+definitions have no action. Complete stored-set validation precedes these
+representation checks in all modes.
+
 A returned `Rule` includes namespace, canonical subscription path, exact name,
-filter, and its committed creation timestamp in Unix milliseconds. Reading does
+filter, optional action, and its committed creation timestamp in Unix milliseconds. Reading does
 not consult or advance the applied clock or propose a command.
 
 ## Filter Values
@@ -84,8 +92,9 @@ explicit null. Compound values are not part of this contract.
 The existing domain limits remain authoritative: 32 rules per subscription,
 32 total conditions per correlation filter, 64 KiB per versioned stored rule,
 and 256 KiB per complete subscription rule set. Existing SQL compilation and
-evaluation budgets are unchanged. This additive API changes neither command
-encoding nor stored-record versions.
+evaluation budgets are unchanged. Action-bearing definitions count filter and
+action together under the stored-rule limit. This additive API uses the existing
+domain action command and changes neither command encoding nor stored-record versions.
 
 Rule and entity services share listener admission and transport bounds:
 128 concurrent requests across service clones, at most 32 HTTP/2 streams per
@@ -104,7 +113,7 @@ successful rule mutation.
 `switchyardctl` exposes the same four operations:
 
 ```text
-rule create <topic> <subscription> <name> --filter-file <path>
+rule create <topic> <subscription> <name> --filter-file <path> [--action-file <path>]
 rule get <topic> <subscription> <name>
 rule list <topic> <subscription>
 rule delete <topic> <subscription> <name>
@@ -118,15 +127,42 @@ complete; there are no paging options. Create/delete emit
 not a fetched definition or an asynchronous operation. Get/list validate the
 complete reply before writing JSON. Creation timestamps are decimal strings to
 preserve the full unsigned 64-bit range.
+Get/List automatically set `include_actions` to true. Output omits `action` for
+action-free definitions, preserving their original JSON shape; present actions
+use the exact source and explicit supported semantic version.
 
-Filter files are bounded regular files of at most 512 KiB. Symlinks to regular
+Filter files are bounded regular files of at most 512 KiB; action files have a
+separate 32 KiB bound. Symlinks to regular
 files retain the existing file-helper behavior; FIFOs and other nonregular
 opened files are refused. The complete encoded protobuf request is checked
-against 64 KiB before connecting. Filter-file and conversion errors, and remote
+against 64 KiB before connecting, after both files have been loaded. Filter/action-file
+and conversion errors, and remote
 RPC statuses, produce nonzero exits and static errors without echoing file paths,
 filter contents, tokens, or remote diagnostic text. SQL is not compiled locally:
 the server remains authoritative for syntax, semantic versions, and compilation
-budgets.
+budgets. A supplied action selects only `CreateRuleWithAction`, with no fallback
+if the server refuses that method. Omitting the action file selects only the
+original action-free `CreateRule`.
+
+Action JSON requires `type: "sql"` and a string `expression`, with optional
+unsigned `semantic_version`. Explicit null, unknown/duplicate fields, and other
+action types are refused. Omitted versions select the server's current version 1;
+unsupported supplied versions and well-typed invalid source are forwarded for
+authoritative refusal. Responses require explicit supported version 1 and bounded
+source. The checked-in [removal action](../examples/rules/remove-audit.json) is:
+
+```json
+{
+  "type": "sql",
+  "expression": "REMOVE user.audit;",
+  "semantic_version": 1
+}
+```
+
+Only bounded static user-property removal is implemented. The action compiler
+runs after authorization and before binding, with owner-side validation repeated
+under the captured child generation. The language and independent-copy behavior
+remain those in [SQL Actions](sql-actions.md).
 
 Filters use an explicit `type` field. True and false are `{"type":"true"}` and
 `{"type":"false"}`. SQL uses `expression` and optional `semantic_version`; the
