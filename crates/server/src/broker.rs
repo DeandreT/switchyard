@@ -39,6 +39,7 @@ mod atomic_work;
 mod bindings;
 mod guarded_atomic_messaging;
 mod native_atomic_messaging;
+mod native_atomic_protocol;
 mod protocol;
 mod request_queue;
 
