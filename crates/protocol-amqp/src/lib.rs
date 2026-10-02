@@ -20,6 +20,7 @@ mod message;
 mod session_filter;
 mod settlement;
 mod tls;
+mod transaction_registry;
 
 use thiserror::Error;
 
@@ -31,7 +32,8 @@ pub use crate::{
     atomic_work::{
         AtomicMessagingOwnerWork, AtomicMessagingWorkBudget, AtomicMessagingWorkError,
         AtomicMessagingWorkUsage, MAX_ATOMIC_WORK_CONTENT_BYTES, MAX_ATOMIC_WORK_GROUPS,
-        MAX_ATOMIC_WORK_VALUE_ITEMS, OwnedAtomicMessagingSubmission, StagedAtomicMessaging,
+        MAX_ATOMIC_WORK_VALUE_ITEMS, OwnedAtomicMessagingSubmission,
+        OwnedEmptyAtomicMessagingSubmission, StagedAtomicMessaging,
     },
     authorization::SharedAccessAuthentication,
     batch::SERVICE_BUS_BATCH_MESSAGE_FORMAT,
@@ -66,6 +68,11 @@ pub use crate::{
     },
     session_filter::{SESSION_FILTER, SessionRequest, read_session_filter, stamp_session_filter},
     tls::{TlsConfigurationError, tls_server_config},
+    transaction_registry::{
+        ATOMIC_TRANSACTION_TIMEOUT, AtomicTransactionController, AtomicTransactionDischarge,
+        AtomicTransactionRegistry, AtomicTransactionRegistryError, AtomicTransactionRegistryHandle,
+        AtomicTransactionSubmission, MAX_ATOMIC_TRANSACTION_TERMINALS,
+    },
 };
 
 /// Settlement modes are broker semantics, not wire syntax, so they live in the

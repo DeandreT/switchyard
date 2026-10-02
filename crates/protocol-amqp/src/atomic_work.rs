@@ -79,6 +79,25 @@ impl AtomicMessagingWorkBudget {
         &self,
         binding: EntityBinding,
     ) -> Result<StagedAtomicMessaging, AtomicMessagingWorkError> {
+        let lease = self.reserve_slot()?;
+        Ok(StagedAtomicMessaging {
+            binding,
+            commands: Vec::new(),
+            usage: AtomicMessagingInputUsage::default(),
+            lease,
+        })
+    }
+
+    pub(crate) fn stage_unbound(&self) -> Result<UnboundAtomicMessaging, AtomicMessagingWorkError> {
+        let lease = self.reserve_slot()?;
+        Ok(UnboundAtomicMessaging {
+            commands: Vec::new(),
+            usage: AtomicMessagingInputUsage::default(),
+            lease,
+        })
+    }
+
+    fn reserve_slot(&self) -> Result<WorkLease, AtomicMessagingWorkError> {
         {
             let mut usage = self
                 .usage
@@ -91,15 +110,10 @@ impl AtomicMessagingWorkBudget {
             }
             usage.groups += 1;
         }
-        Ok(StagedAtomicMessaging {
-            binding,
-            commands: Vec::new(),
-            usage: AtomicMessagingInputUsage::default(),
-            lease: WorkLease {
-                budget: self.clone(),
-                content_bytes: 0,
-                value_items: 0,
-            },
+        Ok(WorkLease {
+            budget: self.clone(),
+            content_bytes: 0,
+            value_items: 0,
         })
     }
 }
@@ -134,16 +148,7 @@ impl StagedAtomicMessaging {
     /// Consumes a candidate, retaining it only after all input and shared caps
     /// pass. A refused candidate is dropped outside the admission lock.
     pub fn try_push(&mut self, kind: CommandKind) -> Result<(), AtomicMessagingWorkError> {
-        let mut next = self.usage;
-        next.try_extend(&kind)
-            .map_err(AtomicMessagingWorkError::Input)?;
-        self.commands
-            .try_reserve(1)
-            .map_err(|_| AtomicMessagingWorkError::Unavailable)?;
-        self.lease.try_charge(next)?;
-        self.usage = next;
-        self.commands.push(kind);
-        Ok(())
+        push_kind(&mut self.commands, &mut self.usage, &mut self.lease, kind)
     }
 
     /// Moves commands and their reservation together into unique queue work.
@@ -165,6 +170,78 @@ impl fmt::Debug for StagedAtomicMessaging {
             .field("usage", &self.usage)
             .finish_non_exhaustive()
     }
+}
+
+/// Private work storage; the registry owns whether and when it becomes bound.
+pub(crate) struct UnboundAtomicMessaging {
+    commands: Vec<CommandKind>,
+    usage: AtomicMessagingInputUsage,
+    lease: WorkLease,
+}
+
+impl UnboundAtomicMessaging {
+    #[cfg(test)]
+    pub(crate) fn usage(&self) -> AtomicMessagingInputUsage {
+        self.usage
+    }
+
+    pub(crate) fn try_push(&mut self, kind: CommandKind) -> Result<(), AtomicMessagingWorkError> {
+        push_kind(&mut self.commands, &mut self.usage, &mut self.lease, kind)
+    }
+
+    pub(crate) fn into_bound_submission(
+        self,
+        binding: EntityBinding,
+        ticket: AtomicCommitTicket,
+    ) -> OwnedAtomicMessagingSubmission {
+        OwnedAtomicMessagingSubmission {
+            binding,
+            commands: self.commands,
+            ticket,
+            usage: self.usage,
+            lease: self.lease,
+        }
+    }
+
+    pub(crate) fn into_empty_submission(
+        self,
+        ticket: AtomicCommitTicket,
+    ) -> Result<OwnedEmptyAtomicMessagingSubmission, AtomicMessagingWorkError> {
+        if !self.commands.is_empty() || self.usage != AtomicMessagingInputUsage::default() {
+            return Err(AtomicMessagingWorkError::Unavailable);
+        }
+        Ok(OwnedEmptyAtomicMessagingSubmission {
+            ticket,
+            lease: self.lease,
+        })
+    }
+}
+
+impl fmt::Debug for UnboundAtomicMessaging {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnboundAtomicMessaging")
+            .field("usage", &self.usage)
+            .finish_non_exhaustive()
+    }
+}
+
+fn push_kind(
+    commands: &mut Vec<CommandKind>,
+    usage: &mut AtomicMessagingInputUsage,
+    lease: &mut WorkLease,
+    kind: CommandKind,
+) -> Result<(), AtomicMessagingWorkError> {
+    let mut next = *usage;
+    next.try_extend(&kind)
+        .map_err(AtomicMessagingWorkError::Input)?;
+    commands
+        .try_reserve(1)
+        .map_err(|_| AtomicMessagingWorkError::Unavailable)?;
+    lease.try_charge(next)?;
+    *usage = next;
+    commands.push(kind);
+    Ok(())
 }
 
 /// Unique queued work. Its permit observers never retain its commands or lease.
@@ -214,6 +291,56 @@ impl fmt::Debug for OwnedAtomicMessagingSubmission {
         formatter
             .debug_struct("OwnedAtomicMessagingSubmission")
             .field("usage", &self.usage)
+            .field("permit", self.permit())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Unique owner submission for a group that staged no actions.
+///
+/// Its slot stays charged through owner claim, decision, and reply. There is no
+/// entity binding to validate and no messaging payload to stamp or apply.
+/// Construction is restricted to the registry's checked empty-work handoff.
+///
+/// ```compile_fail
+/// fn duplicate(work: protocol_amqp::OwnedEmptyAtomicMessagingSubmission) {
+///     let _second = work.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn claim_twice(work: protocol_amqp::OwnedEmptyAtomicMessagingSubmission) {
+///     let _first = work.into_owner_parts();
+///     let _second = work.into_owner_parts();
+/// }
+/// ```
+pub struct OwnedEmptyAtomicMessagingSubmission {
+    ticket: AtomicCommitTicket,
+    lease: WorkLease,
+}
+
+impl OwnedEmptyAtomicMessagingSubmission {
+    pub fn permit(&self) -> &AtomicCommitPermit {
+        self.ticket.permit()
+    }
+
+    pub fn into_owner_parts(self) -> (AtomicCommitTicket, AtomicMessagingOwnerWork) {
+        (
+            self.ticket,
+            AtomicMessagingOwnerWork {
+                commands: Vec::new(),
+                usage: AtomicMessagingInputUsage::default(),
+                taken: false,
+                _lease: self.lease,
+            },
+        )
+    }
+}
+
+impl fmt::Debug for OwnedEmptyAtomicMessagingSubmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnedEmptyAtomicMessagingSubmission")
             .field("permit", self.permit())
             .finish_non_exhaustive()
     }

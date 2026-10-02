@@ -456,3 +456,306 @@ fn debug_output_never_formats_command_payloads_or_bindings() {
     drop(work);
     assert_eq!(budget.usage(), AtomicMessagingWorkUsage::default());
 }
+
+#[test]
+fn unbound_groups_and_empty_submissions_share_the_existing_slot_cap() {
+    let budget = AtomicMessagingWorkBudget::new();
+    let bound = (0..MAX_ATOMIC_WORK_GROUPS - 1)
+        .map(|_| budget.stage(binding()).expect("bound slot"))
+        .collect::<Vec<_>>();
+    let unbound = budget.stage_unbound().expect("last unbound slot");
+    let charged = budget.usage();
+    assert_eq!(charged.groups(), MAX_ATOMIC_WORK_GROUPS);
+    assert_eq!(unbound.usage(), AtomicMessagingInputUsage::default());
+    assert!(matches!(
+        budget.stage_unbound(),
+        Err(AtomicMessagingWorkError::Group { .. })
+    ));
+    assert!(matches!(
+        budget.stage(binding()),
+        Err(AtomicMessagingWorkError::Group { .. })
+    ));
+    let (permit, ticket) = pending();
+    let empty = unbound
+        .into_empty_submission(ticket)
+        .expect("empty handoff");
+    assert_eq!(empty.permit().state(), AtomicCommitState::Pending);
+    assert_eq!(budget.usage(), charged);
+    drop(empty);
+    assert_eq!(permit.state(), AtomicCommitState::Aborted);
+    assert_eq!(budget.usage().groups(), MAX_ATOMIC_WORK_GROUPS - 1);
+    drop(bound);
+    assert_eq!(budget.usage(), AtomicMessagingWorkUsage::default());
+}
+
+#[test]
+fn failed_first_push_can_still_use_the_checked_empty_handoff() {
+    let budget = AtomicMessagingWorkBudget::new();
+    let mut unbound = budget.stage_unbound().expect("unbound group");
+    let charged = budget.usage();
+    assert!(matches!(
+        unbound.try_push(CommandKind::ExpireLocks),
+        Err(AtomicMessagingWorkError::Input(
+            BrokerError::AtomicMessagingOperationNotSupported
+        ))
+    ));
+    assert_eq!(unbound.usage(), AtomicMessagingInputUsage::default());
+    assert!(unbound.commands.is_empty());
+    assert_eq!(budget.usage(), charged);
+    let (permit, ticket) = pending();
+    let empty = unbound.into_empty_submission(ticket).expect("still empty");
+    let (ticket, work) = empty.into_owner_parts();
+    assert_eq!(work.usage, AtomicMessagingInputUsage::default());
+    assert!(work.commands.is_empty());
+    let claim = ticket.try_claim().expect("empty owner claim");
+    claim.finish(AtomicCommitDecision::Committed);
+    assert_eq!(permit.state(), AtomicCommitState::Committed);
+    assert_eq!(budget.usage(), charged);
+    drop(work);
+    assert_eq!(budget.usage(), AtomicMessagingWorkUsage::default());
+}
+
+#[test]
+fn unbound_push_and_bound_push_use_one_aggregate_content_budget() {
+    let budget = AtomicMessagingWorkBudget::new();
+    let mut bound = budget.stage(binding()).expect("bound group");
+    let mut unbound = budget.stage_unbound().expect("unbound group");
+    let mut refused = budget.stage_unbound().expect("refused group");
+    bound
+        .try_push(send(MAX_ATOMIC_MESSAGING_CONTENT_BYTES))
+        .expect("bound content");
+    unbound
+        .try_push(send(MAX_ATOMIC_MESSAGING_CONTENT_BYTES))
+        .expect("unbound content");
+    assert_eq!(bound.usage(), unbound.usage());
+    assert_eq!(
+        budget.usage().content_bytes(),
+        MAX_ATOMIC_WORK_CONTENT_BYTES
+    );
+    let charged = budget.usage();
+    assert!(matches!(
+        refused.try_push(send(1)),
+        Err(AtomicMessagingWorkError::Content { .. })
+    ));
+    assert_eq!(refused.usage(), AtomicMessagingInputUsage::default());
+    assert!(refused.commands.is_empty());
+    assert!(refused.commands.capacity() >= 1);
+    assert_eq!(budget.usage(), charged);
+    let (permit, ticket) = pending();
+    let empty = refused
+        .into_empty_submission(ticket)
+        .expect("no accepted action");
+    assert_eq!(budget.usage(), charged);
+    drop(empty);
+    assert_eq!(permit.state(), AtomicCommitState::Aborted);
+    assert_eq!(budget.usage().groups(), 2);
+    assert_eq!(
+        budget.usage().content_bytes(),
+        MAX_ATOMIC_WORK_CONTENT_BYTES
+    );
+    drop(bound);
+    drop(unbound);
+    assert_eq!(budget.usage(), AtomicMessagingWorkUsage::default());
+}
+
+#[test]
+fn unbound_and_bound_value_items_cannot_bypass_the_shared_cap() {
+    let budget = AtomicMessagingWorkBudget::new();
+    let mut bound = budget.stage(binding()).expect("bound group");
+    let mut unbound = budget.stage_unbound().expect("unbound group");
+    let mut refused = budget.stage_unbound().expect("refused group");
+    bound
+        .try_push(values(MAX_ATOMIC_MESSAGING_VALUE_ITEMS))
+        .expect("bound values");
+    unbound
+        .try_push(values(MAX_ATOMIC_MESSAGING_VALUE_ITEMS))
+        .expect("unbound values");
+    assert_eq!(bound.usage(), unbound.usage());
+    let charged = budget.usage();
+    assert_eq!(charged.value_items(), MAX_ATOMIC_WORK_VALUE_ITEMS);
+    assert!(matches!(
+        refused.try_push(values(1)),
+        Err(AtomicMessagingWorkError::ValueItem { .. })
+    ));
+    assert_eq!(budget.usage(), charged);
+    assert_eq!(refused.usage(), AtomicMessagingInputUsage::default());
+    drop(bound);
+    refused.try_push(values(1)).expect("refunded capacity");
+    assert_eq!(
+        budget.usage().value_items(),
+        MAX_ATOMIC_MESSAGING_VALUE_ITEMS + 1
+    );
+    drop(unbound);
+    drop(refused);
+    assert_eq!(budget.usage(), AtomicMessagingWorkUsage::default());
+}
+
+#[test]
+fn checked_empty_handoff_rejects_even_zero_content_actions() {
+    for action in [
+        send(1),
+        complete(),
+        CommandKind::SendBatch {
+            messages: Vec::new(),
+        },
+    ] {
+        let budget = AtomicMessagingWorkBudget::new();
+        let mut unbound = budget.stage_unbound().expect("unbound group");
+        unbound.try_push(action).expect("accepted action");
+        assert_eq!(unbound.usage().actions(), 1);
+        let (permit, ticket) = pending();
+        assert!(matches!(
+            unbound.into_empty_submission(ticket),
+            Err(AtomicMessagingWorkError::Unavailable)
+        ));
+        assert_eq!(permit.state(), AtomicCommitState::Aborted);
+        assert_eq!(budget.usage(), AtomicMessagingWorkUsage::default());
+    }
+}
+
+#[test]
+fn checked_empty_handoff_also_rejects_nondefault_usage_without_commands() {
+    let budget = AtomicMessagingWorkBudget::new();
+    let mut unbound = budget.stage_unbound().expect("unbound group");
+    unbound.try_push(complete()).expect("zero-content action");
+    // A defensive private misuse cannot disguise accepted actions as empty.
+    unbound.commands.clear();
+    let (permit, ticket) = pending();
+    assert!(matches!(
+        unbound.into_empty_submission(ticket),
+        Err(AtomicMessagingWorkError::Unavailable)
+    ));
+    assert_eq!(permit.state(), AtomicCommitState::Aborted);
+    assert_eq!(budget.usage(), AtomicMessagingWorkUsage::default());
+}
+
+#[test]
+fn binding_handoff_moves_existing_payloads_and_retains_the_same_lease() {
+    let budget = AtomicMessagingWorkBudget::new();
+    let mut unbound = budget.stage_unbound().expect("unbound group");
+    let body = vec![0; 41];
+    let original = body.as_ptr();
+    unbound
+        .try_push(CommandKind::Send {
+            message_id: String::new(),
+            body,
+            time_to_live_millis: None,
+            session_id: None,
+        })
+        .expect("send");
+    unbound.try_push(complete()).expect("zero-content action");
+    let input = unbound.usage();
+    let charged = budget.usage();
+    let (permit, ticket) = pending();
+    let bound = unbound.into_bound_submission(binding(), ticket);
+    assert_eq!(budget.usage(), charged);
+    let (received_binding, ticket, mut work) = bound.into_owner_parts();
+    assert_eq!(received_binding, binding());
+    assert_eq!(work.usage, input);
+    let claim = ticket.try_claim().expect("owner claim");
+    work.with_commands(|commands| {
+        assert_eq!(commands.len(), 2);
+        match &commands[0] {
+            CommandKind::Send { body, .. } => assert_eq!(body.as_ptr(), original),
+            _ => panic!("send is first"),
+        }
+        assert_eq!(budget.usage(), charged);
+        drop(commands);
+        assert_eq!(budget.usage(), charged);
+    })
+    .expect("one owner callback");
+    claim.finish(AtomicCommitDecision::Rejected);
+    assert_eq!(permit.state(), AtomicCommitState::Rejected);
+    assert_eq!(budget.usage(), charged);
+    drop(work);
+    assert_eq!(budget.usage(), AtomicMessagingWorkUsage::default());
+}
+
+#[test]
+fn empty_work_retains_its_slot_after_ticket_abort_and_owner_claim_failure() {
+    let budget = AtomicMessagingWorkBudget::new();
+    let unbound = budget.stage_unbound().expect("unbound group");
+    let (permit, ticket) = pending();
+    let empty = unbound.into_empty_submission(ticket).expect("empty work");
+    let observer = empty.permit().clone();
+    drop(observer.clone());
+    assert_eq!(observer.state(), AtomicCommitState::Pending);
+    assert_eq!(budget.usage().groups(), 1);
+    let (ticket, work) = empty.into_owner_parts();
+    assert!(permit.abort());
+    assert!(matches!(
+        ticket.try_claim(),
+        Err(crate::AtomicCommitClaimError::Aborted)
+    ));
+    assert_eq!(budget.usage().groups(), 1);
+    drop(work);
+    assert_eq!(budget.usage(), AtomicMessagingWorkUsage::default());
+    assert_eq!(observer.state(), AtomicCommitState::Aborted);
+}
+
+#[test]
+fn empty_owner_unwind_releases_its_slot_and_is_indeterminate() {
+    let budget = AtomicMessagingWorkBudget::new();
+    let unbound = budget.stage_unbound().expect("unbound group");
+    let (permit, ticket) = pending();
+    let empty = unbound.into_empty_submission(ticket).expect("empty work");
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        let (ticket, _work) = empty.into_owner_parts();
+        let _claim = ticket.try_claim().expect("owner claim");
+        assert_eq!(budget.usage().groups(), 1);
+        panic!("empty owner unwound");
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(permit.state(), AtomicCommitState::Indeterminate);
+    assert_eq!(budget.usage(), AtomicMessagingWorkUsage::default());
+}
+
+#[test]
+fn poisoned_unbound_admission_fails_closed_without_changing_existing_work() {
+    let budget = AtomicMessagingWorkBudget::new();
+    let mut unbound = budget.stage_unbound().expect("unbound group");
+    let charged = budget.usage();
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        let _guard = budget.usage.lock().expect("not yet poisoned");
+        panic!("poison admission mutex");
+    }));
+    assert!(unwound.is_err());
+    assert!(matches!(
+        budget.stage_unbound(),
+        Err(AtomicMessagingWorkError::Unavailable)
+    ));
+    assert!(matches!(
+        unbound.try_push(send(1)),
+        Err(AtomicMessagingWorkError::Unavailable)
+    ));
+    assert_eq!(unbound.usage(), AtomicMessagingInputUsage::default());
+    assert_eq!(budget.usage(), charged);
+    drop(unbound);
+    assert_eq!(budget.usage(), AtomicMessagingWorkUsage::default());
+}
+
+#[test]
+fn bridge_debug_output_retains_only_usage_and_permit_state() {
+    let budget = AtomicMessagingWorkBudget::new();
+    let mut unbound = budget.stage_unbound().expect("unbound group");
+    unbound
+        .try_push(CommandKind::Send {
+            message_id: "private-unbound-id".into(),
+            body: b"private-unbound-body".to_vec(),
+            time_to_live_millis: None,
+            session_id: None,
+        })
+        .expect("send");
+    let output = format!("{unbound:?}");
+    assert!(!output.contains("private-unbound"));
+    assert!(!output.contains("CommandKind"));
+    drop(unbound);
+    let unbound = budget.stage_unbound().expect("empty group");
+    let (_, ticket) = pending();
+    let empty = unbound.into_empty_submission(ticket).expect("empty work");
+    let output = format!("{empty:?}");
+    assert!(!output.contains("commands"));
+    assert!(!output.contains("EntityBinding"));
+    drop(empty);
+    assert_eq!(budget.usage(), AtomicMessagingWorkUsage::default());
+}

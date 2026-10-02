@@ -51,6 +51,10 @@ pub use guarded_atomic_messaging::GuardedAtomicSubmitError;
 const COMMAND_QUEUE_DEPTH: usize = 1_024;
 
 enum Request {
+    ApplyEmptyAtomicMessagingOwned {
+        submission: protocol_amqp::OwnedEmptyAtomicMessagingSubmission,
+        reply: flume::Sender<Result<domain::AtomicMessagingApplication, GuardedAtomicSubmitError>>,
+    },
     ApplyAtomicMessagingOwned {
         submission: protocol_amqp::OwnedAtomicMessagingSubmission,
         reply: flume::Sender<Result<domain::AtomicMessagingApplication, GuardedAtomicSubmitError>>,
@@ -538,6 +542,9 @@ impl Broker {
             .spawn(move || {
                 while let Ok(request) = incoming.recv() {
                     match request {
+                        Request::ApplyEmptyAtomicMessagingOwned { submission, reply } => {
+                            atomic_work::apply_empty_owned(submission, reply);
+                        }
                         Request::ApplyAtomicMessagingOwned { submission, reply } => {
                             atomic_work::apply_owned(&proposer, &watching, submission, reply);
                         }
