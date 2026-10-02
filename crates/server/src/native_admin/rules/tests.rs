@@ -10,6 +10,8 @@ use tonic::Code;
 use super::{RuleTarget, filter, rule_name, scalar, status};
 use crate::{ProposeError, SubmitError};
 
+mod actions;
+
 fn scalar_input(value: Value) -> v1::RuleScalarValue {
     v1::RuleScalarValue { value: Some(value) }
 }

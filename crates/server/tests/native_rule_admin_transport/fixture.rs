@@ -277,6 +277,7 @@ pub(super) fn get(path: &str, name: &str) -> GetRuleRequest {
     GetRuleRequest {
         namespace: "tenant".into(),
         subscription_path: path.into(),
+        include_actions: false,
         name: name.into(),
     }
 }
@@ -285,6 +286,7 @@ pub(super) fn list(path: &str) -> ListRulesRequest {
     ListRulesRequest {
         namespace: "tenant".into(),
         subscription_path: path.into(),
+        include_actions: false,
     }
 }
 

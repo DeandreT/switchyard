@@ -1,6 +1,7 @@
 use admin_api::v1::{
-    CreateRuleRequest, DeleteRuleRequest, GetRuleRequest, ListRulesRequest, ListRulesResponse,
-    Rule, RuleMutationResponse, rule_service_server::RuleService,
+    CreateRuleRequest, CreateRuleWithActionRequest, DeleteRuleRequest, GetRuleRequest,
+    ListRulesRequest, ListRulesResponse, Rule, RuleMutationResponse,
+    rule_service_server::RuleService,
 };
 use domain::{EntityBinding, RuleDefinition, RuleName, SubscriptionName, Timestamp};
 use protocol_amqp::EntityMetadata;
@@ -10,6 +11,7 @@ use super::{
     Status, topology,
 };
 
+mod action;
 mod filter;
 mod scalar;
 mod status;
@@ -74,11 +76,47 @@ impl NativeAdminService {
         Ok(admission.binding)
     }
 
-    fn rule_response(&self, target: &RuleTarget, rule: RuleDefinition) -> Result<Rule, Status> {
+    async fn create_bound_rule(
+        &self,
+        target: RuleTarget,
+        rule: RuleDefinition,
+    ) -> Result<Response<RuleMutationResponse>, Status> {
+        rule.encoded_size().map_err(status::input)?;
+        let binding = self.bind_rule_target(&target).await?;
+        let kind = match rule.action {
+            Some(action) => CommandKind::CreateRuleWithAction {
+                subscription: target.subscription,
+                name: rule.name,
+                filter: rule.filter,
+                action,
+            },
+            None => CommandKind::CreateRule {
+                subscription: target.subscription,
+                name: rule.name,
+                filter: rule.filter,
+            },
+        };
+        let outcome = self
+            .broker
+            .submit_fenced(binding, target.topic, kind)
+            .await
+            .map_err(status::mutation)?;
+        if outcome != CommandOutcome::RuleCreated {
+            return Err(Status::internal("unexpected rule creation result"));
+        }
+        Ok(Response::new(RuleMutationResponse {}))
+    }
+
+    fn rule_response(
+        &self,
+        target: &RuleTarget,
+        rule: RuleDefinition,
+        include_actions: bool,
+    ) -> Result<Rule, Status> {
         rule.validate().map_err(status::stored)?;
-        if rule.action.is_some() {
+        if rule.action.is_some() && !include_actions {
             return Err(Status::unimplemented(
-                "native rule responses cannot represent SQL actions yet",
+                "rule action metadata was not requested",
             ));
         }
         Ok(Rule {
@@ -87,7 +125,30 @@ impl NativeAdminService {
             name: rule.name.as_str().to_owned(),
             filter: Some(filter::write(&rule.filter)?),
             created_at_unix_millis: rule.created_at.as_millis(),
+            action: rule.action.as_ref().map(action::write),
         })
+    }
+
+    fn rule_list_response(
+        &self,
+        target: &RuleTarget,
+        rules: Vec<RuleDefinition>,
+        include_actions: bool,
+    ) -> Result<ListRulesResponse, Status> {
+        if rules.len() > domain::MAX_SUBSCRIPTION_RULES {
+            return Err(Status::internal("invalid stored rule set"));
+        }
+        let rules = rules
+            .into_iter()
+            .map(|rule| self.rule_response(target, rule, include_actions))
+            .collect::<Result<Vec<_>, _>>()?;
+        let response = ListRulesResponse { rules };
+        if prost::Message::encoded_len(&response) > crate::NATIVE_ADMIN_RESPONSE_LIMIT {
+            return Err(Status::resource_exhausted(
+                "rule response exceeds its encoded-byte limit",
+            ));
+        }
+        Ok(response)
     }
 }
 
@@ -109,25 +170,30 @@ impl RuleService for NativeAdminService {
             created_at: Timestamp::UNIX_EPOCH,
             action: None,
         };
-        rule.encoded_size().map_err(status::input)?;
-        let binding = self.bind_rule_target(&target).await?;
-        let outcome = self
-            .broker
-            .submit_fenced(
-                binding,
-                target.topic,
-                CommandKind::CreateRule {
-                    subscription: target.subscription,
-                    name: rule.name,
-                    filter: rule.filter,
-                },
-            )
-            .await
-            .map_err(status::mutation)?;
-        if outcome != CommandOutcome::RuleCreated {
-            return Err(Status::internal("unexpected rule creation result"));
-        }
-        Ok(Response::new(RuleMutationResponse {}))
+        self.create_bound_rule(target, rule).await
+    }
+
+    async fn create_rule_with_action(
+        &self,
+        request: Request<CreateRuleWithActionRequest>,
+    ) -> Result<Response<RuleMutationResponse>, Status> {
+        let input = request.get_ref();
+        let resource = topology::requested_resource(&input.subscription_path);
+        let _permit = self.begin_request(&request, &input.namespace, Some(&resource))?;
+        let target = RuleTarget::parse(&input.subscription_path)?;
+        let name = rule_name(&input.name)?;
+        let action = action::read(input.action.as_ref())?;
+        let filter = filter::read(input.filter.as_ref())?;
+        self.create_bound_rule(
+            target,
+            RuleDefinition {
+                name,
+                filter,
+                created_at: Timestamp::UNIX_EPOCH,
+                action: Some(action),
+            },
+        )
+        .await
     }
 
     async fn get_rule(&self, request: Request<GetRuleRequest>) -> Result<Response<Rule>, Status> {
@@ -146,7 +212,11 @@ impl RuleService for NativeAdminService {
             .into_iter()
             .find(|rule| rule.name == name)
             .ok_or_else(|| Status::not_found("rule does not exist"))?;
-        Ok(Response::new(self.rule_response(&target, rule)?))
+        Ok(Response::new(self.rule_response(
+            &target,
+            rule,
+            input.include_actions,
+        )?))
     }
 
     async fn list_rules(
@@ -163,19 +233,7 @@ impl RuleService for NativeAdminService {
             .rules_fenced(binding, target.topic.clone(), target.subscription.clone())
             .await
             .map_err(status::read)?;
-        if rules.len() > domain::MAX_SUBSCRIPTION_RULES {
-            return Err(Status::internal("invalid stored rule set"));
-        }
-        let rules = rules
-            .into_iter()
-            .map(|rule| self.rule_response(&target, rule))
-            .collect::<Result<Vec<_>, _>>()?;
-        let response = ListRulesResponse { rules };
-        if prost::Message::encoded_len(&response) > crate::NATIVE_ADMIN_RESPONSE_LIMIT {
-            return Err(Status::resource_exhausted(
-                "rule response exceeds its encoded-byte limit",
-            ));
-        }
+        let response = self.rule_list_response(&target, rules, input.include_actions)?;
         Ok(Response::new(response))
     }
 

@@ -31,9 +31,15 @@ pub(super) async fn action_bearing_reads_refuse_without_omitting_metadata<P: Sto
         code(node.get(PATH, "annotated").await, Code::Unimplemented),
         code(node.list(PATH).await, Code::Unimplemented),
     ] {
+        assert_eq!(error.message(), "rule action metadata was not requested");
         assert!(!error.message().contains("private-action"));
-        assert!(error.message().contains("cannot represent SQL actions"));
     }
+    assert_eq!(
+        node.get_actions(PATH, "annotated").await?.action,
+        sql_action(action.expression(), Some(1))
+    );
+    assert_eq!(node.list_actions(PATH).await?.len(), 3);
+    assert!(node.get_actions(PATH, "plain").await?.action.is_none());
     let definitions = tokio::time::timeout(
         DEADLINE,
         node.broker.handle().rules(
@@ -114,6 +120,10 @@ pub(super) async fn exact_limit_legacy_rules_remain_readable<P: StoreProvider>(
     });
     assert_eq!(node.get(PATH, name.as_str()).await?.filter, expected);
     assert_eq!(node.list(PATH).await?.len(), 2);
+    let with_actions = node.get_actions(PATH, name.as_str()).await?;
+    assert_eq!(with_actions.filter, expected);
+    assert!(with_actions.action.is_none());
+    assert_eq!(node.list_actions(PATH).await?.len(), 2);
     node.unchanged(&before, writes, clocks)?;
     node.clock.manual.set(1_000);
     node.create(PATH, "new-format", false_filter()).await?;

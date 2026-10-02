@@ -5,6 +5,7 @@ use serde::Serialize;
 use super::super::CliError;
 use super::{
     MAX_RESPONSE_BYTES, MAX_RULES,
+    action::{self, JsonAction},
     filter::{self, JsonFilter},
     validate_rule_name,
 };
@@ -15,6 +16,8 @@ pub(super) struct RuleOutput {
     subscription_path: String,
     name: String,
     filter: JsonFilter,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<JsonAction>,
     created_at_unix_millis: String,
 }
 
@@ -50,11 +53,17 @@ pub(super) fn rule(
     }
     validate_rule_name(&input.name).map_err(|_| invalid())?;
     let filter = filter::from_protobuf(input.filter.ok_or_else(invalid)?).map_err(|_| invalid())?;
+    let action = input
+        .action
+        .map(action::from_protobuf)
+        .transpose()
+        .map_err(|_| invalid())?;
     Ok(RuleOutput {
         namespace: input.namespace,
         subscription_path: input.subscription_path,
         name: input.name,
         filter,
+        action,
         created_at_unix_millis: input.created_at_unix_millis.to_string(),
     })
 }

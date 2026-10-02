@@ -22,7 +22,7 @@ fn message<'a>(file: &'a FileDescriptorProto, name: &str) -> &'a DescriptorProto
 }
 
 #[test]
-fn rule_service_is_four_explicit_operations_without_paging_or_updates() {
+fn rule_service_keeps_original_operations_and_appends_action_creation() {
     let descriptor = descriptor();
     let service = descriptor
         .service
@@ -35,6 +35,11 @@ fn rule_service_is_four_explicit_operations_without_paging_or_updates() {
         ("GetRule", "GetRuleRequest", "Rule"),
         ("ListRules", "ListRulesRequest", "ListRulesResponse"),
         ("DeleteRule", "DeleteRuleRequest", "RuleMutationResponse"),
+        (
+            "CreateRuleWithAction",
+            "CreateRuleWithActionRequest",
+            "RuleMutationResponse",
+        ),
     ];
     assert_eq!(service.method.len(), expected.len());
     for (method, (name, input, output)) in service.method.iter().zip(expected) {
@@ -62,11 +67,30 @@ fn rule_service_is_four_explicit_operations_without_paging_or_updates() {
         ),
         (
             "GetRuleRequest",
-            vec![("namespace", 1), ("subscription_path", 2), ("name", 3)],
+            vec![
+                ("namespace", 1),
+                ("subscription_path", 2),
+                ("name", 3),
+                ("include_actions", 4),
+            ],
         ),
         (
             "ListRulesRequest",
-            vec![("namespace", 1), ("subscription_path", 2)],
+            vec![
+                ("namespace", 1),
+                ("subscription_path", 2),
+                ("include_actions", 3),
+            ],
+        ),
+        (
+            "CreateRuleWithActionRequest",
+            vec![
+                ("namespace", 1),
+                ("subscription_path", 2),
+                ("name", 3),
+                ("filter", 4),
+                ("action", 5),
+            ],
         ),
         (
             "DeleteRuleRequest",
@@ -80,6 +104,7 @@ fn rule_service_is_four_explicit_operations_without_paging_or_updates() {
                 ("name", 3),
                 ("filter", 4),
                 ("created_at_unix_millis", 5),
+                ("action", 6),
             ],
         ),
         ("ListRulesResponse", vec![("rules", 1)]),
@@ -97,6 +122,119 @@ fn rule_service_is_four_explicit_operations_without_paging_or_updates() {
     assert_eq!(
         list.type_name.as_deref(),
         Some(format!("{prefix}Rule").as_str())
+    );
+}
+
+#[test]
+fn action_contract_preserves_presence_and_default_false_read_opt_in() {
+    let file = descriptor();
+    let prefix = format!(".{PROTOBUF_PACKAGE}.");
+    let action = message(&file, "SqlRuleAction");
+    assert_eq!(action.field.len(), 2);
+    assert_eq!(action.field[0].name.as_deref(), Some("expression"));
+    assert_eq!(action.field[0].number, Some(1));
+    assert_eq!(action.field[0].r#type, Some(Type::String as i32));
+    assert_eq!(action.field[1].name.as_deref(), Some("semantic_version"));
+    assert_eq!(action.field[1].number, Some(2));
+    assert_eq!(action.field[1].r#type, Some(Type::Uint32 as i32));
+    assert_eq!(action.field[1].proto3_optional, Some(true));
+    for (owner, number) in [("CreateRuleWithActionRequest", 5), ("Rule", 6)] {
+        let field = message(&file, owner)
+            .field
+            .iter()
+            .find(|field| field.number == Some(number))
+            .unwrap();
+        assert_eq!(field.name.as_deref(), Some("action"));
+        assert_eq!(field.r#type, Some(Type::Message as i32));
+        assert_eq!(
+            field.type_name.as_deref(),
+            Some(format!("{prefix}SqlRuleAction").as_str())
+        );
+    }
+    for (owner, number) in [("GetRuleRequest", 4), ("ListRulesRequest", 3)] {
+        let field = message(&file, owner)
+            .field
+            .iter()
+            .find(|field| field.number == Some(number))
+            .unwrap();
+        assert_eq!(field.name.as_deref(), Some("include_actions"));
+        assert_eq!(field.r#type, Some(Type::Bool as i32));
+        assert!(!field.proto3_optional.unwrap_or(false));
+    }
+    for (version, bytes) in [
+        (None, vec![]),
+        (Some(0), vec![0x10, 0]),
+        (Some(1), vec![0x10, 1]),
+    ] {
+        let action = v1::SqlRuleAction {
+            expression: String::new(),
+            semantic_version: version,
+        };
+        assert_eq!(action.encode_to_vec(), bytes);
+        assert_eq!(v1::SqlRuleAction::decode(bytes.as_slice()).unwrap(), action);
+    }
+    assert!(v1::GetRuleRequest::default().encode_to_vec().is_empty());
+    assert!(v1::ListRulesRequest::default().encode_to_vec().is_empty());
+    assert_eq!(
+        v1::GetRuleRequest {
+            include_actions: true,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        [0x20, 1]
+    );
+    assert_eq!(
+        v1::ListRulesRequest {
+            include_actions: true,
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        [0x18, 1]
+    );
+    assert!(v1::CreateRuleWithActionRequest::default().action.is_none());
+    assert!(v1::Rule::default().action.is_none());
+    let source = " /* exact source */ REMOVE user.[audit]; ";
+    let action = v1::SqlRuleAction {
+        expression: source.into(),
+        semantic_version: Some(1),
+    };
+    let request = v1::CreateRuleWithActionRequest {
+        action: Some(action.clone()),
+        ..Default::default()
+    };
+    assert_eq!(
+        v1::CreateRuleWithActionRequest::decode(request.encode_to_vec().as_slice()).unwrap(),
+        request
+    );
+    let response = v1::Rule {
+        action: Some(action),
+        ..Default::default()
+    };
+    assert_eq!(
+        v1::Rule::decode(response.encode_to_vec().as_slice()).unwrap(),
+        response
+    );
+}
+
+#[test]
+fn original_create_request_encoding_cannot_carry_an_action() {
+    let request = v1::CreateRuleRequest {
+        namespace: "n".into(),
+        subscription_path: "p".into(),
+        name: "r".into(),
+        filter: Some(v1::RuleFilter {
+            filter: Some(v1::rule_filter::Filter::TrueFilter(v1::TrueRuleFilter {})),
+        }),
+    };
+    assert_eq!(
+        request.encode_to_vec(),
+        [
+            0x0a, 1, b'n', 0x12, 1, b'p', 0x1a, 1, b'r', 0x22, 2, 0x0a, 0
+        ]
+    );
+    assert_eq!(
+        v1::CreateRuleRequest::decode(request.encode_to_vec().as_slice()).unwrap(),
+        request
     );
 }
 

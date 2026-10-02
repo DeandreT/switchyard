@@ -27,6 +27,8 @@ service RuleService {
   rpc GetRule(GetRuleRequest) returns (Rule);
   rpc ListRules(ListRulesRequest) returns (ListRulesResponse);
   rpc DeleteRule(DeleteRuleRequest) returns (RuleMutationResponse);
+  // A separate method prevents older servers from ignoring an action field.
+  rpc CreateRuleWithAction(CreateRuleWithActionRequest) returns (RuleMutationResponse);
 }
 
 service BackupService {
@@ -215,15 +217,28 @@ message CreateRuleRequest {
   RuleFilter filter = 4;
 }
 
+message CreateRuleWithActionRequest {
+  string namespace = 1;
+  string subscription_path = 2;
+  string name = 3;
+  RuleFilter filter = 4;
+  // Required by the server; omission does not select action-free creation.
+  SqlRuleAction action = 5;
+}
+
 message GetRuleRequest {
   string namespace = 1;
   string subscription_path = 2;
   string name = 3;
+  // False refuses an action-bearing rule instead of hiding its action.
+  bool include_actions = 4;
 }
 
 message ListRulesRequest {
   string namespace = 1;
   string subscription_path = 2;
+  // False refuses the complete response when any member has an action.
+  bool include_actions = 3;
 }
 
 message DeleteRuleRequest {
@@ -240,6 +255,7 @@ message Rule {
   string name = 3;
   RuleFilter filter = 4;
   uint64 created_at_unix_millis = 5;
+  SqlRuleAction action = 6;
 }
 
 // The complete bounded rule set; there is no implicit default or continuation.
@@ -260,6 +276,12 @@ message RuleFilter {
 }
 
 message SqlRuleFilter {
+  string expression = 1;
+  // Omitted requests select the current version; responses always include it.
+  optional uint32 semantic_version = 2;
+}
+
+message SqlRuleAction {
   string expression = 1;
   // Omitted requests select the current version; responses always include it.
   optional uint32 semantic_version = 2;

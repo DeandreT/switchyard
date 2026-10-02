@@ -17,6 +17,8 @@ use tokio::{
     time::timeout,
 };
 
+#[path = "native_rule_commands/actions.rs"]
+mod actions;
 #[path = "native_rule_commands/crud.rs"]
 mod crud;
 #[path = "native_rule_commands/fixture.rs"]
@@ -45,10 +47,10 @@ fn failed(output: &Output) -> String {
 }
 
 macro_rules! cases {
-    ($($name:ident => $module:ident::$function:ident,)+) => {
+    ($($name:ident => $case:path,)+) => {
         $(#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn $name() -> TestResult {
-            timeout(DEADLINE * 12, $module::$function()).await?
+            timeout(DEADLINE * 12, $case()).await?
         })+
     };
 }
@@ -59,5 +61,9 @@ cases! {
     invalid_rule_files_and_arguments_do_not_open_a_connection => input::invalid,
     oversized_protobuf_rule_request_is_refused_before_connect => input::request_limit,
     sql_compilation_and_versions_remain_server_decisions => crud::server_statuses,
-    action_bearing_rules_fail_without_partial_or_misleading_cli_output => read_boundaries::actions,
+    action_bearing_rules_have_complete_exact_cli_output => read_boundaries::actions,
+    tls_rule_actions_round_trip_independent_copies_and_durable_reopen => actions::round_trip,
+    action_validation_remains_authoritative_and_local_inputs_precede_connect => actions::validation,
+    action_create_never_falls_back_to_a_legacy_mutating_rpc => actions::legacy::no_fallback,
+    invalid_late_action_reply_never_prints_partial_cli_output => actions::legacy::invalid_reply,
 }

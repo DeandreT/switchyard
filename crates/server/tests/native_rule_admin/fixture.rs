@@ -213,6 +213,46 @@ impl<P: StoreProvider> Node<P> {
         .into_inner())
     }
 
+    pub async fn create_action(
+        &self,
+        path: &str,
+        name: &str,
+        filter: Option<RuleFilter>,
+        action: Option<SqlRuleAction>,
+    ) -> Result<(), tonic::Status> {
+        tokio::time::timeout(
+            DEADLINE,
+            self.service
+                .create_rule_with_action(Request::new(create_action(path, name, filter, action))),
+        )
+        .await
+        .expect("bounded action rule create")?;
+        Ok(())
+    }
+
+    pub async fn get_actions(&self, path: &str, name: &str) -> Result<Rule, tonic::Status> {
+        let mut input = get(path, name);
+        input.include_actions = true;
+        Ok(
+            tokio::time::timeout(DEADLINE, self.service.get_rule(Request::new(input)))
+                .await
+                .expect("bounded action rule get")?
+                .into_inner(),
+        )
+    }
+
+    pub async fn list_actions(&self, path: &str) -> Result<Vec<Rule>, tonic::Status> {
+        let mut input = list(path);
+        input.include_actions = true;
+        Ok(
+            tokio::time::timeout(DEADLINE, self.service.list_rules(Request::new(input)))
+                .await
+                .expect("bounded action rule list")?
+                .into_inner()
+                .rules,
+        )
+    }
+
     pub async fn list(&self, path: &str) -> Result<Vec<Rule>, tonic::Status> {
         Ok(
             tokio::time::timeout(DEADLINE, self.service.list_rules(Request::new(list(path))))
@@ -301,13 +341,35 @@ pub(super) fn get(path: &str, name: &str) -> GetRuleRequest {
         namespace: "tenant".into(),
         subscription_path: path.into(),
         name: name.into(),
+        include_actions: false,
     }
 }
 pub(super) fn list(path: &str) -> ListRulesRequest {
     ListRulesRequest {
         namespace: "tenant".into(),
         subscription_path: path.into(),
+        include_actions: false,
     }
+}
+pub(super) fn create_action(
+    path: &str,
+    name: &str,
+    filter: Option<RuleFilter>,
+    action: Option<SqlRuleAction>,
+) -> CreateRuleWithActionRequest {
+    CreateRuleWithActionRequest {
+        namespace: "tenant".into(),
+        subscription_path: path.into(),
+        name: name.into(),
+        filter,
+        action,
+    }
+}
+pub(super) fn sql_action(expression: &str, semantic_version: Option<u32>) -> Option<SqlRuleAction> {
+    Some(SqlRuleAction {
+        expression: expression.into(),
+        semantic_version,
+    })
 }
 pub(super) fn delete(path: &str, name: &str) -> DeleteRuleRequest {
     DeleteRuleRequest {

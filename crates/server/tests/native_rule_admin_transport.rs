@@ -4,10 +4,11 @@ use std::{error::Error, time::Duration};
 
 use admin_api::v1::{
     CorrelationProperty, CorrelationRuleFilter, CreateEntityRequest, CreateRuleRequest,
-    DeleteRuleRequest, EntityKind, FalseRuleFilter, GetEntityRequest, GetRuleRequest,
-    ListRulesRequest, Rule, RuleFilter, RuleNullValue, RuleScalarValue, SqlRuleFilter,
-    TrueRuleFilter, entity_service_client::EntityServiceClient, rule_filter::Filter,
-    rule_scalar_value::Value as Scalar, rule_service_client::RuleServiceClient,
+    CreateRuleWithActionRequest, DeleteRuleRequest, EntityKind, FalseRuleFilter, GetEntityRequest,
+    GetRuleRequest, ListRulesRequest, Rule, RuleFilter, RuleNullValue, RuleScalarValue,
+    SqlRuleAction, SqlRuleFilter, TrueRuleFilter, entity_service_client::EntityServiceClient,
+    rule_filter::Filter, rule_scalar_value::Value as Scalar,
+    rule_service_client::RuleServiceClient,
 };
 use domain::NamespaceName;
 use prost::Message as ProstMessage;
@@ -16,6 +17,12 @@ use testkit::StoreProvider;
 use tokio::time::timeout;
 use tonic::{Code, Request};
 
+#[path = "native_rule_admin_transport/action_routing.rs"]
+mod action_routing;
+#[path = "native_rule_admin_transport/action_security.rs"]
+mod action_security;
+#[path = "native_rule_admin_transport/actions.rs"]
+mod actions;
 #[path = "native_rule_admin_transport/crud.rs"]
 mod crud;
 #[path = "native_rule_admin_transport/fixture.rs"]
@@ -57,4 +64,8 @@ for_each_backend! {
     rule_requests_require_exact_manage_scope => security::exact_scope,
     oversized_requests_and_bounded_responses_leave_services_healthy => security::limits,
     native_rules_drive_ordinary_amqp_fanout_and_survive_reopen => routing::round_trip,
+    action_creation_and_opt_in_reads_preserve_exact_metadata => actions::round_trip,
+    action_requests_reject_invalid_input_before_mutation => actions::refusals,
+    action_requests_require_exact_manage_scope => action_security::exact_scope,
+    native_actions_drive_three_independent_amqp_copies_and_survive_reopen => action_routing::round_trip,
 }

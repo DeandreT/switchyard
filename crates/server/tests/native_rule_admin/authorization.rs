@@ -354,3 +354,204 @@ pub(super) async fn manage_scope_precedes_store_and_sql_validation<P: StoreProvi
     assert_eq!(node.clocks(), 0);
     Ok(())
 }
+
+pub(super) async fn manage_scope_precedes_action_validation_and_reads<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    let mut node = Node::start(provider)?;
+    node.topology("Orders", "Alpha").await?;
+    node.topology("Literal/$Management", "Alpha").await?;
+    node.service = node
+        .service
+        .clone()
+        .with_shared_access_policy(policy()?, HOST)?;
+    let child = token(&format!("amqps://{HOST}/{PATH}"), "manage", EXPIRY);
+    let namespace_token = token(&format!("amqps://{HOST}"), "manage", EXPIRY);
+    let before = node.snapshot()?;
+    let reads = node.reads();
+    let writes = node.writes();
+    let clocks = node.clocks();
+    for (path, credential, expected) in [
+        (PATH, None, Code::Unauthenticated),
+        (PATH, Some("not-a-token".into()), Code::Unauthenticated),
+        (
+            PATH,
+            Some(token(&format!("amqps://{HOST}/{PATH}"), "send", EXPIRY)),
+            Code::PermissionDenied,
+        ),
+        (
+            "Orders/subscriptions/Beta",
+            Some(child.clone()),
+            Code::PermissionDenied,
+        ),
+        (
+            "Orders/subscriptions/alpha",
+            Some(child.clone()),
+            Code::PermissionDenied,
+        ),
+        (
+            "orders/subscriptions/Alpha",
+            Some(child.clone()),
+            Code::PermissionDenied,
+        ),
+        (
+            "Orders/subscriptions/Alpha/$DeadLetterQueue",
+            Some(child.clone()),
+            Code::InvalidArgument,
+        ),
+    ] {
+        let input = create_action(
+            path,
+            "bad/name",
+            true_filter(),
+            sql_action("SET private-action = 'secret-action'", Some(2)),
+        );
+        let request = match credential.as_deref() {
+            Some(token) => authorized(input, token),
+            None => Request::new(input),
+        };
+        let error = code(
+            tokio::time::timeout(DEADLINE, node.service.create_rule_with_action(request)).await?,
+            expected,
+        );
+        assert!(!error.message().contains("secret-action"));
+        let mut input = get(path, "$Default");
+        input.include_actions = true;
+        let request = match credential.as_deref() {
+            Some(token) => authorized(input, token),
+            None => Request::new(input),
+        };
+        code(
+            tokio::time::timeout(DEADLINE, node.service.get_rule(request)).await?,
+            expected,
+        );
+        let mut input = list(path);
+        input.include_actions = true;
+        let request = match credential.as_deref() {
+            Some(token) => authorized(input, token),
+            None => Request::new(input),
+        };
+        code(
+            tokio::time::timeout(DEADLINE, node.service.list_rules(request)).await?,
+            expected,
+        );
+    }
+    let mut input = create_action(PATH, "foreign", true_filter(), sql_action("REMOVE x", None));
+    input.namespace = "foreign".into();
+    code(
+        tokio::time::timeout(
+            DEADLINE,
+            node.service
+                .create_rule_with_action(authorized(input, &namespace_token)),
+        )
+        .await?,
+        Code::PermissionDenied,
+    );
+    for (source, version, expected) in [
+        ("REMOVE", None, Code::InvalidArgument),
+        (
+            "SET private-action = 'secret-action'",
+            None,
+            Code::Unimplemented,
+        ),
+        ("broken-private-source", Some(2), Code::Unimplemented),
+    ] {
+        code(
+            tokio::time::timeout(
+                DEADLINE,
+                node.service.create_rule_with_action(authorized(
+                    create_action(PATH, "invalid", true_filter(), sql_action(source, version)),
+                    &child,
+                )),
+            )
+            .await?,
+            expected,
+        );
+    }
+    assert_eq!(node.reads(), reads);
+    node.unchanged(&before, writes, clocks)?;
+    let literal = "Literal/$Management/subscriptions/Alpha";
+    let literal_token = token(
+        &format!("amqps://{HOST}/Literal/$Management"),
+        "manage",
+        EXPIRY,
+    );
+    let source = " /* retained literal */ REMOVE user.[audit]; ";
+    tokio::time::timeout(
+        DEADLINE,
+        node.service.create_rule_with_action(authorized(
+            create_action(
+                literal,
+                " Literal Action ",
+                false_filter(),
+                sql_action(source, None),
+            ),
+            &literal_token,
+        )),
+    )
+    .await??;
+    let before = node.snapshot()?;
+    let reads = node.reads();
+    let writes = node.writes();
+    let clocks = node.clocks();
+    let mut wrong_case = get(
+        "Literal/$management/subscriptions/Alpha",
+        " Literal Action ",
+    );
+    wrong_case.include_actions = true;
+    code(
+        tokio::time::timeout(
+            DEADLINE,
+            node.service
+                .get_rule(authorized(wrong_case, &literal_token)),
+        )
+        .await?,
+        Code::PermissionDenied,
+    );
+    assert_eq!(node.reads(), reads);
+    node.clock.manual.set(0);
+    let mut input = get(literal, " Literal Action ");
+    input.include_actions = true;
+    let rule = tokio::time::timeout(
+        DEADLINE,
+        node.service.get_rule(authorized(input, &literal_token)),
+    )
+    .await??
+    .into_inner();
+    assert_eq!(rule.namespace, "tenant");
+    assert_eq!(rule.subscription_path, literal);
+    assert_eq!(rule.name, " Literal Action ");
+    assert_eq!(rule.action, sql_action(source, Some(1)));
+    let mut input = list(literal);
+    input.include_actions = true;
+    let listed = tokio::time::timeout(
+        DEADLINE,
+        node.service.list_rules(authorized(input, &literal_token)),
+    )
+    .await??
+    .into_inner();
+    assert_eq!(
+        listed.rules.iter().find(|item| item.name == rule.name),
+        Some(&rule)
+    );
+    code(
+        tokio::time::timeout(
+            DEADLINE,
+            node.service
+                .list_rules(authorized(list(literal), &literal_token)),
+        )
+        .await?,
+        Code::Unimplemented,
+    );
+    node.unchanged(&before, writes, clocks)?;
+    node.clock.manual.set(2_000);
+    tokio::time::timeout(
+        DEADLINE,
+        node.service.delete_rule(authorized(
+            delete(literal, " Literal Action "),
+            &literal_token,
+        )),
+    )
+    .await??;
+    Ok(())
+}

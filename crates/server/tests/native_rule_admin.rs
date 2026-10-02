@@ -13,10 +13,10 @@ use std::{
 };
 
 use admin_api::v1::{
-    CorrelationProperty, CorrelationRuleFilter, CreateRuleRequest, DeleteRuleRequest,
-    FalseRuleFilter, GetRuleRequest, ListRulesRequest, Rule, RuleFilter, RuleNullValue,
-    RuleScalarValue, SqlRuleFilter, TrueRuleFilter, rule_filter, rule_scalar_value,
-    rule_service_server::RuleService,
+    CorrelationProperty, CorrelationRuleFilter, CreateRuleRequest, CreateRuleWithActionRequest,
+    DeleteRuleRequest, FalseRuleFilter, GetRuleRequest, ListRulesRequest, Rule, RuleFilter,
+    RuleNullValue, RuleScalarValue, SqlRuleAction, SqlRuleFilter, TrueRuleFilter, rule_filter,
+    rule_scalar_value, rule_service_server::RuleService,
 };
 use domain::{
     CommandKind, CorrelationFilter, DeleteEntityTarget, EntityPath, MessageValue, NamespaceName,
@@ -35,6 +35,10 @@ const PATH: &str = "Orders/subscriptions/Alpha";
 #[path = "native_rule_admin/fixture.rs"]
 mod fixture;
 use fixture::*;
+#[path = "native_rule_admin/action_atomicity.rs"]
+mod action_atomicity;
+#[path = "native_rule_admin/actions.rs"]
+mod actions;
 #[path = "native_rule_admin/atomicity.rs"]
 mod atomicity;
 #[path = "native_rule_admin/authorization.rs"]
@@ -56,6 +60,12 @@ macro_rules! for_each_backend {
 }
 
 for_each_backend! {
+    super::actions::action_crud_is_explicit_clock_free_and_create_only => action_crud_is_explicit_clock_free_and_create_only,
+    super::actions::action_validation_and_combined_limits_precede_owner => action_validation_and_combined_limits_precede_owner,
+    super::authorization::manage_scope_precedes_action_validation_and_reads => manage_scope_precedes_action_validation_and_reads,
+    super::action_atomicity::action_mutations_retry_without_partial_state_and_reopen => action_mutations_retry_without_partial_state_and_reopen,
+    super::action_atomicity::corrupt_actions_refuse_complete_reads_without_repairs => corrupt_actions_refuse_complete_reads_without_repairs,
+    super::action_atomicity::captured_action_bindings_fence_recreated_children => captured_action_bindings_fence_recreated_children,
     super::lifecycle::crud_default_sorting_and_clock_free_reopen => crud_default_sorting_and_clock_free_reopen,
     super::lifecycle::literal_names_paths_and_empty_sets_are_isolated => literal_names_paths_and_empty_sets_are_isolated,
     super::scalars::all_scalar_constructors_round_trip_without_coercion => all_scalar_constructors_round_trip_without_coercion,

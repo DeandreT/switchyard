@@ -221,14 +221,15 @@ fn request_encoding_boundary_is_checked_before_connect() {
     assert!(
         validate_request_size(&v1::ListRulesRequest {
             namespace: NAMESPACE.into(),
-            subscription_path: PATH.into()
+            subscription_path: PATH.into(),
+            include_actions: true,
         })
         .is_ok()
     );
 }
 
 #[test]
-fn command_parser_requires_filter_file_and_has_no_action_upsert_or_paging() {
+fn command_parser_requires_filter_file_and_has_no_inline_action_upsert_or_paging() {
     use crate::{Arguments, Command};
     let parsed = Arguments::try_parse_from([
         "switchyardctl",

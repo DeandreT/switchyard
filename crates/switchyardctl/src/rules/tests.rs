@@ -29,9 +29,12 @@ fn valid_rule(name: &str) -> v1::Rule {
             filter: Some(rule_filter::Filter::TrueFilter(v1::TrueRuleFilter {})),
         }),
         created_at_unix_millis: 1_000,
+        action: None,
     }
 }
 
+#[path = "tests/actions.rs"]
+mod actions;
 #[path = "tests/input.rs"]
 mod input;
 #[path = "tests/output.rs"]

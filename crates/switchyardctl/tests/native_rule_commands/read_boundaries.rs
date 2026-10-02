@@ -22,14 +22,23 @@ pub(super) async fn actions() -> TestResult {
     )
     .await??;
     let before = node.store.snapshot()?;
+    let action =
+        json!({"type":"sql","expression":"REMOVE [private-action-source]","semantic_version":1});
     for command in [
         vec!["rule", "get", "Orders", "Alpha", "Action"],
         vec!["rule", "list", "Orders", "Alpha"],
     ] {
-        let stderr = failed(&node.run(&command).await?);
-        assert!(stderr.contains("administration request failed (Unimplemented)"));
-        assert!(!stderr.contains("private-action-source"));
-        assert!(!stderr.contains("cannot represent SQL actions"));
+        let output = node.json(&command).await?;
+        let rule = if command[1] == "get" {
+            &output
+        } else {
+            let rules = output["rules"].as_array().expect("rules");
+            assert_eq!(rules.len(), 2);
+            assert!(rules[0].get("action").is_none());
+            &rules[1]
+        };
+        assert_eq!(rule["name"], "Action");
+        assert_eq!(rule["action"], action);
     }
     assert_eq!(
         node.json(&["rule", "get", "Orders", "Alpha", "$Default"])

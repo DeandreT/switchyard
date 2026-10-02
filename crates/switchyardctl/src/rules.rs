@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use admin_api::v1::{
-    CreateRuleRequest, DeleteRuleRequest, GetRuleRequest, ListRulesRequest,
-    rule_service_client::RuleServiceClient,
+    CreateRuleRequest, CreateRuleWithActionRequest, DeleteRuleRequest, GetRuleRequest,
+    ListRulesRequest, rule_service_client::RuleServiceClient,
 };
 use clap::{Args, Subcommand};
 use prost::Message;
@@ -12,6 +12,7 @@ use super::{
     REQUEST_TIMEOUT, topology, write_output,
 };
 
+mod action;
 mod filter;
 mod output;
 mod scalar;
@@ -19,6 +20,7 @@ mod scalar;
 mod tests;
 
 const MAX_FILTER_FILE_BYTES: usize = 512 * 1024;
+const MAX_ACTION_FILE_BYTES: usize = 32 * 1024;
 const MAX_RULES: usize = 32;
 
 #[derive(Debug, Subcommand)]
@@ -47,10 +49,13 @@ pub(super) struct RuleCreate {
     name: String,
     #[arg(long, value_name = "PATH")]
     filter_file: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    action_file: Option<PathBuf>,
 }
 
 enum PreparedCommand {
     Create(Box<CreateRuleRequest>),
+    CreateWithAction(Box<CreateRuleWithActionRequest>),
     Get(GetRuleRequest),
     List(ListRulesRequest),
     Delete(DeleteRuleRequest),
@@ -81,14 +86,30 @@ fn prepare(namespace: &str, command: &RuleCommand) -> Result<PreparedCommand, Cl
         RuleCommand::Create(input) => {
             let path = topology::subscription_path(&input.topic, &input.subscription)?;
             validate_rule_name(&input.name)?;
-            let request = CreateRuleRequest {
-                namespace: namespace.to_owned(),
-                subscription_path: path,
-                name: input.name.clone(),
-                filter: Some(filter::load(&input.filter_file)?),
-            };
-            validate_request_size(&request)?;
-            Ok(PreparedCommand::Create(Box::new(request)))
+            let filter = Some(filter::load(&input.filter_file)?);
+            match &input.action_file {
+                Some(action_file) => {
+                    let request = CreateRuleWithActionRequest {
+                        namespace: namespace.to_owned(),
+                        subscription_path: path,
+                        name: input.name.clone(),
+                        filter,
+                        action: Some(action::load(action_file)?),
+                    };
+                    validate_request_size(&request)?;
+                    Ok(PreparedCommand::CreateWithAction(Box::new(request)))
+                }
+                None => {
+                    let request = CreateRuleRequest {
+                        namespace: namespace.to_owned(),
+                        subscription_path: path,
+                        name: input.name.clone(),
+                        filter,
+                    };
+                    validate_request_size(&request)?;
+                    Ok(PreparedCommand::Create(Box::new(request)))
+                }
+            }
         }
         RuleCommand::Get {
             topic,
@@ -101,6 +122,7 @@ fn prepare(namespace: &str, command: &RuleCommand) -> Result<PreparedCommand, Cl
                 namespace: namespace.to_owned(),
                 subscription_path: path,
                 name: name.clone(),
+                include_actions: true,
             };
             validate_request_size(&request)?;
             Ok(PreparedCommand::Get(request))
@@ -112,6 +134,7 @@ fn prepare(namespace: &str, command: &RuleCommand) -> Result<PreparedCommand, Cl
             let request = ListRulesRequest {
                 namespace: namespace.to_owned(),
                 subscription_path: topology::subscription_path(topic, subscription)?,
+                include_actions: true,
             };
             validate_request_size(&request)?;
             Ok(PreparedCommand::List(request))
@@ -147,6 +170,15 @@ pub(super) async fn execute(arguments: &Arguments, command: &RuleCommand) -> Res
                     output::mutation(&input.namespace, &input.subscription_path, &input.name);
                 client
                     .create_rule(settings.request(*input))
+                    .await
+                    .map_err(|status| CliError::Request(status.code()))?;
+                write_output(&completed)
+            }
+            PreparedCommand::CreateWithAction(input) => {
+                let completed =
+                    output::mutation(&input.namespace, &input.subscription_path, &input.name);
+                client
+                    .create_rule_with_action(settings.request(*input))
                     .await
                     .map_err(|status| CliError::Request(status.code()))?;
                 write_output(&completed)
