@@ -26,8 +26,10 @@ use tonic::{
 };
 use url::{Host, Position, Url};
 
+mod rules;
 mod topology;
 
+use rules::RuleCommand;
 use topology::{
     SubscriptionCommand, SubscriptionConfigurationOutput, TopicCommand, TopicConfigurationOutput,
 };
@@ -36,6 +38,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CA_FILE_BYTES: usize = 1024 * 1024;
 const MAX_TOKEN_FILE_BYTES: usize = 16 * 1024;
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_PAGE_TOKEN_BYTES: usize = 512;
 
@@ -61,7 +64,7 @@ struct Arguments {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Print the native API contract and supported entity operations.
+    /// Print the native API contract and supported operations.
     Compatibility,
     Queue {
         #[command(subcommand)]
@@ -74,6 +77,10 @@ enum Command {
     Subscription {
         #[command(subcommand)]
         command: SubscriptionCommand,
+    },
+    Rule {
+        #[command(subcommand)]
+        command: RuleCommand,
     },
 }
 
@@ -213,7 +220,7 @@ impl ConnectionSettings {
         })
     }
 
-    async fn connect(&self) -> Result<EntityServiceClient<Channel>, CliError> {
+    async fn connect_channel(&self) -> Result<Channel, CliError> {
         let mut endpoint = Endpoint::from_shared(self.endpoint.clone())
             .map_err(|_| CliError::Input("invalid administration endpoint"))?
             .connect_timeout(CONNECT_TIMEOUT)
@@ -230,12 +237,15 @@ impl ConnectionSettings {
                 .tls_config(tls)
                 .map_err(|_| CliError::Input("invalid TLS configuration"))?;
         }
-        let channel = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect())
+        tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect())
             .await
             .map_err(|_| CliError::Timeout)?
-            .map_err(|_| CliError::Connect)?;
-        Ok(EntityServiceClient::new(channel)
-            .max_encoding_message_size(64 * 1024)
+            .map_err(|_| CliError::Connect)
+    }
+
+    async fn connect(&self) -> Result<EntityServiceClient<Channel>, CliError> {
+        Ok(EntityServiceClient::new(self.connect_channel().await?)
+            .max_encoding_message_size(MAX_REQUEST_BYTES)
             .max_decoding_message_size(MAX_RESPONSE_BYTES))
     }
 
@@ -509,6 +519,7 @@ struct CompatibilityOutput {
     queue_operations: [&'static str; 5],
     topic_operations: [&'static str; 5],
     subscription_operations: [&'static str; 5],
+    rule_operations: [&'static str; 4],
 }
 
 fn write_output(output: &impl Serialize) -> Result<(), CliError> {
@@ -527,12 +538,14 @@ async fn execute(arguments: Arguments) -> Result<(), CliError> {
                 queue_operations: ["create", "get", "list", "update", "delete"],
                 topic_operations: ["create", "get", "list", "update", "delete"],
                 subscription_operations: ["create", "get", "list", "update", "delete"],
+                rule_operations: ["create", "get", "list", "delete"],
             });
         }
         Command::Topic { command } => return topology::execute_topic(&arguments, command).await,
         Command::Subscription { command } => {
             return topology::execute_subscription(&arguments, command).await;
         }
+        Command::Rule { command } => return rules::execute(&arguments, command).await,
         Command::Queue { command } => command,
     };
     validate_queue_command(command)?;

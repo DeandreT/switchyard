@@ -1855,6 +1855,7 @@ dependencies = [
  "clap",
  "domain",
  "hmac",
+ "prost",
  "rcgen",
  "rustix",
  "rustls",

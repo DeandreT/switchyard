@@ -1,0 +1,4 @@
+{
+  "type": "sql",
+  "expression": "color = 'red' AND priority >= 3"
+}

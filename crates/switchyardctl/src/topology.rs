@@ -384,7 +384,7 @@ fn validate_primary_path(path: &str) -> Result<(), CliError> {
     validate_queue_path(path)
 }
 
-fn subscription_path(topic: &str, name: &str) -> Result<String, CliError> {
+pub(super) fn subscription_path(topic: &str, name: &str) -> Result<String, CliError> {
     validate_primary_path(topic)?;
     let bytes = name.as_bytes();
     if bytes.len() > 50
