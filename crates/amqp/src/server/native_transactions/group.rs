@@ -215,21 +215,49 @@ pub(in crate::server) struct Group {
     pub(in crate::server) controller: NativeControllerIdentity,
     phase: AtomicU8,
     obligations: Mutex<Vec<Arc<Obligation>>>,
+    retirements: Mutex<Vec<Arc<super::retirement::RetirementObligation>>>,
     changed: Notify,
+    cleanup: Option<Arc<Notify>>,
 }
 
 impl Group {
+    #[cfg(test)]
     pub(in crate::server) fn new(
         id: TransactionId,
         controller: NativeControllerIdentity,
+    ) -> Arc<Self> {
+        Self::new_inner(id, controller, None)
+    }
+
+    pub(in crate::server) fn new_with_cleanup(
+        id: TransactionId,
+        controller: NativeControllerIdentity,
+        cleanup: Arc<Notify>,
+    ) -> Arc<Self> {
+        Self::new_inner(id, controller, Some(cleanup))
+    }
+
+    fn new_inner(
+        id: TransactionId,
+        controller: NativeControllerIdentity,
+        cleanup: Option<Arc<Notify>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             id,
             controller,
             phase: AtomicU8::new(0),
             obligations: Mutex::new(Vec::new()),
+            retirements: Mutex::new(Vec::new()),
             changed: Notify::new(),
+            cleanup,
         })
+    }
+
+    fn notify_changed(&self) {
+        self.changed.notify_waiters();
+        if let Some(cleanup) = &self.cleanup {
+            cleanup.notify_one();
+        }
     }
 
     pub(in crate::server) fn state(&self) -> NativeTransactionState {
@@ -260,7 +288,7 @@ impl Group {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    self.changed.notify_waiters();
+                    self.notify_changed();
                     return;
                 }
                 Err(next) => previous = next,
@@ -291,10 +319,11 @@ impl Group {
         identity: DeliveryIdentity,
     ) -> Result<Arc<Obligation>, NativeTransactionError> {
         let mut obligations = lock(&self.obligations);
+        let retirements = lock(&self.retirements);
         if self.state() != NativeTransactionState::Pending {
             return Err(self.error());
         }
-        if obligations.len() >= MAX_NATIVE_TRANSACTION_POSTINGS {
+        if obligations.len() + retirements.len() >= MAX_NATIVE_TRANSACTION_POSTINGS {
             return Err(NativeTransactionError::Limit);
         }
         let obligation = Arc::new(Obligation {
@@ -306,6 +335,44 @@ impl Group {
         });
         obligations.push(obligation.clone());
         Ok(obligation)
+    }
+
+    pub(in crate::server) fn reserve_retirements(
+        self: &Arc<Self>,
+        candidates: &[NativeRetirementCandidate],
+    ) -> Result<Vec<NativeRetirementAttempt>, NativeTransactionError> {
+        let obligations = lock(&self.obligations);
+        let mut retirements = lock(&self.retirements);
+        if self.state() != NativeTransactionState::Pending {
+            return Err(self.error());
+        }
+        if obligations.len() + retirements.len() + candidates.len()
+            > MAX_NATIVE_TRANSACTION_POSTINGS
+        {
+            return Err(NativeTransactionError::Limit);
+        }
+        for (index, candidate) in candidates.iter().enumerate() {
+            if retirements.iter().any(|obligation| {
+                obligation
+                    .delivery_identity
+                    .same_delivery(&candidate.delivery_identity)
+            }) || candidates[..index].iter().any(|prior| {
+                prior
+                    .delivery_identity
+                    .same_delivery(&candidate.delivery_identity)
+            }) {
+                return Err(NativeTransactionError::InvalidPreparedSet);
+            }
+        }
+        let attempts: Vec<_> = candidates
+            .iter()
+            .map(|candidate| NativeRetirementAttempt {
+                group: self.clone(),
+                obligation: super::retirement::RetirementObligation::new(candidate),
+            })
+            .collect();
+        retirements.extend(attempts.iter().map(|attempt| attempt.obligation.clone()));
+        Ok(attempts)
     }
 
     pub(in crate::server) fn seal(&self, fail: bool) -> Result<(), NativeTransactionError> {
@@ -352,7 +419,7 @@ impl Group {
         {
             return Err(NativeTransactionError::InvalidDecision);
         }
-        self.changed.notify_waiters();
+        self.notify_changed();
         Ok(())
     }
 
@@ -373,7 +440,7 @@ impl Group {
                 .compare_exchange(previous, 4, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => {
-                    self.changed.notify_waiters();
+                    self.notify_changed();
                     return Ok(());
                 }
                 Err(next) => previous = next,
@@ -382,16 +449,21 @@ impl Group {
     }
 
     pub(in crate::server) fn refresh_ready(&self) {
-        let ready = lock(&self.obligations)
-            .iter()
-            .all(|obligation| obligation.is_flushed());
+        let obligations = lock(&self.obligations);
+        let retirements = lock(&self.retirements);
+        let ready = obligations.iter().all(|obligation| obligation.is_flushed())
+            && retirements
+                .iter()
+                .all(|obligation| obligation.is_prepared());
+        drop(retirements);
+        drop(obligations);
         if ready
             && self
                 .phase
                 .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
-            self.changed.notify_waiters();
+            self.notify_changed();
         }
     }
 
@@ -403,7 +475,7 @@ impl Group {
                 .compare_exchange_weak(previous, 4, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => {
-                    self.changed.notify_waiters();
+                    self.notify_changed();
                     return;
                 }
                 Err(next) => previous = next,
@@ -424,13 +496,21 @@ impl Group {
         }
     }
 
-    pub(in crate::server) fn exact_prepared(&self, postings: &[PreparedPosting]) -> bool {
+    pub(in crate::server) fn exact_prepared(&self, work: &[NativePreparedWork]) -> bool {
         let obligations = lock(&self.obligations);
-        obligations.len() == postings.len()
+        let retirements = lock(&self.retirements);
+        obligations.len() + retirements.len() == work.len()
             && obligations.iter().all(|obligation| {
-                postings
+                work
                     .iter()
-                    .filter(|posting| posting.matches(self, obligation))
+                    .filter(|item| matches!(item, NativePreparedWork::Posting(posting) if posting.matches(self, obligation)))
+                    .count()
+                    == 1
+            })
+            && retirements.iter().all(|obligation| {
+                work
+                    .iter()
+                    .filter(|item| matches!(item, NativePreparedWork::Retirement(retirement) if retirement.matches(self, obligation)))
                     .count()
                     == 1
             })
@@ -438,6 +518,16 @@ impl Group {
 
     pub(in crate::server) fn obligations(&self) -> Vec<Arc<Obligation>> {
         lock(&self.obligations).clone()
+    }
+
+    pub(in crate::server) fn retirement_attempts(self: &Arc<Self>) -> Vec<NativeRetirementAttempt> {
+        lock(&self.retirements)
+            .iter()
+            .map(|obligation| NativeRetirementAttempt {
+                group: self.clone(),
+                obligation: obligation.clone(),
+            })
+            .collect()
     }
 
     pub(in crate::server) fn is_terminal(&self) -> bool {
@@ -485,7 +575,7 @@ pub struct NativeReadySubmission {
 }
 
 impl NativeReadySubmission {
-    pub(in crate::server) fn new(control: ControlData, postings: Vec<PreparedPosting>) -> Self {
+    pub(in crate::server) fn new(control: ControlData, work: Vec<NativePreparedWork>) -> Self {
         let group = control.group.as_ref().cloned();
         Self {
             ticket: NativeReadyTicket {
@@ -493,7 +583,7 @@ impl NativeReadySubmission {
             },
             resources: NativeTransactionResources {
                 control: Some(control),
-                postings,
+                postings: work,
                 group,
             },
         }
@@ -555,7 +645,7 @@ impl NativeClaim {
             let _ = group
                 .phase
                 .compare_exchange(3, state, Ordering::AcqRel, Ordering::Acquire);
-            group.changed.notify_waiters();
+            group.notify_changed();
         }
     }
 
@@ -565,7 +655,7 @@ impl NativeClaim {
             let _ = group
                 .phase
                 .compare_exchange(3, 4, Ordering::AcqRel, Ordering::Acquire);
-            group.changed.notify_waiters();
+            group.notify_changed();
         }
     }
 }
@@ -576,14 +666,14 @@ impl Drop for NativeClaim {
             let _ = group
                 .phase
                 .compare_exchange(3, 7, Ordering::AcqRel, Ordering::Acquire);
-            group.changed.notify_waiters();
+            group.notify_changed();
         }
     }
 }
 
 pub struct NativeTransactionResources {
     pub(in crate::server) control: Option<ControlData>,
-    pub(in crate::server) postings: Vec<PreparedPosting>,
+    pub(in crate::server) postings: Vec<NativePreparedWork>,
     group: Option<Arc<Group>>,
 }
 

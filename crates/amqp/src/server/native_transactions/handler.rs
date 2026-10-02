@@ -1,3 +1,6 @@
+use super::super::transactional_sender::{
+    accept_native_sender, finish_native_retirement, provisional_native_retirement,
+};
 use super::endpoints::NativeAcceptance;
 use super::group::{ControlData, PostData};
 use super::*;
@@ -13,6 +16,60 @@ pub(in crate::server) async fn handle_native_command<W: AsyncWrite + Unpin>(
         return Ok(());
     }
     match command {
+        NativeCommand::AcceptSender { acceptance, reply } => {
+            let channel = acceptance.channel;
+            let handle = acceptance.attach.approval().local_handle();
+            let owner = acceptance.attach.approval().link_identity().clone();
+            if let Err(error) = book.preflight_accept_sender(&owner) {
+                let _ = reply.send(Err(native_error(error)));
+                return Ok(());
+            }
+            let commands = acceptance.commands.clone();
+            let result = accept_native_sender(*acceptance, sessions, writer).await;
+            let result = match result {
+                Ok(owner) => book
+                    .accept_sender(channel, handle, owner.clone(), commands)
+                    .map(|()| owner)
+                    .map_err(native_error),
+                Err(EngineError::Io(error)) => {
+                    let _ = reply.send(Err(native_error(NativeTransactionError::Faulted(
+                        NativeFault::Flush,
+                    ))));
+                    return Err(error.into());
+                }
+                Err(error) => Err(error),
+            };
+            let _ = reply.send(result);
+        }
+        NativeCommand::SendTransactional {
+            route,
+            message,
+            delivery_tag,
+            reply,
+        } => {
+            if let Err(error) = book.preflight_sender(&route.owner) {
+                (*reply).reject(native_error(error));
+                return Ok(());
+            }
+            let Some(session) = sessions.get_mut(&route.channel) else {
+                (*reply).reject(EngineError::RemoteDetached);
+                return Ok(());
+            };
+            let maximum = writer.maximum_frame_size();
+            queue_send(
+                route.channel,
+                route.handle,
+                session,
+                &route.owner,
+                *message,
+                delivery_tag,
+                0,
+                reply,
+                writer,
+                maximum,
+            )
+            .await?;
+        }
         NativeCommand::AcceptCoordinator { acceptance, reply } => {
             let NativeAcceptance {
                 channel,
@@ -193,6 +250,13 @@ pub(in crate::server) async fn handle_native_command<W: AsyncWrite + Unpin>(
                             return reply_failure(reply, error);
                         }
                     }
+                    for attempt in group.retirement_attempts() {
+                        if let Err(error) =
+                            finish_native_retirement(&attempt, false, sessions, writer).await
+                        {
+                            return reply_failure(reply, classify_native_io(error));
+                        }
+                    }
                 }
                 Err(NativeTransactionError::Faulted(NativeFault::PartialAtSeal)) => {
                     let refusal = NativeControlRefusal::from_data(
@@ -230,7 +294,7 @@ pub(in crate::server) async fn handle_native_command<W: AsyncWrite + Unpin>(
                 Ok(()) => {
                     data.obligation.flushed();
                     data.group.refresh_ready();
-                    let _ = reply.send(Ok(PreparedPosting { data: *data }));
+                    let _ = reply.send(Ok(PreparedPosting { data }));
                 }
                 Err(NativeIoError::Local(error)) => {
                     data.group.fault(NativeFault::Stage);
@@ -242,6 +306,29 @@ pub(in crate::server) async fn handle_native_command<W: AsyncWrite + Unpin>(
                         NativeFault::Flush,
                     ))));
                     return Err(error);
+                }
+            }
+        }
+        NativeCommand::ProvisionalRetirement { data, reply } => {
+            if !matches!(
+                data.attempt.state(),
+                NativeTransactionState::Pending | NativeTransactionState::Sealed
+            ) {
+                let _ = reply.send(Err(native_error(data.attempt.group.error())));
+                return Ok(());
+            }
+            match provisional_native_retirement(&data.attempt, sessions, writer).await {
+                Ok(()) => {
+                    data.attempt.prepared();
+                    let _ = reply.send(Ok(PreparedRetirement { data }));
+                }
+                Err(error) => {
+                    let error = classify_native_io(error);
+                    data.attempt.fault(match &error {
+                        NativeIoError::Local(_) => NativeFault::Stage,
+                        NativeIoError::Write(_) => NativeFault::Flush,
+                    });
+                    return reply_failure(reply, error);
                 }
             }
         }
@@ -260,6 +347,13 @@ pub(in crate::server) async fn handle_native_command<W: AsyncWrite + Unpin>(
                 for obligation in group.obligations() {
                     if let Err(error) = abort_post(&obligation, sessions, writer).await {
                         return reply_failure(reply, error);
+                    }
+                }
+                for attempt in group.retirement_attempts() {
+                    if let Err(error) =
+                        finish_native_retirement(&attempt, false, sessions, writer).await
+                    {
+                        return reply_failure(reply, classify_native_io(error));
                     }
                 }
             }
@@ -299,8 +393,26 @@ pub(in crate::server) async fn handle_native_command<W: AsyncWrite + Unpin>(
             for posting in &postings {
                 let outcome = (state == Some(NativeTransactionState::Committed))
                     .then_some(DeliveryState::Accepted(Accepted));
-                if let Err(error) = finish_post(&posting.data, outcome, sessions, writer).await {
-                    return reply_failure(reply, error);
+                match posting {
+                    NativePreparedWork::Posting(posting) => {
+                        if let Err(error) =
+                            finish_post(&posting.data, outcome, sessions, writer).await
+                        {
+                            return reply_failure(reply, error);
+                        }
+                    }
+                    NativePreparedWork::Retirement(retirement) => {
+                        if let Err(error) = finish_native_retirement(
+                            &retirement.data.attempt,
+                            state == Some(NativeTransactionState::Committed),
+                            sessions,
+                            writer,
+                        )
+                        .await
+                        {
+                            return reply_failure(reply, classify_native_io(error));
+                        }
+                    }
                 }
             }
             if state != Some(NativeTransactionState::Committed) {
@@ -345,6 +457,14 @@ pub(in crate::server) async fn handle_native_command<W: AsyncWrite + Unpin>(
 enum NativeIoError {
     Local(EngineError),
     Write(EngineError),
+}
+
+fn classify_native_io(error: EngineError) -> NativeIoError {
+    if matches!(&error, EngineError::Io(_)) {
+        NativeIoError::Write(error)
+    } else {
+        NativeIoError::Local(error)
+    }
 }
 
 fn reply_failure<T>(

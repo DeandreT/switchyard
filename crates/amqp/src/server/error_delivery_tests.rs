@@ -208,11 +208,12 @@ impl Fixture {
         self.sender(channel, handle).unsettled.insert(
             id,
             OutgoingDelivery {
-                reply,
+                reply: reply.into(),
                 delivery_identity,
                 delivery_tag: id.to_be_bytes().to_vec().into(),
                 outcome: None,
                 receiver_settled: false,
+                retirement: None,
             },
         );
         result
@@ -450,7 +451,7 @@ fn installed_snapshots_collect_exact_incoming_phases_and_the_outgoing_live_union
         content_lease: queued_lease,
         delivery_tag: vec![77].into(),
         message_format: 0,
-        reply,
+        reply: reply.into(),
     });
     let delivery_identity = link
         .unsettled

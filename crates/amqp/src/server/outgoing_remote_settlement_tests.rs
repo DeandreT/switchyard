@@ -155,11 +155,12 @@ impl Fixture {
                 .insert(
                     id,
                     OutgoingDelivery {
-                        reply,
+                        reply: reply.into(),
                         delivery_identity: delivery_identity.clone(),
                         delivery_tag: id.to_be_bytes().to_vec().into(),
                         outcome: None,
                         receiver_settled: false,
+                        retirement: None,
                     }
                 )
                 .is_none()
@@ -620,11 +621,12 @@ fn delivery_at(
             .insert(
                 id,
                 OutgoingDelivery {
-                    reply,
+                    reply: reply.into(),
                     delivery_identity,
                     delivery_tag: id.to_be_bytes().to_vec().into(),
                     outcome: None,
-                    receiver_settled: false
+                    receiver_settled: false,
+                    retirement: None,
                 }
             )
             .is_none()

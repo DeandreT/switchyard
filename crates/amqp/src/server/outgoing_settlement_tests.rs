@@ -635,11 +635,12 @@ async fn automatic_acknowledgement_precedes_send_reply_and_survives_a_dropped_re
         fixture.sending_mut().unsettled.insert(
             ID,
             OutgoingDelivery {
-                reply,
+                reply: reply.into(),
                 delivery_identity,
                 delivery_tag: vec![ID as u8].into(),
                 outcome: Some(Outcome::Accepted(Accepted)),
                 receiver_settled: false,
+                retirement: None,
             },
         );
         fixture.output.blocked_flush.store(true, Ordering::Release);
@@ -695,11 +696,12 @@ async fn automatic_acknowledgement_flush_failure_never_publishes_a_successful_se
     fixture.sending_mut().unsettled.insert(
         ID,
         OutgoingDelivery {
-            reply,
+            reply: reply.into(),
             delivery_identity,
             delivery_tag: vec![ID as u8].into(),
             outcome: Some(Outcome::Accepted(Accepted)),
             receiver_settled: false,
+            retirement: None,
         },
     );
     fixture.output.failed_flush.store(true, Ordering::Release);
@@ -752,11 +754,12 @@ async fn early_outcome_is_latched_until_final_transfer_then_automatically_acknow
     link.unsettled.insert(
         ID,
         OutgoingDelivery {
-            reply,
+            reply: reply.into(),
             delivery_identity: delivery_identity.clone(),
             delivery_tag: vec![ID as u8].into(),
             outcome: None,
             receiver_settled: false,
+            retirement: None,
         },
     );
     link.active = Some(ActiveSend {
@@ -843,11 +846,12 @@ async fn automatic_policy_never_acknowledges_first_mode_or_already_settled_outco
             fixture.sending_mut().unsettled.insert(
                 ID,
                 OutgoingDelivery {
-                    reply,
+                    reply: reply.into(),
                     delivery_identity,
                     delivery_tag: vec![ID as u8].into(),
                     outcome: None,
                     receiver_settled: false,
+                    retirement: None,
                 },
             );
             apply_disposition(
@@ -895,7 +899,7 @@ async fn presettled_active_send_reports_success_only_after_final_transfer_flush(
         delivery_tag: vec![ID as u8].into(),
         message_format: 0,
         settled: true,
-        settled_reply: Some(reply),
+        settled_reply: Some(reply.into()),
     });
     fixture.output.blocked_flush.store(true, Ordering::Release);
     let mut processing = Box::pin(send_fragment(

@@ -11,6 +11,11 @@ struct ReceiverRoute {
     hook: Arc<NativeRetirementHook>,
 }
 
+struct SenderRoute {
+    route: NativeRoute,
+    hook: Arc<NativeRetirementHook>,
+}
+
 struct Terminal {
     id: TransactionId,
     controller: NativeControllerIdentity,
@@ -34,8 +39,10 @@ pub(in crate::server) struct NativeTransactionBook {
     policy: NativeIngressPolicy,
     controllers: Vec<ControllerRoute>,
     receivers: Vec<ReceiverRoute>,
+    senders: Vec<SenderRoute>,
     groups: HashMap<TransactionId, Arc<Group>>,
     terminals: VecDeque<Terminal>,
+    cleanup: Arc<tokio::sync::Notify>,
 }
 
 impl NativeTransactionBook {
@@ -48,8 +55,10 @@ impl NativeTransactionBook {
             policy,
             controllers: Vec::new(),
             receivers: Vec::new(),
+            senders: Vec::new(),
             groups: HashMap::new(),
             terminals: VecDeque::new(),
+            cleanup: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -60,8 +69,10 @@ impl NativeTransactionBook {
             policy: NativeIngressPolicy::Disabled,
             controllers: Vec::new(),
             receivers: Vec::new(),
+            senders: Vec::new(),
             groups: HashMap::new(),
             terminals: VecDeque::new(),
+            cleanup: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -69,8 +80,12 @@ impl NativeTransactionBook {
         self.policy
     }
 
+    pub(in crate::server) fn cleanup_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.cleanup.clone()
+    }
+
     fn check_owner(&self, owner: &LinkIdentity) -> Result<(), NativeTransactionError> {
-        if self.policy != NativeIngressPolicy::Posting {
+        if self.policy == NativeIngressPolicy::Disabled {
             return Err(NativeTransactionError::Disabled);
         }
         let same = self
@@ -90,6 +105,8 @@ impl NativeTransactionBook {
         self.controllers
             .retain(|record| record.controller.is_active() && !record.route.owner.is_retired());
         self.receivers
+            .retain(|record| !record.route.owner.is_retired());
+        self.senders
             .retain(|record| !record.route.owner.is_retired());
         let completed: Vec<_> = self
             .groups
@@ -212,6 +229,143 @@ impl NativeTransactionBook {
             }
         };
         Ok(NativePartialPosting::new(group, obligation))
+    }
+
+    pub(in crate::server) fn preflight_accept_sender(
+        &mut self,
+        owner: &LinkIdentity,
+    ) -> Result<(), NativeTransactionError> {
+        if self.policy != NativeIngressPolicy::PostingAndRetirement {
+            return Err(NativeTransactionError::Disabled);
+        }
+        self.check_owner(owner)?;
+        self.reap();
+        if self.senders.len() >= MAX_LINKS_PER_CONNECTION {
+            return Err(NativeTransactionError::Limit);
+        }
+        Ok(())
+    }
+
+    pub(in crate::server) fn accept_sender(
+        &mut self,
+        channel: u16,
+        handle: u32,
+        owner: LinkIdentity,
+        commands: mpsc::Sender<Command>,
+    ) -> Result<(), NativeTransactionError> {
+        self.preflight_accept_sender(&owner)?;
+        let hook = NativeRetirementHook::new();
+        owner
+            .install_native_retirement_hook(hook.clone())
+            .map_err(|_| NativeTransactionError::Retired)?;
+        self.senders.push(SenderRoute {
+            route: NativeRoute {
+                channel,
+                handle,
+                owner,
+                commands,
+            },
+            hook,
+        });
+        Ok(())
+    }
+
+    pub(in crate::server) fn preflight_sender(
+        &self,
+        owner: &LinkIdentity,
+    ) -> Result<(), NativeTransactionError> {
+        if self.policy != NativeIngressPolicy::PostingAndRetirement {
+            return Err(NativeTransactionError::Disabled);
+        }
+        self.check_owner(owner)?;
+        if !self
+            .senders
+            .iter()
+            .any(|record| record.route.owner.same_link(owner))
+        {
+            return Err(NativeTransactionError::InvalidAttach);
+        }
+        Ok(())
+    }
+
+    pub(in crate::server) fn begin_retirements(
+        &mut self,
+        state: &TransactionalState,
+        candidates: &[NativeRetirementCandidate],
+    ) -> Result<Vec<NativeRetirementAttempt>, NativeTransactionError> {
+        if self.policy != NativeIngressPolicy::PostingAndRetirement {
+            return Err(NativeTransactionError::Disabled);
+        }
+        self.reap();
+        let group = self
+            .groups
+            .get(&state.txn_id)
+            .cloned()
+            .ok_or(NativeTransactionError::UnknownTransaction)?;
+        if !matches!(&state.outcome, Some(Outcome::Accepted(_))) {
+            group.fault(NativeFault::Stage);
+            return Err(NativeTransactionError::Unsupported);
+        }
+        if group.state() != NativeTransactionState::Pending || !group.controller.is_active() {
+            return Err(group.error());
+        }
+        if candidates.len() > MAX_NATIVE_TRANSACTION_POSTINGS {
+            group.fault(NativeFault::Stage);
+            return Err(NativeTransactionError::Limit);
+        }
+        for candidate in candidates {
+            if let Err(error) = self.preflight_sender(&candidate.owner) {
+                group.fault(NativeFault::Stage);
+                return Err(error);
+            }
+            if !candidate
+                .delivery_identity
+                .owner()
+                .same_link(&candidate.owner)
+                || !self.senders.iter().any(|record| {
+                    record.route.channel == candidate.channel
+                        && record.route.handle == candidate.handle
+                        && record.route.owner.same_link(&candidate.owner)
+                })
+            {
+                group.fault(NativeFault::Stage);
+                return Err(NativeTransactionError::InvalidPreparedSet);
+            }
+        }
+        let attempts = match group.reserve_retirements(candidates) {
+            Ok(attempts) => attempts,
+            Err(error) => {
+                group.fault(NativeFault::Stage);
+                return Err(error);
+            }
+        };
+        for candidate in candidates {
+            let sender = self
+                .senders
+                .iter()
+                .find(|record| record.route.owner.same_link(&candidate.owner))
+                .ok_or(NativeTransactionError::Retired)?;
+            if let Err(error) = sender.hook.track(&group) {
+                group.fault(NativeFault::Stage);
+                return Err(error);
+            }
+        }
+        if group.state() != NativeTransactionState::Pending {
+            return Err(group.error());
+        }
+        Ok(attempts)
+    }
+
+    pub(in crate::server) fn fault_retirement(
+        &self,
+        state: Option<&DeliveryState>,
+        fault: NativeFault,
+    ) {
+        if let Some(DeliveryState::Transactional(state)) = state
+            && let Some(group) = self.groups.get(&state.txn_id)
+        {
+            group.fault(fault);
+        }
     }
 
     pub(in crate::server) fn fault_posting(
@@ -430,7 +584,8 @@ impl NativeTransactionBook {
         {
             return Err(NativeTransactionError::UnknownTransaction);
         }
-        let group = Group::new(id.clone(), data.controller.clone());
+        let group =
+            Group::new_with_cleanup(id.clone(), data.controller.clone(), self.cleanup.clone());
         data.controller.0.register(&group)?;
         self.groups.insert(id, group.clone());
         Ok(group)
@@ -444,6 +599,9 @@ impl NativeTransactionBook {
             record.controller.0.close();
         }
         for record in &self.receivers {
+            record.hook.close();
+        }
+        for record in &self.senders {
             record.hook.close();
         }
     }

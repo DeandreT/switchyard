@@ -9,6 +9,7 @@ mod endpoints;
 mod group;
 mod handler;
 mod receiver_identity;
+mod retirement;
 
 pub(super) use book::NativeTransactionBook;
 pub(super) use control_refusal::NativeControlRefusal;
@@ -18,6 +19,7 @@ pub use endpoints::{
 };
 pub(super) use group::NativePartialPosting;
 pub(super) use group::NativeRetirementHook;
+pub(super) use group::NativeRoute;
 pub use group::{
     NativeClaim, NativeControllerIdentity, NativeReadySubmission, NativeReadyTicket,
     NativeTransactionIdentity, NativeTransactionResources, PendingDeclareReceipt, PreparedPosting,
@@ -25,6 +27,8 @@ pub use group::{
 };
 pub(super) use handler::{handle_control_refusal, handle_native_command};
 pub use receiver_identity::NativeReceiverIdentity;
+pub use retirement::{NativePreparedWork, PreparedRetirement, TransactionRetirementReceipt};
+pub(super) use retirement::{NativeRetirementAttempt, NativeRetirementCandidate};
 
 pub const MAX_NATIVE_TRANSACTIONS: usize = 32;
 pub const MAX_NATIVE_TRANSACTION_POSTINGS: usize = 100;
@@ -35,6 +39,7 @@ const MAX_NATIVE_TERMINALS: usize = 32;
 pub(super) enum NativeIngressPolicy {
     Disabled,
     Posting,
+    PostingAndRetirement,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

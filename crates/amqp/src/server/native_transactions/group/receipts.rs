@@ -227,7 +227,7 @@ impl TransactionPostingReceipt {
 }
 
 pub struct PreparedPosting {
-    pub(in crate::server) data: PostData,
+    pub(in crate::server) data: Box<PostData>,
 }
 
 impl PreparedPosting {
@@ -294,16 +294,29 @@ impl SealedDischargeReceipt {
         self,
         postings: Vec<PreparedPosting>,
     ) -> Result<NativeReadySubmission, NativeTransactionError> {
+        self.prepare_work(
+            postings
+                .into_iter()
+                .map(NativePreparedWork::Posting)
+                .collect(),
+        )
+    }
+
+    /// Consumes every exact posting and retirement prepared by this group.
+    pub fn prepare_work(
+        self,
+        work: Vec<NativePreparedWork>,
+    ) -> Result<NativeReadySubmission, NativeTransactionError> {
         let DischargeStatus::Live(group) = &self.status else {
             return Err(NativeTransactionError::NotReady);
         };
         if self.data.fail || group.state() != NativeTransactionState::Ready {
             return Err(NativeTransactionError::NotReady);
         }
-        if !group.exact_prepared(&postings) {
+        if !group.exact_prepared(&work) {
             return Err(NativeTransactionError::InvalidPreparedSet);
         }
-        Ok(NativeReadySubmission::new(self.data, postings))
+        Ok(NativeReadySubmission::new(self.data, work))
     }
 
     pub async fn rollback(self) -> Result<(), EngineError> {

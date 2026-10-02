@@ -41,6 +41,7 @@ mod retained_delivery;
 mod sender_identity;
 mod session_channels;
 mod session_identity;
+mod transactional_sender;
 mod transactions;
 
 use connection_identity::ConnectionActorExit;
@@ -67,10 +68,11 @@ use link_handles::{
 pub use native_transactions::{
     CoordinatorEndpoint, CoordinatorRequest, MAX_NATIVE_TRANSACTION_CONTROL_BYTES,
     MAX_NATIVE_TRANSACTION_POSTINGS, MAX_NATIVE_TRANSACTIONS, NativeClaim,
-    NativeControllerIdentity, NativeDeclarationRefusal, NativeFault, NativeReadySubmission,
-    NativeReadyTicket, NativeReceiverIdentity, NativeTransactionDecision, NativeTransactionError,
-    NativeTransactionIdentity, NativeTransactionResources, NativeTransactionState,
-    PendingDeclareReceipt, PreparedPosting, SealedDischargeReceipt, TransactionPostingReceipt,
+    NativeControllerIdentity, NativeDeclarationRefusal, NativeFault, NativePreparedWork,
+    NativeReadySubmission, NativeReadyTicket, NativeReceiverIdentity, NativeTransactionDecision,
+    NativeTransactionError, NativeTransactionIdentity, NativeTransactionResources,
+    NativeTransactionState, PendingDeclareReceipt, PreparedPosting, PreparedRetirement,
+    SealedDischargeReceipt, TransactionPostingReceipt, TransactionRetirementReceipt,
     TransactionalIngress, TransactionalReceiver,
 };
 use native_transactions::{NativeIngressPolicy, NativeTransactionBook};
@@ -82,6 +84,10 @@ pub use sender_identity::NativeSenderIdentity;
 use session_channels::{local_channel_for_peer, preferred_vacant_channel};
 pub use session_identity::IncomingAttach;
 use session_identity::{AttachApproval, AttachApprovalError, SessionIdentity};
+use transactional_sender::{
+    OutgoingReply, apply_native_outgoing_disposition, reconcile_native_retirements,
+};
+pub use transactional_sender::{SentDelivery, TransactionalDisposition, TransactionalSender};
 use transactions::{
     TRANSACTIONS_NOT_IMPLEMENTED, attach_uses_transactions, refuse_transaction_flow,
     source_uses_transactions, transaction_state,
@@ -559,6 +565,27 @@ impl ServerConnection {
             sasl,
             options,
             NativeIngressPolicy::Posting,
+        )
+        .await
+    }
+
+    /// Enables trusted native transactional postings and outgoing retirements.
+    /// This does not enable Service Bus transactions or a persistence adapter.
+    pub async fn accept_with_transactional_work<Io>(
+        stream: Io,
+        container_id: impl Into<String>,
+        sasl: Option<Arc<dyn SaslAuthenticator>>,
+        options: ConnectionOptions,
+    ) -> Result<Self, EngineError>
+    where
+        Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        Self::accept_inner(
+            stream,
+            container_id,
+            sasl,
+            options,
+            NativeIngressPolicy::PostingAndRetirement,
         )
         .await
     }
@@ -1335,7 +1362,7 @@ struct QueuedSend {
     content_lease: ContentLease,
     delivery_tag: DeliveryTag,
     message_format: u32,
-    reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
+    reply: OutgoingReply,
 }
 
 struct ActiveSend {
@@ -1348,15 +1375,16 @@ struct ActiveSend {
     delivery_tag: DeliveryTag,
     message_format: u32,
     settled: bool,
-    settled_reply: Option<oneshot::Sender<Result<SendOutcome, EngineError>>>,
+    settled_reply: Option<OutgoingReply>,
 }
 
 struct OutgoingDelivery {
-    reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
+    reply: OutgoingReply,
     delivery_identity: NativeOutgoingDeliveryIdentity,
     delivery_tag: DeliveryTag,
     outcome: Option<Outcome>,
     receiver_settled: bool,
+    retirement: Option<native_transactions::NativeRetirementAttempt>,
 }
 
 struct SendOutcome {
@@ -1416,6 +1444,7 @@ async fn run_connection<Io>(
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let mut native_transactions = NativeTransactionBook::new(connection, native_policy);
+    let native_cleanup = native_transactions.cleanup_notify();
     let remote_max_frame_size = settings.remote_max_frame_size;
     let activity = Activity::configured(settings.options);
     let (mut reader, writer) = tokio::io::split(stream);
@@ -1458,6 +1487,13 @@ async fn run_connection<Io>(
         let stopped = {
             let processing = async {
                 loop {
+                    if native_policy == NativeIngressPolicy::PostingAndRetirement
+                        && reconcile_native_retirements(&mut sessions, &mut writer)
+                            .await
+                            .is_err()
+                    {
+                        break;
+                    }
                     if activity.heartbeat_is_due(settings.peer_idle_millis)
                         && writer
                             .write_frame(&Frame::Amqp {
@@ -1471,6 +1507,11 @@ async fn run_connection<Io>(
                         break;
                     }
                     tokio::select! {
+                        () = native_cleanup.notified(), if native_policy == NativeIngressPolicy::PostingAndRetirement => {
+                            if reconcile_native_retirements(&mut sessions, &mut writer).await.is_err() {
+                                break;
+                            }
+                        }
                         () = activity.heartbeat_due(settings.peer_idle_millis), if !activity.is_closing() => {
                             if writer.write_frame(&Frame::Amqp {
                                 channel: 0,
@@ -2054,7 +2095,17 @@ async fn handle_frame_scoped<W: AsyncWrite + Unpin>(
             .await?;
         }
         Performative::Disposition(disposition) => {
-            apply_disposition(channel, disposition, writer, sessions).await?;
+            if !apply_native_outgoing_disposition(
+                channel,
+                &disposition,
+                sessions,
+                writer,
+                native_transactions,
+            )
+            .await?
+            {
+                apply_disposition(channel, disposition, writer, sessions).await?;
+            }
         }
         Performative::Detach(detach) => {
             if let Some(session) = sessions.get_mut(&channel) {
@@ -4197,10 +4248,11 @@ async fn queue_send<W: AsyncWrite + Unpin>(
     message: Message,
     delivery_tag: DeliveryTag,
     message_format: u32,
-    reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
+    reply: impl Into<OutgoingReply>,
     writer: &mut FrameWriter<W>,
     _remote_max_frame_size: u32,
 ) -> Result<(), EngineError> {
+    let reply = reply.into();
     if identity.is_retired() || session.ending || session.closing_handles.contains(&handle) {
         let _ = reply.send(Err(EngineError::RemoteDetached));
         return Ok(());
@@ -4666,6 +4718,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
                     delivery_tag: queued.delivery_tag.clone(),
                     outcome: None,
                     receiver_settled: false,
+                    retirement: None,
                 },
             );
             None
@@ -4707,6 +4760,9 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
                 acknowledgement: None,
             }));
         } else {
+            if let Some(row) = link.unsettled.get_mut(&delivery_id) {
+                row.reply.flushed(&row.delivery_identity);
+            }
             resolve_outgoing(channel, link, delivery_id, writer).await?;
         }
     }
@@ -5143,6 +5199,9 @@ mod outgoing_settlement_tests;
 
 #[cfg(test)]
 mod sender_provenance_tests;
+
+#[cfg(test)]
+mod native_retirement_tests;
 
 #[cfg(test)]
 mod session_provenance_tests;

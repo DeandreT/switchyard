@@ -171,14 +171,15 @@ impl Fixture {
                 .insert(
                     id,
                     OutgoingDelivery {
-                        reply,
+                        reply: reply.into(),
                         delivery_identity: NativeOutgoingDeliveryIdentity::for_delivery(
                             &link.identity,
                             id
                         ),
                         delivery_tag: tag.into(),
                         outcome: None,
-                        receiver_settled: false
+                        receiver_settled: false,
+                        retirement: None,
                     }
                 )
                 .is_none()
@@ -224,7 +225,7 @@ impl Fixture {
             delivery_tag: tag.into(),
             message_format: 0,
             settled: true,
-            settled_reply: Some(reply),
+            settled_reply: Some(reply.into()),
         });
         result
     }
@@ -678,7 +679,7 @@ async fn defensive_overcapacity_scan_does_not_advance_or_overwrite_an_alias() {
         content_lease,
         delivery_tag: b"queued".to_vec().into(),
         message_format: 0,
-        reply,
+        reply: reply.into(),
     });
     let flow = fixture.session().flow.snapshot();
     let credit = fixture.link(HANDLE).credit.snapshot();

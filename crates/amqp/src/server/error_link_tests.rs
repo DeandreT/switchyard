@@ -188,11 +188,12 @@ impl Fixture {
             link.unsettled.insert(
                 7,
                 OutgoingDelivery {
-                    reply,
+                    reply: reply.into(),
                     delivery_identity: NativeOutgoingDeliveryIdentity::for_delivery(owner, 7),
                     delivery_tag: vec![7].into(),
                     outcome: None,
                     receiver_settled: false,
+                    retirement: None,
                 },
             );
         }

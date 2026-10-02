@@ -1,4 +1,6 @@
+use super::super::transactional_sender::{NativeSenderAcceptance, TransactionalReply};
 use super::group::{ControlData, NativeRoute, PostData};
+use super::retirement::RetirementData;
 use super::*;
 
 pub enum CoordinatorRequest {
@@ -180,6 +182,16 @@ pub(in crate::server) enum NativeCommand {
         acceptance: Box<NativeAcceptance>,
         reply: oneshot::Sender<Result<LinkIdentity, EngineError>>,
     },
+    AcceptSender {
+        acceptance: Box<NativeSenderAcceptance>,
+        reply: oneshot::Sender<Result<LinkIdentity, EngineError>>,
+    },
+    SendTransactional {
+        route: NativeRoute,
+        message: Box<Message>,
+        delivery_tag: DeliveryTag,
+        reply: Box<TransactionalReply>,
+    },
     Declare {
         data: Box<ControlData>,
         id: TransactionId,
@@ -198,13 +210,17 @@ pub(in crate::server) enum NativeCommand {
         data: Box<PostData>,
         reply: oneshot::Sender<Result<PreparedPosting, EngineError>>,
     },
+    ProvisionalRetirement {
+        data: Box<RetirementData>,
+        reply: oneshot::Sender<Result<PreparedRetirement, EngineError>>,
+    },
     Rollback {
         data: Box<ControlData>,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
     Finish {
         control: Box<ControlData>,
-        postings: Vec<PreparedPosting>,
+        postings: Vec<NativePreparedWork>,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
 }
@@ -215,7 +231,7 @@ impl NativeCommand {
             Self::AcceptCoordinator { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
-            Self::AcceptReceiver { reply, .. } => {
+            Self::AcceptReceiver { reply, .. } | Self::AcceptSender { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
             Self::Declare { reply, .. } => {
@@ -230,6 +246,10 @@ impl NativeCommand {
             Self::Provisional { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
+            Self::ProvisionalRetirement { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::SendTransactional { reply, .. } => (*reply).reject(error),
         }
     }
 }
