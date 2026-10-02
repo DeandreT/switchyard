@@ -32,6 +32,7 @@ mod frame_writer;
 mod idle;
 mod incoming_ledger;
 mod link_handles;
+mod native_transactions;
 mod outgoing_identity;
 mod receive_credit;
 mod retained_delivery;
@@ -60,6 +61,15 @@ use link_handles::{
     HandleAlias, connection_link_name_in_use, current_alias, is_error_detached,
     local_handle_for_peer, mark_error_detached, preferred_vacant_handle,
 };
+pub use native_transactions::{
+    CoordinatorEndpoint, CoordinatorRequest, MAX_NATIVE_TRANSACTION_CONTROL_BYTES,
+    MAX_NATIVE_TRANSACTION_POSTINGS, MAX_NATIVE_TRANSACTIONS, NativeClaim,
+    NativeControllerIdentity, NativeFault, NativeReadySubmission, NativeReadyTicket,
+    NativeTransactionDecision, NativeTransactionError, NativeTransactionIdentity,
+    NativeTransactionResources, NativeTransactionState, PendingDeclareReceipt, PreparedPosting,
+    SealedDischargeReceipt, TransactionPostingReceipt, TransactionalIngress, TransactionalReceiver,
+};
+use native_transactions::{NativeIngressPolicy, NativeTransactionBook};
 use outgoing_identity::AckIdentity;
 use receive_credit::{Consumption, ReceiveCredit};
 pub use retained_delivery::RetainedDelivery;
@@ -495,10 +505,51 @@ impl ServerConnection {
     }
 
     pub async fn accept_with_options<Io>(
+        stream: Io,
+        container_id: impl Into<String>,
+        sasl: Option<Arc<dyn SaslAuthenticator>>,
+        options: ConnectionOptions,
+    ) -> Result<Self, EngineError>
+    where
+        Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        Self::accept_inner(
+            stream,
+            container_id,
+            sasl,
+            options,
+            NativeIngressPolicy::Disabled,
+        )
+        .await
+    }
+
+    /// Enables the trusted native transactional-ingress API on this connection.
+    /// This does not enable Service Bus transactions or a persistence adapter.
+    pub async fn accept_with_transactional_ingress<Io>(
+        stream: Io,
+        container_id: impl Into<String>,
+        sasl: Option<Arc<dyn SaslAuthenticator>>,
+        options: ConnectionOptions,
+    ) -> Result<Self, EngineError>
+    where
+        Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        Self::accept_inner(
+            stream,
+            container_id,
+            sasl,
+            options,
+            NativeIngressPolicy::Posting,
+        )
+        .await
+    }
+
+    async fn accept_inner<Io>(
         mut stream: Io,
         container_id: impl Into<String>,
         sasl: Option<Arc<dyn SaslAuthenticator>>,
         options: ConnectionOptions,
+        native_policy: NativeIngressPolicy,
     ) -> Result<Self, EngineError>
     where
         Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -584,6 +635,7 @@ impl ServerConnection {
                     peer_idle_millis,
                 },
                 exit_guard.identity(),
+                native_policy,
                 command_rx,
                 incoming_session_tx,
                 driver_consumed,
@@ -730,6 +782,10 @@ impl ServerSession {
         attach
             .validate_request(&self.identity)
             .map_err(attach_approval_error)?;
+        native_transactions::validate_accept_kind(
+            &attach,
+            native_transactions::NativeAttachKind::Ordinary,
+        )?;
         if has_recovery_state(&attach) {
             return Err(invalid_state(RECOVERY_NOT_IMPLEMENTED));
         }
@@ -990,6 +1046,7 @@ async fn request<T>(
 }
 
 enum Command {
+    NativeTransactions(native_transactions::NativeCommand),
     AcceptSession {
         channel: u16,
         identity: SessionIdentity,
@@ -1046,6 +1103,7 @@ enum Command {
 
 fn reject_closed_command(command: Command) {
     match command {
+        Command::NativeTransactions(command) => command.reject(EngineError::RemoteClosed),
         Command::Send { reply, .. } => {
             let _ = reply.send(Err(EngineError::RemoteClosed));
         }
@@ -1212,7 +1270,7 @@ fn connection_link_slot_count(sessions: &HashMap<u16, SessionState>) -> usize {
 
 enum LinkState {
     Sending(Box<SendingLink>),
-    Receiving(ReceivingLink),
+    Receiving(Box<ReceivingLink>),
 }
 
 impl LinkState {
@@ -1272,9 +1330,21 @@ struct SendOutcome {
     acknowledgement: Option<AckIdentity>,
 }
 
+enum ReceivingSink {
+    Ordinary(mpsc::Sender<Delivery>),
+    Coordinator(mpsc::Sender<native_transactions::CoordinatorRequest>),
+    Transactional(mpsc::Sender<native_transactions::TransactionalIngress>),
+}
+
+impl From<mpsc::Sender<Delivery>> for ReceivingSink {
+    fn from(deliveries: mpsc::Sender<Delivery>) -> Self {
+        Self::Ordinary(deliveries)
+    }
+}
+
 struct ReceivingLink {
     max_message_size: u64,
-    deliveries: mpsc::Sender<Delivery>,
+    deliveries: ReceivingSink,
     partial: Option<PartialDelivery>,
     detached: watch::Sender<bool>,
     credit: ReceiveCredit,
@@ -1292,14 +1362,17 @@ struct PartialDelivery {
     bytes: Vec<u8>,
     content_lease: ContentLease,
     identity: DeliveryIdentity,
+    native_posting: Option<native_transactions::NativePartialPosting>,
     forbidden_receiver_mode: bool,
     forbidden_sender_settled: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_connection<Io>(
     stream: Io,
     settings: ConnectionSettings,
     connection: &NativeConnectionIdentity,
+    native_policy: NativeIngressPolicy,
     mut commands: mpsc::Receiver<Command>,
     incoming_sessions: mpsc::Sender<IncomingSession>,
     consumed: Arc<Notify>,
@@ -1307,6 +1380,7 @@ async fn run_connection<Io>(
 ) where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    let mut native_transactions = NativeTransactionBook::new(connection, native_policy);
     let remote_max_frame_size = settings.remote_max_frame_size;
     let activity = Activity::configured(settings.options);
     let (mut reader, writer) = tokio::io::split(stream);
@@ -1376,6 +1450,7 @@ async fn run_connection<Io>(
                             let frame = match frame {
                                 Ok(frame) => frame,
                                 Err(error) => {
+                                    native_transactions.close_all();
                                     if !activity.is_closing() {
                                         notify_framing_error(&mut writer, &error).await;
                                     }
@@ -1398,6 +1473,7 @@ async fn run_connection<Io>(
                                 settings.remote_channel_max,
                                 activity.is_closing(),
                                 ConnectionScope::Native(connection),
+                                &mut native_transactions,
                             ).await {
                                 Ok(FrameAction::Continue) => pump_ready = true,
                                 Ok(FrameAction::CloseSent) => pump_ready = false,
@@ -1434,12 +1510,18 @@ async fn run_connection<Io>(
                                 }
                                 command => command,
                             };
-                            match handle_command(
-                                command,
-                                &mut writer,
-                                &mut sessions,
-                                remote_max_frame_size,
-                            ).await {
+                            let result = match command {
+                                Command::NativeTransactions(command) => native_transactions::handle_native_command(
+                                    command, &mut native_transactions, &mut sessions, &mut writer,
+                                ).await.map(|()| CommandAction::Continue),
+                                command => {
+                                    if matches!(&command, Command::Close { .. }) {
+                                        native_transactions.close_all();
+                                    }
+                                    handle_command(command, &mut writer, &mut sessions, remote_max_frame_size).await
+                                }
+                            };
+                            match result {
                                 Ok(CommandAction::Continue) => pump_ready = true,
                                 Ok(CommandAction::Closing(reply)) => {
                                     pump_ready = false;
@@ -1473,6 +1555,7 @@ async fn run_connection<Io>(
                 () = processing => None,
             }
         };
+        native_transactions.close_all();
         if let Some(reason @ (ActivityTimeout::Receive | ActivityTimeout::Peer)) = stopped
             && !activity.is_tainted()
             && !activity.is_closing()
@@ -1522,6 +1605,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
     remote_channel_max: u16,
     locally_closing: bool,
 ) -> Result<FrameAction, EngineError> {
+    let mut native_transactions = NativeTransactionBook::disabled();
     handle_frame_scoped(
         frame,
         writer,
@@ -1531,6 +1615,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
         remote_channel_max,
         locally_closing,
         ConnectionScope::Unbound,
+        &mut native_transactions,
     )
     .await
 }
@@ -1545,6 +1630,7 @@ async fn handle_frame_scoped<W: AsyncWrite + Unpin>(
     remote_channel_max: u16,
     locally_closing: bool,
     connection: ConnectionScope<'_>,
+    native_transactions: &mut NativeTransactionBook,
 ) -> Result<FrameAction, EngineError> {
     let Frame::Amqp {
         channel,
@@ -1779,7 +1865,31 @@ async fn handle_frame_scoped<W: AsyncWrite + Unpin>(
                 return Ok(FrameAction::Continue);
             }
             let historical_recovery = known_error && attach.unsettled.is_some();
-            if !historical_recovery && attach_uses_transactions(&attach) {
+            let native_kind = if historical_recovery {
+                native_transactions::NativeAttachKind::Ordinary
+            } else {
+                match native_transactions::classify_attach(&attach, native_transactions.policy()) {
+                    Ok(kind) => kind,
+                    Err(error) => {
+                        refuse_session_state(
+                            channel,
+                            error.condition(),
+                            error.description(),
+                            session,
+                            writer,
+                        )
+                        .await?;
+                        return Ok(FrameAction::Continue);
+                    }
+                }
+            };
+            if !historical_recovery
+                && attach_uses_transactions(&attach)
+                && !matches!(
+                    native_kind,
+                    native_transactions::NativeAttachKind::Coordinator(_)
+                )
+            {
                 refuse_session_state(
                     channel,
                     "amqp:not-implemented",
@@ -1790,7 +1900,10 @@ async fn handle_frame_scoped<W: AsyncWrite + Unpin>(
                 .await?;
                 return Ok(FrameAction::Continue);
             }
-            if !historical_recovery && source_default_outcome(attach.source.as_ref()).is_err() {
+            if !historical_recovery
+                && matches!(native_kind, native_transactions::NativeAttachKind::Ordinary)
+                && source_default_outcome(attach.source.as_ref()).is_err()
+            {
                 refuse_session_state(
                     channel,
                     "amqp:invalid-field",
@@ -1851,7 +1964,12 @@ async fn handle_frame_scoped<W: AsyncWrite + Unpin>(
                     .await?;
                     return Ok(FrameAction::Continue);
                 };
-                let attach = IncomingAttach::new(*attach, session.identity.clone(), handle);
+                let attach = IncomingAttach::new_with_kind(
+                    *attach,
+                    session.identity.clone(),
+                    handle,
+                    native_kind,
+                );
                 session.handle_aliases.insert(
                     handle,
                     HandleAlias {
@@ -1890,7 +2008,15 @@ async fn handle_frame_scoped<W: AsyncWrite + Unpin>(
             apply_flow(channel, flow, writer, sessions, remote_max_frame_size).await?;
         }
         Performative::Transfer(transfer) => {
-            receive_transfer(channel, transfer, payload, sessions, writer).await?;
+            receive_transfer_with_native(
+                channel,
+                transfer,
+                payload,
+                sessions,
+                writer,
+                native_transactions,
+            )
+            .await?;
         }
         Performative::Disposition(disposition) => {
             apply_disposition(channel, disposition, writer, sessions).await?;
@@ -1949,6 +2075,7 @@ async fn handle_frame_scoped<W: AsyncWrite + Unpin>(
             }
         }
         Performative::Close(_) => {
+            native_transactions.close_all();
             if !locally_closing {
                 writer
                     .write_amqp(0, Performative::Close(Close::default()), Vec::new())
@@ -1966,6 +2093,166 @@ enum CommandAction {
     Closing(oneshot::Sender<Result<(), EngineError>>),
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn accept_native_receiving<W: AsyncWrite + Unpin>(
+    channel: u16,
+    owner: SessionIdentity,
+    attach: IncomingAttach,
+    max_message_size: u64,
+    deliveries: ReceivingSink,
+    detached: watch::Sender<bool>,
+    consumption: Arc<Consumption>,
+    sessions: &mut HashMap<u16, SessionState>,
+    writer: &mut FrameWriter<W>,
+) -> Result<LinkIdentity, EngineError> {
+    if owner.is_retired() {
+        return Err(EngineError::RemoteDetached);
+    }
+    let session = sessions
+        .get_mut(&channel)
+        .ok_or(EngineError::RemoteDetached)?;
+    if session.ending || session.identity.is_retired() {
+        return Err(EngineError::RemoteDetached);
+    }
+    if !session.identity.same_session(&owner) {
+        return Err(invalid_state(
+            "attach approval belongs to a different session generation",
+        ));
+    }
+    attach
+        .validate_request(&owner)
+        .map_err(attach_approval_error)?;
+    let expected = match &deliveries {
+        ReceivingSink::Coordinator(_) => match attach.approval().kind() {
+            kind @ native_transactions::NativeAttachKind::Coordinator(_) => kind,
+            native_transactions::NativeAttachKind::Ordinary => {
+                return Err(invalid_state("ordinary attach cannot become a coordinator"));
+            }
+        },
+        ReceivingSink::Transactional(_) => native_transactions::NativeAttachKind::Ordinary,
+        ReceivingSink::Ordinary(_) => {
+            return Err(invalid_state("native acceptance requires a dedicated sink"));
+        }
+    };
+    native_transactions::validate_accept_kind(&attach, expected)?;
+    if attach.role != Role::Sender {
+        return Err(invalid_state(
+            "native ingress requires a peer sending endpoint",
+        ));
+    }
+    if has_recovery_state(&attach) {
+        return Err(invalid_state(RECOVERY_NOT_IMPLEMENTED));
+    }
+    let handle = attach.approval().local_handle();
+    let pending = session
+        .pending_attaches
+        .get(&handle)
+        .ok_or(EngineError::RemoteDetached)?;
+    let approval = pending
+        .approval
+        .as_ref()
+        .ok_or(EngineError::RemoteDetached)?;
+    attach
+        .validate(&session.identity, approval)
+        .map_err(attach_approval_error)?;
+    if pending.recovery_refusal {
+        return Err(invalid_state(RECOVERY_NOT_IMPLEMENTED));
+    }
+    if !session.handle_aliases.get(&handle).is_some_and(|alias| {
+        alias.identity.same_link(approval.link_identity())
+            && alias.peer_handle == Some(attach.handle)
+    }) {
+        return Err(invalid_state(
+            "attach approval has no matching handle alias",
+        ));
+    }
+    if session.links.contains_key(&handle) || session.closing_handles.contains(&handle) {
+        return Err(invalid_state(
+            "link handle is attached or awaiting detach acknowledgement",
+        ));
+    }
+    let initial_count = attach
+        .initial_delivery_count
+        .ok_or_else(|| invalid_state("sender attach has no initial delivery count"))?;
+    let receive_maximum = effective_receive_maximum(Some(max_message_size));
+    let (attach, approval) = attach.into_parts();
+    let identity = approval.link_identity().clone();
+    let mut response = attach.response(attach.source.clone(), attach.target.clone());
+    response.handle = handle;
+    if matches!(
+        expected,
+        native_transactions::NativeAttachKind::Coordinator(_)
+    ) {
+        response.target = Some(
+            crate::Coordinator {
+                capabilities: Some(
+                    vec![
+                        crate::Symbol::from("amqp:local-transactions"),
+                        crate::Symbol::from("amqp:multi-txns-per-ssn"),
+                        crate::Symbol::from("amqp:multi-ssns-per-txn"),
+                    ]
+                    .into(),
+                ),
+            }
+            .into(),
+        );
+    }
+    response.max_message_size = Some(receive_maximum);
+    let frame = Frame::Amqp {
+        channel,
+        performative: Some(Performative::Attach(Box::new(response))),
+        payload: Vec::new(),
+    };
+    if let Err(error) = writer.encoded_frame(&frame) {
+        close_pending_link(
+            channel,
+            handle,
+            &approval,
+            session,
+            writer,
+            Some(Error::new(
+                crate::AmqpError::FrameSizeTooSmall,
+                "attach response exceeds the peer frame limit",
+                None,
+            )),
+            false,
+        )
+        .await?;
+        return Err(error.into());
+    }
+    ensure_local_begin(channel, session, writer).await?;
+    writer.write_frame(&frame).await?;
+    if let Some(alias) = session.handle_aliases.get_mut(&handle) {
+        alias.own_attach_sent = true;
+    }
+    session.links.insert(
+        handle,
+        LinkState::Receiving(Box::new(ReceivingLink {
+            max_message_size: receive_maximum,
+            deliveries,
+            partial: None,
+            detached,
+            credit: ReceiveCredit::new(initial_count, LINK_CREDIT, consumption),
+            decoders: MessageFormatDecoders::default(),
+            identity: identity.clone(),
+            sender_settle_mode: attach.snd_settle_mode,
+            receiver_settle_mode: attach.rcv_settle_mode,
+        })),
+    );
+    refill_link(channel, handle, session, writer).await?;
+    let pending_flow = session
+        .pending_attaches
+        .remove(&handle)
+        .and_then(|pending| pending.latest);
+    if let Some(flow) = pending_flow {
+        apply_link_flow(channel, flow, writer, sessions).await?;
+    }
+    if identity.is_retired() {
+        return Err(EngineError::RemoteDetached);
+    }
+    Ok(identity)
+}
+
 async fn handle_command<W: AsyncWrite + Unpin>(
     command: Command,
     writer: &mut FrameWriter<W>,
@@ -1973,6 +2260,9 @@ async fn handle_command<W: AsyncWrite + Unpin>(
     remote_max_frame_size: u32,
 ) -> Result<CommandAction, EngineError> {
     match command {
+        Command::NativeTransactions(command) => {
+            command.reject(invalid_state(TRANSACTIONS_NOT_IMPLEMENTED));
+        }
         Command::AcceptSession {
             channel,
             identity,
@@ -2060,6 +2350,13 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             }
             if let Err(error) = attach.validate_request(&owner) {
                 let _ = reply.send(Err(attach_approval_error(error)));
+                return Ok(CommandAction::Continue);
+            }
+            if let Err(error) = native_transactions::validate_accept_kind(
+                &attach,
+                native_transactions::NativeAttachKind::Ordinary,
+            ) {
+                let _ = reply.send(Err(error));
                 return Ok(CommandAction::Continue);
             }
             let handle = attach.approval().local_handle();
@@ -2174,9 +2471,9 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                     };
                     session.links.insert(
                         handle,
-                        LinkState::Receiving(ReceivingLink {
+                        LinkState::Receiving(Box::new(ReceivingLink {
                             max_message_size: receive_maximum,
-                            deliveries: deliveries_tx,
+                            deliveries: deliveries_tx.into(),
                             partial: None,
                             detached: detached_tx,
                             credit: ReceiveCredit::new(initial_count, LINK_CREDIT, consumption),
@@ -2184,7 +2481,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                             identity,
                             sender_settle_mode: attach.snd_settle_mode,
                             receiver_settle_mode: attach.rcv_settle_mode,
-                        }),
+                        })),
                     );
                     refill_link(channel, handle, session, writer).await?;
                 }
@@ -2544,6 +2841,7 @@ async fn settle_outgoing<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-client"))]
 async fn receive_transfer<W: AsyncWrite + Unpin>(
     channel: u16,
     transfer: Transfer,
@@ -2551,10 +2849,34 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
     sessions: &mut HashMap<u16, SessionState>,
     writer: &mut FrameWriter<W>,
 ) -> Result<(), EngineError> {
+    let mut native_transactions = NativeTransactionBook::disabled();
+    receive_transfer_with_native(
+        channel,
+        transfer,
+        payload,
+        sessions,
+        writer,
+        &mut native_transactions,
+    )
+    .await
+}
+
+async fn receive_transfer_with_native<W: AsyncWrite + Unpin>(
+    channel: u16,
+    transfer: Transfer,
+    payload: Vec<u8>,
+    sessions: &mut HashMap<u16, SessionState>,
+    writer: &mut FrameWriter<W>,
+    native_transactions: &mut NativeTransactionBook,
+) -> Result<(), EngineError> {
     let session = sessions
         .get_mut(&channel)
         .ok_or_else(|| invalid_state("transfer on an unknown session"))?;
     if is_error_detached(session, transfer.handle) {
+        native_transactions.fault_posting(
+            transfer.state.as_ref(),
+            native_transactions::NativeFault::Stage,
+        );
         return refuse_session_state(
             channel,
             "amqp:session:errant-link",
@@ -2564,13 +2886,21 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         )
         .await;
     }
+    let native_transactional = matches!(session.links.get(&transfer.handle), Some(LinkState::Receiving(link))
+        if matches!(&link.deliveries, ReceivingSink::Transactional(_)));
     if !session.closing_handles.contains(&transfer.handle)
         && matches!(
             session.links.get(&transfer.handle),
             Some(LinkState::Receiving(_))
         )
         && transaction_state(transfer.state.as_ref())
+        && !(native_transactional
+            && matches!(&transfer.state, Some(DeliveryState::Transactional(_))))
     {
+        native_transactions.fault_posting(
+            transfer.state.as_ref(),
+            native_transactions::NativeFault::Stage,
+        );
         return refuse_session_state(
             channel,
             "amqp:not-implemented",
@@ -2581,6 +2911,10 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         .await;
     }
     if let Err(error) = session.flow.receive_transfer() {
+        native_transactions.fault_posting(
+            transfer.state.as_ref(),
+            native_transactions::NativeFault::Stage,
+        );
         return refuse_session(
             channel,
             "amqp:session:window-violation",
@@ -2594,6 +2928,10 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         return refill_link(channel, transfer.handle, session, writer).await;
     }
     let Some(link) = session.links.get_mut(&transfer.handle) else {
+        native_transactions.fault_posting(
+            transfer.state.as_ref(),
+            native_transactions::NativeFault::Stage,
+        );
         return refuse_session(
             channel,
             "amqp:session:unattached-handle",
@@ -2604,6 +2942,10 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         .await;
     };
     let LinkState::Receiving(link) = link else {
+        native_transactions.fault_posting(
+            transfer.state.as_ref(),
+            native_transactions::NativeFault::Stage,
+        );
         return refuse_session(
             channel,
             "amqp:session:errant-link",
@@ -2614,7 +2956,77 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         .await;
     };
 
+    if let Some(partial) = &link.partial {
+        if let Some(posting) = &partial.native_posting {
+            if let Err(error) = posting.validate_continuation(transfer.state.as_ref()) {
+                native_transactions.fault_posting(
+                    transfer.state.as_ref(),
+                    native_transactions::NativeFault::Continuation,
+                );
+                detach_link_error(
+                    channel,
+                    transfer.handle,
+                    session,
+                    writer,
+                    error.condition(),
+                    error.description(),
+                )
+                .await?;
+                return refill_link(channel, transfer.handle, session, writer).await;
+            }
+        } else if native_transactional && transaction_state(transfer.state.as_ref()) {
+            native_transactions.fault_posting(
+                transfer.state.as_ref(),
+                native_transactions::NativeFault::Continuation,
+            );
+            detach_link_error(
+                channel,
+                transfer.handle,
+                session,
+                writer,
+                "amqp:invalid-field",
+                "ordinary delivery cannot become a transactional posting",
+            )
+            .await?;
+            return refill_link(channel, transfer.handle, session, writer).await;
+        }
+    }
+    let native_posting_frame = matches!(
+        transfer.state.as_ref(),
+        Some(DeliveryState::Transactional(_))
+    ) || link
+        .partial
+        .as_ref()
+        .is_some_and(|partial| partial.native_posting.is_some());
+    if transfer.settled == Some(true)
+        && (native_posting_frame || matches!(&link.deliveries, ReceivingSink::Coordinator(_)))
+    {
+        native_transactions.fault_posting(
+            transfer.state.as_ref(),
+            native_transactions::NativeFault::Stage,
+        );
+        let condition = if matches!(&link.deliveries, ReceivingSink::Coordinator(_)) {
+            "amqp:illegal-state"
+        } else {
+            "amqp:not-allowed"
+        };
+        detach_link_error(
+            channel,
+            transfer.handle,
+            session,
+            writer,
+            condition,
+            "sender-settled native transaction ingress is not supported",
+        )
+        .await?;
+        return refill_link(channel, transfer.handle, session, writer).await;
+    }
+
     if transfer.resume {
+        native_transactions.fault_posting(
+            transfer.state.as_ref(),
+            native_transactions::NativeFault::Stage,
+        );
         detach_link_error(
             channel,
             transfer.handle,
@@ -2665,6 +3077,10 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         None
     };
     if let Some((condition, description)) = identity_error {
+        native_transactions.fault_posting(
+            transfer.state.as_ref(),
+            native_transactions::NativeFault::Decode,
+        );
         detach_link_error(
             channel,
             transfer.handle,
@@ -2692,6 +3108,10 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         match result {
             Ok(identity) => identity,
             Err(error) => {
+                native_transactions.fault_posting(
+                    transfer.state.as_ref(),
+                    native_transactions::NativeFault::Stage,
+                );
                 let condition = match error {
                     IncomingLedgerError::LinkLimitReached { .. }
                     | IncomingLedgerError::SessionLimitReached { .. } => {
@@ -2715,6 +3135,10 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
     if link.partial.is_none()
         && let Err(error) = link.credit.try_begin_delivery()
     {
+        native_transactions.fault_posting(
+            transfer.state.as_ref(),
+            native_transactions::NativeFault::Stage,
+        );
         detach_link_error(
             channel,
             transfer.handle,
@@ -2730,7 +3154,37 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
         // A fresh ID supersedes error history only after ledger and credit admission.
         session.error_deliveries.reassign_incoming(identity.id());
     }
+    let native_posting = if link.partial.is_none() && native_transactional {
+        if let Some(DeliveryState::Transactional(state)) = transfer.state.as_ref() {
+            match native_transactions.begin_posting(&link.identity, identity.clone(), state) {
+                Ok(posting) => Some(posting),
+                Err(error) => {
+                    detach_link_error(
+                        channel,
+                        transfer.handle,
+                        session,
+                        writer,
+                        error.condition(),
+                        error.description(),
+                    )
+                    .await?;
+                    return refill_link(channel, transfer.handle, session, writer).await;
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if transfer.aborted {
+        if let Some(posting) = native_posting.as_ref().or_else(|| {
+            link.partial
+                .as_ref()
+                .and_then(|partial| partial.native_posting.as_ref())
+        }) {
+            posting.fault(native_transactions::NativeFault::Aborted);
+        }
         link.partial = None;
         session
             .incoming
@@ -2807,6 +3261,7 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
             bytes: payload,
             content_lease: content_lease.expect("a first transfer reserves its content"),
             identity,
+            native_posting,
             forbidden_receiver_mode: link.receiver_settle_mode == ReceiverSettleMode::First
                 && transfer.rcv_settle_mode == Some(ReceiverSettleMode::Second),
             forbidden_sender_settled: link.sender_settle_mode == SenderSettleMode::Unsettled
@@ -2853,6 +3308,9 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
     let message = match decoder(&partial.bytes) {
         Ok(message) => message,
         Err(error) => {
+            if let Some(posting) = &partial.native_posting {
+                posting.fault(native_transactions::NativeFault::Decode);
+            }
             let description = if partial.message_format == 0 {
                 error.to_string()
             } else {
@@ -2880,27 +3338,63 @@ async fn receive_transfer<W: AsyncWrite + Unpin>(
                 .unwrap_or_else(|| link.receiver_settle_mode.clone()),
         )
         .map_err(|error| invalid_state(error.to_string()))?;
-    if link
-        .deliveries
-        .try_send(Delivery {
-            #[cfg(test)]
-            id: partial.id,
-            #[cfg(test)]
-            settled: _completion == Completion::SenderSettled,
-            message_format: partial.message_format,
-            message,
-            identity: partial.identity,
-            content_lease: Some(Arc::new(partial.content_lease)),
-        })
-        .is_err()
-    {
+    let delivery = Delivery {
+        #[cfg(test)]
+        id: partial.id,
+        #[cfg(test)]
+        settled: _completion == Completion::SenderSettled,
+        message_format: partial.message_format,
+        message,
+        identity: partial.identity,
+        content_lease: Some(Arc::new(partial.content_lease)),
+    };
+    let publication_error = match &link.deliveries {
+        ReceivingSink::Ordinary(sink) => sink.try_send(delivery).err().map(|_| {
+            (
+                "amqp:resource-limit-exceeded",
+                "incoming delivery queue is unavailable",
+            )
+        }),
+        ReceivingSink::Coordinator(sink) => {
+            if let Err(refusal) = native_transactions.publish_control(
+                channel,
+                transfer.handle,
+                &link.identity,
+                delivery,
+                sink,
+            ) {
+                native_transactions::handle_control_refusal(refusal, session, writer).await?;
+            }
+            return refill_link(channel, transfer.handle, session, writer).await;
+        }
+        ReceivingSink::Transactional(sink) => {
+            if let Some(posting) = partial.native_posting {
+                native_transactions
+                    .publish_posting(posting, delivery, sink)
+                    .err()
+                    .map(|error| (error.condition(), error.description()))
+            } else {
+                sink.try_send(native_transactions::TransactionalIngress::Ordinary(
+                    RetainedDelivery::new(delivery),
+                ))
+                .err()
+                .map(|_| {
+                    (
+                        "amqp:resource-limit-exceeded",
+                        "incoming delivery queue is unavailable",
+                    )
+                })
+            }
+        }
+    };
+    if let Some((condition, description)) = publication_error {
         detach_link_error(
             channel,
             transfer.handle,
             session,
             writer,
-            "amqp:resource-limit-exceeded",
-            "incoming delivery queue is unavailable",
+            condition,
+            description,
         )
         .await?;
     }
@@ -4615,6 +5109,9 @@ mod content_budget_tests;
 
 #[cfg(test)]
 mod connection_identity_tests;
+
+#[cfg(test)]
+mod native_transaction_tests;
 
 #[cfg(test)]
 mod session_channel_tests;

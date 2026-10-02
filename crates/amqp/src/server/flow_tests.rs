@@ -23,9 +23,9 @@ async fn queued_consumption_does_not_publish_credit_after_local_detach() {
         let (detached, _) = watch::channel(false);
         session.links.insert(
             handle,
-            LinkState::Receiving(ReceivingLink {
+            LinkState::Receiving(Box::new(ReceivingLink {
                 max_message_size: u64::MAX,
-                deliveries,
+                deliveries: deliveries.into(),
                 partial: None,
                 detached,
                 credit,
@@ -33,7 +33,7 @@ async fn queued_consumption_does_not_publish_credit_after_local_detach() {
                 identity: LinkIdentity::new(),
                 sender_settle_mode: SenderSettleMode::Mixed,
                 receiver_settle_mode: ReceiverSettleMode::First,
-            }),
+            })),
         );
     }
     remember_closing_handle(&mut session, 0).expect("local detach already sent");

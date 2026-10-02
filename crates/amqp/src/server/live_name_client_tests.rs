@@ -519,17 +519,17 @@ fn wrapper_entry(channel: u16, role: Role) -> WrapperEntry {
         }))
     } else {
         let (deliveries, _) = mpsc::channel(DELIVERY_QUEUE_CAPACITY);
-        LinkState::Receiving(ReceivingLink {
+        LinkState::Receiving(Box::new(ReceivingLink {
             identity: owner.clone(),
             max_message_size: 1024,
-            deliveries,
+            deliveries: deliveries.into(),
             partial: None,
             detached,
             credit: ReceiveCredit::new(0, LINK_CREDIT, consumption.clone()),
             decoders: MessageFormatDecoders::default(),
             sender_settle_mode: SenderSettleMode::Mixed,
             receiver_settle_mode: ReceiverSettleMode::First,
-        })
+        }))
     };
     (
         PendingAttach {

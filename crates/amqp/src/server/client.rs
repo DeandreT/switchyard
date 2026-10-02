@@ -1487,9 +1487,9 @@ where
                                             }))
                                         }
                                         Role::Receiver => {
-                                            LinkState::Receiving(ReceivingLink {
+                                            LinkState::Receiving(Box::new(ReceivingLink {
                                                 max_message_size: receive_maximum,
-                                                deliveries: deliveries_tx,
+                                                deliveries: deliveries_tx.into(),
                                                 partial: None,
                                                 detached: detached_tx,
                                                 credit: ReceiveCredit::new(0, LINK_CREDIT, consumption.clone()),
@@ -1497,7 +1497,7 @@ where
                                                 identity,
                                                 sender_settle_mode: request.sender_settle_mode,
                                                 receiver_settle_mode: request.receiver_settle_mode,
-                                            })
+                                            }))
                                         }
                                     };
                                     session.pending_attaches.insert(handle, PendingLinkFlow::new(peer_role, None));

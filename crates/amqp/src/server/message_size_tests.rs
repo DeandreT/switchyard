@@ -417,9 +417,9 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
     let mut session = session_state();
     session.links.insert(
         0,
-        LinkState::Receiving(ReceivingLink {
+        LinkState::Receiving(Box::new(ReceivingLink {
             max_message_size: 8,
-            deliveries,
+            deliveries: deliveries.into(),
             partial: None,
             detached,
             credit: receiving_credit(),
@@ -427,15 +427,15 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
             identity: LinkIdentity::new(),
             sender_settle_mode: SenderSettleMode::Mixed,
             receiver_settle_mode: ReceiverSettleMode::First,
-        }),
+        })),
     );
     let (healthy_tx, mut healthy_rx) = mpsc::channel(1);
     let (healthy_detached, _) = watch::channel(false);
     session.links.insert(
         1,
-        LinkState::Receiving(ReceivingLink {
+        LinkState::Receiving(Box::new(ReceivingLink {
             max_message_size: u64::MAX,
-            deliveries: healthy_tx,
+            deliveries: healthy_tx.into(),
             partial: None,
             detached: healthy_detached,
             credit: receiving_credit(),
@@ -443,7 +443,7 @@ async fn locally_enforced_receiving_limits_reject_fragment_growth_without_stoppi
             identity: LinkIdentity::new(),
             sender_settle_mode: SenderSettleMode::Mixed,
             receiver_settle_mode: ReceiverSettleMode::First,
-        }),
+        })),
     );
     for handle in [0, 1] {
         session.handle_aliases.insert(

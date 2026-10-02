@@ -2,13 +2,17 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
 };
 
 use crate::ReceiverSettleMode;
 
 use super::NativeConnectionIdentity;
+
+mod link_identity;
+mod transactional_settlement;
+pub(super) use link_identity::LinkIdentity;
 
 #[cfg(test)]
 #[path = "incoming_ledger/error_history_tests.rs"]
@@ -17,76 +21,6 @@ mod error_history_tests;
 pub(super) const MAX_INCOMING_DELIVERIES_PER_LINK: usize = 1_024;
 pub(super) const MAX_INCOMING_DELIVERIES_PER_SESSION: usize = 4_096;
 const MAX_TAG_BYTES: usize = 32;
-
-#[derive(Clone, Debug)]
-pub(super) struct LinkIdentity(Arc<LinkGeneration>);
-
-#[derive(Debug)]
-struct LinkGeneration {
-    retired: AtomicBool,
-    // Only test-only unbound factories can omit connection provenance.
-    connection: Option<NativeConnectionIdentity>,
-}
-
-impl LinkIdentity {
-    #[cfg(test)]
-    pub(super) fn new() -> Self {
-        Self(Arc::new(LinkGeneration {
-            retired: AtomicBool::new(false),
-            connection: None,
-        }))
-    }
-
-    pub(super) fn for_connection(connection: &NativeConnectionIdentity) -> Self {
-        Self(Arc::new(LinkGeneration {
-            retired: AtomicBool::new(false),
-            connection: Some(connection.clone()),
-        }))
-    }
-
-    pub(super) fn new_child(&self) -> Self {
-        Self(Arc::new(LinkGeneration {
-            retired: AtomicBool::new(false),
-            connection: self.0.connection.clone(),
-        }))
-    }
-
-    pub(super) fn connection_identity(&self) -> Option<&NativeConnectionIdentity> {
-        self.0.connection.as_ref()
-    }
-
-    pub(super) fn same_link(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-
-    pub(super) fn retire(&self) {
-        self.0.retired.store(true, Ordering::Release);
-    }
-
-    pub(super) fn is_retired(&self) -> bool {
-        self.0.retired.load(Ordering::Acquire)
-    }
-
-    fn key(&self) -> usize {
-        Arc::as_ptr(&self.0) as usize
-    }
-
-    fn check_live(&self) -> Result<(), IncomingLedgerError> {
-        if self.is_retired() {
-            Err(IncomingLedgerError::RetiredLink)
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl PartialEq for LinkIdentity {
-    fn eq(&self, other: &Self) -> bool {
-        self.same_link(other)
-    }
-}
-
-impl Eq for LinkIdentity {}
 
 #[derive(Clone, Debug)]
 pub(super) struct DeliveryIdentity(Arc<DeliveryGeneration>);
@@ -170,6 +104,7 @@ enum Phase {
     Partial,
     Complete,
     AwaitingSenderAck,
+    TransactionalProvisional,
 }
 
 #[derive(Debug)]
@@ -215,6 +150,12 @@ pub(super) enum IncomingLedgerError {
     IncompleteDelivery,
     #[error("incoming delivery has already completed")]
     AlreadyComplete,
+    #[error("transactional posting requires dedicated settlement")]
+    TransactionalDelivery,
+    #[error("native retirement bookkeeping is unavailable")]
+    NativeHookUnavailable,
+    #[error("native retirement bookkeeping is already installed")]
+    NativeHookInUse,
 }
 
 impl IncomingLedger {
@@ -327,6 +268,9 @@ impl IncomingLedger {
         if delivery.phase == Phase::Partial {
             return Err(IncomingLedgerError::IncompleteDelivery);
         }
+        if delivery.phase == Phase::TransactionalProvisional {
+            return Err(IncomingLedgerError::TransactionalDelivery);
+        }
         if delivery.phase == Phase::AwaitingSenderAck || delivery.remote_settled {
             return Ok(SettlementAction::NoDisposition);
         }
@@ -381,7 +325,10 @@ impl IncomingLedger {
                 .deliveries
                 .get_mut(&identity.id())
                 .expect("matching live delivery exists");
-            if delivery.phase == Phase::AwaitingSenderAck {
+            if matches!(
+                delivery.phase,
+                Phase::AwaitingSenderAck | Phase::TransactionalProvisional
+            ) {
                 self.release(&identity, Terminal::Settled);
                 result.released += 1;
             } else {

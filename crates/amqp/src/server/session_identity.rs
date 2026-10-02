@@ -8,6 +8,7 @@ use crate::{Attach, ReceiverSettleMode, Role, SenderSettleMode};
 
 use super::NativeConnectionIdentity;
 use super::incoming_ledger::LinkIdentity;
+use super::native_transactions::NativeAttachKind;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SessionIdentity(LinkIdentity);
@@ -49,9 +50,14 @@ pub(super) struct AttachApproval {
     role: Role,
     sender_settle_mode: SenderSettleMode,
     receiver_settle_mode: ReceiverSettleMode,
+    kind: NativeAttachKind,
 }
 
 impl AttachApproval {
+    pub(super) fn kind(&self) -> NativeAttachKind {
+        self.kind
+    }
+
     pub(super) fn link_identity(&self) -> &LinkIdentity {
         &self.link
     }
@@ -100,7 +106,17 @@ pub struct IncomingAttach {
 }
 
 impl IncomingAttach {
+    #[cfg(test)]
     pub(super) fn new(attach: Attach, session: SessionIdentity, local_handle: u32) -> Self {
+        Self::new_with_kind(attach, session, local_handle, NativeAttachKind::Ordinary)
+    }
+
+    pub(super) fn new_with_kind(
+        attach: Attach,
+        session: SessionIdentity,
+        local_handle: u32,
+        kind: NativeAttachKind,
+    ) -> Self {
         let link = session.new_link();
         let approval = Arc::new(AttachApproval {
             session,
@@ -111,6 +127,7 @@ impl IncomingAttach {
             role: attach.role.clone(),
             sender_settle_mode: attach.snd_settle_mode.clone(),
             receiver_settle_mode: attach.rcv_settle_mode.clone(),
+            kind,
         });
         Self { attach, approval }
     }

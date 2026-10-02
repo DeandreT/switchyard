@@ -237,6 +237,11 @@ pub fn encode_frame(frame: &Frame) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(test)]
+pub(crate) fn decode_frame_for_test(frame: &[u8]) -> io::Result<Frame> {
+    decode_frame(frame)
+}
+
 fn decode_frame(frame: &[u8]) -> io::Result<Frame> {
     if frame.len() < FRAME_HEADER_SIZE {
         return Err(invalid_data("AMQP frame is shorter than its header"));

@@ -23,9 +23,9 @@ impl Fixture {
             credit.take_refill().expect("initial grant");
             session.links.insert(
                 handle as u32,
-                LinkState::Receiving(ReceivingLink {
+                LinkState::Receiving(Box::new(ReceivingLink {
                     max_message_size: u64::MAX,
-                    deliveries,
+                    deliveries: deliveries.into(),
                     partial: None,
                     detached,
                     credit,
@@ -33,7 +33,7 @@ impl Fixture {
                     identity: LinkIdentity::new(),
                     sender_settle_mode: sender_mode.clone(),
                     receiver_settle_mode: receiver_mode.clone(),
-                }),
+                })),
             );
             received.push(receiver);
         }

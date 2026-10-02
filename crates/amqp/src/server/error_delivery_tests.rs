@@ -110,17 +110,17 @@ impl Fixture {
                 Arc::new(Consumption::new(Arc::new(Notify::new()))),
             );
             credit.take_refill();
-            LinkState::Receiving(ReceivingLink {
+            LinkState::Receiving(Box::new(ReceivingLink {
                 identity: owner.clone(),
                 max_message_size: u64::MAX,
-                deliveries,
+                deliveries: deliveries.into(),
                 partial: None,
                 detached,
                 credit,
                 decoders: MessageFormatDecoders::default(),
                 sender_settle_mode: SenderSettleMode::Mixed,
                 receiver_settle_mode: ReceiverSettleMode::First,
-            })
+            }))
         };
         let session = self.sessions.get_mut(&channel).expect("session");
         assert!(session.links.insert(handle, link).is_none());

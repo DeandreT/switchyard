@@ -48,10 +48,10 @@ fn endpoint(role: &Role, owner: LinkIdentity) -> LinkState {
         }))
     } else {
         let (deliveries, _) = mpsc::channel(DELIVERY_QUEUE_CAPACITY);
-        LinkState::Receiving(ReceivingLink {
+        LinkState::Receiving(Box::new(ReceivingLink {
             identity: owner,
             max_message_size: 1024,
-            deliveries,
+            deliveries: deliveries.into(),
             partial: None,
             detached,
             credit: ReceiveCredit::new(
@@ -62,7 +62,7 @@ fn endpoint(role: &Role, owner: LinkIdentity) -> LinkState {
             decoders: MessageFormatDecoders::default(),
             sender_settle_mode: SenderSettleMode::Mixed,
             receiver_settle_mode: ReceiverSettleMode::First,
-        })
+        }))
     }
 }
 

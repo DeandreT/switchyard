@@ -487,9 +487,9 @@ async fn stale_send_and_endpoint_close_cannot_mutate_replacement_generations() {
                     .links
                     .insert(
                         HANDLE,
-                        LinkState::Receiving(ReceivingLink {
+                        LinkState::Receiving(Box::new(ReceivingLink {
                             max_message_size: u64::MAX,
-                            deliveries,
+                            deliveries: deliveries.into(),
                             partial: None,
                             detached,
                             credit: ReceiveCredit::new(0, LINK_CREDIT, consumption),
@@ -497,7 +497,7 @@ async fn stale_send_and_endpoint_close_cannot_mutate_replacement_generations() {
                             identity: fixture.owner.clone(),
                             sender_settle_mode: SenderSettleMode::Mixed,
                             receiver_settle_mode: ReceiverSettleMode::First,
-                        }),
+                        })),
                     );
             }
             let (reply, result) = oneshot::channel();

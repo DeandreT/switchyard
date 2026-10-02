@@ -102,17 +102,17 @@ impl Fixture {
                 Arc::new(Consumption::new(Arc::new(Notify::new()))),
             );
             credit.take_refill();
-            LinkState::Receiving(ReceivingLink {
+            LinkState::Receiving(Box::new(ReceivingLink {
                 identity: owner.clone(),
                 max_message_size: 4096,
-                deliveries,
+                deliveries: deliveries.into(),
                 partial: None,
                 detached,
                 credit,
                 decoders: MessageFormatDecoders::default(),
                 sender_settle_mode: SenderSettleMode::Mixed,
                 receiver_settle_mode: ReceiverSettleMode::First,
-            })
+            }))
         } else {
             LinkState::Sending(Box::new(SendingLink {
                 identity: owner.clone(),

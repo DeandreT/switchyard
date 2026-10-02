@@ -82,9 +82,9 @@ impl Harness {
             credit.take_refill();
             session.links.insert(
                 handle,
-                LinkState::Receiving(ReceivingLink {
+                LinkState::Receiving(Box::new(ReceivingLink {
                     max_message_size: 1024 * 1024,
-                    deliveries,
+                    deliveries: deliveries.into(),
                     partial: None,
                     detached,
                     credit,
@@ -96,7 +96,7 @@ impl Harness {
                     identity: LinkIdentity::new(),
                     sender_settle_mode: SenderSettleMode::Mixed,
                     receiver_settle_mode: ReceiverSettleMode::First,
-                }),
+                })),
             );
             receivers.push(receiver);
         }
