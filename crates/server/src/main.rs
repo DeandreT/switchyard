@@ -63,7 +63,7 @@ struct Arguments {
     websocket_listen: Option<SocketAddr>,
 
     /// Enable experimental same-queue atomic messaging on a separate raw
-    /// TCP/TLS address. Development only; SDK transaction scopes are unsupported.
+    /// TCP/TLS address. Development only; SDK scopes require warmed same-queue links.
     #[arg(long)]
     experimental_atomic_messaging_listen: Option<SocketAddr>,
 
@@ -382,7 +382,7 @@ fn run_with_arguments(arguments: Arguments) -> Result<(), StartupError> {
             info!(address = %socket.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, namespace = %namespace, tls = tls.is_some(), "accepting AMQP WebSocket connections");
         }
         if let Some((_, socket)) = &experimental {
-            info!(address = %socket.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, namespace = %namespace, tls = tls.is_some(), sdk_transaction_scopes = false, "accepting experimental atomic messaging connections");
+            info!(address = %socket.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, namespace = %namespace, tls = tls.is_some(), sdk_transaction_scopes = "experimental-warmed-same-queue", "accepting experimental atomic messaging connections");
         }
         let amqp = amqp_listener(
             broker.handle(),

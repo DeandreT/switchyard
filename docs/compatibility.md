@@ -40,7 +40,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Duplicate detection | Pre-1.0 | State machine, AMQP send/scheduling mappings, Rust and current .NET clients end to end |
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API |
-| Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation, explicit [posting-only listener](atomic-posting-ingress.md), and separate [atomic messaging listener](atomic-messaging-ingress.md) for held PeekLock Complete; SDK transaction scopes not implemented, default Service Bus listeners still refuse transaction traffic |
+| Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [warmed same-queue .NET scopes](dotnet-transaction-scopes.md) gate immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete over HTTP/2 and authenticated TLS; other services not implemented |
 | Partitioned entities | Later | Out of initial scope |
@@ -102,7 +102,10 @@ behavior it currently enforces:
   Complete from a canonical held delivery and an exact native retirement receipt.
   Its process address is an explicit development-only
   `--experimental-atomic-messaging-listen` option with the existing TLS/SAS policy.
-  Default listeners and SDK transaction scopes remain disabled.
+  A separate [pinned .NET scope gate](dotnet-transaction-scopes.md) establishes
+  warmed same-queue immediate send and held Complete over TLS on both backends.
+  Cold-first scopes, experimental management, cross-queue work, and recovery
+  remain unsupported. Default listeners retain their transaction refusal.
 - A queue can enable duplicate detection by message ID, with a 10-minute
   default history window bounded to 20 seconds through 7 days. A duplicate
   send is accepted and dropped, and history survives completion, dead-lettering,
@@ -755,7 +758,9 @@ Its explicit [attach-default opt-ins](transaction-attach-defaults.md) negotiate
 Mixed receiver requests to actual Unsettled/Second and interpret an omitted
 fresh coordinator count as zero under an immutable approved exception.
 Existing strict native APIs and ordinary/posting-only listeners are unchanged;
-these wire accommodations are not an SDK transaction-scope gate.
+the accommodations alone are not an SDK gate. The separate
+[pinned .NET scope tests](dotnet-transaction-scopes.md) establish only warmed
+same-queue immediate send and held Complete over experimental TLS.
 An End on an unmapped channel is refused without manufacturing a session reply.
 Client Begin searches only vacant channels within the peer's inclusive channel
 limit. Pending, live, and ending sessions cannot be overwritten. Client End

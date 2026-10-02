@@ -126,7 +126,8 @@ impl<B: NativeAtomicBroker> AmqpListener<B> {
 
     /// Explicitly serves primary non-session queue postings and PeekLock retirement.
     /// Ordinary `serve` and the posting-only endpoint retain their existing policies.
-    /// Management, session queues, and SDK transaction scopes remain unsupported.
+    /// Only warmed same-queue SDK send and held Complete are gated over raw TLS.
+    /// Management, session queues, and cold-first SDK scopes remain unsupported.
     pub async fn serve_atomic_messaging_ingress(
         self,
         listener: TcpListener,

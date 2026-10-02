@@ -152,12 +152,16 @@ adds coordinator receipts and an ordered owner handoff. The trusted
 and logical work through one broker job. An explicit
 [posting-only listener](docs/atomic-posting-ingress.md) now derives and stages
 actual native receipts through that owner. Default Service Bus listeners still
-refuse transactions; SDK transaction scopes remain unfinished. A separate
+refuse transactions. A separate
 [atomic messaging listener](docs/atomic-messaging-ingress.md) adds actual held
 PeekLock completion to the same owner, without changing the posting-only endpoint.
 The process exposes it only through the separate, development-only
 `--experimental-atomic-messaging-listen` address; ordinary AMQP and WebSocket
 listeners retain their previous policies.
+Both pinned .NET clients have an opt-in [transaction-scope gate](docs/dotnet-transaction-scopes.md)
+for warmed, same-queue immediate send and held Complete over TLS on that address,
+with memory and Fjall coverage. Cold-first scopes, experimental management,
+cross-queue work, and transaction recovery remain unsupported.
 The sender-side listener uses [retained ingress receipts](docs/retained-ingress.md)
 to preserve native content accounting through broker replies and acknowledgment flush.
 [Native connection identities](docs/native-connection-identity.md) preserve exact

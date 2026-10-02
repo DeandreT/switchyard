@@ -4,7 +4,9 @@ Two independent, additive native opt-ins accommodate specific transaction-link
 requests without changing the existing strict APIs. The explicit
 [atomic messaging listener](atomic-messaging-ingress.md) selects both; ordinary
 listeners and the [posting-only listener](atomic-posting-ingress.md) do not.
-This is a wire-profile increment, not an official SDK transaction-scope gate.
+These are wire-profile opt-ins, not SDK support on their own. The separate
+[pinned .NET transaction-scope gate](dotnet-transaction-scopes.md) establishes
+its specific warmed same-queue subset through this listener.
 
 ## Receiving Settlement Negotiation
 
