@@ -1,4 +1,4 @@
-//! Typed, no-action subscription rules and their local admission limits.
+//! Typed subscription rules and their local admission limits.
 
 use std::{collections::BTreeMap, fmt};
 
@@ -6,9 +6,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BrokerError, IdentifierError, MessageValue, Timestamp};
 
+mod action;
 mod scalar;
 mod sql;
 
+pub(crate) use action::SqlActionProgram;
+pub use action::{SQL_ACTION_SEMANTIC_VERSION, SqlAction};
 pub use sql::{SQL_FILTER_SEMANTIC_VERSION, SqlFilter};
 
 pub const MAX_RULE_NAME_LENGTH: usize = 50;
@@ -156,23 +159,45 @@ pub struct RuleDefinition {
     pub name: RuleName,
     pub filter: RuleFilter,
     pub created_at: Timestamp,
+    pub action: Option<SqlAction>,
 }
 
 impl RuleDefinition {
-    /// SQL was introduced in value format 10; older envelopes must not claim it.
+    /// Older envelopes retain their original three-field rule shape.
     pub fn decode(bytes: &[u8]) -> Result<Self, crate::CodecError> {
         let (version, payload) = crate::codec::split(bytes)?;
-        let rule: Self = crate::codec::decode_payload(payload)?;
+        let rule = if version < crate::codec::VALUE_FORMAT_V11 {
+            let (name, filter, created_at) = crate::codec::decode_payload(payload)?;
+            Self {
+                name,
+                filter,
+                created_at,
+                action: None,
+            }
+        } else {
+            crate::codec::decode_payload(payload)?
+        };
         if version < crate::codec::VALUE_FORMAT_V10 && matches!(&rule.filter, RuleFilter::Sql(_)) {
             return Err(crate::CodecError::Decode);
         }
         Ok(rule)
     }
 
-    /// Validates and counts the complete stored envelope without copying it.
-    pub fn encoded_size(&self) -> Result<usize, BrokerError> {
+    /// Validates source semantics without re-encoding an older stored envelope.
+    pub fn validate(&self) -> Result<(), BrokerError> {
         RuleName::validate(self.name.as_str())?;
         self.filter.validate()?;
+        if let Some(action) = &self.action {
+            action
+                .validate_source()
+                .map_err(BrokerError::SqlActionCompilation)?;
+        }
+        Ok(())
+    }
+
+    /// Validates and counts the complete stored envelope without copying it.
+    pub fn encoded_size(&self) -> Result<usize, BrokerError> {
+        self.validate()?;
         let size: usize =
             postcard::serialize_with_flavor(self, postcard::ser_flavors::Size::default())
                 .map_err(|_| crate::CodecError::Encode)?;
@@ -207,6 +232,41 @@ pub(crate) fn is_rule_scalar(value: &MessageValue) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_rules_decode_without_actions_and_new_shapes_cannot_be_rolled_back()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let rule = RuleDefinition {
+            name: RuleName::new("legacy")?,
+            filter: RuleFilter::True,
+            created_at: Timestamp::from_millis(7),
+            action: None,
+        };
+        let payload = postcard::to_stdvec(&(&rule.name, &rule.filter, rule.created_at))?;
+        for version in crate::codec::VALUE_FORMAT_V1..=crate::codec::VALUE_FORMAT_V10 {
+            let mut bytes = vec![version];
+            bytes.extend_from_slice(&payload);
+            assert_eq!(RuleDefinition::decode(&bytes)?, rule);
+            let mut current = crate::codec::encode(&rule)?;
+            current[0] = version;
+            assert_eq!(
+                RuleDefinition::decode(&current),
+                Err(crate::CodecError::Decode)
+            );
+        }
+        let rule = RuleDefinition {
+            action: Some(SqlAction::new("REMOVE user.color;")?),
+            ..rule
+        };
+        let bytes = crate::codec::encode(&rule)?;
+        assert_eq!(RuleDefinition::decode(&bytes)?, rule);
+        for version in crate::codec::VALUE_FORMAT_V1..=crate::codec::VALUE_FORMAT_V10 {
+            let mut old = bytes.clone();
+            old[0] = version;
+            assert_eq!(RuleDefinition::decode(&old), Err(crate::CodecError::Decode));
+        }
+        Ok(())
+    }
 
     #[test]
     fn names_preserve_case_spaces_and_sdk_default() -> Result<(), IdentifierError> {
@@ -317,6 +377,7 @@ mod tests {
                 ..CorrelationFilter::default()
             }),
             created_at: Timestamp::UNIX_EPOCH,
+            action: None,
         };
         assert_eq!(rule.encoded_size()?, crate::codec::encode(&rule)?.len());
         let oversized = RuleDefinition {

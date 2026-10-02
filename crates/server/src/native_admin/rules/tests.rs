@@ -222,6 +222,7 @@ fn exact_rule_envelope_overhead_is_counted_after_borrowed_payload_admission() {
     let rule = domain::RuleDefinition {
         name: rule_name("bounded").unwrap(),
         created_at: Timestamp::UNIX_EPOCH,
+        action: None,
         filter: RuleFilter::Correlation(CorrelationFilter {
             properties: BTreeMap::from([(
                 String::new(),
@@ -368,6 +369,40 @@ fn rule_statuses_are_local_and_stored_failures_are_redacted() {
         )))
         .code(),
         Code::ResourceExhausted
+    );
+}
+
+#[test]
+fn action_compilation_statuses_remain_static_and_distinct() {
+    for (error, code) in [
+        (SqlCompileError::Syntax, Code::InvalidArgument),
+        (
+            SqlCompileError::Unsupported {
+                feature: "private-action-source",
+            },
+            Code::Unimplemented,
+        ),
+        (
+            SqlCompileError::Limit {
+                kind: domain::SqlCompileLimit::Nodes,
+                maximum: 32,
+            },
+            Code::ResourceExhausted,
+        ),
+    ] {
+        let status = status::mutation(submit(BrokerError::SqlActionCompilation(error)));
+        assert_eq!(status.code(), code);
+        assert!(!status.message().contains("private-action-source"));
+    }
+    assert_eq!(
+        status::read(submit(BrokerError::SqlActionCompilation(
+            SqlCompileError::Limit {
+                kind: domain::SqlCompileLimit::AggregateSourceBytes,
+                maximum: domain::MAX_SQL_COMPILE_SOURCE_BYTES,
+            }
+        )))
+        .code(),
+        Code::ResourceExhausted,
     );
 }
 

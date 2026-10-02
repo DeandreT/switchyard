@@ -156,7 +156,38 @@ fn definition(name: &str, filter: RuleFilter) -> RuleDefinition {
         name: RuleName::new(name).expect("name"),
         filter,
         created_at: Timestamp::from_millis(1_000),
+        action: None,
     }
+}
+
+#[tokio::test]
+async fn action_metadata_cannot_be_silently_reported_as_an_empty_action() {
+    let broker = ObservedBroker::default();
+    let plain = definition("plain", RuleFilter::True);
+    let mut action = definition("annotated", RuleFilter::True);
+    action.action = Some(domain::SqlAction::new("REMOVE [private-action]").expect("action"));
+    assert!(matches!(
+        encoded_rule(&action),
+        Err(RuleRequestError::Unsupported(_))
+    ));
+    *broker.definitions.lock().expect("rules") = vec![action, plain];
+    // Even a page that would otherwise omit the action rule must fail closed.
+    for skip in [0, 1, 2] {
+        let response = process_request_for(
+            &enumeration(Value::Int(1), Value::Int(skip)),
+            ENTITY,
+            &broker,
+            None,
+            BUDGET,
+        )
+        .await;
+        assert_eq!(response.status_code, 501);
+        assert_eq!(response.error_condition, Some(crate::NOT_IMPLEMENTED));
+        assert_eq!(response.body, Value::Null);
+        assert!(!response.status_description.contains("private-action"));
+    }
+    assert!(broker.submissions.lock().expect("commands").is_empty());
+    assert_eq!(broker.reads.lock().expect("reads").len(), 3);
 }
 
 fn authorization(permissions: PermissionSet, granted: &str) -> ManagementAuthorization {

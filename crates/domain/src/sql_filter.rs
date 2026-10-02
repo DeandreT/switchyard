@@ -154,7 +154,7 @@ impl SqlCompileBudget {
         self.used
     }
 
-    fn charge_source(&mut self, bytes: usize) -> Result<(), SqlCompileError> {
+    pub(crate) fn charge_source(&mut self, bytes: usize) -> Result<(), SqlCompileError> {
         Self::charge(
             &mut self.used.source_bytes,
             self.limits.source_bytes,
@@ -163,7 +163,7 @@ impl SqlCompileBudget {
         )
     }
 
-    fn charge_tokens(&mut self, tokens: usize) -> Result<(), SqlCompileError> {
+    pub(crate) fn charge_tokens(&mut self, tokens: usize) -> Result<(), SqlCompileError> {
         Self::charge(
             &mut self.used.tokens,
             self.limits.tokens,
@@ -172,7 +172,7 @@ impl SqlCompileBudget {
         )
     }
 
-    fn charge_node(&mut self) -> Result<(), SqlCompileError> {
+    pub(crate) fn charge_node(&mut self) -> Result<(), SqlCompileError> {
         Self::charge(
             &mut self.used.nodes,
             self.limits.nodes,

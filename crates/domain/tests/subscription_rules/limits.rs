@@ -5,6 +5,7 @@ fn sized_rule(name: &str, bytes: usize) -> TestResult<RuleDefinition> {
         name: RuleName::new(name)?,
         filter: correlation([("value".into(), MessageValue::Binary(vec![0; bytes - 100]))]),
         created_at: Timestamp::from_millis(1),
+        action: None,
     };
     let actual = codec::encode(&definition)?.len();
     let RuleFilter::Correlation(filter) = &mut definition.filter else {
@@ -68,6 +69,7 @@ fn rule_count_and_exact_encoded_byte_caps_are_atomic_and_persisted_damage_is_not
         name: RuleName::new("r-extra")?,
         filter: RuleFilter::True,
         created_at: Timestamp::from_millis(1),
+        action: None,
     };
     fixture.machine.store().apply(WriteBatch::default().put(
         keys::rule(
@@ -175,6 +177,7 @@ fn rule_count_and_exact_encoded_byte_caps_are_atomic_and_persisted_damage_is_not
         name: RuleName::new("small")?,
         filter: RuleFilter::True,
         created_at: Timestamp::from_millis(1),
+        action: None,
     };
     fixture.machine.store().apply(WriteBatch::default().put(
         keys::rule(

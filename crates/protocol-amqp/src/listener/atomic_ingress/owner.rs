@@ -227,7 +227,7 @@ impl<B: NativeAtomicBroker> Owner<B> {
                 receipt,
                 result,
             } => {
-                self.checked_posting(key, producer, receipt, result);
+                self.checked_posting(key, producer, *receipt, result);
             }
             Operation::Prepared {
                 key,

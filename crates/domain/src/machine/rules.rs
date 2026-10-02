@@ -7,6 +7,12 @@ use crate::{
 };
 
 use super::*;
+use crate::rule::SqlActionProgram;
+
+struct StoredRules {
+    definitions: Vec<RuleDefinition>,
+    bytes: usize,
+}
 
 impl<S: StateStore> StateMachine<S> {
     /// The complete, sorted rule set. An empty set deliberately matches nothing.
@@ -32,7 +38,7 @@ impl<S: StateStore> StateMachine<S> {
         namespace: &NamespaceName,
         topic: &EntityPath,
         subscription: &SubscriptionName,
-    ) -> Result<Vec<RuleDefinition>, BrokerError> {
+    ) -> Result<StoredRules, BrokerError> {
         self.require_rule_subscription(namespace, topic, subscription)?;
         let prefix = keys::rule_prefix(namespace, topic, subscription);
         let entries = self
@@ -57,13 +63,16 @@ impl<S: StateStore> StateMachine<S> {
             let rule = RuleDefinition::decode(&bytes)?;
             if rule.name.as_str() != name
                 || keys::rule(namespace, topic, subscription, &rule.name) != key
-                || rule.encoded_size().is_err()
+                || rule.validate().is_err()
             {
                 return Err(BrokerError::DanglingRuleMetadata);
             }
             rules.push(rule);
         }
-        Ok(rules)
+        Ok(StoredRules {
+            definitions: rules,
+            bytes: total,
+        })
     }
 
     pub(super) fn load_rules(
@@ -73,8 +82,10 @@ impl<S: StateStore> StateMachine<S> {
         subscription: &SubscriptionName,
         budget: &mut SqlCompileBudget,
     ) -> Result<LoadedRules, BrokerError> {
-        let definitions = self.read_rule_definitions(namespace, topic, subscription)?;
+        let stored = self.read_rule_definitions(namespace, topic, subscription)?;
+        let definitions = stored.definitions;
         let mut programs = Vec::with_capacity(definitions.len());
+        let mut actions = Vec::with_capacity(definitions.len());
         for definition in &definitions {
             let program = match &definition.filter {
                 RuleFilter::Sql(filter) => Some(
@@ -84,10 +95,22 @@ impl<S: StateStore> StateMachine<S> {
                 _ => None,
             };
             programs.push(program);
+            actions.push(
+                definition
+                    .action
+                    .as_ref()
+                    .map(|action| {
+                        SqlActionProgram::compile_with_budget(action.expression(), budget)
+                            .map_err(stored_action_compile_error)
+                    })
+                    .transpose()?,
+            );
         }
         Ok(LoadedRules {
             definitions,
             programs,
+            actions,
+            stored_bytes: stored.bytes,
         })
     }
 
@@ -148,14 +171,20 @@ impl<S: StateStore> StateMachine<S> {
         subscription: &SubscriptionName,
         name: &RuleName,
         filter: &RuleFilter,
+        action: Option<&crate::SqlAction>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
         // Count the borrowed definition before copying any rule payload.
-        let rules = self.rules(&command.namespace, &command.entity, subscription)?;
-        if rules.iter().any(|rule| rule.name == *name) {
+        let rules = self.load_rules(
+            &command.namespace,
+            &command.entity,
+            subscription,
+            &mut SqlCompileBudget::default(),
+        )?;
+        if rules.definitions.iter().any(|rule| rule.name == *name) {
             return Err(BrokerError::RuleAlreadyExists);
         }
-        if rules.len() == MAX_SUBSCRIPTION_RULES {
+        if rules.definitions.len() == MAX_SUBSCRIPTION_RULES {
             return Err(BrokerError::RuleLimitExceeded {
                 maximum: MAX_SUBSCRIPTION_RULES,
             });
@@ -164,10 +193,15 @@ impl<S: StateStore> StateMachine<S> {
         if let RuleFilter::Sql(filter) = filter {
             SqlProgram::compile(filter.expression()).map_err(BrokerError::SqlRuleCompilation)?;
         }
-        let size = rule_definition_size(name, filter, command.issued_at)?;
-        let total = rules.iter().try_fold(size, |total, rule| {
-            Ok::<_, BrokerError>(total.saturating_add(rule.encoded_size()?))
-        })?;
+        if let Some(action) = action {
+            action
+                .validate_source()
+                .map_err(BrokerError::SqlActionCompilation)?;
+            SqlActionProgram::compile(action.expression())
+                .map_err(BrokerError::SqlActionCompilation)?;
+        }
+        let size = rule_definition_size(name, filter, command.issued_at, action)?;
+        let total = rules.stored_bytes.saturating_add(size);
         if total > MAX_SUBSCRIPTION_RULE_BYTES {
             return Err(BrokerError::RuleSetTooLarge {
                 maximum_bytes: MAX_SUBSCRIPTION_RULE_BYTES,
@@ -177,6 +211,7 @@ impl<S: StateStore> StateMachine<S> {
             name: name.clone(),
             filter: filter.clone(),
             created_at: command.issued_at,
+            action: action.cloned(),
         };
         batch.push_put(
             keys::rule(&command.namespace, &command.entity, subscription, name),
@@ -222,15 +257,48 @@ fn stored_compile_error(error: SqlCompileError) -> BrokerError {
     }
 }
 
+fn stored_action_compile_error(error: SqlCompileError) -> BrokerError {
+    match error {
+        SqlCompileError::Limit {
+            kind:
+                SqlCompileLimit::AggregateSourceBytes
+                | SqlCompileLimit::AggregateTokens
+                | SqlCompileLimit::AggregateNodes,
+            ..
+        } => BrokerError::SqlActionCompilation(error),
+        _ => BrokerError::DanglingRuleMetadata,
+    }
+}
+
 pub(super) struct LoadedRules {
     definitions: Vec<RuleDefinition>,
     programs: Vec<Option<SqlProgram>>,
+    actions: Vec<Option<SqlActionProgram>>,
+    stored_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+impl LoadedRules {
+    pub(super) fn action(&self, index: usize) -> Result<(&SqlActionProgram, &str), BrokerError> {
+        let program = self
+            .actions
+            .get(index)
+            .and_then(Option::as_ref)
+            .ok_or(BrokerError::DanglingRuleMetadata)?;
+        let rule = self
+            .definitions
+            .get(index)
+            .ok_or(BrokerError::DanglingRuleMetadata)?;
+        Ok((program, rule.name.as_str()))
+    }
+}
+
+#[derive(Debug)]
 pub(super) enum SubscriptionMatch {
     NoMatch,
-    Matched,
+    Matched {
+        no_action: bool,
+        actions: Vec<usize>,
+    },
     FilterError(SqlEvaluationError),
 }
 
@@ -263,6 +331,9 @@ impl RuleMatchBudget {
                 })
         });
         let candidates = system_candidates(message);
+        let value_items = message
+            .envelope
+            .map_or(Ok(0), MessageEnvelope::validate_value_limits)?;
         for rules in subscriptions {
             for rule in &rules.definitions {
                 self.add_work(1)?;
@@ -286,6 +357,18 @@ impl RuleMatchBudget {
                                 .saturating_add(value_bytes),
                         )?;
                     }
+                }
+            }
+            for program in rules.actions.iter().flatten() {
+                self.add_work(value_items.saturating_add(property_count))?;
+                for target in program.targets() {
+                    self.add_work(property_count.saturating_add(1))?;
+                    self.add_bytes(
+                        target
+                            .len()
+                            .saturating_mul(property_count)
+                            .saturating_add(key_bytes),
+                    )?;
                 }
             }
         }
@@ -313,10 +396,11 @@ pub(super) fn matching_subscriptions(
     budget.charge(message, subscriptions)?;
     let mut matches = Vec::with_capacity(subscriptions.len());
     for rules in subscriptions {
-        let mut matched = false;
+        let mut no_action = false;
+        let mut actions = Vec::new();
         let mut first_error = None;
-        for (rule, program) in rules.definitions.iter().zip(&rules.programs) {
-            matched |= match &rule.filter {
+        for (index, (rule, program)) in rules.definitions.iter().zip(&rules.programs).enumerate() {
+            let matched = match &rule.filter {
                 RuleFilter::True => true,
                 RuleFilter::False => false,
                 RuleFilter::Correlation(filter) => correlation_matches(message, filter),
@@ -341,10 +425,19 @@ pub(super) fn matching_subscriptions(
                     }
                 }
             };
+            if matched {
+                if rule.action.is_some() {
+                    actions.push(index);
+                } else {
+                    no_action = true;
+                }
+            }
         }
         matches.push(match first_error {
             Some(error) => SubscriptionMatch::FilterError(error),
-            None if matched => SubscriptionMatch::Matched,
+            None if no_action || !actions.is_empty() => {
+                SubscriptionMatch::Matched { no_action, actions }
+            }
             None => SubscriptionMatch::NoMatch,
         });
     }
@@ -456,11 +549,12 @@ fn rule_definition_size(
     name: &RuleName,
     filter: &RuleFilter,
     created_at: Timestamp,
+    action: Option<&crate::SqlAction>,
 ) -> Result<usize, BrokerError> {
     RuleName::validate(name.as_str())?;
     // Structs and tuples have the same positional postcard field encoding.
     let size: usize = postcard::serialize_with_flavor(
-        &(name, filter, created_at),
+        &(name, filter, created_at, action),
         postcard::ser_flavors::Size::default(),
     )
     .map_err(|_| crate::CodecError::Encode)?;
@@ -472,3 +566,6 @@ fn rule_definition_size(
     }
     Ok(size)
 }
+
+#[cfg(test)]
+mod tests;

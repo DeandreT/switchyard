@@ -125,6 +125,7 @@ fn complete_rule_reads_reject_corrupt_late_entries_before_any_publication<P: Sto
             name,
             filter: RuleFilter::True,
             created_at: Timestamp::from_millis(10),
+            action: None,
         };
         let expected =
             match damage {
@@ -306,6 +307,7 @@ fn missing_wrong_parent_orphan_and_invalid_rule_commands_never_mutate_metadata<P
             name,
             filter: RuleFilter::True,
             created_at: Timestamp::from_millis(0),
+            action: None,
         })?,
     ))?;
     reject(
@@ -448,6 +450,7 @@ fn orphan_rule_prefixes_are_not_clean_absence_even_without_the_parent_topic<P: S
             name: RuleName::new("orphan")?,
             filter: RuleFilter::True,
             created_at: Timestamp::from_millis(10),
+            action: None,
         };
         let key = keys::rule(
             &fixture.namespace,
@@ -541,6 +544,7 @@ struct StoredRuleProbe<'a> {
     name: &'a RuleName,
     filter: StoredFilterProbe,
     created_at: Timestamp,
+    action: Option<domain::SqlAction>,
 }
 
 #[derive(serde::Serialize)]
@@ -593,6 +597,7 @@ fn compound_or_deeply_nested_stored_conditions_return_scoped_codec_errors_withou
             name: name.clone(),
             filter: correlation([("value".into(), value)]),
             created_at: Timestamp::from_millis(0),
+            action: None,
         })?);
     }
     let terminal = postcard::to_stdvec(&MessageValue::Null)?;
@@ -614,6 +619,7 @@ fn compound_or_deeply_nested_stored_conditions_return_scoped_codec_errors_withou
             ..StoredCorrelationProbe::default()
         }),
         created_at: Timestamp::from_millis(0),
+        action: None,
     })?;
     assert!(nested.len() < domain::MAX_RULE_BYTES);
     payloads.push(nested);

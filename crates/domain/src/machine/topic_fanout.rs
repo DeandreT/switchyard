@@ -38,6 +38,18 @@ pub(super) struct TopicEmission<'a> {
     pub(super) sequence: SequenceNumber,
     pub(super) scheduled_enqueue_time: Option<Timestamp>,
     pub(super) matches: &'a [SubscriptionMatch],
+    pub(super) counters: &'a mut QueueCounters,
+}
+
+struct TopicCopy<'a> {
+    config: &'a QueueConfig,
+    entity: &'a EntityPath,
+    shadow: &'a EntityPath,
+    message: MessageInput<'a>,
+    sequence: SequenceNumber,
+    scheduled_enqueue_time: Option<Timestamp>,
+    route: RetentionRoute,
+    envelope: Option<MessageEnvelope>,
 }
 
 const SQL_FILTER_ERROR_REASON: &str = "SwitchyardSqlFilterError";
@@ -104,19 +116,21 @@ impl TopicDeadLetter {
 fn retention_route(
     config: &crate::SubscriptionConfig,
     message: MessageInput<'_>,
-    outcome: SubscriptionMatch,
+    outcome: &SubscriptionMatch,
 ) -> RetentionRoute {
     match outcome {
         SubscriptionMatch::FilterError(error)
             if config.dead_lettering_on_filter_evaluation_exceptions =>
         {
-            RetentionRoute::DeadLetter(TopicDeadLetter::Sql(error))
+            RetentionRoute::DeadLetter(TopicDeadLetter::Sql(*error))
         }
         SubscriptionMatch::NoMatch | SubscriptionMatch::FilterError(_) => RetentionRoute::None,
-        SubscriptionMatch::Matched if config.requires_session && message.session_id.is_none() => {
+        SubscriptionMatch::Matched { .. }
+            if config.requires_session && message.session_id.is_none() =>
+        {
             RetentionRoute::DeadLetter(TopicDeadLetter::MissingSession)
         }
-        SubscriptionMatch::Matched => RetentionRoute::Active,
+        SubscriptionMatch::Matched { .. } => RetentionRoute::Active,
     }
 }
 
@@ -188,24 +202,51 @@ impl TopicBudget {
             return Err(BrokerError::DanglingRuleMetadata);
         }
         for (index, subscription) in targets.subscriptions.iter().enumerate() {
-            match retention_route(&subscription.config, message, matches[index]) {
-                RetentionRoute::None => {}
-                RetentionRoute::Active => self.charge_copy(cost)?,
-                RetentionRoute::DeadLetter(info) => self.charge_copy(TopicMessageCost {
-                    content_bytes: cost
-                        .content_bytes
-                        .saturating_sub(
-                            message
-                                .session_id
-                                .map_or(0, |session| session.as_str().len()),
-                        )
-                        .saturating_add(info.reason_str().len())
-                        .saturating_add(info.description().len()),
-                    value_items: cost.value_items.saturating_add(2),
-                })?,
+            let route = retention_route(&subscription.config, message, &matches[index]);
+            match &matches[index] {
+                SubscriptionMatch::Matched { no_action, actions } => {
+                    if *no_action {
+                        self.charge_route(cost, message, route)?;
+                    }
+                    for &rule in actions {
+                        let (program, name) = targets.rules[index].action(rule)?;
+                        let projected = action_cost(
+                            message,
+                            program,
+                            name,
+                            &subscription.config.to_queue_config(),
+                        )?;
+                        self.charge_route(projected, message, route)?;
+                    }
+                }
+                _ => self.charge_route(cost, message, route)?,
             }
         }
         Ok(())
+    }
+
+    fn charge_route(
+        &mut self,
+        cost: TopicMessageCost,
+        message: MessageInput<'_>,
+        route: RetentionRoute,
+    ) -> Result<(), BrokerError> {
+        match route {
+            RetentionRoute::None => Ok(()),
+            RetentionRoute::Active => self.charge_copy(cost),
+            RetentionRoute::DeadLetter(info) => self.charge_copy(TopicMessageCost {
+                content_bytes: cost
+                    .content_bytes
+                    .saturating_sub(
+                        message
+                            .session_id
+                            .map_or(0, |session| session.as_str().len()),
+                    )
+                    .saturating_add(info.reason_str().len())
+                    .saturating_add(info.description().len()),
+                value_items: cost.value_items.saturating_add(2),
+            }),
+        }
     }
 }
 
@@ -376,6 +417,7 @@ impl<S: StateStore> StateMachine<S> {
                         sequence,
                         scheduled_enqueue_time: plan.scheduled_enqueue_time,
                         matches: &plan.matches,
+                        counters: &mut counters,
                     },
                     batch,
                     &mut enqueued,
@@ -471,62 +513,227 @@ impl<S: StateStore> StateMachine<S> {
             .enumerate()
         {
             let subscription_config = subscription.config.to_queue_config();
-            let route = retention_route(&subscription.config, message, emission.matches[index]);
+            let outcome = &emission.matches[index];
+            let route = retention_route(&subscription.config, message, outcome);
             if matches!(route, RetentionRoute::None) {
                 continue;
             }
-            if let RetentionRoute::DeadLetter(info) = route {
-                let scope = EnqueueScope {
-                    namespace: &command.namespace,
-                    entity: shadow,
-                    issued_at: command.issued_at,
-                };
-                let mut record = message_record(
-                    scope,
-                    &subscription_config.dead_letter_shadow(),
-                    MessageInput {
-                        time_to_live_millis: None,
-                        session_id: None,
-                        ..message
-                    },
-                    emission.sequence,
-                    None,
-                );
-                // These fixed fields fit the ingress header reserve; their
-                // content and projected value nodes were budgeted beforehand.
-                record.dead_letter = Some(DeadLetterInfo {
-                    reason: info.reason(),
-                    description: info.description().to_owned(),
-                    dead_lettered_at: command.issued_at,
-                });
-                record.scheduled_enqueue_time = emission.scheduled_enqueue_time;
-                batch.push_put(
-                    keys::message(&command.namespace, shadow, emission.sequence),
-                    codec::encode(&record)?,
-                );
-                batch.push_put(
-                    keys::ready(&command.namespace, shadow, emission.sequence),
-                    Vec::new(),
-                );
-                enqueued.insert(shadow.clone());
-            } else {
-                self.enqueue_message(
-                    EnqueueScope {
-                        namespace: &command.namespace,
+            let (base, actions) = match outcome {
+                SubscriptionMatch::Matched { no_action, actions } => {
+                    (*no_action, actions.as_slice())
+                }
+                _ => (true, &[][..]),
+            };
+            if base {
+                self.emit_topic_copy(
+                    command,
+                    TopicCopy {
+                        config: &subscription_config,
                         entity: &subscription.entity,
-                        issued_at: command.issued_at,
+                        shadow,
+                        message,
+                        sequence: emission.sequence,
+                        scheduled_enqueue_time: emission.scheduled_enqueue_time,
+                        route,
+                        envelope: None,
                     },
-                    &subscription_config,
-                    message,
-                    emission.sequence,
-                    emission.scheduled_enqueue_time,
                     batch,
+                    enqueued,
                 )?;
-                enqueued.insert(subscription.entity.clone());
+            }
+            for &rule in actions {
+                let (program, name) = targets.rules[index].action(rule)?;
+                let sequence = emission.counters.allocate_sequence()?;
+                let envelope = action_envelope(message, program, name);
+                self.emit_topic_copy(
+                    command,
+                    TopicCopy {
+                        config: &subscription_config,
+                        entity: &subscription.entity,
+                        shadow,
+                        message,
+                        sequence,
+                        scheduled_enqueue_time: emission.scheduled_enqueue_time,
+                        route,
+                        envelope: Some(envelope),
+                    },
+                    batch,
+                    enqueued,
+                )?;
             }
         }
         Ok(())
     }
+
+    fn emit_topic_copy(
+        &self,
+        command: &Command,
+        copy: TopicCopy<'_>,
+        batch: &mut WriteBatch,
+        enqueued: &mut BTreeSet<EntityPath>,
+    ) -> Result<(), BrokerError> {
+        let TopicCopy {
+            config: subscription_config,
+            entity,
+            shadow,
+            message,
+            sequence,
+            scheduled_enqueue_time,
+            route,
+            envelope,
+        } = copy;
+        if let RetentionRoute::DeadLetter(info) = route {
+            let scope = EnqueueScope {
+                namespace: &command.namespace,
+                entity: shadow,
+                issued_at: command.issued_at,
+            };
+            let mut record = message_record(
+                scope,
+                &subscription_config.dead_letter_shadow(),
+                MessageInput {
+                    time_to_live_millis: None,
+                    session_id: None,
+                    envelope: if envelope.is_some() {
+                        None
+                    } else {
+                        message.envelope
+                    },
+                    ..message
+                },
+                sequence,
+                None,
+            );
+            // These fixed fields fit the ingress header reserve; their
+            // content and projected value nodes were budgeted beforehand.
+            record.dead_letter = Some(DeadLetterInfo {
+                reason: info.reason(),
+                description: info.description().to_owned(),
+                dead_lettered_at: command.issued_at,
+            });
+            if let Some(envelope) = envelope {
+                record.envelope = Some(Box::new(envelope));
+            }
+            record.scheduled_enqueue_time = scheduled_enqueue_time;
+            batch.push_put(
+                keys::message(&command.namespace, shadow, sequence),
+                codec::encode(&record)?,
+            );
+            batch.push_put(
+                keys::ready(&command.namespace, shadow, sequence),
+                Vec::new(),
+            );
+            enqueued.insert(shadow.clone());
+        } else {
+            let scope = EnqueueScope {
+                namespace: &command.namespace,
+                entity,
+                issued_at: command.issued_at,
+            };
+            if let Some(envelope) = envelope {
+                let mut record = message_record(
+                    scope,
+                    subscription_config,
+                    MessageInput {
+                        envelope: None,
+                        ..message
+                    },
+                    sequence,
+                    scheduled_enqueue_time,
+                );
+                record.envelope = Some(Box::new(envelope));
+                self.enqueue_record(scope, subscription_config, record, batch)?;
+            } else {
+                self.enqueue_message(
+                    scope,
+                    subscription_config,
+                    message,
+                    sequence,
+                    scheduled_enqueue_time,
+                    batch,
+                )?;
+            }
+            enqueued.insert(entity.clone());
+        }
+        Ok(())
+    }
+}
+
+fn action_cost(
+    message: MessageInput<'_>,
+    program: &crate::rule::SqlActionProgram,
+    name: &str,
+    config: &QueueConfig,
+) -> Result<TopicMessageCost, BrokerError> {
+    let (content, value_items, header) = match message.envelope {
+        Some(envelope) => envelope.removal_projection(program.targets(), "RuleName", name)?,
+        None => MessageEnvelope::legacy_annotation_projection(
+            message.message_id,
+            message.body.len(),
+            "RuleName",
+            name,
+        )?,
+    };
+    let overhead = message.envelope.map_or_else(
+        || {
+            message
+                .session_id
+                .map_or(0, |session| 5_usize.saturating_add(session.as_str().len()))
+        },
+        |envelope| {
+            authoritative_property_overhead(envelope, message.message_id, message.session_id)
+        },
+    );
+    let header_bytes = header
+        .saturating_add(overhead)
+        .saturating_add(BROKER_HEADER_RESERVE_BYTES);
+    if header_bytes > MAX_MESSAGE_HEADER_BYTES {
+        return Err(BrokerError::MessageHeaderTooLarge {
+            header_bytes,
+            maximum_bytes: MAX_MESSAGE_HEADER_BYTES,
+        });
+    }
+    let body_bytes = content.saturating_add(overhead).max(message.body.len());
+    if body_bytes > config.max_message_bytes {
+        return Err(BrokerError::MessageTooLarge {
+            body_bytes,
+            maximum_bytes: config.max_message_bytes,
+        });
+    }
+    Ok(TopicMessageCost {
+        content_bytes: content
+            .saturating_add(message.body.len())
+            .saturating_add(message.message_id.len())
+            .saturating_add(
+                message
+                    .session_id
+                    .map_or(0, |session| session.as_str().len()),
+            ),
+        value_items,
+    })
+}
+
+fn action_envelope(
+    message: MessageInput<'_>,
+    program: &crate::rule::SqlActionProgram,
+    name: &str,
+) -> MessageEnvelope {
+    let mut envelope = message
+        .envelope
+        .cloned()
+        .unwrap_or_else(|| MessageEnvelope {
+            properties: crate::MessageProperties {
+                message_id: Some(MessageIdentifier::String(message.message_id.to_owned())),
+                ..crate::MessageProperties::default()
+            },
+            body: crate::MessageBody::Data(vec![message.body.to_vec()]),
+            ..MessageEnvelope::default()
+        });
+    program.apply(&mut envelope);
+    envelope
+        .application_properties
+        .insert("RuleName".to_owned(), MessageValue::String(name.to_owned()));
+    envelope
 }
 
 fn enforce_input_limit(

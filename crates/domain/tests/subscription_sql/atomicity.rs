@@ -20,6 +20,7 @@ struct StoredRule {
     name: RuleName,
     filter: StoredFilter,
     created_at: Timestamp,
+    action: Option<domain::SqlAction>,
 }
 
 fn replayed_sql_rule_is_compiled_by_the_owner_before_any_metadata_is_staged<P: StoreProvider>(
@@ -133,6 +134,7 @@ fn corrupt_late_sql_versions_sources_and_topology_refuse_all_ingress_atomically<
                 expression: source,
             }),
             created_at: Timestamp::from_millis(10),
+            action: None,
         })?;
         let mutation = if damage == 6 {
             WriteBatch::default().delete(keys::queue_config(

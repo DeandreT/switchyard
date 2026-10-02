@@ -23,6 +23,8 @@ mod crud;
 mod fixture;
 #[path = "native_rule_commands/input.rs"]
 mod input;
+#[path = "native_rule_commands/read_boundaries.rs"]
+mod read_boundaries;
 #[path = "native_rule_commands/security.rs"]
 mod security;
 
@@ -57,4 +59,5 @@ cases! {
     invalid_rule_files_and_arguments_do_not_open_a_connection => input::invalid,
     oversized_protobuf_rule_request_is_refused_before_connect => input::request_limit,
     sql_compilation_and_versions_remain_server_decisions => crud::server_statuses,
+    action_bearing_rules_fail_without_partial_or_misleading_cli_output => read_boundaries::actions,
 }

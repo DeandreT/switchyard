@@ -247,7 +247,7 @@ impl<B: NativeAtomicBroker> Owner<B> {
                     Operation::PostingChecked {
                         key,
                         producer,
-                        receipt,
+                        receipt: Box::new(receipt),
                         result,
                     }
                 });

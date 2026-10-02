@@ -25,11 +25,13 @@ async fn complete_rules_are_clock_free_and_subscription_scoped<P: StoreProvider>
             name: RuleName::new("$Default")?,
             filter: RuleFilter::True,
             created_at: Timestamp::from_millis(1_000),
+            action: None,
         },
         RuleDefinition {
             name: RuleName::new("never")?,
             filter: RuleFilter::False,
             created_at: Timestamp::from_millis(1_000),
+            action: None,
         },
     ];
     node.store

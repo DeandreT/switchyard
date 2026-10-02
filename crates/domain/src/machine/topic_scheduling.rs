@@ -118,6 +118,7 @@ impl<S: StateStore> StateMachine<S> {
                     sequence,
                     scheduled_enqueue_time: candidate.record.scheduled_enqueue_time,
                     matches: &candidate.matches,
+                    counters: &mut counters,
                 },
                 batch,
                 &mut enqueued,

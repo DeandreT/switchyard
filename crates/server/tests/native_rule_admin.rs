@@ -43,6 +43,8 @@ mod authorization;
 mod failures;
 #[path = "native_rule_admin/lifecycle.rs"]
 mod lifecycle;
+#[path = "native_rule_admin/read_boundaries.rs"]
+mod read_boundaries;
 #[path = "native_rule_admin/scalars.rs"]
 mod scalars;
 
@@ -63,4 +65,6 @@ for_each_backend! {
     super::atomicity::failed_mutations_retry_and_reopen_without_partial_rules => failed_mutations_retry_and_reopen_without_partial_rules,
     super::atomicity::corrupt_sets_refuse_without_partial_responses_or_repairs => corrupt_sets_refuse_without_partial_responses_or_repairs,
     super::atomicity::captured_subscription_generation_fences_inflight_rpcs => captured_subscription_generation_fences_inflight_rpcs,
+    super::read_boundaries::action_bearing_reads_refuse_without_omitting_metadata => action_bearing_reads_refuse_without_omitting_metadata,
+    super::read_boundaries::exact_limit_legacy_rules_remain_readable => exact_limit_legacy_rules_remain_readable,
 }

@@ -146,8 +146,13 @@ mod tests {
             name: crate::RuleName::new("sql").expect("valid rule name"),
             filter: crate::RuleFilter::Sql(SqlFilter::new("TRUE").expect("supported SQL")),
             created_at: crate::Timestamp::UNIX_EPOCH,
+            action: None,
         };
         let mut bytes = crate::codec::encode(&rule)?;
+        assert_eq!(crate::RuleDefinition::decode(&bytes)?, rule);
+        bytes = postcard::to_stdvec(&(&rule.name, &rule.filter, rule.created_at))
+            .map_err(|_| crate::CodecError::Encode)?;
+        bytes.insert(0, crate::codec::VALUE_FORMAT_V10);
         assert_eq!(crate::RuleDefinition::decode(&bytes)?, rule);
         for version in crate::codec::VALUE_FORMAT_V1..crate::codec::VALUE_FORMAT_V10 {
             bytes[0] = version;

@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AcceptedSession, Delivery, EntityPath, LockToken, MessageEnvelope, MessageValue, NamespaceName,
     QueueConfig, QueueConfigUpdate, ReceiveMode, RuleFilter, RuleName, SequenceNumber, SessionHold,
-    SessionId, SubscriptionConfig, SubscriptionConfigUpdate, SubscriptionName, Timestamp,
-    TopicConfig, TopicConfigUpdate,
+    SessionId, SqlAction, SubscriptionConfig, SubscriptionConfigUpdate, SubscriptionName,
+    Timestamp, TopicConfig, TopicConfigUpdate,
 };
 
 /// One replicated instruction for the broker state machine.
@@ -339,6 +339,14 @@ pub enum CommandKind {
     /// Purges bounded owned state while retaining monotonic counter fences.
     DeleteEntity {
         target: DeleteEntityTarget,
+    },
+    /// Creates one independently copied action rule without changing older
+    /// command variant indices or positional payloads.
+    CreateRuleWithAction {
+        subscription: SubscriptionName,
+        name: RuleName,
+        filter: RuleFilter,
+        action: SqlAction,
     },
 }
 

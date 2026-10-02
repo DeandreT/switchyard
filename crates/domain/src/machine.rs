@@ -260,7 +260,20 @@ impl<S: StateStore> StateMachine<S> {
                 subscription,
                 name,
                 filter,
-            } => self.create_rule(command, subscription, name, filter, &mut batch)?,
+            } => self.create_rule(command, subscription, name, filter, None, &mut batch)?,
+            CommandKind::CreateRuleWithAction {
+                subscription,
+                name,
+                filter,
+                action,
+            } => self.create_rule(
+                command,
+                subscription,
+                name,
+                filter,
+                Some(action),
+                &mut batch,
+            )?,
             CommandKind::DeleteRule { subscription, name } => {
                 self.delete_rule(command, subscription, name, &mut batch)?
             }
@@ -1032,8 +1045,19 @@ impl<S: StateStore> StateMachine<S> {
         batch: &mut WriteBatch,
     ) -> Result<(), BrokerError> {
         let record = message_record(scope, config, message, sequence, scheduled_enqueue_time);
+        self.enqueue_record(scope, config, record, batch)
+    }
+
+    fn enqueue_record(
+        &self,
+        scope: EnqueueScope<'_>,
+        config: &QueueConfig,
+        record: MessageRecord,
+        batch: &mut WriteBatch,
+    ) -> Result<(), BrokerError> {
         let namespace = scope.namespace;
         let entity = scope.entity;
+        let sequence = record.sequence;
         batch.push_put(
             keys::message(namespace, entity, sequence),
             codec::encode(&record)?,

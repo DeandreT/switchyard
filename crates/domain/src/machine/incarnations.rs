@@ -112,6 +112,7 @@ impl<S: StateStore> StateMachine<S> {
     ) -> Result<(), BrokerError> {
         let child = match kind {
             CommandKind::CreateRule { subscription, .. }
+            | CommandKind::CreateRuleWithAction { subscription, .. }
             | CommandKind::DeleteRule { subscription, .. } => {
                 Some(entity.subscription(subscription)?)
             }

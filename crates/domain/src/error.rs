@@ -68,6 +68,8 @@ pub enum BrokerError {
     DanglingRuleMetadata,
     #[error("SQL rule could not be compiled: {0}")]
     SqlRuleCompilation(#[from] SqlCompileError),
+    #[error("SQL rule action compilation failed: {0}")]
+    SqlActionCompilation(SqlCompileError),
     #[error("topic rule matching {limit:?} exceeds the maximum of {maximum}")]
     TopicRuleMatchTooLarge {
         limit: RuleMatchLimit,

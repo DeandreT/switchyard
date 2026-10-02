@@ -16,6 +16,7 @@ fn original_source_is_stored_listed_and_reopened_without_normalization<P: StoreP
         name: RuleName::new("sql")?,
         filter: sql(source)?,
         created_at: Timestamp::from_millis(2),
+        action: None,
     };
     let key = keys::rule(
         &fixture.namespace,

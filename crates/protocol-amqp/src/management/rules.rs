@@ -299,6 +299,7 @@ fn create_rule(message: &Message) -> Result<(RuleName, RuleFilter), RuleRequestE
         name: rule_name,
         filter,
         created_at: Timestamp::UNIX_EPOCH,
+        action: None,
     };
     rule.encoded_size()?;
     Ok((rule.name, rule.filter))
@@ -403,6 +404,11 @@ fn encoded_filter(filter: &RuleFilter) -> Value {
 }
 
 fn encoded_rule(rule: &RuleDefinition) -> Result<Value, RuleRequestError> {
+    if rule.action.is_some() {
+        return Err(RuleRequestError::Unsupported(
+            "AMQP rule responses cannot represent SQL actions yet",
+        ));
+    }
     let created = i64::try_from(rule.created_at.as_millis()).map_err(|_| {
         RuleRequestError::Internal("rule creation timestamp cannot be represented on AMQP")
     })?;
@@ -463,6 +469,12 @@ pub(super) async fn process<B: Broker>(
                     return ManagementResponse::from_rejection(message_id, tracking_id, &error);
                 }
             };
+            if rules.iter().any(|rule| rule.action.is_some()) {
+                return RuleRequestError::Unsupported(
+                    "AMQP rule responses cannot represent SQL actions yet",
+                )
+                .response(message_id, tracking_id);
+            }
             let entries = match rules
                 .iter()
                 .skip(skip)

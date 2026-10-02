@@ -70,13 +70,17 @@ pub const STORE_FORMAT_V12: u32 = 12;
 /// Earlier builds ignore these records and can address a replacement by name.
 pub const STORE_FORMAT_V13: u32 = 13;
 
+/// Version 14: SQL actions produce independently transformed subscription
+/// copies. Earlier builds cannot interpret action-bearing rules or that fanout.
+pub const STORE_FORMAT_V14: u32 = 14;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V13;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V14;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
@@ -453,22 +457,49 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V12,
-                expected: STORE_FORMAT_V13,
+                expected: ACTIVE_STORE_FORMAT,
             })
         );
-        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V13);
         Ok(())
     }
 
     #[test]
     fn incarnation_layout_is_not_readable_as_the_previous_layout() {
         let recorded = STORE_FORMAT_V13.to_be_bytes();
-        assert_eq!(require_readable_format(&recorded), Ok(()));
+        assert_eq!(require_format_version(&recorded, STORE_FORMAT_V13), Ok(()));
         assert_eq!(
             require_format_version(&recorded, STORE_FORMAT_V12),
             Err(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V13,
                 expected: STORE_FORMAT_V12,
+            })
+        );
+    }
+
+    #[test]
+    fn refuses_a_store_from_before_sql_actions() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        stamp_format(directory.path(), &STORE_FORMAT_V13.to_be_bytes())?;
+        assert_eq!(
+            FjallStore::open(directory.path()).err(),
+            Some(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V13,
+                expected: STORE_FORMAT_V14,
+            })
+        );
+        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V14);
+        Ok(())
+    }
+
+    #[test]
+    fn action_layout_is_not_readable_as_the_previous_layout() {
+        let recorded = STORE_FORMAT_V14.to_be_bytes();
+        assert_eq!(require_readable_format(&recorded), Ok(()));
+        assert_eq!(
+            require_format_version(&recorded, STORE_FORMAT_V13),
+            Err(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V14,
+                expected: STORE_FORMAT_V13,
             })
         );
     }

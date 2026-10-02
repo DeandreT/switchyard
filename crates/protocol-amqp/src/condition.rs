@@ -51,11 +51,13 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::AtomicMessagingTooLarge { .. }
         | BrokerError::TopicRuleMatchTooLarge { .. } => RESOURCE_LIMIT_EXCEEDED,
         BrokerError::TopicDataPlaneNotImplemented => NOT_IMPLEMENTED,
-        BrokerError::SqlRuleCompilation(error) => match error {
-            domain::SqlCompileError::Syntax => INVALID_FIELD,
-            domain::SqlCompileError::Unsupported { .. } => NOT_IMPLEMENTED,
-            domain::SqlCompileError::Limit { .. } => RESOURCE_LIMIT_EXCEEDED,
-        },
+        BrokerError::SqlRuleCompilation(error) | BrokerError::SqlActionCompilation(error) => {
+            match error {
+                domain::SqlCompileError::Syntax => INVALID_FIELD,
+                domain::SqlCompileError::Unsupported { .. } => NOT_IMPLEMENTED,
+                domain::SqlCompileError::Limit { .. } => RESOURCE_LIMIT_EXCEEDED,
+            }
+        }
         BrokerError::IngressBatchLimitExceeded { limit, .. }
         | BrokerError::TopicFanoutTooLarge { limit, .. } => match limit {
             IngressBatchLimit::ContentBytes => MESSAGE_SIZE_EXCEEDED,
@@ -140,6 +142,28 @@ mod tests {
     use domain::{QueueCounterKind, QueueImmutableProperty, SequenceNumber, SessionId, Timestamp};
 
     use super::*;
+
+    #[test]
+    fn action_compilation_refusals_have_nonretryable_conditions() {
+        for (error, condition) in [
+            (domain::SqlCompileError::Syntax, INVALID_FIELD),
+            (
+                domain::SqlCompileError::Unsupported { feature: "action" },
+                NOT_IMPLEMENTED,
+            ),
+            (
+                domain::SqlCompileError::Limit {
+                    kind: domain::SqlCompileLimit::Nodes,
+                    maximum: 32,
+                },
+                RESOURCE_LIMIT_EXCEEDED,
+            ),
+        ] {
+            let error = BrokerError::SqlActionCompilation(error);
+            assert_eq!(condition_for(&error), condition);
+            assert!(!is_retryable(&error));
+        }
+    }
 
     #[test]
     fn atomic_group_refusals_have_nonretryable_conditions() {

@@ -382,9 +382,13 @@ impl ManagementResponse {
             crate::NOT_IMPLEMENTED
                 if matches!(
                     rejection,
-                    BrokerRejection::Refused(domain::BrokerError::SqlRuleCompilation(
-                        domain::SqlCompileError::Unsupported { .. }
-                    ))
+                    BrokerRejection::Refused(
+                        domain::BrokerError::SqlRuleCompilation(
+                            domain::SqlCompileError::Unsupported { .. }
+                        ) | domain::BrokerError::SqlActionCompilation(
+                            domain::SqlCompileError::Unsupported { .. }
+                        )
+                    )
                 ) =>
             {
                 501

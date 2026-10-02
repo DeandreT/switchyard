@@ -20,7 +20,7 @@ pub(super) enum Operation {
     PostingChecked {
         key: u64,
         producer: u64,
-        receipt: TransactionPostingReceipt,
+        receipt: Box<TransactionPostingReceipt>,
         result: Result<CommandKind, AmqpProtocolError>,
     },
     Prepared {

@@ -21,6 +21,7 @@ fn default_rule_is_an_atomic_persisted_member_and_reads_remain_bounded<P: StoreP
         name: default,
         filter: RuleFilter::True,
         created_at: Timestamp::from_millis(5),
+        action: None,
     };
     assert_eq!(read_rules(&fixture, "Alpha")?, vec![definition.clone()]);
     assert_eq!(

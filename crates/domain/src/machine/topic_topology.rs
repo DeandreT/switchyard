@@ -212,6 +212,7 @@ impl<S: StateStore> StateMachine<S> {
             name: RuleName::new("$Default")?,
             filter: RuleFilter::True,
             created_at: command.issued_at,
+            action: None,
         };
         batch.push_put(
             keys::rule(&command.namespace, &command.entity, name, &default.name),

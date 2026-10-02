@@ -16,6 +16,13 @@ pub(super) fn compilation(error: SqlCompileError) -> Status {
 pub(super) fn input(error: BrokerError) -> Status {
     match error {
         BrokerError::SqlRuleCompilation(error) => compilation(error),
+        BrokerError::SqlActionCompilation(error) => match error {
+            SqlCompileError::Syntax => Status::invalid_argument("invalid SQL action syntax"),
+            SqlCompileError::Unsupported { .. } => Status::unimplemented("unsupported SQL action"),
+            SqlCompileError::Limit { .. } => {
+                Status::resource_exhausted("SQL compilation limit reached")
+            }
+        },
         BrokerError::RuleTooLarge { .. }
         | BrokerError::RuleSetTooLarge { .. }
         | BrokerError::RuleLimitExceeded { .. } => Status::resource_exhausted("rule limit reached"),
@@ -43,7 +50,8 @@ pub(super) fn mutation(error: SubmitError) -> Status {
             | BrokerError::RuleSetTooLarge { .. }
             | BrokerError::RuleLimitExceeded { .. }
             | BrokerError::InvalidRule { .. }
-            | BrokerError::SqlRuleCompilation(_)),
+            | BrokerError::SqlRuleCompilation(_)
+            | BrokerError::SqlActionCompilation(_)),
         )) => input(error),
         other => read(other),
     }
@@ -62,9 +70,10 @@ pub(super) fn read(error: SubmitError) -> Status {
             | BrokerError::RuleNotFound
             | BrokerError::EntityBindingStale,
         )) => Status::not_found("rule scope or target does not exist"),
-        SubmitError::Propose(ProposeError::Broker(BrokerError::SqlRuleCompilation(
-            SqlCompileError::Limit { .. },
-        ))) => Status::resource_exhausted("SQL compilation limit reached"),
+        SubmitError::Propose(ProposeError::Broker(
+            BrokerError::SqlRuleCompilation(SqlCompileError::Limit { .. })
+            | BrokerError::SqlActionCompilation(SqlCompileError::Limit { .. }),
+        )) => Status::resource_exhausted("SQL compilation limit reached"),
         _ => Status::internal("rule operation failed"),
     }
 }

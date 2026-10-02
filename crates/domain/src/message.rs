@@ -369,7 +369,8 @@ impl MessageRecord {
             codec::VALUE_FORMAT_V7
             | codec::VALUE_FORMAT_V8
             | codec::VALUE_FORMAT_V9
-            | codec::VALUE_FORMAT_V10 => codec::decode_payload(payload),
+            | codec::VALUE_FORMAT_V10
+            | codec::VALUE_FORMAT_V11 => codec::decode_payload(payload),
             _ => unreachable!("split rejects unknown value formats"),
         }?;
         if version < codec::VALUE_FORMAT_V9

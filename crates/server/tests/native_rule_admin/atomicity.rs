@@ -60,6 +60,7 @@ struct StoredRule {
     name: RuleName,
     filter: StoredFilter,
     created_at: Timestamp,
+    action: Option<domain::SqlAction>,
 }
 
 // Mirror only the stored enum ordinals to inject a syntactically corrupt source.
@@ -112,6 +113,7 @@ pub(super) async fn corrupt_sets_refuse_without_partial_responses_or_repairs<P: 
             name: RuleName::new("other-name")?,
             filter: domain::RuleFilter::False,
             created_at: Timestamp::from_millis(1_000),
+            action: None,
         })?,
     )]);
     cases.push(vec![(
@@ -123,6 +125,7 @@ pub(super) async fn corrupt_sets_refuse_without_partial_responses_or_repairs<P: 
                 expression: "broken =".into(),
             }),
             created_at: Timestamp::from_millis(1_000),
+            action: None,
         })?,
     )]);
     cases.push(
@@ -135,6 +138,7 @@ pub(super) async fn corrupt_sets_refuse_without_partial_responses_or_repairs<P: 
                         name: RuleName::new(name)?,
                         filter: domain::RuleFilter::False,
                         created_at: Timestamp::from_millis(1_000),
+                        action: None,
                     })?,
                 ))
             })

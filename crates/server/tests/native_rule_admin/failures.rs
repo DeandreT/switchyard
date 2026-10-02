@@ -148,6 +148,7 @@ fn large_rule(name: &str, wanted: usize) -> TestResult<(RuleDefinition, Option<R
                 ..Default::default()
             }),
             created_at: Timestamp::from_millis(1_000),
+            action: None,
         })
     };
     let mut low = 0;

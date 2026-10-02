@@ -75,7 +75,12 @@ impl NativeAdminService {
     }
 
     fn rule_response(&self, target: &RuleTarget, rule: RuleDefinition) -> Result<Rule, Status> {
-        rule.encoded_size().map_err(status::stored)?;
+        rule.validate().map_err(status::stored)?;
+        if rule.action.is_some() {
+            return Err(Status::unimplemented(
+                "native rule responses cannot represent SQL actions yet",
+            ));
+        }
         Ok(Rule {
             namespace: self.namespace.as_str().to_owned(),
             subscription_path: target.path.as_str().to_owned(),
@@ -102,6 +107,7 @@ impl RuleService for NativeAdminService {
             name,
             filter,
             created_at: Timestamp::UNIX_EPOCH,
+            action: None,
         };
         rule.encoded_size().map_err(status::input)?;
         let binding = self.bind_rule_target(&target).await?;

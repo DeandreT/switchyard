@@ -38,7 +38,7 @@ fn legacy_six_field_records_select_the_explicit_true_default() -> Result<(), Cod
             dead_lettering_on_filter_evaluation_exceptions: true,
         };
         let mut bytes = codec::encode(&legacy)?;
-        assert_eq!(bytes[0], codec::VALUE_FORMAT_V10);
+        assert_eq!(bytes[0], codec::ACTIVE_VALUE_FORMAT);
         assert_eq!(SubscriptionConfig::decode(&bytes), Err(CodecError::Decode));
         for version in codec::VALUE_FORMAT_V1..=codec::VALUE_FORMAT_V9 {
             bytes[0] = version;
@@ -58,7 +58,7 @@ fn current_true_and_false_policies_round_trip_but_cannot_be_relabelled_legacy()
             ..SubscriptionConfig::default()
         };
         let mut bytes = codec::encode(&original)?;
-        assert_eq!(bytes[0], codec::VALUE_FORMAT_V10);
+        assert_eq!(bytes[0], codec::ACTIVE_VALUE_FORMAT);
         assert_eq!(SubscriptionConfig::decode(&bytes)?, original);
         assert_eq!(codec::decode::<SubscriptionConfig>(&bytes)?, original);
         for version in codec::VALUE_FORMAT_V1..=codec::VALUE_FORMAT_V9 {
@@ -84,11 +84,11 @@ fn malformed_current_and_unknown_policy_records_are_refused() -> Result<(), Code
         SubscriptionConfig::decode(&[]),
         Err(CodecError::EmptyEnvelope)
     );
-    bytes[0] = codec::VALUE_FORMAT_V10 + 1;
+    bytes[0] = codec::ACTIVE_VALUE_FORMAT + 1;
     assert_eq!(
         SubscriptionConfig::decode(&bytes),
         Err(CodecError::UnsupportedVersion {
-            version: codec::VALUE_FORMAT_V10 + 1
+            version: codec::ACTIVE_VALUE_FORMAT + 1
         })
     );
     Ok(())

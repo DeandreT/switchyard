@@ -24,6 +24,7 @@ fn seed_rules<P: StoreProvider>(
             name: RuleName::new(format!("rule{index:02}"))?,
             filter,
             created_at: Timestamp::from_millis(1),
+            action: None,
         };
         batch.push_put(
             keys::rule(

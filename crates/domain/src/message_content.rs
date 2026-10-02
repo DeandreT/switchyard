@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::BrokerError;
 
+mod removal_projection;
+
 /// Maximum child nesting for a retained value. Root values have depth zero;
 /// every compound or described child increases the depth by one.
 pub const MAX_MESSAGE_VALUE_DEPTH: usize = 64;
