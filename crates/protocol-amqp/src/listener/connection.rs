@@ -332,8 +332,13 @@ where
                 .await
         }
         AdmissionMode::AtomicMessaging => {
-            ServerConnection::accept_with_transactional_work(stream, container_id, sasl, options)
-                .await
+            ServerConnection::accept_with_transactional_work_defaults(
+                stream,
+                container_id,
+                sasl,
+                options,
+            )
+            .await
         }
     }
 }

@@ -10,28 +10,27 @@ pub(super) async fn restricted_profiles_and_posting_only_policy_refuse_before_bi
     provider: P,
 ) -> TestResult {
     let node = Node::start(provider, ListenerMode::Messaging).await?;
-    for variant in 0..8 {
+    for variant in 0..7 {
         let mut peer = Peer::connect(node.address).await?;
         peer.begin(RECEIVE).await?;
         let mut request = Peer::attach_request(RECEIVE, RECEIVE_HANDLE, "orders", Role::Receiver);
         match variant {
             0 => request.rcv_settle_mode = ReceiverSettleMode::First,
             1 => request.snd_settle_mode = SenderSettleMode::Settled,
-            2 => request.snd_settle_mode = SenderSettleMode::Mixed,
-            3 => {
+            2 => {
                 request.source.as_mut().expect("Source").filter = Some(
                     [(Symbol::from("selector"), Value::String("true".into()))]
                         .into_iter()
                         .collect(),
                 )
             }
-            4 => request.source.as_mut().expect("Source").dynamic = true,
-            5 => request.source.as_mut().expect("Source").durable = 1,
-            6 => {
+            3 => request.source.as_mut().expect("Source").dynamic = true,
+            4 => request.source.as_mut().expect("Source").durable = 1,
+            5 => {
                 request.source.as_mut().expect("Source").distribution_mode =
                     Some(Symbol::from("copy"))
             }
-            7 => {
+            6 => {
                 request.source.as_mut().expect("Source").distribution_mode =
                     Some(Symbol::from("unknown-mode"))
             }

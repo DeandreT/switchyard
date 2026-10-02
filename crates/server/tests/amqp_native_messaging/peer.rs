@@ -97,6 +97,17 @@ impl Peer {
         self.channels[&channel]
     }
 
+    pub(super) async fn acknowledge_end(&mut self, channel: u16) -> TestResult {
+        self.send(channel, Performative::End(amqp::End::default()), vec![])
+            .await?;
+        let local = self.channels.remove(&channel).expect("ended peer session");
+        self.handles.remove(&local);
+        self.received.remove(&local);
+        self.sent.remove(&channel);
+        self.deliveries.remove(&channel);
+        Ok(())
+    }
+
     fn valid_flow(&self, frame: &Frame) -> bool {
         matches!(frame, Frame::Amqp { channel, performative: Some(Performative::Flow(flow)), payload }
             if payload.is_empty() && self.channels.values().any(|known| known == channel)
@@ -197,6 +208,16 @@ impl Peer {
     }
 
     pub(super) async fn admitted(&mut self, channel: u16, client_role: Role) -> TestResult {
+        self.admitted_with_initial_count(channel, client_role, None)
+            .await
+    }
+
+    async fn admitted_with_initial_count(
+        &mut self,
+        channel: u16,
+        client_role: Role,
+        initial_count: Option<u32>,
+    ) -> TestResult {
         let mut attached = false;
         for _ in 0..32 {
             let frame = self.read().await?;
@@ -225,6 +246,9 @@ impl Peer {
                     assert!(attached && client_role == Role::Sender);
                     assert!(payload.is_empty());
                     assert!(flow.link_credit.is_some_and(|credit| credit > 0));
+                    if let Some(expected) = initial_count {
+                        assert_eq!(flow.delivery_count, Some(expected));
+                    }
                     return Ok(());
                 }
                 _ => assert!(
@@ -237,22 +261,58 @@ impl Peer {
     }
 
     pub(super) async fn coordinator(&mut self) -> TestResult {
+        self.coordinator_with_initial_count(Some(0)).await
+    }
+
+    pub(super) async fn coordinator_with_initial_count(
+        &mut self,
+        initial_count: Option<u32>,
+    ) -> TestResult {
+        self.coordinator_with_profile(
+            initial_count,
+            SenderSettleMode::Unsettled,
+            Source {
+                outcomes: Some(
+                    vec![
+                        Symbol::from("amqp:declared:list"),
+                        Symbol::from("amqp:accepted:list"),
+                        Symbol::from("amqp:rejected:list"),
+                    ]
+                    .into(),
+                ),
+                ..Source::default()
+            },
+        )
+        .await
+    }
+
+    pub(super) async fn coordinator_with_sdk_defaults(&mut self) -> TestResult {
+        self.coordinator_with_profile(
+            None,
+            SenderSettleMode::Mixed,
+            Source {
+                distribution_mode: Some(Symbol::from("move")),
+                ..Source::default()
+            },
+        )
+        .await
+    }
+
+    async fn coordinator_with_profile(
+        &mut self,
+        initial_count: Option<u32>,
+        sender_mode: SenderSettleMode,
+        source: Source,
+    ) -> TestResult {
         self.begin(CONTROL).await?;
         let mut request = Self::attach_request(CONTROL, CONTROL_HANDLE, "", Role::Sender);
+        request.initial_delivery_count = initial_count;
+        request.snd_settle_mode = sender_mode;
         request.target = Some(Coordinator::default().into());
-        request.source = Some(Source {
-            outcomes: Some(
-                vec![
-                    Symbol::from("amqp:declared:list"),
-                    Symbol::from("amqp:accepted:list"),
-                    Symbol::from("amqp:rejected:list"),
-                ]
-                .into(),
-            ),
-            ..Source::default()
-        });
+        request.source = Some(source);
         self.attach(CONTROL, request).await?;
-        self.admitted(CONTROL, Role::Sender).await
+        self.admitted_with_initial_count(CONTROL, Role::Sender, Some(initial_count.unwrap_or(0)))
+            .await
     }
 
     pub(super) async fn producer(&mut self, channel: u16, entity: &str) -> TestResult {
@@ -273,8 +333,25 @@ impl Peer {
         &mut self,
         distribution: Option<&str>,
     ) -> TestResult<WireDelivery> {
+        self.consumer_with_profile(SenderSettleMode::Unsettled, distribution)
+            .await
+    }
+
+    pub(super) async fn consumer_with_sender_mode(
+        &mut self,
+        sender_mode: SenderSettleMode,
+    ) -> TestResult<WireDelivery> {
+        self.consumer_with_profile(sender_mode, None).await
+    }
+
+    async fn consumer_with_profile(
+        &mut self,
+        sender_mode: SenderSettleMode,
+        distribution: Option<&str>,
+    ) -> TestResult<WireDelivery> {
         self.begin(RECEIVE).await?;
         let mut request = Self::attach_request(RECEIVE, RECEIVE_HANDLE, "orders", Role::Receiver);
+        request.snd_settle_mode = sender_mode;
         request
             .source
             .as_mut()

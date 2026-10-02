@@ -167,7 +167,10 @@ pub(super) async fn serve_session<B: NativeAtomicBroker>(
                 continue;
             }
             if attach.role == Role::Receiver {
-                if attach.snd_settle_mode != SenderSettleMode::Unsettled
+                if !matches!(
+                    attach.snd_settle_mode,
+                    SenderSettleMode::Mixed | SenderSettleMode::Unsettled
+                )
                     || attach.rcv_settle_mode != ReceiverSettleMode::Second
                     || attach.source.as_ref().is_some_and(|source| {
                         source.dynamic
@@ -181,7 +184,7 @@ pub(super) async fn serve_session<B: NativeAtomicBroker>(
                         attach,
                         error_for(
                             AmqpError::NotAllowed,
-                            "atomic receiving requires a fixed, non-durable, unfiltered Unsettled/Second move source".into(),
+                            "atomic receiving requires a fixed, non-durable, unfiltered Mixed-or-Unsettled/Second move source".into(),
                         ),
                     )
                     .await?;
@@ -203,7 +206,10 @@ pub(super) async fn serve_session<B: NativeAtomicBroker>(
                     }
                 };
                 let maximum = admission.config.max_message_bytes as u64;
-                let sender = match session.accept_transactional_sender(attach, maximum).await {
+                let sender = match session
+                    .accept_transactional_sender_negotiating_unsettled(attach, maximum)
+                    .await
+                {
                     Ok(sender) => sender,
                     Err(EngineError::RemoteDetached) => continue,
                     Err(error) => return Err(error.into()),

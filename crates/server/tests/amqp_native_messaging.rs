@@ -61,11 +61,38 @@ mod atomicity;
 mod lifecycle;
 #[path = "amqp_native_messaging/refusals.rs"]
 mod refusals;
+#[path = "amqp_native_messaging/sdk_defaults.rs"]
+mod sdk_defaults;
 
 macro_rules! backend_cases {
     ($module:ident, $provider:expr) => {
         mod $module {
             use super::*;
+            #[tokio::test]
+            async fn sdk_defaults_rearm_the_same_canonical_original_before_mixed_commit()
+            -> TestResult {
+                sdk_defaults::sdk_defaults_rearm_the_same_canonical_original_before_mixed_commit(
+                    $provider,
+                )
+                .await
+            }
+            #[tokio::test]
+            async fn negotiated_unsettled_original_still_refuses_settled_retirement() -> TestResult
+            {
+                sdk_defaults::negotiated_unsettled_original_still_refuses_settled_retirement(
+                    $provider,
+                )
+                .await
+            }
+            #[tokio::test]
+            async fn coordinator_default_is_confined_to_messaging_admission() -> TestResult {
+                sdk_defaults::coordinator_default_is_confined_to_messaging_admission($provider)
+                    .await
+            }
+            #[tokio::test]
+            async fn mixed_receiver_still_requires_listen_before_bind() -> TestResult {
+                sdk_defaults::mixed_receiver_still_requires_listen_before_bind($provider).await
+            }
             #[tokio::test]
             async fn mixed_batch_and_canonical_complete_commit_once() -> TestResult {
                 lifecycle::mixed_batch_and_canonical_complete_commit_once($provider).await
