@@ -73,4 +73,6 @@ These APIs add no connection transaction registry, provisional settlement,
 held-message undo, AMQP Declare/Discharge acceptance, or authorization checks.
 The separate [owned work API](atomic-work-reservations.md) keeps bounded resource
 reservations attached to commands throughout queueing and owner completion.
+The trusted [paired owner handoff](native-atomic-owner-handoff.md) coordinates a
+logical permit and native claim without performing wire I/O on the owner.
 The wire still [refuses unsupported transaction traffic](amqp-transaction-types.md).

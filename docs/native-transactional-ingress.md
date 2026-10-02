@@ -100,11 +100,14 @@ destruction order by themselves: trusted owners must finalize or drop claims
 before releasing resources. Native resource finalization follows the recorded
 decision, not a new commit.
 
-The broker bridge is still missing. It must move the native ticket, native
-resources, logical registry ticket, staged commands, and shared work lease into
-one owner job, claim native authority first and logical authority second before
-any entity, clock, or storage work, and publish both decisions before effects or
-replies. A physical storage failure remains
-[indeterminate](atomic-commit-permits.md#result-boundaries), never a guaranteed
-wire rollback. SDK transaction scopes, transactional outgoing settlements, and
-durable recovery are not enabled by this native increment.
+The trusted [paired owner handoff](native-atomic-owner-handoff.md) now moves the
+native ticket, native resources, logical registry ticket, staged commands, and
+shared work lease into one owner job. It claims native authority first and
+logical authority second before broker clock sampling, entity validation, or
+storage access, and publishes both decisions before effects or replies.
+Pairing does not prove that the two submissions represent the same wire work.
+The serialized connection adapter, authorization and message-conversion bridge,
+and staging-refusal control response remain missing. A physical storage failure
+remains [indeterminate](atomic-commit-permits.md#result-boundaries), never a
+guaranteed wire rollback. SDK transaction scopes, transactional outgoing
+settlements, and durable recovery are not enabled.

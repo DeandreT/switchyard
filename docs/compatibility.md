@@ -40,7 +40,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Duplicate detection | Pre-1.0 | State machine, AMQP send/scheduling mappings, Rust and current .NET clients end to end |
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API |
-| Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and opt-in [native posting lifecycle](native-transactional-ingress.md); broker bridge and SDK transaction scopes not implemented, Service Bus listeners still refuse transaction traffic |
+| Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation, opt-in [native posting lifecycle](native-transactional-ingress.md), and [paired owner handoff](native-atomic-owner-handoff.md); connection adapter and SDK transaction scopes not implemented, Service Bus listeners still refuse transaction traffic |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete over HTTP/2 and authenticated TLS; other services not implemented |
 | Partitioned entities | Later | Out of initial scope |
@@ -93,6 +93,9 @@ behavior it currently enforces:
   resource accounting while commands are queued, cancelled, or being applied.
   The [local transaction registry](transaction-registry.md) bounds declarations
   and controller lifetimes but does not enable wire transaction traffic.
+  A trusted [paired owner handoff](native-atomic-owner-handoff.md) preserves both
+  native receipts and staged logical work through one broker job, without
+  establishing their correspondence or authorization.
 - A queue can enable duplicate detection by message ID, with a 10-minute
   default history window bounded to 20 seconds through 7 days. A duplicate
   send is accepted and dropped, and history survives completion, dead-lettering,

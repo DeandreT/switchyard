@@ -80,3 +80,5 @@ is added here. AMQP transaction traffic remains
 [explicitly unsupported](amqp-transaction-types.md).
 The separate [local registry](transaction-registry.md) builds a bounded lifecycle
 on these reservations, including unbound declarations and empty owner work.
+The trusted [paired owner handoff](native-atomic-owner-handoff.md) keeps this
+reservation alongside native receipts through coordinated owner decisions.

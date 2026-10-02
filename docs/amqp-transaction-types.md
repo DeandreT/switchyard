@@ -63,8 +63,10 @@ as a domain settlement.
 
 The Service Bus listener has no wire transaction registry, Declare/Discharge
 execution, staged message visibility, transaction timeout, or wire retry contract.
-The opt-in native API adds control receipts and provisional acknowledgments,
-but not the broker bridge. The separate trusted same-queue foundation is
+The opt-in native API adds control receipts and provisional acknowledgments.
+The trusted [paired owner handoff](native-atomic-owner-handoff.md) carries native
+and logical submissions through one broker job, but not through a serialized,
+authorized connection adapter. The separate trusted same-queue foundation is
 described in [Atomic Queue Operations](atomic-queue-operations.md), with a
 separate trusted [local registry](transaction-registry.md). Its uncertain
 physical commit result must not be reported as guaranteed wire rollback.

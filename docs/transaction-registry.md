@@ -4,8 +4,10 @@
 lifecycle for future connection transactions. It is a trusted Rust API, not an
 enabled AMQP coordinator: Service Bus listeners and default connection drivers
 still [refuse transaction traffic](amqp-transaction-types.md). The separate
-opt-in [native posting lifecycle](native-transactional-ingress.md) is not yet
-bound to this registry or the broker owner.
+opt-in [native posting lifecycle](native-transactional-ingress.md) can now travel
+with a logical submission through the trusted
+[paired broker owner handoff](native-atomic-owner-handoff.md). A connection
+adapter does not yet establish correspondence between the two lifecycles.
 
 ## Ownership And Identity
 
