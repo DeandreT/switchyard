@@ -60,15 +60,19 @@ pub enum NodeState {
     Durable(StateMachine<FjallStore>),
 }
 
-/// Validates a configuration and opens the state it names.
+/// Validates a configuration and opens development state on the chosen backend.
 ///
-/// Production is refused an in-memory store here rather than at the point a
-/// message is lost.
+/// Production is refused before opening storage: memory cannot provide durable
+/// state, and the quorum replication required for durable production is not yet
+/// implemented. Cluster validation takes precedence over either refusal.
 pub fn open(cluster: ClusterConfig, storage: StorageChoice) -> Result<NodeState, StartupError> {
     cluster.validate()?;
     match (cluster.mode, storage) {
         (DeploymentMode::Production, StorageChoice::Memory) => {
             Err(StartupError::MemoryStorageInProduction)
+        }
+        (DeploymentMode::Production, StorageChoice::Durable { .. }) => {
+            Err(StartupError::ReplicationUnavailableInProduction)
         }
         (_, StorageChoice::Memory) => {
             Ok(NodeState::Memory(StateMachine::new(MemoryStore::default())))
@@ -85,6 +89,8 @@ pub enum StartupError {
     LoggingInitialization,
     #[error("production mode cannot run on in-memory storage")]
     MemoryStorageInProduction,
+    #[error("production mode requires quorum replication, which is not implemented")]
+    ReplicationUnavailableInProduction,
     #[error("--experimental-atomic-messaging-listen is only available in development mode")]
     ExperimentalAtomicMessagingInProduction,
     #[error("the durable backend needs a data directory")]
@@ -149,6 +155,44 @@ mod tests {
     }
 
     #[test]
+    fn production_is_refused_before_a_durable_directory_or_its_parent_is_created() {
+        for voters in [3, 5] {
+            let root = TempDir::new().expect("a temporary startup directory");
+            let parent = root.path().join("unopened-parent");
+            let directory = parent.join("unopened-store");
+            assert_eq!(
+                open(
+                    ClusterConfig {
+                        mode: DeploymentMode::Production,
+                        voters,
+                    },
+                    StorageChoice::Durable {
+                        directory: directory.clone(),
+                    },
+                )
+                .err(),
+                Some(StartupError::ReplicationUnavailableInProduction),
+            );
+            assert!(!directory.exists());
+            assert!(!parent.exists());
+            assert_eq!(
+                std::fs::read_dir(root.path())
+                    .expect("the startup directory is readable")
+                    .count(),
+                0,
+            );
+        }
+    }
+
+    #[test]
+    fn production_replication_refusal_has_a_static_description() {
+        assert_eq!(
+            StartupError::ReplicationUnavailableInProduction.to_string(),
+            "production mode requires quorum replication, which is not implemented",
+        );
+    }
+
+    #[test]
     fn an_invalid_cluster_is_refused_before_any_directory_is_touched() {
         let directory = TempDir::new().expect("a temporary directory");
         let two_voters = ClusterConfig {
@@ -173,6 +217,36 @@ mod tests {
                 .count(),
             0,
             "a rejected configuration should not have created a store"
+        );
+    }
+
+    #[test]
+    fn an_invalid_development_cluster_is_refused_before_directory_creation() {
+        let root = TempDir::new().expect("a temporary startup directory");
+        let parent = root.path().join("unopened-parent");
+        let directory = parent.join("unopened-store");
+        assert_eq!(
+            open(
+                ClusterConfig {
+                    mode: DeploymentMode::Development,
+                    voters: 2,
+                },
+                StorageChoice::Durable {
+                    directory: directory.clone(),
+                },
+            )
+            .err(),
+            Some(StartupError::Cluster(
+                cluster::ClusterConfigError::DevelopmentRequiresOneVoter,
+            )),
+        );
+        assert!(!directory.exists());
+        assert!(!parent.exists());
+        assert_eq!(
+            std::fs::read_dir(root.path())
+                .expect("the startup directory is readable")
+                .count(),
+            0,
         );
     }
 

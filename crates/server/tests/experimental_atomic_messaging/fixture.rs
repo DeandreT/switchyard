@@ -258,3 +258,50 @@ pub(super) async fn occupied_socket() -> TestResult {
     drop(occupied);
     Ok(())
 }
+
+pub(super) async fn production_replication_refusal() -> TestResult {
+    let temporary = TempDir::new()?;
+    let credentials = Credentials::new()?;
+    let occupied = timeout(DEADLINE, tokio::net::TcpListener::bind("127.0.0.1:0")).await??;
+    let address = occupied.local_addr()?;
+    let expected =
+        "switchyard: production mode requires quorum replication, which is not implemented";
+
+    for voters in [3, 5] {
+        let parent = temporary.path().join(format!("never-created-{voters}"));
+        let directory = parent.join("data");
+        assert!(!parent.exists() && !directory.exists());
+        let mut arguments = vec![
+            "--namespace".into(),
+            HOST.into(),
+            "--mode".into(),
+            "production".into(),
+            "--voters".into(),
+            voters.to_string(),
+            "--listen".into(),
+            address.to_string(),
+            "--storage".into(),
+            "fjall".into(),
+            "--data-dir".into(),
+            directory.to_string_lossy().into_owned(),
+        ];
+        credentials.arguments(&mut arguments);
+        let output = Process::spawn(&arguments)?.finish(false).await?;
+        assert!(!output.status.success());
+        assert!(
+            output.stderr.lines().any(|line| line == expected),
+            "production voters={voters} must refuse replication before the occupied bind: {}",
+            output.stderr
+        );
+        for captured in [&output.stdout, &output.stderr] {
+            assert!(!captured.contains("configuration is valid"));
+            assert!(!captured.contains("accepting "));
+            assert!(!captured.contains(KEY));
+        }
+        assert!(!output.stderr.contains("could not listen on"));
+        assert!(!parent.exists() && !directory.exists());
+    }
+
+    drop(occupied);
+    Ok(())
+}

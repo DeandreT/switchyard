@@ -72,6 +72,11 @@ async fn production_refuses_experimental_flag_before_credentials_or_data_directo
 }
 
 #[tokio::test]
+async fn production_requires_replication_before_data_directory_or_listener_binding() -> TestResult {
+    fixture::production_replication_refusal().await
+}
+
+#[tokio::test]
 async fn occupied_experimental_socket_fails_before_any_listener_serves() -> TestResult {
     fixture::occupied_socket().await
 }
