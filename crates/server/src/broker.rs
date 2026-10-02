@@ -123,6 +123,11 @@ enum Request {
         target: AdminTarget,
         reply: flume::Sender<Result<Option<EntityMetadata>, ProposeError>>,
     },
+    BindAdminEntity {
+        namespace: NamespaceName,
+        target: AdminTarget,
+        reply: flume::Sender<Result<Option<EntityAdmission>, ProposeError>>,
+    },
     ListSubscriptions {
         namespace: NamespaceName,
         topic: EntityPath,
@@ -679,6 +684,13 @@ impl Broker {
                             reply,
                         } => {
                             let _ = reply.send(proposer.admin_entity_metadata(&namespace, &target));
+                        }
+                        Request::BindAdminEntity {
+                            namespace,
+                            target,
+                            reply,
+                        } => {
+                            let _ = reply.send(proposer.bind_admin_entity(&namespace, &target));
                         }
                         Request::ListSubscriptions {
                             namespace,

@@ -25,6 +25,7 @@ use crate::{AdminTarget, BrokerHandle, ProposeError, SubmitError};
 mod deletion;
 mod paging;
 mod queue_paging;
+mod rules;
 mod topology;
 
 pub use queue_paging::{MAX_NATIVE_QUEUE_SCAN_ROUNDS, MAX_NATIVE_QUEUE_SCAN_ROWS};

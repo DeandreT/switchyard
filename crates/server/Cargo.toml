@@ -37,6 +37,7 @@ hmac.workspace = true
 log.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
+serde.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 testkit.workspace = true

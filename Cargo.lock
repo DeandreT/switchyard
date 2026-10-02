@@ -1703,6 +1703,7 @@ dependencies = [
  "protocol-amqp",
  "rcgen",
  "rustls",
+ "serde",
  "sha2",
  "storage",
  "tempfile",

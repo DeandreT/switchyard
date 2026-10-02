@@ -3,6 +3,28 @@ use domain::{RuleDefinition, SubscriptionDefinition, SubscriptionName};
 use super::*;
 
 impl BrokerHandle {
+    /// Binds complete native metadata and its incarnation in one clock-free owner turn.
+    pub async fn bind_admin(
+        &self,
+        namespace: NamespaceName,
+        target: AdminTarget,
+    ) -> Result<Option<EntityAdmission>, SubmitError> {
+        let (reply, admission) = flume::bounded(1);
+        self.requests
+            .send_async(Request::BindAdminEntity {
+                namespace,
+                target,
+                reply,
+            })
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        admission
+            .recv_async()
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
+
     /// Reads complete, bounded subscription rules without a command stamp.
     pub fn rules_blocking(
         &self,

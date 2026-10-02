@@ -7,7 +7,9 @@ use std::{
     time::Duration,
 };
 
-use admin_api::v1::entity_service_server::EntityServiceServer;
+use admin_api::v1::{
+    entity_service_server::EntityServiceServer, rule_service_server::RuleServiceServer,
+};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -98,7 +100,12 @@ impl NativeAdminListener {
         };
         server
             .add_service(
-                EntityServiceServer::new(self.service)
+                EntityServiceServer::new(self.service.clone())
+                    .max_decoding_message_size(NATIVE_ADMIN_REQUEST_LIMIT)
+                    .max_encoding_message_size(NATIVE_ADMIN_RESPONSE_LIMIT),
+            )
+            .add_service(
+                RuleServiceServer::new(self.service)
                     .max_decoding_message_size(NATIVE_ADMIN_REQUEST_LIMIT)
                     .max_encoding_message_size(NATIVE_ADMIN_RESPONSE_LIMIT),
             )

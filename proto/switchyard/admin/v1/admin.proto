@@ -22,6 +22,13 @@ service EntityService {
   rpc DeleteEntity(DeleteEntityRequest) returns (Operation);
 }
 
+service RuleService {
+  rpc CreateRule(CreateRuleRequest) returns (RuleMutationResponse);
+  rpc GetRule(GetRuleRequest) returns (Rule);
+  rpc ListRules(ListRulesRequest) returns (ListRulesResponse);
+  rpc DeleteRule(DeleteRuleRequest) returns (RuleMutationResponse);
+}
+
 service BackupService {
   rpc StartBackup(StartBackupRequest) returns (Operation);
   rpc GetOperation(GetOperationRequest) returns (Operation);
@@ -197,6 +204,113 @@ message ListEntitiesResponse {
   // Opaque continuation. An empty entity page can still have a continuation;
   // listing is exhausted only when this token is empty.
   string next_page_token = 2;
+}
+
+// Subscription paths use the same canonical structure as entity administration.
+// Rule mutations are synchronous, create-only or delete-only operations.
+message CreateRuleRequest {
+  string namespace = 1;
+  string subscription_path = 2;
+  string name = 3;
+  RuleFilter filter = 4;
+}
+
+message GetRuleRequest {
+  string namespace = 1;
+  string subscription_path = 2;
+  string name = 3;
+}
+
+message ListRulesRequest {
+  string namespace = 1;
+  string subscription_path = 2;
+}
+
+message DeleteRuleRequest {
+  string namespace = 1;
+  string subscription_path = 2;
+  string name = 3;
+}
+
+message RuleMutationResponse {}
+
+message Rule {
+  string namespace = 1;
+  string subscription_path = 2;
+  string name = 3;
+  RuleFilter filter = 4;
+  uint64 created_at_unix_millis = 5;
+}
+
+// The complete bounded rule set; there is no implicit default or continuation.
+message ListRulesResponse {
+  repeated Rule rules = 1;
+}
+
+message TrueRuleFilter {}
+message FalseRuleFilter {}
+
+message RuleFilter {
+  oneof filter {
+    TrueRuleFilter true_filter = 1;
+    FalseRuleFilter false_filter = 2;
+    CorrelationRuleFilter correlation_filter = 3;
+    SqlRuleFilter sql_filter = 4;
+  }
+}
+
+message SqlRuleFilter {
+  string expression = 1;
+  // Omitted requests select the current version; responses always include it.
+  optional uint32 semantic_version = 2;
+}
+
+message CorrelationRuleFilter {
+  optional string correlation_id = 1;
+  optional string message_id = 2;
+  optional string to = 3;
+  optional string reply_to = 4;
+  optional string subject = 5;
+  optional string session_id = 6;
+  optional string reply_to_session_id = 7;
+  optional string content_type = 8;
+  // Repeated entries preserve duplicate names so they can be refused.
+  repeated CorrelationProperty properties = 9;
+}
+
+message CorrelationProperty {
+  string name = 1;
+  RuleScalarValue value = 2;
+}
+
+message RuleNullValue {}
+
+// Scalar constructors and integer widths are distinct, with no coercion.
+// Floating-point values retain their original IEEE-754 bits.
+message RuleScalarValue {
+  oneof value {
+    RuleNullValue null_value = 1;
+    bool bool_value = 2;
+    uint32 ubyte_value = 3;
+    uint32 ushort_value = 4;
+    uint32 uint_value = 5;
+    uint64 ulong_value = 6;
+    sint32 byte_value = 7;
+    sint32 short_value = 8;
+    sint32 int_value = 9;
+    sint64 long_value = 10;
+    fixed32 float_bits = 11;
+    fixed64 double_bits = 12;
+    bytes decimal32_bytes = 13;
+    bytes decimal64_bytes = 14;
+    bytes decimal128_bytes = 15;
+    uint32 char_codepoint = 16;
+    sint64 timestamp_millis = 17;
+    bytes uuid_bytes = 18;
+    bytes binary_value = 19;
+    string string_value = 20;
+    string symbol_value = 21;
+  }
 }
 
 message StartBackupRequest {

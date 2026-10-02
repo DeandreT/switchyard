@@ -1,5 +1,5 @@
-use domain::{SubscriptionDefinition, SubscriptionName};
-use protocol_amqp::EntityMetadata;
+use domain::{EntityIncarnationKind, SubscriptionDefinition, SubscriptionName};
+use protocol_amqp::{EntityAdmission, EntityMetadata};
 
 use super::*;
 
@@ -70,6 +70,37 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
                 .subscription_entity_metadata(namespace, topic, name)?
                 .map(EntityMetadata::Subscription)),
         }
+    }
+
+    /// Captures validated native topology and its identity without AMQP parsing or a clock read.
+    pub fn bind_admin_entity(
+        &self,
+        namespace: &NamespaceName,
+        target: &AdminTarget,
+    ) -> Result<Option<EntityAdmission>, ProposeError> {
+        let metadata = self.admin_entity_metadata(namespace, target)?;
+        let entity = target.canonical_entity()?;
+        let Some(metadata) = metadata else {
+            if self
+                .machine
+                .entity_incarnation(namespace, &entity)?
+                .is_some_and(|incarnation| !incarnation.is_retired())
+            {
+                return Err(BrokerError::DanglingEntityMetadata.into());
+            }
+            return Ok(None);
+        };
+        let kind = match metadata {
+            EntityMetadata::Queue(_) => EntityIncarnationKind::Queue,
+            EntityMetadata::Topic(_) => EntityIncarnationKind::Topic,
+            EntityMetadata::Subscription(_) => EntityIncarnationKind::Subscription,
+            EntityMetadata::DeadLetter(_) => return Err(BrokerError::InvalidEntityBinding.into()),
+        };
+        let binding = self
+            .machine
+            .bind_entity(namespace, &entity, &entity, kind)?
+            .ok_or(BrokerError::DanglingEntityMetadata)?;
+        Ok(Some(EntityAdmission { metadata, binding }))
     }
 
     /// Reads complete, validated subscription membership before a caller paginates it.
