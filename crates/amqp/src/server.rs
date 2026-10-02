@@ -37,6 +37,7 @@ mod native_transactions;
 mod outgoing_identity;
 mod receive_credit;
 mod retained_delivery;
+mod sender_identity;
 mod session_channels;
 mod session_identity;
 mod transactions;
@@ -75,6 +76,7 @@ use native_transactions::{NativeIngressPolicy, NativeTransactionBook};
 use outgoing_identity::AckIdentity;
 use receive_credit::{Consumption, ReceiveCredit};
 pub use retained_delivery::RetainedDelivery;
+pub use sender_identity::NativeSenderIdentity;
 use session_channels::{local_channel_for_peer, preferred_vacant_channel};
 pub use session_identity::IncomingAttach;
 use session_identity::{AttachApproval, AttachApprovalError, SessionIdentity};
@@ -436,6 +438,12 @@ pub struct PendingSettlement {
 impl PendingSettlement {
     pub fn outcome(&self) -> &Outcome {
         &self.outcome
+    }
+
+    /// Tests active exact sending-link origin, independent of the outcome or
+    /// pending acknowledgement. This is not delivery or settlement authority.
+    pub fn belongs_to_sender(&self, sender: &NativeSenderIdentity) -> bool {
+        sender.matches_active_origin(&self.identity)
     }
 
     pub async fn accept(&self) -> Result<(), EngineError> {
@@ -855,6 +863,11 @@ impl ServerSession {
 impl Sender {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Observes this accepted sending-link origin without retaining transport.
+    pub fn sender_identity(&self) -> NativeSenderIdentity {
+        NativeSenderIdentity::for_accepted_sender(&self.identity)
     }
 
     /// The peer receiver's encoded-message limit, or no advertised limit.
@@ -5107,6 +5120,9 @@ mod owned_session_admission_tests;
 
 #[cfg(test)]
 mod outgoing_settlement_tests;
+
+#[cfg(test)]
+mod sender_provenance_tests;
 
 #[cfg(test)]
 mod session_provenance_tests;
