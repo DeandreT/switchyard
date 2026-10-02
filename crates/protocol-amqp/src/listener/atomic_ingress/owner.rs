@@ -93,6 +93,7 @@ impl<B: NativeAtomicBroker> Owner<B> {
             }
             Event::RegisterController {
                 identity,
+                authorization,
                 close,
                 reply,
             } => {
@@ -116,6 +117,7 @@ impl<B: NativeAtomicBroker> Owner<B> {
                 self.controllers.push(Controller {
                     identity,
                     logical,
+                    authorization,
                     close,
                     closed: false,
                 });
@@ -237,7 +239,7 @@ impl<B: NativeAtomicBroker> Owner<B> {
                     group.handoff_busy = false;
                 }
                 match result {
-                    Ok(()) => self.handoff(key),
+                    Ok(expiry) => self.handoff(key, expiry),
                     Err(error) => {
                         self.fail_group(key);
                         self.close_group_producers(key, error);
@@ -699,21 +701,44 @@ impl<B: NativeAtomicBroker> Owner<B> {
                             .and_then(|row| row.authorization.clone())
                     })
                     .collect();
+                let controller_authorization = self
+                    .controllers
+                    .iter()
+                    .find(|row| row.identity.same_controller(&group.controller))
+                    .and_then(|row| row.authorization.clone());
                 self.push(key, async move {
-                    let mut result = Ok(());
-                    for authorization in authorizations {
-                        if let Err(error) = authorization.ensure().await {
-                            result = Err(error);
-                            break;
+                    let result = async {
+                        let mut expiry = match controller_authorization {
+                            Some(authorization) => Some(
+                                authorization
+                                    .any_grant_claim_expiry_epoch_seconds()
+                                    .await
+                                    .map_err(|_| {
+                                        super::super::unauthorized_error(
+                                            "the controller's authorization has expired",
+                                        )
+                                    })?,
+                            ),
+                            None => None,
+                        };
+                        for authorization in authorizations {
+                            let producer_expiry =
+                                authorization.claim_expiry_epoch_seconds().await?;
+                            expiry = Some(
+                                expiry
+                                    .map_or(producer_expiry, |expiry| expiry.min(producer_expiry)),
+                            );
                         }
+                        Ok(expiry)
                     }
+                    .await;
                     Operation::Authorized { key, result }
                 });
             }
         }
     }
 
-    fn handoff(&mut self, key: u64) {
+    fn handoff(&mut self, key: u64, claim_expiry: Option<u64>) {
         let valid = self.groups.get(&key).is_some_and(|group| {
             group.ready
                 && !group.refused
@@ -741,7 +766,7 @@ impl<B: NativeAtomicBroker> Owner<B> {
         else {
             return;
         };
-        let logical = match self
+        let mut logical = match self
             .registry
             .discharge(&controller.logical, &group.id, false)
         {
@@ -754,6 +779,9 @@ impl<B: NativeAtomicBroker> Owner<B> {
         let Some(group) = self.groups.get_mut(&key) else {
             return;
         };
+        if let Some(expiry) = claim_expiry {
+            logical.restrict_claim_expiry_epoch_seconds(expiry);
+        }
         let Some(sealed) = group.sealed.take() else {
             logical.permit().abort();
             self.fail_group(key);

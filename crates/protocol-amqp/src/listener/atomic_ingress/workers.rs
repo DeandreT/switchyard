@@ -125,7 +125,12 @@ pub(super) async fn controller(
     let (reply, registered) = oneshot::channel();
     let mut pending_control = None;
     let result = async {
-        let registration = Event::RegisterController { identity: identity.clone(), close, reply };
+        let registration = Event::RegisterController {
+            identity: identity.clone(),
+            authorization: authorization.clone(),
+            close,
+            reply,
+        };
         let sent = tokio::select! {
             biased;
             () = controller_expired(authorization.as_ref()) => {

@@ -33,7 +33,7 @@ pub(super) enum Operation {
     },
     Authorized {
         key: u64,
-        result: Result<(), AmqpProtocolError>,
+        result: Result<Option<u64>, AmqpProtocolError>,
     },
     Applied {
         key: u64,

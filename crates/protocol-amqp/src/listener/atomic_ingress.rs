@@ -52,6 +52,7 @@ enum Event {
     },
     RegisterController {
         identity: NativeControllerIdentity,
+        authorization: Option<Arc<crate::authorization::ConnectionAuthorization>>,
         close: mpsc::Sender<WorkerClose>,
         reply: oneshot::Sender<Result<(), AmqpProtocolError>>,
     },

@@ -199,6 +199,24 @@ impl ConnectionAuthorization {
         }
     }
 
+    /// Snapshots the longest-lived matching grant, not a revocation lease.
+    pub(crate) async fn claim_expiry_epoch_seconds(
+        &self,
+        resource: &ResourceScope,
+        permission: Permission,
+    ) -> Result<u64, AuthorizationError> {
+        let grants = self.grants.read().await;
+        claim_expiry_epoch_seconds_at(&grants, resource, permission, SystemTime::now())
+    }
+
+    /// Empty work requires a currently valid connection grant of any permission.
+    pub(crate) async fn any_grant_claim_expiry_epoch_seconds(
+        &self,
+    ) -> Result<u64, AuthorizationError> {
+        let grants = self.grants.read().await;
+        any_grant_claim_expiry_epoch_seconds_at(&grants, SystemTime::now())
+    }
+
     pub(crate) async fn wait_until_unauthorized(
         &self,
         resource: &ResourceScope,
@@ -367,6 +385,40 @@ fn epoch_seconds() -> u64 {
         .as_secs()
 }
 
+fn claim_expiry_epoch_seconds_at(
+    grants: &[AccessGrant],
+    resource: &ResourceScope,
+    permission: Permission,
+    now: SystemTime,
+) -> Result<u64, AuthorizationError> {
+    let now = checked_epoch_seconds_at(now)?;
+    grants
+        .iter()
+        .filter(|grant| grant.allows(resource, permission, now))
+        .map(AccessGrant::expires_at_epoch_seconds)
+        .max()
+        .ok_or(AuthorizationError)
+}
+
+fn any_grant_claim_expiry_epoch_seconds_at(
+    grants: &[AccessGrant],
+    now: SystemTime,
+) -> Result<u64, AuthorizationError> {
+    let now = checked_epoch_seconds_at(now)?;
+    grants
+        .iter()
+        .map(AccessGrant::expires_at_epoch_seconds)
+        .filter(|expiry| *expiry > now)
+        .max()
+        .ok_or(AuthorizationError)
+}
+
+fn checked_epoch_seconds_at(now: SystemTime) -> Result<u64, AuthorizationError> {
+    now.duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .map_err(|_| AuthorizationError)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AuthorizationError;
 
@@ -380,6 +432,46 @@ mod tests {
     use super::*;
 
     const HOST: &str = "tenant.servicebus.windows.net";
+    const CLAIM_EXPIRY: u64 = 2_000_000_000;
+
+    fn plain_claim_grant(path: &str, permissions: PermissionSet) -> AccessGrant {
+        let policy = SharedAccessPolicy::new([SharedAccessRule::new(
+            "claim-rule",
+            ResourceScope::entity(HOST, path).expect("claim scope"),
+            SharedAccessKey::new("claim-secret").expect("claim key"),
+            None,
+            permissions,
+        )
+        .expect("claim rule")])
+        .expect("claim policy");
+        policy
+            .authenticate_plain("claim-rule", "claim-secret")
+            .expect("authenticated claim grant")
+            .into_amqp_scope()
+    }
+
+    fn finite_claim_grant(permissions: PermissionSet) -> AccessGrant {
+        const TOKEN: &str = "SharedAccessSignature sr=amqps%3A%2F%2Ftenant.servicebus.windows.net%2Forders&sig=R8KtgcCb7NeOCrECrMXtQ13KLGC8CiJYw0fUnUQCznw%3D&se=2000000000&skn=send";
+        let policy = SharedAccessPolicy::new([SharedAccessRule::new(
+            "send",
+            ResourceScope::namespace(HOST).expect("namespace scope"),
+            SharedAccessKey::new("secret").expect("claim key"),
+            None,
+            permissions,
+        )
+        .expect("claim rule")])
+        .expect("claim policy");
+        policy
+            .authenticate_sas(TOKEN, 0)
+            .expect("authenticated finite claim grant")
+            .into_amqp_scope()
+    }
+
+    fn claim_time(epoch_seconds: u64) -> SystemTime {
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(epoch_seconds))
+            .expect("representable claim time")
+    }
 
     fn connection(permissions: PermissionSet) -> Arc<ConnectionAuthorization> {
         let policy = SharedAccessPolicy::new([SharedAccessRule::new(
@@ -618,5 +710,158 @@ mod tests {
         )
         .await
         .expect("a connection without grants is immediately unauthorized");
+    }
+
+    #[test]
+    fn claim_snapshots_preserve_exact_resource_case_and_permission_boundaries() {
+        let now = claim_time(1);
+        let grants = [plain_claim_grant(
+            "Orders/subscriptions/Accounting/$management",
+            PermissionSet::SEND,
+        )];
+        let allowed = ResourceScope::entity(HOST, "Orders/subscriptions/Accounting/$management")
+            .expect("exact resource")
+            .into_amqp_scope();
+        assert_eq!(
+            claim_expiry_epoch_seconds_at(&grants, &allowed, Permission::Send, now)
+                .expect("exact Send grant"),
+            u64::MAX
+        );
+        for denied in [
+            "Orders",
+            "Orders/subscriptions/Accounting",
+            "Orders/subscriptions/Billing/$management",
+            "orders/subscriptions/Accounting/$management",
+            "Orders/subscriptions/accounting/$management",
+        ] {
+            let resource = ResourceScope::entity(HOST, denied)
+                .expect("denied resource")
+                .into_amqp_scope();
+            assert!(
+                claim_expiry_epoch_seconds_at(&grants, &resource, Permission::Send, now).is_err()
+            );
+        }
+        for permission in [Permission::Listen, Permission::Manage, Permission::Audit] {
+            assert!(claim_expiry_epoch_seconds_at(&grants, &allowed, permission, now).is_err());
+        }
+    }
+
+    #[test]
+    fn claim_snapshot_uses_maximum_only_among_matching_live_grants() {
+        let resource = ResourceScope::entity(HOST, "orders").expect("resource");
+        let mut grants = vec![
+            finite_claim_grant(PermissionSet::SEND),
+            plain_claim_grant("orders", PermissionSet::LISTEN),
+            plain_claim_grant("orders-archive", PermissionSet::SEND),
+        ];
+        let now = claim_time(CLAIM_EXPIRY - 1);
+        assert_eq!(
+            claim_expiry_epoch_seconds_at(&grants, &resource, Permission::Send, now)
+                .expect("finite matching grant"),
+            CLAIM_EXPIRY
+        );
+        grants.push(plain_claim_grant("orders", PermissionSet::MANAGE));
+        for _ in 0..2 {
+            assert_eq!(
+                claim_expiry_epoch_seconds_at(&grants, &resource, Permission::Send, now)
+                    .expect("overlapping Manage grant includes Send"),
+                u64::MAX
+            );
+            grants.reverse();
+        }
+    }
+
+    #[test]
+    fn claim_snapshots_refuse_expiry_equality_expired_and_empty_grants() {
+        let grants = [finite_claim_grant(PermissionSet::SEND)];
+        let resource = ResourceScope::entity(HOST, "orders").expect("resource");
+        assert_eq!(
+            claim_expiry_epoch_seconds_at(
+                &grants,
+                &resource,
+                Permission::Send,
+                claim_time(CLAIM_EXPIRY - 1),
+            )
+            .expect("not expired"),
+            CLAIM_EXPIRY
+        );
+        for now in [claim_time(CLAIM_EXPIRY), claim_time(CLAIM_EXPIRY + 1)] {
+            assert!(
+                claim_expiry_epoch_seconds_at(&grants, &resource, Permission::Send, now).is_err()
+            );
+            assert!(any_grant_claim_expiry_epoch_seconds_at(&grants, now).is_err());
+        }
+        assert!(
+            claim_expiry_epoch_seconds_at(&[], &resource, Permission::Send, claim_time(0)).is_err()
+        );
+        assert!(any_grant_claim_expiry_epoch_seconds_at(&[], claim_time(0)).is_err());
+    }
+
+    #[test]
+    fn empty_work_snapshot_accepts_any_live_grant_and_uses_its_maximum_expiry() {
+        let resource = ResourceScope::entity(HOST, "other").expect("unmatched resource");
+        let now = claim_time(CLAIM_EXPIRY - 1);
+        let mut grants = vec![finite_claim_grant(PermissionSet::LISTEN)];
+        assert!(claim_expiry_epoch_seconds_at(&grants, &resource, Permission::Send, now).is_err());
+        assert_eq!(
+            any_grant_claim_expiry_epoch_seconds_at(&grants, now).expect("any Listen grant"),
+            CLAIM_EXPIRY
+        );
+        grants.push(plain_claim_grant("unrelated", PermissionSet::LISTEN));
+        assert_eq!(
+            any_grant_claim_expiry_epoch_seconds_at(&grants, now).expect("longest any grant"),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn claim_snapshots_fail_closed_when_epoch_time_cannot_be_represented() {
+        let now = UNIX_EPOCH
+            .checked_sub(Duration::from_nanos(1))
+            .expect("representable pre-epoch time");
+        let grants = [plain_claim_grant("orders", PermissionSet::MANAGE)];
+        let resource = ResourceScope::entity(HOST, "orders").expect("resource");
+        assert!(claim_expiry_epoch_seconds_at(&grants, &resource, Permission::Send, now).is_err());
+        assert!(any_grant_claim_expiry_epoch_seconds_at(&grants, now).is_err());
+    }
+
+    #[tokio::test]
+    async fn public_claim_snapshots_return_numbers_without_changing_existing_authorization() {
+        let connection = connection(PermissionSet::SEND);
+        let resource = ResourceScope::entity(HOST, "orders").expect("resource");
+        let before = connection.grants.read().await.clone();
+        assert_eq!(
+            connection
+                .claim_expiry_epoch_seconds(&resource, Permission::Send)
+                .await
+                .expect("current Send snapshot"),
+            u64::MAX
+        );
+        assert_eq!(
+            connection
+                .any_grant_claim_expiry_epoch_seconds()
+                .await
+                .expect("current connection snapshot"),
+            u64::MAX
+        );
+        assert!(
+            connection
+                .claim_expiry_epoch_seconds(&resource, Permission::Listen)
+                .await
+                .is_err()
+        );
+        assert!(
+            connection
+                .authorize_resource(&resource, Permission::Send)
+                .await
+                .is_ok()
+        );
+        assert!(
+            connection
+                .authorize_resource(&resource, Permission::Listen)
+                .await
+                .is_err()
+        );
+        assert_eq!(*connection.grants.read().await, before);
     }
 }

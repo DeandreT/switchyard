@@ -7,6 +7,7 @@ use super::operations::Operation;
 
 mod admissions;
 mod begin_gate;
+mod claim_expiry;
 mod fixture;
 mod recorder;
 

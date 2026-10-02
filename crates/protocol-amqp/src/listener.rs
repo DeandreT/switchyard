@@ -551,6 +551,13 @@ impl LinkAuthorization {
             .map_err(|_| unauthorized_error("the link's authorization has expired"))
     }
 
+    async fn claim_expiry_epoch_seconds(&self) -> Result<u64, AmqpProtocolError> {
+        self.connection
+            .claim_expiry_epoch_seconds(&self.resource, self.permission)
+            .await
+            .map_err(|_| unauthorized_error("the link's authorization has expired"))
+    }
+
     async fn wait_until_unauthorized(&self) {
         self.connection
             .wait_until_unauthorized(&self.resource, self.permission)

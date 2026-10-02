@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, time::Instant};
+use std::{collections::VecDeque, sync::Arc, time::Instant};
 
 use amqp::{
     NativeControllerIdentity, NativeReceiverIdentity, NativeTransactionIdentity, PreparedPosting,
@@ -12,6 +12,7 @@ use crate::AtomicTransactionController;
 pub(super) struct Controller {
     pub(super) identity: NativeControllerIdentity,
     pub(super) logical: AtomicTransactionController,
+    pub(super) authorization: Option<Arc<crate::authorization::ConnectionAuthorization>>,
     pub(super) close: mpsc::Sender<WorkerClose>,
     pub(super) closed: bool,
 }

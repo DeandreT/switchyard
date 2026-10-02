@@ -15,9 +15,11 @@ use tokio::{
     time::timeout,
 };
 
+use super::super::super::LinkAuthorization;
 use super::super::{Event, QueueAdmission, WorkerClose, owner::Owner};
 use super::begin_gate::{BeginGate, GatedIo};
 use super::recorder::Recorder;
+use crate::authorization::ConnectionAuthorization;
 
 pub(super) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub(super) const DEADLINE: Duration = Duration::from_secs(5);
@@ -257,6 +259,12 @@ async fn attached(peer: &mut Peer, channel: u16, handle: u32) -> TestResult {
 
 impl Fixture {
     pub(super) async fn new() -> TestResult<Self> {
+        Self::new_with_authorization(None).await
+    }
+
+    pub(super) async fn new_with_authorization(
+        authorization: Option<Arc<ConnectionAuthorization>>,
+    ) -> TestResult<Self> {
         timeout(DEADLINE, async {
             let (server, io) = tokio::io::duplex(16_384);
             let begin_gate = Arc::new(BeginGate::default());
@@ -344,6 +352,7 @@ impl Fixture {
             let (reply, registered) = oneshot::channel();
             owner.process(Event::RegisterController {
                 identity: coordinator.controller_identity().clone(),
+                authorization: authorization.clone(),
                 close: close_controller,
                 reply,
             });
@@ -359,13 +368,28 @@ impl Fixture {
             )?;
             let (close_producer, producer_commands) = mpsc::channel(1);
             let (reply, registered) = oneshot::channel();
+            let producer_authorization = match authorization {
+                Some(connection) => {
+                    let permission = auth::Permission::Send;
+                    let resource = connection
+                        .authorize_entity("orders", permission)
+                        .await
+                        .map_err(|_| "private sender authorization missing")?;
+                    Some(LinkAuthorization {
+                        connection,
+                        resource,
+                        permission,
+                    })
+                }
+                None => None,
+            };
             owner.process(Event::RegisterProducer {
                 identity: receiver.receiver_identity(),
                 admission: QueueAdmission {
                     binding,
                     config: QueueConfig::default(),
                 },
-                authorization: None,
+                authorization: producer_authorization,
                 close: close_producer,
                 reply,
             });
