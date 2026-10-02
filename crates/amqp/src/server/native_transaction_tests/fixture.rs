@@ -51,6 +51,11 @@ enum FlushTarget {
         handle: u32,
         rejected: bool,
     },
+    ErrorDetach {
+        channel: u16,
+        handle: u32,
+        condition: &'static str,
+    },
 }
 
 impl FlushTarget {
@@ -144,6 +149,27 @@ impl FlushTarget {
                         error.condition.as_symbol().as_str() == "amqp:transaction:rollback"
                     })
             }
+            (
+                Self::ErrorDetach {
+                    channel: expected,
+                    handle,
+                    condition,
+                },
+                Frame::Amqp {
+                    channel,
+                    performative: Some(Performative::Detach(detach)),
+                    payload,
+                },
+            ) => {
+                *channel == expected
+                    && detach.handle == handle
+                    && detach.closed
+                    && payload.is_empty()
+                    && detach
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| error.condition.as_symbol().as_str() == condition)
+            }
             _ => false,
         }
     }
@@ -194,6 +220,28 @@ impl FlushGate {
                 id,
                 handle,
                 rejected,
+            },
+            true,
+        );
+    }
+
+    pub(super) fn block_error_detach(&self, channel: u16, handle: u32, condition: &'static str) {
+        self.arm(
+            FlushTarget::ErrorDetach {
+                channel,
+                handle,
+                condition,
+            },
+            false,
+        );
+    }
+
+    pub(super) fn fail_error_detach(&self, channel: u16, handle: u32, condition: &'static str) {
+        self.arm(
+            FlushTarget::ErrorDetach {
+                channel,
+                handle,
+                condition,
             },
             true,
         );

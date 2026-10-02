@@ -37,11 +37,19 @@ impl CoordinatorEndpoint {
     }
 
     pub async fn close(&self) -> Result<(), EngineError> {
+        self.close_inner(None).await
+    }
+
+    pub async fn close_with_error(&self, error: Error) -> Result<(), EngineError> {
+        self.close_inner(Some(error)).await
+    }
+
+    async fn close_inner(&self, error: Option<Error>) -> Result<(), EngineError> {
         request(&self.route.commands, |reply| Command::Detach {
             channel: self.route.channel,
             handle: self.route.handle,
             identity: self.route.owner.clone(),
-            error: None,
+            error,
             reply,
         })
         .await
@@ -132,11 +140,19 @@ impl TransactionalReceiver {
     }
 
     pub async fn close(&self) -> Result<(), EngineError> {
+        self.close_inner(None).await
+    }
+
+    pub async fn close_with_error(&self, error: Error) -> Result<(), EngineError> {
+        self.close_inner(Some(error)).await
+    }
+
+    async fn close_inner(&self, error: Option<Error>) -> Result<(), EngineError> {
         request(&self.route.commands, |reply| Command::Detach {
             channel: self.route.channel,
             handle: self.route.handle,
             identity: self.route.owner.clone(),
-            error: None,
+            error,
             reply,
         })
         .await

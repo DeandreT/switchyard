@@ -547,3 +547,85 @@ async fn abort_metadata_cleanup_keeps_complete_and_prepared_content_owned_until_
         }
     }
 }
+
+#[tokio::test]
+async fn ordinary_error_detach_faults_native_group_without_refunding_held_content() {
+    for flushed in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture
+            .controller
+            .0
+            .register(&fixture.group)
+            .expect("controller retirement tracks the original group");
+        let posting = fixture.posting();
+        let (posting, prepared) = if flushed {
+            let prepared = fixture.drive(posting.provisional_accept()).await;
+            assert_eq!(fixture.dispositions().await.len(), 1);
+            (None, Some(prepared))
+        } else {
+            (Some(posting), None)
+        };
+        assert_eq!(fixture.budget.retained_bytes(), fixture.post_bytes);
+        let error = Error::new(
+            crate::AmqpError::InternalError,
+            "native posting stage failed",
+            None,
+        );
+        let (reply, response) = oneshot::channel();
+        let result = crate::server::handle_command(
+            Command::Detach {
+                channel: CHANNEL,
+                handle: CONTROL,
+                identity: fixture.controller_owner.clone(),
+                error: Some(error.clone()),
+                reply,
+            },
+            &mut fixture.writer,
+            &mut fixture.sessions,
+            512,
+        )
+        .await
+        .expect("ordinary exact Detach handler");
+        assert!(matches!(result, CommandAction::Continue));
+        response
+            .await
+            .expect("close reply")
+            .expect("error Detach flushed");
+        assert_eq!(fixture.group.state(), NativeTransactionState::Faulted);
+        assert_eq!(
+            fixture.group.error(),
+            NativeTransactionError::Faulted(NativeFault::Closed)
+        );
+        assert!(!fixture.controller.is_active());
+        assert_eq!(
+            fixture.budget.retained_bytes(),
+            fixture.post_bytes,
+            "error Detach retires metadata, not an external native receipt lease"
+        );
+        let bytes = std::mem::take(&mut *fixture.output.0.lock().expect("captured frames"));
+        let mut input = bytes.as_slice();
+        let Frame::Amqp {
+            channel: CHANNEL,
+            performative: Some(Performative::Detach(detach)),
+            payload,
+        } = read_frame(&mut input).await.expect("exact error Detach")
+        else {
+            panic!("no posting or control outcome")
+        };
+        assert_eq!(detach.handle, CONTROL);
+        assert!(detach.closed);
+        assert_eq!(detach.error, Some(error));
+        assert!(payload.is_empty());
+        assert!(input.is_empty());
+        if let Some(posting) = &posting {
+            assert_eq!(posting.message(), &fixture.post);
+        }
+        if let Some(prepared) = &prepared {
+            assert_eq!(prepared.message(), &fixture.post);
+        }
+        drop(posting);
+        drop(prepared);
+        assert_eq!(fixture.budget.retained_bytes(), 0);
+        assert_eq!(fixture.group.state(), NativeTransactionState::Faulted);
+    }
+}

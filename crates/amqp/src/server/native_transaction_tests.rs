@@ -27,6 +27,9 @@ mod receiver_provenance;
 #[path = "native_transaction_tests/formats.rs"]
 mod formats;
 
+#[path = "native_transaction_tests/error_close.rs"]
+mod error_close;
+
 #[tokio::test]
 async fn default_connection_refuses_coordinator_without_publishing_approval() {
     let mut fixture = Fixture::new(false).await;
