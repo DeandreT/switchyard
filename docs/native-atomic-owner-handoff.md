@@ -33,6 +33,12 @@ access. The logical claim checks its existing monotonic deadline. A refused
 native claim drops the logical ticket before replying. A refused logical claim
 records a known-no-I/O native abort before replying.
 
+Any [optional epoch restriction](atomic-commit-permits.md#optional-epoch-horizon)
+is forwarded on the unique logical ticket for both bound and empty work. The
+logical owner claim re-samples epoch time before acquisition; expiry follows the
+same refused-claim compensation before broker I/O. Pairing does not derive,
+refresh, or prove that trusted numeric restriction.
+
 Once both claims have started, cancellation or connection retirement cannot
 undo the owner operation. On unwind, the logical claim records Indeterminate
 before the native claim does, before the retained native resources and logical

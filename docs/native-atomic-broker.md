@@ -14,6 +14,12 @@ before wrapping it in asynchronous result conversion. Dropping the wrapper
 before its first poll therefore retains the original pending-only cancellation
 behavior; it does not postpone arming cancellation until polling.
 
+The unique logical ticket also retains any
+[optional numeric claim-expiry restriction](atomic-commit-permits.md#optional-epoch-horizon)
+through this boundary, for both bound and empty work. The owner checks it before
+logical acquisition, compensating an earlier native claim before broker I/O.
+The trait neither derives authorization nor extends a captured horizon.
+
 `NativeAtomicBrokerCompletion` owns an application result and the unique native
 resources. It is not clonable. `application()` borrows the result; consuming
 `into_parts()` moves both parts out for asynchronous native finalization. Its

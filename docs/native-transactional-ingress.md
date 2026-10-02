@@ -118,8 +118,10 @@ shared work lease into one owner job. It claims native authority first and
 logical authority second before broker clock sampling, entity validation, or
 storage access, and publishes both decisions before effects or replies.
 Pairing does not prove that the two submissions represent the same wire work.
-The serialized connection adapter and authorization and message-conversion
-bridge remain missing. A physical storage failure
+The explicit [posting-only listener](atomic-posting-ingress.md) supplies the
+serialized connection owner and authorization/message-conversion bridge for
+primary non-session queue sends; ordinary listeners remain disabled.
+A physical storage failure
 remains [indeterminate](atomic-commit-permits.md#result-boundaries), never a
 guaranteed wire rollback. SDK transaction scopes, transactional outgoing
 settlements, and durable recovery are not enabled.

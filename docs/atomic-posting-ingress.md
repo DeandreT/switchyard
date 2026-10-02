@@ -92,7 +92,25 @@ unrelated controllers or reverse started work. Existing native error-history
 fallback can instead close the affected session.
 
 Producer authorization is checked at admission, stage, and handoff, and grant
-expiry is watched by collectors. These checks do not provide an atomic wall-clock
-authorization-expiry fence against a queued owner claim under delayed runtime
-scheduling. No stronger authorization-at-claim guarantee is exposed by this
-experimental entry point.
+expiry is watched by collectors. At handoff, the controller snapshots the maximum
+expiry among currently valid connection grants. Each required producer
+snapshots the maximum expiry among grants allowing its exact resource and Send.
+The minimum of these required expiries restricts the unique logical ticket; only
+the number travels with the queued job, not grants or authorization locks. An
+empty transaction still requires the controller's any-valid-grant snapshot.
+When authentication is disabled, no epoch restriction is added.
+
+The broker owner samples epoch time again before the logical claim transition.
+At or after the captured expiry, pending authority becomes the existing
+`Aborted` state. The earlier native claim is compensated with a known-no-I/O
+abort before broker clock sampling or storage access. This adds no new wire
+error code or persistent record, and the independent monotonic transaction
+deadline still applies. Started work cannot be revoked.
+
+This is a sampled expiry check, not an atomic wall-clock-plus-claim or revocation
+guarantee. A forward clock jump after sampling can cross the horizon before the
+claim; a backward jump can make a captured horizon appear live again while work
+is pending. Renewals after the snapshot do not extend a queued job, and later
+grant replacement or removal is still handled by existing pending-cancellation
+events. Snapshot selection adds no new grant-count, scan-work, or process-memory
+bound.

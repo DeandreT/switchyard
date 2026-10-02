@@ -33,6 +33,29 @@ pending work. The deadline is checked at acquisition, not by a background timer;
 it does not interrupt an already-started storage operation. This clock is
 separate from the deterministic timestamp stamped into domain commands.
 
+## Optional Epoch Horizon
+
+`AtomicCommitTicket::restrict_claim_expiry_epoch_seconds(u64)` adds a numeric
+owner-claim ceiling to the unique ticket. Repeated calls only tighten it; they
+cannot extend or remove it. The same method on `OwnedAtomicMessagingSubmission`,
+`OwnedEmptyAtomicMessagingSubmission`, and `AtomicTransactionSubmission` forwards
+the restriction without changing permit observers, authority, payload ownership,
+or resource accounting.
+
+A restricted ticket samples `SystemTime` epoch seconds at owner acquisition and
+aborts pending authority when the sample reaches the horizon or cannot represent
+epoch time. The original monotonic deadline remains an independent limit.
+Unrestricted tickets keep their previous behavior and do not sample wall-clock
+time. An expiry refusal is the existing `AtomicCommitClaimError::Aborted`, not a
+new persistent decision or wire error. Neither clock can revoke Started work.
+
+The number is a trusted restriction, not proof of an authorization grant. The
+[posting-only listener](atomic-posting-ingress.md) derives it from current grants;
+this API does not inspect or retain them. Clock sampling and the claim transition
+are separate operations, so forward or backward wall-clock changes retain their
+sampling caveats. Renewals cannot extend an already captured queued horizon, and
+the restriction supplies no grant-revocation guarantee or new memory/scan bound.
+
 ## Cancellation And Shutdown
 
 The async entry point constructs its cancellation guard before returning the
@@ -75,4 +98,5 @@ The separate [owned work API](atomic-work-reservations.md) keeps bounded resourc
 reservations attached to commands throughout queueing and owner completion.
 The trusted [paired owner handoff](native-atomic-owner-handoff.md) coordinates a
 logical permit and native claim without performing wire I/O on the owner.
-The wire still [refuses unsupported transaction traffic](amqp-transaction-types.md).
+Ordinary/default wire paths still
+[refuse unsupported transaction traffic](amqp-transaction-types.md).
