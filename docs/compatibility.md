@@ -854,6 +854,23 @@ later credit reduction can delay it until a new grant. This follows the
 Reservations do not reserve encoded payload bytes or guarantee successful
 encoding, flush, or settlement. Ordinary sends without reservations retain
 their existing queued-send API and resource limits.
+`send_reserved_with_settlement_owned` consumes a claimed reservation and returns
+an owned `Send + 'static` future without borrowing the sender. Creating that
+future performs no transport IO; it already owns the message, tag, original
+endpoint metadata, and cancellation guard. The borrowed reserved-send method
+delegates to the same path when polled. Dropping before the actor consumes the
+token cancels the unique slot through shared state, including while command
+capacity is unavailable. After native admission, dropping a waiter cannot undo
+the send, return spent wire credit, release its retained tag, or settle a broker
+lock.
+For unsettled sends, the result is the existing `PendingSettlement` after the
+peer outcome or applicable default, not a flush-only receipt. Initially
+sender-settled sends retain their local Accepted result after final flush. Its
+exact delivery provenance and caller-controlled final acknowledgement remain
+unchanged. Multiple owned futures may be awaited independently; this API does
+not enable ordinary
+listener pipelining, reserve caller-owned message bytes, or add broker
+authorization. See [Native Outgoing Admission](native-outgoing-admission.md).
 Outgoing delivery IDs are allocated independently of incoming IDs, within one
 session's sending direction. When the cursor wraps onto a live ID, a bounded
 vacancy search skips unresolved deliveries, pending acknowledgements, and active
