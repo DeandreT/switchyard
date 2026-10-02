@@ -6,6 +6,8 @@ It joins actual native control and posting receipts to the logical transaction
 registry and the paired broker owner. Ordinary `serve()` and the server's normal
 listener configuration remain transaction-disabled. This is not an official SDK
 transaction-scope gate, transactional receiving, or a persistent recovery log.
+The separate [atomic messaging listener](atomic-messaging-ingress.md) adds held
+PeekLock retirement without broadening this posting-only endpoint.
 
 ## Admission And Correspondence
 

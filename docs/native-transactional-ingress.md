@@ -135,7 +135,9 @@ Pairing does not prove that the two submissions represent the same wire work.
 The explicit [posting-only listener](atomic-posting-ingress.md) supplies the
 serialized connection owner and authorization/message-conversion bridge for
 primary non-session queue sends; ordinary listeners remain disabled.
+The separate [atomic messaging listener](atomic-messaging-ingress.md) adds
+exact held PeekLock completion and a mixed prepared manifest.
 A physical storage failure
 remains [indeterminate](atomic-commit-permits.md#result-boundaries), never a
-guaranteed wire rollback. SDK transaction scopes, transactional outgoing
-settlements, and durable recovery are not enabled.
+guaranteed wire rollback. SDK transaction scopes and durable recovery are not
+enabled; outgoing settlements remain unsupported on this posting-only path.

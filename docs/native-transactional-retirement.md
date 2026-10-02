@@ -52,6 +52,16 @@ the AMQP standard. `NativePreparedWork` combines posting and retirement proofs;
 `SealedDischargeReceipt::prepare_work()` requires the exact complete mixed set.
 The existing posting-only `prepare()` API remains available.
 
+`SealedDischargeReceipt::retirement_origins()` observes the sealed live group's
+bounded exact sender and original-delivery metadata, including receipts not yet
+dequeued by a collector. The snapshot is inert and grants no settlement or
+commit authority. Terminal replay receipts return `None`, not a claimed empty
+manifest. This lets a serialized adapter account for captured retirements before
+acknowledging rollback and rearming a worker.
+The companion `posting_receivers()` snapshot includes one exact receiver origin
+per captured posting, including repeated origins on the same link. It has the
+same terminal-replay and inert metadata boundaries; it is not a prepared manifest.
+
 ## Rollback And Lifetime
 
 Known rollback restores the original live delivery and preserves its ID, tag,
@@ -83,8 +93,10 @@ does not own this consumer-drop control.
 
 Early-settlement rollback requires source-default handling and is not implemented
 by this subset. Transactional acquisition, prior nonterminal-state restoration,
-other retirement outcomes, and broker-adapter correspondence to held domain
-locks remain separate work. The
+and other retirement outcomes remain separate work. The separate
+[atomic messaging listener](atomic-messaging-ingress.md) establishes bounded
+correspondence to actual primary-queue PeekLock deliveries; this native API
+does not activate it by itself. The
 [posting-only listener](atomic-posting-ingress.md) remains posting-only.
 
 These distinctions follow [AMQP Transactions sections 4.4.2 and

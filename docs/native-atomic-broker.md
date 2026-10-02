@@ -55,5 +55,7 @@ This boundary adds no authorization, receiver admission, body conversion,
 connection supervision, persistent format, or recovery log. A serialized,
 authorized connection adapter is still required; the explicit
 [posting-only listener](atomic-posting-ingress.md) provides a narrow one.
+The separate [atomic messaging listener](atomic-messaging-ingress.md) also derives
+held completion from actual outgoing retirement receipts and queue locks.
 Default Service Bus listener
 transactions and SDK transaction scopes remain disabled.

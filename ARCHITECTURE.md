@@ -313,10 +313,12 @@ exposes these operations.
 The current core has a trusted atomic-messaging foundation for immediate sends
 and held settlements on one primary non-session queue. A bounded point-read
 overlay prepares an ordered group and commits one normalized batch, publishing
-only committed ready-index effects. It has no wire coordinator or staged
-transaction lifecycle yet; see [Atomic Queue Operations](docs/atomic-queue-operations.md).
-The native codec represents [transaction wire types](docs/amqp-transaction-types.md),
-with explicit engine refusals before ordinary messaging mutation.
+only committed ready-index effects; see [Atomic Queue Operations](docs/atomic-queue-operations.md).
+Explicit trusted native listeners provide coordinator and staged posting
+receipts, with a separate [atomic messaging listener](docs/atomic-messaging-ingress.md)
+joining held PeekLock completion to the same-queue owner. These are local,
+bounded lifecycles rather than replicated transaction records or SDK scopes.
+Default Service Bus listeners still refuse transaction traffic.
 The following lifecycle remains the production design.
 
 AMQP transactions are represented by replicated begin, stage, commit, and

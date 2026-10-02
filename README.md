@@ -137,7 +137,7 @@ and retained recreation fences described in [Entity Deletion](docs/entity-deleti
 Other native services and Azure administration compatibility remain unfinished.
 
 The trusted Rust broker API also provides bounded, same-queue atomic sends and
-settlements. This is a transaction foundation, not wire transaction support;
+settlements. These primitives underpin the separate opt-in native listeners;
 scope and retry boundaries are in [Atomic Queue Operations](docs/atomic-queue-operations.md).
 The optional [guarded commit API](docs/atomic-commit-permits.md) adds pending-only
 cancellation and a runtime commit decision.
@@ -152,8 +152,9 @@ adds coordinator receipts and an ordered owner handoff. The trusted
 and logical work through one broker job. An explicit
 [posting-only listener](docs/atomic-posting-ingress.md) now derives and stages
 actual native receipts through that owner. Default Service Bus listeners still
-refuse transactions; SDK transaction scopes and transactional receiving remain
-unfinished.
+refuse transactions; SDK transaction scopes remain unfinished. A separate
+[atomic messaging listener](docs/atomic-messaging-ingress.md) adds actual held
+PeekLock completion to the same owner, without changing the posting-only endpoint.
 The sender-side listener uses [retained ingress receipts](docs/retained-ingress.md)
 to preserve native content accounting through broker replies and acknowledgment flush.
 [Native connection identities](docs/native-connection-identity.md) preserve exact
@@ -169,7 +170,7 @@ live delivery state or granting settlement authority.
 A separate opt-in [native transactional retirement](docs/native-transactional-retirement.md)
 path captures exact peer dispositions for fully flushed outgoing deliveries and
 combines their prepared receipts with postings. It does not enable transactional
-receiving in the broker adapter or SDKs.
+receiving by default or SDK transaction scopes.
 
 ## Production Contract
 
