@@ -141,6 +141,8 @@ settlements. This is a transaction foundation, not wire transaction support;
 scope and retry boundaries are in [Atomic Queue Operations](docs/atomic-queue-operations.md).
 The optional [guarded commit API](docs/atomic-commit-permits.md) adds pending-only
 cancellation and a runtime commit decision.
+The [owned work API](docs/atomic-work-reservations.md) carries shared resource
+reservations through queueing, cancellation, and owner completion.
 The [native transaction types](docs/amqp-transaction-types.md) are represented
 explicitly but refused by connection drivers until the wire lifecycle is built.
 

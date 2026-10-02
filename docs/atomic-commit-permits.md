@@ -71,4 +71,6 @@ idempotent. No decision survives a process restart.
 
 These APIs add no connection transaction registry, provisional settlement,
 held-message undo, AMQP Declare/Discharge acceptance, or authorization checks.
+The separate [owned work API](atomic-work-reservations.md) keeps bounded resource
+reservations attached to commands throughout queueing and owner completion.
 The wire still [refuses unsupported transaction traffic](amqp-transaction-types.md).

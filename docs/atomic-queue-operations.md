@@ -105,6 +105,10 @@ total memory or process-RSS guarantee. A backend point read materializes one
 value before its length can be rejected; the existing record decoder is not
 replaced here.
 
+The payload-free `AtomicMessagingInputUsage` exposes this same borrowed input
+accounting incrementally. Optional [owned work reservations](atomic-work-reservations.md)
+add shared slot, content, and value-item caps that survive owner queue handoff.
+
 The 100-message ceiling aligns with the documented
 [Service Bus send transaction quota](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-quotas).
 Other ceilings, and the narrower allowed operations, are local policies, not
