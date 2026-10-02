@@ -33,9 +33,9 @@ Committed delivery notifications wake all registered entity waiters, including
 independent session receivers; registration precedes each receive attempt.
 Boolean, scalar correlation, and bounded SQL rules are persisted and managed
 through AMQP and the native gRPC [rule API](docs/native-rules.md).
-SQL error routing has an explicit subscription policy. Trusted domain
+SQL error routing has an explicit subscription policy. AMQP and domain
 [REMOVE actions](docs/sql-actions.md) create independently transformed copies;
-wire action creation and Azure administration remain unimplemented. Native
+native action creation and Azure administration remain unimplemented. Native
 administration creates, reads, lists, partially updates, and atomically deletes
 queues, topics, and subscriptions. Deletion purges owned state under explicit
 work limits while retaining counters and entity identities as recreation fences; see
@@ -289,11 +289,12 @@ override matches within one subscription. By default they route one session-free
 lifetime-free copy to its shadow with fixed local error fields; disabling the
 subscription option drops only that copy. Resource limits instead refuse the
 entire command atomically, including limits found after a finite error.
-The trusted action command adds one independently annotated copy per matching
+The domain action command adds one independently annotated copy per matching
 REMOVE action, beyond the single OR-combined action-free copy. Those copies use
 additional parent counter sequences after all original input acknowledgements;
-the exact-key removal and final RuleName collision policy are local. Wire and
-native administration refuse actions they cannot represent. Detailed policies
+the exact-key removal and final RuleName collision policy are local. AMQP
+enumeration preserves complete actions; native administration refuses action
+reads until it can represent them. Detailed policies
 are in [SQL Rules](docs/sql-rules.md) and [SQL Actions](docs/sql-actions.md).
 Fanout admission bounds retained copies, content, and typed value items before
 cloning; committed application effects name only actual ready destinations.

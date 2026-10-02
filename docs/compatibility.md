@@ -32,7 +32,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
 | Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; Azure administration not implemented |
-| Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD; trusted REMOVE actions with independent copies, wire action CRUD pending |
+| Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD; AMQP REMOVE actions with independent copies, native action CRUD pending |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Dead-letter | Pre-1.0 | State machine, AMQP mapping |
@@ -221,12 +221,14 @@ Duplicate detection runs once at topic ingress;
 duplicate publications consume a sequence but create no copies. A topic with
 no subscriptions acknowledges publications without retaining messages, and a
 later subscription sees only later publications. Each copy preserves its body
-and typed envelope, takes the shortest requested/topic/subscription TTL, and has
+and system fields; [REMOVE actions](sql-actions.md) transform only their private
+application properties. Copies take the shortest requested/topic/subscription TTL and have
 independent receive, settlement, lock expiry, deferral, and dead-letter state.
 All input and destination validation precedes commit, including duplicate inputs;
 one invalid destination or exhausted topic sequence rejects the whole command.
 
-Copies share their publication's topic-assigned sequence. This local policy is
+Action-free copies share their publication's topic-assigned sequence; retained
+action copies receive additional parent-topic sequences. The shared-sequence policy is
 inferred from Microsoft's
 [topic-scoped sequencing description](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sequencing),
 not a cloud-verified cross-subscription guarantee. A late subscription does not
@@ -244,8 +246,8 @@ OR together and emit at most one copy per matching subscription. Removing the
 final rule selects nothing, with no implicit default fallback. These Boolean,
 default, and combination semantics follow Microsoft's
 [topic filter documentation](https://learn.microsoft.com/en-us/azure/service-bus-messaging/topic-filters).
-Bounded SQL predicates are supported alongside those filters. Trusted
-[REMOVE actions](sql-actions.md) add independent copies; wire action creation and
+Bounded SQL predicates are supported alongside those filters. AMQP and domain
+[REMOVE actions](sql-actions.md) add independent copies; native action creation and
 compound correlation predicates remain explicitly unsupported rather than
 treated as successful matches.
 
@@ -412,7 +414,11 @@ the normal atomic stamped-command path. Enumeration accepts `top` 1 through 100
 and a nonnegative `skip` against the complete bounded, sorted rule set. A requested
 page that exceeds the response allowance fails rather than returning a shortened
 successful page, which could prematurely stop the SDK's enumeration loop.
-SQL enumeration returns the exact stored source and SDK compatibility level 20.
+SQL filter and [REMOVE action](sql-actions.md) enumeration returns exact stored
+source and AMQP int compatibility level 20. Actions use the full-width SQL-action
+descriptor, distinct from the SQL-filter descriptor; no-action rules retain the
+empty-action descriptor. Optional action creation is accepted through the same
+admitted child binding, with no request-field or associated-link redirection.
 Malformed syntax returns status 400; unsupported constructs return 501; compile
 and evaluation resource limits return 403. None are simulated successful rules.
 
@@ -1030,15 +1036,25 @@ send, and timer activation. Boolean/correlation rule creation, removal,
 enumeration, and delivery selection are also exercised. SQL gates cover exact
 source enumeration, numeric and case-aware selection, missing/null properties,
 correlation overlap, both batch APIs, current-rule scheduled activation, and
-filter-error dead-letter/drop policies. Actions and Azure administration remain
-ungated. These checks establish local interoperability, not cloud parity for
-the documented SQL semantic choices.
+filter-error dead-letter/drop policies. Separate [REMOVE action](sql-actions.md)
+gates on both pins and backends prove exact action source enumeration, original
+filter independence, one OR-combined base plus two independently settled action
+copies, exact-key removals, final RuleName collision handling, body/system/footer
+preservation, and an awaited unsupported-SET refusal followed by a healthy send.
+They restore default rules, verify empty subscriptions and dead-letter queues,
+and check committed cleanup again after reopen. Azure administration remains
+ungated. These checks establish local interoperability, not cloud parity for the
+documented SQL semantic choices.
 
 The SDK gates build into separate temporary directories and run the resulting
 assemblies directly. Run them explicitly with
 `cargo test -j 2 -p server --test amqp_dotnet_current -- --ignored --test-threads=1`;
 each .NET build is limited to two jobs, and serial test execution preserves that
 limit across the two releases.
+The new action gates reuse the bounded transaction process runner: each build
+and client process has a 180-second deadline and bounded output capture, with
+owned-process cleanup and isolated certificate trust. This does not add process
+lifetime guarantees to the older ordinary-message or WebSocket gate runners.
 
 ### Message Content
 

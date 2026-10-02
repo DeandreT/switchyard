@@ -1,16 +1,74 @@
 # SQL Actions
 
-The trusted domain command `CreateRuleWithAction` adds a bounded SQL action to a
-subscription rule. This first subset removes user properties only. It does not
-implement `SET`, system-property mutation, dynamic property names, arithmetic,
-functions, parameters, or complete Azure action compatibility.
+The domain command `CreateRuleWithAction` and AMQP rule management add a bounded
+SQL action to a subscription rule. This first subset removes user properties
+only. It does not implement `SET`, system-property mutation, dynamic property
+names, arithmetic, functions, parameters, or complete Azure action compatibility.
 
-AMQP, native gRPC, and `switchyardctl` cannot create actions yet. Their rule reads
-must not discard action metadata: native Get refuses an action-bearing rule,
-native List refuses any action-bearing member, and AMQP enumeration refuses an
-action-bearing set before pagination. Those refusals are Unimplemented / status
-501, not successful empty actions. Native deletion can still remove a valid
-action-bearing rule. The trusted broker's rule reads retain the complete action.
+Native gRPC and `switchyardctl` cannot create actions yet. Their rule reads must
+not discard action metadata: native Get refuses an action-bearing rule, and
+native List refuses any action-bearing member. Those refusals are Unimplemented,
+not successful empty actions. Native deletion can still remove a valid
+action-bearing rule. AMQP enumeration and trusted broker reads retain the
+complete action.
+
+## AMQP Management
+
+`com.microsoft:add-rule` accepts an optional `sql-rule-action` map containing
+only a string `expression`. Omission or null means no action, not an empty SQL
+program. The edge checks borrowed source bounds before copying, compiles the
+supported grammar, and submits the typed command through the admitted
+subscription binding. The owner independently validates and recompiles it.
+Syntax refusal returns status 400 / `amqp:invalid-field`; unsupported `SET` and
+other constructs return 501 / `amqp:not-implemented`; compile limits return
+403 / `amqp:resource-limit-exceeded`. Refusals do not echo source text.
+Parser diagnostic logging follows the
+[SQL rule privacy policy](sql-rules.md#resource-and-diagnostic-boundaries).
+
+Enumeration uses the SQL-action descriptor `0x0000013700000006` with the exact
+stored source followed by AMQP **int** 20. This wire compatibility level is not
+the domain semantic version 1. No-action rules retain the empty-action descriptor
+`0x0000013700000005`. These shapes follow Microsoft's
+[rule request/response contract](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-amqp-request-response#rule-operations).
+Pagination and complete response-size checks are unchanged; an oversized page
+is refused rather than returned as a truncated success.
+
+All rule operations still require Listen on the subscription's management
+endpoint. Permission checks precede parsing and owner access. Request fields and
+associated-link names cannot redirect the admitted child binding, and deletion
+followed by recreation does not refresh an old management link. This is separate
+from the native administration API's Manage permission.
+
+With the official .NET client, use `ServiceBusRuleManager`, not the HTTP
+administration client:
+
+```csharp
+var rules = client.CreateRuleManager("events", "audit");
+await rules.CreateRuleAsync(new CreateRuleOptions("RedWithoutColor",
+    new SqlRuleFilter("color = 'red'"))
+{
+    Action = new SqlRuleAction("REMOVE user.color;"),
+});
+```
+
+Delete the explicit `$Default` rule when its unchanged action-free copy is not
+wanted. Creating an action rule does not replace an existing rule or transform
+messages already retained by the subscription.
+
+Both pinned official .NET clients, 7.21.0 and 7.20.2, have separate opt-in
+action gates on memory and Fjall storage. They verify exact source enumeration,
+three independently settled copies, original-filter independence, exact-key
+removal and final RuleName replacement, preserved body/system/footer content,
+and awaited unsupported `SET` refusal followed by a healthy publication.
+Defaults and empty runtime state are checked before and after reopen. Run with:
+
+```sh
+cargo test -p server --test amqp_dotnet_current --locked -j 2 -- rule_actions --ignored --test-threads=1
+```
+
+The new action gates use isolated certificate trust and bounded child-process
+execution. They establish local interoperability, not live-cloud parity for
+the local semantics below.
 
 ## Grammar And Storage
 
