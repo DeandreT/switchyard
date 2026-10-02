@@ -64,6 +64,8 @@ as a domain settlement.
 The Service Bus listener has no wire transaction registry, Declare/Discharge
 execution, staged message visibility, transaction timeout, or wire retry contract.
 The opt-in native API adds control receipts and provisional acknowledgments.
+Its [consuming refusal API](native-transaction-refusals.md) handles declaration
+and pre-owner staging failures using original control receipts.
 The trusted [paired owner handoff](native-atomic-owner-handoff.md) carries native
 and logical submissions through one broker job, but not through a serialized,
 authorized connection adapter. The separate trusted same-queue foundation is

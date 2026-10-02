@@ -86,7 +86,8 @@ stage messages, retain exact prepared receipts, and submit matching native and
 logical groups. It must keep processing admitted postings while waiting for
 sealed readiness, rather than blocking their provisional acknowledgments.
 
-Staging refusal also needs a consuming native control response that cannot
-reverse started or indeterminate work. Transactional outgoing settlements,
+The [consuming native refusal API](native-transaction-refusals.md) supplies a
+pre-owner declaration and staging response, without reversing started or
+indeterminate work. Transactional outgoing settlements,
 SDK transaction scopes, durable recovery, and new persistent formats are not
 enabled by this handoff.

@@ -24,6 +24,9 @@ and postings are refused by this initial local policy.
 Failed control commands use Rejected only when the original source advertises
 it; otherwise the coordinator link is detached. A partial posting at discharge
 always requires coordinator detachment, even when Rejected was advertised.
+Trusted adapters can also consume original declaration and sealed staging
+receipts through the [explicit refusal API](native-transaction-refusals.md),
+without minting a declaration or reversing a started owner.
 
 A declaration is an actual control-message receipt, not registration by an
 arbitrary binary ID. Its successful Declared response is written and flushed
@@ -106,8 +109,8 @@ shared work lease into one owner job. It claims native authority first and
 logical authority second before broker clock sampling, entity validation, or
 storage access, and publishes both decisions before effects or replies.
 Pairing does not prove that the two submissions represent the same wire work.
-The serialized connection adapter, authorization and message-conversion bridge,
-and staging-refusal control response remain missing. A physical storage failure
+The serialized connection adapter and authorization and message-conversion
+bridge remain missing. A physical storage failure
 remains [indeterminate](atomic-commit-permits.md#result-boundaries), never a
 guaranteed wire rollback. SDK transaction scopes, transactional outgoing
 settlements, and durable recovery are not enabled.
