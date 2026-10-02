@@ -462,6 +462,8 @@ declaration and explicit rollback during that fixed
 [initial window](initial-transaction-authorization.md). Queue access and every
 commit, including an empty commit, still require current authorization. A
 successful grant permanently ends the window; expiry never starts it again.
+Raw TLS/CBS regressions on both backends verify grant loss, same-connection
+reauthorization, and a fresh coordinator without reuse of the old transaction.
 AMQP resource scopes normalize only recognized subscription, dead-letter, and
 management control segments, never user names. Namespace and parent grants
 inherit to their children; exact dead-letter or management grants do not grant

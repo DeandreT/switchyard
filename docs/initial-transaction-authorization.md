@@ -58,3 +58,25 @@ The ordinary listener, posting-only listener, strict native APIs, TLS/SASL
 handshake deadline, and transport watchdogs retain their existing policies.
 Connections with authentication disabled retain their explicit development
 behavior; this window does not make an unauthenticated listener safe.
+
+## Reauthorization Evidence
+
+A raw TLS/MSSBCBS regression runs against memory and Fjall. A finite Send grant
+outlasts the configured initial window, then the test awaits the old
+coordinator's exact authorization-error Detach. After acknowledgment, a
+freshly named coordinator on the same session and numeric handle is refused
+without a current grant. A new token on the existing CBS links permits another
+fresh coordinator. Its explicit initial delivery count preserves the existing
+error-handle history rule; omission is not tested on a reused handle.
+
+The new coordinator rejects the old transaction ID with
+`amqp:transaction:unknown-id`, then remains usable for a fresh Declare and one
+same-queue commit. This proves old authority cannot be reused across controller
+generations, not that every retained terminal record is deleted. Before fresh
+queue admission, snapshots and read, write, bind, receive, broker-clock, and
+owner-handoff counters remain unchanged. The commit writes one batch, and its
+snapshot survives reopening the store.
+
+The test progresses through bounded protocol responses, not sleeps or elapsed
+time assertions. This is a native socket lifecycle check, not an SDK renewal,
+retry, revocation, or transaction-recovery guarantee.
