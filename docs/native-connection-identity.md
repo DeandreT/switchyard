@@ -40,6 +40,11 @@ Negotiated drivers bind session and link generations to their original native
 connection. Child links inherit that proof rather than deriving it from a
 channel or handle. Existing exact link and delivery checks remain separate.
 
+Opt-in transactional receivers also expose an exact
+[receiving-link observer](native-receiver-provenance.md). It distinguishes
+replaced links on one still-active connection and can check the original owner
+of a posting or prepared receipt without consulting numeric aliases.
+
 A [retained ingress receipt](retained-ingress.md) exposes its delivery owner's
 optional `connection_identity()`. Callers must refuse a missing origin instead
 of guessing one from numeric labels. Receipts published by negotiated native

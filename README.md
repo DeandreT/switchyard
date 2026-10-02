@@ -155,6 +155,9 @@ The sender-side listener uses [retained ingress receipts](docs/retained-ingress.
 to preserve native content accounting through broker replies and acknowledgment flush.
 [Native connection identities](docs/native-connection-identity.md) preserve exact
 receipt origin and expose actor retirement without granting transaction authority.
+[Native receiver identities](docs/native-receiver-provenance.md) distinguish
+replaced receiving-link generations; decoder-aware acceptance remains opt-in
+per link and does not stage logical batch work.
 
 ## Production Contract
 

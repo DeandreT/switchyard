@@ -15,6 +15,13 @@ that immutable classification and the exact pending approval again. Editing a
 terminus cannot upgrade an ordinary approval into coordinator authority, or
 convert a coordinator into an ordinary queue receiver.
 
+An accepted transactional receiver now exposes an exact, inert
+[receiver-generation observer](native-receiver-provenance.md). Posting and
+prepared receipts can be checked against it without treating reusable numeric
+aliases as authority. An additive decoder-aware acceptance method also admits
+explicit link-local message formats; batch expansion and authorization still
+belong to the missing application adapter.
+
 Coordinators support local transactions, multiple transactions per session, and
 posting across sessions on the same connection. Distributed/global declarations,
 transactional acquisition and retirement, and recovered links remain unsupported.
