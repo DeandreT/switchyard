@@ -282,6 +282,41 @@ impl SealedDischargeReceipt {
         }
     }
 
+    /// Observes the sealed group's exact outgoing origins, not live settlement authority.
+    /// Terminal replay receipts do not retain a complete obligation snapshot.
+    pub fn retirement_origins(
+        &self,
+    ) -> Option<Vec<(NativeSenderIdentity, NativeOutgoingDeliveryIdentity)>> {
+        let DischargeStatus::Live(group) = &self.status else {
+            return None;
+        };
+        Some(
+            lock(&group.retirements)
+                .iter()
+                .map(|obligation| {
+                    (
+                        NativeSenderIdentity::for_accepted_sender(&obligation.owner),
+                        obligation.delivery_identity.clone(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Observes one exact receiver origin per captured posting, including duplicates.
+    /// This is bounded collector accounting, not a prepared work manifest.
+    pub fn posting_receivers(&self) -> Option<Vec<NativeReceiverIdentity>> {
+        let DischargeStatus::Live(group) = &self.status else {
+            return None;
+        };
+        Some(
+            lock(&group.obligations)
+                .iter()
+                .map(|obligation| NativeReceiverIdentity::for_accepted_receiver(&obligation.owner))
+                .collect(),
+        )
+    }
+
     pub async fn wait_ready(&self) -> Result<(), NativeTransactionError> {
         match &self.status {
             DischargeStatus::Live(group) => group.wait_ready().await,

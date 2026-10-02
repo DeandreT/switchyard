@@ -9,7 +9,8 @@ use tokio::{
 };
 
 use super::super::{
-    Driver, Event, MAX_LINKS, MAX_SESSIONS, WorkerIdentity, owner::Owner, routing, run_driver,
+    Driver, Event, IngressMode, MAX_LINKS, MAX_SESSIONS, WorkerIdentity, owner::Owner, routing,
+    run_driver,
 };
 use super::{
     drive_provisional,
@@ -230,6 +231,7 @@ async fn pending_admissions_and_actual_collectors_share_one_session_budget() -> 
         None,
         driver.events.clone(),
         Arc::new(Semaphore::new(MAX_LINKS)),
+        IngressMode::Posting,
     ));
     assert_eq!(driver.session_count(), 1);
 

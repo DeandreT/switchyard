@@ -9,6 +9,7 @@ mod admissions;
 mod begin_gate;
 mod claim_expiry;
 mod fixture;
+mod mixed_rollback;
 mod recorder;
 
 use fixture::{CONTROL, DEADLINE, Fixture, POST, TestResult};

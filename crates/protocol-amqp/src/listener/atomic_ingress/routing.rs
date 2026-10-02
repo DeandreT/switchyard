@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use amqp::{
-    AmqpError, EngineError, IncomingAttach, LinkEndpoint, MessageFormatDecoders, Role,
-    SenderSettleMode, ServerSession, TargetTerminus,
+    AmqpError, EngineError, IncomingAttach, LinkEndpoint, MessageFormatDecoders,
+    ReceiverSettleMode, Role, SenderSettleMode, ServerSession, TargetTerminus,
 };
 use auth::Permission;
 use domain::{EntityIncarnationKind, NamespaceName};
@@ -11,7 +11,7 @@ use tokio::{
     task::JoinSet,
 };
 
-use super::{Event, IngressError, QueueAdmission, workers};
+use super::{Event, IngressError, IngressMode, QueueAdmission, workers};
 use crate::{
     Attachment, BrokerRejection, EntityMetadata, NativeAtomicBroker,
     authorization::ConnectionAuthorization,
@@ -27,6 +27,7 @@ pub(super) async fn serve_session<B: NativeAtomicBroker>(
     authorization: Option<Arc<ConnectionAuthorization>>,
     events: mpsc::Sender<Event>,
     links: Arc<Semaphore>,
+    mode: IngressMode,
 ) -> Result<(), IngressError> {
     let mut workers = JoinSet::new();
     let result: Result<(), IngressError> = async {
@@ -149,18 +150,72 @@ pub(super) async fn serve_session<B: NativeAtomicBroker>(
             }
 
             // Unsupported roles and endpoints are refused without reading topology.
-            if attach.role != Role::Sender
+            if (attach.role != Role::Sender && mode != IngressMode::Messaging)
                 || crate::address::strip_control_suffix(&target, "/$management").is_some()
+                || (attach.role == Role::Receiver
+                    && crate::address::strip_control_suffix(&source, "/$management").is_some())
             {
                 refuse(
                     &session,
                     attach,
                     error_for(
                         AmqpError::NotImplemented,
-                        "this endpoint supports queue posting and coordinator links only".into(),
+                        "this endpoint does not support the requested link".into(),
                     ),
                 )
                 .await?;
+                continue;
+            }
+            if attach.role == Role::Receiver {
+                if attach.snd_settle_mode != SenderSettleMode::Unsettled
+                    || attach.rcv_settle_mode != ReceiverSettleMode::Second
+                    || attach.source.as_ref().is_some_and(|source| {
+                        source.dynamic
+                            || source.durable != 0
+                            || source.distribution_mode.as_ref().is_some_and(|mode| mode.as_str() != "move")
+                            || source.filter.as_ref().is_some_and(|filter| !filter.is_empty())
+                    })
+                {
+                    refuse(
+                        &session,
+                        attach,
+                        error_for(
+                            AmqpError::NotAllowed,
+                            "atomic receiving requires a fixed, non-durable, unfiltered Unsettled/Second move source".into(),
+                        ),
+                    )
+                    .await?;
+                    continue;
+                }
+                let (admission, link_authorization) = match admit_queue(
+                    &broker,
+                    &namespace,
+                    &source,
+                    authorization.as_ref(),
+                    Permission::Listen,
+                )
+                .await
+                {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        refuse(&session, attach, error).await?;
+                        continue;
+                    }
+                };
+                let maximum = admission.config.max_message_bytes as u64;
+                let sender = match session.accept_transactional_sender(attach, maximum).await {
+                    Ok(sender) => sender,
+                    Err(EngineError::RemoteDetached) => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                workers.spawn(workers::consumer(
+                    sender,
+                    admission,
+                    broker.clone(),
+                    link_authorization,
+                    events.clone(),
+                    permit,
+                ));
                 continue;
             }
             if attach.snd_settle_mode == SenderSettleMode::Settled {
@@ -177,7 +232,7 @@ pub(super) async fn serve_session<B: NativeAtomicBroker>(
             }
 
             let (admission, link_authorization) =
-                match admit_queue(&broker, &namespace, &target, authorization.as_ref()).await {
+                match admit_queue(&broker, &namespace, &target, authorization.as_ref(), Permission::Send).await {
                     Ok(admission) => admission,
                     Err(error) => {
                         refuse(&session, attach, error).await?;
@@ -227,25 +282,28 @@ async fn admit_queue<B: NativeAtomicBroker>(
     namespace: &NamespaceName,
     address: &str,
     authorization: Option<&Arc<ConnectionAuthorization>>,
+    permission: Permission,
 ) -> Result<(QueueAdmission, Option<LinkAuthorization>), amqp::Error> {
     let target = parse_attachment(address)
         .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?;
     let Attachment::Queue(entity) = &target else {
         return Err(error_for(
             AmqpError::NotAllowed,
-            "only primary queues accept atomic postings".into(),
+            "only primary queues accept atomic messaging".into(),
         ));
     };
     let link_authorization = match authorization {
         Some(authorization) => {
             let resource = authorization
-                .authorize_entity(entity.as_str(), Permission::Send)
+                .authorize_entity(entity.as_str(), permission)
                 .await
-                .map_err(|_| unauthorized_error("Send is not authorized for this queue"))?;
+                .map_err(|_| {
+                    unauthorized_error("the required operation is not authorized for this queue")
+                })?;
             Some(LinkAuthorization {
                 connection: Arc::clone(authorization),
                 resource,
-                permission: Permission::Send,
+                permission,
             })
         }
         None => None,

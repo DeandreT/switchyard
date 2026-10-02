@@ -1,10 +1,12 @@
 use std::{collections::VecDeque, sync::Arc, time::Instant};
 
 use amqp::{
-    NativeControllerIdentity, NativeReceiverIdentity, NativeTransactionIdentity, PreparedPosting,
-    SealedDischargeReceipt, TransactionId, TransactionPostingReceipt,
+    Error as AmqpProtocolError, NativeControllerIdentity, NativeOutgoingDeliveryIdentity,
+    NativePreparedWork, NativeReceiverIdentity, NativeSenderIdentity, NativeTransactionIdentity,
+    SealedDischargeReceipt, TransactionId, TransactionPostingReceipt, TransactionRetirementReceipt,
 };
-use tokio::sync::mpsc;
+use domain::{LockToken, SequenceNumber};
+use tokio::sync::{mpsc, oneshot};
 
 use super::{LinkAuthorization, QueueAdmission, WorkerClose};
 use crate::AtomicTransactionController;
@@ -31,14 +33,62 @@ pub(super) struct Posting {
     pub(super) receipt: TransactionPostingReceipt,
 }
 
+pub(super) struct HeldDelivery {
+    pub(super) sequence: SequenceNumber,
+    pub(super) token: LockToken,
+    pub(super) original: NativeOutgoingDeliveryIdentity,
+}
+
+#[derive(Clone)]
+pub(super) enum RetirementCompletion {
+    Committed,
+    Rearmed,
+    Refused(AmqpProtocolError),
+}
+
+pub(super) struct Consumer {
+    pub(super) key: u64,
+    pub(super) identity: NativeSenderIdentity,
+    pub(super) admission: QueueAdmission,
+    pub(super) authorization: Option<LinkAuthorization>,
+    pub(super) close: mpsc::Sender<WorkerClose>,
+    pub(super) closed: bool,
+    pub(super) held: Option<HeldDelivery>,
+    pub(super) pending: Option<u64>,
+}
+
+pub(super) struct Retirement {
+    pub(super) consumer: u64,
+    pub(super) receipt: TransactionRetirementReceipt,
+}
+
+pub(super) struct RetirementWaiter {
+    pub(super) consumer: u64,
+    pub(super) original: NativeOutgoingDeliveryIdentity,
+    pub(super) reply: oneshot::Sender<RetirementCompletion>,
+}
+
+pub(super) enum QueuedWork {
+    Posting(Box<Posting>),
+    Retirement(Retirement),
+}
+
 pub(super) struct Group {
     pub(super) id: TransactionId,
     pub(super) controller: NativeControllerIdentity,
     pub(super) deadline: Instant,
     pub(super) native: Option<NativeTransactionIdentity>,
-    pub(super) queued: VecDeque<Posting>,
-    pub(super) prepared: Vec<PreparedPosting>,
+    pub(super) queued: VecDeque<QueuedWork>,
+    pub(super) prepared: Vec<NativePreparedWork>,
     pub(super) producers: Vec<u64>,
+    pub(super) consumers: Vec<u64>,
+    pub(super) retirements: Vec<RetirementWaiter>,
+    pub(super) seen_retirements: Vec<NativeOutgoingDeliveryIdentity>,
+    pub(super) seen_postings: Vec<NativeReceiverIdentity>,
+    pub(super) rollback_origins:
+        Option<Vec<(NativeSenderIdentity, NativeOutgoingDeliveryIdentity)>>,
+    pub(super) rollback_postings: Option<Vec<NativeReceiverIdentity>>,
+    pub(super) rollback: bool,
     pub(super) sealed: Option<SealedDischargeReceipt>,
     pub(super) ready: bool,
     pub(super) waiting_ready: bool,
@@ -64,6 +114,13 @@ impl Group {
             queued: VecDeque::new(),
             prepared: Vec::new(),
             producers: Vec::new(),
+            consumers: Vec::new(),
+            retirements: Vec::new(),
+            seen_retirements: Vec::new(),
+            seen_postings: Vec::new(),
+            rollback_origins: None,
+            rollback_postings: None,
+            rollback: false,
             sealed: None,
             ready: false,
             waiting_ready: false,

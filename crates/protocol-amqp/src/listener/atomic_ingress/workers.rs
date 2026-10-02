@@ -15,6 +15,9 @@ use crate::{
     listener::{LinkAuthorization, rejection_error, unauthorized_error},
 };
 
+mod consumer;
+pub(super) use consumer::consumer;
+
 pub(super) async fn producer<B: NativeAtomicBroker>(
     mut receiver: TransactionalReceiver,
     admission: QueueAdmission,

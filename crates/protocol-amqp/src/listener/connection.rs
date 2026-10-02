@@ -123,12 +123,24 @@ impl<B: NativeAtomicBroker> AmqpListener<B> {
     pub async fn serve_atomic_posting_ingress(self, listener: TcpListener) -> std::io::Result<()> {
         self.serve_with_driver(listener, AtomicPostingDriver).await
     }
+
+    /// Explicitly serves primary non-session queue postings and PeekLock retirement.
+    /// Ordinary `serve` and the posting-only endpoint retain their existing policies.
+    /// Management, session queues, and SDK transaction scopes remain unsupported.
+    pub async fn serve_atomic_messaging_ingress(
+        self,
+        listener: TcpListener,
+    ) -> std::io::Result<()> {
+        self.serve_with_driver(listener, AtomicMessagingDriver)
+            .await
+    }
 }
 
 #[derive(Clone, Copy)]
 enum AdmissionMode {
     Ordinary,
     AtomicPosting,
+    AtomicMessaging,
 }
 
 trait ConnectionDriver<B: Broker>: Copy + Send + 'static {
@@ -176,6 +188,29 @@ impl<B: NativeAtomicBroker> ConnectionDriver<B> for AtomicPostingDriver {
     ) -> impl Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a
     {
         atomic_ingress::serve_atomic_posting_connection(
+            connection,
+            namespace,
+            broker,
+            authorization,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AtomicMessagingDriver;
+
+impl<B: NativeAtomicBroker> ConnectionDriver<B> for AtomicMessagingDriver {
+    const ADMISSION: AdmissionMode = AdmissionMode::AtomicMessaging;
+
+    fn serve_open<'a>(
+        self,
+        connection: &'a mut ServerConnection,
+        namespace: NamespaceName,
+        broker: B,
+        authorization: Option<Arc<ConnectionAuthorization>>,
+    ) -> impl Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send + 'a
+    {
+        atomic_ingress::serve_atomic_messaging_connection(
             connection,
             namespace,
             broker,
@@ -294,6 +329,10 @@ where
         }
         AdmissionMode::AtomicPosting => {
             ServerConnection::accept_with_transactional_ingress(stream, container_id, sasl, options)
+                .await
+        }
+        AdmissionMode::AtomicMessaging => {
+            ServerConnection::accept_with_transactional_work(stream, container_id, sasl, options)
                 .await
         }
     }

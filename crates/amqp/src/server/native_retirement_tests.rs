@@ -19,6 +19,8 @@ mod lifecycle;
 mod lifetime;
 #[path = "native_retirement_tests/ordering.rs"]
 mod ordering;
+#[path = "native_retirement_tests/origins.rs"]
+mod origins;
 #[path = "native_retirement_tests/refusals.rs"]
 mod refusals;
 

@@ -1,10 +1,11 @@
-//! Explicit posting-only ingress; ordinary listeners retain their refusal policy.
+//! Explicit bounded native ingress; ordinary listeners retain their refusal policy.
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use amqp::{
     CoordinatorRequest, Error as AmqpProtocolError, NativeConnectionIdentity,
-    NativeControllerIdentity, NativeReceiverIdentity, TransactionPostingReceipt,
+    NativeControllerIdentity, NativeOutgoingDeliveryIdentity, NativeReceiverIdentity,
+    NativeSenderIdentity, TransactionPostingReceipt, TransactionRetirementReceipt,
 };
 use domain::{EntityBinding, QueueConfig};
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -14,6 +15,7 @@ use tokio::{
 };
 
 use super::LinkAuthorization;
+use groups::{HeldDelivery, RetirementCompletion};
 
 mod groups;
 mod operations;
@@ -28,6 +30,12 @@ const MAX_SESSIONS: usize = 32;
 const MAX_LINKS: usize = 128;
 const EVENT_CAPACITY: usize = 256;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IngressMode {
+    Posting,
+    Messaging,
+}
+
 struct QueueAdmission {
     binding: EntityBinding,
     config: QueueConfig,
@@ -40,9 +48,32 @@ enum WorkerClose {
 enum WorkerIdentity {
     Controller(NativeControllerIdentity),
     Producer(NativeReceiverIdentity),
+    Consumer(NativeSenderIdentity),
 }
 
 enum Event {
+    RegisterConsumer {
+        identity: NativeSenderIdentity,
+        admission: QueueAdmission,
+        authorization: Option<LinkAuthorization>,
+        close: mpsc::Sender<WorkerClose>,
+        reply: oneshot::Sender<Result<(), AmqpProtocolError>>,
+    },
+    RegisterHeld {
+        source: NativeSenderIdentity,
+        delivery: HeldDelivery,
+        reply: oneshot::Sender<Result<(), AmqpProtocolError>>,
+    },
+    Retirement {
+        source: NativeSenderIdentity,
+        receipt: TransactionRetirementReceipt,
+        reply: oneshot::Sender<RetirementCompletion>,
+    },
+    ClearHeld {
+        source: NativeSenderIdentity,
+        original: NativeOutgoingDeliveryIdentity,
+        reply: oneshot::Sender<()>,
+    },
     RegisterProducer {
         identity: NativeReceiverIdentity,
         admission: QueueAdmission,
@@ -91,7 +122,30 @@ pub(super) async fn serve_atomic_posting_connection<B: crate::NativeAtomicBroker
     broker: B,
     authorization: Option<Arc<crate::authorization::ConnectionAuthorization>>,
 ) -> Result<(), IngressError> {
-    driver(connection, namespace, broker, authorization).await
+    driver(
+        connection,
+        namespace,
+        broker,
+        authorization,
+        IngressMode::Posting,
+    )
+    .await
+}
+
+pub(super) async fn serve_atomic_messaging_connection<B: crate::NativeAtomicBroker>(
+    connection: &mut amqp::ServerConnection,
+    namespace: domain::NamespaceName,
+    broker: B,
+    authorization: Option<Arc<crate::authorization::ConnectionAuthorization>>,
+) -> Result<(), IngressError> {
+    driver(
+        connection,
+        namespace,
+        broker,
+        authorization,
+        IngressMode::Messaging,
+    )
+    .await
 }
 
 struct Driver<B: crate::NativeAtomicBroker> {
@@ -100,10 +154,16 @@ struct Driver<B: crate::NativeAtomicBroker> {
     admissions: FuturesUnordered<SessionAdmission>,
     events: mpsc::Sender<Event>,
     incoming: mpsc::Receiver<Event>,
+    mode: IngressMode,
 }
 
 impl<B: crate::NativeAtomicBroker> Driver<B> {
+    #[cfg(test)]
     fn new(connection: NativeConnectionIdentity, broker: B) -> Self {
+        Self::with_mode(connection, broker, IngressMode::Posting)
+    }
+
+    fn with_mode(connection: NativeConnectionIdentity, broker: B, mode: IngressMode) -> Self {
         let (events, incoming) = mpsc::channel(EVENT_CAPACITY);
         Self {
             owner: owner::Owner::new(connection, broker),
@@ -111,6 +171,7 @@ impl<B: crate::NativeAtomicBroker> Driver<B> {
             admissions: FuturesUnordered::new(),
             events,
             incoming,
+            mode,
         }
     }
 
@@ -132,8 +193,13 @@ async fn driver<B: crate::NativeAtomicBroker>(
     namespace: domain::NamespaceName,
     broker: B,
     authorization: Option<Arc<crate::authorization::ConnectionAuthorization>>,
+    mode: IngressMode,
 ) -> Result<(), IngressError> {
-    let driver = Driver::new(connection.connection_identity().clone(), broker.clone());
+    let driver = Driver::with_mode(
+        connection.connection_identity().clone(),
+        broker.clone(),
+        mode,
+    );
     run_driver(connection, namespace, broker, authorization, driver).await
 }
 
@@ -197,6 +263,7 @@ async fn run_driver<B: crate::NativeAtomicBroker>(
                             authorization.clone(),
                             driver.events.clone(),
                             Arc::clone(&links),
+                            driver.mode,
                         ));
                     }
                     Some(Err(amqp::EngineError::RemoteDetached)) | None => {}

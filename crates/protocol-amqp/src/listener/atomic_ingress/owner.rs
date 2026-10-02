@@ -3,13 +3,15 @@ use std::{collections::BTreeMap, future::pending, time::Instant};
 use amqp::{
     AmqpError, CoordinatorRequest, Error as AmqpProtocolError, ErrorCondition,
     MAX_NATIVE_TRANSACTION_POSTINGS, MAX_NATIVE_TRANSACTIONS, NativeConnectionIdentity,
-    NativeControllerIdentity, NativeDeclarationRefusal, NativeTransactionState,
+    NativeControllerIdentity, NativeDeclarationRefusal, NativePreparedWork, NativeTransactionState,
 };
 use domain::EntityIncarnationKind;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_amqp::primitives::Symbol;
 
-use super::groups::{Controller, Group, Posting, Producer, id_key};
+use super::groups::{
+    Consumer, Controller, Group, Posting, Producer, QueuedWork, RetirementCompletion, id_key,
+};
 use super::operations::{Operation, OperationFuture};
 use super::{Event, MAX_LINKS, WorkerClose, WorkerIdentity, same_connection};
 use crate::{
@@ -21,15 +23,20 @@ use crate::{
 // Includes declaration refusals and negative/final flushes, not only postings.
 const MAX_OPERATIONS: usize = 128;
 
+mod postings;
+mod retirements;
+
 pub(super) struct Owner<B: NativeAtomicBroker> {
     registry: AtomicTransactionRegistry,
     connection: NativeConnectionIdentity,
     broker: B,
     controllers: Vec<Controller>,
     producers: Vec<Producer>,
+    consumers: Vec<Consumer>,
     groups: BTreeMap<u64, Group>,
     operations: FuturesUnordered<OperationFuture>,
     next_producer: u64,
+    next_consumer: u64,
     closed: bool,
 }
 
@@ -42,9 +49,11 @@ impl<B: NativeAtomicBroker> Owner<B> {
             broker,
             controllers: Vec::new(),
             producers: Vec::new(),
+            consumers: Vec::new(),
             groups: BTreeMap::new(),
             operations: FuturesUnordered::new(),
             next_producer: 0,
+            next_consumer: 0,
             closed: false,
         }
     }
@@ -54,6 +63,36 @@ impl<B: NativeAtomicBroker> Owner<B> {
             return;
         }
         match event {
+            Event::RegisterConsumer {
+                identity,
+                admission,
+                authorization,
+                close,
+                reply,
+            } => {
+                self.register_consumer(identity, admission, authorization, close, reply);
+            }
+            Event::RegisterHeld {
+                source,
+                delivery,
+                reply,
+            } => {
+                self.register_held(source, delivery, reply);
+            }
+            Event::Retirement {
+                source,
+                receipt,
+                reply,
+            } => {
+                self.retirement(source, receipt, reply);
+            }
+            Event::ClearHeld {
+                source,
+                original,
+                reply,
+            } => {
+                self.clear_held(source, original, reply);
+            }
             Event::RegisterProducer {
                 identity,
                 admission,
@@ -73,7 +112,10 @@ impl<B: NativeAtomicBroker> Owner<B> {
                         .iter()
                         .any(|row| row.identity.same_receiver(&identity));
                 let key = self.next_producer.checked_add(1);
-                if !valid || key.is_none() || self.producers.len() >= MAX_LINKS {
+                if !valid
+                    || key.is_none()
+                    || self.producers.len() + self.consumers.len() >= MAX_LINKS
+                {
                     let error = refused("the transactional producer admission is unavailable");
                     let _ = close.try_send(WorkerClose::Close(Some(error.clone())));
                     let _ = reply.send(Err(error));
@@ -129,6 +171,7 @@ impl<B: NativeAtomicBroker> Owner<B> {
                 match source {
                     WorkerIdentity::Controller(identity) => self.close_controller(&identity, None),
                     WorkerIdentity::Producer(identity) => self.close_producer(&identity, None),
+                    WorkerIdentity::Consumer(identity) => self.close_consumer(&identity, None),
                 }
                 let _ = reply.send(());
             }
@@ -173,7 +216,10 @@ impl<B: NativeAtomicBroker> Owner<B> {
                         }
                     }
                 }
-                Err(_) => self.fail_and_close_controller(key),
+                Err(_) => {
+                    self.abort_group(key, Some(retirements::unavailable_error()));
+                    self.fail_and_close_controller(key);
+                }
             },
             Operation::PostingChecked {
                 key,
@@ -211,56 +257,99 @@ impl<B: NativeAtomicBroker> Owner<B> {
                             .is_some_and(|row| posting.belongs_to_receiver(&row.identity));
                         if exact {
                             if let Some(group) = self.groups.get_mut(&key) {
-                                group.prepared.push(posting);
+                                group.prepared.push(NativePreparedWork::Posting(posting));
                             }
                         } else {
                             self.fail_group(key);
                         }
                     }
+                    _ if self.ignore_obsolete_work(key) => {}
                     _ => self.fail_group(key),
                 }
+            }
+            Operation::RetirementChecked {
+                key,
+                consumer,
+                receipt,
+                result,
+            } => {
+                self.checked_retirement(key, consumer, receipt, result);
+            }
+            Operation::RetirementPrepared {
+                key,
+                consumer,
+                result,
+            } => {
+                self.prepared_retirement(key, consumer, result);
             }
             Operation::Ready {
                 key,
                 receipt,
                 result,
             } => {
-                if result.is_err() {
+                let obsolete = self
+                    .groups
+                    .get(&key)
+                    .is_none_or(|group| group.rollback || group.ending);
+                if result.is_err() && !obsolete {
                     self.fail_group(key);
                 }
                 if let Some(group) = self.groups.get_mut(&key) {
                     group.waiting_ready = false;
-                    group.ready = result.is_ok();
-                    group.sealed = Some(receipt);
+                    if !obsolete {
+                        group.ready = result.is_ok();
+                        group.sealed = Some(receipt);
+                    }
                 }
             }
             Operation::Authorized { key, result } => {
                 if let Some(group) = self.groups.get_mut(&key) {
                     group.handoff_busy = false;
                 }
+                if self.ignore_obsolete_work(key) {
+                    self.reap_rows();
+                    self.kick();
+                    return;
+                }
                 match result {
                     Ok(expiry) => self.handoff(key, expiry),
                     Err(error) => {
-                        self.fail_group(key);
+                        self.abort_group(key, Some(error.clone()));
                         self.close_group_producers(key, error);
                     }
                 }
             }
             Operation::Applied { key, result } => match result {
                 Ok(completion) => {
-                    let (_, resources) = completion.into_parts();
+                    let (application, resources) = completion.into_parts();
+                    let completion = retirements::owner_completion(&application);
                     self.push(key, async move {
                         Operation::Finished {
                             key,
                             result: resources.finish().await,
+                            completion,
                         }
                     });
                 }
-                Err(_) => self.fail_and_close_controller(key),
-            },
-            Operation::Finished { key, result } => {
-                if result.is_err() {
+                Err(_) => {
+                    self.abort_group(key, Some(retirements::unavailable_error()));
                     self.fail_and_close_controller(key);
+                }
+            },
+            Operation::Finished {
+                key,
+                result,
+                completion,
+            } => {
+                if result.is_err() {
+                    let error = match &completion {
+                        RetirementCompletion::Refused(error) => error.clone(),
+                        _ => retirements::unavailable_error(),
+                    };
+                    self.abort_group(key, Some(error));
+                    self.fail_and_close_controller(key);
+                } else {
+                    self.complete_retirements(key, completion);
                 }
                 if let Some(group) = self.groups.get_mut(&key) {
                     group.ending = true;
@@ -337,21 +426,27 @@ impl<B: NativeAtomicBroker> Owner<B> {
         for identity in dead_producers {
             self.close_producer(&identity, None);
         }
-        let faulted: Vec<_> = self
-            .groups
+        let dead_consumers: Vec<_> = self
+            .consumers
             .iter()
-            .filter_map(|(&key, group)| {
-                (!group.submitted
-                    && !group.refused
-                    && group.native.as_ref().is_some_and(|native| {
-                        matches!(
-                            native.state(),
-                            NativeTransactionState::Faulted | NativeTransactionState::Aborted
-                        )
-                    }))
-                .then_some(key)
-            })
+            .filter(|row| !row.closed && !row.identity.is_active())
+            .map(|row| row.identity.clone())
             .collect();
+        for identity in dead_consumers {
+            self.close_consumer(&identity, None);
+        }
+        let faulted: Vec<_> =
+            self.groups
+                .iter()
+                .filter_map(|(&key, group)| {
+                    (!group.submitted
+                        && !group.refused
+                        && group.native.as_ref().is_some_and(|native| {
+                            native.state() == NativeTransactionState::Faulted
+                        }))
+                    .then_some(key)
+                })
+                .collect();
         for key in faulted {
             self.fail_group(key);
         }
@@ -366,6 +461,13 @@ impl<B: NativeAtomicBroker> Owner<B> {
         self.closed = true;
         // Publish pending logical aborts before any owned native future drops.
         self.registry.close();
+        let keys: Vec<_> = self.groups.keys().copied().collect();
+        for key in keys {
+            self.complete_retirements(
+                key,
+                RetirementCompletion::Refused(refused("the atomic connection is closing")),
+            );
+        }
         for controller in &mut self.controllers {
             controller.closed = true;
             let _ = controller.close.try_send(WorkerClose::Close(None));
@@ -373,6 +475,10 @@ impl<B: NativeAtomicBroker> Owner<B> {
         for producer in &mut self.producers {
             producer.closed = true;
             let _ = producer.close.try_send(WorkerClose::Close(None));
+        }
+        for consumer in &mut self.consumers {
+            consumer.closed = true;
+            let _ = consumer.close.try_send(WorkerClose::Close(None));
         }
     }
 
@@ -463,135 +569,31 @@ impl<B: NativeAtomicBroker> Owner<B> {
                 }
                 let Some(key) = key else { return };
                 if receipt.fail() {
+                    let live_manifest = receipt.retirement_origins().is_some()
+                        && receipt.posting_receivers().is_some();
+                    if let Some(group) = self.groups.get_mut(&key) {
+                        group.rollback = true;
+                        group.rollback_origins = receipt.retirement_origins();
+                        group.rollback_postings = receipt.posting_receivers();
+                    }
                     let _ = self.registry.discharge(&logical, &id, true);
-                    self.fail_group(key);
+                    let error = (!live_manifest)
+                        .then(|| refused("terminal rollback cannot rearm an active delivery"));
+                    self.abort_group(key, error);
                 }
                 let Some(group) = self.groups.get_mut(&key) else {
                     return;
                 };
-                if group.sealed.is_some() || group.waiting_ready || group.submitted {
+                let duplicate = group.submitted
+                    || (!receipt.fail() && (group.sealed.is_some() || group.waiting_ready))
+                    || (receipt.fail() && group.sealed.as_ref().is_some_and(|prior| prior.fail()));
+                if duplicate {
                     self.fail_and_close_controller(key);
                     return;
                 }
                 group.sealed = Some(receipt);
             }
         }
-    }
-
-    fn posting(
-        &mut self,
-        source: amqp::NativeReceiverIdentity,
-        receipt: amqp::TransactionPostingReceipt,
-    ) {
-        let owns_source = receipt.belongs_to_receiver(&source);
-        let producer = self
-            .producers
-            .iter()
-            .find(|row| !row.closed && row.identity.same_receiver(&source));
-        let key = id_key(receipt.transaction_id());
-        let exact = producer.is_some_and(|row| receipt.belongs_to_receiver(&row.identity))
-            && key
-                .and_then(|key| self.groups.get(&key))
-                .is_some_and(|group| {
-                    group
-                        .controller
-                        .same_controller(receipt.controller_identity())
-                        && !group.refused
-                        && !group.ending
-                        && !group.submitted
-                        && group.queued.len()
-                            + group.prepared.len()
-                            + usize::from(group.posting_busy)
-                            < MAX_NATIVE_TRANSACTION_POSTINGS
-                });
-        if !exact {
-            if let Some(key) = key
-                && self.groups.get(&key).is_some_and(|group| {
-                    group
-                        .controller
-                        .same_controller(receipt.controller_identity())
-                })
-            {
-                self.fail_group(key);
-            }
-            receipt.fail();
-            if owns_source {
-                self.close_producer(
-                    &source,
-                    Some(refused("transactional posting admission was refused")),
-                );
-            }
-            return;
-        }
-        let (Some(producer), Some(key)) = (producer, key) else {
-            return;
-        };
-        let producer = producer.key;
-        if let Some(group) = self.groups.get_mut(&key) {
-            if !group.producers.contains(&producer) {
-                group.producers.push(producer);
-            }
-            group.queued.push_back(Posting { producer, receipt });
-        }
-    }
-
-    fn checked_posting(
-        &mut self,
-        key: u64,
-        producer: u64,
-        receipt: amqp::TransactionPostingReceipt,
-        result: Result<domain::CommandKind, AmqpProtocolError>,
-    ) {
-        let group = self.groups.get(&key);
-        let row = self
-            .producers
-            .iter()
-            .find(|row| row.key == producer && !row.closed);
-        let valid = group.is_some_and(|group| !group.refused && !group.ending && !group.submitted)
-            && row.is_some_and(|row| receipt.belongs_to_receiver(&row.identity));
-        let kind = match result {
-            Ok(kind) if valid => kind,
-            Ok(_) => {
-                self.refuse_posting(
-                    key,
-                    producer,
-                    receipt,
-                    refused("transactional posting origin was refused"),
-                );
-                return;
-            }
-            Err(error) => {
-                self.refuse_posting(key, producer, receipt, error);
-                return;
-            }
-        };
-        let (Some(group), Some(row)) = (self.groups.get(&key), row) else {
-            return;
-        };
-        let Some(controller) = self
-            .controllers
-            .iter()
-            .find(|row| row.identity.same_controller(&group.controller))
-        else {
-            return;
-        };
-        let staged = self.registry.try_stage(
-            &controller.logical,
-            &group.id,
-            row.admission.binding.clone(),
-            kind,
-        );
-        if let Err(error) = staged {
-            self.refuse_posting(key, producer, receipt, staging_error(&error));
-            return;
-        }
-        self.push(key, async move {
-            Operation::Prepared {
-                key,
-                producer,
-                result: receipt.provisional_accept().await,
-            }
-        });
     }
 
     fn kick(&mut self) {
@@ -603,6 +605,7 @@ impl<B: NativeAtomicBroker> Owner<B> {
             if self.operations.len() >= MAX_OPERATIONS {
                 break;
             }
+            let rollback_ready = self.rollback_collectors_ready(key);
             let Some(group) = self.groups.get_mut(&key) else {
                 continue;
             };
@@ -611,16 +614,33 @@ impl<B: NativeAtomicBroker> Owner<B> {
             }
             if group.refused {
                 if !group.waiting_ready
+                    && !group.posting_busy
+                    && (!group.rollback || group.operations == 0)
+                    && rollback_ready
                     && let Some(receipt) = group.sealed.take()
                 {
                     group.ending = true;
+                    let receipt_manifest =
+                        group.rollback_origins.is_some() && group.rollback_postings.is_some();
                     self.push(key, async move {
-                        let result = if receipt.fail() {
+                        let rollback = receipt.fail();
+                        let result = if rollback {
                             receipt.rollback().await
                         } else {
                             receipt.refuse_staging().await
                         };
-                        Operation::Finished { key, result }
+                        let completion = if rollback && receipt_manifest {
+                            RetirementCompletion::Rearmed
+                        } else {
+                            RetirementCompletion::Refused(refused(
+                                "transaction staging was refused",
+                            ))
+                        };
+                        Operation::Finished {
+                            key,
+                            result,
+                            completion,
+                        }
                     });
                 }
                 continue;
@@ -646,37 +666,10 @@ impl<B: NativeAtomicBroker> Owner<B> {
                 continue;
             };
             if !group.posting_busy
-                && let Some(posting) = group.queued.pop_front()
+                && let Some(work) = group.queued.pop_front()
             {
                 group.posting_busy = true;
-                let producer = posting.producer;
-                let authorization = self
-                    .producers
-                    .iter()
-                    .find(|row| row.key == producer)
-                    .and_then(|row| row.authorization.clone());
-                self.push(key, async move {
-                    let receipt = posting.receipt;
-                    let authorized = match authorization {
-                        Some(auth) => auth.ensure().await,
-                        None => Ok(()),
-                    };
-                    let result = authorized.and_then(|()| {
-                        read_ingress(receipt.message(), receipt.message_format()).map_err(|error| {
-                            AmqpProtocolError::new(
-                                ErrorCondition::Custom(Symbol::from(error.condition())),
-                                "transactional message encoding was refused",
-                                None,
-                            )
-                        })
-                    });
-                    Operation::PostingChecked {
-                        key,
-                        producer,
-                        receipt,
-                        result,
-                    }
-                });
+                self.start_work(key, work);
             }
             if self.operations.len() >= MAX_OPERATIONS {
                 break;
@@ -700,6 +693,12 @@ impl<B: NativeAtomicBroker> Owner<B> {
                             .find(|row| row.key == *key)
                             .and_then(|row| row.authorization.clone())
                     })
+                    .chain(group.consumers.iter().filter_map(|key| {
+                        self.consumers
+                            .iter()
+                            .find(|row| row.key == *key)
+                            .and_then(|row| row.authorization.clone())
+                    }))
                     .collect();
                 let controller_authorization = self
                     .controllers
@@ -751,6 +750,7 @@ impl<B: NativeAtomicBroker> Owner<B> {
                         .iter()
                         .any(|row| row.key == *key && !row.closed && row.identity.is_active())
                 })
+                && self.retirement_sources_valid(key, group)
         });
         if !valid {
             self.fail_group(key);
@@ -788,7 +788,7 @@ impl<B: NativeAtomicBroker> Owner<B> {
             return;
         };
         let postings = std::mem::take(&mut group.prepared);
-        let native = match sealed.prepare(postings) {
+        let native = match sealed.prepare_work(postings) {
             Ok(native) => native,
             Err(_) => {
                 logical.permit().abort();
@@ -852,6 +852,10 @@ impl<B: NativeAtomicBroker> Owner<B> {
     }
 
     fn fail_group(&mut self, key: u64) {
+        self.abort_group(key, Some(refused("transactional queue work was refused")));
+    }
+
+    fn abort_group(&mut self, key: u64, error: Option<AmqpProtocolError>) {
         let Some(group) = self.groups.get(&key) else {
             return;
         };
@@ -864,13 +868,16 @@ impl<B: NativeAtomicBroker> Owner<B> {
         }
         // Submitted work may still be Pending. The same CAS protects the gap
         // between native owner claim and logical owner claim; Started is inert.
-        if group.submitted {
-            return;
-        }
-        if let Some(group) = self.groups.get_mut(&key) {
+        let submitted = group.submitted;
+        if let Some(group) = self.groups.get_mut(&key)
+            && !submitted
+        {
             group.refused = true;
             group.queued.clear();
             group.prepared.clear();
+        }
+        if let Some(error) = error {
+            self.complete_retirements(key, RetirementCompletion::Refused(error));
         }
     }
 
@@ -929,7 +936,12 @@ impl<B: NativeAtomicBroker> Owner<B> {
         let keys: Vec<_> = self
             .groups
             .iter()
-            .filter(|(_, group)| group.producers.contains(&producer))
+            .filter(|(_, group)| {
+                group.producers.contains(&producer)
+                    || group.rollback_postings.as_ref().is_some_and(|origins| {
+                        origins.iter().any(|source| source.same_receiver(identity))
+                    })
+            })
             .map(|(&key, _)| key)
             .collect();
         for key in keys {
@@ -966,10 +978,25 @@ impl<B: NativeAtomicBroker> Owner<B> {
             .retain(|_, group| !(group.ending && group.operations == 0));
         self.producers.retain(|row| {
             !row.closed
-                || self
-                    .groups
-                    .values()
-                    .any(|group| group.producers.contains(&row.key))
+                || self.groups.values().any(|group| {
+                    group.producers.contains(&row.key)
+                        || group.rollback_postings.as_ref().is_some_and(|origins| {
+                            origins
+                                .iter()
+                                .any(|source| source.same_receiver(&row.identity))
+                        })
+                })
+        });
+        self.consumers.retain(|row| {
+            !row.closed
+                || self.groups.values().any(|group| {
+                    group.consumers.contains(&row.key)
+                        || group.rollback_origins.as_ref().is_some_and(|origins| {
+                            origins
+                                .iter()
+                                .any(|(source, _)| source.same_sender(&row.identity))
+                        })
+                })
         });
         self.controllers.retain(|row| {
             !row.closed

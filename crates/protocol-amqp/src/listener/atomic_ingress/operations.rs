@@ -2,10 +2,12 @@ use std::{future::Future, pin::Pin};
 
 use amqp::{
     EngineError, Error as AmqpProtocolError, NativeControllerIdentity, NativeTransactionError,
-    NativeTransactionIdentity, PreparedPosting, SealedDischargeReceipt, TransactionPostingReceipt,
+    NativeTransactionIdentity, PreparedPosting, PreparedRetirement, SealedDischargeReceipt,
+    TransactionPostingReceipt, TransactionRetirementReceipt,
 };
 use domain::CommandKind;
 
+use super::groups::RetirementCompletion;
 use crate::{NativeAtomicBrokerCompletion, NativeAtomicResponseUnavailable};
 
 pub(super) type OperationFuture = Pin<Box<dyn Future<Output = Operation> + Send + 'static>>;
@@ -26,6 +28,17 @@ pub(super) enum Operation {
         producer: u64,
         result: Result<PreparedPosting, EngineError>,
     },
+    RetirementChecked {
+        key: u64,
+        consumer: u64,
+        receipt: TransactionRetirementReceipt,
+        result: Result<(), AmqpProtocolError>,
+    },
+    RetirementPrepared {
+        key: u64,
+        consumer: u64,
+        result: Result<PreparedRetirement, EngineError>,
+    },
     Ready {
         key: u64,
         receipt: SealedDischargeReceipt,
@@ -42,6 +55,7 @@ pub(super) enum Operation {
     Finished {
         key: u64,
         result: Result<(), EngineError>,
+        completion: RetirementCompletion,
     },
     DeclarationRefused {
         controller: NativeControllerIdentity,
@@ -55,6 +69,8 @@ impl Operation {
             Self::Declared { key, .. }
             | Self::PostingChecked { key, .. }
             | Self::Prepared { key, .. }
+            | Self::RetirementChecked { key, .. }
+            | Self::RetirementPrepared { key, .. }
             | Self::Ready { key, .. }
             | Self::Authorized { key, .. }
             | Self::Applied { key, .. }
