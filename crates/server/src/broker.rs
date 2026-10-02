@@ -38,10 +38,12 @@ mod atomic_messaging;
 mod atomic_work;
 mod bindings;
 mod guarded_atomic_messaging;
+mod native_atomic_messaging;
 mod protocol;
 mod request_queue;
 
 pub use guarded_atomic_messaging::GuardedAtomicSubmitError;
+pub use native_atomic_messaging::{NativeAtomicMessagingCompletion, NativeAtomicSubmitError};
 
 /// Commands that may be waiting ahead of a caller's own.
 ///
@@ -51,6 +53,10 @@ pub use guarded_atomic_messaging::GuardedAtomicSubmitError;
 const COMMAND_QUEUE_DEPTH: usize = 1_024;
 
 enum Request {
+    ApplyNativeAtomicMessagingOwned {
+        submission: Box<protocol_amqp::OwnedNativeAtomicMessagingSubmission>,
+        reply: flume::Sender<NativeAtomicMessagingCompletion>,
+    },
     ApplyEmptyAtomicMessagingOwned {
         submission: protocol_amqp::OwnedEmptyAtomicMessagingSubmission,
         reply: flume::Sender<Result<domain::AtomicMessagingApplication, GuardedAtomicSubmitError>>,
@@ -542,6 +548,14 @@ impl Broker {
             .spawn(move || {
                 while let Ok(request) = incoming.recv() {
                     match request {
+                        Request::ApplyNativeAtomicMessagingOwned { submission, reply } => {
+                            native_atomic_messaging::apply_owned(
+                                &proposer,
+                                &watching,
+                                *submission,
+                                reply,
+                            );
+                        }
                         Request::ApplyEmptyAtomicMessagingOwned { submission, reply } => {
                             atomic_work::apply_empty_owned(submission, reply);
                         }

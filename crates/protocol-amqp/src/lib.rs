@@ -17,6 +17,7 @@ mod condition;
 mod listener;
 mod management;
 mod message;
+mod native_atomic_work;
 mod session_filter;
 mod settlement;
 mod tls;
@@ -65,6 +66,10 @@ pub use crate::{
         DEAD_LETTER_DESCRIPTION_PROPERTY, DEAD_LETTER_REASON_PROPERTY, IncomingMessage,
         MESSAGE_STATE_ANNOTATION, SCHEDULED_ENQUEUE_TIME_ANNOTATION, read_incoming, write_delivery,
         write_peek_delivery,
+    },
+    native_atomic_work::{
+        NativeClaim, NativeReadySubmission, NativeReadyTicket, NativeTransactionDecision,
+        NativeTransactionError, NativeTransactionResources, OwnedNativeAtomicMessagingSubmission,
     },
     session_filter::{SESSION_FILTER, SessionRequest, read_session_filter, stamp_session_filter},
     tls::{TlsConfigurationError, tls_server_config},
