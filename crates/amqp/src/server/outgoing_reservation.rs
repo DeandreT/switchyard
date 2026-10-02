@@ -19,6 +19,8 @@ use super::{
 };
 use crate::{DeliveryState, DeliveryTag, Message, Outcome};
 
+mod owned_send;
+
 const WAITING: u8 = 0;
 const RESERVED: u8 = 1;
 const CLAIMED: u8 = 2;
@@ -257,34 +259,8 @@ impl Sender {
         message: Message,
         delivery_tag: DeliveryTag,
     ) -> Result<PendingSettlement, EngineError> {
-        if !reservation.belongs_to(&self.identity) {
-            return Err(EngineError::SendReservationRevoked);
-        }
-        let mut queued_guard = ReservationGuard::new(Arc::clone(&reservation.guard.control));
-        let (reply, outcome) = oneshot::channel();
-        self.commands
-            .send(Command::SendReserved {
-                channel: self.channel,
-                handle: self.handle,
-                identity: self.identity.clone(),
-                reservation,
-                message: Box::new(message),
-                delivery_tag,
-                reply,
-            })
+        self.send_reserved_with_settlement_owned(reservation, message, delivery_tag)
             .await
-            .map_err(|_| EngineError::Stopped)?;
-        let outcome = outcome.await.map_err(|_| EngineError::Stopped)??;
-        queued_guard.disarm();
-        Ok(PendingSettlement {
-            outcome: outcome.outcome,
-            identity: self.identity.clone(),
-            delivery_identity: outcome.delivery_identity,
-            acknowledgement: outcome.acknowledgement,
-            channel: self.channel,
-            handle: self.handle,
-            commands: self.commands.clone(),
-        })
     }
 }
 

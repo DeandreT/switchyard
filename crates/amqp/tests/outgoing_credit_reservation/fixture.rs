@@ -18,6 +18,11 @@ use amqp::{
 };
 use tokio::{io::DuplexStream, sync::Notify};
 
+mod flush_gate;
+
+pub(super) use flush_gate::FlushGate;
+use flush_gate::GatedIo;
+
 pub(super) const CHANNEL: u16 = 19;
 pub(super) const OTHER_CHANNEL: u16 = 23;
 pub(super) const HANDLE: u32 = 7;
@@ -265,6 +270,17 @@ impl Peer {
         handle: u32,
         tag: &[u8],
     ) -> Transfer {
+        self.transfer_message(peer_channel, handle, tag, &message())
+            .await
+    }
+
+    pub(super) async fn transfer_message(
+        &mut self,
+        peer_channel: u16,
+        handle: u32,
+        tag: &[u8],
+        expected: &Message,
+    ) -> Transfer {
         for _ in 0..16 {
             match self.frame().await {
                 Frame::Amqp {
@@ -284,7 +300,7 @@ impl Peer {
                     assert!(!transfer.more);
                     assert_eq!(
                         decode_message(&payload).expect("outgoing message"),
-                        message()
+                        *expected
                     );
                     return transfer;
                 }
@@ -295,6 +311,17 @@ impl Peer {
     }
 
     pub(super) async fn accepted(&mut self, channel: u16, id: u32, settled: bool) {
+        self.outcome(channel, id, settled, DeliveryState::Accepted(Accepted))
+            .await;
+    }
+
+    pub(super) async fn outcome(
+        &mut self,
+        channel: u16,
+        id: u32,
+        settled: bool,
+        state: DeliveryState,
+    ) {
         self.send(
             channel,
             Performative::Disposition(Disposition {
@@ -302,7 +329,7 @@ impl Peer {
                 first: id,
                 last: None,
                 settled,
-                state: Some(DeliveryState::Accepted(Accepted)),
+                state: Some(state),
                 batchable: false,
             }),
         )
@@ -382,8 +409,18 @@ pub(super) struct Fixture {
 
 impl Fixture {
     pub(super) async fn new() -> Self {
+        Self::open(None).await
+    }
+
+    pub(super) async fn gated() -> (Self, Arc<FlushGate>) {
+        let gate = Arc::new(FlushGate::new());
+        (Self::open(Some(Arc::clone(&gate))).await, gate)
+    }
+
+    async fn open(gate: Option<Arc<FlushGate>>) -> Self {
         bounded(async {
             let (wire, mut io) = tokio::io::duplex(16_384);
+            let wire = GatedIo::new(wire, gate);
             let opening = async {
                 write_protocol_header(&mut io, ProtocolHeader::AMQP)
                     .await
