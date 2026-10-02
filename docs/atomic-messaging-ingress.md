@@ -8,6 +8,31 @@ non-session queues. Ordinary `serve()`, server configuration, and the existing
 posting-only listener retain their previous policies. This is not an official
 SDK transaction-scope gate or a durable transaction recovery log.
 
+## Experimental Process Endpoint
+
+The broker process can expose this path at a separate development-only address:
+
+```sh
+cargo run -p server -- \
+  --mode development \
+  --listen 127.0.0.1:5672 \
+  --admin-listen 127.0.0.1:9080 \
+  --experimental-atomic-messaging-listen 127.0.0.1:5673
+```
+
+The address is opt-in and does not change ordinary AMQP, WebSocket, or native
+administration endpoints. It uses the same namespace, TLS identity, and
+shared-access policy as the ordinary listener. Configured credentials still
+require TLS. Production mode refuses the experimental flag before reading
+credentials or opening storage. All configured sockets bind before any
+listener starts serving.
+
+Use an isolated development network. Plaintext development remains possible;
+the flag does not make an unauthenticated or externally reachable endpoint safe.
+The supported receiving profile and transaction limits below still apply;
+enabling the address does not enable official SDK transaction scopes or
+management operations.
+
 ## Admission And Held Deliveries
 
 The endpoint shares TCP admission, TLS, WebSocket, SASL, CBS, handshake deadlines,

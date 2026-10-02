@@ -100,6 +100,8 @@ behavior it currently enforces:
   work, performs bounded admission and staging, and joins the two lifecycles.
   A separate [atomic messaging listener](atomic-messaging-ingress.md) derives
   Complete from a canonical held delivery and an exact native retirement receipt.
+  Its process address is an explicit development-only
+  `--experimental-atomic-messaging-listen` option with the existing TLS/SAS policy.
   Default listeners and SDK transaction scopes remain disabled.
 - A queue can enable duplicate detection by message ID, with a 10-minute
   default history window bounded to 20 seconds through 7 days. A duplicate

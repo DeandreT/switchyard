@@ -155,6 +155,9 @@ actual native receipts through that owner. Default Service Bus listeners still
 refuse transactions; SDK transaction scopes remain unfinished. A separate
 [atomic messaging listener](docs/atomic-messaging-ingress.md) adds actual held
 PeekLock completion to the same owner, without changing the posting-only endpoint.
+The process exposes it only through the separate, development-only
+`--experimental-atomic-messaging-listen` address; ordinary AMQP and WebSocket
+listeners retain their previous policies.
 The sender-side listener uses [retained ingress receipts](docs/retained-ingress.md)
 to preserve native content accounting through broker replies and acknowledgment flush.
 [Native connection identities](docs/native-connection-identity.md) preserve exact
