@@ -77,6 +77,7 @@ impl Fixture {
                 NativeCoordinatorProfile {
                     capabilities: 0,
                     outcomes: 0,
+                    default_initial_delivery_count: false,
                 },
             )
             .expect("bound controller fixture");

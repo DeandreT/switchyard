@@ -590,6 +590,29 @@ impl ServerConnection {
         .await
     }
 
+    /// Enables native transactional work with a narrow coordinator Attach default.
+    /// An omitted sender initial-delivery-count is accepted as zero only on a
+    /// fresh coordinator. Other native acceptance APIs retain their strict policy.
+    /// This interoperability exception does not enable SDK transaction scopes.
+    pub async fn accept_with_transactional_work_defaults<Io>(
+        stream: Io,
+        container_id: impl Into<String>,
+        sasl: Option<Arc<dyn SaslAuthenticator>>,
+        options: ConnectionOptions,
+    ) -> Result<Self, EngineError>
+    where
+        Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        Self::accept_inner(
+            stream,
+            container_id,
+            sasl,
+            options,
+            NativeIngressPolicy::WorkDefaults,
+        )
+        .await
+    }
+
     async fn accept_inner<Io>(
         mut stream: Io,
         container_id: impl Into<String>,
@@ -1487,7 +1510,7 @@ async fn run_connection<Io>(
         let stopped = {
             let processing = async {
                 loop {
-                    if native_policy == NativeIngressPolicy::PostingAndRetirement
+                    if native_policy.supports_retirement()
                         && reconcile_native_retirements(&mut sessions, &mut writer)
                             .await
                             .is_err()
@@ -1507,7 +1530,7 @@ async fn run_connection<Io>(
                         break;
                     }
                     tokio::select! {
-                        () = native_cleanup.notified(), if native_policy == NativeIngressPolicy::PostingAndRetirement => {
+                        () = native_cleanup.notified(), if native_policy.supports_retirement() => {
                             if reconcile_native_retirements(&mut sessions, &mut writer).await.is_err() {
                                 break;
                             }
@@ -2267,9 +2290,18 @@ async fn accept_native_receiving<W: AsyncWrite + Unpin>(
             "link handle is attached or awaiting detach acknowledgement",
         ));
     }
-    let initial_count = attach
-        .initial_delivery_count
-        .ok_or_else(|| invalid_state("sender attach has no initial delivery count"))?;
+    let initial_count = match attach.initial_delivery_count {
+        Some(count) => count,
+        None if matches!(
+            expected,
+            native_transactions::NativeAttachKind::Coordinator(profile)
+                if profile.defaults_initial_delivery_count()
+        ) =>
+        {
+            0
+        }
+        None => return Err(invalid_state("sender attach has no initial delivery count")),
+    };
     let receive_maximum = effective_receive_maximum(Some(max_message_size));
     let (attach, approval) = attach.into_parts();
     let identity = approval.link_identity().clone();
@@ -5202,6 +5234,9 @@ mod sender_provenance_tests;
 
 #[cfg(test)]
 mod native_retirement_tests;
+
+#[cfg(test)]
+mod transactional_defaults_tests;
 
 #[cfg(test)]
 mod session_provenance_tests;

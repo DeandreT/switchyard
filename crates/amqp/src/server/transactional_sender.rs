@@ -114,7 +114,34 @@ impl ServerSession {
         attach: IncomingAttach,
         _max_message_size: u64,
     ) -> Result<TransactionalSender, EngineError> {
-        acceptance::validate_sender_approval(&attach, &self.identity)?;
+        self.accept_transactional_sender_with_policy(
+            attach,
+            acceptance::NativeSenderSettlePolicy::StrictUnsettled,
+        )
+        .await
+    }
+
+    /// Negotiates actual Unsettled sending for an original Mixed or Unsettled request.
+    /// The receiving endpoint must still request Second mode; settled originals
+    /// and changes to the original requested settlement modes are refused.
+    pub async fn accept_transactional_sender_negotiating_unsettled(
+        &self,
+        attach: IncomingAttach,
+        _max_message_size: u64,
+    ) -> Result<TransactionalSender, EngineError> {
+        self.accept_transactional_sender_with_policy(
+            attach,
+            acceptance::NativeSenderSettlePolicy::NegotiateUnsettled,
+        )
+        .await
+    }
+
+    async fn accept_transactional_sender_with_policy(
+        &self,
+        attach: IncomingAttach,
+        policy: acceptance::NativeSenderSettlePolicy,
+    ) -> Result<TransactionalSender, EngineError> {
+        acceptance::validate_sender_approval(&attach, &self.identity, policy)?;
         let owner = attach.approval().link_identity().clone();
         let handle = attach.approval().local_handle();
         let (detached, detached_rx) = watch::channel(false);
@@ -124,6 +151,7 @@ impl ServerSession {
             attach,
             detached,
             commands: self.commands.clone(),
+            policy,
         };
         request(&self.commands, |reply| {
             Command::NativeTransactions(native_transactions::NativeCommand::AcceptSender {

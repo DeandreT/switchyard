@@ -163,6 +163,7 @@ impl Fixture {
                 NativeCoordinatorProfile {
                     capabilities: 0,
                     outcomes: 2,
+                    default_initial_delivery_count: false,
                 },
             )
             .expect("approved controller fixture");

@@ -26,9 +26,7 @@ pub(in crate::server) async fn apply_native_outgoing_disposition<W: AsyncWrite +
     writer: &mut FrameWriter<W>,
     book: &mut NativeTransactionBook,
 ) -> Result<bool, EngineError> {
-    if book.policy() != NativeIngressPolicy::PostingAndRetirement
-        || disposition.role != Role::Receiver
-    {
+    if !book.policy().supports_retirement() || disposition.role != Role::Receiver {
         return Ok(false);
     }
     let Some(session) = sessions.get(&channel) else {

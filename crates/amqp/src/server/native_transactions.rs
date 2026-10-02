@@ -40,6 +40,13 @@ pub(super) enum NativeIngressPolicy {
     Disabled,
     Posting,
     PostingAndRetirement,
+    WorkDefaults,
+}
+
+impl NativeIngressPolicy {
+    pub(super) fn supports_retirement(self) -> bool {
+        matches!(self, Self::PostingAndRetirement | Self::WorkDefaults)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,6 +59,14 @@ pub(super) enum NativeAttachKind {
 pub(super) struct NativeCoordinatorProfile {
     capabilities: u8,
     outcomes: u8,
+    // Preserve the actor-approved nullness across mutable Attach adjustments.
+    default_initial_delivery_count: bool,
+}
+
+impl NativeCoordinatorProfile {
+    pub(super) fn defaults_initial_delivery_count(self) -> bool {
+        self.default_initial_delivery_count
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,7 +184,7 @@ pub(super) fn classify_attach(
     if attach.role != Role::Sender
         || attach.snd_settle_mode == SenderSettleMode::Settled
         || has_recovery_state(attach)
-        || attach.initial_delivery_count.is_none()
+        || (attach.initial_delivery_count.is_none() && policy != NativeIngressPolicy::WorkDefaults)
     {
         return Err(NativeTransactionError::InvalidAttach);
     }
@@ -217,6 +232,7 @@ pub(super) fn classify_attach(
     Ok(NativeAttachKind::Coordinator(NativeCoordinatorProfile {
         capabilities,
         outcomes,
+        default_initial_delivery_count: attach.initial_delivery_count.is_none(),
     }))
 }
 
@@ -246,8 +262,14 @@ pub(super) fn validate_accept_kind(
     attach: &IncomingAttach,
     expected: NativeAttachKind,
 ) -> Result<(), EngineError> {
+    let policy = match expected {
+        NativeAttachKind::Coordinator(profile) if profile.defaults_initial_delivery_count() => {
+            NativeIngressPolicy::WorkDefaults
+        }
+        _ => NativeIngressPolicy::Posting,
+    };
     if attach.approval().kind() != expected
-        || classify_attach(attach, NativeIngressPolicy::Posting).map_err(native_error)? != expected
+        || classify_attach(attach, policy).map_err(native_error)? != expected
     {
         return Err(native_error(NativeTransactionError::InvalidAttach));
     }

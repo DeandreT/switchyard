@@ -235,7 +235,7 @@ impl NativeTransactionBook {
         &mut self,
         owner: &LinkIdentity,
     ) -> Result<(), NativeTransactionError> {
-        if self.policy != NativeIngressPolicy::PostingAndRetirement {
+        if !self.policy.supports_retirement() {
             return Err(NativeTransactionError::Disabled);
         }
         self.check_owner(owner)?;
@@ -274,7 +274,7 @@ impl NativeTransactionBook {
         &self,
         owner: &LinkIdentity,
     ) -> Result<(), NativeTransactionError> {
-        if self.policy != NativeIngressPolicy::PostingAndRetirement {
+        if !self.policy.supports_retirement() {
             return Err(NativeTransactionError::Disabled);
         }
         self.check_owner(owner)?;
@@ -293,7 +293,7 @@ impl NativeTransactionBook {
         state: &TransactionalState,
         candidates: &[NativeRetirementCandidate],
     ) -> Result<Vec<NativeRetirementAttempt>, NativeTransactionError> {
-        if self.policy != NativeIngressPolicy::PostingAndRetirement {
+        if !self.policy.supports_retirement() {
             return Err(NativeTransactionError::Disabled);
         }
         self.reap();

@@ -6,11 +6,19 @@ pub(in crate::server) struct NativeSenderAcceptance {
     pub(in crate::server) attach: IncomingAttach,
     pub(in crate::server) detached: watch::Sender<bool>,
     pub(in crate::server) commands: mpsc::Sender<Command>,
+    pub(super) policy: NativeSenderSettlePolicy,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum NativeSenderSettlePolicy {
+    StrictUnsettled,
+    NegotiateUnsettled,
 }
 
 pub(super) fn validate_sender_approval(
     attach: &IncomingAttach,
     session: &SessionIdentity,
+    policy: NativeSenderSettlePolicy,
 ) -> Result<(), EngineError> {
     attach
         .validate_request(session)
@@ -20,18 +28,32 @@ pub(super) fn validate_sender_approval(
         native_transactions::NativeAttachKind::Ordinary,
     )?;
     let original = attach.approval().refusal_attach();
+    let valid_sender_mode = match policy {
+        NativeSenderSettlePolicy::StrictUnsettled => {
+            original.snd_settle_mode == SenderSettleMode::Unsettled
+        }
+        NativeSenderSettlePolicy::NegotiateUnsettled => matches!(
+            original.snd_settle_mode,
+            SenderSettleMode::Mixed | SenderSettleMode::Unsettled
+        ),
+    };
     if original.role != Role::Sender
         || attach.role != Role::Receiver
-        || original.snd_settle_mode != SenderSettleMode::Unsettled
-        || attach.snd_settle_mode != SenderSettleMode::Unsettled
+        || !valid_sender_mode
+        || original.snd_settle_mode != attach.snd_settle_mode
         || original.rcv_settle_mode != ReceiverSettleMode::Second
         || attach.rcv_settle_mode != ReceiverSettleMode::Second
         || has_recovery_state(attach)
         || attach_uses_transactions(attach)
     {
-        return Err(invalid_state(
-            "native retirement requires original Unsettled/Second ordinary source",
-        ));
+        return Err(invalid_state(match policy {
+            NativeSenderSettlePolicy::StrictUnsettled => {
+                "native retirement requires original Unsettled/Second ordinary source"
+            }
+            NativeSenderSettlePolicy::NegotiateUnsettled => {
+                "native retirement requires original Mixed or Unsettled/Second ordinary source"
+            }
+        }));
     }
     Ok(())
 }
@@ -46,9 +68,10 @@ pub(in crate::server) async fn accept_native_sender<W: AsyncWrite + Unpin>(
         session: owner,
         attach,
         detached,
+        policy,
         ..
     } = acceptance;
-    validate_sender_approval(&attach, &owner)?;
+    validate_sender_approval(&attach, &owner, policy)?;
     let session = sessions
         .get_mut(&channel)
         .ok_or(EngineError::RemoteDetached)?;
@@ -80,6 +103,7 @@ pub(in crate::server) async fn accept_native_sender<W: AsyncWrite + Unpin>(
     let mut response = attach.response(attach.source.clone(), attach.target.clone());
     response.handle = handle;
     response.max_message_size = None;
+    response.snd_settle_mode = SenderSettleMode::Unsettled;
     let default_outcome = source_default_outcome(response.source.as_ref())?;
     let frame = Frame::Amqp {
         channel,
@@ -121,7 +145,7 @@ pub(in crate::server) async fn accept_native_sender<W: AsyncWrite + Unpin>(
             identity: identity.clone(),
             auto_acknowledge: false,
             max_message_size: normalized_message_size(attach.max_message_size),
-            settle_mode: attach.snd_settle_mode,
+            settle_mode: SenderSettleMode::Unsettled,
             receiver_settle_mode: attach.rcv_settle_mode,
             default_outcome,
             outstanding_tags: HashSet::new(),
