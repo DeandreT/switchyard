@@ -35,6 +35,7 @@ use crate::{AdminTarget, Clock, LocalProposer, ProposeError};
 
 mod admin_reads;
 mod atomic_messaging;
+mod atomic_work;
 mod bindings;
 mod guarded_atomic_messaging;
 mod protocol;
@@ -50,6 +51,10 @@ pub use guarded_atomic_messaging::GuardedAtomicSubmitError;
 const COMMAND_QUEUE_DEPTH: usize = 1_024;
 
 enum Request {
+    ApplyAtomicMessagingOwned {
+        submission: protocol_amqp::OwnedAtomicMessagingSubmission,
+        reply: flume::Sender<Result<domain::AtomicMessagingApplication, GuardedAtomicSubmitError>>,
+    },
     ApplyAtomicMessagingGuarded {
         binding: EntityBinding,
         kinds: Vec<CommandKind>,
@@ -533,6 +538,9 @@ impl Broker {
             .spawn(move || {
                 while let Ok(request) = incoming.recv() {
                     match request {
+                        Request::ApplyAtomicMessagingOwned { submission, reply } => {
+                            atomic_work::apply_owned(&proposer, &watching, submission, reply);
+                        }
                         Request::ApplyAtomicMessagingGuarded {
                             binding,
                             kinds,

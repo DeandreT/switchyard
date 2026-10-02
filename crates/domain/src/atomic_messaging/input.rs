@@ -7,11 +7,14 @@ use crate::{
 
 use super::AtomicMessagingLimit as Limit;
 
-#[derive(Default)]
-struct InputBudget {
+/// Payload-free borrowed input usage for one bounded atomic messaging group.
+/// This does not validate message shape, entity configuration, locks, or authorization.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AtomicMessagingInputUsage {
+    actions: usize,
     messages: usize,
-    bytes: usize,
-    nodes: usize,
+    content_bytes: usize,
+    value_items: usize,
 }
 
 fn add(used: &mut usize, amount: usize, limit: Limit) -> Result<(), BrokerError> {
@@ -22,9 +25,35 @@ fn add(used: &mut usize, amount: usize, limit: Limit) -> Result<(), BrokerError>
     Ok(())
 }
 
-impl InputBudget {
+impl AtomicMessagingInputUsage {
+    pub const fn actions(&self) -> usize {
+        self.actions
+    }
+
+    pub const fn messages(&self) -> usize {
+        self.messages
+    }
+
+    pub const fn content_bytes(&self) -> usize {
+        self.content_bytes
+    }
+
+    pub const fn value_items(&self) -> usize {
+        self.value_items
+    }
+
+    /// Adds one supported action without retaining or cloning its payload.
+    /// Failed additions leave all usage unchanged; successful usage is cumulative.
+    pub fn try_extend(&mut self, kind: &CommandKind) -> Result<(), BrokerError> {
+        let mut candidate = *self;
+        add(&mut candidate.actions, 1, Limit::Actions)?;
+        candidate.extend_kind(kind)?;
+        *self = candidate;
+        Ok(())
+    }
+
     fn bytes(&mut self, bytes: usize) -> Result<(), BrokerError> {
-        add(&mut self.bytes, bytes, Limit::ContentBytes)
+        add(&mut self.content_bytes, bytes, Limit::ContentBytes)
     }
 
     fn value(&mut self, value: &MessageValue, depth: usize) -> Result<(), BrokerError> {
@@ -33,7 +62,7 @@ impl InputBudget {
                 reason: format!("message value depth exceeds {MAX_MESSAGE_VALUE_DEPTH}"),
             });
         }
-        add(&mut self.nodes, 1, Limit::ValueItems)?;
+        add(&mut self.value_items, 1, Limit::ValueItems)?;
         match value {
             MessageValue::List(values) | MessageValue::Array(values) => {
                 for value in values {
@@ -61,7 +90,7 @@ impl InputBudget {
             _ => Some(0),
         }
         .ok_or_else(|| Limit::ContentBytes.exceeded())?;
-        if minimum_sections > Limit::ContentBytes.maximum() - self.bytes {
+        if minimum_sections > Limit::ContentBytes.maximum() - self.content_bytes {
             return Err(Limit::ContentBytes.exceeded());
         }
         for value in envelope
@@ -122,17 +151,8 @@ impl InputBudget {
         }
         Ok(())
     }
-}
 
-pub(super) fn validate<'a>(
-    kinds: impl Iterator<Item = &'a CommandKind>,
-    actions: usize,
-) -> Result<(), BrokerError> {
-    if actions > Limit::Actions.maximum() {
-        return Err(Limit::Actions.exceeded());
-    }
-    let mut budget = InputBudget::default();
-    for kind in kinds {
+    fn extend_kind(&mut self, kind: &CommandKind) -> Result<(), BrokerError> {
         match kind {
             CommandKind::Send {
                 message_id,
@@ -143,7 +163,7 @@ pub(super) fn validate<'a>(
                 if session_id.is_some() {
                     return Err(BrokerError::AtomicMessagingOperationNotSupported);
                 }
-                budget.message(message_id, body, None)?;
+                self.message(message_id, body, None)?;
             }
             CommandKind::SendEnvelope {
                 message_id,
@@ -155,17 +175,17 @@ pub(super) fn validate<'a>(
                 if session_id.is_some() {
                     return Err(BrokerError::AtomicMessagingOperationNotSupported);
                 }
-                budget.message(message_id, body, Some(envelope))?;
+                self.message(message_id, body, Some(envelope))?;
             }
             CommandKind::SendBatch { messages } => {
-                if messages.len() > Limit::Messages.maximum() - budget.messages {
+                if messages.len() > Limit::Messages.maximum() - self.messages {
                     return Err(Limit::Messages.exceeded());
                 }
                 for message in messages {
                     if message.scheduled_enqueue_time.is_some() || message.session_id.is_some() {
                         return Err(BrokerError::AtomicMessagingOperationNotSupported);
                     }
-                    budget.message(&message.message_id, &message.body, Some(&message.envelope))?;
+                    self.message(&message.message_id, &message.body, Some(&message.envelope))?;
                 }
             }
             CommandKind::Complete { .. }
@@ -176,19 +196,33 @@ pub(super) fn validate<'a>(
                 description,
                 ..
             } => {
-                budget.bytes(reason.len())?;
-                budget.bytes(description.len())?;
+                self.bytes(reason.len())?;
+                self.bytes(description.len())?;
             }
             CommandKind::Settle {
                 disposition,
                 properties_to_modify,
                 ..
             } => {
-                budget.properties(properties_to_modify)?;
-                budget.disposition(disposition)?;
+                self.properties(properties_to_modify)?;
+                self.disposition(disposition)?;
             }
             _ => return Err(BrokerError::AtomicMessagingOperationNotSupported),
         }
+        Ok(())
+    }
+}
+
+pub(super) fn validate<'a>(
+    kinds: impl Iterator<Item = &'a CommandKind>,
+    actions: usize,
+) -> Result<(), BrokerError> {
+    if actions > Limit::Actions.maximum() {
+        return Err(Limit::Actions.exceeded());
+    }
+    let mut usage = AtomicMessagingInputUsage::default();
+    for kind in kinds {
+        usage.try_extend(kind)?;
     }
     Ok(())
 }

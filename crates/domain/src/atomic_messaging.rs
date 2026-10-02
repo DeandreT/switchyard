@@ -10,6 +10,8 @@ use crate::{
 
 mod input;
 
+pub use input::AtomicMessagingInputUsage;
+
 pub const MAX_ATOMIC_MESSAGING_ACTIONS: usize = 100;
 pub const MAX_ATOMIC_MESSAGING_MESSAGES: usize = 100;
 pub const MAX_ATOMIC_MESSAGING_CONTENT_BYTES: usize = 4 * 1024 * 1024;

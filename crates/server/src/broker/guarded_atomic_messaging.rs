@@ -13,6 +13,10 @@ pub enum GuardedAtomicSubmitError {
     Propose(#[from] ProposeError),
     #[error("the broker owner stopped; consult the commit permit for its decision")]
     BrokerStopped,
+    #[error(
+        "atomic command work is no longer available; consult the commit permit for its decision"
+    )]
+    WorkUnavailable,
 }
 
 impl BrokerHandle {
@@ -101,7 +105,7 @@ pub(super) fn apply_guarded<S: StateStore, C: Clock>(
     let _ = reply.send(application.map_err(GuardedAtomicSubmitError::Propose));
 }
 
-fn commit_decision(
+pub(super) fn commit_decision(
     application: &Result<AtomicMessagingApplication, ProposeError>,
 ) -> AtomicCommitDecision {
     match application {

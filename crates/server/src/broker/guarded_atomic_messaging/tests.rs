@@ -29,6 +29,9 @@ use crate::{Broker, Clock, GuardedAtomicSubmitError, LocalProposer, ProposeError
 mod fixture;
 use fixture::*;
 
+#[path = "tests/atomic_work.rs"]
+mod atomic_work;
+
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const DEADLINE: Duration = Duration::from_secs(5);
 const NO_WAKE: Duration = Duration::from_millis(30);

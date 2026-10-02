@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod address;
+mod atomic_work;
 mod authorization;
 mod batch;
 mod broker;
@@ -26,6 +27,11 @@ pub use crate::{
     address::{
         Attachment, DEAD_LETTER_SUFFIX, SUBSCRIPTION_SEGMENT, namespace_from_hostname,
         parse_attachment, parse_session_id,
+    },
+    atomic_work::{
+        AtomicMessagingOwnerWork, AtomicMessagingWorkBudget, AtomicMessagingWorkError,
+        AtomicMessagingWorkUsage, MAX_ATOMIC_WORK_CONTENT_BYTES, MAX_ATOMIC_WORK_GROUPS,
+        MAX_ATOMIC_WORK_VALUE_ITEMS, OwnedAtomicMessagingSubmission, StagedAtomicMessaging,
     },
     authorization::SharedAccessAuthentication,
     batch::SERVICE_BUS_BATCH_MESSAGE_FORMAT,
