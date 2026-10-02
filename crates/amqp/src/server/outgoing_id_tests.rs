@@ -172,6 +172,10 @@ impl Fixture {
                     id,
                     OutgoingDelivery {
                         reply,
+                        delivery_identity: NativeOutgoingDeliveryIdentity::for_delivery(
+                            &link.identity,
+                            id
+                        ),
                         delivery_tag: tag.into(),
                         outcome: None,
                         receiver_settled: false
@@ -216,6 +220,7 @@ impl Fixture {
             offset: 1,
             first_frame_sent: true,
             delivery_id: id,
+            delivery_identity: NativeOutgoingDeliveryIdentity::for_delivery(&link.identity, id),
             delivery_tag: tag.into(),
             message_format: 0,
             settled: true,

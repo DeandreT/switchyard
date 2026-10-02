@@ -5,6 +5,9 @@ mod fixture;
 
 use fixture::*;
 
+#[path = "sender_provenance_tests/generation_tests.rs"]
+mod generation_tests;
+
 fn assert_origin(
     receipt: &PendingSettlement,
     sender: &NativeSenderIdentity,
@@ -500,9 +503,11 @@ fn unbound_private_sender_and_receipt_fail_closed_without_an_active_connection()
         detached,
         identity: identity.clone(),
     };
+    let delivery_identity = NativeOutgoingDeliveryIdentity::for_delivery(&identity, 0);
     let receipt = PendingSettlement {
         outcome: Outcome::Accepted(Accepted),
         identity,
+        delivery_identity,
         acknowledgement: None,
         channel: 0,
         handle: 0,

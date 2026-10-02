@@ -6,31 +6,42 @@ use std::{
     },
 };
 
-use super::incoming_ledger::LinkIdentity;
+use super::{NativeOutgoingDeliveryIdentity, incoming_ledger::LinkIdentity};
 
 #[derive(Clone, Debug)]
 pub(super) struct AckIdentity(Arc<AckGeneration>);
 
 #[derive(Debug)]
 struct AckGeneration {
-    owner: LinkIdentity,
-    id: u32,
+    delivery: NativeOutgoingDeliveryIdentity,
     tag: Vec<u8>,
     settled: AtomicBool,
 }
 
 impl AckIdentity {
+    #[cfg(test)]
     pub(super) fn new(owner: &LinkIdentity, id: u32, tag: &[u8]) -> Self {
+        Self::for_delivery(
+            &NativeOutgoingDeliveryIdentity::for_delivery(owner, id),
+            tag,
+        )
+    }
+
+    pub(super) fn for_delivery(delivery: &NativeOutgoingDeliveryIdentity, tag: &[u8]) -> Self {
         Self(Arc::new(AckGeneration {
-            owner: owner.clone(),
-            id,
+            delivery: delivery.clone(),
             tag: tag.to_vec(),
             settled: AtomicBool::new(false),
         }))
     }
 
     pub(super) fn id(&self) -> u32 {
-        self.0.id
+        self.0.delivery.id()
+    }
+
+    #[cfg(test)]
+    pub(super) fn delivery_identity(&self) -> &NativeOutgoingDeliveryIdentity {
+        &self.0.delivery
     }
 
     pub(super) fn tag(&self) -> &[u8] {
@@ -38,7 +49,7 @@ impl AckIdentity {
     }
 
     pub(super) fn belongs_to(&self, owner: &LinkIdentity) -> bool {
-        self.0.owner.same_link(owner)
+        self.0.delivery.owner().same_link(owner)
     }
 
     pub(super) fn same_ack(&self, other: &Self) -> bool {

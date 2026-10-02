@@ -144,6 +144,8 @@ impl Fixture {
         active: bool,
     ) -> oneshot::Receiver<Result<SendOutcome, EngineError>> {
         let (reply, result) = oneshot::channel();
+        let delivery_identity =
+            NativeOutgoingDeliveryIdentity::for_delivery(&self.link().identity, id);
         self.link_mut()
             .outstanding_tags
             .insert(id.to_be_bytes().to_vec());
@@ -154,6 +156,7 @@ impl Fixture {
                     id,
                     OutgoingDelivery {
                         reply,
+                        delivery_identity: delivery_identity.clone(),
                         delivery_tag: id.to_be_bytes().to_vec().into(),
                         outcome: None,
                         receiver_settled: false,
@@ -173,6 +176,7 @@ impl Fixture {
                 offset: 1,
                 first_frame_sent: true,
                 delivery_id: id,
+                delivery_identity,
                 delivery_tag: id.to_be_bytes().to_vec().into(),
                 message_format: 0,
                 settled: false,
@@ -605,6 +609,8 @@ fn delivery_at(
     id: u32,
 ) -> oneshot::Receiver<Result<SendOutcome, EngineError>> {
     let (reply, result) = oneshot::channel();
+    let delivery_identity =
+        NativeOutgoingDeliveryIdentity::for_delivery(&sending_mut(session, handle).identity, id);
     sending_mut(session, handle)
         .outstanding_tags
         .insert(id.to_be_bytes().to_vec());
@@ -615,6 +621,7 @@ fn delivery_at(
                 id,
                 OutgoingDelivery {
                     reply,
+                    delivery_identity,
                     delivery_tag: id.to_be_bytes().to_vec().into(),
                     outcome: None,
                     receiver_settled: false

@@ -201,10 +201,15 @@ impl Fixture {
         id: u32,
     ) -> oneshot::Receiver<Result<SendOutcome, EngineError>> {
         let (reply, result) = oneshot::channel();
+        let delivery_identity = NativeOutgoingDeliveryIdentity::for_delivery(
+            &self.sender(channel, handle).identity,
+            id,
+        );
         self.sender(channel, handle).unsettled.insert(
             id,
             OutgoingDelivery {
                 reply,
+                delivery_identity,
                 delivery_tag: id.to_be_bytes().to_vec().into(),
                 outcome: None,
                 receiver_settled: false,
@@ -447,12 +452,19 @@ fn installed_snapshots_collect_exact_incoming_phases_and_the_outgoing_live_union
         message_format: 0,
         reply,
     });
+    let delivery_identity = link
+        .unsettled
+        .get(&8)
+        .expect("original active delivery")
+        .delivery_identity
+        .clone();
     link.active = Some(ActiveSend {
         payload: vec![1],
         content_lease: lease,
         offset: 0,
         first_frame_sent: true,
         delivery_id: 8,
+        delivery_identity,
         delivery_tag: vec![8].into(),
         message_format: 0,
         settled: false,
@@ -1038,6 +1050,7 @@ async fn failed_or_cancelled_error_detach_flush_keeps_known_ids_owned_in_both_di
                     offset: 0,
                     first_frame_sent: true,
                     delivery_id: 9,
+                    delivery_identity: NativeOutgoingDeliveryIdentity::for_delivery(&owner, 9),
                     delivery_tag: vec![9].into(),
                     message_format: 0,
                     settled: true,

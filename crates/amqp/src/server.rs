@@ -34,6 +34,7 @@ mod idle;
 mod incoming_ledger;
 mod link_handles;
 mod native_transactions;
+mod outgoing_delivery_identity;
 mod outgoing_identity;
 mod receive_credit;
 mod retained_delivery;
@@ -73,6 +74,7 @@ pub use native_transactions::{
     TransactionalIngress, TransactionalReceiver,
 };
 use native_transactions::{NativeIngressPolicy, NativeTransactionBook};
+pub use outgoing_delivery_identity::NativeOutgoingDeliveryIdentity;
 use outgoing_identity::AckIdentity;
 use receive_credit::{Consumption, ReceiveCredit};
 pub use retained_delivery::RetainedDelivery;
@@ -429,6 +431,7 @@ pub struct Sender {
 pub struct PendingSettlement {
     outcome: Outcome,
     identity: LinkIdentity,
+    delivery_identity: NativeOutgoingDeliveryIdentity,
     acknowledgement: Option<AckIdentity>,
     channel: u16,
     handle: u32,
@@ -438,6 +441,12 @@ pub struct PendingSettlement {
 impl PendingSettlement {
     pub fn outcome(&self) -> &Outcome {
         &self.outcome
+    }
+
+    /// Observes the original delivery generation. This may already be a
+    /// transport-terminal delivery; the observer grants no settlement authority.
+    pub fn delivery_identity(&self) -> &NativeOutgoingDeliveryIdentity {
+        &self.delivery_identity
     }
 
     /// Tests active exact sending-link origin, independent of the outcome or
@@ -914,6 +923,7 @@ impl Sender {
         Ok(PendingSettlement {
             outcome: outcome.outcome,
             identity: self.identity.clone(),
+            delivery_identity: outcome.delivery_identity,
             acknowledgement: outcome.acknowledgement,
             channel: self.channel,
             handle: self.handle,
@@ -1334,6 +1344,7 @@ struct ActiveSend {
     offset: usize,
     first_frame_sent: bool,
     delivery_id: u32,
+    delivery_identity: NativeOutgoingDeliveryIdentity,
     delivery_tag: DeliveryTag,
     message_format: u32,
     settled: bool,
@@ -1342,6 +1353,7 @@ struct ActiveSend {
 
 struct OutgoingDelivery {
     reply: oneshot::Sender<Result<SendOutcome, EngineError>>,
+    delivery_identity: NativeOutgoingDeliveryIdentity,
     delivery_tag: DeliveryTag,
     outcome: Option<Outcome>,
     receiver_settled: bool,
@@ -1349,6 +1361,7 @@ struct OutgoingDelivery {
 
 struct SendOutcome {
     outcome: Outcome,
+    delivery_identity: NativeOutgoingDeliveryIdentity,
     acknowledgement: Option<AckIdentity>,
 }
 
@@ -4639,6 +4652,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
         }
         let queued = link.queued.pop_front().expect("queued delivery exists");
         let id = delivery_id;
+        let delivery_identity = NativeOutgoingDeliveryIdentity::for_delivery(&link.identity, id);
         session.next_delivery_id = id.wrapping_add(1);
         let settled = link.settle_mode == SenderSettleMode::Settled;
         let settled_reply = if settled {
@@ -4648,6 +4662,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
                 id,
                 OutgoingDelivery {
                     reply: queued.reply,
+                    delivery_identity: delivery_identity.clone(),
                     delivery_tag: queued.delivery_tag.clone(),
                     outcome: None,
                     receiver_settled: false,
@@ -4661,6 +4676,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
             offset: 0,
             first_frame_sent: false,
             delivery_id: id,
+            delivery_identity,
             delivery_tag: queued.delivery_tag,
             message_format: queued.message_format,
             settled,
@@ -4676,6 +4692,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
             payload,
             content_lease,
             delivery_id,
+            delivery_identity,
             delivery_tag,
             settled_reply,
             ..
@@ -4686,6 +4703,7 @@ async fn send_fragment<W: AsyncWrite + Unpin>(
             link.outstanding_tags.remove(delivery_tag.as_ref());
             let _ = reply.send(Ok(SendOutcome {
                 outcome: Outcome::Accepted(Accepted),
+                delivery_identity,
                 acknowledgement: None,
             }));
         } else {
@@ -4731,8 +4749,9 @@ async fn resolve_outgoing<W: AsyncWrite + Unpin>(
     };
     let acknowledge =
         link.receiver_settle_mode == ReceiverSettleMode::Second && !delivery.receiver_settled;
-    let mut acknowledgement =
-        acknowledge.then(|| AckIdentity::new(&link.identity, id, delivery.delivery_tag.as_ref()));
+    let mut acknowledgement = acknowledge.then(|| {
+        AckIdentity::for_delivery(&delivery.delivery_identity, delivery.delivery_tag.as_ref())
+    });
     if let Some(identity) = &acknowledgement {
         link.pending_acknowledgements.insert(id, identity.clone());
         if link.auto_acknowledge {
@@ -4748,6 +4767,7 @@ async fn resolve_outgoing<W: AsyncWrite + Unpin>(
     }
     let _ = delivery.reply.send(Ok(SendOutcome {
         outcome,
+        delivery_identity: delivery.delivery_identity,
         acknowledgement,
     }));
     Ok(())

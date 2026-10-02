@@ -94,6 +94,16 @@ impl Peer {
     }
 
     pub(super) async fn transfer(&mut self, peer_channel: u16, local_handle: u32) -> Transfer {
+        self.transfer_with_settlement(peer_channel, local_handle, false)
+            .await
+    }
+
+    pub(super) async fn transfer_with_settlement(
+        &mut self,
+        peer_channel: u16,
+        local_handle: u32,
+        settled: bool,
+    ) -> Transfer {
         for _ in 0..16 {
             let frame = self.frame().await;
             if self.allowed_flow(&frame) {
@@ -111,7 +121,7 @@ impl Peer {
             assert_eq!(transfer.handle, local_handle);
             assert_eq!(transfer.delivery_tag, Some(TAG.to_vec().into()));
             assert_eq!(transfer.message_format, Some(0));
-            assert_eq!(transfer.settled, Some(false));
+            assert_eq!(transfer.settled, Some(settled));
             assert!(!transfer.more);
             assert!(transfer.state.is_none());
             assert_eq!(
@@ -299,6 +309,26 @@ impl Fixture {
         name: &str,
         mode: ReceiverSettleMode,
     ) -> IncomingAttach {
+        self.incoming_with_mode(
+            session,
+            channel,
+            handle,
+            name,
+            mode,
+            SenderSettleMode::Unsettled,
+        )
+        .await
+    }
+
+    pub(super) async fn incoming_with_mode(
+        &mut self,
+        session: &mut ServerSession,
+        channel: u16,
+        handle: u32,
+        name: &str,
+        mode: ReceiverSettleMode,
+        sender_mode: SenderSettleMode,
+    ) -> IncomingAttach {
         bounded("bounded peer receiver Attach publication", async {
             self.peer
                 .send(
@@ -307,7 +337,7 @@ impl Fixture {
                         name: name.to_owned(),
                         handle,
                         role: Role::Receiver,
-                        snd_settle_mode: SenderSettleMode::Unsettled,
+                        snd_settle_mode: sender_mode,
                         rcv_settle_mode: mode,
                         source: Some(Source::new("same-queue")),
                         target: Some(Target::new("same-queue").into()),

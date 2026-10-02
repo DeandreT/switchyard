@@ -287,6 +287,7 @@ async fn borrowed_pending_settlement_preserves_oversized_rejection_for_valid_ret
     let pending = PendingSettlement {
         outcome: Outcome::Accepted(Accepted),
         identity: fixture.owner.clone(),
+        delivery_identity: token.delivery_identity().clone(),
         acknowledgement: Some(token.clone()),
         channel: CHANNEL,
         handle: HANDLE,
@@ -393,6 +394,7 @@ async fn retired_owner_without_an_acknowledgement_never_becomes_a_successful_noo
         let receipt = PendingSettlement {
             outcome: Outcome::Accepted(Accepted),
             identity: owner,
+            delivery_identity: pending.delivery_identity().clone(),
             acknowledgement: None,
             channel: CHANNEL,
             handle: HANDLE,
@@ -625,6 +627,7 @@ async fn automatic_acknowledgement_precedes_send_reply_and_survives_a_dropped_re
         let mut fixture = Fixture::new(true);
         let (reply, result) = oneshot::channel();
         let mut result = (!dropped).then_some(result);
+        let delivery_identity = NativeOutgoingDeliveryIdentity::for_delivery(&fixture.owner, ID);
         fixture
             .sending_mut()
             .outstanding_tags
@@ -633,6 +636,7 @@ async fn automatic_acknowledgement_precedes_send_reply_and_survives_a_dropped_re
             ID,
             OutgoingDelivery {
                 reply,
+                delivery_identity,
                 delivery_tag: vec![ID as u8].into(),
                 outcome: Some(Outcome::Accepted(Accepted)),
                 receiver_settled: false,
@@ -683,6 +687,7 @@ async fn automatic_acknowledgement_precedes_send_reply_and_survives_a_dropped_re
 async fn automatic_acknowledgement_flush_failure_never_publishes_a_successful_send() {
     let mut fixture = Fixture::new(true);
     let (reply, mut result) = oneshot::channel();
+    let delivery_identity = NativeOutgoingDeliveryIdentity::for_delivery(&fixture.owner, ID);
     fixture
         .sending_mut()
         .outstanding_tags
@@ -691,6 +696,7 @@ async fn automatic_acknowledgement_flush_failure_never_publishes_a_successful_se
         ID,
         OutgoingDelivery {
             reply,
+            delivery_identity,
             delivery_tag: vec![ID as u8].into(),
             outcome: Some(Outcome::Accepted(Accepted)),
             receiver_settled: false,
@@ -741,11 +747,13 @@ async fn early_outcome_is_latched_until_final_transfer_then_automatically_acknow
         .try_reserve(2)
         .expect("active content");
     let link = fixture.sending_mut();
+    let delivery_identity = NativeOutgoingDeliveryIdentity::for_delivery(&link.identity, ID);
     link.outstanding_tags.insert(vec![ID as u8]);
     link.unsettled.insert(
         ID,
         OutgoingDelivery {
             reply,
+            delivery_identity: delivery_identity.clone(),
             delivery_tag: vec![ID as u8].into(),
             outcome: None,
             receiver_settled: false,
@@ -757,6 +765,7 @@ async fn early_outcome_is_latched_until_final_transfer_then_automatically_acknow
         offset: 1,
         first_frame_sent: true,
         delivery_id: ID,
+        delivery_identity,
         delivery_tag: vec![ID as u8].into(),
         message_format: 0,
         settled: false,
@@ -825,6 +834,8 @@ async fn automatic_policy_never_acknowledges_first_mode_or_already_settled_outco
             let mut fixture = Fixture::new(true);
             fixture.sending_mut().receiver_settle_mode = receiver_settle_mode.clone();
             let (reply, result) = oneshot::channel();
+            let delivery_identity =
+                NativeOutgoingDeliveryIdentity::for_delivery(&fixture.owner, ID);
             fixture
                 .sending_mut()
                 .outstanding_tags
@@ -833,6 +844,7 @@ async fn automatic_policy_never_acknowledges_first_mode_or_already_settled_outco
                 ID,
                 OutgoingDelivery {
                     reply,
+                    delivery_identity,
                     delivery_tag: vec![ID as u8].into(),
                     outcome: None,
                     receiver_settled: false,
@@ -872,12 +884,14 @@ async fn presettled_active_send_reports_success_only_after_final_transfer_flush(
         .content_budget()
         .try_reserve(2)
         .expect("active content");
+    let delivery_identity = NativeOutgoingDeliveryIdentity::for_delivery(&fixture.owner, ID);
     fixture.sending_mut().active = Some(ActiveSend {
         payload: vec![1, 2],
         content_lease,
         offset: 1,
         first_frame_sent: true,
         delivery_id: ID,
+        delivery_identity,
         delivery_tag: vec![ID as u8].into(),
         message_format: 0,
         settled: true,

@@ -674,6 +674,7 @@ async fn wrapping_disposition_resolves_existing_ids_without_reusing_an_outstandi
                 0,
                 OutgoingDelivery {
                     reply: old_reply,
+                    delivery_identity: NativeOutgoingDeliveryIdentity::for_delivery(&identity, 0),
                     delivery_tag: vec![0].into(),
                     outcome: None,
                     receiver_settled: false,

@@ -189,6 +189,7 @@ impl Fixture {
                 7,
                 OutgoingDelivery {
                     reply,
+                    delivery_identity: NativeOutgoingDeliveryIdentity::for_delivery(owner, 7),
                     delivery_tag: vec![7].into(),
                     outcome: None,
                     receiver_settled: false,
