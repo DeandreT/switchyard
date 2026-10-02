@@ -159,12 +159,12 @@ The process exposes it only through the separate, development-only
 `--experimental-atomic-messaging-listen` address; ordinary AMQP and WebSocket
 listeners retain their previous policies.
 Both pinned .NET clients have an opt-in [transaction-scope gate](docs/dotnet-transaction-scopes.md)
-for warmed, same-queue immediate send and held Complete over TLS on that address,
-with memory and Fjall coverage. Its fixed
+for warmed and cold-first same-queue immediate send, plus held Complete over TLS
+on that address, with memory and Fjall coverage. Its fixed
 [initial control window](docs/initial-transaction-authorization.md) admits bounded
 declaration and rollback before the first grant, never queue access or commit.
-Cold-first SDK scopes remain ungated; experimental management, cross-queue work,
-and transaction recovery remain unsupported.
+Cold-first support is Send only; transactional acquisition, experimental
+management, cross-queue work, and transaction recovery remain unsupported.
 The sender-side listener uses [retained ingress receipts](docs/retained-ingress.md)
 to preserve native content accounting through broker replies and acknowledgment flush.
 [Native connection identities](docs/native-connection-identity.md) preserve exact

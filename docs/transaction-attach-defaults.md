@@ -6,7 +6,7 @@ requests without changing the existing strict APIs. The explicit
 listeners and the [posting-only listener](atomic-posting-ingress.md) do not.
 These are wire-profile opt-ins, not SDK support on their own. The separate
 [pinned .NET transaction-scope gate](dotnet-transaction-scopes.md) establishes
-its specific warmed same-queue subset through this listener.
+its specific same-queue send and held Complete subset through this listener.
 
 ## Receiving Settlement Negotiation
 
@@ -55,9 +55,11 @@ constructors retain their previous behavior.
 The messaging adapter still authorizes exact Listen before queue binding and
 requires a fixed, non-durable, unfiltered primary non-session queue source.
 Actual settlement remains Unsettled/Second; no settled original gains retirement
-authority. Coordinator admission still requires a valid authentication grant.
+authority. Coordinator metadata admission uses the separate, fixed
+[initial authorization window](initial-transaction-authorization.md); commits
+and queue access still require valid grants.
 
-These accommodations do not add management links, cold-first SDK authorization,
-transactional acquisition, recovery, cross-queue work, or different retirement
-outcomes. Existing resource limits, same-original rollback, exact mixed
+These accommodations alone do not add initial authorization grace, management
+links, transactional acquisition, recovery, cross-queue work, or different
+retirement outcomes. Existing resource limits, same-original rollback, exact mixed
 preparation, and indeterminate-result rules are unchanged.

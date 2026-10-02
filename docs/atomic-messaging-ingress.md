@@ -7,8 +7,9 @@ entry point for [NativeAtomicBroker](native-atomic-broker.md). It joins the
 non-session queues. Ordinary `serve()`, ordinary process listeners, and the
 existing posting-only listener retain their previous policies. A separate
 [pinned .NET transaction-scope gate](dotnet-transaction-scopes.md) establishes
-warmed same-queue send and held Complete over TLS on this endpoint. It is not
-general SDK transaction compatibility or a durable transaction recovery log.
+warmed and cold-first same-queue send, plus held Complete over TLS on this
+endpoint. It is not general SDK transaction compatibility or a durable
+transaction recovery log.
 
 ## Experimental Process Endpoint
 
@@ -32,9 +33,9 @@ listener starts serving.
 Use an isolated development network. Plaintext development remains possible;
 the flag does not make an unauthenticated or externally reachable endpoint safe.
 The supported receiving profile and transaction limits below still apply.
-Only the [gated warmed same-queue SDK subset](dotnet-transaction-scopes.md) is
-established; cold-first SDK scopes remain ungated and management operations
-remain unsupported.
+Only the [gated same-queue SDK subset](dotnet-transaction-scopes.md) is
+established: warmed and cold-first immediate Send, and previously acquired held
+Complete. Transactional acquisition and management operations remain unsupported.
 
 ## Admission And Held Deliveries
 
@@ -54,7 +55,7 @@ The latter is a documented interoperability exception. Strict native APIs,
 ordinary listeners, and the posting-only endpoint retain their previous policies.
 The accommodations alone do not establish SDK support; the separate
 [transaction-scope gate](dotnet-transaction-scopes.md) supplies end-to-end proof
-for its specific warmed same-queue subset.
+for its specific same-queue subset.
 
 Each receiving worker acquires one actual PeekLock delivery through its admitted
 queue-incarnation binding. It sends the message through the dedicated native

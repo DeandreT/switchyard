@@ -3,15 +3,16 @@
 The explicit [atomic messaging listener](atomic-messaging-ingress.md) has
 opt-in end-to-end gates for .NET Service Bus SDK 7.21.0 and 7.20.2 over trusted
 raw TLS. Each pin runs against both memory storage and Fjall. This establishes
-warmed, same-queue immediate send and held PeekLock Complete, not general
-transaction compatibility or production support. Ordinary listeners and the
-posting-only listener retain their previous policies.
+warmed and cold-first same-queue immediate send, plus held PeekLock Complete,
+not general transaction compatibility or production support. Ordinary listeners
+and the posting-only listener retain their previous policies.
 
 ## Gated Workflows
 
-One experimental client and connection performs each scope on one primary
-non-session queue. The gate uses Serializable isolation, async flow, a
-30-second scope timeout, zero SDK retries, and receiver prefetch zero.
+Each scope targets one primary non-session queue. Warmed cases reuse one
+experimental client; cold send cases use distinct fresh clients. The gate uses
+Serializable isolation, async flow, a 30-second scope timeout, zero SDK retries,
+and receiver prefetch zero.
 
 - A true two-member `ServiceBusMessageBatch` sent in an incomplete scope is
   rolled back without retaining either member.
@@ -25,10 +26,18 @@ non-session queue. The gate uses Serializable isolation, async flow, a
   exactly its replacement. No new receive or replay bridges those scopes.
 - The ordinary TLS listener refuses a transactional Send and remains usable
   for ordinary send, receive, and Complete afterward.
+- A fresh client's first network operation sends two messages through
+  `SendMessagesAsync(IEnumerable<ServiceBusMessage>)` inside an incomplete scope.
+  Both are rolled back; earlier committed records remain unchanged.
+- A distinct fresh client performs the same cold-first two-message Send in a
+  completed scope. Exactly those two records are added after the warmed commits.
+  Neither fresh client opens a batch, sends a seed, receives, or peeks first.
 
-The Rust fixture checks canonical records and their exact ready, lock, and
-expiry indexes after the client exits and the broker owner joins. Batch-only
-outputs remain Ready. A held queue's committed replacement may already be
+The Rust fixture requires both exact, newline-terminated success markers and a
+successful process exit after bounded client cleanup. It checks canonical
+records and their exact ready, lock, and expiry indexes after the broker owner
+joins. The warmed and cold send outputs are exactly sequences 1 through 4 and
+remain Ready. A held queue's committed replacement may already be
 Locked by the consumer's next fetch; its precise token and index are checked.
 The fixture drops the store, reopens Fjall, and repeats the record checks with
 an unchanged snapshot. This is message persistence, not transaction-log
@@ -36,12 +45,17 @@ recovery or a graceful-shutdown guarantee.
 
 ## Authorization And Warmup
 
-The gate supplies Send authorization before opening the coordinator. The SDK
-enlists before it opens the producer for a transactional Send. The listener's
-separate [initial control window](initial-transaction-authorization.md) allows
-bounded declaration before that authorization, but these SDK gates do not yet
-establish cold-first scopes. The gate opens a batch outside the scope to warm
-its producer.
+Warmed batch cases open a batch outside the scope, supplying Send authorization
+before opening the coordinator. Cold send cases do not. The pinned
+[7.21.0 sender](https://raw.githubusercontent.com/Azure/azure-sdk-for-net/Azure.Messaging.ServiceBus_7.21.0/sdk/servicebus/Azure.Messaging.ServiceBus/src/Amqp/AmqpSender.cs)
+and [7.20.2 sender](https://raw.githubusercontent.com/Azure/azure-sdk-for-net/Azure.Messaging.ServiceBus_7.20.2/sdk/servicebus/Azure.Messaging.ServiceBus/src/Amqp/AmqpSender.cs)
+enlist before opening the producer. The listener's fixed
+[initial control window](initial-transaction-authorization.md) permits bounded
+declaration first, never queue access or commit without authorization.
+Cold refers to each fresh client's connection, not to an empty queue. Each
+fresh sender and client is disposed with a bound before ordinary Peek
+verification or creation of the next fresh client. This establishes a first
+network API operation, not an independently captured packet-order trace.
 For mixed work, sending and receiving the original outside the scope supplies
 Send and Listen on the same experimental connection.
 
@@ -66,8 +80,9 @@ and does not capture frames or credentials.
 Unexpected scope-disposal errors and unknown commit outcomes fail the gate.
 
 The existing same-queue, incarnation, live-lock, authorization, and resource
-checks remain unchanged. The gate does not establish cold-first authorization,
-cross-queue work, transactional acquisition, sessions, topics, dead-letter
+checks remain unchanged. Cold-first support is limited to immediate Send;
+acquisition still happens outside scopes. The gate does not establish cold-first
+Complete, cross-queue work, transactional acquisition, sessions, topics, dead-letter
 sources, other settlement outcomes, WSS transaction scopes, management on the
 experimental address, retry idempotency, or durable transaction recovery.
 It does not retry an uncertain commit.

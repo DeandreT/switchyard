@@ -4,8 +4,10 @@ The explicit [atomic messaging listener](atomic-messaging-ingress.md) permits
 bounded transaction-control metadata before the first connection grant. This
 supports clients that declare a transaction before opening the queue link that
 supplies CBS authorization. It does not authorize queue access or a commit, and
-is not a claim of cold-first SDK compatibility; the separate
-[SDK gates](dotnet-transaction-scopes.md) still establish only warmed scopes.
+is not general SDK transaction compatibility. The separate
+[SDK gates](dotnet-transaction-scopes.md) establish cold-first immediate
+same-queue Send and the existing warmed workflows over trusted TLS, not
+transactional acquisition or cold-first Complete.
 
 ## Fixed Initial Window
 
