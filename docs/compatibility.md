@@ -456,6 +456,11 @@ grants are scoped to a namespace or entity and to Send, Listen, or Manage; they
 authorize links connection-wide and close an open link when its token expires.
 A connection without a valid grant gets 20 seconds to complete CBS
 authorization. JWT, OIDC, and mTLS are not implemented.
+Only the experimental atomic messaging listener permits bounded coordinator
+declaration and explicit rollback during that fixed
+[initial window](initial-transaction-authorization.md). Queue access and every
+commit, including an empty commit, still require current authorization. A
+successful grant permanently ends the window; expiry never starts it again.
 AMQP resource scopes normalize only recognized subscription, dead-letter, and
 management control segments, never user names. Namespace and parent grants
 inherit to their children; exact dead-letter or management grants do not grant
@@ -761,6 +766,8 @@ Existing strict native APIs and ordinary/posting-only listeners are unchanged;
 the accommodations alone are not an SDK gate. The separate
 [pinned .NET scope tests](dotnet-transaction-scopes.md) establish only warmed
 same-queue immediate send and held Complete over experimental TLS.
+The messaging listener's separate initial control window is socket-tested,
+but cold-first SDK scopes are not established by those warmed client gates.
 An End on an unmapped channel is refused without manufacturing a session reply.
 Client Begin searches only vacant channels within the peer's inclusive channel
 limit. Pending, live, and ending sessions cannot be overwritten. Client End

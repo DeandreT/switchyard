@@ -33,7 +33,8 @@ Use an isolated development network. Plaintext development remains possible;
 the flag does not make an unauthenticated or externally reachable endpoint safe.
 The supported receiving profile and transaction limits below still apply.
 Only the [gated warmed same-queue SDK subset](dotnet-transaction-scopes.md) is
-established; cold-first scopes and management operations remain unsupported.
+established; cold-first SDK scopes remain ungated and management operations
+remain unsupported.
 
 ## Admission And Held Deliveries
 
@@ -102,6 +103,12 @@ a retry-safe rollback. A physical storage failure may follow a committed batch.
 Neither closure nor an unavailable response can revoke OwnerStarted work.
 
 ## Lifetime And Authorization
+
+Only this listener admits bounded coordinator metadata during the fixed
+[initial authorization window](initial-transaction-authorization.md).
+Declare and explicit rollback may precede the first grant; queue access and
+all commits still require current authorization. Successful grant publication
+ends the window permanently, so grant loss never grants a second grace period.
 
 The existing connection bounds remain: 32 session admissions or collectors,
 128 supervised links, 256 owner events, 32 transaction groups and controllers,

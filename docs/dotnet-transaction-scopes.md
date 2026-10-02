@@ -36,9 +36,12 @@ recovery or a graceful-shutdown guarantee.
 
 ## Authorization And Warmup
 
-Send authorization must exist before opening the coordinator. The SDK enlists
-before it opens the producer for a transactional Send, so a cold-first scope is
-not supported. The gate opens a batch outside the scope to warm its producer.
+The gate supplies Send authorization before opening the coordinator. The SDK
+enlists before it opens the producer for a transactional Send. The listener's
+separate [initial control window](initial-transaction-authorization.md) allows
+bounded declaration before that authorization, but these SDK gates do not yet
+establish cold-first scopes. The gate opens a batch outside the scope to warm
+its producer.
 For mixed work, sending and receiving the original outside the scope supplies
 Send and Listen on the same experimental connection.
 
