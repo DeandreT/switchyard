@@ -74,7 +74,8 @@ started or resolves an indeterminate physical commit.
 These APIs retain the existing bounded group, posting, control-content, and
 metadata-history limits. They add no storage format or recovery log. The
 [paired broker handoff](native-atomic-owner-handoff.md) still needs a serialized,
-authorized connection adapter; faulted owner-completion resources do not gain a
+authorized connection adapter, supplied narrowly by the explicit
+[posting-only listener](atomic-posting-ingress.md); faulted owner-completion resources do not gain a
 new guaranteed negative wire response from these pre-owner receipt methods.
 
 ## Scoped Link Errors

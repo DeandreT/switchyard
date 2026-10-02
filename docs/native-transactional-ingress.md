@@ -2,7 +2,7 @@
 
 `ServerConnection::accept_with_transactional_ingress` explicitly enables the
 trusted native server's transaction-posting API. Ordinary server entry points,
-the test client driver, and the Service Bus listeners still refuse transaction
+the test client driver, and the default Service Bus listeners still refuse transaction
 traffic. This is not an SDK transaction gate or a persistent transaction log.
 The [transaction wire types](amqp-transaction-types.md) remain distinct from
 ordinary outcomes throughout this path.
@@ -20,7 +20,8 @@ An accepted transactional receiver now exposes an exact, inert
 prepared receipts can be checked against it without treating reusable numeric
 aliases as authority. An additive decoder-aware acceptance method also admits
 explicit link-local message formats; batch expansion and authorization still
-belong to the missing application adapter.
+belong to an application adapter. The explicit
+[posting-only listener](atomic-posting-ingress.md) supplies that bounded path.
 
 Coordinators support local transactions, multiple transactions per session, and
 posting across sessions on the same connection. Distributed/global declarations,
@@ -43,7 +44,8 @@ retain no message or transport sender, grant no claim authority, and are inert
 when dropped. Native IDs
 retain the codec's 32-byte bound; this API does not promise process-wide ID
 uniqueness. The separate [local registry](transaction-registry.md) issues its own
-checked eight-byte IDs but is not connected to these endpoints yet.
+checked eight-byte IDs; the explicit posting-only listener connects them to
+actual native declarations without changing this lower-level trusted API.
 
 The native actor bounds active groups to 32, postings per group to 100,
 control-message content to 4 KiB, and terminal metadata history to 32 groups.

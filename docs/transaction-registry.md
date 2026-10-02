@@ -2,12 +2,13 @@
 
 `protocol-amqp::AtomicTransactionRegistry` supplies a bounded, serialized local
 lifecycle for future connection transactions. It is a trusted Rust API, not an
-enabled AMQP coordinator: Service Bus listeners and default connection drivers
+enabled AMQP coordinator: default Service Bus listeners and connection drivers
 still [refuse transaction traffic](amqp-transaction-types.md). The separate
 opt-in [native posting lifecycle](native-transactional-ingress.md) can now travel
 with a logical submission through the trusted
-[paired broker owner handoff](native-atomic-owner-handoff.md). A connection
-adapter does not yet establish correspondence between the two lifecycles.
+[paired broker owner handoff](native-atomic-owner-handoff.md). The explicit
+[posting-only listener](atomic-posting-ingress.md) establishes bounded
+correspondence from actual native receipts without changing this trusted API.
 
 ## Ownership And Identity
 
@@ -55,7 +56,8 @@ transaction.
 Pure input admission does not prove message shape, live queue configuration,
 non-session configuration, held-lock validity, or authorization. The ordinary
 owner validation still applies to bound work. Data-link grants and exact native
-receipt authority must be supplied by a future wire adapter.
+receipt authority must be supplied by a wire adapter, such as the explicit
+posting-only listener.
 
 ## Discharge And Decisions
 

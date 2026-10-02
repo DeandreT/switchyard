@@ -47,5 +47,7 @@ reverse a started owner.
 
 This boundary adds no authorization, receiver admission, body conversion,
 connection supervision, persistent format, or recovery log. A serialized,
-authorized connection adapter is still required. Default Service Bus listener
+authorized connection adapter is still required; the explicit
+[posting-only listener](atomic-posting-ingress.md) provides a narrow one.
+Default Service Bus listener
 transactions and SDK transaction scopes remain disabled.

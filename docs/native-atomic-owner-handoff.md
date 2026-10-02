@@ -9,7 +9,7 @@ carry that pair through one broker owner job.
 This is a trusted Rust ownership boundary, not an enabled Service Bus wire
 adapter. Constructing the pair does not prove matching transaction IDs,
 controller provenance, message conversion, queue bindings, or authorization.
-Service Bus listeners and default native connections still refuse transactions.
+Default Service Bus listeners and native connections still refuse transactions.
 
 ## Ownership And Cancellation
 
@@ -83,13 +83,15 @@ Pairing introduces no new capacity pool: native groups retain their existing
 logical work retains its shared 32-slot, 8 MiB content, and 131,072-value-item
 limits. These remain accounting limits, not process-RSS guarantees.
 
-## Remaining Wire Adapter
+## Wire Adapter
 
 A serialized connection adapter must still bind actual native controller and
 delivery provenance to the local registry, authorize data links, convert and
 stage messages, retain exact prepared receipts, and submit matching native and
 logical groups. It must keep processing admitted postings while waiting for
 sealed readiness, rather than blocking their provisional acknowledgments.
+The explicit [posting-only listener](atomic-posting-ingress.md) supplies this
+narrow path; constructing the trusted pair alone still does not do so.
 
 The [consuming native refusal API](native-transaction-refusals.md) supplies a
 pre-owner declaration and staging response, without reversing started or
