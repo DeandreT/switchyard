@@ -867,10 +867,11 @@ For unsettled sends, the result is the existing `PendingSettlement` after the
 peer outcome or applicable default, not a flush-only receipt. Initially
 sender-settled sends retain their local Accepted result after final flush. Its
 exact delivery provenance and caller-controlled final acknowledgement remain
-unchanged. Multiple owned futures may be awaited independently; this API does
-not enable ordinary
-listener pipelining, reserve caller-owned message bytes, or add broker
-authorization. See [Native Outgoing Admission](native-outgoing-admission.md).
+unchanged. Multiple owned futures may be awaited independently; this native API
+does not bound caller-owned message bytes or add broker authorization. The
+ordinary listener applies separate held-work admission around it. See
+[Native Outgoing Admission](native-outgoing-admission.md) and
+[Ordinary Receiving Pipeline](ordinary-receiving-pipeline.md).
 Outgoing delivery IDs are allocated independently of incoming IDs, within one
 session's sending direction. When the cursor wraps onto a live ID, a bounded
 vacancy search skips unresolved deliveries, pending acknowledgements, and active
@@ -988,10 +989,19 @@ guard at final owner claim. A started Receive can still commit after its waiter
 is cancelled; a committed deletion stays deleted, and an unsettled lock retains
 the existing expiry fallback. Teardown releases the exact session hold, not
 all message locks. Payload-size admission also remains after Receive.
-The ordinary receiving task still handles one delivery through its settlement
-before fetching the next. Multiple held deliveries, prefetch throughput, and
-SDK receive-batch interoperability are not claimed by this increment. The
-experimental transactional receiver keeps its separate existing receive path.
+The ordinary receiving task can hold multiple deliveries on the same link and
+finish their independent outcomes out of order. It permits at most 32 work
+items, including one admission, pending Receive, or parked response, and
+4 MiB of conservatively projected captured-message content. Projection and
+content admission precede message conversion and construction of the native
+send future. One already acquired and decoded broker response is outside that
+content allowance; an individually oversized response is refused, not rolled
+back. Temporary aggregate pressure parks that response while existing outcomes
+finish. A started Receive remains pinned across other work completions rather
+than being cancelled and resubmitted. These are local held-work limits, not an
+RSS bound or Azure prefetch quotas. SDK receive-batch interoperability remains
+a separate client gate. The experimental transactional receiver is unchanged.
+See [Ordinary Receiving Pipeline](ordinary-receiving-pipeline.md).
 Peeking is served through the entity's `$management` request/reply links and
 returns encoded AMQP messages without touching their broker state.
 Each peek inspects at most 256 stored records and retains the existing response

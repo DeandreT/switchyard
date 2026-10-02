@@ -88,6 +88,8 @@ fallback. They do not provide a final owner-claim authorization guard, durable
 recovery, transactional admission, or a connection-wide bound on arbitrary
 caller-owned futures and messages.
 
-The ordinary Service Bus listener still receives one delivery through settlement
-before fetching the next. Receive batching and SDK prefetch interoperability
-remain separate work; the experimental transactional receiver is unchanged.
+The ordinary Service Bus listener adds its own
+[bounded receiving pipeline](ordinary-receiving-pipeline.md) around these APIs.
+Its held-work budget is separate from native admission and encoded-content
+limits. SDK receive-batch interoperability remains separate client-gate work;
+the experimental transactional receiver is unchanged.
