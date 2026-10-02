@@ -740,6 +740,13 @@ acknowledgment metadata. `PendingSettlement::delivery_identity()` is historical
 provenance after outcome resolution, not a pre-outcome handle or proof of an
 unsettled delivery. Observer clones retain metadata only; settlement and
 transactional-retirement support are unchanged.
+The separate [native transactional-work opt-in](native-transactional-retirement.md)
+admits Accepted, unsettled retirement dispositions for fully flushed dedicated
+Second-mode sends and prepares an exact mixed set with postings. Rollback restores
+the same outgoing native delivery without replaying its body or releasing its
+alias. This does not change ordinary sender refusals, the posting-only broker
+listener, or SDK transaction support; broker correspondence to held receive locks
+remains unfinished.
 An End on an unmapped channel is refused without manufacturing a session reply.
 Client Begin searches only vacant channels within the peer's inclusive channel
 limit. Pending, live, and ending sessions cannot be overwritten. Client End

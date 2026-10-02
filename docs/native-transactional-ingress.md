@@ -6,6 +6,9 @@ the test client driver, and the default Service Bus listeners still refuse trans
 traffic. This is not an SDK transaction gate or a persistent transaction log.
 The [transaction wire types](amqp-transaction-types.md) remain distinct from
 ordinary outcomes throughout this path.
+The separate `accept_with_transactional_work()` opt-in adds the bounded
+[native retirement path](native-transactional-retirement.md); the ingress-only
+constructor and listener described here remain posting-only.
 
 ## Admission And Control
 
@@ -33,7 +36,8 @@ resolution. It adds no pre-outcome endpoint or transactional retirement path.
 
 Coordinators support local transactions, multiple transactions per session, and
 posting across sessions on the same connection. Distributed/global declarations,
-transactional acquisition and retirement, and recovered links remain unsupported.
+transactional acquisition, retirement on this posting-only path, and recovered
+links remain unsupported.
 Coordinator source outcomes may advertise Declared; ordinary source defaults
 still cannot use Declared or transactional state. Pre-settled control commands
 and postings are refused by this initial local policy.
@@ -55,8 +59,10 @@ uniqueness. The separate [local registry](transaction-registry.md) issues its ow
 checked eight-byte IDs; the explicit posting-only listener connects them to
 actual native declarations without changing this lower-level trusted API.
 
-The native actor bounds active groups to 32, postings per group to 100,
+The native actor bounds active groups to 32, obligations per group to 100,
 control-message content to 4 KiB, and terminal metadata history to 32 groups.
+Postings and retirements share that obligation allowance when the separate
+transactional-work opt-in is used.
 History retains each group's bounded original delivery proofs for exact abort
 cleanup, but no messages, transport senders, or content reservations. These are
 local limits, not Azure quotas or a process-memory bound.

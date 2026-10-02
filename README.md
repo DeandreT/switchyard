@@ -166,6 +166,10 @@ sending-link origin without granting delivery settlement or retirement authority
 [Original outgoing delivery identities](docs/native-outgoing-delivery-provenance.md)
 preserve exact historical generations after outcome resolution, without reporting
 live delivery state or granting settlement authority.
+A separate opt-in [native transactional retirement](docs/native-transactional-retirement.md)
+path captures exact peer dispositions for fully flushed outgoing deliveries and
+combines their prepared receipts with postings. It does not enable transactional
+receiving in the broker adapter or SDKs.
 
 ## Production Contract
 

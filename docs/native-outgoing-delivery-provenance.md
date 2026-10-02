@@ -53,3 +53,7 @@ does not undo already-admitted native work, and no successful public observer is
 returned before a settlement receipt or from a failed send. This API does not
 enable transactional retirement or acquisition, alter transactional-disposition
 refusals, or activate clients, default listeners, or SDK transaction scopes.
+The separate [transactional-work opt-in](native-transactional-retirement.md)
+returns a unique fully flushed sent handle and captures peer retirement receipts.
+Its disposition consumer and prepared resources, not this clonable observer,
+carry that authority.
