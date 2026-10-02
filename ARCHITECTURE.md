@@ -224,6 +224,20 @@ redelivery.
 Receive-delete provides at-most-once delivery. Deletion commits before the
 transfer, so a client failure can lose that delivery by design.
 
+Ordinary AMQP receivers obtain an actor-owned, exact-link outgoing credit
+reservation before submitting each Receive. They check authorization before
+admission and again before submission. Empty reads release the reservation
+before waiting for deliverability, permitting the transport to drain unused
+credit. Reservations share existing outgoing metadata limits and do not
+advance delivery counters until a Transfer begins.
+
+This local admission does not make the broker Receive cancellable or reserve
+encoded payload bytes. Credit withdrawn after claim can delay a transfer;
+disconnect after a committed Receive retains the deletion or lock-expiry
+semantics above. The edge check is not a final owner-claim authorization guard.
+Ordinary receiving remains serial through settlement, and the experimental
+transactional receiver is not changed by this admission path.
+
 FIFO is guaranteed only within a session. Session ownership, its lock deadline,
 and opaque session state are replicated. A new owner cannot acquire a session
 until the previous lock expires or is released.

@@ -835,6 +835,25 @@ send waiter does not release a tag; a failed or cancelled final Transfer or
 acknowledgement flush retains it until teardown. An old terminal receipt cannot
 release a later send's reused tag or numeric ID. These are metadata allowances,
 not a connection-wide content or heap limit.
+An ordinary native sender can request a unique outgoing reservation with
+`reserve_send`; the returned future owns its endpoint identity and does not
+borrow the sender. The connection actor admits it against current peer credit
+and the existing queue, per-link, and per-session metadata limits. Creating or
+claiming a reservation does not advance delivery counts or allocate a delivery
+ID. `try_claim` races processed credit withdrawal through shared revocable
+state; losing that race returns `SendReservationRevoked`. Dropping an unqueued
+reservation or its pending future returns local capacity through shared state
+and wakes the actor, including when the command queue is full or its reply was
+not consumed. Retiring its exact link also revokes it; numeric handle reuse does
+not transfer that authority. Reserved sends retain the ordinary outcome and
+second-mode acknowledgement rules.
+A claimed reservation is local admission, not an irrevocable wire-credit grant.
+The first Transfer still checks the latest peer credit and session window; a
+later credit reduction can delay it until a new grant. This follows the
+[transport flow-control model](https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html#section-flow-control).
+Reservations do not reserve encoded payload bytes or guarantee successful
+encoding, flush, or settlement. Ordinary sends without reservations retain
+their existing queued-send API and resource limits.
 Outgoing delivery IDs are allocated independently of incoming IDs, within one
 session's sending direction. When the cursor wraps onto a live ID, a bounded
 vacancy search skips unresolved deliveries, pending acknowledgements, and active
@@ -938,6 +957,24 @@ The edge resolves a link's address to an entity, turns transfers into send
 commands and dispositions into settlements, and answers a rejection with the
 condition an SDK keys its behaviour off. A receiving link's settle mode selects
 the delivery guarantee: unsettled is peek-lock, pre-settled is receive-delete.
+Before each ordinary broker Receive, the listener checks Listen authorization,
+obtains and claims one native outgoing reservation, and checks authorization
+again before submitting the command. An attached link with no usable peer
+credit therefore does not acquire a lock, delete a message, run Receive expiry
+cleanup, or stamp a Receive proposal. Replaying an unchanged absolute Flow
+grant does not create additional credit. An empty Receive releases its
+reservation before waiting for an enqueue notification or the coarse fallback,
+so it cannot hold unused credit against drain. Detach and authorization loss
+are watched during credit admission, the broker wait, and the empty-queue wait.
+This is an edge-before-enqueue check, not an authorization or cancellation
+guard at final owner claim. A started Receive can still commit after its waiter
+is cancelled; a committed deletion stays deleted, and an unsettled lock retains
+the existing expiry fallback. Teardown releases the exact session hold, not
+all message locks. Payload-size admission also remains after Receive.
+The ordinary receiving task still handles one delivery through its settlement
+before fetching the next. Multiple held deliveries, prefetch throughput, and
+SDK receive-batch interoperability are not claimed by this increment. The
+experimental transactional receiver keeps its separate existing receive path.
 Peeking is served through the entity's `$management` request/reply links and
 returns encoded AMQP messages without touching their broker state.
 Each peek inspects at most 256 stored records and retains the existing response
