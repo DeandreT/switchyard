@@ -191,6 +191,9 @@ Separate ordinary [receiving-batch gates](docs/dotnet-receiving-batches.md) hold
 three action copies on one receiver before completion and exercise out-of-order
 queue settlement with rolling count-prefetch replenishment on both SDK pins and
 both storage backends.
+Authenticated ordinary receiving uses [owned pending-only broker claims](docs/ordinary-receive-claims.md)
+to refuse cancelled or expired queued work before the proposer starts. Already
+Started work retains its existing commit and lock-expiry boundaries.
 The sender-side listener uses [retained ingress receipts](docs/retained-ingress.md)
 to preserve native content accounting through broker replies and acknowledgment flush.
 [Native connection identities](docs/native-connection-identity.md) preserve exact

@@ -91,6 +91,8 @@ caller-owned futures and messages.
 The ordinary Service Bus listener adds its own
 [bounded receiving pipeline](ordinary-receiving-pipeline.md) around these APIs.
 Its held-work budget is separate from native admission and encoded-content
-limits. Separate [SDK batch gates](dotnet-receiving-batches.md) exercise held
+limits. Authenticated ordinary receiving separately adds
+[pending-only broker claims](ordinary-receive-claims.md); this is not authority
+granted by a native reservation. Separate [SDK batch gates](dotnet-receiving-batches.md) exercise held
 action copies and rolling prefetch replenishment; the experimental transactional
 receiver is unchanged.

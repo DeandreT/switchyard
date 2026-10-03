@@ -13,6 +13,10 @@ before command submission. Zero usable credit does not acquire or delete a
 message. Replaying an absolute Flow does not mint credit, and settling a delivery
 does not itself grant fresh wire credit. A claimed slot is local admission;
 the first Transfer still needs the current link credit and session window.
+Authenticated ordinary Receive also uses a
+[pending-only owner claim](ordinary-receive-claims.md) with the admitted target's
+Listen expiry. Its armed future is owned before the claimed native reservation,
+so pending cancellation precedes return of local capacity.
 
 One ordinary link permits at most 32 work items. That count includes a pending
 admission or Receive, and an acquired response parked under content pressure,
@@ -85,9 +89,10 @@ Dropped native result waiters do not undo already admitted sends or
 auto-acknowledge second-mode outcomes. Teardown does not synthesize Abandon for
 every held message.
 
-Broker Receive and settlement commands can still commit after their local
-waiters are cancelled. The edge Listen checks are not a final owner-claim
-authorization guard. These APIs provide no transactional admission, durable
+An owner-Started Receive and ordinary settlement commands can still commit
+after their local waiters are cancelled. Receive's numeric expiry horizon is
+not a live grant-revocation lease, and settlement retains its edge Listen check.
+These APIs provide no transactional admission, durable
 recovery, cancellation rollback, connection-wide arbitrary-future heap cap,
 or proof that SDK prefetch is an application-held-message limit. Separate
 [pinned SDK batch gates](dotnet-receiving-batches.md) exercise held action copies

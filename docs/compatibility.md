@@ -984,9 +984,13 @@ grant does not create additional credit. An empty Receive releases its
 reservation before waiting for an enqueue notification or the coarse fallback,
 so it cannot hold unused credit against drain. Detach and authorization loss
 are watched during credit admission, the broker wait, and the empty-queue wait.
-This is an edge-before-enqueue check, not an authorization or cancellation
-guard at final owner claim. A started Receive can still commit after its waiter
-is cancelled; a committed deletion stays deleted, and an unsettled lock retains
+Authenticated ordinary Receive additionally uses an owned receive-only ticket.
+The owner checks its captured Listen expiry immediately before the proposer;
+dropping the armed future cancels Pending work even while queued. The exact
+binding and physical target are retained, including subscription and dead-letter
+paths. The numeric expiry is not a live grant-revocation lease, and Started
+means admission rather than commit. A Started Receive can still commit after
+its waiter is cancelled; a committed deletion stays deleted, and an unsettled lock retains
 the existing expiry fallback. Teardown releases the exact session hold, not
 all message locks. Payload-size admission also remains after Receive.
 The ordinary receiving task can hold multiple deliveries on the same link and
@@ -1004,6 +1008,8 @@ RSS bound or Azure prefetch quotas. Separate
 copies before completion and rolling three-credit queue replenishment on the
 same receiver. The experimental transactional receiver is unchanged.
 See [Ordinary Receiving Pipeline](ordinary-receiving-pipeline.md).
+See [Ordinary Receive Claims](ordinary-receive-claims.md) for expiry, cleanup
+ordering, unsupported adapters, and unchanged settlement and development paths.
 Peeking is served through the entity's `$management` request/reply links and
 returns encoded AMQP messages without touching their broker state.
 Each peek inspects at most 256 stored records and retains the existing response
