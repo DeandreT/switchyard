@@ -21,6 +21,11 @@ Raft, and compliance implementations remain to be built. Production startup
 is refused before storage is opened because no replicated command proposer
 exists. Development with Fjall provides local persistence only.
 
+Separate trusted prerequisites now provide [atomic committed queue apply](docs/committed-queue-apply.md)
+and [experimental vote/log storage](docs/experimental-log-storage.md). They do
+not implement the replicated proposer, state-machine adapter, snapshots,
+network, leader barriers, or quorum acknowledgements required below.
+
 Within the semantics below, topics have persisted definitions, bounded
 subscription topology, and atomic rule-selected fanout, parent-retained topic
 scheduling, AMQP subscription and dead-letter routing,
@@ -209,6 +214,12 @@ newer store. A command's batch is journalled and fsynced before the store
 reports it applied, and a store directory has a single owner — a second open of a
 live directory is refused rather than shared.
 
+Isolated replica directories have a disjoint durable layout and a unique
+privileged writer with read-only views. The committed queue machine and the
+experimental log adapter retain distinct inner profiles in separate directories;
+neither adopts the other's records. Standalone format 14 is unchanged. These
+prerequisites do not implement production keyspace placement or online upgrades.
+
 The memory backend implements the same atomic batch and snapshot contract, and
 one conformance suite runs against both backends so they cannot drift. It is
 reserved for unit tests, deterministic simulations, Sift demos, and local
@@ -231,12 +242,15 @@ before waiting for deliverability, permitting the transport to drain unused
 credit. Reservations share existing outgoing metadata limits and do not
 advance delivery counters until a Transfer begins.
 
-This local admission does not make the broker Receive cancellable or reserve
-encoded payload bytes. Credit withdrawn after claim can delay a transfer;
-disconnect after a committed Receive retains the deletion or lock-expiry
-semantics above. The edge check is not a final owner-claim authorization guard.
-Ordinary receiving remains serial through settlement, and the experimental
-transactional receiver is not changed by this admission path.
+Authenticated ordinary receiving adds a unique [owner claim](docs/ordinary-receive-claims.md):
+dropping its owned future cancels only Pending work, and the owner checks the
+captured Listen expiry immediately before starting the proposer. Started is
+irrevocable admission, not a commit or live authorization lease. Its
+[bounded pipeline](docs/ordinary-receiving-pipeline.md) supports independent
+held deliveries while committing settlement before the final acknowledgement.
+Credit withdrawn after claim can delay a transfer; disconnect after a committed
+Receive retains the deletion or lock-expiry semantics above. Unsecured legacy
+submission and experimental transactional receiving keep their separate paths.
 
 FIFO is guaranteed only within a session. Session ownership, its lock deadline,
 and opaque session state are replicated. A new owner cannot acquire a session
