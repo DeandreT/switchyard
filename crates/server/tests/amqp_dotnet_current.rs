@@ -32,6 +32,10 @@ mod atomic_messaging;
 #[path = "amqp_dotnet_current/rule_actions.rs"]
 mod rule_actions;
 
+#[cfg(target_os = "linux")]
+#[path = "amqp_dotnet_current/receive_batch.rs"]
+mod receive_batch;
+
 struct TestTimer {
     shutdown: Arc<Shutdown>,
     thread: Option<JoinHandle<()>>,

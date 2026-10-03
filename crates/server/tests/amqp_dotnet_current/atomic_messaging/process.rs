@@ -333,6 +333,47 @@ pub(crate) async fn run_rule_action_client(
     .await
 }
 
+pub(crate) async fn run_receive_batch_client(
+    dll: &Path,
+    endpoint: &str,
+    topic: &str,
+    queue: &str,
+    ca_file: &Path,
+    ca_directory: &Path,
+) -> TestResult<Output> {
+    run(
+        receive_batch_command(dll, endpoint, topic, queue, ca_file, ca_directory),
+        "official same-receiver receive-batch client",
+        RUN_DEADLINE,
+        MAX_OUTPUT_BYTES,
+    )
+    .await
+}
+
+fn receive_batch_command(
+    dll: &Path,
+    endpoint: &str,
+    topic: &str,
+    queue: &str,
+    ca_file: &Path,
+    ca_directory: &Path,
+) -> Command {
+    let mut command = Command::new("dotnet");
+    command
+        .env("DOTNET_PROCESSOR_COUNT", "2")
+        .env("SSL_CERT_FILE", ca_file)
+        .env("SSL_CERT_DIR", ca_directory)
+        .arg(dll)
+        .arg("receive-batch")
+        .arg(HOST)
+        .arg(endpoint)
+        .arg(topic)
+        .arg(queue)
+        .arg(RULE)
+        .arg(KEY);
+    command
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,6 +382,48 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.arg("-c").arg(script);
         command
+    }
+
+    #[test]
+    fn receive_batch_arguments_and_trust_are_local_to_the_child() {
+        let command = receive_batch_command(
+            Path::new("conformance.dll"),
+            "sb://localhost:1234",
+            "batch-topic",
+            "batch-queue",
+            Path::new("local-ca.pem"),
+            Path::new("empty-ca-directory"),
+        );
+        let command = command.as_std();
+        assert_eq!(command.get_program(), "dotnet");
+        let arguments: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            arguments,
+            [
+                "conformance.dll",
+                "receive-batch",
+                HOST,
+                "sb://localhost:1234",
+                "batch-topic",
+                "batch-queue",
+                RULE,
+                KEY,
+            ]
+        );
+        let environment: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("DOTNET_PROCESSOR_COUNT")),
+            Some(&Some(std::ffi::OsStr::new("2")))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("SSL_CERT_FILE")),
+            Some(&Some(std::ffi::OsStr::new("local-ca.pem")))
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("SSL_CERT_DIR")),
+            Some(&Some(std::ffi::OsStr::new("empty-ca-directory")))
+        );
+        assert_eq!(environment.len(), 3);
     }
 
     #[tokio::test]

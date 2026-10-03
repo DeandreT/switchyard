@@ -2,7 +2,7 @@ using Azure;
 using Azure.Messaging.ServiceBus;
 using Azure.Messaging.ServiceBus.Administration;
 
-internal static class RuleActionCases
+internal static partial class RuleActionCases
 {
     private const string Success =
         "official .NET SQL REMOVE actions/source/independent copies/unsupported SET passed";

@@ -1,6 +1,11 @@
 using Azure;
 using Azure.Messaging.ServiceBus;
 
+if (args.Length > 0 && args[0] == "receive-batch")
+{
+    return await RuleActionCases.RunReceivingBatchAsync(args);
+}
+
 if (args.Length > 0 && args[0] == "rule-actions")
 {
     return await RuleActionCases.RunAsync(args);
