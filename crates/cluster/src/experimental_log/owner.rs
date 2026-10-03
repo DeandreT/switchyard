@@ -11,7 +11,8 @@ use storage::CommittedStore;
 use tokio::sync::oneshot;
 
 use super::{
-    LogEntry, LogId, LogStorageError, LogTypes, LogVote, LogWorkload, MAX_LOG_OWNER_JOBS,
+    LogEntry, LogId, LogProfile, LogStorageError, LogTypes, LogVote, LogWorkload,
+    MAX_LOG_OWNER_JOBS,
     budget::{Admission, Lease},
     io_error,
     state::{OwnedLogRange, StoreState},
@@ -22,6 +23,7 @@ pub(super) enum Operation {
     Append(EncodedAppend),
     ReadFull(OwnedLogRange),
     ReadLimited { start: u64, end: u64 },
+    Profile,
     LogState,
     SaveVote(LogVote),
     ReadVote,
@@ -32,6 +34,7 @@ pub(super) enum Operation {
 pub(super) enum Reply {
     Done,
     Entries(Vec<LogEntry>),
+    Profile(LogProfile),
     LogState(LogState<LogTypes>),
     Vote(Option<LogVote>),
 }
@@ -181,6 +184,7 @@ fn execute<W: CommittedStore>(state: &mut StoreState<W>, operation: Operation) -
         Operation::Append(entries) => state.append(&entries).map(|()| Reply::Done),
         Operation::ReadFull(range) => state.read_full(range).map(Reply::Entries),
         Operation::ReadLimited { start, end } => state.read_limited(start, end).map(Reply::Entries),
+        Operation::Profile => state.profile().map(Reply::Profile),
         Operation::LogState => state.log_state().map(Reply::LogState),
         Operation::SaveVote(vote) => state.save_vote(vote).map(|()| Reply::Done),
         Operation::ReadVote => state.read_vote().map(Reply::Vote),

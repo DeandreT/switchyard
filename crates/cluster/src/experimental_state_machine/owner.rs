@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use domain::CommittedCheckpoint;
 use flume::{Receiver, RecvTimeoutError, Sender};
 use storage::CommittedStore;
 use tokio::sync::oneshot;
@@ -20,11 +21,13 @@ use super::{
 pub(super) enum Operation {
     Apply(PreparedApply),
     AppliedState,
+    Checkpoint,
 }
 
 pub(super) enum Reply {
     Applications(Vec<LogApplication>),
     AppliedState(Box<AppliedState>),
+    Checkpoint(Box<CommittedCheckpoint>),
 }
 
 type Response = Result<Reply, StateMachineError>;
@@ -136,6 +139,9 @@ fn run<W: CommittedStore>(
                 Some(Operation::AppliedState) => state
                     .applied_state()
                     .map(|state| Reply::AppliedState(Box::new(state))),
+                Some(Operation::Checkpoint) => state
+                    .checkpoint()
+                    .map(|checkpoint| Reply::Checkpoint(Box::new(checkpoint))),
                 None => Err(StateMachineError::Panicked),
             };
             packet.finish(result);

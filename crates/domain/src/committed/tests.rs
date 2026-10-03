@@ -2,6 +2,8 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 
+mod entry_mark;
+
 fn stream() -> CommittedStreamId {
     CommittedStreamId::new([1; 16]).expect("a stream")
 }

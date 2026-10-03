@@ -217,6 +217,23 @@ pub enum CommittedQueueWork {
     Queue(CommittedQueueCommand),
 }
 
+impl CommittedQueueWork {
+    /// Computes the bounded canonical mark for this work and its predecessor.
+    ///
+    /// This pure calculation performs no storage or clock access. The mark is
+    /// not evidence of commitment, application, authority, or a business outcome.
+    /// Hashable business refusals remain representable.
+    pub fn entry_mark(
+        &self,
+        update: &CommittedCheckpointUpdate,
+    ) -> Result<CommittedEntryMark, CommittedApplyError> {
+        Ok(CommittedEntryMark {
+            id: update.entry,
+            fingerprint: entry_fingerprint(update, self)?,
+        })
+    }
+}
+
 impl fmt::Debug for CommittedQueueWork {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

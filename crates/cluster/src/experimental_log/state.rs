@@ -79,6 +79,7 @@ impl OwnedLogRange {
 pub(super) struct StoreState<W: CommittedStore> {
     writer: W,
     reader: W::Reader,
+    profile: LogProfile,
     progress: LogProgress,
     poisoned: Cell<bool>,
 }
@@ -116,6 +117,7 @@ impl<W: CommittedStore> StoreState<W> {
         Ok(Self {
             writer,
             reader,
+            profile,
             progress,
             poisoned: Cell::new(false),
         })
@@ -160,7 +162,8 @@ impl<W: CommittedStore> StoreState<W> {
                 }
             }
         }
-        if recorded_profile.ok_or(LogStateError::Corrupt)? != profile {
+        let recorded_profile = recorded_profile.ok_or(LogStateError::Corrupt)?;
+        if recorded_profile != profile {
             return Err(LogStateError::InvalidProfile);
         }
         let progress = progress.ok_or(LogStateError::Corrupt)?;
@@ -168,6 +171,7 @@ impl<W: CommittedStore> StoreState<W> {
         Ok(Self {
             writer,
             reader,
+            profile: recorded_profile,
             progress,
             poisoned: Cell::new(false),
         })
@@ -361,6 +365,15 @@ impl<W: CommittedStore> StoreState<W> {
             Err(LogStateError::InvalidRange)
         } else {
             Ok(result)
+        }
+    }
+
+    pub(super) fn profile(&self) -> Result<LogProfile, LogStateError> {
+        self.ensure_healthy()?;
+        let bytes = self.require(self.io(self.reader.get(PROFILE_KEY))?)?;
+        match codec::decode_profile(&bytes) {
+            Ok(profile) if profile == self.profile => Ok(profile),
+            _ => self.corrupt(),
         }
     }
 

@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 pub mod experimental_log;
+mod experimental_owner;
+pub mod experimental_replica;
 pub mod experimental_state_machine;
 
 pub use experimental_log::{
@@ -16,6 +18,11 @@ pub use experimental_state_machine::{
     MAX_APPLY_BYTES, MAX_APPLY_ENTRIES, MAX_STATE_MACHINE_OWNER_BYTES,
     MAX_STATE_MACHINE_OWNER_JOBS, StateMachineError, StateMachineWorkload,
     UnsupportedSnapshotBuilder,
+};
+
+pub use experimental_replica::{
+    ExperimentalReplicaStores, MAX_REPLICA_PAYLOAD_ENTRIES, ReplicaPreparationError,
+    ReplicaProgress,
 };
 
 use serde::{Deserialize, Serialize};

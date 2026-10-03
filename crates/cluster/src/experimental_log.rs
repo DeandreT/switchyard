@@ -31,6 +31,13 @@ pub(crate) fn queue_command_is_send(command: &QueueLogCommand) -> bool {
     matches!(command.0.as_ref(), types::QueueLogKind::Send { .. })
 }
 
+pub(crate) fn queue_command_timestamp(command: &QueueLogCommand) -> domain::Timestamp {
+    match command.0.as_ref() {
+        types::QueueLogKind::CreateQueue { issued_at, .. }
+        | types::QueueLogKind::Send { issued_at, .. } => *issued_at,
+    }
+}
+
 pub(crate) fn encode_membership(
     membership: &openraft::Membership<u64, openraft::BasicNode>,
 ) -> Result<Vec<u8>, LogCodecError> {

@@ -6,6 +6,7 @@ use openraft::{
 };
 use storage::CommittedStore;
 
+use crate::experimental_owner::RetiredOwner;
 use crate::{LogEntry, LogTypes};
 
 use super::{
@@ -27,6 +28,7 @@ use super::{
 pub struct ExperimentalStateMachine {
     handle: Handle,
     thread: Option<JoinHandle<Result<(), StateMachineError>>>,
+    retired: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl ExperimentalStateMachine {
@@ -51,7 +53,26 @@ impl ExperimentalStateMachine {
         Ok(Self {
             handle,
             thread: Some(thread),
+            retired: None,
         })
+    }
+
+    pub(crate) async fn checkpoint(
+        &self,
+    ) -> Result<domain::CommittedCheckpoint, StateMachineError> {
+        match self.handle.request(Operation::Checkpoint).await? {
+            Reply::Checkpoint(checkpoint) => Ok(*checkpoint),
+            _ => Err(StateMachineError::InvalidState),
+        }
+    }
+
+    pub(crate) fn into_runtime_parts(
+        mut self,
+    ) -> Result<(Self, RetiredOwner<StateMachineError>), StateMachineError> {
+        let thread = self.thread.take().ok_or(StateMachineError::Closed)?;
+        let (retired, receiver) = tokio::sync::oneshot::channel();
+        self.retired = Some(retired);
+        Ok((self, RetiredOwner::new(receiver, thread)))
     }
 
     pub fn workload(&self) -> Result<StateMachineWorkload, StateMachineError> {
@@ -75,6 +96,9 @@ impl ExperimentalStateMachine {
 impl Drop for ExperimentalStateMachine {
     fn drop(&mut self) {
         self.handle.close();
+        if let Some(retired) = self.retired.take() {
+            let _ = retired.send(());
+        }
     }
 }
 

@@ -57,6 +57,19 @@ impl<W: CommittedStore> StoreState<W> {
         self.finish(result)
     }
 
+    pub(super) fn checkpoint(&mut self) -> Result<CommittedCheckpoint, StateMachineError> {
+        self.ensure_healthy()?;
+        let result = self
+            .machine
+            .checkpoint()
+            .map_err(domain_error)
+            .and_then(|checkpoint| {
+                recover(&checkpoint)?;
+                Ok(checkpoint)
+            });
+        self.finish(result)
+    }
+
     pub(super) fn apply(
         &mut self,
         input: PreparedApply,

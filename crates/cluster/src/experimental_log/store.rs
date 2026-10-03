@@ -13,6 +13,7 @@ use super::{
     state::{OwnedLogRange, StoreState},
     types::EncodedAppend,
 };
+use crate::experimental_owner::RetiredOwner;
 
 /// One unique adapter and its blocking storage owner. This is not a Raft node.
 ///
@@ -24,6 +25,7 @@ use super::{
 pub struct ExperimentalLogStore {
     handle: Handle,
     thread: Option<JoinHandle<Result<(), LogStorageError>>>,
+    retired: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl ExperimentalLogStore {
@@ -48,7 +50,24 @@ impl ExperimentalLogStore {
         Ok(Self {
             handle,
             thread: Some(thread),
+            retired: None,
         })
+    }
+
+    pub(crate) async fn profile(&self) -> Result<LogProfile, LogStorageError> {
+        match self.handle.request(Operation::Profile, None).await? {
+            Reply::Profile(profile) => Ok(profile),
+            _ => Err(LogStorageError::Corrupt),
+        }
+    }
+
+    pub(crate) fn into_runtime_parts(
+        mut self,
+    ) -> Result<(Self, RetiredOwner<LogStorageError>), LogStorageError> {
+        let thread = self.thread.take().ok_or(LogStorageError::Closed)?;
+        let (retired, receiver) = tokio::sync::oneshot::channel();
+        self.retired = Some(retired);
+        Ok((self, RetiredOwner::new(receiver, thread)))
     }
 
     pub fn log_reader(&self) -> ReadOnlyLogReader {
@@ -78,6 +97,9 @@ impl ExperimentalLogStore {
 impl Drop for ExperimentalLogStore {
     fn drop(&mut self) {
         self.handle.close();
+        if let Some(retired) = self.retired.take() {
+            let _ = retired.send(());
+        }
     }
 }
 
