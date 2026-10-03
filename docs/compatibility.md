@@ -999,8 +999,10 @@ content allowance; an individually oversized response is refused, not rolled
 back. Temporary aggregate pressure parks that response while existing outcomes
 finish. A started Receive remains pinned across other work completions rather
 than being cancelled and resubmitted. These are local held-work limits, not an
-RSS bound or Azure prefetch quotas. SDK receive-batch interoperability remains
-a separate client gate. The experimental transactional receiver is unchanged.
+RSS bound or Azure prefetch quotas. Separate
+[SDK receive-batch gates](dotnet-receiving-batches.md) exercise three held action
+copies before completion and rolling three-credit queue replenishment on the
+same receiver. The experimental transactional receiver is unchanged.
 See [Ordinary Receiving Pipeline](ordinary-receiving-pipeline.md).
 Peeking is served through the entity's `$management` request/reply links and
 returns encoded AMQP messages without touching their broker state.
@@ -1106,7 +1108,12 @@ filter independence, one OR-combined base plus two independently settled action
 copies, exact-key removals, final RuleName collision handling, body/system/footer
 preservation, and an awaited unsupported-SET refusal followed by a healthy send.
 They restore default rules, verify empty subscriptions and dead-letter queues,
-and check committed cleanup again after reopen. Azure administration remains
+and check committed cleanup again after reopen. Separate
+[receive-batch gates](dotnet-receiving-batches.md) prove three action copies held
+on one receiver before any completion, independent out-of-order settlement, and
+rolling queue replenishment with fixed prefetch three. Both pins run both
+backends and check exact empty runtime indexes and counters after reopen.
+Azure administration remains
 ungated. These checks establish local interoperability, not cloud parity for the
 documented SQL semantic choices.
 
@@ -1115,8 +1122,8 @@ assemblies directly. Run them explicitly with
 `cargo test -j 2 -p server --test amqp_dotnet_current -- --ignored --test-threads=1`;
 each .NET build is limited to two jobs, and serial test execution preserves that
 limit across the two releases.
-The new action gates reuse the bounded transaction process runner: each build
-and client process has a 180-second deadline and bounded output capture, with
+The action and receive-batch gates reuse the bounded transaction process runner:
+each build and client process has a 180-second deadline and bounded output capture, with
 owned-process cleanup and isolated certificate trust. This does not add process
 lifetime guarantees to the older ordinary-message or WebSocket gate runners.
 

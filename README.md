@@ -187,6 +187,10 @@ on that address, with memory and Fjall coverage. Its fixed
 declaration and rollback before the first grant, never queue access or commit.
 Cold-first support is Send only; transactional acquisition, experimental
 management, cross-queue work, and transaction recovery remain unsupported.
+Separate ordinary [receiving-batch gates](docs/dotnet-receiving-batches.md) hold
+three action copies on one receiver before completion and exercise out-of-order
+queue settlement with rolling count-prefetch replenishment on both SDK pins and
+both storage backends.
 The sender-side listener uses [retained ingress receipts](docs/retained-ingress.md)
 to preserve native content accounting through broker replies and acknowledgment flush.
 [Native connection identities](docs/native-connection-identity.md) preserve exact

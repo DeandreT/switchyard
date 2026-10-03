@@ -89,5 +89,6 @@ Broker Receive and settlement commands can still commit after their local
 waiters are cancelled. The edge Listen checks are not a final owner-claim
 authorization guard. These APIs provide no transactional admission, durable
 recovery, cancellation rollback, connection-wide arbitrary-future heap cap,
-or proof that SDK prefetch is an application-held-message limit. Same-receiver
-SDK receive-batch interoperability remains a separate client-gate increment.
+or proof that SDK prefetch is an application-held-message limit. Separate
+[pinned SDK batch gates](dotnet-receiving-batches.md) exercise held action copies
+and rolling count-prefetch replenishment on one receiver.
