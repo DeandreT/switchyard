@@ -273,7 +273,7 @@ async fn management_and_deferred_receipts_cannot_cross_subscription_owners<P: St
         ),
     )
     .await??;
-    node.wait_deferred(&node.alpha, 1).await?;
+    node.wait_deferred_committed(&node.alpha, 1).await?;
     node.wait_waiting(&node.alpha).await?;
     let before = node.snapshot()?;
     let submits = node.submissions();

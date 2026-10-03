@@ -388,6 +388,32 @@ impl<P: StoreProvider> Node<P> {
         Ok(())
     }
 
+    pub(super) async fn wait_deferred_committed(
+        &self,
+        entity: &EntityPath,
+        number: u64,
+    ) -> TestResult {
+        self.wait_deferred(entity, number).await?;
+        // An independent empty Receive can already be waiting while the
+        // deferral's point write is visible but its owner apply is returning.
+        let config = timeout(
+            DEADLINE,
+            self._broker
+                .handle()
+                .queue_config(self.namespace.clone(), entity.clone()),
+        )
+        .await??;
+        assert!(
+            config.is_some(),
+            "the deferred subscription remains configured"
+        );
+        assert!(
+            self.record(entity, number)?
+                .is_some_and(|record| { matches!(record.state, domain::MessageState::Deferred) })
+        );
+        Ok(())
+    }
+
     pub(super) fn session(
         &self,
         entity: &EntityPath,
