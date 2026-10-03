@@ -22,9 +22,11 @@ is refused before storage is opened because no replicated command proposer
 exists. Development with Fjall provides local persistence only.
 
 Separate trusted prerequisites now provide [atomic committed queue apply](docs/committed-queue-apply.md)
-and [experimental vote/log storage](docs/experimental-log-storage.md). They do
-not implement the replicated proposer, state-machine adapter, snapshots,
-network, leader barriers, or quorum acknowledgements required below.
+and [experimental vote/log storage](docs/experimental-log-storage.md), with a
+separate [state-machine adapter](docs/experimental-state-machine.md) for bounded
+committed apply and exact membership recovery. They do not implement the
+replicated proposer, snapshots, network, leader barriers, or quorum
+acknowledgements required below.
 
 Within the semantics below, topics have persisted definitions, bounded
 subscription topology, and atomic rule-selected fanout, parent-retained topic

@@ -93,6 +93,9 @@ stores. It is a durability prerequisite, not a running consensus service.
 An isolated [experimental vote/log adapter](docs/experimental-log-storage.md)
 adds bounded durable storage for the pinned replication library. It supplies
 neither a running Raft node nor quorum acknowledgements.
+A matching [experimental state-machine adapter](docs/experimental-state-machine.md)
+adds bounded durable apply, membership recovery, and typed replay/result metadata.
+Snapshots, runtime integration, and replicated client acknowledgement remain absent.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing

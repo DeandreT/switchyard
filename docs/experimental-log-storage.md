@@ -4,7 +4,9 @@ This isolated `cluster` API persists votes and bounded log entries for exactly
 OpenRaft 0.9.25 with default features disabled and `serde`/`storage-v2` enabled.
 That version's storage-v2 interface is explicitly unstable, so the dependency
 is pinned. This is not a running Raft node, network, replicated proposer,
-state-machine adapter, snapshot implementation, or production deployment mode.
+snapshot implementation, or production deployment mode. The separate
+[state-machine adapter](experimental-state-machine.md) now uses the same typed
+entries, without activating a consensus runtime.
 Existing listeners and local proposers remain unchanged; production startup
 still refuses before opening storage.
 
@@ -111,9 +113,9 @@ message bodies, or decoder details. Under the pinned library contract, a storage
 refusal is node-fatal, never a checkpoint-only domain business refusal.
 
 The optional library committed-index persistence methods retain their documented
-no-op defaults. There is no state-machine/runtime integration yet. A future
-durable apply adapter must establish its own recovery contract before using
-those methods or acknowledging client writes.
+no-op defaults. The separate durable apply adapter persists each applied entry
+before returning, but no running node or client acknowledgement path is wired
+to these stores. Optional committed-index persistence is not a quorum receipt.
 
 There is no automatic compaction, snapshot, or purge. The finite retained cap
 fails safely rather than deleting merely-applied history. The intended first
@@ -128,7 +130,8 @@ startup repair.
 
 ## Verification
 
-The cluster suite has 40 unit tests, 48 public integration cases, and two
+At the log-storage checkpoint, the cluster suite had 40 unit tests, 48 public
+integration cases, and two
 compile-fail examples. Public cases exercise both memory and durable replica
 stores, the real append-completion callback, immediate near-capacity appends,
 caller loss, FIFO shutdown, corruption refusal, and retained-range limits.

@@ -51,8 +51,8 @@ Restricted command constructors cannot carry arbitrary `CommandKind`, fenced
 work, receives, settlements, atomic groups, rich envelopes, scheduled work,
 deletion, or topic publications. A valid topic target is a normal queue-only
 refusal; it never routes through fanout. Membership interpretation belongs to
-the future consensus adapter. The domain does not infer voter validity from
-those opaque bytes.
+the [separate library adapter](experimental-state-machine.md). The domain does
+not infer voter validity from those opaque bytes.
 
 The new path limits bodies to 256 KiB, canonical encoded entries to that limit
 plus 4 KiB, membership payloads to 4 KiB, and checkpoint envelopes to 8 KiB.
