@@ -87,6 +87,10 @@ and a shared-access policy. Even with those prerequisites, durable production
 startup is refused until quorum replication and a replicated command proposer
 are implemented. Development with Fjall remains locally durable, not replicated.
 
+A separate trusted [committed queue apply API](docs/committed-queue-apply.md)
+atomically records bounded queue work and replay progress in isolated replica
+stores. It is a durability prerequisite, not a running consensus service.
+
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
 TLS identity and shared-access policy also apply to this separate listener.

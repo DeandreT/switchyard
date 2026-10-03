@@ -43,7 +43,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE actions over HTTP/2 and authenticated TLS; other services not implemented |
-| Quorum replication | Pre-1.0 | Not implemented; durable production startup is refused before opening storage or binding listeners. Development Fjall persistence is local only |
+| Quorum replication | Pre-1.0 | No consensus runtime; production startup is refused. A separate typed committed-queue apply prerequisite atomically retains work and replay progress in isolated replica stores; development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
 | Cross-placement-group transactions | Later | Out of initial scope |
 | Geo-replication | Later | Out of initial scope |
@@ -150,7 +150,9 @@ behavior it currently enforces:
   reason they were dead-lettered, and never dead-letter again — abandoning in
   a dead-letter queue always returns the message to it. The path is reserved:
   it cannot be created or sent to directly.
-- Rejected commands write nothing, so every replica rejects at the same point.
+- Standalone rejected commands write nothing. The separate
+  [committed queue apply API](committed-queue-apply.md) records normal refusals
+  as checkpoint-only progress, leaving business records and their clock unchanged.
 - On a queue that requires sessions, a message carries a session identifier and
   is only delivered to a receiver holding that session's lock. Ordering is
   guaranteed within a session, which is the only FIFO guarantee made. A session
@@ -1333,6 +1335,15 @@ as `queue update`.
 ## Durable Format
 
 The current value format is version 11 and durable store layout is version 14.
+These remain the standalone formats. Isolated replica directories use the
+disjoint layout `0x8000000e`, an exact committed-state profile, and an initialized
+flag updated atomically with each privileged batch. Ordinary open refuses those
+directories, including on older format-14 builds; replica open does not adopt
+standalone directories. Their bounded progress record has its own version-1
+envelope and is not part of the ordinary message-value codec. There is no
+standalone-to-replica migration or runtime replication yet; see
+[Committed Queue Apply](committed-queue-apply.md).
+
 Value format 11 appends optional source-only [SQL actions](sql-actions.md) with
 semantic version 1; legacy rule definitions decode with no action. Maximum-sized
 old rules are validated and charged by their actual stored envelopes, not a
