@@ -15,6 +15,9 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 
 use crate::{Key, Mutation, StateStore, StorageError, StoreSnapshot, Value, WriteBatch};
 
+mod replica;
+pub use replica::FjallReplicaStore;
+
 /// Version 1 of the durable layout: caller keys verbatim in `records`, and a
 /// big-endian format version in `meta`.
 pub const STORE_FORMAT_V1: u32 = 1;
@@ -82,6 +85,12 @@ pub const STORE_FORMAT_V14: u32 = 14;
 /// silently corrupt queue state rather than fail.
 pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V14;
 
+/// Replica layouts use a disjoint version namespace so standalone and older
+/// binaries cannot mistake their records for an ordinary store. Record-layout
+/// changes advance both formats; replica header changes also require an
+/// explicit profile-version change.
+pub const ACTIVE_REPLICA_STORE_FORMAT: u32 = 0x8000_0000 | ACTIVE_STORE_FORMAT;
+
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
 const FORMAT_VERSION_KEY: &[u8] = b"format_version";
@@ -108,6 +117,10 @@ impl FjallStore {
         let records = database
             .keyspace(RECORDS_KEYSPACE, KeyspaceCreateOptions::default)
             .map_err(|error| StorageError::backend("open the record keyspace", &error))?;
+
+        if replica::has_replica_metadata(&meta)? {
+            return Err(StorageError::ReplicaMetadataInStandalone);
+        }
 
         match meta
             .get(FORMAT_VERSION_KEY)

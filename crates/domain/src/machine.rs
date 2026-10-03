@@ -25,6 +25,8 @@ use crate::{
 };
 
 mod atomic_messaging;
+pub(crate) mod committed_apply;
+mod committed_prepare;
 mod entity_deletion;
 mod incarnations;
 mod message_retention;
@@ -891,17 +893,29 @@ impl<S: StateStore> StateMachine<S> {
         {
             return Err(BrokerError::EntityPathAlreadyExists);
         }
-        let shadow = config.dead_letter_shadow();
         self.stage_create_incarnation(
             &command.namespace,
             &command.entity,
             crate::EntityIncarnationKind::Queue,
             batch,
         )?;
-        batch.push_put(key, codec::encode(&config)?);
+        self.stage_queue_configuration(command, config, &dead_letter_queue, batch)
+    }
+
+    fn stage_queue_configuration(
+        &self,
+        command: &Command,
+        config: QueueConfig,
+        dead_letter_queue: &EntityPath,
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
         batch.push_put(
-            keys::queue_config(&command.namespace, &dead_letter_queue),
-            codec::encode(&shadow)?,
+            keys::queue_config(&command.namespace, &command.entity),
+            codec::encode(&config)?,
+        );
+        batch.push_put(
+            keys::queue_config(&command.namespace, dead_letter_queue),
+            codec::encode(&config.dead_letter_shadow())?,
         );
         Ok(CommandOutcome::QueueCreated)
     }
@@ -959,14 +973,25 @@ impl<S: StateStore> StateMachine<S> {
 
         let mut counters = self.load_counters(command)?;
         let sequence = counters.allocate_sequence()?;
+        self.stage_queue_message(command, &config, message, counters, sequence, batch)
+    }
 
+    fn stage_queue_message(
+        &self,
+        command: &Command,
+        config: &QueueConfig,
+        message: MessageInput<'_>,
+        counters: QueueCounters,
+        sequence: SequenceNumber,
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
         batch.push_put(
             keys::queue_counters(&command.namespace, &command.entity),
             codec::encode(&counters)?,
         );
         if self.record_message_id(
             command,
-            &config,
+            config,
             message.message_id,
             &mut BTreeSet::new(),
             batch,
@@ -974,7 +999,7 @@ impl<S: StateStore> StateMachine<S> {
             return Ok(CommandOutcome::Sent { sequence });
         }
 
-        self.enqueue_message(command.into(), &config, message, sequence, None, batch)?;
+        self.enqueue_message(command.into(), config, message, sequence, None, batch)?;
         Ok(CommandOutcome::Sent { sequence })
     }
 

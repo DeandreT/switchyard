@@ -1,25 +1,26 @@
 //! The atomic storage contract and its backends.
 //!
-//! Everything above this crate sees only [`StateStore`]: read one key, walk an
-//! ordered prefix, commit a batch. Both backends implement that contract and
-//! the same conformance suite runs against both, so a queue behaves identically
-//! whether its state lives in memory or on disk.
+//! Ordinary state uses [`StateStore`]: read one key, walk an ordered prefix,
+//! commit a batch. Isolated replica state uses a unique [`CommittedStore`]
+//! writer and read-only views. Both backends have matching conformance suites,
+//! so a queue behaves identically whether its state lives in memory or on disk.
 
 #![forbid(unsafe_code)]
 
 mod durable;
 mod memory;
+mod replica;
 
 use thiserror::Error;
 
 pub use crate::{
     durable::{
-        ACTIVE_STORE_FORMAT, FjallStore, STORE_FORMAT_V1, STORE_FORMAT_V2, STORE_FORMAT_V3,
-        STORE_FORMAT_V4, STORE_FORMAT_V5, STORE_FORMAT_V6, STORE_FORMAT_V7, STORE_FORMAT_V8,
-        STORE_FORMAT_V9, STORE_FORMAT_V10, STORE_FORMAT_V11, STORE_FORMAT_V12, STORE_FORMAT_V13,
-        STORE_FORMAT_V14,
+        ACTIVE_REPLICA_STORE_FORMAT, ACTIVE_STORE_FORMAT, FjallReplicaStore, FjallStore,
+        STORE_FORMAT_V1, STORE_FORMAT_V2, STORE_FORMAT_V3, STORE_FORMAT_V4, STORE_FORMAT_V5,
+        STORE_FORMAT_V6, STORE_FORMAT_V7, STORE_FORMAT_V8, STORE_FORMAT_V9, STORE_FORMAT_V10,
+        STORE_FORMAT_V11, STORE_FORMAT_V12, STORE_FORMAT_V13, STORE_FORMAT_V14,
     },
-    memory::MemoryStore,
+    memory::{MemoryReplicaStore, MemoryStore},
 };
 
 pub type Key = Vec<u8>;
@@ -126,10 +127,35 @@ pub trait StateStore: Clone + Send + Sync + 'static {
     }
 }
 
+/// A trusted, unique writer for replica state.
+///
+/// The reader must observe exactly this writer's records and must refuse every
+/// [`StateStore::apply`] call. Implementations commit the supplied mutations
+/// and their initialized flag atomically, with the same durability and unknown
+/// error-decision contract as [`StateStore::apply`]. An empty privileged commit
+/// still initializes the store.
+///
+/// This is a low-level storage capability, not evidence that a batch came from
+/// consensus or passed authorization. Its owner must serialize preparation and
+/// commit; the interface supplies no compare-and-swap or transaction isolation
+/// across earlier reads. Domain adapters should expose typed operations rather
+/// than this raw batch capability or the writer itself.
+pub trait CommittedStore: Send + 'static {
+    type Reader: StateStore;
+
+    fn reader(&self) -> Self::Reader;
+    fn commit(&mut self, batch: WriteBatch) -> Result<(), StorageError>;
+    fn is_initialized(&self) -> Result<bool, StorageError>;
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum StorageError {
     #[error("storage lock was poisoned")]
     LockPoisoned,
+    #[error("replica state requires a committed-store writer")]
+    ReplicaWriteRequired,
+    #[error("replica metadata cannot be opened as a standalone store")]
+    ReplicaMetadataInStandalone,
     /// A durable backend refused an operation.
     ///
     /// The backend's own error is rendered to a string rather than carried,

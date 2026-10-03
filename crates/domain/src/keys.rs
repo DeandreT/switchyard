@@ -43,6 +43,7 @@ const TAG_TOPIC_CONFIG: u8 = 0x0E;
 const TAG_TOPIC_SUBSCRIPTION: u8 = 0x0F;
 const TAG_SUBSCRIPTION_RULE: u8 = 0x10;
 const TAG_ENTITY_INCARNATION: u8 = 0x11;
+const TAG_COMMITTED_CHECKPOINT: u8 = 0x12;
 
 const SEPARATOR: u8 = 0x00;
 
@@ -78,6 +79,11 @@ fn with_u64(mut key: Vec<u8>, value: u64) -> Vec<u8> {
 /// The single record holding the highest timestamp the machine has applied.
 pub fn clock() -> Vec<u8> {
     vec![TAG_CLOCK]
+}
+
+/// Private replicated-store progress, never written by the standalone machine.
+pub(crate) fn committed_checkpoint() -> Vec<u8> {
+    vec![TAG_COMMITTED_CHECKPOINT]
 }
 
 pub fn queue_config(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {

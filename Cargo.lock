@@ -483,6 +483,7 @@ dependencies = [
  "postcard",
  "regex",
  "serde",
+ "sha2",
  "sqlparser",
  "storage",
  "testkit",

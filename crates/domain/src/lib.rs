@@ -12,6 +12,7 @@ pub mod keys;
 
 mod atomic_messaging;
 mod command;
+mod committed;
 mod entity_binding;
 mod error;
 mod identifier;
@@ -39,6 +40,13 @@ pub use command::{
     Command, CommandKind, CommandOutcome, DeleteEntityTarget, DeliveryBudget, EntityDeleteLimit,
     IngressBatchLimit, IngressEnvelope, ScheduledEnvelope, ScheduledMessage, SettlementDisposition,
 };
+pub use committed::{
+    CommittedApplication, CommittedApplyError, CommittedApplyResult, CommittedCheckpoint,
+    CommittedCheckpointUpdate, CommittedEntryId, CommittedEntryMark, CommittedMembership,
+    CommittedQueueCommand, CommittedQueueWork, CommittedSend, CommittedStreamId,
+    MAX_COMMITTED_BODY_BYTES, MAX_COMMITTED_CHECKPOINT_BYTES, MAX_COMMITTED_ENTRY_BYTES,
+    MAX_COMMITTED_MEMBERSHIP_BYTES,
+};
 pub use entity_binding::{EntityBinding, EntityIncarnation, EntityIncarnationKind, FencedCommand};
 pub use error::BrokerError;
 pub use identifier::{
@@ -47,6 +55,7 @@ pub use identifier::{
     MAX_SUBSCRIPTION_NAME_BYTES, NamespaceName, PlacementGroupId, SUBSCRIPTION_PATH_SEGMENT,
     SessionId, SubscriptionName,
 };
+pub use machine::committed_apply::CommittedStateMachine;
 pub use machine::{
     BROKER_HEADER_RESERVE_BYTES, CommandApplication, MAX_DEAD_LETTER_DETAIL_LENGTH,
     MAX_ENTITY_DELETE_KEY_BYTES, MAX_ENTITY_DELETE_KEYS, MAX_ENTITY_DELETE_VALUE_BYTES,
