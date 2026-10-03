@@ -57,6 +57,15 @@ struct CountingBroker {
 }
 
 impl protocol_amqp::Broker for CountingBroker {
+    fn receive_fenced_owned(
+        &self,
+        submission: protocol_amqp::OwnedReceiveSubmission,
+    ) -> impl Future<Output = Result<Option<domain::Delivery>, protocol_amqp::ReceiveSubmitError>>
+    + Send
+    + 'static {
+        protocol_amqp::Broker::receive_fenced_owned(&self.inner, submission)
+    }
+
     async fn bind(
         &self,
         namespace: NamespaceName,

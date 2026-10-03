@@ -38,6 +38,7 @@ mod atomic_messaging;
 mod atomic_work;
 mod bindings;
 mod guarded_atomic_messaging;
+mod guarded_receive;
 mod native_atomic_messaging;
 mod native_atomic_protocol;
 mod protocol;
@@ -54,6 +55,10 @@ pub use native_atomic_messaging::{NativeAtomicMessagingCompletion, NativeAtomicS
 const COMMAND_QUEUE_DEPTH: usize = 1_024;
 
 enum Request {
+    ApplyReceiveOwned {
+        submission: Box<protocol_amqp::OwnedReceiveSubmission>,
+        reply: flume::Sender<Result<Option<domain::Delivery>, protocol_amqp::ReceiveSubmitError>>,
+    },
     ApplyNativeAtomicMessagingOwned {
         submission: Box<protocol_amqp::OwnedNativeAtomicMessagingSubmission>,
         reply: flume::Sender<NativeAtomicMessagingCompletion>,
@@ -588,6 +593,9 @@ impl Broker {
                                 }
                             }
                             let _ = reply.send(application);
+                        }
+                        Request::ApplyReceiveOwned { submission, reply } => {
+                            guarded_receive::apply_owned(&proposer, &watching, *submission, reply);
                         }
                         Request::Apply {
                             namespace,

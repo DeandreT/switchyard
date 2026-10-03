@@ -8,6 +8,7 @@ use domain::{EntityIncarnationKind, RuleFilter, RuleName};
 use super::*;
 
 mod action_bindings;
+mod receive_bindings;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Call {

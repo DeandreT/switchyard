@@ -12,7 +12,7 @@ use domain::{
     QueueConfig, RuleDefinition, SubscriptionConfig, SubscriptionName, TopicConfig,
 };
 
-use crate::Attachment;
+use crate::{Attachment, OwnedReceiveSubmission, ReceiveSubmitError};
 
 mod bound;
 pub(crate) use bound::BoundBroker;
@@ -70,6 +70,21 @@ impl BrokerRejection {
 }
 
 pub trait Broker: Clone + Send + Sync + 'static {
+    /// Claims one expiry-fenced receive at the serialized owner before any
+    /// validation, domain clock, or storage work. Implementations must arm
+    /// pending cancellation synchronously, before returning the owned future.
+    /// Unsupported brokers never fall back to an unfenced submit.
+    fn receive_fenced_owned(
+        &self,
+        submission: OwnedReceiveSubmission,
+    ) -> impl Future<Output = Result<Option<domain::Delivery>, ReceiveSubmitError>> + Send + 'static
+    {
+        async move {
+            drop(submission);
+            Err(ReceiveSubmitError::Unsupported)
+        }
+    }
+
     fn bind(
         &self,
         namespace: NamespaceName,

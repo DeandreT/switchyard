@@ -2,6 +2,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 
+mod receive_claim;
+
 fn job(done: Arc<AtomicUsize>, result: Result<(), ReceiveExit>) -> work::WorkFuture {
     Box::pin(async move {
         done.fetch_add(1, Ordering::AcqRel);

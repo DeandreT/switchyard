@@ -2,6 +2,8 @@ use amqp::ClaimedOutgoingSendReservation;
 use futures_util::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use tokio::sync::watch;
 
+use crate::{OwnedReceiveSubmission, ReceiveClaimError, ReceiveClaimPermit, ReceiveSubmitError};
+
 use super::{
     budget::{ContentBudget, MAX_RECEIVING_WORK, projected_delivery_bytes},
     work, *,
@@ -18,6 +20,25 @@ enum IntakeResult {
 }
 
 type IntakeFuture = BoxFuture<'static, Result<IntakeResult, ReceiveExit>>;
+
+// Cancellation of the pending owner receive precedes returning native credit.
+// Keep this whole packet captured while its receiving future is polled.
+struct ReceivePacket<R> {
+    receiving: BoxFuture<'static, Result<Option<Delivery>, ReceiveExit>>,
+    reservation: R,
+}
+
+impl<R> ReceivePacket<R> {
+    async fn run(mut self) -> Result<(R, Option<Delivery>), ReceiveExit> {
+        let delivery = self.receiving.as_mut().await?;
+        let Self {
+            receiving,
+            reservation,
+        } = self;
+        drop(receiving);
+        Ok((reservation, delivery))
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn receive_until_stopped<B: Broker>(
@@ -182,24 +203,61 @@ fn start_intake<B: Broker>(
         ensure_authorized(authorization.as_ref()).await?;
         // This future remains pinned across every other work completion.
         let wakeup = broker.deliverable(&namespace, &entity);
-        let outcome = broker
-            .submit(
-                namespace.clone(),
+        let receiving: BoxFuture<'static, _> = if let Some(authorization) = &authorization {
+            // This is the exact admitted Listen resource, not its family owner
+            // or an unrelated grant. The owner will re-sample UTC at claim.
+            let expiry = authorization
+                .claim_expiry_epoch_seconds()
+                .await
+                .map_err(|_| ReceiveExit::Unauthorized)?;
+            let (_, ticket) = ReceiveClaimPermit::new(expiry);
+            let submission = OwnedReceiveSubmission::new(
+                broker.binding().clone(),
                 entity.clone(),
-                CommandKind::Receive {
-                    mode,
-                    lock_duration_millis: None,
-                    session,
-                },
-            )
-            .await
-            .map_err(ReceiveExit::Broker)?;
-        match outcome {
-            CommandOutcome::Received(Some(delivery)) => Ok(IntakeResult::Acquired(Acquired {
+                mode,
+                session,
+                ticket,
+            );
+            let operation = broker.receive_fenced_owned(submission);
+            Box::pin(async move { operation.await.map_err(receive_submit_error) })
+        } else {
+            // Unsecured listeners retain their existing command path.
+            let broker = broker.clone();
+            let namespace = namespace.clone();
+            let entity = entity.clone();
+            Box::pin(async move {
+                match broker
+                    .submit(
+                        namespace,
+                        entity,
+                        CommandKind::Receive {
+                            mode,
+                            lock_duration_millis: None,
+                            session,
+                        },
+                    )
+                    .await
+                    .map_err(ReceiveExit::Broker)?
+                {
+                    CommandOutcome::Received(delivery) => Ok(delivery),
+                    _ => Err(ReceiveExit::Refused(error_for(
+                        AmqpError::InternalError,
+                        "receive produced an unexpected outcome".to_owned(),
+                    ))),
+                }
+            })
+        };
+        let packet = ReceivePacket {
+            receiving,
+            reservation,
+        };
+        let (reservation, delivery) = packet.run().await?;
+        match delivery {
+            Some(delivery) => Ok(IntakeResult::Acquired(Acquired {
                 reservation,
                 delivery: Box::new(delivery),
             })),
-            CommandOutcome::Received(None) => {
+            None => {
                 // Empty Receive must not strand drain with a claimed credit.
                 drop(reservation);
                 tokio::select! {
@@ -208,12 +266,29 @@ fn start_intake<B: Broker>(
                 }
                 Ok(IntakeResult::Retry)
             }
-            _ => Err(ReceiveExit::Refused(error_for(
-                AmqpError::InternalError,
-                "receive produced an unexpected outcome".to_owned(),
-            ))),
         }
     })
+}
+
+fn receive_submit_error(error: ReceiveSubmitError) -> ReceiveExit {
+    match error {
+        ReceiveSubmitError::Claim(ReceiveClaimError::AuthorizationExpired) => {
+            ReceiveExit::Unauthorized
+        }
+        ReceiveSubmitError::Unsupported => ReceiveExit::Refused(error_for(
+            AmqpError::NotImplemented,
+            "expiry-fenced receive admission is not implemented".to_owned(),
+        )),
+        ReceiveSubmitError::Refused(error) => ReceiveExit::Broker(BrokerRejection::Refused(error)),
+        // Cancellation is not proof that this exact native sender retired.
+        // In particular, never wait on on_detach for a healthy cancelled job.
+        ReceiveSubmitError::Claim(_) | ReceiveSubmitError::OwnerUnavailable(_) => {
+            ReceiveExit::Refused(error_for(
+                AmqpError::InternalError,
+                "the receive owner could not produce a result".to_owned(),
+            ))
+        }
+    }
 }
 
 async fn ensure_authorized(authorization: Option<&LinkAuthorization>) -> Result<(), ReceiveExit> {

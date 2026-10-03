@@ -11,6 +11,17 @@ fn rejection(error: SubmitError) -> BrokerRejection {
 }
 
 impl protocol_amqp::Broker for BrokerHandle {
+    fn receive_fenced_owned(
+        &self,
+        submission: protocol_amqp::OwnedReceiveSubmission,
+    ) -> impl std::future::Future<
+        Output = Result<Option<domain::Delivery>, protocol_amqp::ReceiveSubmitError>,
+    > + Send
+    + 'static {
+        // Construct the armed future before a caller can drop the mapper.
+        BrokerHandle::receive_fenced_owned(self, submission)
+    }
+
     async fn bind(
         &self,
         namespace: NamespaceName,

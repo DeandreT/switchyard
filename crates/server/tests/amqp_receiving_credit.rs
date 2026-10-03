@@ -4,10 +4,12 @@ use std::{
     collections::{HashMap, HashSet},
     error::Error,
     future::Future,
+    pin::Pin,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -22,7 +24,10 @@ use domain::{
     QueueConfig, ReceiveMode, SequenceNumber, StateMachine, SubscriptionConfig, SubscriptionName,
     Timestamp, TopicConfig,
 };
-use protocol_amqp::{Attachment, BrokerRejection, EntityAdmission, EntityMetadata};
+use protocol_amqp::{
+    Attachment, BrokerRejection, EntityAdmission, EntityMetadata, OwnedReceiveSubmission,
+    ReceiveClaimPermit, ReceiveClaimState, ReceiveSubmitError,
+};
 use server::{Broker, BrokerHandle, Clock, LocalProposer};
 use storage::{Key, StateStore, StorageError, StoreSnapshot, Value as StoredValue, WriteBatch};
 use testkit::StoreProvider;
@@ -125,6 +130,36 @@ macro_rules! backend_cases {
             #[tokio::test]
             async fn a_started_receive_survives_another_jobs_final_ack() -> TestResult {
                 pipeline::a_started_receive_survives_another_jobs_final_ack($provider).await
+            }
+
+            #[tokio::test]
+            async fn queued_peek_lock_cancellation_precedes_all_receive_owner_work() -> TestResult {
+                auth::guarded::queued_peek_lock_cancellation_precedes_all_receive_owner_work($provider).await
+            }
+
+            #[tokio::test]
+            async fn queued_receive_expiry_is_an_exact_wire_refusal_without_owner_work() -> TestResult {
+                auth::guarded::queued_receive_expiry_is_an_exact_wire_refusal_without_owner_work($provider).await
+            }
+
+            #[tokio::test]
+            async fn a_stale_receive_binding_refuses_before_clock_and_cannot_touch_replacement() -> TestResult {
+                auth::guarded::a_stale_receive_binding_refuses_before_clock_and_cannot_touch_replacement($provider).await
+            }
+
+            #[tokio::test]
+            async fn started_receive_commits_once_despite_connection_and_reply_loss() -> TestResult {
+                auth::guarded::started_receive_commits_once_despite_connection_and_reply_loss($provider).await
+            }
+
+            #[tokio::test]
+            async fn queued_receive_and_delete_cancellation_preserves_the_original() -> TestResult {
+                auth::guarded::queued_receive_and_delete_cancellation_preserves_the_original($provider).await
+            }
+
+            #[tokio::test]
+            async fn valid_guarded_receive_preserves_canonical_delivery_and_settlement() -> TestResult {
+                auth::guarded::valid_guarded_receive_preserves_canonical_delivery_and_settlement($provider).await
             }
         }
     };

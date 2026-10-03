@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "fixture/guarded.rs"]
+mod guarded;
+
 #[derive(Default)]
 pub(super) struct Controls {
     now: AtomicU64,
@@ -7,8 +10,16 @@ pub(super) struct Controls {
     pub(super) completed: AtomicUsize,
     pub(super) writes: AtomicUsize,
     pub(super) clocks: AtomicUsize,
+    pub(super) reads: AtomicUsize,
+    pub(super) guarded_polled: AtomicUsize,
+    pub(super) cancelled: AtomicUsize,
     deliveries: Mutex<Vec<domain::Delivery>>,
     response_gate: Mutex<Option<Arc<ReceiveResponseGateState>>>,
+    before_queue_gate: Mutex<Option<Arc<ReceiveResponseGateState>>>,
+    receive_permits: Mutex<Vec<ReceiveClaimPermit>>,
+    receive_horizons: Mutex<Vec<u64>>,
+    pause_read: Mutex<Option<guarded::StorePause>>,
+    pause_commit: Mutex<Option<guarded::StorePause>>,
     changed: Notify,
 }
 
@@ -37,7 +48,18 @@ impl Controls {
         self.completed.store(0, Ordering::SeqCst);
         self.writes.store(0, Ordering::SeqCst);
         self.clocks.store(0, Ordering::SeqCst);
+        self.reads.store(0, Ordering::SeqCst);
+        self.guarded_polled.store(0, Ordering::SeqCst);
+        self.cancelled.store(0, Ordering::SeqCst);
         self.deliveries.lock().expect("observed deliveries").clear();
+        self.receive_permits
+            .lock()
+            .expect("receive permits")
+            .clear();
+        self.receive_horizons
+            .lock()
+            .expect("receive horizons")
+            .clear();
     }
 
     pub(super) async fn wait_completed(&self, expected: usize) -> TestResult {
@@ -126,6 +148,8 @@ struct ObservedStore<S> {
 
 impl<S: StateStore> StateStore for ObservedStore<S> {
     fn get(&self, key: &[u8]) -> Result<Option<StoredValue>, StorageError> {
+        self.controls.reads.fetch_add(1, Ordering::SeqCst);
+        guarded::await_store_pause(&self.controls.pause_read)?;
         self.inner.get(key)
     }
     fn scan_from(
@@ -134,6 +158,7 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Key, StoredValue)>, StorageError> {
+        self.controls.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.scan_from(prefix, start, limit)
     }
     fn snapshot(&self) -> Result<StoreSnapshot, StorageError> {
@@ -141,6 +166,7 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
     }
     fn apply(&self, batch: WriteBatch) -> Result<(), StorageError> {
         self.controls.writes.fetch_add(1, Ordering::SeqCst);
+        guarded::await_store_pause(&self.controls.pause_commit)?;
         self.inner.apply(batch)
     }
 }
@@ -161,6 +187,14 @@ struct ObservedBroker {
 }
 
 impl protocol_amqp::Broker for ObservedBroker {
+    fn receive_fenced_owned(
+        &self,
+        submission: OwnedReceiveSubmission,
+    ) -> impl Future<Output = Result<Option<domain::Delivery>, ReceiveSubmitError>> + Send + 'static
+    {
+        guarded::observe_owned_receive(&self.inner, self.controls.clone(), submission)
+    }
+
     fn bind(
         &self,
         namespace: NamespaceName,

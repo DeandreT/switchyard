@@ -34,6 +34,29 @@ impl<B: Broker> BoundBroker<B> {
 }
 
 impl<B: Broker> Broker for BoundBroker<B> {
+    fn receive_fenced_owned(
+        &self,
+        submission: OwnedReceiveSubmission,
+    ) -> impl Future<Output = Result<Option<domain::Delivery>, ReceiveSubmitError>> + Send + 'static
+    {
+        // Target is the exact physical route, including a DLQ shadow. The
+        // incarnation owner must never stand in for that target.
+        let valid =
+            submission.binding() == &self.binding && submission.entity() == self.binding.target();
+        let future: futures_util::future::BoxFuture<'static, _> = if valid {
+            // The inner factory arms cancellation before this factory returns.
+            Box::pin(self.inner.receive_fenced_owned(submission))
+        } else {
+            Box::pin(async move {
+                drop(submission);
+                Err(ReceiveSubmitError::Refused(
+                    BrokerError::InvalidEntityBinding,
+                ))
+            })
+        };
+        future
+    }
+
     async fn bind(
         &self,
         namespace: NamespaceName,

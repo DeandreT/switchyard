@@ -19,6 +19,8 @@ mod management;
 mod message;
 mod native_atomic_broker;
 mod native_atomic_work;
+mod receive_claim;
+mod receive_work;
 mod session_filter;
 mod settlement;
 mod tls;
@@ -76,6 +78,11 @@ pub use crate::{
         NativeClaim, NativeReadySubmission, NativeReadyTicket, NativeTransactionDecision,
         NativeTransactionError, NativeTransactionResources, OwnedNativeAtomicMessagingSubmission,
     },
+    receive_claim::{
+        ReceiveClaimAbortGuard, ReceiveClaimError, ReceiveClaimPermit, ReceiveClaimState,
+        ReceiveClaimTicket,
+    },
+    receive_work::{OwnedReceiveSubmission, ReceiveOwnerUnavailableCause, ReceiveSubmitError},
     session_filter::{SESSION_FILTER, SessionRequest, read_session_filter, stamp_session_filter},
     tls::{TlsConfigurationError, tls_server_config},
     transaction_registry::{

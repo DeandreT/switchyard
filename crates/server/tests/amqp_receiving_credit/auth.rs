@@ -6,6 +6,8 @@ use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::form_urlencoded::byte_serialize;
 
+#[path = "auth/guarded.rs"]
+pub(super) mod guarded;
 #[path = "auth/pipeline.rs"]
 pub(super) mod pipeline;
 
