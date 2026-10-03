@@ -32,7 +32,7 @@ pub(super) fn entry_key(index: u64) -> Vec<u8> {
 openraft::declare_raft_types!(
     pub LogTypes:
         D = QueueLogCommand,
-        R = (),
+        R = crate::experimental_state_machine::LogApplication,
         NodeId = u64,
         Node = openraft::BasicNode,
         SnapshotData = std::io::Cursor<Vec<u8>>,

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod experimental_log;
+pub mod experimental_state_machine;
 
 pub use experimental_log::{
     ExperimentalLogStore, LogCodecError, LogEntry, LogId, LogProfile, LogResource, LogStorageError,
@@ -8,6 +9,13 @@ pub use experimental_log::{
     MAX_LIMITED_ENTRIES, MAX_LOG_BODY_BYTES, MAX_LOG_ENTRY_BYTES, MAX_LOG_MEMBERSHIP_BYTES,
     MAX_LOG_METADATA_BYTES, MAX_LOG_OWNER_BYTES, MAX_LOG_OWNER_JOBS, MAX_LOG_QUEUE_BYTES,
     MAX_RETAINED_BYTES, MAX_RETAINED_ENTRIES, QueueLogCommand, ReadOnlyLogReader,
+};
+
+pub use experimental_state_machine::{
+    AppliedState, ExperimentalStateMachine, LogApplication, LogQueueConfigRefusal, LogQueueRefusal,
+    MAX_APPLY_BYTES, MAX_APPLY_ENTRIES, MAX_STATE_MACHINE_OWNER_BYTES,
+    MAX_STATE_MACHINE_OWNER_JOBS, StateMachineError, StateMachineWorkload,
+    UnsupportedSnapshotBuilder,
 };
 
 use serde::{Deserialize, Serialize};

@@ -704,6 +704,31 @@ pub(super) fn validate_encoded_entry(bytes: Vec<u8>) -> Result<EncodedEntry, Log
     let id = wire.id.into_id();
     Ok(EncodedEntry::validated(id, bytes))
 }
+
+pub(super) fn encode_membership(
+    membership: &openraft::Membership<u64, openraft::BasicNode>,
+) -> Result<Vec<u8>, LogCodecError> {
+    let wire = MembershipV1::from_membership(membership)?;
+    encode(
+        &[],
+        &wire,
+        MAX_LOG_MEMBERSHIP_BYTES,
+        LogResource::Membership,
+    )
+}
+
+pub(super) fn decode_membership(
+    bytes: &[u8],
+) -> Result<openraft::Membership<u64, openraft::BasicNode>, LogCodecError> {
+    let wire: MembershipV1<'_> = decode(
+        &[],
+        bytes,
+        MAX_LOG_MEMBERSHIP_BYTES,
+        LogResource::Membership,
+    )?;
+    wire.validate()?;
+    Ok(wire.into_membership())
+}
 #[cfg(test)]
 fn encode_vote(vote: &LogVote) -> Result<Vec<u8>, LogCodecError> {
     encode(

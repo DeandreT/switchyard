@@ -21,6 +21,32 @@ pub use types::{
 pub const MAX_LOG_OWNER_JOBS: usize = 32;
 pub const MAX_LOG_OWNER_BYTES: usize = 4 * 1024 * 1024;
 
+pub(crate) const MEMBERSHIP_SCHEMA_VERSION: u16 = 1;
+
+pub(crate) fn validated_entry_len(entry: &LogEntry) -> Result<usize, LogCodecError> {
+    Ok(codec::encode_entry(entry)?.encoded_len())
+}
+
+pub(crate) fn queue_command_is_send(command: &QueueLogCommand) -> bool {
+    matches!(command.0.as_ref(), types::QueueLogKind::Send { .. })
+}
+
+pub(crate) fn encode_membership(
+    membership: &openraft::Membership<u64, openraft::BasicNode>,
+) -> Result<Vec<u8>, LogCodecError> {
+    codec::encode_membership(membership)
+}
+
+pub(crate) fn decode_membership(
+    schema_version: u16,
+    bytes: &[u8],
+) -> Result<openraft::Membership<u64, openraft::BasicNode>, LogCodecError> {
+    if schema_version != MEMBERSHIP_SCHEMA_VERSION {
+        return Err(LogCodecError::UnsupportedRecord);
+    }
+    codec::decode_membership(bytes)
+}
+
 /// Accepted queued and in-flight work, excluding caller-held read results.
 /// Byte charges include exact encoded append rows and 64 bytes per fixed-size
 /// scalar/read job; they are not exact allocation or serialized response sizes.

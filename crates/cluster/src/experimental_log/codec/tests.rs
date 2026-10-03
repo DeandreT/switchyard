@@ -727,3 +727,159 @@ fn redacted_debug_and_errors_do_not_print_payloads() {
         assert!(!error.to_string().contains("private"));
     }
 }
+
+#[test]
+fn sibling_entry_validation_and_kind_metadata_preserve_the_frozen_bytes() {
+    let create = QueueLogCommand::create_queue(
+        NamespaceName::new("test").unwrap(),
+        EntityPath::new("orders").unwrap(),
+        Timestamp::UNIX_EPOCH,
+        QueueConfig::default(),
+    );
+    assert!(!crate::experimental_log::queue_command_is_send(&create));
+    let send = send(vec![0; MAX_LOG_BODY_BYTES], "message");
+    assert!(crate::experimental_log::queue_command_is_send(&send));
+    for entry in [blank(0), normal(1, create), normal(2, send)] {
+        assert_eq!(
+            crate::experimental_log::validated_entry_len(&entry).unwrap(),
+            encode_entry(&entry).unwrap().encoded_len()
+        );
+    }
+}
+
+#[test]
+fn bare_membership_schema_round_trips_without_a_new_record_header() {
+    let member = membership();
+    let wire = MembershipV1::from_membership(&member).unwrap();
+    let bytes = crate::experimental_log::encode_membership(&member).unwrap();
+    assert_eq!(bytes, postcard::to_stdvec(&wire).unwrap());
+    assert_eq!(
+        crate::experimental_log::decode_membership(
+            crate::experimental_log::MEMBERSHIP_SCHEMA_VERSION,
+            &bytes
+        )
+        .unwrap(),
+        member
+    );
+    for unsupported in [0, 2, u16::MAX] {
+        assert_eq!(
+            crate::experimental_log::decode_membership(unsupported, &[255]).unwrap_err(),
+            LogCodecError::UnsupportedRecord
+        );
+    }
+}
+
+#[test]
+fn bare_membership_checks_canonical_shape_and_bounds_before_owned_nodes() {
+    let bytes = encode_membership(&membership()).unwrap();
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert_eq!(
+        decode_membership(&trailing).unwrap_err(),
+        LogCodecError::NonCanonical
+    );
+    let mut nonminimal = bytes;
+    assert_eq!(nonminimal[0], 2);
+    nonminimal.splice(0..1, [0x82, 0]);
+    assert_eq!(
+        decode_membership(&nonminimal).unwrap_err(),
+        LogCodecError::NonCanonical
+    );
+    assert_eq!(
+        decode_membership(&[1, 1, 1, 33]).unwrap_err(),
+        LogCodecError::Malformed
+    );
+    let duplicate = MembershipV1 {
+        configs: Bounded(vec![Bounded(vec![1])]),
+        nodes: Bounded(vec![
+            NodeV1 {
+                id: 1,
+                address: Text(Cow::Borrowed("first")),
+            },
+            NodeV1 {
+                id: 1,
+                address: Text(Cow::Borrowed("duplicate")),
+            },
+        ]),
+    };
+    let bytes = encode(
+        &[],
+        &duplicate,
+        MAX_LOG_MEMBERSHIP_BYTES,
+        LogResource::Membership,
+    )
+    .unwrap();
+    assert_eq!(
+        decode_membership(&bytes).unwrap_err(),
+        LogCodecError::InvalidMembership
+    );
+    assert_eq!(
+        decode_membership(&vec![0; MAX_LOG_MEMBERSHIP_BYTES + 1]).unwrap_err(),
+        LogCodecError::TooLarge {
+            resource: LogResource::Membership,
+            maximum: MAX_LOG_MEMBERSHIP_BYTES
+        }
+    );
+}
+
+#[test]
+fn exact_membership_payload_cap_remains_usable_by_committed_apply() {
+    let make = |last: usize| {
+        openraft::Membership::new(
+            vec![BTreeSet::from([1])],
+            BTreeMap::from_iter((1..=8).map(|id| {
+                let length = if id == 8 { last } else { MAX_ADDRESS_BYTES };
+                (
+                    id,
+                    openraft::BasicNode {
+                        addr: "x".repeat(length),
+                    },
+                )
+            })),
+        )
+    };
+    let mut low: usize = 0;
+    let mut high: usize = MAX_ADDRESS_BYTES;
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if encode_membership(&make(middle)).is_ok() {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let member = make(low);
+    let payload = encode_membership(&member).unwrap();
+    assert_eq!(payload.len(), MAX_LOG_MEMBERSHIP_BYTES);
+    assert!(encode_membership(&make(low + 1)).is_err());
+    let stream = domain::CommittedStreamId::new([7; 16]).unwrap();
+    let mut machine =
+        domain::CommittedStateMachine::create(storage::MemoryReplicaStore::new(), stream).unwrap();
+    let update = domain::CommittedCheckpointUpdate {
+        stream,
+        expected_previous: None,
+        entry: domain::CommittedEntryId {
+            term: 1,
+            node_id: 3,
+            index: 0,
+        },
+    };
+    let work = domain::CommittedQueueWork::Membership {
+        schema_version: crate::experimental_log::MEMBERSHIP_SCHEMA_VERSION,
+        payload,
+    };
+    assert!(matches!(
+        machine.apply_committed(&update, &work).unwrap(),
+        domain::CommittedApplyResult::Applied {
+            application: domain::CommittedApplication::CheckpointOnly,
+            ..
+        }
+    ));
+    let checkpoint = machine.checkpoint().unwrap();
+    let stored = checkpoint.membership().unwrap();
+    assert_eq!(stored.payload.len(), MAX_LOG_MEMBERSHIP_BYTES);
+    assert_eq!(
+        crate::experimental_log::decode_membership(stored.schema_version, &stored.payload).unwrap(),
+        member
+    );
+}
