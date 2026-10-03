@@ -1,5 +1,15 @@
 #![forbid(unsafe_code)]
 
+pub mod experimental_log;
+
+pub use experimental_log::{
+    ExperimentalLogStore, LogCodecError, LogEntry, LogId, LogProfile, LogResource, LogStorageError,
+    LogTypes, LogVote, LogWorkload, MAX_APPEND_BYTES, MAX_APPEND_ENTRIES, MAX_LIMITED_BYTES,
+    MAX_LIMITED_ENTRIES, MAX_LOG_BODY_BYTES, MAX_LOG_ENTRY_BYTES, MAX_LOG_MEMBERSHIP_BYTES,
+    MAX_LOG_METADATA_BYTES, MAX_LOG_OWNER_BYTES, MAX_LOG_OWNER_JOBS, MAX_LOG_QUEUE_BYTES,
+    MAX_RETAINED_BYTES, MAX_RETAINED_ENTRIES, QueueLogCommand, ReadOnlyLogReader,
+};
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

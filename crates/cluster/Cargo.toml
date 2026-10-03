@@ -7,6 +7,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+domain.workspace = true
+flume.workspace = true
+openraft.workspace = true
+postcard.workspace = true
 serde.workspace = true
+storage.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
+[dev-dependencies]
+testkit.workspace = true
