@@ -63,6 +63,11 @@ SHA-256 writer, without allocating another encoded body. Entry size limits are
 trusted-log admission requirements; an invalid or oversized committed entry
 fails without advancing progress.
 
+The pure `CommittedQueueWork::entry_mark` helper computes the same bounded
+canonical mark for [owned storage-pair validation](experimental-replica-preparation.md).
+It does not apply work, authorize a predecessor, reconstruct an outcome, or
+prove quorum commitment. Hashable business refusals remain representable.
+
 ## Atomic Progress
 
 The fixed checkpoint key is `0x12`. Its independent `SWYC` version-1 envelope

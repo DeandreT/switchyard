@@ -116,6 +116,10 @@ history without snapshots and applied-state-ahead-of-log pairings before
 `Raft::new`, and forbid manual snapshot/purge paths. The pinned startup helper
 can rebuild or purge regardless of that policy. Finite retention must not be
 mistaken for automatic compaction.
+The separate [owned storage-pair preflight](experimental-replica-preparation.md)
+now checks those pairings and the full applied fingerprint chain, membership,
+watermark, and votes without applying or repairing history. Private retirement
+tokens preserve storage-thread join ownership; no runtime is activated.
 
 The [pinned state-machine contract](https://github.com/databendlabs/openraft/blob/v0.9.25/openraft/src/storage/v2.rs)
 defines applied identity, membership, and one result per entry. Its
@@ -127,8 +131,9 @@ adapter caller or establish quorum commitment on their own.
 
 ## Verification
 
-The cluster suite passes 70 unit tests, 48 log integration cases, 41
-state-machine integration cases, and three compile-fail examples. The new
+At the state-machine adapter checkpoint, the cluster suite passed 70 unit
+tests, 48 log integration cases, 41 state-machine integration cases, and three
+compile-fail examples. Its new
 public cases cover both memory and durable replica stores, full retained-range
 application, exact membership recovery, whole-input refusal before I/O,
 caller-loss admission leases, executor responsiveness, joined shutdown, and

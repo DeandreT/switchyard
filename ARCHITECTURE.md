@@ -27,6 +27,10 @@ separate [state-machine adapter](docs/experimental-state-machine.md) for bounded
 committed apply and exact membership recovery. They do not implement the
 replicated proposer, snapshots, network, leader barriers, or quorum
 acknowledgements required below.
+[Owned replica preparation](docs/experimental-replica-preparation.md) validates
+the full applied fingerprint chain, membership, voting state, and store pairing
+without repairing or applying history; private retirement tokens preserve
+storage-thread join ownership for a later runtime.
 
 Within the semantics below, topics have persisted definitions, bounded
 subscription topology, and atomic rule-selected fanout, parent-retained topic

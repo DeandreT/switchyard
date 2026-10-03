@@ -43,7 +43,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE actions over HTTP/2 and authenticated TLS; other services not implemented |
-| Quorum replication | Pre-1.0 | No consensus runtime; production startup is refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories; none supplies quorum acknowledgements or snapshots. Development Fjall persistence remains local only |
+| Quorum replication | Pre-1.0 | No consensus runtime; production startup is refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup; none supplies quorum acknowledgements or snapshots. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
 | Cross-placement-group transactions | Later | Out of initial scope |
 | Geo-replication | Later | Out of initial scope |

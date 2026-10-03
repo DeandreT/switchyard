@@ -127,6 +127,10 @@ rebuilds a missing snapshot after purge and can purge when applied state is
 ahead of the log. A future no-snapshot runtime must reject those pairings
 before starting the library, rather than relying on the policy to suppress
 startup repair.
+The separate [owned storage-pair preflight](experimental-replica-preparation.md)
+now rejects those inputs, validates applied fingerprints/membership/votes, and
+retains private storage-owner retirement/join tokens. It still starts no node
+or network.
 
 ## Verification
 
