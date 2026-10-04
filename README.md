@@ -111,6 +111,9 @@ Both storage backends also provide opt-in [bounded complete reads](docs/bounded-
 for future state-image validation. These reads enforce row and logical data-byte
 limits without changing ordinary reads, replica write authority, or disk formats;
 they do not implement snapshot export, installation, or history compaction.
+The pure [committed image container](docs/committed-image-container.md) adds
+bounded canonical framing, borrowed decoding, and integrity checks. Its declared
+role is not business-record validation or permission to install an image.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
