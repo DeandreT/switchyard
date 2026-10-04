@@ -42,6 +42,9 @@ Locked by the consumer's next fetch; its precise token and index are checked.
 The fixture drops the store, reopens Fjall, and repeats the record checks with
 an unchanged snapshot. This is message persistence, not transaction-log
 recovery or a graceful-shutdown guarantee.
+The gate also preserves [bounded SDK diagnostic evidence](atomic-sdk-evidence.md)
+and runs no-network observer self-tests before starting either backend. These
+checks do not change settlement, retry, or timeout behavior.
 
 ## Authorization And Warmup
 
@@ -90,8 +93,8 @@ It does not retry an uncertain commit.
 ## Running The Gate
 
 The opt-in gate requires Linux, .NET 8, NuGet access or a populated package
-cache, and the repository's pinned Rust toolchain. It builds each SDK pin once
-and runs its two storage backends sequentially:
+cache, and the repository's pinned Rust toolchain. It builds each SDK pin once,
+runs its diagnostic self-tests, and runs its two storage backends sequentially:
 
 ```sh
 CARGO_BUILD_JOBS=2 DOTNET_PROCESSOR_COUNT=2 cargo test -p server \

@@ -210,7 +210,9 @@ The process exposes it only through the separate, development-only
 listeners retain their previous policies.
 Both pinned .NET clients have an opt-in [transaction-scope gate](docs/dotnet-transaction-scopes.md)
 for warmed and cold-first same-queue immediate send, plus held Complete over TLS
-on that address, with memory and Fjall coverage. Its fixed
+on that address, with memory and Fjall coverage. Its
+[bounded diagnostics and observer self-tests](docs/atomic-sdk-evidence.md)
+preserve failure context without changing retry or timeout policy. Its fixed
 [initial control window](docs/initial-transaction-authorization.md) admits bounded
 declaration and rollback before the first grant, never queue access or commit.
 Cold-first support is Send only; transactional acquisition, experimental
