@@ -9,8 +9,9 @@ installs records, or purges history.
 The role is a **declaration, not business-record certification**. Unknown
 business tags and malformed business values can be structurally packaged.
 Queue topology, counters, message state, indexes, lifetime, duplicate history,
-and active value schemas still require a separate whole-image validator before
-any install path can accept them. A valid checksum proves neither commitment
+and active value schemas require the separate
+[whole-image validator](committed-image-validation.md). Neither check enables an
+install path. A valid checksum proves neither commitment
 nor authentication, source health, ancestry, anti-rollback safety, or durability.
 
 ## Canonical Framing

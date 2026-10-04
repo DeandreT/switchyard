@@ -114,6 +114,9 @@ they do not implement snapshot export, installation, or history compaction.
 The pure [committed image container](docs/committed-image-container.md) adds
 bounded canonical framing, borrowed decoding, and integrity checks. Its declared
 role is not business-record validation or permission to install an image.
+The separate [whole-image validator](docs/committed-image-validation.md) checks
+current CreateSend record and index consistency while preserving borrowed bodies.
+It does not certify source history, membership, or installation authority.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
