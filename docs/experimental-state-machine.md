@@ -109,7 +109,23 @@ Snapshot building, receiving, and installation explicitly return unsupported
 storage errors without writing state. They do not create an empty or
 metadata-only snapshot of queue data. A healthy `get_current_snapshot` returns
 `None` after an owner health/recovery query; a poisoned adapter returns an error.
-The `Cursor<Vec<u8>>` associated type is not a snapshot implementation.
+The associated data type is `cluster::BoundedSnapshotData`, not a snapshot
+implementation. It supports asynchronous reads, writes, and seeks with a fixed
+64 MiB logical length and position limit. Invalid seeks and complete oversized
+write calls fail without changing prior bytes or position; capacity reservation
+is fallible and precedes copying or zero-filling sparse gaps. Seeking alone and
+empty writes do not allocate a sparse gap.
+
+Construction copies a bounded byte slice without adopting caller spare
+capacity. Immutable byte access exposes no mutable inner buffer; the type is
+not Clone and its diagnostics omit contents. Flush and shutdown are in-memory
+no-ops, and reads remain available afterward. Unpolled I/O futures are inert;
+polled operations finish immediately without an independently running worker.
+
+This is a per-buffer logical bound, not an aggregate or process-memory bound.
+It supplies no domain-image validation, durability, authorization, admission
+budget, or guarantee that a complete state image will fit. Snapshot methods,
+transport, compaction, startup, and on-disk schemas remain unchanged.
 
 A later no-snapshot runtime must use `SnapshotPolicy::Never`, reject purged
 history without snapshots and applied-state-ahead-of-log pairings before
@@ -150,3 +166,14 @@ Ten repeated cluster runs passed, totaling 1,620 test executions. Both workspace
 feature configurations passed 3,659 tests, and all ten serial official-client
 checks passed. Formatting, both lint configurations, both builds, and protobuf
 validation also passed with builds restricted to two cores.
+
+The subsequent bounded-data checkpoint passed 18 focused buffer cases and its
+new compile-fail mutable-access check. The complete all-feature cluster suite
+passed 408 tests, and the default workspace passed 3,913 tests with ten opt-in
+SDK tests ignored. Both strict workspace lint configurations, both workspace
+builds, formatting, protocol descriptor validation, and whitespace checks
+passed with the same two-core build limit. Buffer cases exercise real-limit
+refusal without large allocation, checked arithmetic and capacity overflow,
+atomic rejected writes/seeks, sparse and vectored I/O, cursor-style shutdown,
+unpolled futures, and content-redacted diagnostics. They prove no storage or
+installation authority.
