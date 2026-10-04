@@ -42,3 +42,5 @@ mod limits;
 mod origins;
 #[path = "committed_apply/replay.rs"]
 mod replay;
+#[path = "committed_apply/validated_image.rs"]
+mod validated_image;

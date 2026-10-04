@@ -10,6 +10,9 @@ use storage::StoreSnapshot;
 
 use super::{CommittedCheckpoint, CommittedStreamId, MAX_COMMITTED_ENTRY_BYTES, decode_checkpoint};
 
+mod validated;
+pub use validated::{CommittedImageValidationError, ValidatedCreateSendImage};
+
 #[cfg(test)]
 mod tests;
 
@@ -34,8 +37,8 @@ const CHECKPOINT_KEY: &[u8] = &[0x12];
 /// The declared role carried by an image container.
 ///
 /// This declaration does not certify the included business rows. Unknown tags
-/// and malformed business records can be structurally packaged. A later full
-/// semantic validator must refuse them before any installation is possible.
+/// and malformed business records can be structurally packaged. Separate
+/// semantic validation must refuse them before any installation is possible.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommittedImageRole {
     CreateSendV1,

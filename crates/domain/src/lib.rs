@@ -43,12 +43,12 @@ pub use command::{
 pub use committed::{
     CommittedApplication, CommittedApplyError, CommittedApplyResult, CommittedCheckpoint,
     CommittedCheckpointUpdate, CommittedEntryId, CommittedEntryMark, CommittedImageError,
-    CommittedImageRole, CommittedImageRow, CommittedImageRows, CommittedMembership,
-    CommittedQueueCommand, CommittedQueueWork, CommittedSend, CommittedStreamId,
-    DecodedCommittedImage, EncodedCommittedImage, MAX_COMMITTED_BODY_BYTES,
+    CommittedImageRole, CommittedImageRow, CommittedImageRows, CommittedImageValidationError,
+    CommittedMembership, CommittedQueueCommand, CommittedQueueWork, CommittedSend,
+    CommittedStreamId, DecodedCommittedImage, EncodedCommittedImage, MAX_COMMITTED_BODY_BYTES,
     MAX_COMMITTED_CHECKPOINT_BYTES, MAX_COMMITTED_ENTRY_BYTES, MAX_COMMITTED_IMAGE_BYTES,
     MAX_COMMITTED_IMAGE_KEY_BYTES, MAX_COMMITTED_IMAGE_ROWS, MAX_COMMITTED_IMAGE_VALUE_BYTES,
-    MAX_COMMITTED_MEMBERSHIP_BYTES,
+    MAX_COMMITTED_MEMBERSHIP_BYTES, ValidatedCreateSendImage,
 };
 pub use entity_binding::{EntityBinding, EntityIncarnation, EntityIncarnationKind, FencedCommand};
 pub use error::BrokerError;

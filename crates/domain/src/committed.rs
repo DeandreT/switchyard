@@ -21,8 +21,9 @@ pub(crate) use checkpoint::{decode_checkpoint, encode_checkpoint};
 pub(crate) use fingerprint::entry_fingerprint;
 pub use image::{
     CommittedImageError, CommittedImageRole, CommittedImageRow, CommittedImageRows,
-    DecodedCommittedImage, EncodedCommittedImage, MAX_COMMITTED_IMAGE_BYTES,
-    MAX_COMMITTED_IMAGE_KEY_BYTES, MAX_COMMITTED_IMAGE_ROWS, MAX_COMMITTED_IMAGE_VALUE_BYTES,
+    CommittedImageValidationError, DecodedCommittedImage, EncodedCommittedImage,
+    MAX_COMMITTED_IMAGE_BYTES, MAX_COMMITTED_IMAGE_KEY_BYTES, MAX_COMMITTED_IMAGE_ROWS,
+    MAX_COMMITTED_IMAGE_VALUE_BYTES, ValidatedCreateSendImage,
 };
 
 pub const MAX_COMMITTED_BODY_BYTES: usize = 256 * 1024;

@@ -5,7 +5,7 @@ use domain::{
     MAX_COMMITTED_BODY_BYTES, MAX_COMMITTED_IMAGE_BYTES, MAX_COMMITTED_IMAGE_KEY_BYTES,
     MAX_COMMITTED_IMAGE_ROWS, MAX_COMMITTED_IMAGE_VALUE_BYTES, MAX_MESSAGE_ID_LENGTH,
     MAX_SESSION_ID_BYTES, MessageState, QueueConfig, QueueCounters, SequenceNumber, SessionId,
-    StateMachine, Timestamp, codec, keys,
+    StateMachine, Timestamp, ValidatedCreateSendImage, codec, keys,
 };
 use storage::{
     BoundedStateStore, CommittedStore, FjallReplicaStore, ReadLimits, StateStore, StorageError,
@@ -330,6 +330,9 @@ fn encode_exact<R: BoundedStateStore>(
                 encoded.as_bytes()[value_offset..].as_ptr()
             ));
         }
+        let validated = ValidatedCreateSendImage::validate(decoded)?;
+        assert_eq!(validated.checkpoint(), checkpoint);
+        assert_eq!(validated.rows().count(), source.entries().len());
     }
     assert!(encoded.len() <= MAX_COMMITTED_IMAGE_BYTES);
     assert_eq!(bounded(reader)?, source);
