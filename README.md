@@ -117,6 +117,9 @@ role is not business-record validation or permission to install an image.
 The separate [whole-image validator](docs/committed-image-validation.md) checks
 current CreateSend record and index consistency while preserving borrowed bodies.
 It does not certify source history, membership, or installation authority.
+The opt-in [bounded domain exporter](docs/committed-image-export.md) captures one
+complete stable view and validates its exact bytes. It has no unbounded fallback
+and does not enable native-owner or runtime snapshots.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing

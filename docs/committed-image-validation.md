@@ -99,6 +99,8 @@ and encoded bytes.
 No fully populated 65,536-row or 64 MiB semantic fixture, allocator/RSS
 instrumentation, source export, physical installation, durable snapshot metadata,
 or automatic history purge is established by this increment.
+The separate [bounded domain exporter](committed-image-export.md) applies these
+checks to one captured view; it does not add installation authority.
 
 The validator checkpoint passed 37 focused checks, including the compile-fail
 contract and actual Fjall reopen. The all-feature domain suite passed 1,184
