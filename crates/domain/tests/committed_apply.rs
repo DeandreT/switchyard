@@ -28,6 +28,8 @@ macro_rules! for_each_backend {
 mod atomicity;
 #[path = "committed_apply/bootstrap.rs"]
 mod bootstrap;
+#[path = "committed_apply/catalog.rs"]
+mod catalog;
 #[path = "committed_apply/corruption.rs"]
 mod corruption;
 #[path = "committed_apply/crash.rs"]

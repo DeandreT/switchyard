@@ -59,7 +59,8 @@ pub use identifier::{
     SessionId, SubscriptionName,
 };
 pub use machine::committed_apply::{
-    CommittedImageBootstrapError, CommittedImageExportError, CommittedStateMachine,
+    CommittedCatalogError, CommittedImageBootstrapError, CommittedImageExportError,
+    CommittedStateMachine, PreparedCreateSendCatalog, RetainedCreateSendCatalog,
     TrustedCreateSendBootstrap,
 };
 pub use machine::{
