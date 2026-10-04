@@ -15,6 +15,9 @@ use crate::{
     StorageError, StoreSnapshot, Value, WriteBatch, replica::ReplicaReader,
 };
 
+mod catalog;
+pub use catalog::{MemoryCatalogReader, MemoryCatalogReplicaStore};
+
 /// Cloning shares one keyspace, so every clone reads what any other wrote.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryStore {

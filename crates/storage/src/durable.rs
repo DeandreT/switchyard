@@ -18,6 +18,9 @@ use crate::{
     StoreSnapshot, Value, WriteBatch,
 };
 
+mod catalog;
+pub use catalog::{FjallCatalogReader, FjallCatalogReplicaStore};
+
 mod replica;
 pub use replica::FjallReplicaStore;
 
@@ -93,6 +96,12 @@ pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V14;
 /// changes advance both formats; replica header changes also require an
 /// explicit profile-version change.
 pub const ACTIVE_REPLICA_STORE_FORMAT: u32 = 0x8000_0000 | ACTIVE_STORE_FORMAT;
+
+/// An explicitly opted-in replica catalog namespace, disjoint from standalone
+/// and ordinary replicas. Record-layout changes advance this format too; catalog
+/// profile changes additionally require an explicit profile-version change.
+/// Existing constructors and directories are not upgraded or adopted.
+pub const ACTIVE_CATALOG_REPLICA_STORE_FORMAT: u32 = 0xc000_0000 | ACTIVE_STORE_FORMAT;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";

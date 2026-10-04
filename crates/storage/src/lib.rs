@@ -12,6 +12,7 @@
 #[cfg(test)]
 mod batch_reservation_tests;
 mod bounded;
+mod catalog;
 mod durable;
 mod memory;
 mod replica;
@@ -20,15 +21,21 @@ use thiserror::Error;
 
 pub(crate) use bounded::ReadBudget;
 pub use bounded::{BoundedStateStore, ReadLimits};
+pub use catalog::{
+    CatalogBoundsError, CatalogCommittedStore, CatalogReadError, MAX_CATALOG_ARTIFACT_BYTES,
+    MAX_CATALOG_METADATA_BYTES, SnapshotCatalogReader, SnapshotCatalogRecord,
+    StoredSnapshotCatalog,
+};
 
 pub use crate::{
     durable::{
-        ACTIVE_REPLICA_STORE_FORMAT, ACTIVE_STORE_FORMAT, FjallReplicaStore, FjallStore,
+        ACTIVE_CATALOG_REPLICA_STORE_FORMAT, ACTIVE_REPLICA_STORE_FORMAT, ACTIVE_STORE_FORMAT,
+        FjallCatalogReader, FjallCatalogReplicaStore, FjallReplicaStore, FjallStore,
         STORE_FORMAT_V1, STORE_FORMAT_V2, STORE_FORMAT_V3, STORE_FORMAT_V4, STORE_FORMAT_V5,
         STORE_FORMAT_V6, STORE_FORMAT_V7, STORE_FORMAT_V8, STORE_FORMAT_V9, STORE_FORMAT_V10,
         STORE_FORMAT_V11, STORE_FORMAT_V12, STORE_FORMAT_V13, STORE_FORMAT_V14,
     },
-    memory::{MemoryReplicaStore, MemoryStore},
+    memory::{MemoryCatalogReader, MemoryCatalogReplicaStore, MemoryReplicaStore, MemoryStore},
 };
 
 pub type Key = Vec<u8>;
