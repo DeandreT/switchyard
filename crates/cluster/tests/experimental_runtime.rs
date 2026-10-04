@@ -33,6 +33,8 @@ macro_rules! for_each_backend {
 
 #[path = "experimental_runtime/client.rs"]
 mod client;
+#[path = "experimental_runtime/failover.rs"]
+mod failover;
 #[path = "experimental_runtime/fixture.rs"]
 mod fixture;
 #[path = "experimental_runtime/quorum.rs"]

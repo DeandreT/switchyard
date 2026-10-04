@@ -8,6 +8,7 @@ use crate::ExperimentalReplicaStores;
 use super::{
     Error,
     client::ExperimentalRaftHandle,
+    continuity::EvidenceSlot,
     network::{NodeGeneration, PendingEndpoint},
 };
 
@@ -33,6 +34,7 @@ pub(super) struct Node {
     admin: mpsc::Sender<AdminRequest>,
     stop: StopSignal,
     completed: watch::Receiver<Option<Result<(), Error>>>,
+    evidence: EvidenceSlot,
 }
 
 impl Node {
@@ -105,7 +107,7 @@ impl Node {
 
     pub(super) fn retire(self) -> NodeRetirement {
         self.request_stop();
-        NodeRetirement::new(self.completed.clone())
+        NodeRetirement::with_evidence(self.completed.clone(), self.evidence.clone())
     }
 
     #[cfg(test)]

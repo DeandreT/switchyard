@@ -157,6 +157,31 @@ pub(super) struct Control<W: CommittedStore> {
     changed: Arc<Notify>,
 }
 
+struct CheckpointObserver<W: CommittedStore> {
+    shared: Arc<Mutex<Shared<W>>>,
+    reader: W::Reader,
+}
+
+impl<W: CommittedStore> CommittedStore for CheckpointObserver<W> {
+    type Reader = W::Reader;
+
+    fn reader(&self) -> Self::Reader {
+        self.reader.clone()
+    }
+
+    fn commit(&mut self, _batch: WriteBatch) -> Result<(), StorageError> {
+        Err(StorageError::ReplicaWriteRequired)
+    }
+
+    fn is_initialized(&self) -> Result<bool, StorageError> {
+        self.shared
+            .lock()
+            .map_err(|_| StorageError::LockPoisoned)?
+            .writer
+            .is_initialized()
+    }
+}
+
 fn observed<W: CommittedStore>(writer: W) -> (ObservedWriter<W>, Control<W>) {
     let reader = writer.reader();
     let shared = Arc::new(Mutex::new(Shared { writer, gate: None }));
@@ -220,6 +245,16 @@ impl<W: CommittedStore> CommittedStore for ObservedWriter<W> {
 impl<W: CommittedStore> Control<W> {
     pub(super) fn reader(&self) -> W::Reader {
         self.reader.clone()
+    }
+    pub(super) fn applied_position(&self) -> TestResult<Option<domain::CommittedEntryId>> {
+        let machine = domain::CommittedStateMachine::open(
+            CheckpointObserver {
+                shared: self.shared.clone(),
+                reader: self.reader(),
+            },
+            stream()?,
+        )?;
+        Ok(machine.checkpoint()?.last().map(|mark| mark.id))
     }
     pub(super) fn gate_log_append(&self) -> Gate {
         self.gate(Match::Prefix(0x10))

@@ -1,21 +1,23 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use domain::{CommittedCheckpoint, CommittedStreamId};
 use openraft::{BasicNode, Raft, error::Fatal};
 use tokio::{
     runtime::Handle,
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 
 use crate::{
     ExperimentalReplicaStores, LogStorageError, LogTypes, ReadOnlyLogReader, StateMachineError,
-    experimental_owner::RetiredOwner, experimental_replica::RuntimeParts,
-    experimental_state_machine::HealthyCheckpointReader,
+    experimental_log::FinalLogReport, experimental_owner::RetiredOwner,
+    experimental_replica::RuntimeParts, experimental_state_machine::HealthyCheckpointReader,
 };
 
 use super::super::{
     Error,
     client::{self, ClientOwner, ExperimentalRaftHandle},
+    continuity::{EvidenceSlot, RetirementEvidence},
     network::{EndpointOwner, PendingEndpoint},
 };
 use super::{AdminRequest, Node, NodeStopCause, StopSignal};
@@ -23,16 +25,41 @@ use super::{AdminRequest, Node, NodeStopCause, StopSignal};
 struct Owners {
     log: RetiredOwner<LogStorageError>,
     state: RetiredOwner<StateMachineError>,
+    log_report: oneshot::Receiver<Result<FinalLogReport, LogStorageError>>,
+    state_report: oneshot::Receiver<Result<CommittedCheckpoint, StateMachineError>>,
+    node_id: u64,
+    stream: CommittedStreamId,
+}
+
+struct JoinedOwners {
+    joined: bool,
+    evidence: Result<Arc<RetirementEvidence>, Error>,
 }
 
 impl Owners {
-    async fn join(self) -> Result<(), Error> {
+    async fn join(mut self) -> JoinedOwners {
         let (log, state) = tokio::join!(self.log.join(), self.state.join());
-        if log.is_err() || state.is_err() {
-            Err(Error::OwnerFailure)
+        let joined = log.is_ok() && state.is_ok();
+        // A report may precede writer Drop. Only real joins authorize reading
+        // it, and missing publication is failure rather than an endless wait.
+        let evidence = if joined {
+            (|| {
+                let log = self
+                    .log_report
+                    .try_recv()
+                    .map_err(|_| Error::OwnerFailure)?
+                    .map_err(|_| Error::OwnerFailure)?;
+                let checkpoint = self
+                    .state_report
+                    .try_recv()
+                    .map_err(|_| Error::OwnerFailure)?
+                    .map_err(|_| Error::OwnerFailure)?;
+                RetirementEvidence::checked(self.node_id, self.stream, log, checkpoint)
+            })()
         } else {
-            Ok(())
-        }
+            Err(Error::OwnerFailure)
+        };
+        JoinedOwners { joined, evidence }
     }
 }
 
@@ -48,6 +75,8 @@ struct Parts {
     admin: Option<JoinHandle<()>>,
     stop: StopSignal,
     failure: Option<Error>,
+    published: bool,
+    evidence: EvidenceSlot,
 }
 
 struct OwnedLifecycle {
@@ -94,12 +123,22 @@ pub(super) async fn start(
         state,
         log_join,
         state_join,
+        log_report,
+        state_report,
         progress,
         config,
-    } = prepared.into_raft_parts().map_err(|_| Error::Closed)?;
+    } = prepared
+        .into_raft_parts()
+        .await
+        .map_err(|error| match error {
+            crate::ReplicaPreparationError::OwnerFailure => Error::OwnerFailure,
+            crate::ReplicaPreparationError::Closed => Error::Closed,
+            _ => Error::Storage,
+        })?;
     let stop = StopSignal::new();
     let checkpoint = state.checkpoint_reader();
     let log_reader = log.log_reader();
+    let evidence = EvidenceSlot::default();
     let mut lifecycle = OwnedLifecycle {
         parts: Some(Parts {
             starting: None,
@@ -112,10 +151,16 @@ pub(super) async fn start(
             owners: Owners {
                 log: log_join,
                 state: state_join,
+                log_report,
+                state_report,
+                node_id: progress.node_id(),
+                stream: progress.stream(),
             },
             admin: None,
             stop: stop.clone(),
             failure: None,
+            published: false,
+            evidence: evidence.clone(),
         }),
         runtime: runtime.clone(),
         completed: Some(finished),
@@ -184,6 +229,7 @@ pub(super) async fn start(
     lifecycle.parts().client = Some(client.clone());
     lifecycle.parts().client_owner = Some(client_owner);
     let (admin, incoming) = mpsc::channel(1);
+    lifecycle.parts().published = true;
     let node = Node {
         client,
         generation,
@@ -191,6 +237,7 @@ pub(super) async fn start(
         admin,
         stop,
         completed,
+        evidence,
     };
     let initialized = progress.membership().log_id().is_some();
     drop(runtime.spawn(run(lifecycle, incoming, members, initialized, metrics)));
@@ -340,7 +387,7 @@ async fn retire(
     if let Some(exit) = client_exit {
         exit.finish();
     }
-    let result = if owners.is_err() {
+    let result = if !owners.joined || (parts.published && owners.evidence.is_err()) {
         Err(Error::OwnerFailure)
     } else if let Some(error) = parts.failure {
         Err(error)
@@ -353,6 +400,15 @@ async fn retire(
     } else {
         Ok(())
     };
+    let result = result.and_then(|()| {
+        if parts.published {
+            parts.evidence.publish(owners.evidence?)
+        } else {
+            // An unpublished startup may have poisoned an owner. Its report
+            // cannot become a restart floor, but both real joins still count.
+            Ok(())
+        }
+    });
     let _ = completed.send(Some(result));
     result
 }

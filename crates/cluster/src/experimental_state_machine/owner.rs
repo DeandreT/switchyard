@@ -1,6 +1,6 @@
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -32,6 +32,15 @@ pub(super) enum Reply {
 
 type Response = Result<Reply, StateMachineError>;
 type PublishedResponse = (Response, oneshot::Receiver<()>);
+type RetirementReport = Result<CommittedCheckpoint, StateMachineError>;
+
+#[derive(Default)]
+enum ReportState {
+    #[default]
+    Unarmed,
+    Armed(oneshot::Sender<RetirementReport>),
+    Finished,
+}
 
 pub(super) struct Packet {
     operation: Option<Operation>,
@@ -80,6 +89,7 @@ impl Drop for Packet {
 pub(super) struct Handle {
     sender: Sender<Packet>,
     admission: Arc<Admission>,
+    report: Arc<Mutex<ReportState>>,
 }
 
 impl Handle {
@@ -89,11 +99,35 @@ impl Handle {
         let (sender, receiver) = flume::bounded(MAX_STATE_MACHINE_OWNER_JOBS);
         let admission = Arc::new(Admission::default());
         let owner_admission = Arc::clone(&admission);
+        let report = Arc::new(Mutex::new(ReportState::default()));
+        let owner_report = Arc::clone(&report);
         let thread = thread::Builder::new()
             .name("switchyard-committed-owner".into())
-            .spawn(move || run(state, receiver, owner_admission))
+            .spawn(move || run(state, receiver, owner_admission, owner_report))
             .map_err(|_| StateMachineError::ThreadStart)?;
-        Ok((Self { sender, admission }, thread))
+        Ok((
+            Self {
+                sender,
+                admission,
+                report,
+            },
+            thread,
+        ))
+    }
+
+    pub(super) fn enable_retirement_report(
+        &self,
+    ) -> Result<oneshot::Receiver<RetirementReport>, StateMachineError> {
+        let mut report = self
+            .report
+            .lock()
+            .map_err(|_| StateMachineError::Panicked)?;
+        if !matches!(*report, ReportState::Unarmed) || self.admission.is_closed() {
+            return Err(StateMachineError::Closed);
+        }
+        let (sender, receiver) = oneshot::channel();
+        *report = ReportState::Armed(sender);
+        Ok(receiver)
     }
 
     pub(super) async fn request(&self, operation: Operation) -> Response {
@@ -124,6 +158,7 @@ fn run<W: CommittedStore>(
     mut state: StoreState<W>,
     receiver: Receiver<Packet>,
     admission: Arc<Admission>,
+    report: Arc<Mutex<ReportState>>,
 ) -> Result<(), StateMachineError> {
     let result = catch_unwind(AssertUnwindSafe(|| {
         loop {
@@ -153,8 +188,35 @@ fn run<W: CommittedStore>(
         for packet in receiver.try_iter() {
             packet.finish(Err(StateMachineError::Panicked));
         }
+        if let Some(report) = take_report(&report) {
+            publish_report(report, Err(StateMachineError::Panicked));
+        }
         return Err(StateMachineError::Panicked);
     }
     admission.close(StateMachineError::Closed);
+    if let Some(report) = take_report(&report) {
+        // Continuity failure is not a failure to drain and join the owner.
+        let checkpoint = catch_unwind(AssertUnwindSafe(|| state.checkpoint()))
+            .unwrap_or(Err(StateMachineError::Panicked));
+        publish_report(report, checkpoint);
+    }
     Ok(())
 }
+
+fn publish_report(report: oneshot::Sender<RetirementReport>, checkpoint: RetirementReport) {
+    // A diagnostic waiter's wake can panic without changing native join status.
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let _ = report.send(checkpoint);
+    }));
+}
+
+fn take_report(report: &Mutex<ReportState>) -> Option<oneshot::Sender<RetirementReport>> {
+    let mut report = report.lock().ok()?;
+    match std::mem::replace(&mut *report, ReportState::Finished) {
+        ReportState::Armed(sender) => Some(sender),
+        ReportState::Unarmed | ReportState::Finished => None,
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests;

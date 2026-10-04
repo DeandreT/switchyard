@@ -121,9 +121,9 @@ impl ExperimentalReplicaStores {
             .adapters()
     }
 
-    pub(crate) fn into_raft_parts(mut self) -> Result<RuntimeParts, ReplicaPreparationError> {
+    pub(crate) async fn into_raft_parts(mut self) -> Result<RuntimeParts, ReplicaPreparationError> {
         let stores = self.stores.take().ok_or(ReplicaPreparationError::Closed)?;
-        stores.into_raft_parts(self.progress, self.config)
+        stores.into_raft_parts(self.progress, self.config).await
     }
 
     /// Validate an owned pair without applying, purging, or repairing history.

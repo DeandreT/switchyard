@@ -15,6 +15,7 @@ use super::{
     MAX_LOG_OWNER_JOBS,
     budget::{Admission, Lease},
     io_error,
+    retirement::ReportSink,
     state::{OwnedLogRange, StoreState},
     types::EncodedAppend,
 };
@@ -22,9 +23,14 @@ use super::{
 pub(super) enum Operation {
     Append(EncodedAppend),
     ReadFull(OwnedLogRange),
-    ReadLimited { start: u64, end: u64 },
+    ReadLimited {
+        start: u64,
+        end: u64,
+    },
     Profile,
     Retention,
+    #[cfg(test)]
+    RetirementReport,
     LogState,
     SaveVote(LogVote),
     ReadVote,
@@ -37,6 +43,8 @@ pub(super) enum Reply {
     Entries(Vec<LogEntry>),
     Profile(LogProfile),
     Retention(LogRetention),
+    #[cfg(test)]
+    RetirementReport(Box<super::FinalLogReport>),
     LogState(LogState<LogTypes>),
     Vote(Option<LogVote>),
 }
@@ -102,6 +110,7 @@ impl Drop for Packet {
 pub(super) struct Handle {
     sender: Sender<Packet>,
     admission: Arc<Admission>,
+    reports: Arc<ReportSink>,
 }
 
 impl Handle {
@@ -110,12 +119,21 @@ impl Handle {
     ) -> Result<(Self, JoinHandle<Result<(), LogStorageError>>), LogStorageError> {
         let (sender, receiver) = flume::bounded(MAX_LOG_OWNER_JOBS);
         let admission = Arc::new(Admission::default());
+        let reports = Arc::new(ReportSink::default());
         let owner_admission = Arc::clone(&admission);
+        let owner_reports = Arc::clone(&reports);
         let thread = thread::Builder::new()
             .name("switchyard-log-owner".into())
-            .spawn(move || run(state, receiver, owner_admission))
+            .spawn(move || run(state, receiver, owner_admission, owner_reports))
             .map_err(|_| LogStorageError::ThreadStart)?;
-        Ok((Self { sender, admission }, thread))
+        Ok((
+            Self {
+                sender,
+                admission,
+                reports,
+            },
+            thread,
+        ))
     }
 
     pub(super) async fn request(
@@ -143,6 +161,16 @@ impl Handle {
         self.admission.close(LogStorageError::Closed);
     }
 
+    pub(super) fn enable_retirement_report(
+        &self,
+    ) -> Result<oneshot::Receiver<Result<super::FinalLogReport, LogStorageError>>, LogStorageError>
+    {
+        if self.admission.is_closed() {
+            return Err(LogStorageError::Closed);
+        }
+        self.reports.enable()
+    }
+
     pub(super) fn workload(&self) -> Result<LogWorkload, LogStorageError> {
         self.admission.workload()
     }
@@ -152,6 +180,7 @@ fn run<W: CommittedStore>(
     mut state: StoreState<W>,
     receiver: Receiver<Packet>,
     admission: Arc<Admission>,
+    reports: Arc<ReportSink>,
 ) -> Result<(), LogStorageError> {
     let result = catch_unwind(AssertUnwindSafe(|| {
         loop {
@@ -175,9 +204,11 @@ fn run<W: CommittedStore>(
         for packet in receiver.try_iter() {
             packet.finish(Err(LogStorageError::Panicked));
         }
+        reports.finish(|| Err(LogStorageError::Panicked));
         return Err(LogStorageError::Panicked);
     }
     admission.close(LogStorageError::Closed);
+    reports.finish(|| state.retirement_report());
     Ok(())
 }
 
@@ -188,6 +219,12 @@ fn execute<W: CommittedStore>(state: &mut StoreState<W>, operation: Operation) -
         Operation::ReadLimited { start, end } => state.read_limited(start, end).map(Reply::Entries),
         Operation::Profile => state.profile().map(Reply::Profile),
         Operation::Retention => state.retention().map(Reply::Retention),
+        #[cfg(test)]
+        Operation::RetirementReport => {
+            return state
+                .retirement_report()
+                .map(|report| Reply::RetirementReport(Box::new(report)));
+        }
         Operation::LogState => state.log_state().map(Reply::LogState),
         Operation::SaveVote(vote) => state.save_vote(vote).map(|()| Reply::Done),
         Operation::ReadVote => state.read_vote().map(Reply::Vote),

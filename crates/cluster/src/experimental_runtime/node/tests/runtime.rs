@@ -11,7 +11,7 @@ use crate::experimental_runtime::{
     Error,
     client::{QueueIntent, QueueWriteError, QueueWriteRejection},
     network::{Routes, stable_label},
-    node::{Node, wait_completed},
+    node::{Node, NodeRetirement, wait_completed},
 };
 use crate::{ExperimentalLogStore, ExperimentalStateMachine, LogProfile, LogTypes};
 
@@ -24,6 +24,7 @@ async fn worker_drain<W: CommittedStore>(
 ) -> TestResult<(StoreSnapshot, StoreSnapshot)> {
     let (node, routes, log_control, state_control) = node(log, state).await?;
     let client_handle = node.client();
+    let notice = NodeRetirement::with_evidence(node.completed.clone(), node.evidence.clone());
     let mut finished = node.completed.clone();
     let gate = state_control.gate_commit();
     let source = routes.begin_node(7)?;
@@ -69,6 +70,8 @@ async fn worker_drain<W: CommittedStore>(
     assert!(!state_control.retired());
     let mut shutdown = Box::pin(node.shutdown());
     pending(shutdown.as_mut()).await?;
+    log_control.wait_retired().await?;
+    assert_eq!(notice.joined_evidence().err(), Some(Error::Closed));
     assert!(!state_control.retired());
     pending(shutdown.as_mut()).await?;
     if cancel_waiter {
@@ -83,6 +86,27 @@ async fn worker_drain<W: CommittedStore>(
     assert!(state_control.retired());
     log_control.wait_retired().await?;
     state_control.wait_retired().await?;
+    notice.clone().join().await?;
+    let evidence = notice.joined_evidence()?;
+    assert_eq!(evidence.log.profile().node_id(), FOLLOWER);
+    assert_eq!(evidence.log.profile().stream(), stream()?);
+    assert_eq!(evidence.log.retention().last_present, Some(id(3)));
+    assert_eq!(
+        evidence.checkpoint.last().map(|mark| mark.id),
+        Some(domain::CommittedEntryId {
+            term: 1,
+            node_id: 7,
+            index: 3,
+        })
+    );
+    assert_eq!(
+        evidence.checkpoint.highest_timestamp(),
+        domain::Timestamp::from_millis(3)
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        &evidence,
+        &notice.joined_evidence()?
+    ));
     assert_eq!(client_handle.workload().accepted_jobs, 0);
     assert_eq!(client_handle.workload().encoded_bytes, 0);
     let intent = QueueIntent::create_queue(
@@ -228,6 +252,41 @@ async fn reopen_failed_start(
     Ok(())
 }
 
+async fn failed_final_checkpoint<W: CommittedStore>(log: W, state: W) -> TestResult {
+    let (node, routes, log_control, state_control) = node(log, state).await?;
+    let before = (log_control.snapshot()?, state_control.snapshot()?);
+    let notice = NodeRetirement::with_evidence(node.completed.clone(), node.evidence.clone());
+    state_control.fail_read();
+    assert_eq!(
+        tokio::time::timeout(DEADLINE, node.shutdown()).await?,
+        Err(Error::OwnerFailure)
+    );
+    assert!(!state_control.read_fault_pending());
+    assert!(log_control.retired());
+    assert!(state_control.retired());
+    assert_eq!(notice.joined_evidence().err(), Some(Error::OwnerFailure));
+    assert_eq!(log_control.snapshot()?, before.0);
+    assert_eq!(state_control.snapshot()?, before.1);
+    drop(routes);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_published_node_requires_a_healthy_final_checkpoint_after_actual_joins() -> TestResult {
+    failed_final_checkpoint(MemoryReplicaStore::new(), MemoryReplicaStore::new()).await
+}
+
+#[tokio::test]
+async fn a_published_durable_node_cannot_launder_a_final_checkpoint_read_failure() -> TestResult {
+    let log = DurableProvider::temporary()?;
+    let state = DurableProvider::temporary()?;
+    failed_final_checkpoint(
+        FjallReplicaStore::open(log.path())?,
+        FjallReplicaStore::open(state.path())?,
+    )
+    .await
+}
+
 #[tokio::test]
 async fn failed_real_new_joins_both_owners_without_publishing_an_endpoint() -> TestResult {
     failed_start(MemoryReplicaStore::new(), MemoryReplicaStore::new(), false).await?;
@@ -273,6 +332,7 @@ async fn core_fatal<W: CommittedStore>(
     let (node, routes, log_control, state_control) = node(log, state).await?;
     let before = state_control.snapshot()?;
     let mut completed = node.completed.clone();
+    let notice = NodeRetirement::with_evidence(node.completed.clone(), node.evidence.clone());
     let generation = node.generation.clone();
     state_control.panic_commit();
     let source = routes.begin_node(7)?;
@@ -297,6 +357,7 @@ async fn core_fatal<W: CommittedStore>(
         tokio::time::timeout(DEADLINE, wait_completed(&mut completed)).await?,
         Err(Error::OwnerFailure)
     );
+    assert_eq!(notice.joined_evidence().err(), Some(Error::OwnerFailure));
     assert!(!generation.is_live());
     assert!(log_control.retired());
     assert!(state_control.retired());

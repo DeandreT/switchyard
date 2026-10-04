@@ -9,6 +9,7 @@ use std::{
 use tokio::sync::watch;
 
 use super::{Error, NodeRetirement};
+use crate::experimental_runtime::continuity::EvidenceSlot;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -77,6 +78,29 @@ async fn a_lost_completion_publisher_is_not_reported_as_joined() -> TestResult {
         tokio::time::timeout(DEADLINE, joined).await?,
         Err(Error::TaskFailed)
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn successful_completion_without_healthy_evidence_is_not_a_restart_floor() -> TestResult {
+    let (_finished, completed) = watch::channel(Some(Ok(())));
+    let notice = NodeRetirement::with_evidence(completed, EvidenceSlot::default());
+    assert_eq!(notice.joined_evidence().err(), Some(Error::OwnerFailure));
+    assert_eq!(notice.join().await, Err(Error::OwnerFailure));
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_completion_cannot_expose_a_restart_floor() -> TestResult {
+    let (finished, completed) = watch::channel(None);
+    let notice = NodeRetirement::with_evidence(completed, EvidenceSlot::default());
+    assert_eq!(notice.joined_evidence().err(), Some(Error::Closed));
+    let mut joined = Box::pin(notice.clone().join());
+    pending(joined.as_mut()).await?;
+    drop(joined);
+    finished.send(Some(Err(Error::CoreFailure)))?;
+    assert_eq!(notice.joined_evidence().err(), Some(Error::CoreFailure));
+    assert_eq!(notice.join().await, Err(Error::CoreFailure));
     Ok(())
 }
 

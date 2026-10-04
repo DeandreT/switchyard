@@ -10,6 +10,7 @@ use domain::CommittedStreamId;
 use crate::ExperimentalReplicaStores;
 
 mod client;
+mod continuity;
 mod network;
 mod node;
 mod startup;

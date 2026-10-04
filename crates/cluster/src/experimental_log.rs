@@ -6,10 +6,12 @@
 mod budget;
 mod codec;
 mod owner;
+mod retirement;
 mod state;
 mod store;
 mod types;
 
+pub(crate) use retirement::FinalLogReport;
 pub use store::{ExperimentalLogStore, ReadOnlyLogReader};
 pub use types::{
     LogCodecError, LogEntry, LogId, LogProfile, LogResource, LogTypes, LogVote, MAX_APPEND_BYTES,

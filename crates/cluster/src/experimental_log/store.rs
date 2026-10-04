@@ -62,6 +62,29 @@ impl ExperimentalLogStore {
         }
     }
 
+    pub(crate) fn enable_retirement_report(
+        &self,
+    ) -> Result<
+        tokio::sync::oneshot::Receiver<Result<super::FinalLogReport, LogStorageError>>,
+        LogStorageError,
+    > {
+        self.handle.enable_retirement_report()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn healthy_retirement_report(
+        &self,
+    ) -> Result<super::FinalLogReport, LogStorageError> {
+        match self
+            .handle
+            .request(Operation::RetirementReport, None)
+            .await?
+        {
+            Reply::RetirementReport(report) => Ok(*report),
+            _ => Err(LogStorageError::Corrupt),
+        }
+    }
+
     pub(crate) fn into_runtime_parts(
         mut self,
     ) -> Result<(Self, RetiredOwner<LogStorageError>), LogStorageError> {

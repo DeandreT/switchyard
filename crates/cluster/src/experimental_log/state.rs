@@ -391,6 +391,16 @@ impl<W: CommittedStore> StoreState<W> {
         }
     }
 
+    pub(super) fn retirement_report(
+        &self,
+    ) -> Result<super::FinalLogReport, super::LogStorageError> {
+        let result = super::retirement::build(self);
+        if result.is_err() {
+            self.poisoned.set(true);
+        }
+        result
+    }
+
     pub(super) fn log_state(&self) -> Result<openraft::LogState<LogTypes>, LogStateError> {
         self.ensure_healthy()?;
         Ok(openraft::LogState {

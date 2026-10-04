@@ -1,8 +1,9 @@
 use tokio::runtime::Handle;
+use tokio::sync::oneshot;
 
 use crate::{
     ExperimentalLogStore, ExperimentalStateMachine, LogStorageError, StateMachineError,
-    experimental_owner::RetiredOwner,
+    experimental_log::FinalLogReport, experimental_owner::RetiredOwner,
 };
 
 use super::{ReplicaPreparationError, ReplicaProgress};
@@ -12,6 +13,9 @@ pub(crate) struct RuntimeParts {
     pub(crate) state: ExperimentalStateMachine,
     pub(crate) log_join: RetiredOwner<LogStorageError>,
     pub(crate) state_join: RetiredOwner<StateMachineError>,
+    pub(crate) log_report: oneshot::Receiver<Result<FinalLogReport, LogStorageError>>,
+    pub(crate) state_report:
+        oneshot::Receiver<Result<domain::CommittedCheckpoint, StateMachineError>>,
     pub(crate) progress: ReplicaProgress,
     pub(crate) config: openraft::Config,
 }
@@ -29,11 +33,29 @@ struct Parts {
 }
 
 impl OwnedStores {
-    pub(super) fn into_raft_parts(
+    pub(super) async fn into_raft_parts(
         mut self,
         progress: ReplicaProgress,
         config: openraft::Config,
     ) -> Result<RuntimeParts, ReplicaPreparationError> {
+        let reports = {
+            let parts = self.parts.as_ref().ok_or(ReplicaPreparationError::Closed)?;
+            parts.log.enable_retirement_report().and_then(|log_report| {
+                parts
+                    .state
+                    .enable_retirement_report()
+                    .map(|state_report| (log_report, state_report))
+                    .map_err(|_| LogStorageError::Closed)
+            })
+        };
+        let (log_report, state_report) = match reports {
+            Ok(reports) => reports,
+            Err(_) => {
+                // Installation failure still owns the pair until both joins.
+                self.shutdown().await?;
+                return Err(ReplicaPreparationError::Storage);
+            }
+        };
         let Parts {
             log,
             state,
@@ -45,6 +67,8 @@ impl OwnedStores {
             state,
             log_join,
             state_join,
+            log_report,
+            state_report,
             progress,
             config,
         })

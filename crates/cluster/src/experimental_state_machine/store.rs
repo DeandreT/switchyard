@@ -32,6 +32,15 @@ pub struct ExperimentalStateMachine {
 }
 
 impl ExperimentalStateMachine {
+    pub(crate) fn enable_retirement_report(
+        &self,
+    ) -> Result<
+        tokio::sync::oneshot::Receiver<Result<domain::CommittedCheckpoint, StateMachineError>>,
+        StateMachineError,
+    > {
+        self.handle.enable_retirement_report()
+    }
+
     pub(crate) fn checkpoint_reader(&self) -> HealthyCheckpointReader {
         HealthyCheckpointReader {
             handle: self.handle.clone(),
