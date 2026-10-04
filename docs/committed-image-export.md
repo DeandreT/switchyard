@@ -107,3 +107,8 @@ gates were not rerun for this domain-only increment.
 The separate [pristine-store bootstrap](committed-image-bootstrap.md) requires
 explicit trusted selection and a consumed unique target writer. Export alone
 does not supply that authority or permit overwriting an initialized store.
+
+The separate [exclusive retention token](committed-image-retention.md) holds the
+machine borrow from this capture through one atomic opaque catalog publication.
+It preserves the original image allocation and adds no live-progress or
+postcommit validation read.

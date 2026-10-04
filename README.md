@@ -135,6 +135,9 @@ older catalogs through ordinary writes and enables no runtime snapshot behavior.
 The [pure native metadata codec](docs/native-snapshot-metadata.md) checks every
 metadata field against the exact validated image and captured checkpoint. Pair
 agreement alone grants no installation, source-health, or history-purge authority.
+The [exclusive domain retention token](docs/committed-image-retention.md) prevents
+intervening apply between bounded capture and one atomic catalog publication.
+Retained reads validate their own image without querying current progress.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
