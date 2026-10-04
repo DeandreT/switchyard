@@ -4,6 +4,7 @@
 //! Production startup and existing standalone proposers remain unchanged.
 
 mod budget;
+mod image_bootstrap;
 mod image_export;
 mod input;
 mod owner;
@@ -12,6 +13,7 @@ mod snapshot;
 mod state;
 mod store;
 
+pub use image_bootstrap::StateMachineImageBootstrapError;
 pub use image_export::StateMachineImageExportError;
 pub use response::{LogApplication, LogQueueConfigRefusal, LogQueueRefusal};
 pub use snapshot::UnsupportedSnapshotBuilder;

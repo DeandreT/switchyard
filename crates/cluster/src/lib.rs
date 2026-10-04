@@ -20,8 +20,8 @@ pub use experimental_log::{
 pub use experimental_state_machine::{
     AppliedState, ExperimentalStateMachine, LogApplication, LogQueueConfigRefusal, LogQueueRefusal,
     MAX_APPLY_BYTES, MAX_APPLY_ENTRIES, MAX_STATE_MACHINE_OWNER_BYTES,
-    MAX_STATE_MACHINE_OWNER_JOBS, StateMachineError, StateMachineImageExportError,
-    StateMachineWorkload, UnsupportedSnapshotBuilder,
+    MAX_STATE_MACHINE_OWNER_JOBS, StateMachineError, StateMachineImageBootstrapError,
+    StateMachineImageExportError, StateMachineWorkload, UnsupportedSnapshotBuilder,
 };
 
 pub use experimental_replica::{

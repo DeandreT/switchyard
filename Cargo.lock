@@ -395,6 +395,7 @@ dependencies = [
  "openraft",
  "postcard",
  "serde",
+ "sha2",
  "storage",
  "testkit",
  "thiserror 2.0.19",

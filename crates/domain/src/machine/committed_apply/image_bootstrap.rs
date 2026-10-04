@@ -42,6 +42,12 @@ impl<'a> TrustedCreateSendBootstrap<'a> {
             artifact,
         }
     }
+
+    /// Borrow the immutable selected expectation, not artifact validity or
+    /// evidence of commitment, provenance, or installation authority.
+    pub fn expected_checkpoint(&self) -> &CommittedCheckpoint {
+        self.checkpoint
+    }
 }
 
 impl fmt::Debug for TrustedCreateSendBootstrap<'_> {
