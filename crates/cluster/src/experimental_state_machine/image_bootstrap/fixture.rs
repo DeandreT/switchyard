@@ -14,7 +14,7 @@ use storage::{
     CommittedStore, MemoryReplicaStore, MemoryStore, StateStore, StoreSnapshot, WriteBatch,
 };
 
-use super::TestResult;
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 pub(super) struct Selected {
     pub image: EncodedCommittedImage,

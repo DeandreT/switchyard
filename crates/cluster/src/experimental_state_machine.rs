@@ -10,13 +10,22 @@ mod input;
 mod owner;
 mod response;
 mod snapshot;
+mod snapshot_metadata;
 mod state;
 mod store;
+
+#[cfg(test)]
+#[path = "experimental_state_machine/image_bootstrap/fixture.rs"]
+mod captured_image_fixture;
 
 pub use image_bootstrap::StateMachineImageBootstrapError;
 pub use image_export::StateMachineImageExportError;
 pub use response::{LogApplication, LogQueueConfigRefusal, LogQueueRefusal};
 pub use snapshot::UnsupportedSnapshotBuilder;
+pub use snapshot_metadata::{
+    DecodedNativeSnapshotPair, EncodedNativeSnapshotMetadata, MAX_NATIVE_SNAPSHOT_METADATA_BYTES,
+    NativeSnapshotMetadataError,
+};
 pub use store::ExperimentalStateMachine;
 pub(crate) use store::HealthyCheckpointReader;
 

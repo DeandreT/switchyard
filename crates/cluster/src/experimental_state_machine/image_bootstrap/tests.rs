@@ -6,8 +6,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 #[path = "construction.rs"]
 mod construction;
-#[path = "fixture.rs"]
-mod fixture;
+use super::super::captured_image_fixture as fixture;
 #[path = "observed.rs"]
 mod observed;
 #[path = "recovery.rs"]

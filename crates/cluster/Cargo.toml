@@ -12,10 +12,10 @@ flume.workspace = true
 openraft.workspace = true
 postcard.workspace = true
 serde.workspace = true
+sha2.workspace = true
 storage.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-sha2.workspace = true
 testkit.workspace = true
