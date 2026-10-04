@@ -24,7 +24,26 @@ pub const MAX_LOG_OWNER_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const MEMBERSHIP_SCHEMA_VERSION: u16 = 1;
 
 pub(crate) fn validated_entry_len(entry: &LogEntry) -> Result<usize, LogCodecError> {
-    Ok(codec::encode_entry(entry)?.encoded_len())
+    codec::entry_len(entry)
+}
+
+pub(crate) fn queue_entry_upper_bound(command: &QueueLogCommand) -> Result<usize, LogCodecError> {
+    codec::queue_entry_upper_bound(command)
+}
+
+pub(crate) fn stamp_queue_command(command: &mut QueueLogCommand, timestamp: domain::Timestamp) {
+    match command.0.as_mut() {
+        types::QueueLogKind::CreateQueue { issued_at, .. }
+        | types::QueueLogKind::Send { issued_at, .. } => *issued_at = timestamp,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LogRetention {
+    pub(crate) last_present: Option<LogId>,
+    pub(crate) last_purged: Option<LogId>,
+    pub(crate) retained_entries: u64,
+    pub(crate) retained_bytes: u64,
 }
 
 pub(crate) fn queue_command_is_send(command: &QueueLogCommand) -> bool {

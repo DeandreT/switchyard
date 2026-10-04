@@ -14,6 +14,7 @@ mod store;
 pub use response::{LogApplication, LogQueueConfigRefusal, LogQueueRefusal};
 pub use snapshot::UnsupportedSnapshotBuilder;
 pub use store::ExperimentalStateMachine;
+pub(crate) use store::HealthyCheckpointReader;
 
 pub type AppliedState = (
     Option<crate::LogId>,

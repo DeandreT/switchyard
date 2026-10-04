@@ -76,6 +76,7 @@ impl Drop for Packet {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Handle {
     sender: Sender<Packet>,
     admission: Arc<Admission>,

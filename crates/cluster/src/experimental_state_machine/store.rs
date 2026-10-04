@@ -32,6 +32,11 @@ pub struct ExperimentalStateMachine {
 }
 
 impl ExperimentalStateMachine {
+    pub(crate) fn checkpoint_reader(&self) -> HealthyCheckpointReader {
+        HealthyCheckpointReader {
+            handle: self.handle.clone(),
+        }
+    }
     /// Synchronously initialize only a pristine committed-state store.
     pub fn create<W: CommittedStore>(
         writer: W,
@@ -90,6 +95,30 @@ impl ExperimentalStateMachine {
             .await
             .map_err(|_| StateMachineError::Panicked)?
             .map_err(|_| StateMachineError::Panicked)?
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct HealthyCheckpointReader {
+    handle: Handle,
+}
+
+impl HealthyCheckpointReader {
+    pub(crate) async fn checkpoint(
+        &self,
+    ) -> Result<domain::CommittedCheckpoint, StateMachineError> {
+        match self.handle.request(Operation::Checkpoint).await? {
+            Reply::Checkpoint(checkpoint) => Ok(*checkpoint),
+            _ => Err(StateMachineError::InvalidState),
+        }
+    }
+}
+
+impl fmt::Debug for HealthyCheckpointReader {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HealthyCheckpointReader")
+            .finish_non_exhaustive()
     }
 }
 
@@ -158,3 +187,6 @@ impl RaftStateMachine<LogTypes> for ExperimentalStateMachine {
         Ok(None)
     }
 }
+
+#[cfg(test)]
+mod reader_tests;

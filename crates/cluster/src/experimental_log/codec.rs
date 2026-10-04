@@ -688,6 +688,41 @@ pub(super) fn encode_entry(entry: &LogEntry) -> Result<EncodedEntry, LogCodecErr
     let bytes = encode(ENTRY_HEADER, &wire, MAX_LOG_ENTRY_BYTES, LogResource::Entry)?;
     Ok(EncodedEntry::validated(entry.log_id, bytes))
 }
+
+pub(super) fn entry_len(entry: &LogEntry) -> Result<usize, LogCodecError> {
+    let wire = EntryV1::from_entry(entry)?;
+    wire.validate()?;
+    Ok(ENTRY_HEADER.len()
+        + encoded_size(
+            &wire,
+            MAX_LOG_ENTRY_BYTES - ENTRY_HEADER.len(),
+            LogResource::Entry,
+        )?)
+}
+
+pub(super) fn queue_entry_upper_bound(command: &QueueLogCommand) -> Result<usize, LogCodecError> {
+    let mut queue = QueueV1::from_command(command)?;
+    match &mut queue {
+        QueueV1::CreateQueue { issued_at, .. } | QueueV1::Send { issued_at, .. } => {
+            *issued_at = u64::MAX
+        }
+    }
+    let wire = EntryV1 {
+        id: IdV1 {
+            term: u64::MAX,
+            node_id: u64::MAX,
+            index: u64::MAX,
+        },
+        payload: PayloadV1::Normal(queue),
+    };
+    wire.validate()?;
+    Ok(ENTRY_HEADER.len()
+        + encoded_size(
+            &wire,
+            MAX_LOG_ENTRY_BYTES - ENTRY_HEADER.len(),
+            LogResource::Entry,
+        )?)
+}
 pub(super) fn decode_entry(bytes: &[u8]) -> Result<LogEntry, LogCodecError> {
     let wire: EntryV1<'_> = decode(ENTRY_HEADER, bytes, MAX_LOG_ENTRY_BYTES, LogResource::Entry)?;
     wire.validate()?;

@@ -11,6 +11,8 @@ mod config;
 mod preflight;
 mod stores;
 
+pub(crate) use stores::RuntimeParts;
+
 /// A count-only replication limit that also fits worst-case encoded entries.
 pub const MAX_REPLICA_PAYLOAD_ENTRIES: u64 =
     (crate::MAX_APPEND_BYTES / crate::MAX_LOG_ENTRY_BYTES) as u64;
@@ -91,6 +93,39 @@ pub struct ExperimentalReplicaStores {
 }
 
 impl ExperimentalReplicaStores {
+    pub(crate) fn pause_runtime_ticks(&mut self) {
+        self.config.enable_tick = false;
+        self.config.enable_heartbeat = true;
+        self.config.enable_elect = true;
+    }
+
+    pub(crate) async fn refresh(&mut self) -> Result<(), ReplicaPreparationError> {
+        let stores = self
+            .stores
+            .as_mut()
+            .ok_or(ReplicaPreparationError::Closed)?;
+        let progress = preflight::validate(self.progress.node_id(), stores).await?;
+        if progress != self.progress {
+            return Err(ReplicaPreparationError::CheckpointMismatch);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn runtime_adapters(
+        &mut self,
+    ) -> Result<(&mut ExperimentalLogStore, &mut ExperimentalStateMachine), ReplicaPreparationError>
+    {
+        self.stores
+            .as_mut()
+            .ok_or(ReplicaPreparationError::Closed)?
+            .adapters()
+    }
+
+    pub(crate) fn into_raft_parts(mut self) -> Result<RuntimeParts, ReplicaPreparationError> {
+        let stores = self.stores.take().ok_or(ReplicaPreparationError::Closed)?;
+        stores.into_raft_parts(self.progress, self.config)
+    }
+
     /// Validate an owned pair without applying, purging, or repairing history.
     /// After the first poll under Tokio, caller loss does not cancel the owned
     /// preparation. Unpolled Drop retains the adapters' drain-only behavior.

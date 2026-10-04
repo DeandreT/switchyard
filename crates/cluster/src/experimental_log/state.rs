@@ -8,7 +8,7 @@ use storage::{CommittedStore, StateStore, StorageError, WriteBatch};
 use thiserror::Error;
 
 use super::{
-    codec,
+    LogRetention, codec,
     types::{
         ENTRY_PREFIX, EncodedAppend, EncodedEntry, LogEntry, LogId, LogProfile, LogProgress,
         LogTypes, LogVote, MAX_APPEND_BYTES, MAX_APPEND_ENTRIES, MAX_LIMITED_BYTES,
@@ -377,6 +377,20 @@ impl<W: CommittedStore> StoreState<W> {
         }
     }
 
+    pub(super) fn retention(&self) -> Result<LogRetention, LogStateError> {
+        self.ensure_healthy()?;
+        let bytes = self.require(self.io(self.reader.get(PROGRESS_KEY))?)?;
+        match codec::decode_progress(&bytes) {
+            Ok(progress) if progress == self.progress => Ok(LogRetention {
+                last_present: progress.last_present,
+                last_purged: progress.last_purged,
+                retained_entries: progress.retained_entries,
+                retained_bytes: progress.retained_bytes,
+            }),
+            _ => self.corrupt(),
+        }
+    }
+
     pub(super) fn log_state(&self) -> Result<openraft::LogState<LogTypes>, LogStateError> {
         self.ensure_healthy()?;
         Ok(openraft::LogState {
@@ -636,5 +650,7 @@ fn validate_rows(progress: &LogProgress, rows: &[EncodedEntry]) -> Result<(), Lo
     Ok(())
 }
 
+#[cfg(test)]
+mod retention_tests;
 #[cfg(test)]
 mod tests;

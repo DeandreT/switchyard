@@ -5,7 +5,16 @@ use crate::{
     experimental_owner::RetiredOwner,
 };
 
-use super::ReplicaPreparationError;
+use super::{ReplicaPreparationError, ReplicaProgress};
+
+pub(crate) struct RuntimeParts {
+    pub(crate) log: ExperimentalLogStore,
+    pub(crate) state: ExperimentalStateMachine,
+    pub(crate) log_join: RetiredOwner<LogStorageError>,
+    pub(crate) state_join: RetiredOwner<StateMachineError>,
+    pub(crate) progress: ReplicaProgress,
+    pub(crate) config: openraft::Config,
+}
 
 pub(super) struct OwnedStores {
     parts: Option<Parts>,
@@ -20,6 +29,27 @@ struct Parts {
 }
 
 impl OwnedStores {
+    pub(super) fn into_raft_parts(
+        mut self,
+        progress: ReplicaProgress,
+        config: openraft::Config,
+    ) -> Result<RuntimeParts, ReplicaPreparationError> {
+        let Parts {
+            log,
+            state,
+            log_join,
+            state_join,
+        } = self.parts.take().ok_or(ReplicaPreparationError::Closed)?;
+        Ok(RuntimeParts {
+            log,
+            state,
+            log_join,
+            state_join,
+            progress,
+            config,
+        })
+    }
+
     pub(super) async fn new(
         log: ExperimentalLogStore,
         state: ExperimentalStateMachine,

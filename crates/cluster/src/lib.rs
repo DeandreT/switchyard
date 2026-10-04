@@ -3,6 +3,7 @@
 pub mod experimental_log;
 mod experimental_owner;
 pub mod experimental_replica;
+pub mod experimental_runtime;
 pub mod experimental_state_machine;
 
 pub use experimental_log::{
@@ -23,6 +24,12 @@ pub use experimental_state_machine::{
 pub use experimental_replica::{
     ExperimentalReplicaStores, MAX_REPLICA_PAYLOAD_ENTRIES, ReplicaPreparationError,
     ReplicaProgress,
+};
+
+pub use experimental_runtime::{
+    ClientWorkload, ExperimentalRaftCluster, ExperimentalRaftHandle, QueueIntent, QueueWriteError,
+    QueueWriteOutcome, QueueWriteRejection, QueueWriteResult, QueueWriteUnknown,
+    ReplicaRuntimeError, TransportWorkload,
 };
 
 use serde::{Deserialize, Serialize};

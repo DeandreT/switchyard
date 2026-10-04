@@ -7,7 +7,8 @@ use openraft::{
 use storage::CommittedStore;
 
 use super::{
-    LogEntry, LogId, LogProfile, LogStorageError, LogTypes, LogVote, LogWorkload, io_error,
+    LogEntry, LogId, LogProfile, LogRetention, LogStorageError, LogTypes, LogVote, LogWorkload,
+    io_error,
     owner::{Handle, Operation, Reply},
     raft_error,
     state::{OwnedLogRange, StoreState},
@@ -122,6 +123,15 @@ impl fmt::Debug for ExperimentalLogStore {
 #[derive(Clone)]
 pub struct ReadOnlyLogReader {
     handle: Handle,
+}
+
+impl ReadOnlyLogReader {
+    pub(crate) async fn retention(&self) -> Result<LogRetention, LogStorageError> {
+        match self.handle.request(Operation::Retention, None).await? {
+            Reply::Retention(retention) => Ok(retention),
+            _ => Err(LogStorageError::Corrupt),
+        }
+    }
 }
 
 impl fmt::Debug for ReadOnlyLogReader {
