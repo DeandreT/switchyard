@@ -127,6 +127,10 @@ It supplies no domain-image validation, durability, authorization, admission
 budget, or guarantee that a complete state image will fit. Snapshot methods,
 transport, compaction, startup, and on-disk schemas remain unchanged.
 
+The separate [owned image exporter](native-image-export.md) can be enabled only
+through explicit bounded-reader constructors. It captures and checks CreateSend
+bytes on this owner without implementing any of these snapshot trait methods.
+
 A later no-snapshot runtime must use `SnapshotPolicy::Never`, reject purged
 history without snapshots and applied-state-ahead-of-log pairings before
 `Raft::new`, and forbid manual snapshot/purge paths. The pinned startup helper

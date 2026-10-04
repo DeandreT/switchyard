@@ -120,6 +120,9 @@ It does not certify source history, membership, or installation authority.
 The opt-in [bounded domain exporter](docs/committed-image-export.md) captures one
 complete stable view and validates its exact bytes. It has no unbounded fallback
 and does not enable native-owner or runtime snapshots.
+The separate [owned exporter](docs/native-image-export.md) adds explicit opt-in
+state-owner capture, full-cap admission, and joined cleanup. It does not enable
+the replication library's snapshot operations or runtime compaction.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
