@@ -117,6 +117,31 @@ Storage admission therefore remains open while that worker drains already
 committed work. Both unique native storage owners are joined before a held
 terminal client result is published and its charge refunded.
 
+Only actual runtime handoff enables private final retirement reports; ordinary
+adapter and prepared-pair shutdown perform no additional final reads. Each
+native storage owner captures its healthy final state after accepted FIFO work
+drains and before its writer drops. The log report contains its durable profile,
+complete vote, retention, and bounded content-chain prefixes; the state-machine
+report contains the full checkpoint. Reports alone are not join receipts.
+
+After both actual native joins, the lifecycle reads the reports without waiting
+and checks the checkpoint against its corresponding retained log prefix,
+including stream, last and previous content marks, timestamp watermark, and
+membership. That prefix need not be the log tail: uncommitted entries may remain.
+This also covers committed state-machine work that drains after the log owner
+exits, without a post-retirement query or a poison-bypassing recovery read.
+
+Report availability and actual native joins are separate. Diagnostic report
+errors or caught report-generation/publication panics do not turn successful
+native drainage into a native join failure. For a published node, missing,
+failing, poisoned, or inconsistent reports nevertheless make retirement fail
+with `OwnerFailure`. An unpublished failed startup discards unavailable
+continuity reports only after both joins, preserving its original startup error
+unless an actual join failed.
+
+Successful retirement retains private immutable evidence alongside its
+completion record. No public restart or rejoin operation is exposed.
+
 Stopping one node retains its completion record in the cluster before the first
 await. Canceling that waiter cannot exclude its still-draining storage from a
 later whole-cluster shutdown. Repeated stops observe the same final result;
@@ -140,15 +165,15 @@ has been joined. There is no forced thread termination or backend I/O timeout.
 
 Verified with Rust 1.97.1, two build jobs, two Rust test threads, and the shared
 build directory. Both all-feature and default-feature workspace runs passed
-3,821 tests each, with ten SDK tests intentionally ignored in each ordinary run.
+3,856 tests each, with ten SDK tests intentionally ignored in each ordinary run.
 The explicit current .NET SDK interoperability run passed all ten tests.
 Formatting, both strict workspace lint configurations, both workspace builds,
 the administration protocol descriptor, and whitespace checks also passed.
 
-The complete cluster suite passed 316 tests in each of ten consecutive runs
-(3,160 test executions). It includes 144 internal tests, 48 log-adapter tests,
-41 committed-state tests, 41 preparation tests, 17 public runtime tests,
-19 public startup tests, and six compile-fail API checks.
+The complete cluster suite then passed 351 tests in each of ten consecutive
+final runs (3,510 test executions). It includes 175 internal tests, 48
+log-adapter tests, 41 committed-state tests, 41 preparation tests, 21 public
+runtime tests, 19 public startup tests, and six compile-fail API checks.
 
 Memory and durable tests exercise actual quorum persistence, local application,
 caller loss, bounded ingress, minority refusal, late native storage drainage,
@@ -157,3 +182,10 @@ durable recovery reopens all six paths after releasing prior store controls and
 readers. Recovery checks preserve original records and membership; a subsequent
 leadership-change unknown is neither retried nor counted as acknowledgement.
 Separate quorum tests require confirmed acknowledgements from the real engine.
+
+Leader-stop tests wait for a higher-term native identity applied by both
+survivors before confirming a new write; follower-stop tests confirm that the
+original leader can still write with the remaining majority. The original
+confirmed message is preserved without resending it. An `Unknown` submission
+is neither retried nor counted as an acknowledgement, and final duplicate
+checks run against frozen state after successful joined cluster shutdown.

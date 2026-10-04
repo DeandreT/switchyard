@@ -101,10 +101,11 @@ checks applied fingerprints, membership, votes, and cleanup before a
 no-snapshot runtime can consume the adapters. It does not start a node.
 A fixed-three-node [in-process runtime experiment](docs/experimental-replica-runtime.md)
 now starts real nodes with bounded transport and owned Create/Send submission,
-quorum-gated acknowledgements, and joined storage cleanup. It is not wired into
-server startup, sockets, ordinary queue operations, or production mode; finite
-retained history, snapshots, authenticated transport, and broader replication
-remain explicit limits.
+quorum-gated acknowledgements, healthy final retirement checks, and joined
+storage cleanup. Restart and rejoin are not exposed. It is not wired into server
+startup, sockets, ordinary queue operations, or production mode; finite retained
+history, snapshots, authenticated transport, and broader replication remain
+explicit limits.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
