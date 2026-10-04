@@ -95,10 +95,16 @@ adds bounded durable storage for the pinned replication library. It supplies
 neither a running Raft node nor quorum acknowledgements.
 A matching [experimental state-machine adapter](docs/experimental-state-machine.md)
 adds bounded durable apply, membership recovery, and typed replay/result metadata.
-Snapshots, runtime integration, and replicated client acknowledgement remain absent.
+The adapter itself supplies neither snapshots nor a replicated client proposer.
 A separate [owned storage-pair preflight](docs/experimental-replica-preparation.md)
-checks applied fingerprints, membership, votes, and cleanup before a future
+checks applied fingerprints, membership, votes, and cleanup before a
 no-snapshot runtime can consume the adapters. It does not start a node.
+A fixed-three-node [in-process runtime experiment](docs/experimental-replica-runtime.md)
+now starts real nodes with bounded transport and owned Create/Send submission,
+quorum-gated acknowledgements, and joined storage cleanup. It is not wired into
+server startup, sockets, ordinary queue operations, or production mode; finite
+retained history, snapshots, authenticated transport, and broader replication
+remain explicit limits.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
