@@ -3,10 +3,10 @@
 `cluster::ExperimentalRaftCluster` runs three actual OpenRaft 0.9.25 nodes in
 one process, over separate unique log and committed-state writers. It exposes
 only fixed membership, bounded primary-queue Create/Send intents, diagnostic
-routing hints, and joined stop/shutdown. Existing server listeners, development
-proposers, timers, and production startup remain unchanged. No socket transport,
-deployment activation, snapshot, purge, arbitrary membership change, or raw
-writable engine is exposed.
+routing hints, exact-history rejoin, and joined stop/shutdown. Existing server
+listeners, development proposers, timers, and production startup remain
+unchanged. No socket transport, deployment activation, snapshot, purge,
+arbitrary membership change, or raw writable engine is exposed.
 
 ## Startup And Recovery
 
@@ -140,7 +140,7 @@ continuity reports only after both joins, preserving its original startup error
 unless an actual join failed.
 
 Successful retirement retains private immutable evidence alongside its
-completion record. No public restart or rejoin operation is exposed.
+completion record. It grants no writable engine, reader, or storage authority.
 
 Stopping one node retains its completion record in the cluster before the first
 await. Canceling that waiter cannot exclude its still-draining storage from a
@@ -161,18 +161,61 @@ ticker join handle on that failure path. The runtime joins its actual storage
 owners and signals normal cancellation, but does not claim every library task
 has been joined. There is no forced thread termination or backend I/O timeout.
 
+## Exact-History Rejoin
+
+`rejoin_node` accepts only a stopped original voter with healthy joined
+retirement evidence. Synchronous refusal returns the supplied prepared pair
+through `RejoinAdmissionError::into_stores` without accessing its backends.
+An unpolled accepted future admits no attempt. First polling transfers the pair
+and cleanup obligations to an owned task; losing the waiter cancels publication,
+not native storage work. The cluster retains one pending receipt independently
+of that waiter, and admits at most one rejoin at a time.
+
+Before any engine starts or replacement route exists, the task refreshes full
+history validation, exact fixed membership, and finite startup headroom. Its
+complete log report and applied checkpoint must equal the healthy retirement
+baseline, including vote commitment, retained unapplied suffixes, content marks,
+timestamps, and membership. A greater index or vote is not a substitute for
+exact continuity. There is no reset, repair, history adoption, or reconstructed
+application result. Rejoin activates normal replication but never initializes
+membership again; existing queue incarnations and records are preserved.
+
+Losing the waiter before engine handoff preserves the old baseline only after
+both candidate storage owners join. After handoff, an unpublished replacement
+is synchronously retired and joined. Its healthy final evidence becomes the
+new baseline, including any vote or history that advanced before publication.
+Without that new evidence, rejoin is fenced for that voter rather than falling
+back to its older history. Cleanup errors remain in whole-cluster shutdown's
+aggregate result without invalidating another voter's independent healthy
+baseline. Continuity metadata remains bounded by the original three identities.
+
+Successful publication installs the new node before removing old retirement
+metadata. Old handles and old route generations stay permanently closed.
+Per-node stop and whole-cluster shutdown also join a canceled pending attempt;
+shutdown retires every running node before waiting for candidate drainage.
+These guarantees require a live Tokio runtime. If first polling occurs outside
+a runtime, the captured live runtime supervises cleanup only and the operation
+fails with `RuntimeUnavailable`; no engine is started there.
+An unpolled cleanup rescue dropped by a closed runtime does not recursively
+reschedule itself or fabricate a joined continuity result.
+
 ## Verification
 
 Verified with Rust 1.97.1, two build jobs, two Rust test threads, and the shared
 build directory. Both all-feature and default-feature workspace runs passed
-3,856 tests each, with ten SDK tests intentionally ignored in each ordinary run.
+more than 3,800 tests each, with ten SDK tests intentionally ignored in each
+ordinary run.
 The explicit current .NET SDK interoperability run passed all ten tests.
+Its first invocation failed the previous-stable client's provisional
+same-original Complete with a service timeout. The unchanged isolated case
+and unchanged full SDK suite subsequently passed. The initial failure is
+retained as unexplained; those reruns do not establish a cause or a fix.
 Formatting, both strict workspace lint configurations, both workspace builds,
 the administration protocol descriptor, and whitespace checks also passed.
 
-The complete cluster suite then passed 351 tests in each of ten consecutive
-final runs (3,510 test executions). It includes 175 internal tests, 48
-log-adapter tests, 41 committed-state tests, 41 preparation tests, 21 public
+The complete cluster suite then passed 382 tests in each of ten consecutive
+final runs (3,820 test executions). It includes 197 internal tests, 48
+log-adapter tests, 41 committed-state tests, 41 preparation tests, 30 public
 runtime tests, 19 public startup tests, and six compile-fail API checks.
 
 Memory and durable tests exercise actual quorum persistence, local application,
@@ -189,3 +232,17 @@ original leader can still write with the remaining majority. The original
 confirmed message is preserved without resending it. An `Unknown` submission
 is neither retried nor counted as an acknowledgement, and final duplicate
 checks run against frozen state after successful joined cluster shutdown.
+
+Exact-history rejoin cases cover stopped leaders and followers on memory and
+Fjall, including surviving-majority writes before catch-up and confirmed writes
+afterward. Candidate-validation cancellation holds both actual native owner
+destructors behind independent gates: stop and whole-cluster shutdown cannot
+complete before both owners finish. A canceled pre-handoff attempt preserves
+the old healthy baseline and permits an exact retry only after those joins.
+
+Private ready-loss cases start an actual replacement, persist a newer vote
+through its native RPC, and lose the publication waiter. They require immediate
+stale-route refusal, actual storage-owner joins, the newer final evidence, and
+physical durable reopen. Closed-runtime cleanup tests prevent recursive rescue
+spawning without claiming joined continuity; the separate live-rescue test
+checks retention of an async startup join, not native storage drainage.
