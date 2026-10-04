@@ -120,3 +120,8 @@ gates ignored. Formatting, strict Clippy and builds in both feature
 configurations, protocol descriptor validation, and whitespace checks passed.
 The full all-feature workspace and live SDK gates were not rerun for this
 isolated opt-in owner increment.
+
+The separate [native pristine bootstrap](native-image-bootstrap.md) restores one
+trusted selection before starting an owner. Its plain constructor leaves export
+disabled; its bounded export variant installs this same capability. Neither
+constructor enables runtime snapshot installation or history compaction.
