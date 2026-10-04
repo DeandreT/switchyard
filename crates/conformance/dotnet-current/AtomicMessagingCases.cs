@@ -1,6 +1,7 @@
 using Azure;
 using Azure.Messaging.ServiceBus;
 using Microsoft.Azure.Amqp;
+using System.Diagnostics;
 using System.Transactions;
 
 internal static partial class AtomicMessagingCases
@@ -8,6 +9,8 @@ internal static partial class AtomicMessagingCases
     private static readonly TimeSpan OperationTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan ScopeTimeout = TimeSpan.FromSeconds(30);
     private const string DisabledDescription = "native transactional ingress is disabled";
+    private const int MaximumOperationDiagnostics = 128;
+    private static int operationDiagnostics;
     private const string Success =
         "official .NET warmed same-queue transaction batch/rollback/complete/rearm/default refusal passed";
 
@@ -20,6 +23,8 @@ internal static partial class AtomicMessagingCases
             return 2;
         }
 
+        using var lifecycle = new AtomicMessagingLifecycleTrace();
+        Interlocked.Exchange(ref operationDiagnostics, 0);
         var endpoints = new List<IAsyncDisposable>();
         Exception? failure = null;
         try
@@ -52,13 +57,25 @@ internal static partial class AtomicMessagingCases
         {
             for (int index = endpoints.Count - 1; index >= 0; index--)
             {
+                var elapsed = Stopwatch.StartNew();
+                Exception? cleanupFailure = null;
                 try
                 {
                     await endpoints[index].DisposeAsync().AsTask().WaitAsync(OperationTimeout);
                 }
                 catch (Exception exception)
                 {
+                    cleanupFailure = exception;
                     failure ??= exception;
+                }
+                finally
+                {
+                    TraceOperation(
+                        $"endpoint disposal {index}",
+                        cleanupFailure is null ? "completed" : "failed",
+                        elapsed,
+                        cancellationRequested: null,
+                        failure: cleanupFailure);
                 }
             }
         }
@@ -66,7 +83,7 @@ internal static partial class AtomicMessagingCases
         if (failure is not null)
         {
             Console.Error.WriteLine(
-                $"atomic messaging gate failed at {failure.Data["atomic-messaging-stage"] ?? "scope or endpoint disposal"}: {failure}");
+                AtomicMessagingDiagnostics.FormatFailure(failure));
             return 1;
         }
 
@@ -297,28 +314,94 @@ internal static partial class AtomicMessagingCases
     private static async Task OperationAsync(string stage, Func<CancellationToken, Task> operation)
     {
         using var cancellation = new CancellationTokenSource(OperationTimeout);
+        var elapsed = Stopwatch.StartNew();
+        Exception? failure = null;
+        TraceOperation(stage, "started", elapsed, cancellation.IsCancellationRequested);
         try
         {
             await operation(cancellation.Token).WaitAsync(OperationTimeout);
         }
         catch (Exception exception)
         {
-            exception.Data["atomic-messaging-stage"] = stage;
+            failure = exception;
+            AtomicMessagingDiagnostics.AnnotateFailure(
+                exception, stage, elapsed.ElapsedMilliseconds, cancellation.IsCancellationRequested);
             throw;
+        }
+        finally
+        {
+            TraceOperation(
+                stage,
+                failure is null ? "completed" : "failed",
+                elapsed,
+                cancellation.IsCancellationRequested,
+                failure);
         }
     }
 
     private static async Task<T> OperationAsync<T>(string stage, Func<CancellationToken, Task<T>> operation)
     {
         using var cancellation = new CancellationTokenSource(OperationTimeout);
+        var elapsed = Stopwatch.StartNew();
+        Exception? failure = null;
+        TraceOperation(stage, "started", elapsed, cancellation.IsCancellationRequested);
         try
         {
             return await operation(cancellation.Token).WaitAsync(OperationTimeout);
         }
         catch (Exception exception)
         {
-            exception.Data["atomic-messaging-stage"] = stage;
+            failure = exception;
+            AtomicMessagingDiagnostics.AnnotateFailure(
+                exception, stage, elapsed.ElapsedMilliseconds, cancellation.IsCancellationRequested);
             throw;
+        }
+        finally
+        {
+            TraceOperation(
+                stage,
+                failure is null ? "completed" : "failed",
+                elapsed,
+                cancellation.IsCancellationRequested,
+                failure);
+        }
+    }
+
+    private static void TraceOperation(
+        string stage,
+        string outcome,
+        Stopwatch elapsed,
+        bool? cancellationRequested,
+        Exception? failure = null)
+    {
+        try
+        {
+            int count = AtomicMessagingDiagnostics.Reserve(ref operationDiagnostics, MaximumOperationDiagnostics);
+            if (count == 0)
+            {
+                return;
+            }
+            if (count > MaximumOperationDiagnostics)
+            {
+                if (count == MaximumOperationDiagnostics + 1)
+                {
+                    Console.Error.WriteLine("atomic-messaging operation diagnostics truncated after 128 events");
+                }
+                return;
+            }
+
+            string reason = failure is ServiceBusException serviceBus
+                ? serviceBus.Reason.ToString()
+                : "none";
+            string boundedStage = stage.Length <= 160 ? stage : stage[..160];
+            string failureType = failure?.GetType().Name ?? "none";
+            failureType = failureType.Length <= 64 ? failureType : failureType[..64];
+            Console.Error.WriteLine(
+                $"atomic-messaging operation utc={DateTime.UtcNow:O} stage={boundedStage} outcome={outcome} elapsed_ms={elapsed.ElapsedMilliseconds} cancellation_requested={cancellationRequested?.ToString() ?? "not-supplied"} failure_type={failureType} servicebus_reason={reason}");
+        }
+        catch (Exception)
+        {
+            // Diagnostic publication must not change the operation result.
         }
     }
 

@@ -270,6 +270,25 @@ pub(super) async fn build_client(sdk_version: &str) -> TestResult<tempfile::Temp
     Ok(artifacts)
 }
 
+pub(super) async fn run_evidence_selftest(dll: &Path) -> TestResult<Output> {
+    run(
+        evidence_selftest_command(dll),
+        "official atomic diagnostic self-test",
+        RUN_DEADLINE,
+        MAX_OUTPUT_BYTES,
+    )
+    .await
+}
+
+fn evidence_selftest_command(dll: &Path) -> Command {
+    let mut command = Command::new("dotnet");
+    command
+        .env("DOTNET_PROCESSOR_COUNT", "2")
+        .arg(dll)
+        .arg("atomic-evidence-selftest");
+    command
+}
+
 pub(super) async fn run_client(
     dll: &Path,
     atomic_endpoint: &str,
@@ -382,6 +401,24 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.arg("-c").arg(script);
         command
+    }
+
+    #[test]
+    fn evidence_selftest_has_no_endpoint_or_credential_arguments() {
+        let command = evidence_selftest_command(Path::new("conformance.dll"));
+        let command = command.as_std();
+        assert_eq!(command.get_program(), "dotnet");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["conformance.dll", "atomic-evidence-selftest"],
+        );
+        assert_eq!(
+            command.get_envs().collect::<Vec<_>>(),
+            [(
+                std::ffi::OsStr::new("DOTNET_PROCESSOR_COUNT"),
+                Some(std::ffi::OsStr::new("2"))
+            )],
+        );
     }
 
     #[test]

@@ -4,6 +4,8 @@ use std::{error::Error, path::Path, time::Duration};
 
 use super::{CURRENT_SDK, HOST, KEY, PREVIOUS_SDK, RULE, websocket};
 
+#[path = "atomic_messaging/evidence.rs"]
+mod evidence;
 #[path = "atomic_messaging/fixture.rs"]
 mod fixture;
 #[path = "atomic_messaging/postconditions.rs"]
@@ -18,6 +20,17 @@ const HELD_QUEUE: &str = "atomic-sdk-held";
 const CONTROL_QUEUE: &str = "atomic-sdk-control";
 const SUCCESS: &str = "official .NET warmed same-queue transaction batch/rollback/complete/rearm/default refusal passed";
 const COLD_SUCCESS: &str = "official .NET cold-first same-queue transaction rollback/commit passed";
+const EVIDENCE_SELFTEST_SUCCESS: &str =
+    "official .NET atomic diagnostic forwarding/restoration/bounds/failure containment passed";
+
+fn evidence_selftest_marker_present(stdout: &str) -> bool {
+    stdout.split_inclusive('\n').any(|line| {
+        let Some(line) = line.strip_suffix('\n') else {
+            return false;
+        };
+        line.strip_suffix('\r').unwrap_or(line) == EVIDENCE_SELFTEST_SUCCESS
+    })
+}
 
 fn success_markers_present(stdout: &str) -> bool {
     let mut warmed = false;
@@ -52,10 +65,18 @@ async fn run_gate(sdk_version: &'static str) -> TestResult {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
+    eprintln!("atomic-sdk build-start sdk={sdk_version}");
     let artifacts = process::build_client(sdk_version).await?;
     let dll = artifacts
         .path()
         .join("bin/Switchyard.Conformance.DotNetCurrent.dll");
+    let output = process::run_evidence_selftest(&dll).await?;
+    if !output.status.success() || !evidence_selftest_marker_present(&output.stdout) {
+        return Err(std::io::Error::other(format!(
+            "official .NET {sdk_version} diagnostic self-test failed ({})\nstdout:\n{}\nstderr:\n{}",
+            output.status, output.stdout, output.stderr,
+        )).into());
+    }
     run_backend(testkit::MemoryProvider::new(), &dll, sdk_version, "memory").await?;
     run_backend(
         testkit::DurableProvider::temporary()?,
@@ -72,7 +93,9 @@ async fn run_backend<P: testkit::StoreProvider>(
     sdk_version: &str,
     backend: &str,
 ) -> TestResult {
+    eprintln!("atomic-sdk backend-start sdk={sdk_version} backend={backend}");
     let mut fixture = fixture::Fixture::start(provider).await?;
+    let client_started = std::time::Instant::now();
     let result = async {
         let output = process::run_client(
             dll,
@@ -89,9 +112,25 @@ async fn run_backend<P: testkit::StoreProvider>(
         }
         Ok::<_, Box<dyn Error>>(())
     }.await;
+    let client_elapsed = client_started.elapsed();
+    let cleanup_started = std::time::Instant::now();
     let cleanup = fixture.stop().await;
-    result?;
-    cleanup?;
+    let cleanup_elapsed = cleanup_started.elapsed();
+    eprintln!(
+        "atomic-sdk backend-finish sdk={sdk_version} backend={backend} client_ok={} cleanup_ok={} client_elapsed_ms={} cleanup_elapsed_ms={}",
+        result.is_ok(),
+        cleanup.is_ok(),
+        client_elapsed.as_millis(),
+        cleanup_elapsed.as_millis(),
+    );
+    evidence::finish(
+        sdk_version,
+        backend,
+        client_elapsed,
+        cleanup_elapsed,
+        result,
+        cleanup,
+    )?;
     let (provider, store, namespace) = fixture.into_stopped_parts();
     postconditions::check(&store, &namespace)?;
     let before = storage::StateStore::snapshot(&store)?;
@@ -109,6 +148,31 @@ async fn run_backend<P: testkit::StoreProvider>(
 #[cfg(test)]
 mod marker_tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_selftest_requires_a_completed_exact_marker() {
+        assert!(evidence_selftest_marker_present(&format!(
+            "{EVIDENCE_SELFTEST_SUCCESS}\n"
+        )));
+        assert!(evidence_selftest_marker_present(&format!(
+            "diagnostic\r\n{EVIDENCE_SELFTEST_SUCCESS}\r\n"
+        )));
+        for stdout in [
+            String::new(),
+            EVIDENCE_SELFTEST_SUCCESS.to_owned(),
+            format!("{EVIDENCE_SELFTEST_SUCCESS}\r"),
+            format!("prefix {EVIDENCE_SELFTEST_SUCCESS}\n"),
+            format!("{EVIDENCE_SELFTEST_SUCCESS} suffix\n"),
+            format!("{EVIDENCE_SELFTEST_SUCCESS} {SUCCESS}\n"),
+            format!(
+                "{}\n",
+                &EVIDENCE_SELFTEST_SUCCESS[..EVIDENCE_SELFTEST_SUCCESS.len() - 1]
+            ),
+            format!("{SUCCESS}\n{COLD_SUCCESS}\n"),
+        ] {
+            assert!(!evidence_selftest_marker_present(&stdout));
+        }
+    }
 
     #[test]
     fn both_exact_completed_markers_are_required() {
