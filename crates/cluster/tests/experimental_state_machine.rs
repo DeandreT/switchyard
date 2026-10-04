@@ -37,6 +37,8 @@ mod corruption;
 mod crash;
 #[path = "experimental_state_machine/fixture.rs"]
 mod fixture;
+#[path = "experimental_state_machine/image_export.rs"]
+mod image_export;
 #[path = "experimental_state_machine/lifecycle.rs"]
 mod lifecycle;
 #[path = "experimental_state_machine/physical.rs"]

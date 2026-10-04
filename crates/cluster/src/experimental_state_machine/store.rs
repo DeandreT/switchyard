@@ -26,7 +26,7 @@ use super::{
 /// }
 /// ```
 pub struct ExperimentalStateMachine {
-    handle: Handle,
+    pub(super) handle: Handle,
     thread: Option<JoinHandle<Result<(), StateMachineError>>>,
     retired: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -62,7 +62,9 @@ impl ExperimentalStateMachine {
         Self::start(StoreState::open(writer, stream)?)
     }
 
-    fn start<W: CommittedStore>(state: StoreState<W>) -> Result<Self, StateMachineError> {
+    pub(super) fn start<W: CommittedStore>(
+        state: StoreState<W>,
+    ) -> Result<Self, StateMachineError> {
         let (handle, thread) = Handle::start(state)?;
         Ok(Self {
             handle,

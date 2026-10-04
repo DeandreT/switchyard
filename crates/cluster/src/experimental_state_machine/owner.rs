@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 
 use super::{
     AppliedState, LogApplication, MAX_STATE_MACHINE_OWNER_JOBS, StateMachineError,
-    StateMachineWorkload,
+    StateMachineImageExportError, StateMachineWorkload,
     budget::{Admission, Lease},
     input::PreparedApply,
     state::StoreState,
@@ -22,12 +22,14 @@ pub(super) enum Operation {
     Apply(PreparedApply),
     AppliedState,
     Checkpoint,
+    ExportImage,
 }
 
 pub(super) enum Reply {
     Applications(Vec<LogApplication>),
     AppliedState(Box<AppliedState>),
     Checkpoint(Box<CommittedCheckpoint>),
+    ImageExport(Result<domain::EncodedCommittedImage, StateMachineImageExportError>),
 }
 
 type Response = Result<Reply, StateMachineError>;
@@ -52,6 +54,7 @@ impl Packet {
     pub(super) fn encoded_bytes(&self) -> usize {
         match self.operation.as_ref() {
             Some(Operation::Apply(entries)) => entries.encoded_bytes(),
+            Some(Operation::ExportImage) => domain::MAX_COMMITTED_IMAGE_BYTES,
             _ => 64,
         }
     }
@@ -178,6 +181,9 @@ fn run<W: CommittedStore>(
                 Some(Operation::Checkpoint) => state
                     .checkpoint()
                     .map(|checkpoint| Reply::Checkpoint(Box::new(checkpoint))),
+                Some(Operation::ExportImage) => {
+                    Ok(Reply::ImageExport(state.export_create_send_image()))
+                }
                 None => Err(StateMachineError::Panicked),
             };
             packet.finish(result);

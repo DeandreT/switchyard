@@ -4,6 +4,7 @@
 //! Production startup and existing standalone proposers remain unchanged.
 
 mod budget;
+mod image_export;
 mod input;
 mod owner;
 mod response;
@@ -11,6 +12,7 @@ mod snapshot;
 mod state;
 mod store;
 
+pub use image_export::StateMachineImageExportError;
 pub use response::{LogApplication, LogQueueConfigRefusal, LogQueueRefusal};
 pub use snapshot::UnsupportedSnapshotBuilder;
 pub use store::ExperimentalStateMachine;
@@ -28,6 +30,7 @@ pub const MAX_STATE_MACHINE_OWNER_BYTES: usize = MAX_APPLY_BYTES;
 
 /// Accepted queued/in-flight work, not caller-owned inputs or result heap size.
 /// Apply charges are encoded-entry bytes; scalar queries carry a 64-byte charge.
+/// Opted-in image exports carry the fixed complete image limit, not output RSS.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StateMachineWorkload {
     pub accepted_jobs: usize,

@@ -3,7 +3,7 @@ use domain::{
     CommittedEntryId, CommittedQueueWork, CommittedStateMachine, CommittedStreamId,
 };
 use openraft::{EntryPayload, StoredMembership};
-use storage::CommittedStore;
+use storage::{BoundedStateStore, CommittedStore};
 
 use crate::experimental_log::{
     LogEntry, LogId, MEMBERSHIP_SCHEMA_VERSION, decode_membership, encode_membership,
@@ -17,9 +17,13 @@ use super::{
 };
 
 pub(super) struct StoreState<W: CommittedStore> {
-    machine: CommittedStateMachine<W>,
-    poisoned: bool,
+    pub(super) machine: CommittedStateMachine<W>,
+    pub(super) poisoned: bool,
+    pub(super) image_export: Option<ImageExportCapability<CommittedStateMachine<W>>>,
 }
+
+type ImageExportCapability<M> =
+    fn(&mut M) -> Result<domain::EncodedCommittedImage, domain::CommittedImageExportError>;
 
 struct PreparedEntry {
     id: CommittedEntryId,
@@ -38,12 +42,37 @@ impl<W: CommittedStore> StoreState<W> {
         Self::validated(machine)
     }
 
+    pub(super) fn create_with_image_export(
+        writer: W,
+        stream: CommittedStreamId,
+    ) -> Result<Self, StateMachineError>
+    where
+        W::Reader: BoundedStateStore,
+    {
+        let mut state = Self::create(writer, stream)?;
+        state.image_export = Some(CommittedStateMachine::<W>::export_create_send_image);
+        Ok(state)
+    }
+
+    pub(super) fn open_with_image_export(
+        writer: W,
+        stream: CommittedStreamId,
+    ) -> Result<Self, StateMachineError>
+    where
+        W::Reader: BoundedStateStore,
+    {
+        let mut state = Self::open(writer, stream)?;
+        state.image_export = Some(CommittedStateMachine::<W>::export_create_send_image);
+        Ok(state)
+    }
+
     fn validated(machine: CommittedStateMachine<W>) -> Result<Self, StateMachineError> {
         let checkpoint = machine.checkpoint().map_err(domain_error)?;
         recover(&checkpoint)?;
         Ok(Self {
             machine,
             poisoned: false,
+            image_export: None,
         })
     }
 
@@ -129,7 +158,7 @@ impl<W: CommittedStore> StoreState<W> {
         Ok(responses)
     }
 
-    fn ensure_healthy(&self) -> Result<(), StateMachineError> {
+    pub(super) fn ensure_healthy(&self) -> Result<(), StateMachineError> {
         if self.poisoned {
             Err(StateMachineError::Poisoned)
         } else {
@@ -186,7 +215,7 @@ fn validate_first(
     }
 }
 
-fn recover(checkpoint: &CommittedCheckpoint) -> Result<AppliedState, StateMachineError> {
+pub(super) fn recover(checkpoint: &CommittedCheckpoint) -> Result<AppliedState, StateMachineError> {
     match (checkpoint.last(), checkpoint.previous()) {
         (None, None) => {}
         (Some(last), None) if last.id.index == 0 => {}
