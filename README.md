@@ -123,6 +123,9 @@ and does not enable native-owner or runtime snapshots.
 The separate [owned exporter](docs/native-image-export.md) adds explicit opt-in
 state-owner capture, full-cap admission, and joined cleanup. It does not enable
 the replication library's snapshot operations or runtime compaction.
+The trusted [pristine-store bootstrap](docs/committed-image-bootstrap.md) restores
+an exactly selected image in one atomic commit. It refuses initialized or
+nonempty targets and adds no runtime installation or history-purge authority.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
