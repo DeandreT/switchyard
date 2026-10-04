@@ -29,7 +29,7 @@ pub use experimental_replica::{
 pub use experimental_runtime::{
     ClientWorkload, ExperimentalRaftCluster, ExperimentalRaftHandle, QueueIntent, QueueWriteError,
     QueueWriteOutcome, QueueWriteRejection, QueueWriteResult, QueueWriteUnknown,
-    ReplicaRuntimeError, TransportWorkload,
+    RejoinAdmissionError, ReplicaRuntimeError, TransportWorkload,
 };
 
 use serde::{Deserialize, Serialize};

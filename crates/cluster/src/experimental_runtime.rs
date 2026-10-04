@@ -13,12 +13,14 @@ mod client;
 mod continuity;
 mod network;
 mod node;
+mod rejoin;
 mod startup;
 
 pub use client::{
     ClientWorkload, ExperimentalRaftHandle, QueueIntent, QueueWriteError, QueueWriteOutcome,
     QueueWriteRejection, QueueWriteResult, QueueWriteUnknown,
 };
+pub use rejoin::RejoinAdmissionError;
 
 pub(crate) type Error = ReplicaRuntimeError;
 
@@ -59,6 +61,12 @@ pub enum ReplicaRuntimeError {
     Initialization,
     #[error("the replica coordination task failed")]
     CoreFailure,
+    #[error("the fixed replica node is already running")]
+    NodeRunning,
+    #[error("a replica rejoin or its prior retirement is still in progress")]
+    RejoinInProgress,
+    #[error("the replica has no healthy joined continuity record")]
+    ContinuityUnavailable,
 }
 
 /// Three real nodes with private storage, transport, and writable engine handles.
@@ -78,6 +86,8 @@ pub enum ReplicaRuntimeError {
 pub struct ExperimentalRaftCluster {
     nodes: BTreeMap<u64, node::Node>,
     retiring: BTreeMap<u64, node::NodeRetirement>,
+    rejoin: rejoin::RejoinState,
+    runtime: tokio::runtime::Handle,
     routes: std::sync::Arc<network::Routes>,
     stream: CommittedStreamId,
 }
@@ -124,6 +134,21 @@ impl ExperimentalRaftCluster {
             .find(|id| self.nodes.contains_key(id))
     }
 
+    /// Rejoin an original fixed voter using its exact healthy retired history.
+    /// Factory refusal returns the untouched pair. An unpolled accepted future
+    /// admits no attempt; after first poll, caller loss retains owned cleanup.
+    /// Membership is never initialized again, and stale handles stay closed.
+    pub fn rejoin_node(
+        &mut self,
+        node_id: u64,
+        stores: ExperimentalReplicaStores,
+    ) -> Result<
+        impl std::future::Future<Output = Result<(), Error>> + Send + '_,
+        RejoinAdmissionError,
+    > {
+        rejoin::admit(self, node_id, stores)
+    }
+
     /// Stop one node and wait for its coordination and native storage owners.
     /// Repeated calls observe the same result; losing a waiter does not remove
     /// this node from the whole-cluster shutdown barrier.
@@ -131,23 +156,34 @@ impl ExperimentalRaftCluster {
         if let Some(node) = self.nodes.remove(&node_id) {
             self.retiring.insert(node_id, node.retire());
         }
-        self.retiring
+        let rejoining = self.rejoin.stop_pending(node_id).await;
+        let stopping = self
+            .retiring
             .get(&node_id)
             .ok_or(Error::Closed)?
             .clone()
             .join()
-            .await
+            .await;
+        rejoining.and(stopping)
     }
 
     /// Start every node's shutdown before awaiting any node's drainage.
     pub async fn shutdown(mut self) -> Result<(), Error> {
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| Error::RuntimeUnavailable)?;
+        self.rejoin.cancel_pending();
         for (id, node) in std::mem::take(&mut self.nodes) {
             self.retiring.insert(id, node.retire());
         }
         let retiring = std::mem::take(&mut self.retiring);
-        let task = runtime.spawn(startup::join_retirements(retiring));
+        let rejoining = std::mem::take(&mut self.rejoin);
+        let task = runtime.spawn(async move {
+            let (stopping, rejoining) = tokio::join!(
+                startup::join_retirements(retiring),
+                rejoining.join_pending(),
+            );
+            stopping.and(rejoining)
+        });
         task.await.map_err(|_| Error::TaskFailed)?
     }
 }

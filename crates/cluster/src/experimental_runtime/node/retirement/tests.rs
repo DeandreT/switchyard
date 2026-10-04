@@ -125,6 +125,8 @@ async fn retained_cluster_shutdown(first: Result<(), Error>) -> TestResult {
     let (last_sender, last_notice) = watch::channel(None);
     let stream = domain::CommittedStreamId::new([99; 16])?;
     let cluster = crate::experimental_runtime::ExperimentalRaftCluster {
+        rejoin: crate::experimental_runtime::rejoin::RejoinState::default(),
+        runtime: tokio::runtime::Handle::current(),
         nodes: BTreeMap::new(),
         retiring: BTreeMap::from([
             (7, NodeRetirement::new(first_notice)),

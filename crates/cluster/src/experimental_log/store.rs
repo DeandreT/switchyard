@@ -71,7 +71,6 @@ impl ExperimentalLogStore {
         self.handle.enable_retirement_report()
     }
 
-    #[cfg(test)]
     pub(crate) async fn healthy_retirement_report(
         &self,
     ) -> Result<super::FinalLogReport, LogStorageError> {

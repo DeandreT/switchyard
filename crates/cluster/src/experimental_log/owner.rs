@@ -23,13 +23,9 @@ use super::{
 pub(super) enum Operation {
     Append(EncodedAppend),
     ReadFull(OwnedLogRange),
-    ReadLimited {
-        start: u64,
-        end: u64,
-    },
+    ReadLimited { start: u64, end: u64 },
     Profile,
     Retention,
-    #[cfg(test)]
     RetirementReport,
     LogState,
     SaveVote(LogVote),
@@ -43,7 +39,6 @@ pub(super) enum Reply {
     Entries(Vec<LogEntry>),
     Profile(LogProfile),
     Retention(LogRetention),
-    #[cfg(test)]
     RetirementReport(Box<super::FinalLogReport>),
     LogState(LogState<LogTypes>),
     Vote(Option<LogVote>),
@@ -219,7 +214,6 @@ fn execute<W: CommittedStore>(state: &mut StoreState<W>, operation: Operation) -
         Operation::ReadLimited { start, end } => state.read_limited(start, end).map(Reply::Entries),
         Operation::Profile => state.profile().map(Reply::Profile),
         Operation::Retention => state.retention().map(Reply::Retention),
-        #[cfg(test)]
         Operation::RetirementReport => {
             return state
                 .retirement_report()

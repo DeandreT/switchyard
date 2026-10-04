@@ -111,6 +111,23 @@ impl ExperimentalReplicaStores {
         Ok(())
     }
 
+    pub(crate) async fn continuity_snapshot(
+        &mut self,
+    ) -> Result<
+        (
+            crate::experimental_log::FinalLogReport,
+            domain::CommittedCheckpoint,
+        ),
+        ReplicaPreparationError,
+    > {
+        let (log, state) = self.runtime_adapters()?;
+        let (log, checkpoint) = tokio::join!(log.healthy_retirement_report(), state.checkpoint(),);
+        Ok((
+            log.map_err(|_| ReplicaPreparationError::Storage)?,
+            checkpoint.map_err(|_| ReplicaPreparationError::Storage)?,
+        ))
+    }
+
     pub(crate) fn runtime_adapters(
         &mut self,
     ) -> Result<(&mut ExperimentalLogStore, &mut ExperimentalStateMachine), ReplicaPreparationError>

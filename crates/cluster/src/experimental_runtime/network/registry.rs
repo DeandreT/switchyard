@@ -27,6 +27,10 @@ struct GenerationState {
 }
 
 impl NodeGeneration {
+    pub(in crate::experimental_runtime) fn retire(&self) {
+        self.0.live.store(false, Ordering::Release);
+    }
+
     pub(in crate::experimental_runtime) fn is_live(&self) -> bool {
         self.0.live.load(Ordering::Acquire)
     }
@@ -72,6 +76,10 @@ pub(in crate::experimental_runtime) struct PendingEndpoint {
 }
 
 impl Routes {
+    pub(in crate::experimental_runtime) fn fixed_members(&self) -> BTreeMap<u64, BasicNode> {
+        self.members.clone()
+    }
+
     pub(in crate::experimental_runtime) fn new(
         stream: CommittedStreamId,
         ids: [u64; 3],

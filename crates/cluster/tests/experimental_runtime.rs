@@ -41,3 +41,7 @@ mod fixture;
 mod quorum;
 #[path = "experimental_runtime/recovery.rs"]
 mod recovery;
+#[path = "experimental_runtime/rejoin.rs"]
+mod rejoin;
+#[path = "experimental_runtime/rejoin_lifecycle.rs"]
+mod rejoin_lifecycle;

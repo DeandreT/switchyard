@@ -75,6 +75,8 @@ impl StartupGuard {
                 let cluster = ExperimentalRaftCluster {
                     nodes: std::mem::take(&mut resources.nodes),
                     retiring: BTreeMap::new(),
+                    rejoin: super::rejoin::RejoinState::default(),
+                    runtime: self.runtime.clone(),
                     routes,
                     stream,
                 };
@@ -179,7 +181,7 @@ impl Drop for StartupGuard {
     }
 }
 
-async fn validate(
+pub(super) async fn validate(
     store: &mut ExperimentalReplicaStores,
     mode: Mode,
     expected: &Membership<u64, BasicNode>,

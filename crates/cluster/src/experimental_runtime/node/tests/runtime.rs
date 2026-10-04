@@ -68,6 +68,23 @@ async fn worker_drain<W: CommittedStore>(
     .await??;
     assert_eq!(response, AppendEntriesResponse::Success);
     assert!(!state_control.retired());
+    node.request_stop();
+    assert!(!node.generation.is_live());
+    assert!(
+        network
+            .append_entries(
+                AppendEntriesRequest::<LogTypes> {
+                    vote: vote(),
+                    prev_log_id: Some(id(3)),
+                    entries: vec![],
+                    leader_commit: Some(id(3)),
+                },
+                RPCOption::new(DEADLINE),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(routes.workload()?.accepted_jobs, 0);
     let mut shutdown = Box::pin(node.shutdown());
     pending(shutdown.as_mut()).await?;
     log_control.wait_retired().await?;

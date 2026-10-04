@@ -68,6 +68,39 @@ pub(super) struct ReplicaControl<W: CommittedStore> {
     pub(super) state: Control<W>,
 }
 
+impl<W: CommittedStore> ReplicaControl<W> {
+    pub(super) fn into_backends(self) -> TestResult<(W, W)> {
+        Ok((self.log.into_writer()?, self.state.into_writer()?))
+    }
+}
+
+pub(super) async fn prepare_reopened<W: CommittedStore>(
+    node_id: u64,
+    log_writer: W,
+    state_writer: W,
+) -> TestResult<(ExperimentalReplicaStores, ReplicaControl<W>)> {
+    let stream = stream()?;
+    let profile = LogProfile::new(node_id, stream)?;
+    let (log_writer, log_control) = observed(log_writer);
+    let (state_writer, state_control) = observed(state_writer);
+    let log = ExperimentalLogStore::open(log_writer, profile)?;
+    let state = match ExperimentalStateMachine::open(state_writer, stream) {
+        Ok(state) => state,
+        Err(error) => {
+            log.shutdown().await?;
+            return Err(error.into());
+        }
+    };
+    let stores = ExperimentalReplicaStores::prepare(node_id, log, state).await?;
+    Ok((
+        stores,
+        ReplicaControl {
+            log: log_control,
+            state: state_control,
+        },
+    ))
+}
+
 pub(super) async fn create<W: CommittedStore>(
     backends: [(W, W); 3],
 ) -> TestResult<(ExperimentalRaftCluster, [ReplicaControl<W>; 3])> {
@@ -243,6 +276,23 @@ impl<W: CommittedStore> CommittedStore for ObservedWriter<W> {
 }
 
 impl<W: CommittedStore> Control<W> {
+    pub(super) fn into_writer(self) -> TestResult<W> {
+        let Self {
+            shared,
+            reader,
+            changed,
+        } = self;
+        drop(reader);
+        drop(changed);
+        // Call only after successful joined stop. Any surviving owner or
+        // observer makes extraction fail rather than duplicating its writer.
+        let shared = Arc::try_unwrap(shared)
+            .map_err(|_| "joined backend still has an owner or checkpoint observer")?
+            .into_inner()
+            .map_err(|_| "joined backend control is poisoned")?;
+        Ok(shared.writer)
+    }
+
     pub(super) fn reader(&self) -> W::Reader {
         self.reader.clone()
     }

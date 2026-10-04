@@ -103,6 +103,8 @@ impl Node {
 
     pub(super) fn request_stop(&self) {
         self.stop.request(NodeStopCause::Shutdown);
+        self.client.close_admission();
+        self.generation.retire();
     }
 
     pub(super) fn retire(self) -> NodeRetirement {
