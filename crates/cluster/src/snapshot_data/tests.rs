@@ -10,6 +10,15 @@ use super::*;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+mod sealed;
+
+fn buffer_capacity<const LIMIT: usize>(buffer: &Buffer<LIMIT>) -> usize {
+    match &buffer.bytes {
+        Backing::Mutable(bytes) => bytes.capacity(),
+        Backing::SealedImage(_) => panic!("mutable fixture acquired sealed backing"),
+    }
+}
+
 #[test]
 fn meets_pinned_snapshot_data_traits() {
     fn check<T: AsyncRead + AsyncWrite + AsyncSeek + Send + Unpin + 'static>(_: T) {}
@@ -23,7 +32,7 @@ fn committed_image_container_limit_fits_the_transport_buffer_without_allocation(
     Pin::new(&mut data).start_seek(SeekFrom::Start(position))?;
     assert_eq!(data.position(), position);
     assert!(data.is_empty());
-    assert_eq!(data.buffer.bytes.capacity(), 0);
+    assert_eq!(buffer_capacity(&data.buffer), 0);
     Ok(())
 }
 
@@ -33,7 +42,7 @@ async fn real_limit_bounds_seek_and_write_without_large_allocation() -> TestResu
     let limit = u64::try_from(MAX_SNAPSHOT_BYTES)?;
     assert_eq!(data.seek(SeekFrom::Start(limit)).await?, limit);
     assert!(data.is_empty());
-    assert_eq!(data.buffer.bytes.capacity(), 0);
+    assert_eq!(buffer_capacity(&data.buffer), 0);
 
     assert_eq!(
         data.write(b"x").await.unwrap_err().kind(),
@@ -48,7 +57,7 @@ async fn real_limit_bounds_seek_and_write_without_large_allocation() -> TestResu
     );
     assert_eq!(data.position(), limit);
     assert!(data.is_empty());
-    assert_eq!(data.buffer.bytes.capacity(), 0);
+    assert_eq!(buffer_capacity(&data.buffer), 0);
     Ok(())
 }
 
@@ -78,7 +87,7 @@ async fn constructor_copies_bytes_and_starts_at_zero() -> TestResult {
 async fn exact_fill_succeeds_and_next_byte_is_refused_atomically() -> TestResult {
     let mut data = Buffer::<8>::default();
     data.write_all(b"abcdefgh").await?;
-    assert_eq!(data.bytes, b"abcdefgh");
+    assert_eq!(data.bytes.as_bytes(), b"abcdefgh");
     assert_eq!(data.position, 8);
     assert_eq!(
         AsyncWriteExt::write(&mut data, b"x")
@@ -87,7 +96,7 @@ async fn exact_fill_succeeds_and_next_byte_is_refused_atomically() -> TestResult
             .kind(),
         io::ErrorKind::InvalidInput
     );
-    assert_eq!(data.bytes, b"abcdefgh");
+    assert_eq!(data.bytes.as_bytes(), b"abcdefgh");
     assert_eq!(data.position, 8);
     Ok(())
 }
@@ -96,7 +105,7 @@ async fn exact_fill_succeeds_and_next_byte_is_refused_atomically() -> TestResult
 async fn oversized_write_does_not_overwrite_a_fitting_prefix() -> TestResult {
     let mut data = Buffer::<8>::from_bytes(b"abcdef")?;
     data.seek(SeekFrom::Start(3)).await?;
-    let capacity = data.bytes.capacity();
+    let capacity = buffer_capacity(&data);
     assert_eq!(
         AsyncWriteExt::write(&mut data, b"123456")
             .await
@@ -104,9 +113,9 @@ async fn oversized_write_does_not_overwrite_a_fitting_prefix() -> TestResult {
             .kind(),
         io::ErrorKind::InvalidInput
     );
-    assert_eq!(data.bytes, b"abcdef");
+    assert_eq!(data.bytes.as_bytes(), b"abcdef");
     assert_eq!(data.position, 3);
-    assert_eq!(data.bytes.capacity(), capacity);
+    assert_eq!(buffer_capacity(&data), capacity);
     Ok(())
 }
 
@@ -115,7 +124,7 @@ async fn bounded_overwrite_preserves_unwritten_suffix() -> TestResult {
     let mut data = Buffer::<8>::from_bytes(b"abcdef")?;
     data.seek(SeekFrom::Start(2)).await?;
     data.write_all(b"XY").await?;
-    assert_eq!(data.bytes, b"abXYef");
+    assert_eq!(data.bytes.as_bytes(), b"abXYef");
     assert_eq!(data.position, 4);
     Ok(())
 }
@@ -124,9 +133,9 @@ async fn bounded_overwrite_preserves_unwritten_suffix() -> TestResult {
 async fn sparse_write_materializes_only_the_bounded_gap() -> TestResult {
     let mut data = Buffer::<8>::from_bytes(b"a")?;
     data.seek(SeekFrom::Start(6)).await?;
-    assert_eq!(data.bytes, b"a");
+    assert_eq!(data.bytes.as_bytes(), b"a");
     data.write_all(b"z").await?;
-    assert_eq!(data.bytes, b"a\0\0\0\0\0z");
+    assert_eq!(data.bytes.as_bytes(), b"a\0\0\0\0\0z");
     assert_eq!(data.position, 7);
     Ok(())
 }
@@ -137,8 +146,8 @@ async fn empty_write_at_sparse_limit_does_not_allocate_or_extend() -> TestResult
     data.seek(SeekFrom::Start(8)).await?;
     assert_eq!(AsyncWriteExt::write(&mut data, b"").await?, 0);
     assert_eq!(data.position, 8);
-    assert!(data.bytes.is_empty());
-    assert_eq!(data.bytes.capacity(), 0);
+    assert!(data.bytes.as_bytes().is_empty());
+    assert_eq!(buffer_capacity(&data), 0);
     Ok(())
 }
 
@@ -146,7 +155,7 @@ async fn empty_write_at_sparse_limit_does_not_allocate_or_extend() -> TestResult
 async fn invalid_signed_and_absolute_seeks_preserve_state() -> TestResult {
     let mut data = Buffer::<8>::from_bytes(b"abcd")?;
     data.seek(SeekFrom::Start(2)).await?;
-    let capacity = data.bytes.capacity();
+    let capacity = buffer_capacity(&data);
     for request in [
         SeekFrom::Start(9),
         SeekFrom::Start(u64::MAX),
@@ -161,8 +170,8 @@ async fn invalid_signed_and_absolute_seeks_preserve_state() -> TestResult {
             io::ErrorKind::InvalidInput
         );
         assert_eq!(data.position, 2);
-        assert_eq!(data.bytes, b"abcd");
-        assert_eq!(data.bytes.capacity(), capacity);
+        assert_eq!(data.bytes.as_bytes(), b"abcd");
+        assert_eq!(buffer_capacity(&data), capacity);
     }
     Ok(())
 }
@@ -184,8 +193,8 @@ async fn arithmetic_overflow_is_checked_before_allocation() -> TestResult {
         io::ErrorKind::InvalidInput
     );
     assert_eq!(data.position, u64::MAX);
-    assert!(data.bytes.is_empty());
-    assert_eq!(data.bytes.capacity(), 0);
+    assert!(data.bytes.as_bytes().is_empty());
+    assert_eq!(buffer_capacity(&data), 0);
     Ok(())
 }
 
@@ -214,8 +223,8 @@ async fn capacity_overflow_is_sanitized_and_preserves_the_buffer() -> TestResult
     assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
     assert_eq!(error.to_string(), "snapshot buffer allocation failed");
     assert_eq!(data.position, position);
-    assert!(data.bytes.is_empty());
-    assert_eq!(data.bytes.capacity(), 0);
+    assert!(data.bytes.as_bytes().is_empty());
+    assert_eq!(buffer_capacity(&data), 0);
     Ok(())
 }
 
@@ -227,7 +236,7 @@ async fn empty_and_eof_reads_do_not_move_a_sparse_position() -> TestResult {
     data.seek(SeekFrom::Start(6)).await?;
     assert_eq!(data.read(&mut [0; 2]).await?, 0);
     assert_eq!(data.position, 6);
-    assert_eq!(data.bytes, b"abc");
+    assert_eq!(data.bytes.as_bytes(), b"abc");
     Ok(())
 }
 
@@ -238,7 +247,7 @@ async fn default_vectored_write_uses_only_first_nonempty_slice() -> TestResult {
     assert!(!data.is_write_vectored());
     let slices = [IoSlice::new(b""), IoSlice::new(b"bb"), IoSlice::new(b"ccc")];
     assert_eq!(data.write_vectored(&slices).await?, 2);
-    assert_eq!(data.bytes, b"aabb");
+    assert_eq!(data.bytes.as_bytes(), b"aabb");
     assert_eq!(data.position, 4);
     let too_large = [
         IoSlice::new(b""),
@@ -249,7 +258,7 @@ async fn default_vectored_write_uses_only_first_nonempty_slice() -> TestResult {
         data.write_vectored(&too_large).await.unwrap_err().kind(),
         io::ErrorKind::InvalidInput
     );
-    assert_eq!(data.bytes, b"aabb");
+    assert_eq!(data.bytes.as_bytes(), b"aabb");
     assert_eq!(data.position, 4);
     Ok(())
 }

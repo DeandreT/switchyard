@@ -7,6 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use domain::EncodedCommittedImage;
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
 /// Maximum logical length and seek position of one snapshot buffer.
@@ -24,6 +25,24 @@ pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
 /// ```compile_fail
 /// fn unbounded_write(data: &mut cluster::BoundedSnapshotData) {
 ///     data.get_mut().extend_from_slice(b"unchecked");
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn duplicate(data: cluster::BoundedSnapshotData) {
+///     let another = data.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn extract(data: cluster::BoundedSnapshotData) {
+///     let bytes = data.into_inner();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn mutate(data: &mut cluster::BoundedSnapshotData) {
+///     data.as_bytes().push(0);
 /// }
 /// ```
 #[derive(Default)]
@@ -45,16 +64,46 @@ impl BoundedSnapshotData {
         })
     }
 
+    /// Moves one bounded owned image into sealed read-only transport backing.
+    ///
+    /// The actual logical length is checked against the independent transport
+    /// cap before adoption. This allocates or copies no artifact bytes, decodes
+    /// nothing, queries no source, and starts at position zero. Spare capacity
+    /// and process memory remain outside the logical bound. A refused image is
+    /// consumed; no mutable buffer or source capability is returned.
+    ///
+    /// Actual writes, including empty poll_write and default vectored writes,
+    /// return PermissionDenied before modification. Tokio write_all on an empty
+    /// slice is instead an inert extension-method shortcut that never calls the
+    /// writer and returns success. Flush/shutdown are still nonpersistent no-ops,
+    /// and reads/seeks remain usable afterward. There is no unseal operation.
+    ///
+    /// This carries transport bytes only: no semantic/source-health validation,
+    /// metadata agreement, commitment, installation, ancestry, runtime adoption,
+    /// storage mutation, machine poisoning or log-purge authority is added.
+    ///
+    /// ```compile_fail
+    /// fn consumed(image: domain::EncodedCommittedImage) {
+    ///     let data = cluster::BoundedSnapshotData::from_image(image);
+    ///     let bytes = image.as_bytes();
+    /// }
+    /// ```
+    pub fn from_image(image: EncodedCommittedImage) -> io::Result<Self> {
+        Ok(Self {
+            buffer: Buffer::from_image(image)?,
+        })
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
-        &self.buffer.bytes
+        self.buffer.bytes.as_bytes()
     }
 
     pub fn len(&self) -> usize {
-        self.buffer.bytes.len()
+        self.as_bytes().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buffer.bytes.is_empty()
+        self.as_bytes().is_empty()
     }
 
     pub fn position(&self) -> u64 {
@@ -110,11 +159,31 @@ impl AsyncSeek for BoundedSnapshotData {
     }
 }
 
+enum Backing {
+    Mutable(Vec<u8>),
+    SealedImage(EncodedCommittedImage),
+}
+
+impl Default for Backing {
+    fn default() -> Self {
+        Self::Mutable(Vec::new())
+    }
+}
+
+impl Backing {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Mutable(bytes) => bytes,
+            Self::SealedImage(image) => image.as_bytes(),
+        }
+    }
+}
+
 // The public associated type fixes its bound. Tiny internal bounds exercise the
 // same I/O implementation without allocating production-size test payloads.
 #[derive(Default)]
 struct Buffer<const LIMIT: usize> {
-    bytes: Vec<u8>,
+    bytes: Backing,
     position: u64,
 }
 
@@ -129,7 +198,21 @@ impl<const LIMIT: usize> Buffer<LIMIT> {
         Ok(buffer)
     }
 
+    fn from_image(image: EncodedCommittedImage) -> io::Result<Self> {
+        if image.len() > LIMIT {
+            return Err(bound_error());
+        }
+        Ok(Self {
+            bytes: Backing::SealedImage(image),
+            position: 0,
+        })
+    }
+
     fn write_bounded(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let destination = match &mut self.bytes {
+            Backing::Mutable(destination) => destination,
+            Backing::SealedImage(_) => return Err(sealed_error()),
+        };
         if bytes.is_empty() {
             return Ok(0);
         }
@@ -141,18 +224,18 @@ impl<const LIMIT: usize> Buffer<LIMIT> {
         let position = u64::try_from(end).map_err(|_| bound_error())?;
 
         // Nothing observable changes before fallible capacity reservation.
-        self.bytes
-            .try_reserve_exact(end.saturating_sub(self.bytes.len()))
+        destination
+            .try_reserve_exact(end.saturating_sub(destination.len()))
             .map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::OutOfMemory,
                     "snapshot buffer allocation failed",
                 )
             })?;
-        if end > self.bytes.len() {
-            self.bytes.resize(end, 0);
+        if end > destination.len() {
+            destination.resize(end, 0);
         }
-        self.bytes[start..end].copy_from_slice(bytes);
+        destination[start..end].copy_from_slice(bytes);
         self.position = position;
         Ok(bytes.len())
     }
@@ -160,7 +243,7 @@ impl<const LIMIT: usize> Buffer<LIMIT> {
     fn seek_bounded(&mut self, from: SeekFrom) -> io::Result<()> {
         let position = match from {
             SeekFrom::Start(position) => position,
-            SeekFrom::End(offset) => u64::try_from(self.bytes.len())
+            SeekFrom::End(offset) => u64::try_from(self.bytes.as_bytes().len())
                 .map_err(|_| bound_error())?
                 .checked_add_signed(offset)
                 .ok_or_else(bound_error)?,
@@ -188,7 +271,7 @@ impl<const LIMIT: usize> AsyncRead for Buffer<LIMIT> {
         let Ok(start) = usize::try_from(this.position) else {
             return Poll::Ready(Err(bound_error()));
         };
-        let available = this.bytes.get(start..).unwrap_or_default();
+        let available = this.bytes.as_bytes().get(start..).unwrap_or_default();
         let count = available.len().min(buffer.remaining());
         let Ok(count_u64) = u64::try_from(count) else {
             return Poll::Ready(Err(bound_error()));
@@ -229,6 +312,13 @@ impl<const LIMIT: usize> AsyncSeek for Buffer<LIMIT> {
     fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
         Poll::Ready(Ok(self.get_mut().position))
     }
+}
+
+fn sealed_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "sealed snapshot data is read-only",
+    )
 }
 
 fn bound_error() -> io::Error {
