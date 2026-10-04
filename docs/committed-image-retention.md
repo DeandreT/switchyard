@@ -129,3 +129,8 @@ failure called a crate-private checkpoint-key helper; the fixture was corrected
 to locate its captured key/value without exposing a production API. The full
 all-feature workspace suite and live SDK gates were not rerun for this isolated
 domain-capability change.
+
+The separate [owned native catalog API](native-snapshot-catalog.md) derives and
+checks metadata before consuming this token on the existing state owner. It
+keeps full-artifact admission, immutable result custody, and joined cleanup
+without enabling engine snapshot installation or history removal.

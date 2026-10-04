@@ -138,6 +138,9 @@ agreement alone grants no installation, source-health, or history-purge authorit
 The [exclusive domain retention token](docs/committed-image-retention.md) prevents
 intervening apply between bounded capture and one atomic catalog publication.
 Retained reads validate their own image without querying current progress.
+The [owned native catalog API](docs/native-snapshot-catalog.md) builds and reads
+exact image/metadata pairs through the existing state owner with full-cap
+admission and joined cleanup. It grants no engine snapshot or purge authority.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
