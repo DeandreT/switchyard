@@ -98,6 +98,39 @@ share the same 256-entry/64 MiB limits and canonical size accounting, so an
 individual valid retained range fits both. This does not guarantee aggregate
 queue admission or availability under native work pressure.
 
+## Private Live-Partition Tests
+
+A private `cfg(test)` control cuts the four directed routes between one live
+node and its two peers, using their exact current source and target generations.
+The cut fences new admission only; it does not stop a node, replace a writer,
+or revoke packets accepted before the cut. Those packets retain custody and
+their count/byte charges through actual target completion. The cut's settled
+barrier includes queued, forwarded, and reservation-to-publication work.
+Healing removes only those exact-generation cuts, never resurrecting retired
+origins or affecting replacement generations.
+
+The memory and Fjall scenarios require both surviving nodes to reach matching
+full applied checkpoints with a higher-term native identity before requesting
+another write. Routing hints select a candidate but are not commitment proof:
+only a confirmed native receipt counts as an acknowledgement. The isolated
+node must refuse its intent before submission; an unknown is never retried or
+counted as a refusal or success. After healing, the original live node must
+catch up without resending confirmed work. Full records, queue incarnations,
+and applied checkpoints are checked before and after joined shutdown. The
+durable case then releases all old controls, readers, and writers and physically
+reopens all six directories, checking their exact log/state snapshots and
+full checkpoints.
+
+A separate backend-gated native Vote scenario requires a lost RPC waiter to
+retain its charge and keep the cut unsettled until the original target call
+finishes. Final reports are inspected only after actual storage-owner joins;
+the durable case also checks the saved vote and checkpoint after physical
+reopen. No retry request supplies that evidence.
+
+These are private in-process test controls, not a public partition API, socket
+fault model, snapshot/recovery service, or new server activation. Durable
+reopening checks adapter history, not an additional running-engine restart.
+
 ## Joined Retirement
 
 First polling startup or cluster shutdown transfers cleanup to an owned task
@@ -203,20 +236,21 @@ reschedule itself or fabricate a joined continuity result.
 
 Verified with Rust 1.97.1, two build jobs, two Rust test threads, and the shared
 build directory. Both all-feature and default-feature workspace runs passed
-more than 3,800 tests each, with ten SDK tests intentionally ignored in each
-ordinary run.
-The explicit current .NET SDK interoperability run passed all ten tests.
-Its first invocation failed the previous-stable client's provisional
+3,894 tests each, with ten SDK tests intentionally ignored in each ordinary run.
+The preceding rejoin checkpoint's explicit .NET SDK interoperability run passed
+all ten tests. Its first invocation failed the previous-stable client's provisional
 same-original Complete with a service timeout. The unchanged isolated case
 and unchanged full SDK suite subsequently passed. The initial failure is
 retained as unexplained; those reruns do not establish a cause or a fix.
 Formatting, both strict workspace lint configurations, both workspace builds,
 the administration protocol descriptor, and whitespace checks also passed.
 
-The complete cluster suite then passed 382 tests in each of ten consecutive
-final runs (3,820 test executions). It includes 197 internal tests, 48
+The complete cluster suite passed 389 tests. It includes 204 internal tests, 48
 log-adapter tests, 41 committed-state tests, 41 preparation tests, 30 public
 runtime tests, 19 public startup tests, and six compile-fail API checks.
+The seven new private partition cases also passed ten consecutive focused runs
+(70 test executions). The preceding rejoin checkpoint passed its full 382-test
+cluster suite ten consecutive times (3,820 test executions).
 
 Memory and durable tests exercise actual quorum persistence, local application,
 caller loss, bounded ingress, minority refusal, late native storage drainage,
