@@ -32,6 +32,8 @@ mod corruption;
 mod crash;
 #[path = "committed_apply/fixture.rs"]
 mod fixture;
+#[path = "committed_apply/image.rs"]
+mod image;
 #[path = "committed_apply/lifecycle.rs"]
 mod lifecycle;
 #[path = "committed_apply/limits.rs"]

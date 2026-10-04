@@ -16,6 +16,17 @@ fn meets_pinned_snapshot_data_traits() {
     check(BoundedSnapshotData::new());
 }
 
+#[test]
+fn committed_image_container_limit_fits_the_transport_buffer_without_allocation() -> TestResult {
+    let position = u64::try_from(domain::MAX_COMMITTED_IMAGE_BYTES)?;
+    let mut data = BoundedSnapshotData::new();
+    Pin::new(&mut data).start_seek(SeekFrom::Start(position))?;
+    assert_eq!(data.position(), position);
+    assert!(data.is_empty());
+    assert_eq!(data.buffer.bytes.capacity(), 0);
+    Ok(())
+}
+
 #[tokio::test]
 async fn real_limit_bounds_seek_and_write_without_large_allocation() -> TestResult {
     let mut data = BoundedSnapshotData::new();
