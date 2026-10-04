@@ -30,6 +30,8 @@ mod atomicity;
 mod corruption;
 #[path = "committed_apply/crash.rs"]
 mod crash;
+#[path = "committed_apply/export.rs"]
+mod export;
 #[path = "committed_apply/fixture.rs"]
 mod fixture;
 #[path = "committed_apply/image.rs"]

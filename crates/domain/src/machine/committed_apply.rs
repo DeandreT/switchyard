@@ -9,8 +9,12 @@ use crate::{
 
 use super::{committed_prepare::CommittedPreparationError, *};
 
+mod image_export;
+pub use image_export::CommittedImageExportError;
+
 /// One synchronous committed-entry writer with a matching read-only machine.
-/// This is not a consensus engine, retry-deduplication service, or snapshot API.
+/// It does not implement consensus, retry deduplication, or runtime snapshot
+/// installation.
 pub struct CommittedStateMachine<W: CommittedStore> {
     writer: W,
     machine: StateMachine<W::Reader>,

@@ -58,7 +58,7 @@ pub use identifier::{
     MAX_SUBSCRIPTION_NAME_BYTES, NamespaceName, PlacementGroupId, SUBSCRIPTION_PATH_SEGMENT,
     SessionId, SubscriptionName,
 };
-pub use machine::committed_apply::CommittedStateMachine;
+pub use machine::committed_apply::{CommittedImageExportError, CommittedStateMachine};
 pub use machine::{
     BROKER_HEADER_RESERVE_BYTES, CommandApplication, MAX_DEAD_LETTER_DETAIL_LENGTH,
     MAX_ENTITY_DELETE_KEY_BYTES, MAX_ENTITY_DELETE_KEYS, MAX_ENTITY_DELETE_VALUE_BYTES,
