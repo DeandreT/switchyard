@@ -100,6 +100,7 @@ where
         machine,
         poisoned: false,
         image_export: None,
+        image_catalog: None,
     })
     .map_err(|_| StateMachineImageBootstrapError::OwnerStartAfterCommit)
 }

@@ -11,7 +11,8 @@ use storage::CommittedStore;
 use tokio::sync::oneshot;
 
 use super::{
-    AppliedState, LogApplication, MAX_STATE_MACHINE_OWNER_JOBS, StateMachineError,
+    AppliedState, BuiltNativeSnapshotCatalog, LogApplication, MAX_STATE_MACHINE_OWNER_JOBS,
+    RetainedNativeSnapshotCatalog, StateMachineCatalogError, StateMachineError,
     StateMachineImageExportError, StateMachineWorkload,
     budget::{Admission, Lease},
     input::PreparedApply,
@@ -23,6 +24,8 @@ pub(super) enum Operation {
     AppliedState,
     Checkpoint,
     ExportImage,
+    BuildCatalog,
+    ReadCatalog,
 }
 
 pub(super) enum Reply {
@@ -30,6 +33,8 @@ pub(super) enum Reply {
     AppliedState(Box<AppliedState>),
     Checkpoint(Box<CommittedCheckpoint>),
     ImageExport(Result<domain::EncodedCommittedImage, StateMachineImageExportError>),
+    CatalogBuilt(Result<BuiltNativeSnapshotCatalog, StateMachineCatalogError>),
+    CatalogRead(Result<Option<RetainedNativeSnapshotCatalog>, StateMachineCatalogError>),
 }
 
 type Response = Result<Reply, StateMachineError>;
@@ -54,7 +59,9 @@ impl Packet {
     pub(super) fn encoded_bytes(&self) -> usize {
         match self.operation.as_ref() {
             Some(Operation::Apply(entries)) => entries.encoded_bytes(),
-            Some(Operation::ExportImage) => domain::MAX_COMMITTED_IMAGE_BYTES,
+            Some(Operation::ExportImage | Operation::BuildCatalog | Operation::ReadCatalog) => {
+                domain::MAX_COMMITTED_IMAGE_BYTES
+            }
             _ => 64,
         }
     }
@@ -183,6 +190,12 @@ fn run<W: CommittedStore>(
                     .map(|checkpoint| Reply::Checkpoint(Box::new(checkpoint))),
                 Some(Operation::ExportImage) => {
                     Ok(Reply::ImageExport(state.export_create_send_image()))
+                }
+                Some(Operation::BuildCatalog) => {
+                    Ok(Reply::CatalogBuilt(state.build_create_send_catalog()))
+                }
+                Some(Operation::ReadCatalog) => {
+                    Ok(Reply::CatalogRead(state.read_create_send_catalog()))
                 }
                 None => Err(StateMachineError::Panicked),
             };

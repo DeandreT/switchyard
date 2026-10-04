@@ -5,6 +5,7 @@
 
 mod budget;
 mod image_bootstrap;
+mod image_catalog;
 mod image_export;
 mod input;
 mod owner;
@@ -19,6 +20,10 @@ mod store;
 mod captured_image_fixture;
 
 pub use image_bootstrap::StateMachineImageBootstrapError;
+pub use image_catalog::{
+    BuiltNativeSnapshotCatalog, MAX_NATIVE_CATALOG_METADATA_OVERHEAD_BYTES,
+    RetainedNativeSnapshotCatalog, StateMachineCatalogError,
+};
 pub use image_export::StateMachineImageExportError;
 pub use response::{LogApplication, LogQueueConfigRefusal, LogQueueRefusal};
 pub use snapshot::UnsupportedSnapshotBuilder;
@@ -41,7 +46,9 @@ pub const MAX_STATE_MACHINE_OWNER_BYTES: usize = MAX_APPLY_BYTES;
 
 /// Accepted queued/in-flight work, not caller-owned inputs or result heap size.
 /// Apply charges are encoded-entry bytes; scalar queries carry a 64-byte charge.
-/// Opted-in image exports carry the fixed complete image limit, not output RSS.
+/// Opted-in image exports and catalog operations carry the complete image limit,
+/// not output RSS. Catalogs explicitly add at most 8 KiB encoded metadata and
+/// small checkpoint/projection bookkeeping outside this admission accounting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StateMachineWorkload {
     pub accepted_jobs: usize,
