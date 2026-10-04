@@ -89,6 +89,10 @@ the existing read-limit cause maps to `LimitExceeded`. This is not a sanitized
 external error interface; domain/protocol adapters must map causes before
 publishing external diagnostics.
 
+The separate [pure native metadata codec](native-snapshot-metadata.md) validates
+complete metadata/image agreement. Storage remains opaque: it does not call that
+codec, enforce image semantics, or grant native adoption authority.
+
 Catalog commits retain the existing unknown physical commit-decision contract:
 an error can follow the entire successful durable publication. Do not publish
 success effects, assume rollback, or automatically retry. Release every physical

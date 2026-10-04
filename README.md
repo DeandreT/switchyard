@@ -132,6 +132,9 @@ validation read. Bounded export remains an explicit constructor choice.
 The opt-in [catalog storage profile](docs/snapshot-catalog-storage.md) retains an
 opaque metadata/image pair atomically beside business records. It preserves
 older catalogs through ordinary writes and enables no runtime snapshot behavior.
+The [pure native metadata codec](docs/native-snapshot-metadata.md) checks every
+metadata field against the exact validated image and captured checkpoint. Pair
+agreement alone grants no installation, source-health, or history-purge authority.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
