@@ -11,8 +11,8 @@ use std::{
 };
 
 use crate::{
-    CommittedStore, Key, Mutation, StateStore, StorageError, StoreSnapshot, Value, WriteBatch,
-    replica::ReplicaReader,
+    BoundedStateStore, CommittedStore, Key, Mutation, ReadBudget, ReadLimits, StateStore,
+    StorageError, StoreSnapshot, Value, WriteBatch, replica::ReplicaReader,
 };
 
 /// Cloning shares one keyspace, so every clone reads what any other wrote.
@@ -154,3 +154,22 @@ impl StateStore for MemoryStore {
             .collect())
     }
 }
+
+impl BoundedStateStore for MemoryStore {
+    fn snapshot_bounded(&self, limits: ReadLimits) -> Result<StoreSnapshot, StorageError> {
+        let entries = self
+            .entries
+            .read()
+            .map_err(|_| StorageError::LockPoisoned)?;
+        let mut budget = ReadBudget::new(limits);
+        let mut result = Vec::new();
+        for (key, value) in entries.iter() {
+            budget.consume(key.len(), value.len())?;
+            result.push((key.clone(), value.clone()));
+        }
+        Ok(StoreSnapshot { entries: result })
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests;

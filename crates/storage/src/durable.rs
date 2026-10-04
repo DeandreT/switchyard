@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 
-use crate::{Key, Mutation, StateStore, StorageError, StoreSnapshot, Value, WriteBatch};
+use crate::{
+    BoundedStateStore, Key, Mutation, ReadBudget, ReadLimits, StateStore, StorageError,
+    StoreSnapshot, Value, WriteBatch,
+};
 
 mod replica;
 pub use replica::FjallReplicaStore;
@@ -231,6 +234,57 @@ impl StateStore for FjallStore {
     }
 }
 
+impl BoundedStateStore for FjallStore {
+    fn snapshot_bounded(&self, limits: ReadLimits) -> Result<StoreSnapshot, StorageError> {
+        let snapshot = self.database.snapshot();
+        read_bounded_snapshot(&snapshot, &self.records, limits)
+    }
+}
+
+fn read_bounded_snapshot(
+    snapshot: &fjall::Snapshot,
+    records: &Keyspace,
+    limits: ReadLimits,
+) -> Result<StoreSnapshot, StorageError> {
+    let mut budget = ReadBudget::new(limits);
+    let mut entries = Vec::new();
+    for guard in snapshot.iter(records) {
+        budget.check_next_row()?;
+        let key = guard
+            .key()
+            .map_err(|error| StorageError::backend("read a bounded record key", &error))?;
+        if key.len() > limits.max_key_bytes {
+            return Err(StorageError::ReadLimitExceeded);
+        }
+        // Every lookup uses this same pinned view; live size/get reads would race.
+        let value_bytes = snapshot
+            .size_of(records, &key)
+            .map_err(|error| StorageError::backend("read a bounded record size", &error))?
+            .ok_or_else(|| bounded_snapshot_error("record size is missing from its stable view"))?;
+        let value_bytes =
+            usize::try_from(value_bytes).map_err(|_| StorageError::ReadLimitExceeded)?;
+        budget.consume(key.len(), value_bytes)?;
+        let value = snapshot
+            .get(records, &key)
+            .map_err(|error| StorageError::backend("read a bounded record value", &error))?
+            .ok_or_else(|| bounded_snapshot_error("record is missing from its stable view"))?;
+        if value.len() != value_bytes {
+            return Err(bounded_snapshot_error(
+                "record size differs within its stable view",
+            ));
+        }
+        entries.push((key.to_vec(), value.to_vec()));
+    }
+    Ok(StoreSnapshot { entries })
+}
+
+fn bounded_snapshot_error(detail: &'static str) -> StorageError {
+    StorageError::Backend {
+        operation: "read a bounded snapshot",
+        detail: detail.into(),
+    }
+}
+
 /// Rejects a store this build cannot read, rather than misreading it.
 fn require_readable_format(recorded: &[u8]) -> Result<(), StorageError> {
     require_format_version(recorded, ACTIVE_STORE_FORMAT)
@@ -256,6 +310,9 @@ fn read_entry(guard: fjall::Guard) -> Result<(Key, Value), StorageError> {
         .map_err(|error| StorageError::backend("read a scanned record", &error))?;
     Ok((key.to_vec(), value.to_vec()))
 }
+
+#[cfg(test)]
+mod bounded_tests;
 
 #[cfg(test)]
 mod tests {

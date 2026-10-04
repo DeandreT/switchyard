@@ -4,14 +4,20 @@
 //! commit a batch. Isolated replica state uses a unique [`CommittedStore`]
 //! writer and read-only views. Both backends have matching conformance suites,
 //! so a queue behaves identically whether its state lives in memory or on disk.
+//! [`BoundedStateStore`] optionally adds complete, stable reads with explicit
+//! row and logical key/value byte limits; ordinary reads remain unchanged.
 
 #![forbid(unsafe_code)]
 
+mod bounded;
 mod durable;
 mod memory;
 mod replica;
 
 use thiserror::Error;
+
+pub(crate) use bounded::ReadBudget;
+pub use bounded::{BoundedStateStore, ReadLimits};
 
 pub use crate::{
     durable::{
@@ -152,6 +158,8 @@ pub trait CommittedStore: Send + 'static {
 pub enum StorageError {
     #[error("storage lock was poisoned")]
     LockPoisoned,
+    #[error("storage read limit exceeded")]
+    ReadLimitExceeded,
     #[error("replica state requires a committed-store writer")]
     ReplicaWriteRequired,
     #[error("replica metadata cannot be opened as a standalone store")]

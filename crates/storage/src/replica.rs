@@ -1,4 +1,6 @@
-use crate::{Key, StateStore, StorageError, StoreSnapshot, Value, WriteBatch};
+use crate::{
+    BoundedStateStore, Key, ReadLimits, StateStore, StorageError, StoreSnapshot, Value, WriteBatch,
+};
 
 /// The read-only view associated with a committed-store writer.
 ///
@@ -43,6 +45,12 @@ impl<S: StateStore> StateStore for ReplicaReader<S> {
         limit: usize,
     ) -> Result<Vec<(Key, Value)>, StorageError> {
         self.inner.scan_from(prefix, start, limit)
+    }
+}
+
+impl<S: BoundedStateStore> BoundedStateStore for ReplicaReader<S> {
+    fn snapshot_bounded(&self, limits: ReadLimits) -> Result<StoreSnapshot, StorageError> {
+        self.inner.snapshot_bounded(limits)
     }
 }
 
