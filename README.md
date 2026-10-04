@@ -129,6 +129,9 @@ nonempty targets and adds no runtime installation or history-purge authority.
 The separate [native bootstrap](docs/native-image-bootstrap.md) checks selected
 native metadata before restoration, then starts the owner without a postcommit
 validation read. Bounded export remains an explicit constructor choice.
+The opt-in [catalog storage profile](docs/snapshot-catalog-storage.md) retains an
+opaque metadata/image pair atomically beside business records. It preserves
+older catalogs through ordinary writes and enables no runtime snapshot behavior.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing

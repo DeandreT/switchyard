@@ -70,3 +70,8 @@ Both strict workspace lint configurations, both workspace builds, formatting,
 protocol descriptor validation, and whitespace checks passed. No live SDK gate
 was rerun for this storage-only increment; the earlier unexplained SDK failure
 is not classified or fixed by these results.
+
+The separate [opt-in catalog profile](snapshot-catalog-storage.md) retains opaque
+metadata and image bytes outside these business snapshots. Catalog reads have
+their own fixed component bounds and one-view guarantees; ordinary complete
+reads and existing store profiles remain unchanged.
