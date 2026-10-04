@@ -122,6 +122,12 @@ not Clone and its diagnostics omit contents. Flush and shutdown are in-memory
 no-ops, and reads remain available afterward. Unpolled I/O futures are inert;
 polled operations finish immediately without an independently running worker.
 
+The additive [sealed image transport](sealed-image-transport.md) constructor
+instead moves an owned image without a body copy. Actual writes, including empty
+and default vectored writes, refuse without mutation; empty `write_all` is a
+separate inert library shortcut. Mutable constructors retain the behavior above.
+This alternative enables no engine snapshot, source-validation, or purge path.
+
 This is a per-buffer logical bound, not an aggregate or process-memory bound.
 It supplies no domain-image validation, durability, authorization, admission
 budget, or guarantee that a complete state image will fit. Snapshot methods,

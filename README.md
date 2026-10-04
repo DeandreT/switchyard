@@ -147,6 +147,8 @@ target in one commit. It does not enable populated replacement or runtime adopti
 The [selected native catalog bootstrap](docs/native-catalog-bootstrap.md) checks
 the actual metadata/image pair before target access, then starts the owner after
 that single publication. Catalog operations remain an explicit constructor choice.
+The [sealed transport buffer](docs/sealed-image-transport.md) moves an owned image
+without a body copy and refuses writes while preserving bounded reads and seeks.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
