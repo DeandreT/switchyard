@@ -1,5 +1,8 @@
 use std::{fmt, future::Future};
 
+mod bootstrap;
+pub use bootstrap::StateMachineCatalogBootstrapError;
+
 use domain::{
     CommittedCatalogError, CommittedCheckpoint, CommittedStateMachine, EncodedCommittedImage,
     RetainedCreateSendCatalog,

@@ -48,6 +48,15 @@ impl<'a> TrustedCreateSendBootstrap<'a> {
     pub fn expected_checkpoint(&self) -> &CommittedCheckpoint {
         self.checkpoint
     }
+
+    /// Borrow the immutable selected artifact bytes, still unvalidated here.
+    ///
+    /// This view is not proof of the trusted expectation, source validity,
+    /// commitment, provenance, ancestry, or installation authority. It grants
+    /// no mutation capability and makes no copy of the selected artifact.
+    pub fn artifact_bytes(&self) -> &'a [u8] {
+        self.artifact
+    }
 }
 
 impl fmt::Debug for TrustedCreateSendBootstrap<'_> {

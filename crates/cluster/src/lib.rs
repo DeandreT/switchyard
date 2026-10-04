@@ -23,9 +23,9 @@ pub use experimental_state_machine::{
     LogQueueRefusal, MAX_APPLY_BYTES, MAX_APPLY_ENTRIES,
     MAX_NATIVE_CATALOG_METADATA_OVERHEAD_BYTES, MAX_NATIVE_SNAPSHOT_METADATA_BYTES,
     MAX_STATE_MACHINE_OWNER_BYTES, MAX_STATE_MACHINE_OWNER_JOBS, NativeSnapshotMetadataError,
-    RetainedNativeSnapshotCatalog, StateMachineCatalogError, StateMachineError,
-    StateMachineImageBootstrapError, StateMachineImageExportError, StateMachineWorkload,
-    UnsupportedSnapshotBuilder,
+    RetainedNativeSnapshotCatalog, StateMachineCatalogBootstrapError, StateMachineCatalogError,
+    StateMachineError, StateMachineImageBootstrapError, StateMachineImageExportError,
+    StateMachineWorkload, UnsupportedSnapshotBuilder,
 };
 
 pub use experimental_replica::{

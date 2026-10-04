@@ -22,7 +22,7 @@ mod captured_image_fixture;
 pub use image_bootstrap::StateMachineImageBootstrapError;
 pub use image_catalog::{
     BuiltNativeSnapshotCatalog, MAX_NATIVE_CATALOG_METADATA_OVERHEAD_BYTES,
-    RetainedNativeSnapshotCatalog, StateMachineCatalogError,
+    RetainedNativeSnapshotCatalog, StateMachineCatalogBootstrapError, StateMachineCatalogError,
 };
 pub use image_export::StateMachineImageExportError;
 pub use response::{LogApplication, LogQueueConfigRefusal, LogQueueRefusal};
