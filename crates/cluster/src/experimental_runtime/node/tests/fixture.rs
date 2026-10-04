@@ -177,17 +177,17 @@ impl Drop for CommitGate {
     }
 }
 
-struct Observed<W: CommittedStore> {
+pub(super) struct Observed<W: CommittedStore> {
     inner: W,
     flags: Arc<Flags>,
 }
 #[derive(Clone)]
-struct Reader<R: StateStore> {
+pub(super) struct Reader<R: StateStore> {
     inner: R,
     flags: Arc<Flags>,
 }
 
-fn observed<W: CommittedStore>(writer: W) -> (Observed<W>, Control<W::Reader>) {
+pub(super) fn observed<W: CommittedStore>(writer: W) -> (Observed<W>, Control<W::Reader>) {
     let flags = Arc::new(Flags {
         retired: AtomicBool::new(false),
         retired_changed: Notify::new(),

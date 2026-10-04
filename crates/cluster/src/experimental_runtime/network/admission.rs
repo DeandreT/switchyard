@@ -11,6 +11,8 @@ pub(super) struct Lease {
     routes: Arc<Routes>,
     generation: NodeGeneration,
     bytes: usize,
+    #[cfg(test)]
+    test_source: Option<NodeGeneration>,
 }
 
 impl Lease {
@@ -19,13 +21,25 @@ impl Lease {
             routes,
             generation,
             bytes,
+            #[cfg(test)]
+            test_source: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_test_source(mut self, source: NodeGeneration) -> Self {
+        self.test_source = Some(source);
+        self
     }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
+        #[cfg(not(test))]
         self.routes.refund(&self.generation, self.bytes);
+        #[cfg(test)]
+        self.routes
+            .refund_for_test(self.test_source.as_ref(), &self.generation, self.bytes);
     }
 }
 

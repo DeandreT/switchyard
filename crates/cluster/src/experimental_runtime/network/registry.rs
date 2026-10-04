@@ -13,6 +13,11 @@ use super::supervisor::EndpointOwner;
 use super::{MAX_RPC_BYTES, MAX_RPC_JOBS, MAX_TARGET_RPC_BYTES, RpcCause, RpcWorkload};
 use crate::LogTypes;
 
+#[cfg(test)]
+mod partition;
+#[cfg(test)]
+pub(in crate::experimental_runtime) use partition::TestIsolation;
+
 pub(in crate::experimental_runtime) fn stable_label(node_id: u64) -> String {
     format!("switchyard-in-process-{node_id}")
 }
@@ -54,6 +59,8 @@ pub(in crate::experimental_runtime) struct Routes {
 struct RouteState {
     slots: BTreeMap<u64, Slot>,
     workload: RpcWorkload,
+    #[cfg(test)]
+    test_edges: Vec<partition::EdgeState>,
 }
 
 struct Slot {
@@ -111,6 +118,8 @@ impl Routes {
             state: Mutex::new(RouteState {
                 slots,
                 workload: RpcWorkload::default(),
+                #[cfg(test)]
+                test_edges: Vec::new(),
             }),
             changed: Notify::new(),
         }))
@@ -197,6 +206,10 @@ impl Routes {
         if !endpoint.generation.is_live() {
             return Err(RpcCause::Unavailable);
         }
+        #[cfg(test)]
+        if state.edge_is_cut(source, &endpoint.generation) {
+            return Err(RpcCause::Unavailable);
+        }
         let target_bytes = state.slots.get(&target).ok_or(RpcCause::Unavailable)?.bytes;
         let jobs = state
             .workload
@@ -220,7 +233,11 @@ impl Routes {
             slot.jobs += 1;
             slot.bytes = target_total;
         }
+        #[cfg(test)]
+        state.track_edge(source, &endpoint.generation);
         let lease = Lease::new(self.clone(), endpoint.generation.clone(), bytes);
+        #[cfg(test)]
+        let lease = lease.with_test_source(source.clone());
         let job = make(lease);
         // The admitted count also covers publication. A closing worker cannot
         // finish while this packet is between reservation and queue insertion.
@@ -233,6 +250,7 @@ impl Routes {
         })
     }
 
+    #[cfg(not(test))]
     pub(super) fn refund(&self, generation: &NodeGeneration, bytes: usize) {
         if let Ok(mut state) = self.state.lock() {
             state.workload.accepted_jobs = state.workload.accepted_jobs.saturating_sub(1);

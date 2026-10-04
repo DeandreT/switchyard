@@ -16,6 +16,9 @@ mod node;
 mod rejoin;
 mod startup;
 
+#[cfg(test)]
+mod partition_tests;
+
 pub use client::{
     ClientWorkload, ExperimentalRaftHandle, QueueIntent, QueueWriteError, QueueWriteOutcome,
     QueueWriteRejection, QueueWriteResult, QueueWriteUnknown,

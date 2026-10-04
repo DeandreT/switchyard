@@ -6,6 +6,8 @@ mod supervisor;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(super) use registry::TestIsolation;
 pub(super) use registry::{NodeGeneration, PendingEndpoint, Routes, stable_label};
 pub(super) use rpc::NetworkFactory;
 pub(super) use supervisor::EndpointOwner;

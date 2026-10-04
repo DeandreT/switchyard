@@ -8,6 +8,7 @@ use std::{
 use super::{NodeStopCause, StopSignal};
 
 mod fixture;
+mod partition_custody;
 mod runtime;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
