@@ -144,6 +144,9 @@ admission and joined cleanup. It grants no engine snapshot or purge authority.
 The [combined catalog bootstrap](docs/committed-image-catalog-bootstrap.md)
 publishes exact selected business rows and their opaque catalog into a pristine
 target in one commit. It does not enable populated replacement or runtime adoption.
+The [selected native catalog bootstrap](docs/native-catalog-bootstrap.md) checks
+the actual metadata/image pair before target access, then starts the owner after
+that single publication. Catalog operations remain an explicit constructor choice.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing

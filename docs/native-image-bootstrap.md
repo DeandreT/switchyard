@@ -119,5 +119,10 @@ No real allocator failure, OS thread-exhaustion fault, mid-sync or power-loss
 injection, fully populated 64 MiB/65,536-row restore, or RSS proof is established
 here. The domain bootstrap's separate child-process tests cover abrupt exits
 before and after a synchronous commit, not torn-journal recovery. Snapshot
-catalog publication, populated-state installation, engine adoption, and history
-compaction remain unsupported.
+catalog publication is not added by this ordinary constructor; populated-state
+installation, engine adoption, and history compaction remain unsupported.
+
+The separate [native catalog bootstrap](native-catalog-bootstrap.md) checks the
+actual metadata/artifact pair, independently enforces trusted selection, and uses
+one combined business/init/catalog commit before starting the owner. It does not
+change this constructor's expected-checkpoint-first validation or ordinary commit.
