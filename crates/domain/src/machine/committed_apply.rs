@@ -9,7 +9,9 @@ use crate::{
 
 use super::{committed_prepare::CommittedPreparationError, *};
 
+mod image_bootstrap;
 mod image_export;
+pub use image_bootstrap::{CommittedImageBootstrapError, TrustedCreateSendBootstrap};
 pub use image_export::CommittedImageExportError;
 
 /// One synchronous committed-entry writer with a matching read-only machine.

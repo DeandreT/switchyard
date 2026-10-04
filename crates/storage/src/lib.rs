@@ -9,6 +9,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod batch_reservation_tests;
 mod bounded;
 mod durable;
 mod memory;
@@ -44,6 +46,17 @@ pub struct WriteBatch {
 }
 
 impl WriteBatch {
+    /// Fallibly reserves mutation capacity without changing batch contents.
+    ///
+    /// This bounds neither mutation data nor allocator capacity/RSS and grants
+    /// no write authority. Callers still own their separate storage capability.
+    pub fn try_reserve_mutations(
+        &mut self,
+        additional: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
+        self.mutations.try_reserve_exact(additional)
+    }
+
     pub fn put(mut self, key: impl Into<Key>, value: impl Into<Value>) -> Self {
         self.push_put(key, value);
         self
