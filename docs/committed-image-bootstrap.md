@@ -141,3 +141,8 @@ native membership interpretation, snapshot catalog, engine installation, runtime
 adoption, or history compaction is established here. Existing no-snapshot
 preflight/runtime still require matching complete retained history and refuse
 purged or application-ahead pairings.
+
+The separate opt-in [combined catalog bootstrap](committed-image-catalog-bootstrap.md)
+publishes these same selected rows, initialization, and an opaque image/metadata
+pair in one commit. This ordinary constructor remains catalog-independent and
+keeps its original generic bounds, source ordering, and target refusal behavior.
