@@ -107,6 +107,11 @@ into server startup, sockets, ordinary queue operations, or production mode;
 finite retained history, snapshots, authenticated transport, and broader
 replication remain explicit limits.
 
+Both storage backends also provide opt-in [bounded complete reads](docs/bounded-storage-reads.md)
+for future state-image validation. These reads enforce row and logical data-byte
+limits without changing ordinary reads, replica write authority, or disk formats;
+they do not implement snapshot export, installation, or history compaction.
+
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
 TLS identity and shared-access policy also apply to this separate listener.
