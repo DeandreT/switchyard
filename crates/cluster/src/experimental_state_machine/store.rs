@@ -7,7 +7,7 @@ use openraft::{
 use storage::CommittedStore;
 
 use crate::experimental_owner::RetiredOwner;
-use crate::{LogEntry, LogTypes};
+use crate::{BoundedSnapshotData, LogEntry, LogTypes};
 
 use super::{
     AppliedState, LogApplication, StateMachineError, StateMachineWorkload,
@@ -177,14 +177,14 @@ impl RaftStateMachine<LogTypes> for ExperimentalStateMachine {
 
     async fn begin_receiving_snapshot(
         &mut self,
-    ) -> Result<Box<std::io::Cursor<Vec<u8>>>, StorageError<u64>> {
+    ) -> Result<Box<BoundedSnapshotData>, StorageError<u64>> {
         Err(snapshot_error(ErrorVerb::Write))
     }
 
     async fn install_snapshot(
         &mut self,
         _meta: &SnapshotMeta<u64, openraft::BasicNode>,
-        _snapshot: Box<std::io::Cursor<Vec<u8>>>,
+        _snapshot: Box<BoundedSnapshotData>,
     ) -> Result<(), StorageError<u64>> {
         Err(snapshot_error(ErrorVerb::Write))
     }

@@ -5,6 +5,9 @@ mod experimental_owner;
 pub mod experimental_replica;
 pub mod experimental_runtime;
 pub mod experimental_state_machine;
+mod snapshot_data;
+
+pub use snapshot_data::{BoundedSnapshotData, MAX_SNAPSHOT_BYTES};
 
 pub use experimental_log::{
     ExperimentalLogStore, LogCodecError, LogEntry, LogId, LogProfile, LogResource, LogStorageError,

@@ -35,7 +35,7 @@ openraft::declare_raft_types!(
         R = crate::experimental_state_machine::LogApplication,
         NodeId = u64,
         Node = openraft::BasicNode,
-        SnapshotData = std::io::Cursor<Vec<u8>>,
+        SnapshotData = crate::BoundedSnapshotData,
         AsyncRuntime = openraft::TokioRuntime,
 );
 

@@ -1,11 +1,8 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io::Cursor,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use cluster::{
-    ExperimentalLogStore, ExperimentalStateMachine, LogApplication as A, LogEntry, LogProfile,
-    LogQueueConfigRefusal, LogQueueRefusal, StateMachineError,
+    BoundedSnapshotData, ExperimentalLogStore, ExperimentalStateMachine, LogApplication as A,
+    LogEntry, LogProfile, LogQueueConfigRefusal, LogQueueRefusal, StateMachineError,
 };
 use domain::{CommittedStreamId, QueueConfig, Timestamp};
 use openraft::{
@@ -301,7 +298,10 @@ async fn unsupported_snapshot_methods_never_write_and_current_snapshot_checks_he
         snapshot_id: "private-snapshot-name".into(),
     };
     let error = machine
-        .install_snapshot(&meta, Box::new(Cursor::new(vec![0x71; 1024])))
+        .install_snapshot(
+            &meta,
+            Box::new(BoundedSnapshotData::from_bytes(&[0x71; 1024])?),
+        )
         .await
         .expect_err("snapshot installation must refuse");
     assert!(error.to_string().contains("does not support snapshots"));
