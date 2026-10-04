@@ -1,6 +1,10 @@
 use std::sync::{Arc, Mutex};
 
-use storage::{CommittedStore, Key, StateStore, StorageError, StoreSnapshot, Value, WriteBatch};
+use storage::{
+    CatalogCommittedStore, CatalogReadError, CommittedStore, Key, SnapshotCatalogReader,
+    SnapshotCatalogRecord, StateStore, StorageError, StoreSnapshot, StoredSnapshotCatalog, Value,
+    WriteBatch,
+};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct Counts {
@@ -11,6 +15,9 @@ pub(super) struct Counts {
     pub snapshots: usize,
     pub reader_applies: usize,
     pub commits: usize,
+    pub catalog_reader_factories: usize,
+    pub catalog_reads: usize,
+    pub catalog_commits: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -18,17 +25,29 @@ pub(super) enum Fault {
     #[default]
     None,
     Initialized,
+    InitializedLimit,
     Scan,
+    ScanLimit,
     CommitBefore,
     CommitAfter,
+    CommitLimit,
+    CommitCorrupt,
     ExitBefore,
     ExitAfter,
+}
+
+#[derive(Clone)]
+pub(super) struct CatalogAttempt {
+    pub metadata: Vec<u8>,
+    pub artifact: Vec<u8>,
+    pub artifact_pointer: usize,
 }
 
 struct Shared<W> {
     writer: W,
     force_uninitialized: bool,
     batches: Vec<WriteBatch>,
+    catalog_attempts: Vec<CatalogAttempt>,
 }
 
 pub(super) struct Writer<W> {
@@ -48,6 +67,7 @@ pub(super) fn observed<W: CommittedStore>(writer: W) -> (Writer<W>, Control<W>) 
         writer,
         force_uninitialized: false,
         batches: Vec::new(),
+        catalog_attempts: Vec::new(),
     }));
     let counts = Arc::new(Mutex::new(Counts::default()));
     let fault = Arc::new(Mutex::new(Fault::None));
@@ -68,6 +88,13 @@ pub(super) fn observed<W: CommittedStore>(writer: W) -> (Writer<W>, Control<W>) 
 impl<W: CommittedStore> Control<W> {
     pub(super) fn counts(&self) -> Counts {
         self.counts.lock().expect("test counts lock").clone()
+    }
+
+    pub(super) fn reset(&self) {
+        *self.counts.lock().expect("test counts lock") = Counts::default();
+        let mut shared = self.shared.lock().expect("test writer lock");
+        shared.batches.clear();
+        shared.catalog_attempts.clear();
     }
 
     pub(super) fn reader(&self) -> W::Reader {
@@ -145,9 +172,17 @@ impl<W: CommittedStore> CommittedStore for Writer<W> {
     fn is_initialized(&self) -> Result<bool, StorageError> {
         self.counts.lock().expect("test counts lock").initialized += 1;
         let mut fault = self.fault.lock().expect("test fault lock");
-        if matches!(*fault, Fault::Initialized) {
-            *fault = Fault::None;
-            return Err(physical_error());
+        match *fault {
+            Fault::Initialized | Fault::InitializedLimit => {
+                let error = if matches!(*fault, Fault::InitializedLimit) {
+                    StorageError::ReadLimitExceeded
+                } else {
+                    physical_error()
+                };
+                *fault = Fault::None;
+                return Err(error);
+            }
+            _ => {}
         }
         drop(fault);
         let shared = self.shared.lock().expect("test writer lock");
@@ -202,9 +237,17 @@ impl<R: StateStore> StateStore for Reader<R> {
             limit,
         ));
         let mut fault = self.fault.lock().expect("test fault lock");
-        if matches!(*fault, Fault::Scan) {
-            *fault = Fault::None;
-            return Err(physical_error());
+        match *fault {
+            Fault::Scan | Fault::ScanLimit => {
+                let error = if matches!(*fault, Fault::ScanLimit) {
+                    StorageError::ReadLimitExceeded
+                } else {
+                    physical_error()
+                };
+                *fault = Fault::None;
+                return Err(error);
+            }
+            _ => {}
         }
         drop(fault);
         self.inner.scan_from(prefix, start, limit)
@@ -225,5 +268,109 @@ fn physical_error() -> StorageError {
     StorageError::Backend {
         operation: "injected image bootstrap target",
         detail: "SECRET target path/body/backend detail".into(),
+    }
+}
+
+impl<W: CatalogCommittedStore> Control<W> {
+    pub(super) fn catalog(&self) -> Result<Option<StoredSnapshotCatalog>, CatalogReadError> {
+        self.shared
+            .lock()
+            .expect("test writer lock")
+            .writer
+            .catalog_reader()
+            .read_catalog()
+    }
+
+    pub(super) fn inject_catalog(
+        &self,
+        metadata: &[u8],
+        artifact: &[u8],
+    ) -> Result<(), StorageError> {
+        self.shared
+            .lock()
+            .expect("test writer lock")
+            .writer
+            .commit_with_catalog(
+                WriteBatch::default(),
+                SnapshotCatalogRecord::new(metadata, artifact).expect("bounded catalog fixture"),
+            )
+    }
+
+    pub(super) fn catalog_attempts(&self) -> Vec<CatalogAttempt> {
+        self.shared
+            .lock()
+            .expect("test writer lock")
+            .catalog_attempts
+            .clone()
+    }
+}
+
+impl<W: CatalogCommittedStore> CatalogCommittedStore for Writer<W> {
+    type CatalogReader = CatalogReader<W::CatalogReader>;
+
+    fn catalog_reader(&self) -> Self::CatalogReader {
+        self.counts
+            .lock()
+            .expect("test counts lock")
+            .catalog_reader_factories += 1;
+        CatalogReader {
+            inner: self
+                .shared
+                .lock()
+                .expect("test writer lock")
+                .writer
+                .catalog_reader(),
+            counts: Arc::clone(&self.counts),
+        }
+    }
+
+    fn commit_with_catalog(
+        &mut self,
+        batch: WriteBatch,
+        catalog: SnapshotCatalogRecord<'_>,
+    ) -> Result<(), StorageError> {
+        self.counts
+            .lock()
+            .expect("test counts lock")
+            .catalog_commits += 1;
+        let mut shared = self.shared.lock().expect("test writer lock");
+        shared.batches.push(batch.clone());
+        // Comparison copies are test-only, not production retention behavior.
+        shared.catalog_attempts.push(CatalogAttempt {
+            metadata: catalog.metadata().to_vec(),
+            artifact: catalog.artifact().to_vec(),
+            artifact_pointer: catalog.artifact().as_ptr() as usize,
+        });
+        let fault = std::mem::take(&mut *self.fault.lock().expect("test fault lock"));
+        match fault {
+            Fault::CommitBefore => return Err(physical_error()),
+            Fault::CommitLimit => return Err(StorageError::ReadLimitExceeded),
+            Fault::CommitCorrupt => {
+                return Err(StorageError::CorruptMetadata {
+                    detail: "SECRET catalog header/address".into(),
+                });
+            }
+            Fault::ExitBefore => std::process::exit(71),
+            _ => {}
+        }
+        shared.writer.commit_with_catalog(batch, catalog)?;
+        match fault {
+            Fault::CommitAfter => Err(physical_error()),
+            Fault::ExitAfter => std::process::exit(72),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct CatalogReader<R> {
+    inner: R,
+    counts: Arc<Mutex<Counts>>,
+}
+
+impl<R: SnapshotCatalogReader> SnapshotCatalogReader for CatalogReader<R> {
+    fn read_catalog(&self) -> Result<Option<StoredSnapshotCatalog>, CatalogReadError> {
+        self.counts.lock().expect("test counts lock").catalog_reads += 1;
+        self.inner.read_catalog()
     }
 }

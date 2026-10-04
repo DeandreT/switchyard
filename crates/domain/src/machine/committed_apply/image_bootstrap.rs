@@ -83,6 +83,8 @@ pub enum CommittedImageBootstrapError {
 
 type Result<T> = std::result::Result<T, CommittedImageBootstrapError>;
 
+mod catalog;
+
 impl<W: CommittedStore> CommittedStateMachine<W> {
     /// Atomically seeds only a pristine replica with the exact selected image.
     ///
@@ -122,17 +124,7 @@ impl<W: CommittedStore> CommittedStateMachine<W> {
         request: TrustedCreateSendBootstrap<'_>,
     ) -> Result<Self> {
         let image = validate_selection(&request)?;
-        let reader = writer.reader();
-        if writer
-            .is_initialized()
-            .map_err(|_| CommittedImageBootstrapError::TargetReadFailed)?
-            || !reader
-                .scan_prefix(&[], 1)
-                .map_err(|_| CommittedImageBootstrapError::TargetReadFailed)?
-                .is_empty()
-        {
-            return Err(CommittedImageBootstrapError::TargetNotPristine);
-        }
+        let reader = pristine_reader(&writer)?;
         let batch = copy_rows(&image)?;
         writer
             .commit(batch)
@@ -169,6 +161,21 @@ fn validate_selection<'a>(
         }
         _ => CommittedImageBootstrapError::InvalidImage,
     })
+}
+
+fn pristine_reader<W: CommittedStore>(writer: &W) -> Result<W::Reader> {
+    let reader = writer.reader();
+    if writer
+        .is_initialized()
+        .map_err(|_| CommittedImageBootstrapError::TargetReadFailed)?
+        || !reader
+            .scan_prefix(&[], 1)
+            .map_err(|_| CommittedImageBootstrapError::TargetReadFailed)?
+            .is_empty()
+    {
+        return Err(CommittedImageBootstrapError::TargetNotPristine);
+    }
+    Ok(reader)
 }
 
 fn copy_rows(image: &ValidatedCreateSendImage<'_>) -> Result<WriteBatch> {

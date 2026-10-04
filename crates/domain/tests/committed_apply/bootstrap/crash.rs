@@ -168,10 +168,20 @@ impl Drop for ChildGuard {
 }
 
 fn run_child(directory: &Path, stage: &str) -> TestResult<(ExitStatus, String)> {
+    run_child_for_test(directory, stage, CHILD_TEST, DIRECTORY, STAGE)
+}
+
+pub(super) fn run_child_for_test(
+    directory: &Path,
+    stage: &str,
+    child_test: &str,
+    directory_variable: &str,
+    stage_variable: &str,
+) -> TestResult<(ExitStatus, String)> {
     let child = Command::new(std::env::current_exe()?)
-        .args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
-        .env(DIRECTORY, directory)
-        .env(STAGE, stage)
+        .args(["--exact", child_test, "--test-threads=1", "--nocapture"])
+        .env(directory_variable, directory)
+        .env(stage_variable, stage)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

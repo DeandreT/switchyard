@@ -17,6 +17,8 @@ use super::{
     fixture::{entity, namespace, record, stream},
 };
 
+#[path = "bootstrap/catalog.rs"]
+mod catalog;
 #[path = "bootstrap/crash.rs"]
 mod crash;
 #[path = "bootstrap/observed.rs"]

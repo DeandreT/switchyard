@@ -139,6 +139,12 @@ pub trait SnapshotCatalogReader: Clone + Send + Sync + 'static {
 ///
 /// The catalog reader observes exactly this writer's catalog. Business readers
 /// and their snapshots contain only caller records, never catalog metadata.
+/// This opted-in contract also requires [`CommittedStore::is_initialized`] to
+/// validate the profile and initialization invariants: an uninitialized store
+/// contains neither business records nor a catalog. Malformed profile/init or
+/// uninitialized state containing either must return an error, not Ok(false).
+/// This requirement is specific to catalog writers and does not broaden the
+/// ordinary CommittedStore contract or provide a read/commit compare-and-swap.
 /// The privileged batch, initialized flag, and both supplied catalog components
 /// must be committed atomically. Ordinary [`CommittedStore::commit`] preserves
 /// the catalog slot unchanged. A retained catalog may legitimately be older
