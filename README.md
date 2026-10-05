@@ -138,6 +138,9 @@ its owned result grants no writer, fence or publication authority.
 The separate [protected Memory store](docs/protected-memory-state.md) replaces
 complete business/init/catalog/fence data in one fresh private object; its
 unique writer supplies no durable, canonical-selection or adoption authority.
+The [protected image agreement check](docs/protected-image-agreement.md) borrows
+one owned capture and checks complete artifact, checkpoint, fence and row
+agreement without reading a store or granting publication authority.
 The [pure native metadata codec](docs/native-snapshot-metadata.md) checks every
 metadata field against the exact validated image and captured checkpoint. Pair
 agreement alone grants no installation, source-health, or history-purge authority.
