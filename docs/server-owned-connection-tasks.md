@@ -1,10 +1,13 @@
 # Isolated Connection Task Ownership
 
-The AMQP engine has a private `cfg(test)` path that retains the actual actor and
-optional reader task for one negotiated connection. Unlike the separate
+The AMQP engine's earlier private `cfg(test)` path retained the actual actor and
+optional reader task for one negotiated connection. It is now promoted behind an
+explicit [public owner and consuming acceptor](server-connection-owner.md).
+This page preserves the earlier isolated-path evidence and corrections; the
+linked public contract records the current opt-in boundary. Unlike the separate
 [retirement model](server-task-retirement.md), these are the original socket
-futures, not synthetic children. This path is not public or activated by ordinary,
-atomic, or WebSocket listeners, SDK fixtures, or production startup.
+futures, not synthetic children. Default ordinary, atomic, or WebSocket listeners,
+SDK fixtures, and production startup still do not activate this custody.
 
 The unique external owner must remain retained and drive borrowed `finish` on
 its captured live runtime A. Disposable connection parents and status observers
@@ -16,32 +19,35 @@ global quarantine, dedicated runtime, or autonomous last-owner cleanup.
 
 A private negotiation/launch extraction preserves the existing option validation,
 SASL/header/Open sequence, frame limits, deadline helpers, caller conversion
-timing, and original EngineError/cause objects. Public acceptance immediately
-uses legacy launch in the same poll. That path still discards the actor handle
-and uses the original ConnectionReader; client behavior is unchanged.
+timing, and original EngineError/cause objects. Existing `ServerConnection`
+acceptance immediately uses legacy launch in the same poll. That path still
+discards the actor handle and uses the original ConnectionReader; client behavior
+is unchanged.
 
 Public `shutdown` still cancels driver work and observes actor exit notification,
 not an actual actor join. Its implementation, close/error precedence, session
 epilogue, diagnostics, transport, and default timeouts are unchanged. Only the
-private scoped launch activates the new custody. No dependency, public export,
-storage format, or default admission policy changes.
+scoped launch activates the new custody. The earlier private checkpoint changed
+no public exports; the later public API remains opt-in. Dependencies, storage
+formats, and default admission policies are unchanged.
 
 ## Ownership And Installation
 
 Two fixed role cells retain the original handles and results. The owner also
-holds sticky stop state, logical observations, and a synthetic resource anchor
-that need not be Send. It does not own Broker, provider, certificates, or a
-whole-fixture resource bundle. The two roles are not a full descendant-tree or
+holds sticky stop state and a caller anchor that need not be Send or 'static.
+Logical observations and injected controls remain test-only. It does not own
+Broker, provider, certificates, or a whole-fixture resource bundle. The two roles
+are not a full descendant-tree or
 aggregate allocation bound.
 
 Synchronous launch claims an unused actor slot atomically against sealing.
-Sealed or duplicate launch returns the untouched negotiated transport without
-creating an identity or task. An accepted no-await installation guard stays
+Sealed or private-test duplicate launch returns the original advanced negotiated
+transport without creating an identity or task. An accepted no-await installation guard stays
 outside the actor future and roots its actual handle before launch returns.
 Stop arriving before lifecycle binding remains sticky and reaches the eventual
 cancellation sender.
 
-The actor captures only reader registration, stop, runtime, and test controls,
+The actor captures only reader registration, stop, runtime, and test-only controls,
 never its own handle cell or the whole external owner. The reader captures its
 original transport/frame/activity future and controls, not a role cell. Reader
 claim also serializes against sealing; claim-before-seal retains the installation
@@ -79,10 +85,11 @@ output is unit; engine I/O errors already absorbed/logged are not newly forwarde
 as join failures. A second finish returns no new report or health proof.
 Joining either task does not join its runtime's OS workers or its caller.
 
-## Focused Evidence
+## Earlier Focused Evidence
 
-The 23 focused tests cover empty/cached finish, a non-Send Rc anchor, untouched
-sealed/duplicate refusal, and unpolled/pending negotiation loss without new roles.
+The earlier 23 focused tests cover empty/cached finish, a non-Send Rc anchor,
+original sealed/duplicate refusal, and unpolled/pending negotiation loss without
+new roles.
 They preserve a typed private I/O cause through extracted and public acceptance,
 the original invalid-timeout variant, and exact header/Open/Close wire bytes.
 
@@ -139,10 +146,11 @@ listener descendants, broker/native jobs, or fixture resources. Existing stop
 windows still bound observation rather than physical completion. It supplies no
 safe-reopen receipt, whole-run coverage, live SDK evidence, or explanation/fix
 for the historical provisional-Complete timeout in
-[client diagnostic evidence](atomic-sdk-evidence.md). Full retained ownership and
-listener integration remain separate work.
+[client diagnostic evidence](atomic-sdk-evidence.md). Public engine ownership is
+opt-in; full descendant custody, protocol listener integration, and fixture
+activation remain separate work.
 
-## Verification
+## Earlier Verification
 
 The corrected source passed all 23 focused tests, ten additional complete
 focused runs (230 passes), and 30 additional isolated cancellation-handoff runs.
