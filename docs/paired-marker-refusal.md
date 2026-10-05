@@ -55,6 +55,10 @@ activation, adoption/completion receipt, or resource-custody guarantee in this
 increment. Reserving marker presence is a prerequisite for future isolated work,
 not evidence that those features exist.
 
+The separate [controlled paired-storage prototype](paired-storage-prototype.md)
+adds private test-only physical writers. It does not turn this production guard
+into a constructor, inspector, adoption capability or custody receipt.
+
 ## Evidence
 
 Eight private test families cover every marker and all three public generic

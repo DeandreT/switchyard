@@ -159,6 +159,8 @@ The private [paired-image model](docs/native-image-paired-model.md) tests bounde
 transition records and conservative classification without enabling adoption.
 Generic durable openers [refuse reserved paired metadata](docs/paired-marker-refusal.md)
 before application stamps or record-keyspace acquisition, without adding a paired writer.
+The separate private [paired-storage prototype](docs/paired-storage-prototype.md)
+tests controlled physical creation and atomic replacement without enabling adoption.
 The [sealed local compaction API](docs/sealed-local-compaction.md) retains a
 checked catalog before deleting an exact local prefix, without runtime activation.
 

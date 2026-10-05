@@ -105,6 +105,11 @@ Physical fencing, atomic state/catalog/selection-fence publication, complete
 same-view backend capture, creation ordering, sealed writer admission and BOTH
 owner custody require separately reviewed implementation and evidence.
 
+The separate [controlled physical prototype](paired-storage-prototype.md) tests
+private storage creation, capture, replacement and reopening. Its opaque fixture
+bytes do not promote this model into semantic adoption or establish application-
+owner custody; the evidence above remains specific to the pure model.
+
 ## Verification
 
 The final source passed all 38 focused tests and ten additional repeated runs

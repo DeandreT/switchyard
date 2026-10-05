@@ -59,6 +59,10 @@ records, even when a caller key has the same spelling as a reserved metadata key
 There is no public combined transaction-view API across separately requested
 business and catalog reads.
 
+The separate [controlled paired-storage prototype](paired-storage-prototype.md)
+tests private physical publication with an opaque fence. It adds no selection-
+fence capability or cross-directory transaction to this public catalog API.
+
 ## Complete Bounded Reads
 
 `SnapshotCatalogRecord::new(metadata, artifact)` borrows immutable inputs and
