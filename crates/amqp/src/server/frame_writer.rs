@@ -13,6 +13,10 @@ use super::{
 
 const MIN_FRAME_SIZE: u32 = 512;
 
+mod diagnostics;
+use super::diagnostics::DiagnosticWriterPhase;
+use diagnostics::Observation;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("encoded AMQP frame of {actual} bytes exceeds the peer maximum of {maximum}")]
 pub(super) struct FrameWriteError {
@@ -29,6 +33,7 @@ pub(super) struct FrameWriter<W> {
     content_budget: ContentBudget,
     error_link_names: ErrorLinkNames,
     reservation_cleanup: Arc<Notify>,
+    diagnostics: Option<diagnostics::Binding>,
 }
 
 impl<W> FrameWriter<W> {
@@ -48,6 +53,7 @@ impl<W> FrameWriter<W> {
             content_budget: ContentBudget::default(),
             error_link_names: ErrorLinkNames::default(),
             reservation_cleanup: Arc::new(Notify::new()),
+            diagnostics: None,
         })
     }
 
@@ -89,6 +95,18 @@ impl<W> FrameWriter<W> {
         self.activity = activity;
     }
 
+    #[cfg(test)]
+    pub(super) fn new_with_diagnostics(
+        inner: W,
+        maximum: u32,
+        recorder: super::diagnostics::ServerDiagnosticRecorder,
+        parent: Option<super::diagnostics::DiagnosticScope>,
+    ) -> io::Result<Self> {
+        let mut writer = Self::new(inner, maximum)?;
+        writer.diagnostics = Some(diagnostics::Binding::new(recorder, parent));
+        Ok(writer)
+    }
+
     pub fn maximum_frame_size(&self) -> u32 {
         self.maximum
     }
@@ -113,13 +131,21 @@ impl<W> FrameWriter<W> {
 
 impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     pub async fn write_frame(&mut self, frame: &Frame) -> io::Result<()> {
+        let mut observation = Observation::start(self.diagnostics.as_ref());
         if self.activity.is_tainted() {
+            observation.finish(DiagnosticWriterPhase::PreflightRefused);
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "an incomplete AMQP frame has tainted the transport",
             ));
         }
-        let encoded = self.encoded_frame(frame)?;
+        let encoded = match self.encoded_frame(frame) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                observation.finish(DiagnosticWriterPhase::PreflightRefused);
+                return Err(error);
+            }
+        };
         let close = matches!(
             frame,
             Frame::Amqp {
@@ -127,22 +153,46 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
                 ..
             }
         );
-        let deadline = self
-            .activity
-            .write_deadline(self.options, self.peer_idle_millis, close)?;
+        let deadline =
+            match self
+                .activity
+                .write_deadline(self.options, self.peer_idle_millis, close)
+            {
+                Ok(deadline) => deadline,
+                Err(error) => {
+                    observation.finish(DiagnosticWriterPhase::PreflightRefused);
+                    return Err(error);
+                }
+            };
         self.activity.begin_write(close);
-        let mut result = tokio::time::timeout_at(deadline, async {
+        observation.writing();
+        // Keep the observation outside the timed future: timeout is not Drop.
+        let timed = tokio::time::timeout_at(deadline, async {
             self.inner.write_all(&encoded).await?;
-            self.inner.flush().await
+            observation.wrote();
+            self.inner.flush().await?;
+            observation.flushed();
+            Ok::<(), io::Error>(())
         })
-        .await
-        .unwrap_or_else(|_| {
-            Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "AMQP frame write or flush timed out",
-            ))
-        });
+        .await;
+        let mut phase = DiagnosticWriterPhase::WriteAccepted;
+        let mut result = match timed {
+            Ok(result) => {
+                if result.is_err() {
+                    phase = observation.error_phase();
+                }
+                result
+            }
+            Err(_) => {
+                phase = observation.timeout_phase();
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "AMQP frame write or flush timed out",
+                ))
+            }
+        };
         if result.is_ok() && tokio::time::Instant::now() >= deadline {
+            phase = DiagnosticWriterPhase::TimeoutAfterFlush;
             result = Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "AMQP frame write or flush completed after its deadline",
@@ -153,6 +203,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         } else {
             self.activity.failed_write();
         }
+        observation.finish(phase);
         result
     }
 

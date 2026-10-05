@@ -4,6 +4,7 @@ use super::*;
 
 mod capture;
 mod schema;
+mod writer;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 const EVENT: DiagnosticEvent = DiagnosticEvent::Fixture(DiagnosticFixtureBoundary::Started);
