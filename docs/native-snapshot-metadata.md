@@ -16,6 +16,10 @@ certification, snapshot installation, quorum, authorization, authenticity,
 ancestry, anti-rollback, or history-purge authority. Existing owner constructors,
 snapshot traits, runtime startup, and no-purge restrictions are unchanged.
 
+The separate [candidate preparer](aligned-seed-candidates.md) generates desired
+empty-log controls from checked image data and caller expectations. It does not
+persist a catalog or certify historical voting or adoption authority.
+
 ## Frozen Format
 
 The complete metadata limit is 8 KiB. Its 12-byte frame contains `SWYM`,

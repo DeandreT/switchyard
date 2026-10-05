@@ -166,6 +166,9 @@ checked catalog before deleting an exact local prefix, without runtime activatio
 The [aligned seed inspector](docs/aligned-seed-inspection.md) checks canonical
 image/catalog bytes and an empty aligned log against independent expectations,
 without storage access or write/adoption authority.
+The [canonical seed preparer](docs/aligned-seed-candidates.md) generates immutable
+candidate metadata and empty-log controls from a borrowed artifact and requested
+expectations, without publication or historical voting authority.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing

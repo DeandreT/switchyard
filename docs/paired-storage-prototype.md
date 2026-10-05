@@ -208,6 +208,10 @@ The separate [aligned seed inspector](aligned-seed-inspection.md) checks canonic
 image/catalog and empty-log agreement. It does not interpret this prototype's
 opaque physical records or grant either capsule's publication authority.
 
+The separate [candidate preparer](aligned-seed-candidates.md) produces canonical
+image/catalog and empty-log bytes, not these opaque physical record profiles or
+either capsule's publication authority. It supplies no protected fence.
+
 ## Verification
 
 The initial focused compile failed because private test-module imports shadowed

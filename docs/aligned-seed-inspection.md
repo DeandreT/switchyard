@@ -116,6 +116,10 @@ atomic fence publication, domain plan handoff, bounded physical inventories,
 unique source custody, actual joins and stable fallback policy. Neither the
 private physical prototype nor this result grants those capabilities.
 
+The separate [candidate preparer](aligned-seed-candidates.md) generates canonical
+image/catalog and empty-log controls from an artifact and requested expectations.
+Generated profile, vote and ordinal are desired data, not prior durable history.
+
 ## Verification
 
 The focused suite passed all 27 tests. Ten unchanged serial repetitions passed
