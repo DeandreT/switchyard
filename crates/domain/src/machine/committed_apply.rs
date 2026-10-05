@@ -19,7 +19,11 @@ pub use image_catalog::{
     CommittedCatalogError, PreparedCreateSendCatalog, RetainedCreateSendCatalog,
 };
 pub use image_export::CommittedImageExportError;
-pub use image_replacement::{CommittedImageReplacementError, TrustedCreateSendReplacement};
+pub use image_replacement::{
+    CommittedImageReplacementError, CreateSendImageExpectation, CreateSendReplacementCounts,
+    CreateSendReplacementPlanError, PlannedCreateSendReplacement, TrustedCreateSendReplacement,
+    plan_create_send_replacement,
+};
 
 /// One synchronous committed-entry writer with a matching read-only machine.
 /// It does not implement consensus, retry deduplication, or runtime snapshot

@@ -10,6 +10,11 @@ use super::{
 };
 
 mod batch;
+mod planning;
+pub use planning::{
+    CreateSendImageExpectation, CreateSendReplacementCounts, CreateSendReplacementPlanError,
+    PlannedCreateSendReplacement, plan_create_send_replacement,
+};
 
 #[cfg(test)]
 mod tests;

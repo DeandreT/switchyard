@@ -60,8 +60,10 @@ pub use identifier::{
 };
 pub use machine::committed_apply::{
     CommittedCatalogError, CommittedImageBootstrapError, CommittedImageExportError,
-    CommittedImageReplacementError, CommittedStateMachine, PreparedCreateSendCatalog,
-    RetainedCreateSendCatalog, TrustedCreateSendBootstrap, TrustedCreateSendReplacement,
+    CommittedImageReplacementError, CommittedStateMachine, CreateSendImageExpectation,
+    CreateSendReplacementCounts, CreateSendReplacementPlanError, PlannedCreateSendReplacement,
+    PreparedCreateSendCatalog, RetainedCreateSendCatalog, TrustedCreateSendBootstrap,
+    TrustedCreateSendReplacement, plan_create_send_replacement,
 };
 pub use machine::{
     BROKER_HEADER_RESERVE_BYTES, CommandApplication, MAX_DEAD_LETTER_DETAIL_LENGTH,

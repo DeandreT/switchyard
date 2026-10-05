@@ -9,6 +9,9 @@ use super::{CommittedImageReplacementError as Error, Result};
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod count_tests;
+
 pub(super) const MAX_MUTATIONS: usize = 2 * crate::MAX_COMMITTED_IMAGE_ROWS;
 pub(super) const MAX_PAYLOAD_BYTES: usize = 2 * crate::MAX_COMMITTED_IMAGE_BYTES;
 
@@ -40,11 +43,43 @@ pub(super) fn plan(
     old: &DecodedCommittedImage<'_>,
     selected: &ValidatedCreateSendImage<'_>,
 ) -> Result<Plan> {
+    Ok(count_rows(
+        old.rows(),
+        selected.rows(),
+        old.row_count(),
+        selected.row_count(),
+    )?
+    .plan)
+}
+
+pub(super) struct CountedRows {
+    plan: Plan,
+    puts: usize,
+    deletes: usize,
+}
+
+impl CountedRows {
+    pub(super) fn counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.deletes,
+            self.puts,
+            self.plan.mutations,
+            self.plan.bytes,
+        )
+    }
+}
+
+pub(super) fn count_rows(
+    old_rows: CommittedImageRows<'_>,
+    selected_rows: CommittedImageRows<'_>,
+    old_row_count: usize,
+    selected_row_count: usize,
+) -> Result<CountedRows> {
     let mut plan = Plan::default();
-    let mut selected_rows = selected.rows().peekable();
+    let mut selected_rows = selected_rows.peekable();
     let mut old_count = 0usize;
     let mut puts = 0usize;
-    for old_row in old.rows() {
+    for old_row in old_rows {
         old_count = old_count.checked_add(1).ok_or(Error::LimitExceeded)?;
         while selected_rows
             .peek()
@@ -69,10 +104,18 @@ pub(super) fn plan(
         plan.add(row.key().len(), row.value().len())?;
         puts = puts.checked_add(1).ok_or(Error::LimitExceeded)?;
     }
-    if puts != selected.row_count() || old_count != old.row_count() {
+    if puts != selected_row_count || old_count != old_row_count {
         return Err(Error::InvalidImage);
     }
-    Ok(plan)
+    let deletes = plan
+        .mutations
+        .checked_sub(puts)
+        .ok_or(Error::InvalidImage)?;
+    Ok(CountedRows {
+        plan,
+        puts,
+        deletes,
+    })
 }
 
 pub(super) fn copy_deletes(
