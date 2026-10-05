@@ -204,6 +204,10 @@ separate prerequisites. There is no runtime, engine, network or SDK activation,
 whole-tree custody, safe-reopen authority or explanation/fix for historical SDK
 timeouts.
 
+The separate [aligned seed inspector](aligned-seed-inspection.md) checks canonical
+image/catalog and empty-log agreement. It does not interpret this prototype's
+opaque physical records or grant either capsule's publication authority.
+
 ## Verification
 
 The initial focused compile failed because private test-module imports shadowed

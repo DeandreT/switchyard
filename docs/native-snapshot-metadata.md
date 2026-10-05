@@ -129,3 +129,7 @@ prevent apply between capture and publication; a later unique-owner retention
 capability must enforce that ordering. Owner admission for combined results
 also needs an explicit metadata-overhead policy rather than silently clamping
 the charge or reducing the complete artifact limit.
+
+The separate [aligned seed inspector](aligned-seed-inspection.md) combines this
+pair check with an exactly aligned empty log and independent caller expectations.
+It supplies checked data, not storage, source-health or installation authority.

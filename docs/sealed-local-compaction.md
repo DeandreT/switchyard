@@ -114,6 +114,10 @@ explicit standalone suffix application, and preparation of a fresh generation.
 Remote replacement requires separate durable adoption policy; this API does not
 use populated image replacement or activate engine installation/compaction.
 
+The separate [aligned seed inspector](aligned-seed-inspection.md) reads offered
+canonical bytes without storage access. It neither constructs this owning pair
+nor grants its retention, deletion or joined-cleanup capabilities.
+
 ## Verification
 
 The final focused run passed 57 local-compaction tests, five native-summary

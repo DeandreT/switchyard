@@ -163,6 +163,9 @@ The separate private [paired-storage prototype](docs/paired-storage-prototype.md
 tests controlled physical creation and atomic replacement without enabling adoption.
 The [sealed local compaction API](docs/sealed-local-compaction.md) retains a
 checked catalog before deleting an exact local prefix, without runtime activation.
+The [aligned seed inspector](docs/aligned-seed-inspection.md) checks canonical
+image/catalog bytes and an empty aligned log against independent expectations,
+without storage access or write/adoption authority.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
