@@ -8,6 +8,8 @@ coverage, not additional transaction compatibility or a timeout fix.
 The separate [typed server recorder foundation](server-diagnostics.md) is not
 attached to these fixtures, connections, or collectors. Its manual typed rows
 cannot supply missing server evidence, whole-task coverage, or stronger cleanup.
+The separate [task-retirement model](server-task-retirement.md) is also private
+and test-only. It changes no fixture ownership, stop window, or reopen guarantee.
 
 ## Bounded Context
 
