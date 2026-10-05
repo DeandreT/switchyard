@@ -5,6 +5,10 @@ bounded operation and AMQP lifecycle context without changing their transaction
 workflows, success markers, zero-retry policy, or deadlines. This is diagnostic
 coverage, not additional transaction compatibility or a timeout fix.
 
+The separate [typed server recorder foundation](server-diagnostics.md) is not
+attached to these fixtures, connections, or collectors. Its manual typed rows
+cannot supply missing server evidence, whole-task coverage, or stronger cleanup.
+
 ## Bounded Context
 
 Each atomic client run emits at most 128 operation rows and one truncation

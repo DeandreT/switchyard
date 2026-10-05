@@ -260,6 +260,8 @@ preserve failure context without changing retry or timeout policy. Its fixed
 declaration and rollback before the first grant, never queue access or commit.
 Cold-first support is Send only; transactional acquisition, experimental
 management, cross-queue work, and transaction recovery remain unsupported.
+An isolated [typed server recorder](docs/server-diagnostics.md) stores bounded
+data-only observations; it has no live protocol or shutdown hooks yet.
 Separate ordinary [receiving-batch gates](docs/dotnet-receiving-batches.md) hold
 three action copies on one receiver before completion and exercise out-of-order
 queue settlement with rolling count-prefetch replenishment on both SDK pins and
