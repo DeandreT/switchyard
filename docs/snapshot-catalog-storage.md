@@ -60,6 +60,9 @@ Separately requested business and catalog reads still have no shared transaction
 view. The [complete legacy state capture](complete-catalog-state-capture.md)
 returns bounded business/init/catalog data from one retained backend view,
 without supplying a fence or publication authority.
+The separate [protected Memory publication](protected-memory-state.md) couples
+complete replacement with an opaque fence in a fresh object. It does not wrap
+or promote either legacy catalog writer.
 
 The separate [controlled paired-storage prototype](paired-storage-prototype.md)
 tests private physical publication with an opaque fence. It adds no selection-

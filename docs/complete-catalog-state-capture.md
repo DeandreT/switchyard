@@ -72,6 +72,9 @@ mutation batch, writer, CAS or publication/adoption permission. Legacy fence
 absence is not a selection identity. The [borrowed replacement planner](committed-image-replacement-plan.md)
 and [private physical prototype](paired-storage-prototype.md) remain separate;
 neither accepts this result as authority or is promoted by this API.
+The [protected Memory store](protected-memory-state.md) is a separate unique
+writer with its own complete read-only capture. This legacy result cannot be
+converted into that writer or used as a publication permit.
 
 No format bump, repair, poison/retry policy, durable intent, history purge,
 native physical retirement, safe reopen, runtime snapshot activation, SDK

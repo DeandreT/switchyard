@@ -135,6 +135,9 @@ older catalogs through ordinary writes and enables no runtime snapshot behavior.
 The separate [complete catalog-state capture](docs/complete-catalog-state-capture.md)
 reads business, initialization and the opaque pair from one bounded backend view;
 its owned result grants no writer, fence or publication authority.
+The separate [protected Memory store](docs/protected-memory-state.md) replaces
+complete business/init/catalog/fence data in one fresh private object; its
+unique writer supplies no durable, canonical-selection or adoption authority.
 The [pure native metadata codec](docs/native-snapshot-metadata.md) checks every
 metadata field against the exact validated image and captured checkpoint. Pair
 agreement alone grants no installation, source-health, or history-purge authority.
