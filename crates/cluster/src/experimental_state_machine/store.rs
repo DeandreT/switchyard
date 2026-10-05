@@ -32,6 +32,73 @@ pub struct ExperimentalStateMachine {
 }
 
 impl ExperimentalStateMachine {
+    pub(crate) fn into_local_compaction_parts(
+        mut self,
+    ) -> (Self, Option<RetiredOwner<StateMachineError>>) {
+        let token = self.thread.take().map(|thread| {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            self.retired = Some(sender);
+            RetiredOwner::new(receiver, thread)
+        });
+        (self, token)
+    }
+    pub(crate) async fn seal_local_compaction(
+        &self,
+        identity: crate::experimental_local_compaction::frontier::PairIdentity,
+        publisher: crate::experimental_local_compaction::frontier::Publisher,
+    ) -> Result<
+        domain::CommittedCheckpoint,
+        crate::experimental_local_compaction::LocalCompactionError,
+    > {
+        use crate::experimental_local_compaction::LocalCompactionError as E;
+        match self
+            .handle
+            .request(Operation::SealLocal {
+                identity,
+                publisher,
+            })
+            .await
+        {
+            Ok(Reply::LocalSealed(checkpoint)) => Ok(*checkpoint),
+            Err(StateMachineError::UnsupportedSnapshot) => Err(E::DisabledSource),
+            _ => Err(E::OwnerFailure),
+        }
+    }
+
+    pub(crate) fn build_local_compaction(
+        &self,
+        identity: crate::experimental_local_compaction::frontier::PairIdentity,
+        node_id: u64,
+        attempt: u64,
+        expected: Box<domain::CommittedCheckpoint>,
+    ) -> impl std::future::Future<
+        Output = Result<
+            crate::experimental_local_compaction::frontier::Receipt,
+            crate::experimental_local_compaction::LocalCompactionError,
+        >,
+    >
+    + Send
+    + 'static
+    + use<> {
+        let handle = self.handle.clone();
+        async move {
+            use crate::experimental_local_compaction::LocalCompactionError as E;
+            match handle
+                .request(Operation::BuildLocal {
+                    identity,
+                    node_id,
+                    attempt,
+                    expected,
+                })
+                .await
+            {
+                Ok(Reply::LocalBuilt(result)) => result,
+                Err(StateMachineError::Closed) => Err(E::Closed),
+                _ => Err(E::OwnerFailure),
+            }
+        }
+    }
+
     pub(crate) fn enable_retirement_report(
         &self,
     ) -> Result<

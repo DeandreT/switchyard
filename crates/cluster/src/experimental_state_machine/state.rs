@@ -219,20 +219,32 @@ fn validate_first(
 }
 
 pub(super) fn recover(checkpoint: &CommittedCheckpoint) -> Result<AppliedState, StateMachineError> {
-    match (checkpoint.last(), checkpoint.previous()) {
+    recover_fields(
+        checkpoint.last(),
+        checkpoint.previous(),
+        checkpoint.membership(),
+    )
+}
+
+pub(super) fn recover_fields(
+    last: Option<domain::CommittedEntryMark>,
+    previous: Option<domain::CommittedEntryMark>,
+    membership: Option<&domain::CommittedMembership>,
+) -> Result<AppliedState, StateMachineError> {
+    match (last, previous) {
         (None, None) => {}
         (Some(last), None) if last.id.index == 0 => {}
         (Some(last), Some(previous)) if successor(previous.id, last.id) => {}
         _ => return Err(StateMachineError::InvalidState),
     }
-    let membership = match checkpoint.membership() {
+    let membership = match membership {
         None => StoredMembership::default(),
         Some(membership) => {
-            let last = checkpoint.last().ok_or(StateMachineError::InvalidState)?;
+            let last = last.ok_or(StateMachineError::InvalidState)?;
             if membership.source.index > last.id.index
                 || raft_id(membership.source) > raft_id(last.id)
                 || (membership.source.index == last.id.index && membership.source != last.id)
-                || checkpoint.previous().is_some_and(|previous| {
+                || previous.is_some_and(|previous| {
                     membership.source.index <= previous.id.index
                         && (raft_id(membership.source) > raft_id(previous.id)
                             || (membership.source.index == previous.id.index
@@ -246,7 +258,7 @@ pub(super) fn recover(checkpoint: &CommittedCheckpoint) -> Result<AppliedState, 
             StoredMembership::new(Some(raft_id(membership.source)), value)
         }
     };
-    Ok((checkpoint.last().map(|last| raft_id(last.id)), membership))
+    Ok((last.map(|last| raft_id(last.id)), membership))
 }
 
 fn successor(previous: CommittedEntryId, next: CommittedEntryId) -> bool {

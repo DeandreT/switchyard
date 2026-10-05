@@ -10,6 +10,8 @@ use openraft::{BasicNode, SnapshotMeta};
 use super::{AppliedState, state::recover};
 
 mod codec;
+mod local_summary;
+pub(crate) use local_summary::NativeCheckpointSummary;
 
 #[cfg(test)]
 mod tests;

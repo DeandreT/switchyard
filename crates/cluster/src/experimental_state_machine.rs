@@ -29,6 +29,7 @@ pub use image_catalog::{
 pub use image_export::StateMachineImageExportError;
 pub use response::{LogApplication, LogQueueConfigRefusal, LogQueueRefusal};
 pub use snapshot::UnsupportedSnapshotBuilder;
+pub(crate) use snapshot_metadata::NativeCheckpointSummary;
 pub use snapshot_metadata::{
     DecodedNativeSnapshotPair, EncodedNativeSnapshotMetadata, MAX_NATIVE_SNAPSHOT_METADATA_BYTES,
     NativeSnapshotMetadataError,

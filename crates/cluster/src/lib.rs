@@ -1,6 +1,11 @@
 #![forbid(unsafe_code)]
 
+pub mod experimental_local_compaction;
 pub mod experimental_log;
+pub use experimental_local_compaction::{
+    ExperimentalLocalCompactionPair, LocalCompactionAdmissionError, LocalCompactionError,
+    LocalCompactionProgress,
+};
 mod experimental_owner;
 pub mod experimental_replica;
 pub mod experimental_runtime;
@@ -10,11 +15,12 @@ mod snapshot_data;
 pub use snapshot_data::{BoundedSnapshotData, MAX_SNAPSHOT_BYTES};
 
 pub use experimental_log::{
-    ExperimentalLogStore, LogCodecError, LogEntry, LogId, LogProfile, LogResource, LogStorageError,
-    LogTypes, LogVote, LogWorkload, MAX_APPEND_BYTES, MAX_APPEND_ENTRIES, MAX_LIMITED_BYTES,
-    MAX_LIMITED_ENTRIES, MAX_LOG_BODY_BYTES, MAX_LOG_ENTRY_BYTES, MAX_LOG_MEMBERSHIP_BYTES,
-    MAX_LOG_METADATA_BYTES, MAX_LOG_OWNER_BYTES, MAX_LOG_OWNER_JOBS, MAX_LOG_QUEUE_BYTES,
-    MAX_RETAINED_BYTES, MAX_RETAINED_ENTRIES, QueueLogCommand, ReadOnlyLogReader,
+    ExperimentalCompactionLogStore, ExperimentalLogStore, LogCodecError, LogEntry, LogId,
+    LogProfile, LogResource, LogStorageError, LogTypes, LogVote, LogWorkload, MAX_APPEND_BYTES,
+    MAX_APPEND_ENTRIES, MAX_LIMITED_BYTES, MAX_LIMITED_ENTRIES, MAX_LOG_BODY_BYTES,
+    MAX_LOG_ENTRY_BYTES, MAX_LOG_MEMBERSHIP_BYTES, MAX_LOG_METADATA_BYTES, MAX_LOG_OWNER_BYTES,
+    MAX_LOG_OWNER_JOBS, MAX_LOG_QUEUE_BYTES, MAX_RETAINED_BYTES, MAX_RETAINED_ENTRIES,
+    QueueLogCommand, ReadOnlyLogReader,
 };
 
 pub use experimental_state_machine::{

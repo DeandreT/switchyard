@@ -143,11 +143,32 @@ impl fmt::Debug for RetainedNativeSnapshotCatalog {
 }
 
 pub(super) struct CatalogCapabilities<M> {
+    build_local: fn(
+        &mut M,
+        crate::experimental_local_compaction::frontier::PairIdentity,
+        u64,
+        u64,
+        &CommittedCheckpoint,
+    ) -> Result<crate::experimental_local_compaction::frontier::Receipt>,
     build: fn(&mut M) -> Result<BuiltNativeSnapshotCatalog>,
     read: fn(&mut M) -> Result<Option<RetainedNativeSnapshotCatalog>>,
 }
 
 impl ExperimentalStateMachine {
+    #[cfg(test)]
+    pub(crate) fn create_catalog_and_export_for_test<W>(
+        writer: W,
+        stream: domain::CommittedStreamId,
+    ) -> std::result::Result<Self, StateMachineError>
+    where
+        W: CatalogCommittedStore,
+        W::Reader: BoundedStateStore,
+    {
+        let mut state = StoreState::create_with_image_export(writer, stream)?;
+        state.image_catalog = Some(capabilities::<W>());
+        Self::start(state)
+    }
+
     /// Create a pristine owner with explicit bounded native catalog operations.
     ///
     /// Existing constructors leave this capability disabled. This constructor
@@ -247,6 +268,7 @@ where
     W::Reader: BoundedStateStore,
 {
     CatalogCapabilities {
+        build_local: build_local::<W>,
         build: build::<W>,
         read: read::<W>,
     }
@@ -279,6 +301,46 @@ where
     Ok(BuiltNativeSnapshotCatalog { image, details })
 }
 
+fn build_local<W>(
+    machine: &mut CommittedStateMachine<W>,
+    identity: crate::experimental_local_compaction::frontier::PairIdentity,
+    node_id: u64,
+    attempt: u64,
+    expected: &CommittedCheckpoint,
+) -> Result<crate::experimental_local_compaction::frontier::Receipt>
+where
+    W: CatalogCommittedStore,
+    W::Reader: BoundedStateStore,
+{
+    use crate::experimental_local_compaction::frontier::ReceiptData;
+    let token = machine
+        .prepare_create_send_catalog()
+        .map_err(StateMachineCatalogError::Domain)?;
+    if token.checkpoint() != expected {
+        return Err(StateMachineCatalogError::Metadata(
+            NativeSnapshotMetadataError::IncompatibleCheckpoint,
+        ));
+    }
+    let metadata = EncodedNativeSnapshotMetadata::encode(token.image_bytes())
+        .map_err(StateMachineCatalogError::Metadata)?;
+    let projection = DecodedNativeSnapshotPair::decode(metadata.as_bytes(), token.image_bytes())
+        .and_then(|pair| pair.snapshot_meta())
+        .map_err(StateMachineCatalogError::Metadata)?;
+    let receipt = std::sync::Arc::new(ReceiptData {
+        identity,
+        attempt,
+        node_id,
+        checkpoint: token.checkpoint().clone(),
+        metadata,
+        projection,
+    });
+    let image = token
+        .retain(receipt.metadata.as_bytes())
+        .map_err(StateMachineCatalogError::Domain)?;
+    drop(image);
+    Ok(receipt)
+}
+
 fn read<W>(machine: &mut CommittedStateMachine<W>) -> Result<Option<RetainedNativeSnapshotCatalog>>
 where
     W: CatalogCommittedStore,
@@ -304,6 +366,28 @@ where
 }
 
 impl<W: CommittedStore> StoreState<W> {
+    pub(super) fn local_catalog_enabled(&self) -> bool {
+        self.image_catalog.is_some()
+    }
+
+    pub(super) fn build_for_local_compaction(
+        &mut self,
+        identity: crate::experimental_local_compaction::frontier::PairIdentity,
+        node_id: u64,
+        attempt: u64,
+        expected: &CommittedCheckpoint,
+    ) -> Result<crate::experimental_local_compaction::frontier::Receipt> {
+        self.ensure_healthy()
+            .map_err(StateMachineCatalogError::Owner)?;
+        let build = self
+            .image_catalog
+            .as_ref()
+            .map(|cap| cap.build_local)
+            .ok_or(StateMachineCatalogError::Disabled)?;
+        let result = build(&mut self.machine, identity, node_id, attempt, expected);
+        self.catalog_result(result)
+    }
+
     pub(super) fn build_create_send_catalog(&mut self) -> Result<BuiltNativeSnapshotCatalog> {
         self.ensure_healthy()
             .map_err(StateMachineCatalogError::Owner)?;

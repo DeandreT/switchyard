@@ -3,6 +3,9 @@
 //! No state-machine adapter, network, snapshot, quorum acknowledgement, or
 //! production activation is provided by this module.
 
+pub(crate) mod local_compaction;
+pub use local_compaction::ExperimentalCompactionLogStore;
+
 mod budget;
 mod codec;
 mod owner;

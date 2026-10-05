@@ -5,6 +5,10 @@ use std::{
     time::Duration,
 };
 
+use crate::experimental_local_compaction::{
+    LocalCompactionError,
+    frontier::{PairIdentity, Publisher, Receipt},
+};
 use domain::CommittedCheckpoint;
 use flume::{Receiver, RecvTimeoutError, Sender};
 use storage::CommittedStore;
@@ -20,6 +24,16 @@ use super::{
 };
 
 pub(super) enum Operation {
+    SealLocal {
+        identity: PairIdentity,
+        publisher: Publisher,
+    },
+    BuildLocal {
+        identity: PairIdentity,
+        node_id: u64,
+        attempt: u64,
+        expected: Box<CommittedCheckpoint>,
+    },
     Apply(PreparedApply),
     AppliedState,
     Checkpoint,
@@ -29,6 +43,8 @@ pub(super) enum Operation {
 }
 
 pub(super) enum Reply {
+    LocalSealed(Box<CommittedCheckpoint>),
+    LocalBuilt(Result<Receipt, LocalCompactionError>),
     Applications(Vec<LogApplication>),
     AppliedState(Box<AppliedState>),
     Checkpoint(Box<CommittedCheckpoint>),
@@ -59,9 +75,12 @@ impl Packet {
     pub(super) fn encoded_bytes(&self) -> usize {
         match self.operation.as_ref() {
             Some(Operation::Apply(entries)) => entries.encoded_bytes(),
-            Some(Operation::ExportImage | Operation::BuildCatalog | Operation::ReadCatalog) => {
-                domain::MAX_COMMITTED_IMAGE_BYTES
-            }
+            Some(
+                Operation::ExportImage
+                | Operation::BuildCatalog
+                | Operation::ReadCatalog
+                | Operation::BuildLocal { .. },
+            ) => domain::MAX_COMMITTED_IMAGE_BYTES,
             _ => 64,
         }
     }
@@ -170,6 +189,7 @@ fn run<W: CommittedStore>(
     admission: Arc<Admission>,
     report: Arc<Mutex<ReportState>>,
 ) -> Result<(), StateMachineError> {
+    let mut local_seal: Option<(PairIdentity, Publisher)> = None;
     let result = catch_unwind(AssertUnwindSafe(|| {
         loop {
             if admission.is_closed() && receiver.is_empty() {
@@ -180,7 +200,81 @@ fn run<W: CommittedStore>(
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break,
             };
-            let result = match packet.operation.take() {
+            let operation = packet.operation.take();
+            // An explicit read/tagged-operation allowlist also denies future
+            // generic mutation variants added to this owner.
+            let allowed = match (&local_seal, &operation) {
+                (None, Some(Operation::BuildLocal { .. })) => false,
+                (None, _) => true,
+                (
+                    Some(_),
+                    Some(
+                        Operation::AppliedState
+                        | Operation::Checkpoint
+                        | Operation::ExportImage
+                        | Operation::ReadCatalog,
+                    ),
+                ) => true,
+                (
+                    Some((identity, _)),
+                    Some(Operation::BuildLocal {
+                        identity: supplied, ..
+                    }),
+                ) => identity.same(supplied),
+                _ => false,
+            };
+            if !allowed {
+                packet.finish(Err(StateMachineError::Closed));
+                continue;
+            }
+            let result = catch_unwind(AssertUnwindSafe(|| match operation {
+                Some(Operation::SealLocal {
+                    identity,
+                    publisher,
+                }) => {
+                    if !state.local_catalog_enabled() {
+                        Err(StateMachineError::UnsupportedSnapshot)
+                    } else {
+                        match state.checkpoint() {
+                            Ok(checkpoint) => {
+                                local_seal = Some((identity, publisher));
+                                Ok(Reply::LocalSealed(Box::new(checkpoint)))
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                }
+                Some(Operation::BuildLocal {
+                    identity,
+                    node_id,
+                    attempt,
+                    expected,
+                }) => {
+                    let admitted = local_seal
+                        .as_ref()
+                        .is_some_and(|(_, publisher)| publisher.allows_build(attempt));
+                    if !admitted {
+                        return Err(StateMachineError::Closed);
+                    }
+                    let result = state
+                        .build_for_local_compaction(identity, node_id, attempt, &expected)
+                        .map_err(LocalCompactionError::from_catalog);
+                    let result = match result {
+                        Ok(receipt) => match local_seal.as_ref() {
+                            Some((_, publisher)) => {
+                                publisher.publish(receipt.clone()).map(|()| receipt)
+                            }
+                            None => Err(LocalCompactionError::InvalidPair),
+                        },
+                        Err(error) => {
+                            if let Some((_, publisher)) = &local_seal {
+                                publisher.refuse(attempt, error);
+                            }
+                            Err(error)
+                        }
+                    };
+                    Ok(Reply::LocalBuilt(result))
+                }
                 Some(Operation::Apply(entries)) => state.apply(entries).map(Reply::Applications),
                 Some(Operation::AppliedState) => state
                     .applied_state()
@@ -198,11 +292,31 @@ fn run<W: CommittedStore>(
                     Ok(Reply::CatalogRead(state.read_create_send_catalog()))
                 }
                 None => Err(StateMachineError::Panicked),
+            }));
+            let result = match result {
+                Ok(result) => result,
+                Err(panic) => {
+                    // Mark before the active packet unwinds and wakes its caller.
+                    if let Some((_, publisher)) = &local_seal {
+                        publisher.terminal(LocalCompactionError::OwnerFailure);
+                    }
+                    std::panic::resume_unwind(panic)
+                }
             };
+            // A permitted read can poison the source after a durable receipt.
+            // Publish terminal state before waking any completed caller.
+            if state.poisoned
+                && let Some((_, publisher)) = &local_seal
+            {
+                publisher.terminal(LocalCompactionError::OwnerFailure);
+            }
             packet.finish(result);
         }
     }));
     if result.is_err() {
+        if let Some((_, publisher)) = &local_seal {
+            publisher.terminal(LocalCompactionError::OwnerFailure);
+        }
         admission.close(StateMachineError::Panicked);
         for packet in receiver.try_iter() {
             packet.finish(Err(StateMachineError::Panicked));
