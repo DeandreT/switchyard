@@ -47,6 +47,9 @@ impl FjallCatalogReplicaStore {
         let meta = database
             .keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)
             .map_err(|error| StorageError::backend("open catalog replica metadata", &error))?;
+        let snapshot = database.snapshot();
+        reject_paired_metadata_markers(&snapshot, &meta)?;
+        drop(snapshot);
         let records = database
             .keyspace(RECORDS_KEYSPACE, KeyspaceCreateOptions::default)
             .map_err(|error| StorageError::backend("open catalog replica records", &error))?;

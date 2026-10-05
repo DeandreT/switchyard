@@ -126,6 +126,9 @@ impl FjallStore {
         let meta = database
             .keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)
             .map_err(|error| StorageError::backend("open the metadata keyspace", &error))?;
+        let snapshot = database.snapshot();
+        reject_paired_metadata_markers(&snapshot, &meta)?;
+        drop(snapshot);
         let records = database
             .keyspace(RECORDS_KEYSPACE, KeyspaceCreateOptions::default)
             .map_err(|error| StorageError::backend("open the record keyspace", &error))?;
@@ -294,6 +297,25 @@ fn bounded_snapshot_error(detail: &'static str) -> StorageError {
     }
 }
 
+fn reject_paired_metadata_markers(
+    snapshot: &fjall::Snapshot,
+    meta: &Keyspace,
+) -> Result<(), StorageError> {
+    // Presence fences the paired role even when the marker itself is malformed.
+    for key in [&[0x22, 0x01][..], &[0x22, 0x02][..], &[0x22, 0x03][..]] {
+        if snapshot
+            .size_of(meta, key)
+            .map_err(|error| StorageError::backend("check a paired replica marker", &error))?
+            .is_some()
+        {
+            return Err(StorageError::CorruptMetadata {
+                detail: "paired replica metadata cannot be opened by a generic store".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Rejects a store this build cannot read, rather than misreading it.
 fn require_readable_format(recorded: &[u8]) -> Result<(), StorageError> {
     require_format_version(recorded, ACTIVE_STORE_FORMAT)
@@ -322,6 +344,9 @@ fn read_entry(guard: fjall::Guard) -> Result<(Key, Value), StorageError> {
 
 #[cfg(test)]
 mod bounded_tests;
+
+#[cfg(test)]
+mod paired_marker_tests;
 
 #[cfg(test)]
 mod tests {

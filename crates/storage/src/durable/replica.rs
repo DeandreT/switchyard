@@ -32,6 +32,9 @@ impl FjallReplicaStore {
         let meta = database
             .keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)
             .map_err(|error| StorageError::backend("open the metadata keyspace", &error))?;
+        let snapshot = database.snapshot();
+        reject_paired_metadata_markers(&snapshot, &meta)?;
+        drop(snapshot);
         let records = database
             .keyspace(RECORDS_KEYSPACE, KeyspaceCreateOptions::default)
             .map_err(|error| StorageError::backend("open the record keyspace", &error))?;
