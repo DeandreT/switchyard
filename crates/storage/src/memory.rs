@@ -176,3 +176,6 @@ impl BoundedStateStore for MemoryStore {
 
 #[cfg(test)]
 mod bounded_tests;
+
+mod protected_state;
+pub use protected_state::{MemoryProtectedStateReader, MemoryProtectedStateStore};

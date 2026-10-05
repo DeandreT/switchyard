@@ -16,6 +16,7 @@ mod catalog;
 mod complete_catalog_state;
 mod durable;
 mod memory;
+mod protected_state;
 mod replica;
 
 use thiserror::Error;
@@ -31,6 +32,12 @@ pub use catalog::{
 pub use complete_catalog_state::{
     COMPLETE_CATALOG_STATE_RECORD_LIMITS, CompleteCatalogReplicaStateReader,
     MAX_COMPLETE_CATALOG_STATE_BYTES, StoredCatalogReplicaState,
+};
+
+pub use memory::{MemoryProtectedStateReader, MemoryProtectedStateStore};
+pub use protected_state::{
+    MAX_PROTECTED_STATE_BYTES, MAX_PROTECTED_STATE_FENCE_BYTES, PROTECTED_STATE_RECORD_LIMITS,
+    ProtectedStateError, ProtectedStatePublication, ProtectedStateReader, StoredProtectedState,
 };
 
 pub use crate::{
