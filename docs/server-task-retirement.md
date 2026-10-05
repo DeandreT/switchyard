@@ -101,6 +101,8 @@ store, or certificates and does not make incomplete fixture stop safe for reopen
 No cleanup timeout, error precedence, native-owner health, or whole-run coverage
 claim changes. The [typed recorder and test writer observations](server-diagnostics.md)
 remain separate; this model publishes no trace rows.
+The separate [actual connection pair](server-owned-connection-tasks.md) retains
+the original socket-task handles privately; it does not activate fixture cleanup.
 
 The historical provisional-Complete SDK timeout remains unexplained as recorded
 in [client diagnostic evidence](atomic-sdk-evidence.md). Whole-resource custody

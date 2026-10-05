@@ -266,6 +266,8 @@ An isolated [typed server recorder](docs/server-diagnostics.md) stores bounded
 data-only observations; it has no live protocol or shutdown hooks yet.
 A private [task-retirement model](docs/server-task-retirement.md) exercises actual
 join barriers while requiring a retained external owner; it is not fixture cleanup.
+A separate [actual connection-task path](docs/server-owned-connection-tasks.md)
+retains the actor and reader privately, without listener or fixture activation.
 Separate ordinary [receiving-batch gates](docs/dotnet-receiving-batches.md) hold
 three action copies on one receiver before completion and exercise out-of-order
 queue settlement with rolling count-prefetch replenishment on both SDK pins and
