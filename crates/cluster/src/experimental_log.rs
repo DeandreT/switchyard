@@ -14,6 +14,9 @@ mod state;
 mod store;
 mod types;
 
+#[cfg(test)]
+mod native_adoption_model;
+
 pub(crate) use retirement::FinalLogReport;
 pub use store::{ExperimentalLogStore, ReadOnlyLogReader};
 pub use types::{
