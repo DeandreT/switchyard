@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{future::poll_fn, sync::Arc};
 
 use amqp::{
     AmqpError, EngineError, IncomingAttach, LinkEndpoint, MessageFormatDecoders,
@@ -6,10 +6,7 @@ use amqp::{
 };
 use auth::Permission;
 use domain::{EntityIncarnationKind, NamespaceName};
-use tokio::{
-    sync::{Semaphore, mpsc, oneshot},
-    task::JoinSet,
-};
+use tokio::sync::{Semaphore, mpsc};
 
 use super::{Event, IngressError, IngressMode, QueueAdmission, workers};
 use crate::{
@@ -20,6 +17,12 @@ use crate::{
     parse_attachment,
 };
 
+mod adapter;
+#[cfg(test)]
+pub(super) use adapter::Branch;
+use adapter::{DefaultWorkers, accepted, launch};
+pub(super) use adapter::{RouteError, WorkerTasks, stop_connection};
+
 pub(super) async fn serve_session<B: NativeAtomicBroker>(
     mut session: ServerSession,
     namespace: NamespaceName,
@@ -29,162 +32,230 @@ pub(super) async fn serve_session<B: NativeAtomicBroker>(
     links: Arc<Semaphore>,
     mode: IngressMode,
 ) -> Result<(), IngressError> {
-    let mut workers = JoinSet::new();
-    let result: Result<(), IngressError> = async {
-        loop {
-            let attach = tokio::select! {
-                result = workers.join_next(), if !workers.is_empty() => {
-                    match result {
-                        Some(Ok(Ok(()))) => continue,
-                        Some(Ok(Err(error))) => return Err(error),
-                        Some(Err(error)) => return Err(error.into()),
-                        None => continue,
-                    }
-                }
-                attach = session.next_incoming_attach() => attach,
-            };
-            let Some(mut attach) = attach else { break };
-            let permit = match Arc::clone(&links).try_acquire_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    refuse(
-                        &session,
-                        attach,
-                        error_for(
-                            AmqpError::ResourceLimitExceeded,
-                            "posting link limit reached".into(),
-                        ),
-                    )
-                    .await?;
-                    continue;
-                }
-            };
+    let mut workers = DefaultWorkers::new();
+    let result = route_session(
+        &mut session,
+        &namespace,
+        &broker,
+        &authorization,
+        &events,
+        &links,
+        mode,
+        &mut workers,
+    )
+    .await;
+    let result = result.map_err(|error| match error {
+        RouteError::Routing(error) | RouteError::Worker(error) => error,
+        RouteError::Closed {
+            reason,
+            acknowledged,
+        } => {
+            let _ = acknowledged;
+            match reason {}
+        }
+    });
+    if result.is_err() {
+        stop_connection(&events).await;
+    }
+    result
+}
 
-            if attach
-                .target
-                .as_ref()
-                .and_then(TargetTerminus::as_coordinator)
-                .is_some()
-            {
-                if let Some(authorization) = authorization.as_ref()
-                    && !match mode {
-                        IngressMode::Posting => authorization.has_valid_grant().await,
-                        IngressMode::Messaging => authorization.can_control_metadata().await,
-                    }
-                {
-                    refuse(
-                        &session,
-                        attach,
-                        unauthorized_error("a coordinator requires a valid grant"),
-                    )
-                    .await?;
-                    continue;
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn route_session<B: NativeAtomicBroker, W: WorkerTasks>(
+    session: &mut ServerSession,
+    namespace: &NamespaceName,
+    broker: &B,
+    authorization: &Option<Arc<ConnectionAuthorization>>,
+    events: &mpsc::Sender<Event>,
+    links: &Arc<Semaphore>,
+    mode: IngressMode,
+    workers: &mut W,
+) -> Result<(), RouteError<W::Failure, W::Closed>> {
+    loop {
+        let attach = tokio::select! {
+            result = poll_fn(|cx| workers.poll_next(cx)), if !workers.is_empty() => {
+                match result {
+                    Some(Ok(())) => continue,
+                    Some(Err(error)) => return Err(RouteError::Worker(error)),
+                    None => continue,
                 }
-                let endpoint = match session
-                    .accept_coordinator(
-                        attach,
-                        crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64,
-                    )
-                    .await
-                {
-                    Ok(endpoint) => endpoint,
-                    Err(EngineError::RemoteDetached) => continue,
-                    Err(error) => return Err(error.into()),
-                };
-                workers.spawn(workers::controller(
-                    endpoint,
-                    authorization.clone(),
-                    events.clone(),
-                    permit,
-                    mode,
-                ));
-                continue;
             }
-
-            let source = attach
-                .source
-                .as_ref()
-                .and_then(|source| source.address.clone())
-                .unwrap_or_default();
-            let target = attach
-                .target
-                .as_ref()
-                .and_then(TargetTerminus::as_target)
-                .and_then(|target| target.address.clone())
-                .unwrap_or_default();
-            if let Some(authorization) = authorization.as_ref()
-                && (source == crate::CBS_NODE || target == crate::CBS_NODE)
-            {
-                if attach.role == Role::Sender && attach.initial_delivery_count.is_none() {
-                    attach.initial_delivery_count = Some(0);
-                }
-                let endpoint = match session
-                    .accept_attach(attach, crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64)
-                    .await
-                {
-                    Ok(endpoint) => endpoint,
-                    Err(EngineError::RemoteDetached) => continue,
-                    Err(error) => return Err(error.into()),
-                };
-                let authorization = Arc::clone(authorization);
-                match (target.as_str(), source.as_str(), endpoint) {
-                    (crate::CBS_NODE, _, LinkEndpoint::Receiver(receiver)) => {
-                        workers.spawn(async move {
-                            let _permit = permit;
-                            serve_cbs_requests(receiver, authorization).await
-                        });
-                    }
-                    (_, crate::CBS_NODE, LinkEndpoint::Sender(sender)) if !target.is_empty() => {
-                        let (route, responses) =
-                            authorization.register_reply_route(target.clone()).await;
-                        workers.spawn(async move {
-                            let _permit = permit;
-                            serve_cbs_replies(sender, target, route, responses, authorization).await
-                        });
-                    }
-                    (_, _, endpoint) => {
-                        detach_with(
-                            endpoint,
-                            error_for(AmqpError::InvalidField, "invalid CBS link".into()),
-                        )
-                        .await;
-                    }
-                }
-                continue;
-            }
-
-            // Unsupported roles and endpoints are refused without reading topology.
-            if (attach.role != Role::Sender && mode != IngressMode::Messaging)
-                || crate::address::strip_control_suffix(&target, "/$management").is_some()
-                || (attach.role == Role::Receiver
-                    && crate::address::strip_control_suffix(&source, "/$management").is_some())
-            {
+            attach = session.next_incoming_attach() => attach,
+        };
+        let Some(mut attach) = attach else { break };
+        let permit = match Arc::clone(links).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
                 refuse(
-                    &session,
+                    session,
                     attach,
                     error_for(
-                        AmqpError::NotImplemented,
-                        "this endpoint does not support the requested link".into(),
+                        AmqpError::ResourceLimitExceeded,
+                        "posting link limit reached".into(),
                     ),
                 )
                 .await?;
                 continue;
             }
-            if attach.role == Role::Receiver {
-                if !matches!(
-                    attach.snd_settle_mode,
-                    SenderSettleMode::Mixed | SenderSettleMode::Unsettled
+        };
+
+        if attach
+            .target
+            .as_ref()
+            .and_then(TargetTerminus::as_coordinator)
+            .is_some()
+        {
+            if let Some(authorization) = authorization.as_ref()
+                && !match mode {
+                    IngressMode::Posting => authorization.has_valid_grant().await,
+                    IngressMode::Messaging => authorization.can_control_metadata().await,
+                }
+            {
+                refuse(
+                    session,
+                    attach,
+                    unauthorized_error("a coordinator requires a valid grant"),
                 )
-                    || attach.rcv_settle_mode != ReceiverSettleMode::Second
-                    || attach.source.as_ref().is_some_and(|source| {
-                        source.dynamic
-                            || source.durable != 0
-                            || source.distribution_mode.as_ref().is_some_and(|mode| mode.as_str() != "move")
-                            || source.filter.as_ref().is_some_and(|filter| !filter.is_empty())
-                    })
-                {
-                    refuse(
-                        &session,
+                .await?;
+                continue;
+            }
+            let ticket = workers.reserve().map_err(RouteError::closed)?;
+            let endpoint = match accepted(
+                workers,
+                session.accept_coordinator(
+                    attach,
+                    crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64,
+                ),
+            )
+            .await
+            {
+                Ok(endpoint) => endpoint,
+                Err(EngineError::RemoteDetached) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            launch(
+                workers,
+                ticket,
+                workers::controller(
+                    endpoint,
+                    authorization.clone(),
+                    events.clone(),
+                    permit,
+                    mode,
+                ),
+                events,
+                adapter::Branch::Controller,
+            )
+            .await?;
+            continue;
+        }
+
+        let source = attach
+            .source
+            .as_ref()
+            .and_then(|source| source.address.clone())
+            .unwrap_or_default();
+        let target = attach
+            .target
+            .as_ref()
+            .and_then(TargetTerminus::as_target)
+            .and_then(|target| target.address.clone())
+            .unwrap_or_default();
+        if let Some(authorization) = authorization.as_ref()
+            && (source == crate::CBS_NODE || target == crate::CBS_NODE)
+        {
+            if attach.role == Role::Sender && attach.initial_delivery_count.is_none() {
+                attach.initial_delivery_count = Some(0);
+            }
+            let ticket = workers.reserve().map_err(RouteError::closed)?;
+            let endpoint = match accepted(
+                workers,
+                session.accept_attach(attach, crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64),
+            )
+            .await
+            {
+                Ok(endpoint) => endpoint,
+                Err(EngineError::RemoteDetached) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let authorization = Arc::clone(authorization);
+            match (target.as_str(), source.as_str(), endpoint) {
+                (crate::CBS_NODE, _, LinkEndpoint::Receiver(receiver)) => {
+                    launch(
+                        workers,
+                        ticket,
+                        async move {
+                            let _permit = permit;
+                            serve_cbs_requests(receiver, authorization).await
+                        },
+                        events,
+                        adapter::Branch::CbsRequests,
+                    )
+                    .await?;
+                }
+                (_, crate::CBS_NODE, LinkEndpoint::Sender(sender)) if !target.is_empty() => {
+                    let (route, responses) =
+                        authorization.register_reply_route(target.clone()).await;
+                    launch(
+                        workers,
+                        ticket,
+                        async move {
+                            let _permit = permit;
+                            serve_cbs_replies(sender, target, route, responses, authorization).await
+                        },
+                        events,
+                        adapter::Branch::CbsReplies,
+                    )
+                    .await?;
+                }
+                (_, _, endpoint) => {
+                    detach_with(
+                        endpoint,
+                        error_for(AmqpError::InvalidField, "invalid CBS link".into()),
+                    )
+                    .await;
+                }
+            }
+            continue;
+        }
+
+        // Unsupported roles and endpoints are refused without reading topology.
+        if (attach.role != Role::Sender && mode != IngressMode::Messaging)
+            || crate::address::strip_control_suffix(&target, "/$management").is_some()
+            || (attach.role == Role::Receiver
+                && crate::address::strip_control_suffix(&source, "/$management").is_some())
+        {
+            refuse(
+                session,
+                attach,
+                error_for(
+                    AmqpError::NotImplemented,
+                    "this endpoint does not support the requested link".into(),
+                ),
+            )
+            .await?;
+            continue;
+        }
+        if attach.role == Role::Receiver {
+            if !matches!(
+                attach.snd_settle_mode,
+                SenderSettleMode::Mixed | SenderSettleMode::Unsettled
+            ) || attach.rcv_settle_mode != ReceiverSettleMode::Second
+                || attach.source.as_ref().is_some_and(|source| {
+                    source.dynamic
+                        || source.durable != 0
+                        || source
+                            .distribution_mode
+                            .as_ref()
+                            .is_some_and(|mode| mode.as_str() != "move")
+                        || source
+                            .filter
+                            .as_ref()
+                            .is_some_and(|filter| !filter.is_empty())
+                })
+            {
+                refuse(
+                        session,
                         attach,
                         error_for(
                             AmqpError::NotAllowed,
@@ -192,99 +263,118 @@ pub(super) async fn serve_session<B: NativeAtomicBroker>(
                         ),
                     )
                     .await?;
+                continue;
+            }
+            let (admission, link_authorization) = match admit_queue(
+                broker,
+                namespace,
+                &source,
+                authorization.as_ref(),
+                Permission::Listen,
+            )
+            .await
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    refuse(session, attach, error).await?;
                     continue;
                 }
-                let (admission, link_authorization) = match admit_queue(
-                    &broker,
-                    &namespace,
-                    &source,
-                    authorization.as_ref(),
-                    Permission::Listen,
-                )
-                .await
-                {
-                    Ok(admission) => admission,
-                    Err(error) => {
-                        refuse(&session, attach, error).await?;
-                        continue;
-                    }
-                };
-                let maximum = admission.config.max_message_bytes as u64;
-                let sender = match session
-                    .accept_transactional_sender_negotiating_unsettled(attach, maximum)
-                    .await
-                {
-                    Ok(sender) => sender,
-                    Err(EngineError::RemoteDetached) => continue,
-                    Err(error) => return Err(error.into()),
-                };
-                workers.spawn(workers::consumer(
+            };
+            let maximum = admission.config.max_message_bytes as u64;
+            let ticket = workers.reserve().map_err(RouteError::closed)?;
+            let sender = match accepted(
+                workers,
+                session.accept_transactional_sender_negotiating_unsettled(attach, maximum),
+            )
+            .await
+            {
+                Ok(sender) => sender,
+                Err(EngineError::RemoteDetached) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            launch(
+                workers,
+                ticket,
+                workers::consumer(
                     sender,
                     admission,
                     broker.clone(),
                     link_authorization,
                     events.clone(),
                     permit,
-                ));
-                continue;
-            }
-            if attach.snd_settle_mode == SenderSettleMode::Settled {
-                refuse(
-                    &session,
-                    attach,
-                    error_for(
-                        AmqpError::NotAllowed,
-                        "posting links require unsettled transfers".into(),
-                    ),
-                )
-                .await?;
-                continue;
-            }
+                ),
+                events,
+                adapter::Branch::Consumer,
+            )
+            .await?;
+            continue;
+        }
+        if attach.snd_settle_mode == SenderSettleMode::Settled {
+            refuse(
+                session,
+                attach,
+                error_for(
+                    AmqpError::NotAllowed,
+                    "posting links require unsettled transfers".into(),
+                ),
+            )
+            .await?;
+            continue;
+        }
 
-            let (admission, link_authorization) =
-                match admit_queue(&broker, &namespace, &target, authorization.as_ref(), Permission::Send).await {
-                    Ok(admission) => admission,
-                    Err(error) => {
-                        refuse(&session, attach, error).await?;
-                        continue;
-                    }
-                };
-            let decoders = MessageFormatDecoders::default().with_decoder(
-                crate::SERVICE_BUS_BATCH_MESSAGE_FORMAT,
-                amqp::decode_message,
-            )?;
-            let maximum = admission.config.max_message_bytes as u64;
-            let receiver = match session
-                .accept_transactional_receiver_with_decoders(attach, maximum, decoders)
-                .await
-            {
-                Ok(receiver) => receiver,
-                Err(EngineError::RemoteDetached) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            workers.spawn(workers::producer(
+        let (admission, link_authorization) = match admit_queue(
+            broker,
+            namespace,
+            &target,
+            authorization.as_ref(),
+            Permission::Send,
+        )
+        .await
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                refuse(session, attach, error).await?;
+                continue;
+            }
+        };
+        let decoders = MessageFormatDecoders::default().with_decoder(
+            crate::SERVICE_BUS_BATCH_MESSAGE_FORMAT,
+            amqp::decode_message,
+        )?;
+        let maximum = admission.config.max_message_bytes as u64;
+        let ticket = workers.reserve().map_err(RouteError::closed)?;
+        let receiver = match accepted(
+            workers,
+            session.accept_transactional_receiver_with_decoders(attach, maximum, decoders),
+        )
+        .await
+        {
+            Ok(receiver) => receiver,
+            Err(EngineError::RemoteDetached) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        launch(
+            workers,
+            ticket,
+            workers::producer(
                 receiver,
                 admission,
                 broker.clone(),
                 link_authorization,
                 events.clone(),
                 permit,
-            ));
-        }
-        // Peer End retires each endpoint, allowing its scoped cleanup to complete.
-        while let Some(result) = workers.join_next().await {
-            result??;
-        }
-        Ok(())
+            ),
+            events,
+            adapter::Branch::Producer,
+        )
+        .await?;
     }
-    .await;
-    if result.is_err() {
-        let (reply, stopped) = oneshot::channel();
-        if events.send(Event::StopConnection { reply }).await.is_ok() {
-            let _ = stopped.await;
-        }
+    // Peer End retires each endpoint, allowing its scoped cleanup to complete.
+    workers.begin_peer_end_drain();
+    while let Some(result) = poll_fn(|cx| workers.poll_next(cx)).await {
+        result.map_err(RouteError::Worker)?;
     }
-    result
+    Ok(())
 }
 
 async fn admit_queue<B: NativeAtomicBroker>(

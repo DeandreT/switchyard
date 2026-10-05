@@ -24,6 +24,9 @@ mod routing;
 mod workers;
 
 #[cfg(test)]
+mod retained_session;
+
+#[cfg(test)]
 mod tests;
 
 const MAX_SESSIONS: usize = 32;
