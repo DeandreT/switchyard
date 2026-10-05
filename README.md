@@ -197,6 +197,10 @@ cargo run -p switchyardctl -- \
   queue get orders
 ```
 
+An optional [development maintenance clock assessment](docs/development-maintenance-clock.md)
+uses `--development-maintenance-readiness` on that same admin listener and the
+`maintenance-clock` CLI command. It is not whole-node readiness or write authority.
+
 The CLI also supports `queue list` and `queue update`, and emits JSON. Topics
 and subscriptions have separate create/get/list/update commands:
 
