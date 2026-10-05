@@ -151,6 +151,8 @@ The [sealed transport buffer](docs/sealed-image-transport.md) moves an owned ima
 without a body copy and refuses writes while preserving bounded reads and seeks.
 The [standalone catalog builder](docs/standalone-snapshot-builder.md) returns a
 sealed snapshot through the existing owner without enabling engine snapshot methods.
+The separate [trusted image replacement](docs/committed-image-replacement.md)
+replaces initialized business rows and their opaque catalog in one atomic commit.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing

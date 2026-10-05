@@ -122,3 +122,8 @@ were ignored in the workspace run. Formatting, strict workspace Clippy and
 builds in both configurations, protobuf descriptor generation, and diff checks
 passed. Full all-feature workspace tests and live SDK gates were not rerun for
 this isolated domain constructor and storage-contract clarification.
+
+The separate [trusted replacement](committed-image-replacement.md) applies to
+initialized targets and requires a bounded business reader plus an exact old
+checkpoint expectation. It does not broaden this pristine-only constructor or
+grant native installation or history-purge authority.
