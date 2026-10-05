@@ -1,8 +1,13 @@
 //! Disjoint standalone logical role; never an OpenRaft adapter or runtime store.
+mod aligned_seed;
 mod codec;
 mod owner;
 mod state;
 mod store;
+pub use aligned_seed::{
+    AlignedSeedExpectation, AlignedSeedInspectionError, BorrowedAlignedSeed, InspectedAlignedSeed,
+    inspect_aligned_seed,
+};
 pub use store::ExperimentalCompactionLogStore;
 
 #[cfg(test)]

@@ -15,6 +15,11 @@ mod snapshot_data;
 pub use snapshot_data::{BoundedSnapshotData, MAX_SNAPSHOT_BYTES};
 
 pub use experimental_log::{
+    AlignedSeedExpectation, AlignedSeedInspectionError, BorrowedAlignedSeed, InspectedAlignedSeed,
+    inspect_aligned_seed,
+};
+
+pub use experimental_log::{
     ExperimentalCompactionLogStore, ExperimentalLogStore, LogCodecError, LogEntry, LogId,
     LogProfile, LogResource, LogStorageError, LogTypes, LogVote, LogWorkload, MAX_APPEND_BYTES,
     MAX_APPEND_ENTRIES, MAX_LIMITED_BYTES, MAX_LIMITED_ENTRIES, MAX_LOG_BODY_BYTES,

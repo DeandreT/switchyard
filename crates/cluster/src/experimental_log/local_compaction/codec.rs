@@ -31,6 +31,57 @@ pub(super) fn check_profile(bytes: &[u8], profile: &LogProfile) -> Result<(), Er
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ObservedProfileError {
+    Limit,
+    Allocation,
+    Unsupported,
+    Invalid,
+}
+
+// Parse observed identity before any comparison to a caller's expectation.
+pub(super) fn decode_observed_profile(bytes: &[u8]) -> Result<LogProfile, ObservedProfileError> {
+    use ObservedProfileError as E;
+    if bytes.len() > crate::MAX_LOG_METADATA_BYTES {
+        return Err(E::Limit);
+    }
+    if bytes.len() < PROFILE_HEADER.len() + 8 {
+        return Err(E::Invalid);
+    }
+    if !bytes.starts_with(PROFILE_HEADER) {
+        return Err(E::Unsupported);
+    }
+    let start = PROFILE_HEADER.len() + 4;
+    let length = u32::from_be_bytes(
+        bytes[PROFILE_HEADER.len()..start]
+            .try_into()
+            .map_err(|_| E::Invalid)?,
+    );
+    let end = start
+        .checked_add(usize::try_from(length).map_err(|_| E::Limit)?)
+        .filter(|end| end.checked_add(4) == Some(bytes.len()))
+        .ok_or(E::Invalid)?;
+    let cap = u32::from_be_bytes(bytes[end..].try_into().map_err(|_| E::Invalid)?);
+    if cap != MAX_BASELINE_BYTES as u32 {
+        return Err(E::Invalid);
+    }
+    let profile =
+        super::super::codec::decode_profile(&bytes[start..end]).map_err(|error| match error {
+            crate::LogCodecError::UnsupportedRecord => E::Unsupported,
+            crate::LogCodecError::TooLarge { .. } | crate::LogCodecError::SizeOverflow => E::Limit,
+            _ => E::Invalid,
+        })?;
+    let canonical = encode_profile(&profile).map_err(|error| match error {
+        Error::Allocation => E::Allocation,
+        Error::LimitExceeded => E::Limit,
+        _ => E::Invalid,
+    })?;
+    if canonical != bytes {
+        return Err(E::Invalid);
+    }
+    Ok(profile)
+}
+
 #[derive(Serialize, Deserialize)]
 struct Id {
     term: u64,

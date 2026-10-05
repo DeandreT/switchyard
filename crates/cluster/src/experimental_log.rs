@@ -5,6 +5,10 @@
 
 pub(crate) mod local_compaction;
 pub use local_compaction::ExperimentalCompactionLogStore;
+pub use local_compaction::{
+    AlignedSeedExpectation, AlignedSeedInspectionError, BorrowedAlignedSeed, InspectedAlignedSeed,
+    inspect_aligned_seed,
+};
 
 mod budget;
 mod codec;
