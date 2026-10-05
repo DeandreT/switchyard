@@ -40,8 +40,16 @@ mod connection;
 #[cfg(test)]
 mod owned_tasks;
 mod receiving;
+mod retained_connection;
 mod routing;
 mod websocket;
+
+pub use retained_connection::{
+    RetainedConnectionJoinReport, RetainedConnectionOutcome, RetainedConnectionOutcomes,
+    RetainedConnectionOwner, RetainedConnectionRequest, RetainedConnectionResult,
+    RetainedConnectionStartCause, RetainedConnectionStartError, RetainedConnectionStarter,
+    RetainedConnectionTaskJoins,
+};
 
 use receiving::serve_receiving_client;
 use routing::{management_target, plan_link, plan_management};

@@ -10,6 +10,8 @@ use tokio::{
 use tracing::{debug, warn};
 
 use super::{AmqpListener, atomic_ingress, serve_open_connection, websocket};
+
+pub(super) mod retained;
 use crate::{
     Broker, NativeAtomicBroker, SharedAccessAuthentication,
     authorization::{ConnectionAuthorization, SharedAccessSaslAcceptor},
@@ -309,8 +311,8 @@ where
     let result = driver
         .serve_open(&mut connection, namespace, broker, authorization)
         .await;
-    // Dropping a connection initiates cancellation, but admission is not freed
-    // until both engine tasks have relinquished their halves of the socket.
+    // Dropping a connection initiates cancellation; shutdown observes the actor's
+    // exit notification, not actual task joins.
     connection.shutdown().await;
     result
 }

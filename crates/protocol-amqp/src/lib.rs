@@ -52,7 +52,12 @@ pub use crate::{
         RESOURCE_LIMIT_EXCEEDED, RESOURCE_LOCKED, SESSION_CANNOT_BE_LOCKED, SESSION_LOCK_LOST,
         TIMEOUT, condition_for, is_retryable,
     },
-    listener::AmqpListener,
+    listener::{
+        AmqpListener, RetainedConnectionJoinReport, RetainedConnectionOutcome,
+        RetainedConnectionOutcomes, RetainedConnectionOwner, RetainedConnectionRequest,
+        RetainedConnectionResult, RetainedConnectionStartCause, RetainedConnectionStartError,
+        RetainedConnectionStarter, RetainedConnectionTaskJoins,
+    },
     management::{
         ADD_RULE_OPERATION, ASSOCIATED_LINK_NAME_PROPERTY, CANCEL_SCHEDULED_MESSAGE_OPERATION,
         DEAD_LETTER_DESCRIPTION, DEAD_LETTER_REASON, DISPOSITION_STATUS, ENUMERATE_RULES_OPERATION,
