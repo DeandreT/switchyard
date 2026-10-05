@@ -8,7 +8,7 @@ use storage::{
 use tokio::sync::Notify;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(super) struct Counts {
+pub(in crate::experimental_state_machine) struct Counts {
     pub reader_factories: usize,
     pub initialized: usize,
     pub gets: usize,
@@ -23,7 +23,7 @@ pub(super) struct Counts {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) enum Fault {
+pub(in crate::experimental_state_machine) enum Fault {
     #[default]
     None,
     CapturePhysical,
@@ -38,7 +38,7 @@ pub(super) enum Fault {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum GateKind {
+pub(in crate::experimental_state_machine) enum GateKind {
     Capture,
     Catalog,
 }
@@ -54,29 +54,31 @@ struct Observation {
     gate: Option<(GateKind, Arc<ReadGate>)>,
 }
 
-pub(super) struct Writer<W: CatalogCommittedStore> {
+pub(in crate::experimental_state_machine) struct Writer<W: CatalogCommittedStore> {
     writer: Arc<Mutex<W>>,
     observation: Arc<Mutex<Observation>>,
 }
 
-pub(super) struct Control<W: CatalogCommittedStore> {
+pub(in crate::experimental_state_machine) struct Control<W: CatalogCommittedStore> {
     writer: Arc<Mutex<W>>,
     observation: Arc<Mutex<Observation>>,
 }
 
 #[derive(Clone)]
-pub(super) struct Reader<R> {
+pub(in crate::experimental_state_machine) struct Reader<R> {
     inner: R,
     observation: Arc<Mutex<Observation>>,
 }
 
 #[derive(Clone)]
-pub(super) struct CatalogReader<R> {
+pub(in crate::experimental_state_machine) struct CatalogReader<R> {
     inner: R,
     observation: Arc<Mutex<Observation>>,
 }
 
-pub(super) fn observed<W: CatalogCommittedStore>(writer: W) -> (Writer<W>, Control<W>) {
+pub(in crate::experimental_state_machine) fn observed<W: CatalogCommittedStore>(
+    writer: W,
+) -> (Writer<W>, Control<W>) {
     let writer = Arc::new(Mutex::new(writer));
     let observation = Arc::new(Mutex::new(Observation::default()));
     (
@@ -92,7 +94,7 @@ pub(super) fn observed<W: CatalogCommittedStore>(writer: W) -> (Writer<W>, Contr
 }
 
 impl<W: CatalogCommittedStore> Control<W> {
-    pub(super) fn counts(&self) -> Counts {
+    pub(in crate::experimental_state_machine) fn counts(&self) -> Counts {
         self.observation
             .lock()
             .expect("test observation")
@@ -100,7 +102,7 @@ impl<W: CatalogCommittedStore> Control<W> {
             .clone()
     }
 
-    pub(super) fn limits(&self) -> Vec<ReadLimits> {
+    pub(in crate::experimental_state_machine) fn limits(&self) -> Vec<ReadLimits> {
         self.observation
             .lock()
             .expect("test observation")
@@ -108,7 +110,7 @@ impl<W: CatalogCommittedStore> Control<W> {
             .clone()
     }
 
-    pub(super) fn catalog_batches(&self) -> Vec<WriteBatch> {
+    pub(in crate::experimental_state_machine) fn catalog_batches(&self) -> Vec<WriteBatch> {
         self.observation
             .lock()
             .expect("test observation")
@@ -116,7 +118,7 @@ impl<W: CatalogCommittedStore> Control<W> {
             .clone()
     }
 
-    pub(super) fn committed_pointers(&self) -> Vec<(usize, usize)> {
+    pub(in crate::experimental_state_machine) fn committed_pointers(&self) -> Vec<(usize, usize)> {
         self.observation
             .lock()
             .expect("test observation")
@@ -124,7 +126,7 @@ impl<W: CatalogCommittedStore> Control<W> {
             .clone()
     }
 
-    pub(super) fn read_pointers(&self) -> Vec<(usize, usize)> {
+    pub(in crate::experimental_state_machine) fn read_pointers(&self) -> Vec<(usize, usize)> {
         self.observation
             .lock()
             .expect("test observation")
@@ -132,7 +134,7 @@ impl<W: CatalogCommittedStore> Control<W> {
             .clone()
     }
 
-    pub(super) fn reset(&self) {
+    pub(in crate::experimental_state_machine) fn reset(&self) {
         let mut state = self.observation.lock().expect("test observation");
         assert!(state.gate.is_none(), "reset only after consuming the gate");
         state.counts = Counts::default();
@@ -144,26 +146,33 @@ impl<W: CatalogCommittedStore> Control<W> {
     }
 
     // Matching raw capabilities are used only for evidence/injection and serial reopen.
-    pub(super) fn reader(&self) -> W::Reader {
+    pub(in crate::experimental_state_machine) fn reader(&self) -> W::Reader {
         self.writer.lock().expect("test writer").reader()
     }
 
-    pub(super) fn catalog_reader(&self) -> W::CatalogReader {
+    pub(in crate::experimental_state_machine) fn catalog_reader(&self) -> W::CatalogReader {
         self.writer.lock().expect("test writer").catalog_reader()
     }
 
-    pub(super) fn writer(&self) -> Writer<W> {
+    pub(in crate::experimental_state_machine) fn writer(&self) -> Writer<W> {
         Writer {
             writer: self.writer.clone(),
             observation: self.observation.clone(),
         }
     }
 
-    pub(super) fn inject(&self, batch: WriteBatch) -> Result<(), StorageError> {
+    pub(in crate::experimental_state_machine) fn inject(
+        &self,
+        batch: WriteBatch,
+    ) -> Result<(), StorageError> {
         self.writer.lock().expect("test writer").commit(batch)
     }
 
-    pub(super) fn retain(&self, metadata: &[u8], image: &[u8]) -> Result<(), StorageError> {
+    pub(in crate::experimental_state_machine) fn retain(
+        &self,
+        metadata: &[u8],
+        image: &[u8],
+    ) -> Result<(), StorageError> {
         let record = SnapshotCatalogRecord::new(metadata, image)
             .map_err(|_| StorageError::ReadLimitExceeded)?;
         self.writer
@@ -172,11 +181,11 @@ impl<W: CatalogCommittedStore> Control<W> {
             .commit_with_catalog(WriteBatch::default(), record)
     }
 
-    pub(super) fn fault(&self, fault: Fault) {
+    pub(in crate::experimental_state_machine) fn fault(&self, fault: Fault) {
         self.observation.lock().expect("test observation").fault = fault;
     }
 
-    pub(super) fn gate(&self, kind: GateKind) -> GateGuard {
+    pub(in crate::experimental_state_machine) fn gate(&self, kind: GateKind) -> GateGuard {
         let gate = Arc::new(ReadGate {
             state: Mutex::new(GateState::default()),
             notify: Notify::new(),
@@ -440,10 +449,10 @@ impl ReadGate {
     }
 }
 
-pub(super) struct GateGuard(Arc<ReadGate>);
+pub(in crate::experimental_state_machine) struct GateGuard(Arc<ReadGate>);
 
 impl GateGuard {
-    pub(super) async fn entered(&self) {
+    pub(in crate::experimental_state_machine) async fn entered(&self) {
         loop {
             let wake = self.0.notify.notified();
             tokio::pin!(wake);
@@ -455,7 +464,7 @@ impl GateGuard {
         }
     }
 
-    pub(super) fn release(&self) {
+    pub(in crate::experimental_state_machine) fn release(&self) {
         self.0.release();
     }
 }

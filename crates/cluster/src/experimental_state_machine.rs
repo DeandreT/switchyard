@@ -1,9 +1,10 @@
 //! Isolated committed queue application for the pinned replication library.
 //!
-//! This is not a Raft node, network, client proposer, or snapshot implementation.
+//! This is not a Raft node, network, client proposer, or engine snapshot implementation.
 //! Production startup and existing standalone proposers remain unchanged.
 
 mod budget;
+mod catalog_snapshot_builder;
 mod image_bootstrap;
 mod image_catalog;
 mod image_export;
@@ -19,6 +20,7 @@ mod store;
 #[path = "experimental_state_machine/image_bootstrap/fixture.rs"]
 mod captured_image_fixture;
 
+pub use catalog_snapshot_builder::CreateSendSnapshotBuilder;
 pub use image_bootstrap::StateMachineImageBootstrapError;
 pub use image_catalog::{
     BuiltNativeSnapshotCatalog, MAX_NATIVE_CATALOG_METADATA_OVERHEAD_BYTES,

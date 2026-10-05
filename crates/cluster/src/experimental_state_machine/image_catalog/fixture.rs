@@ -12,7 +12,7 @@ use crate::{
     ExperimentalStateMachine, LogApplication, LogEntry, LogId, LogQueueRefusal, QueueLogCommand,
 };
 
-pub(super) async fn seeded<W>(
+pub(in crate::experimental_state_machine) async fn seeded<W>(
     writer: W,
     maximum: bool,
 ) -> TestResult<(ExperimentalStateMachine, Control<W>)>
@@ -103,7 +103,7 @@ async fn seed(machine: &mut ExperimentalStateMachine, maximum: bool) -> TestResu
     Ok(())
 }
 
-pub(super) fn source<W: CatalogCommittedStore>(
+pub(in crate::experimental_state_machine) fn source<W: CatalogCommittedStore>(
     control: &Control<W>,
 ) -> TestResult<captured::Selected> {
     let snapshot = control.reader().snapshot()?;
@@ -122,7 +122,10 @@ pub(super) fn source<W: CatalogCommittedStore>(
     })
 }
 
-pub(super) async fn finish(machine: ExperimentalStateMachine, result: TestResult) -> TestResult {
+pub(in crate::experimental_state_machine) async fn finish(
+    machine: ExperimentalStateMachine,
+    result: TestResult,
+) -> TestResult {
     let joined = machine.shutdown().await;
     result?;
     joined?;

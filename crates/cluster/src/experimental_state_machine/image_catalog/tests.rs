@@ -14,9 +14,9 @@ mod custody;
 #[path = "failures.rs"]
 mod failures;
 #[path = "fixture.rs"]
-mod fixture;
+pub(in crate::experimental_state_machine) mod fixture;
 #[path = "observed.rs"]
-mod observed;
+pub(in crate::experimental_state_machine) mod observed;
 #[path = "workflow.rs"]
 mod workflow;
 

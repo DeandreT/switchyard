@@ -61,6 +61,20 @@ pub struct BuiltNativeSnapshotCatalog {
 }
 
 impl BuiltNativeSnapshotCatalog {
+    // The catalog is already retained. This private handoff moves both owned
+    // parts; the standalone builder maps defensive transport errors statically.
+    pub(super) fn into_standalone_snapshot(
+        self,
+    ) -> std::io::Result<openraft::Snapshot<crate::LogTypes>> {
+        let Self { image, details } = self;
+        let BuiltDetails { projection, .. } = *details;
+        let data = crate::BoundedSnapshotData::from_image(image)?;
+        Ok(openraft::Snapshot {
+            meta: projection,
+            snapshot: Box::new(data),
+        })
+    }
+
     pub fn image_bytes(&self) -> &[u8] {
         self.image.as_bytes()
     }
@@ -137,8 +151,8 @@ impl ExperimentalStateMachine {
     /// Create a pristine owner with explicit bounded native catalog operations.
     ///
     /// Existing constructors leave this capability disabled. This constructor
-    /// does not enable the separate image-export operation or any OpenRaft snapshot
-    /// builder/current-snapshot/install method, engine adoption, or log purge.
+    /// does not enable the separate image-export operation or an engine-facing
+    /// snapshot builder/current-snapshot/install method, engine adoption, or log purge.
     ///
     /// ```compile_fail
     /// fn no_catalog<W: storage::CommittedStore>(writer: W, stream: domain::CommittedStreamId)
@@ -332,4 +346,4 @@ impl<W: CommittedStore> StoreState<W> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

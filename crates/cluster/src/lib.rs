@@ -18,7 +18,7 @@ pub use experimental_log::{
 };
 
 pub use experimental_state_machine::{
-    AppliedState, BuiltNativeSnapshotCatalog, DecodedNativeSnapshotPair,
+    AppliedState, BuiltNativeSnapshotCatalog, CreateSendSnapshotBuilder, DecodedNativeSnapshotPair,
     EncodedNativeSnapshotMetadata, ExperimentalStateMachine, LogApplication, LogQueueConfigRefusal,
     LogQueueRefusal, MAX_APPLY_BYTES, MAX_APPLY_ENTRIES,
     MAX_NATIVE_CATALOG_METADATA_OVERHEAD_BYTES, MAX_NATIVE_SNAPSHOT_METADATA_BYTES,
