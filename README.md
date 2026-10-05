@@ -288,6 +288,9 @@ without changing default ingress or claiming whole-descendant cleanup.
 A private [retained atomic session experiment](docs/retained-atomic-session.md)
 keeps one actual session's original routing-worker outcomes through its joins;
 it is not yet integrated into the connection owner or SDK fixture cleanup.
+A private [two-session collector](docs/retained-atomic-collector.md) extends that
+experiment with one shared logical owner and a connection-wide worker history;
+it still requires separately retained socket tasks and changes no default policy.
 Separate ordinary [receiving-batch gates](docs/dotnet-receiving-batches.md) hold
 three action copies on one receiver before completion and exercise out-of-order
 queue settlement with rolling count-prefetch replenishment on both SDK pins and

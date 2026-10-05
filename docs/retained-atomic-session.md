@@ -101,6 +101,11 @@ their shared owner, listener descendants, native jobs and fixture resources need
 separate custody and actual barriers. No native physical completion, safe reopen,
 source-health verdict, SDK compatibility fix or wider lifecycle activation follows.
 
+The private [two-session collector](retained-atomic-collector.md) now provides
+that experiment's fixed two-admission/two-Session graph with one shared owner
+and worker history. It reuses the scoped Session helper, but is still separate
+from the socket owner, native-job completion and SDK fixture cleanup.
+
 ## Verification
 
 The final focused suite passed all 34 regular tests. Ten unchanged serial repeats

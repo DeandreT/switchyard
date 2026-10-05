@@ -125,6 +125,9 @@ guarantee is claimed for that configuration.
 The separate private [retained atomic session experiment](retained-atomic-session.md)
 roots one actual session and its original routing workers. It is not integrated
 into this API and does not expand the three covered roles or SDK fixture cleanup.
+The private [two-session collector](retained-atomic-collector.md) shares logical
+owner authority and worker history across two actual sessions. It also remains
+separate from this socket API and establishes no combined descendant barrier.
 
 ## Verification
 

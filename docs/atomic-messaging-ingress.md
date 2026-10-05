@@ -14,6 +14,9 @@ transaction recovery log.
 The private [retained atomic session experiment](retained-atomic-session.md)
 exercises original routing-worker custody with a finite lifetime history budget.
 It does not activate that budget or retained descendant cleanup on this endpoint.
+The private [two-session collector](retained-atomic-collector.md) exercises the
+same routing body with one shared logical owner and global worker history; it
+likewise changes no endpoint limits, admission or cleanup policy.
 
 ## Experimental Process Endpoint
 
