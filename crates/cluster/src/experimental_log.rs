@@ -62,6 +62,12 @@ pub(crate) fn queue_command_timestamp(command: &QueueLogCommand) -> domain::Time
     }
 }
 
+pub(crate) fn bounded_membership_len(
+    membership: &openraft::Membership<u64, openraft::BasicNode>,
+) -> Result<usize, LogCodecError> {
+    codec::bounded_membership_len(membership)
+}
+
 pub(crate) fn encode_membership(
     membership: &openraft::Membership<u64, openraft::BasicNode>,
 ) -> Result<Vec<u8>, LogCodecError> {

@@ -123,6 +123,7 @@ where
         poisoned: false,
         image_export: None,
         image_catalog: None,
+        image_replacement: None,
     })
     .map_err(|_| StateMachineCatalogBootstrapError::OwnerStartAfterCommit)
 }

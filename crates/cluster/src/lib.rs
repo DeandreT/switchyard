@@ -24,14 +24,15 @@ pub use experimental_log::{
 };
 
 pub use experimental_state_machine::{
-    AppliedState, BuiltNativeSnapshotCatalog, CreateSendSnapshotBuilder, DecodedNativeSnapshotPair,
-    EncodedNativeSnapshotMetadata, ExperimentalStateMachine, LogApplication, LogQueueConfigRefusal,
-    LogQueueRefusal, MAX_APPLY_BYTES, MAX_APPLY_ENTRIES,
-    MAX_NATIVE_CATALOG_METADATA_OVERHEAD_BYTES, MAX_NATIVE_SNAPSHOT_METADATA_BYTES,
-    MAX_STATE_MACHINE_OWNER_BYTES, MAX_STATE_MACHINE_OWNER_JOBS, NativeSnapshotMetadataError,
+    AppliedState, BuiltNativeSnapshotCatalog, CommittedNativeReplacement,
+    CreateSendSnapshotBuilder, DecodedNativeSnapshotPair, EncodedNativeSnapshotMetadata,
+    ExperimentalStateMachine, LogApplication, LogQueueConfigRefusal, LogQueueRefusal,
+    MAX_APPLY_BYTES, MAX_APPLY_ENTRIES, MAX_NATIVE_CATALOG_METADATA_OVERHEAD_BYTES,
+    MAX_NATIVE_SNAPSHOT_METADATA_BYTES, MAX_STATE_MACHINE_OWNER_BYTES,
+    MAX_STATE_MACHINE_OWNER_JOBS, NativeSnapshotMetadataError, OwnedTrustedNativeReplacement,
     RetainedNativeSnapshotCatalog, StateMachineCatalogBootstrapError, StateMachineCatalogError,
     StateMachineError, StateMachineImageBootstrapError, StateMachineImageExportError,
-    StateMachineWorkload, UnsupportedSnapshotBuilder,
+    StateMachineImageReplacementError, StateMachineWorkload, UnsupportedSnapshotBuilder,
 };
 
 pub use experimental_replica::{

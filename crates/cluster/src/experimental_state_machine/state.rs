@@ -13,6 +13,7 @@ use crate::experimental_log::{
 use super::{
     AppliedState, LogApplication, StateMachineError,
     image_catalog::CatalogCapabilities,
+    image_replacement::ReplacementCapability,
     input::PreparedApply,
     response::{ExpectedApplication, application_for},
 };
@@ -22,6 +23,7 @@ pub(super) struct StoreState<W: CommittedStore> {
     pub(super) poisoned: bool,
     pub(super) image_export: Option<ImageExportCapability<CommittedStateMachine<W>>>,
     pub(super) image_catalog: Option<CatalogCapabilities<CommittedStateMachine<W>>>,
+    pub(super) image_replacement: Option<ReplacementCapability<CommittedStateMachine<W>>>,
 }
 
 type ImageExportCapability<M> =
@@ -76,6 +78,7 @@ impl<W: CommittedStore> StoreState<W> {
             poisoned: false,
             image_export: None,
             image_catalog: None,
+            image_replacement: None,
         })
     }
 

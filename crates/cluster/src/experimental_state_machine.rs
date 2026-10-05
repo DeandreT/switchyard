@@ -8,6 +8,7 @@ mod catalog_snapshot_builder;
 mod image_bootstrap;
 mod image_catalog;
 mod image_export;
+mod image_replacement;
 mod input;
 mod owner;
 mod response;
@@ -27,6 +28,9 @@ pub use image_catalog::{
     RetainedNativeSnapshotCatalog, StateMachineCatalogBootstrapError, StateMachineCatalogError,
 };
 pub use image_export::StateMachineImageExportError;
+pub use image_replacement::{
+    CommittedNativeReplacement, OwnedTrustedNativeReplacement, StateMachineImageReplacementError,
+};
 pub use response::{LogApplication, LogQueueConfigRefusal, LogQueueRefusal};
 pub use snapshot::UnsupportedSnapshotBuilder;
 pub(crate) use snapshot_metadata::NativeCheckpointSummary;
@@ -52,6 +56,8 @@ pub const MAX_STATE_MACHINE_OWNER_BYTES: usize = MAX_APPLY_BYTES;
 /// Opted-in image exports and catalog operations carry the complete image limit,
 /// not output RSS. Catalogs explicitly add at most 8 KiB encoded metadata and
 /// small checkpoint/projection bookkeeping outside this admission accounting.
+/// Trusted replacement uses the same full source charge; target captures and
+/// up to 128 MiB mutation payload are separately bounded, not included here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StateMachineWorkload {
     pub accepted_jobs: usize,

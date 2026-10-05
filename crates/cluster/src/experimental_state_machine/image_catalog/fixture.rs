@@ -32,7 +32,10 @@ where
     Ok((machine, control))
 }
 
-async fn seed(machine: &mut ExperimentalStateMachine, maximum: bool) -> TestResult {
+pub(in crate::experimental_state_machine) async fn seed(
+    machine: &mut ExperimentalStateMachine,
+    maximum: bool,
+) -> TestResult {
     let config = QueueConfig {
         max_message_bytes: domain::MAX_COMMITTED_BODY_BYTES + domain::BROKER_HEADER_RESERVE_BYTES,
         default_time_to_live_millis: Some(1000),

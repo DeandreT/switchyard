@@ -9,6 +9,7 @@ use domain::{CommittedSend, EntityPath, NamespaceName, QueueConfig, SessionId, T
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{self, SeqAccess, Visitor},
+    ser::SerializeSeq,
 };
 
 use super::types::*;
@@ -738,6 +739,59 @@ pub(super) fn validate_encoded_entry(bytes: Vec<u8>) -> Result<EncodedEntry, Log
     wire.validate()?;
     let id = wire.id.into_id();
     Ok(EncodedEntry::validated(id, bytes))
+}
+
+// The admission guard borrows the frozen MembershipV1 shape without collecting.
+#[derive(Serialize)]
+struct BorrowedMembership<'a> {
+    configs: &'a Vec<BTreeSet<u64>>,
+    nodes: BorrowedNodes<'a>,
+}
+
+struct BorrowedNodes<'a>(&'a openraft::Membership<u64, openraft::BasicNode>);
+
+impl Serialize for BorrowedNodes<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(self.0.nodes().count()))?;
+        for (id, node) in self.0.nodes() {
+            sequence.serialize_element(&NodeV1 {
+                id: *id,
+                address: Text(Cow::Borrowed(&node.addr)),
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+/// Allocation-free shape and exact wire-length bounds, not semantic validation.
+/// Empty/default membership is legal here; native pair agreement validates it.
+pub(super) fn bounded_membership_len(
+    membership: &openraft::Membership<u64, openraft::BasicNode>,
+) -> Result<usize, LogCodecError> {
+    if membership.get_joint_config().len() > MAX_CONFIGS
+        || membership
+            .get_joint_config()
+            .iter()
+            .any(|config| config.len() > MAX_NODES)
+        || membership.nodes().take(MAX_NODES + 1).count() > MAX_NODES
+        || membership
+            .nodes()
+            .any(|(_, node)| node.addr.len() > MAX_ADDRESS_BYTES)
+    {
+        return Err(LogCodecError::InvalidMembership);
+    }
+    // Shape caps above bound this wire below 18 KiB. Count completely without
+    // invoking Counter's allocating I/O-error path, then use the static quota.
+    let length = encoded_size(
+        &BorrowedMembership {
+            configs: membership.get_joint_config(),
+            nodes: BorrowedNodes(membership),
+        },
+        usize::MAX,
+        LogResource::Membership,
+    )?;
+    limit(length, MAX_LOG_MEMBERSHIP_BYTES, LogResource::Membership)?;
+    Ok(length)
 }
 
 pub(super) fn encode_membership(

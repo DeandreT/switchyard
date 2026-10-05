@@ -34,6 +34,7 @@ pub(in crate::experimental_state_machine) enum Fault {
     CatalogAllocation,
     CatalogPanic,
     CommitBefore,
+    CommitLimit,
     CommitAfter,
 }
 
@@ -264,7 +265,10 @@ impl<W: CatalogCommittedStore> CatalogCommittedStore for Writer<W> {
                 catalog.metadata().as_ptr() as usize,
                 catalog.artifact().as_ptr() as usize,
             ));
-            if matches!(state.fault, Fault::CommitBefore | Fault::CommitAfter) {
+            if matches!(
+                state.fault,
+                Fault::CommitBefore | Fault::CommitLimit | Fault::CommitAfter
+            ) {
                 std::mem::take(&mut state.fault)
             } else {
                 Fault::None
@@ -272,6 +276,9 @@ impl<W: CatalogCommittedStore> CatalogCommittedStore for Writer<W> {
         };
         if matches!(fault, Fault::CommitBefore) {
             return Err(physical());
+        }
+        if matches!(fault, Fault::CommitLimit) {
+            return Err(StorageError::ReadLimitExceeded);
         }
         self.writer
             .lock()

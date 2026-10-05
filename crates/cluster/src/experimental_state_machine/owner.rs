@@ -15,9 +15,10 @@ use storage::CommittedStore;
 use tokio::sync::oneshot;
 
 use super::{
-    AppliedState, BuiltNativeSnapshotCatalog, LogApplication, MAX_STATE_MACHINE_OWNER_JOBS,
-    RetainedNativeSnapshotCatalog, StateMachineCatalogError, StateMachineError,
-    StateMachineImageExportError, StateMachineWorkload,
+    AppliedState, BuiltNativeSnapshotCatalog, CommittedNativeReplacement, LogApplication,
+    MAX_STATE_MACHINE_OWNER_JOBS, OwnedTrustedNativeReplacement, RetainedNativeSnapshotCatalog,
+    StateMachineCatalogError, StateMachineError, StateMachineImageExportError,
+    StateMachineImageReplacementError, StateMachineWorkload,
     budget::{Admission, Lease},
     input::PreparedApply,
     state::StoreState,
@@ -40,6 +41,7 @@ pub(super) enum Operation {
     ExportImage,
     BuildCatalog,
     ReadCatalog,
+    ReplaceCatalog(Box<OwnedTrustedNativeReplacement>),
 }
 
 pub(super) enum Reply {
@@ -51,6 +53,7 @@ pub(super) enum Reply {
     ImageExport(Result<domain::EncodedCommittedImage, StateMachineImageExportError>),
     CatalogBuilt(Result<BuiltNativeSnapshotCatalog, StateMachineCatalogError>),
     CatalogRead(Result<Option<RetainedNativeSnapshotCatalog>, StateMachineCatalogError>),
+    CatalogReplaced(Result<CommittedNativeReplacement, StateMachineImageReplacementError>),
 }
 
 type Response = Result<Reply, StateMachineError>;
@@ -79,7 +82,8 @@ impl Packet {
                 Operation::ExportImage
                 | Operation::BuildCatalog
                 | Operation::ReadCatalog
-                | Operation::BuildLocal { .. },
+                | Operation::BuildLocal { .. }
+                | Operation::ReplaceCatalog(_),
             ) => domain::MAX_COMMITTED_IMAGE_BYTES,
             _ => 64,
         }
@@ -291,6 +295,9 @@ fn run<W: CommittedStore>(
                 Some(Operation::ReadCatalog) => {
                     Ok(Reply::CatalogRead(state.read_create_send_catalog()))
                 }
+                Some(Operation::ReplaceCatalog(request)) => Ok(Reply::CatalogReplaced(
+                    state.replace_create_send_image_with_catalog(&request),
+                )),
                 None => Err(StateMachineError::Panicked),
             }));
             let result = match result {
