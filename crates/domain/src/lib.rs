@@ -41,6 +41,11 @@ pub use command::{
     IngressBatchLimit, IngressEnvelope, ScheduledEnvelope, ScheduledMessage, SettlementDisposition,
 };
 pub use committed::{
+    CheckedProtectedCreateSendImage, ProtectedCreateSendImageError,
+    check_protected_create_send_image,
+};
+
+pub use committed::{
     CommittedApplication, CommittedApplyError, CommittedApplyResult, CommittedCheckpoint,
     CommittedCheckpointUpdate, CommittedEntryId, CommittedEntryMark, CommittedImageError,
     CommittedImageRole, CommittedImageRow, CommittedImageRows, CommittedImageValidationError,

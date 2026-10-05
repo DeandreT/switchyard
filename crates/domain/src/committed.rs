@@ -20,6 +20,11 @@ mod tests;
 pub(crate) use checkpoint::{decode_checkpoint, encode_checkpoint};
 pub(crate) use fingerprint::entry_fingerprint;
 pub use image::{
+    CheckedProtectedCreateSendImage, ProtectedCreateSendImageError,
+    check_protected_create_send_image,
+};
+
+pub use image::{
     CommittedImageError, CommittedImageRole, CommittedImageRow, CommittedImageRows,
     CommittedImageValidationError, DecodedCommittedImage, EncodedCommittedImage,
     MAX_COMMITTED_IMAGE_BYTES, MAX_COMMITTED_IMAGE_KEY_BYTES, MAX_COMMITTED_IMAGE_ROWS,

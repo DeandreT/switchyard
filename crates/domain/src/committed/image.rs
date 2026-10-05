@@ -10,6 +10,12 @@ use storage::StoreSnapshot;
 
 use super::{CommittedCheckpoint, CommittedStreamId, MAX_COMMITTED_ENTRY_BYTES, decode_checkpoint};
 
+mod protected;
+pub use protected::{
+    CheckedProtectedCreateSendImage, ProtectedCreateSendImageError,
+    check_protected_create_send_image,
+};
+
 mod validated;
 pub use validated::{CommittedImageValidationError, ValidatedCreateSendImage};
 
