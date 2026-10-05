@@ -67,6 +67,10 @@ not accept its counts as a replacement permit or alter the legacy selection path
 The [aligned seed candidate](aligned-seed-candidates.md) remains a separate
 canonical data preparation boundary, not a publication capability.
 
+The separate [complete legacy state capture](complete-catalog-state-capture.md)
+reads business/init/catalog data from one backend view. It supplies no paired
+fence or current-target publication permit and does not alter this pure planner.
+
 ## Verification
 
 The 30 new regular tests passed, and the combined replacement filter passed all

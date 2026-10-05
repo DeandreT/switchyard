@@ -56,8 +56,10 @@ ancestry, anti-rollback, or source history.
 Both catalog components live outside the business record keyspace. Ordinary
 gets, scans, snapshots, and bounded complete snapshots include only caller
 records, even when a caller key has the same spelling as a reserved metadata key.
-There is no public combined transaction-view API across separately requested
-business and catalog reads.
+Separately requested business and catalog reads still have no shared transaction
+view. The [complete legacy state capture](complete-catalog-state-capture.md)
+returns bounded business/init/catalog data from one retained backend view,
+without supplying a fence or publication authority.
 
 The separate [controlled paired-storage prototype](paired-storage-prototype.md)
 tests private physical publication with an opaque fence. It adds no selection-
