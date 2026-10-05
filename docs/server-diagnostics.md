@@ -1,10 +1,11 @@
 # Typed Server Diagnostic Recorder
 
 `ServerDiagnosticRecorder` is an explicitly allocated, finite, data-only recorder
-in the AMQP crate. It stores caller-supplied typed observations; no listener,
+in the AMQP crate. It stores caller-supplied typed observations; no live listener,
 connection, reader, actor, collector, transaction, writer, fixture, or retirement
-producer is attached by this increment. It spawns nothing and retains no socket,
-message, native protocol identity, broker, or store handle. Existing behavior,
+producer is attached. A private test-only writer binding exercises observations
+without activating a production path. The recorder spawns nothing and retains no
+socket, message, native protocol identity, broker, or store handle. Existing behavior,
 retry policy, deadlines, SDK gates, dependencies, and startup are unchanged.
 
 ## Finite Correlation And Publication
@@ -77,9 +78,9 @@ and complete coverage require separate implementation and evidence. This
 foundation does not explain or fix the historical provisional-Complete SDK
 timeout described in [client diagnostic evidence](atomic-sdk-evidence.md).
 
-## Verification
+## Recorder Verification
 
-The final recorder source passed 26 focused unit tests and six compile-fail
+The recorder-only checkpoint passed 26 focused unit tests and six compile-fail
 examples. Ten additional focused runs passed all 260 executions. The AMQP
 all-feature suite passed 784 tests; the normal CI default-feature workspace suite
 passed 4,521 tests with ten existing ignored tests across 131 targets. Formatting,
@@ -95,3 +96,61 @@ This increment did not rerun the all-feature workspace suite or live SDK gates.
 The selected scope combines normal CI workspace coverage, all-feature AMQP tests,
 and both feature configurations for linting and builds. It adds no live producer,
 complete lifecycle coverage, deadline change, or historical timeout explanation.
+
+## Test-Only Writer Observations
+
+Every existing `FrameWriter` constructor leaves its optional private binding
+disabled. Only a test-only factory enables it. The disabled path reads no
+diagnostic clock, allocates no diagnostic scope, and accesses no recorder.
+This is source-audited, not a test that counts clock reads. A bound test writer
+retains only the recorder, an optional local parent, and its monotonic origin;
+the observation helper keeps no frame, error, socket, Activity, or task reference.
+
+First poll creates a fresh local Write scope. An unpolled future publishes
+nothing. Fixed events distinguish preflight, write-all, flush, local acceptance,
+underlying write/flush errors, outer deadline expiry, late completed flush, and
+abandonment at the last unfinished socket stage. Underlying `TimedOut` errors
+remain distinct from the enclosing timer expiring. A late successful flush can
+produce `FlushDone` followed by `TimeoutAfterFlush`, never `WriteAccepted`.
+
+The observation guard is outside the original single timed write-all/flush
+future. It preserves preflight order, encoded bytes, peer limits, Close handling,
+deadline selection and strict acceptance boundary. Original typed errors and
+custom causes are returned without formatting, inspection, or replacement.
+Existing Activity completion/failure updates run before disarming the guard.
+Dropping a pending attempt reports its unfinished stage once; it does not repair
+Activity, clear taint, retry, write Close, perform I/O, or spawn cleanup.
+
+Full storage, contention, poison, exhausted ordinals, and foreign parent
+provenance remain separate recording losses, not replacement I/O errors.
+Opt-in clock/atomic/nonwaiting publication work can consume real time; unchanged
+deadline policy is not an identical real-world scheduling guarantee.
+
+`WriteAllDone` and `FlushDone` describe local API completion. `WriteAccepted`
+describes original local writer-policy acceptance. None establishes peer or SDK
+receipt, transaction preparation, durability, remote settlement, task joins, or
+fixture retirement. Direct encoding, protocol headers, and negotiation helpers
+remain unobserved. Stage abandonment does not identify its cancellation cause.
+
+The 15 focused writer tests use controlled direct AsyncWrite implementations and
+paused/manual polling, not live sockets or SDK fixtures. They compare enabled
+and disabled outcomes, bytes, polls, deadlines, Close exceptions, taint, original
+custom error identity, pending Drop, and all five writer recording-refusal modes.
+Hostile error formatting is never called. Actual writer-produced captures omit
+private sentinel values and remain unchanged after writer/source references are
+dropped. This is bounded typed test evidence, not production-wide privacy,
+complete trace coverage, allocator-failure injection, or physical cleanup proof.
+
+The final writer checkpoint passed all 15 new writer tests, the combined 41
+recorder/writer unit tests, and the six existing compile-fail examples (47 unique
+focused cases; the writer-only run overlaps the combined run). Ten additional
+combined runs passed 410 executions. The AMQP all-feature suite passed 799 tests;
+the normal CI default-feature workspace suite passed 4,536 tests with ten existing
+ignored tests across 131 targets. Formatting, strict workspace Clippy in both
+feature configurations, both workspace builds, the administrative protocol
+descriptor, and whitespace checks passed without source corrections.
+
+The all-feature workspace suite and live SDK gates were not rerun for this
+test-only binding. This evidence adds no live writer attachment, complete task
+coverage, SDK receipt proof, pending-Drop behavior repair, stronger fixture cleanup,
+or explanation of the historical provisional-Complete timeout.
