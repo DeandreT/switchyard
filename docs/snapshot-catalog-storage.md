@@ -33,6 +33,12 @@ their records are empty. Their normal open paths also refuse catalog directories
 including pristine and initialized-empty ones. There is no automatic migration,
 conversion, or new requirement to wipe existing ordinary directories.
 
+All three generic durable openers also [refuse reserved paired metadata
+markers](paired-marker-refusal.md) before record-keyspace acquisition or
+application stamps, regardless of marker validity. Database recovery and
+metadata-keyspace acquisition still precede that guard; this is not a guarantee
+of unchanged physical files or an arbitrary existing-only inspection API.
+
 ## One Atomic Publication
 
 `CatalogCommittedStore::commit_with_catalog(batch, record)` atomically publishes
