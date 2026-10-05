@@ -117,6 +117,11 @@ uncooperative work remain unsupported. No native physical completion, storage
 fence, safe reopen, whole-listener/descendant cleanup, certificate/provider
 release, source-health verdict or historical SDK-timeout explanation follows.
 
+A separate private [accepted-socket collector](retained-socket-collector.md)
+composes this graph with the original Wrapper/Actor/Reader barrier. The collector's
+standalone scope, production defaults and historical verification below remain
+unchanged.
+
 ## Verification
 
 The first focused attempt stopped at one ambiguous test-result binding; no

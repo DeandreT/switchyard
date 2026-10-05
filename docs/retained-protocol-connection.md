@@ -129,6 +129,10 @@ The private [two-session collector](retained-atomic-collector.md) shares logical
 owner authority and worker history across two actual sessions. It also remains
 separate from this socket API and establishes no combined descendant barrier.
 
+A separate private [accepted-socket collector](retained-socket-collector.md)
+composes both barriers in a fixed test graph. It does not expand this public
+socket API's covered roles or activate production/SDK fixture cleanup.
+
 ## Verification
 
 The final focused suite passed 41 regular tests and three compile-fail examples.
