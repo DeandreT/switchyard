@@ -98,6 +98,7 @@ impl NativeAdminListener {
                 self.connection_limit.get().min(Semaphore::MAX_PERMITS),
             )),
         };
+        let maintenance = self.service.development_maintenance_service();
         server
             .add_service(
                 EntityServiceServer::new(self.service.clone())
@@ -109,6 +110,7 @@ impl NativeAdminListener {
                     .max_decoding_message_size(NATIVE_ADMIN_REQUEST_LIMIT)
                     .max_encoding_message_size(NATIVE_ADMIN_RESPONSE_LIMIT),
             )
+            .add_optional_service(maintenance)
             .serve_with_incoming(incoming)
             .await?;
         Ok(())

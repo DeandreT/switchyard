@@ -26,6 +26,7 @@ use tonic::{
 };
 use url::{Host, Position, Url};
 
+mod maintenance;
 mod rules;
 mod topology;
 
@@ -66,6 +67,8 @@ struct Arguments {
 enum Command {
     /// Print the native API contract and supported operations.
     Compatibility,
+    /// Assess this development owner's command clock without mutating state.
+    MaintenanceClock,
     Queue {
         #[command(subcommand)]
         command: QueueCommand,
@@ -541,6 +544,7 @@ async fn execute(arguments: Arguments) -> Result<(), CliError> {
                 rule_operations: ["create", "get", "list", "delete"],
             });
         }
+        Command::MaintenanceClock => return maintenance::execute(&arguments).await,
         Command::Topic { command } => return topology::execute_topic(&arguments, command).await,
         Command::Subscription { command } => {
             return topology::execute_subscription(&arguments, command).await;

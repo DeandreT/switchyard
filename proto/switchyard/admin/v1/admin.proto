@@ -365,3 +365,24 @@ message AuditRecord {
   bytes previous_hash = 8;
   bytes record_hash = 9;
 }
+
+// Optional development-only descriptive assessment, not admission authority.
+service MaintenanceService {
+  rpc GetClockReadiness(GetClockReadinessRequest) returns (ClockReadinessResponse);
+}
+
+enum MaintenanceClockState {
+  MAINTENANCE_CLOCK_STATE_UNKNOWN = 0;
+  MAINTENANCE_CLOCK_STATE_READY = 1;
+  MAINTENANCE_CLOCK_STATE_UNSAFE = 2;
+  MAINTENANCE_CLOCK_STATE_UNAVAILABLE = 3;
+  MAINTENANCE_CLOCK_STATE_STOPPED = 4;
+}
+
+message GetClockReadinessRequest {
+  string namespace = 1;
+}
+
+message ClockReadinessResponse {
+  MaintenanceClockState state = 1;
+}

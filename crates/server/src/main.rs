@@ -2,6 +2,10 @@
 
 mod logging;
 
+#[cfg(test)]
+#[path = "main/maintenance_tests.rs"]
+mod maintenance_tests;
+
 use std::{
     fs,
     net::SocketAddr,
@@ -57,6 +61,10 @@ struct Arguments {
     #[arg(long)]
     admin_listen: Option<SocketAddr>,
 
+    /// Enable the descriptive development clock probe on --admin-listen.
+    #[arg(long)]
+    development_maintenance_readiness: bool,
+
     /// Enable AMQP over WebSockets at this address. Uses the same TLS identity
     /// and shared-access policy as the other listeners when configured.
     #[arg(long)]
@@ -111,6 +119,20 @@ fn validate_experimental_atomic_messaging_listener(
 ) -> Result<(), StartupError> {
     if mode == DeploymentMode::Production && address.is_some() {
         return Err(StartupError::ExperimentalAtomicMessagingInProduction);
+    }
+    Ok(())
+}
+
+fn validate_development_maintenance_readiness(
+    mode: DeploymentMode,
+    enabled: bool,
+    admin: Option<SocketAddr>,
+) -> Result<(), StartupError> {
+    if enabled && mode == DeploymentMode::Production {
+        return Err(StartupError::DevelopmentMaintenanceReadinessInProduction);
+    }
+    if enabled && admin.is_none() {
+        return Err(StartupError::DevelopmentMaintenanceReadinessRequiresAdminListener);
     }
     Ok(())
 }
@@ -262,6 +284,11 @@ fn run_with_arguments(arguments: Arguments) -> Result<(), StartupError> {
         mode,
         arguments.experimental_atomic_messaging_listen,
     )?;
+    validate_development_maintenance_readiness(
+        mode,
+        arguments.development_maintenance_readiness,
+        arguments.admin_listen,
+    )?;
     let cluster = ClusterConfig {
         mode,
         voters: arguments.voters,
@@ -362,6 +389,9 @@ fn run_with_arguments(arguments: Arguments) -> Result<(), StartupError> {
                     detail: error.to_string(),
                 })?;
             let mut service = NativeAdminService::new(broker.handle(), namespace.clone());
+            if arguments.development_maintenance_readiness {
+                service = service.with_development_maintenance_readiness();
+            }
             if let Some(authentication) = &shared_access_authentication {
                 service = service.with_shared_access_policy(
                     authentication.policy().clone(),

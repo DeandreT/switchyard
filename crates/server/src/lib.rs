@@ -9,6 +9,7 @@
 
 mod broker;
 mod clock;
+mod maintenance;
 mod native_admin;
 mod native_admin_listener;
 mod proposer;
@@ -27,6 +28,7 @@ pub use crate::{
         NativeAtomicSubmitError, SubmitError,
     },
     clock::{Clock, ManualClock, SystemClock},
+    maintenance::MaintenanceClockAssessment,
     native_admin::{MAX_NATIVE_QUEUE_SCAN_ROUNDS, MAX_NATIVE_QUEUE_SCAN_ROWS, NativeAdminService},
     native_admin_listener::{
         DEFAULT_NATIVE_ADMIN_CONNECTION_LIMIT, NATIVE_ADMIN_DEVELOPMENT_PORT,
@@ -93,6 +95,10 @@ pub enum StartupError {
     ReplicationUnavailableInProduction,
     #[error("--experimental-atomic-messaging-listen is only available in development mode")]
     ExperimentalAtomicMessagingInProduction,
+    #[error("--development-maintenance-readiness is only available in development mode")]
+    DevelopmentMaintenanceReadinessInProduction,
+    #[error("--development-maintenance-readiness requires --admin-listen")]
+    DevelopmentMaintenanceReadinessRequiresAdminListener,
     #[error("the durable backend needs a data directory")]
     MissingDataDirectory,
     #[error("could not listen on {address}: {detail}")]

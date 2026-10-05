@@ -20,6 +20,7 @@ mod admin_metadata;
 mod atomic_messaging;
 mod bindings;
 mod entity_metadata;
+mod maintenance;
 pub use admin_metadata::AdminTarget;
 
 /// How far the host clock may step backward before the proposer refuses.

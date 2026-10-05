@@ -23,6 +23,7 @@ use tonic::{Request, Response, Status};
 use crate::{AdminTarget, BrokerHandle, ProposeError, SubmitError};
 
 mod deletion;
+mod maintenance;
 mod paging;
 mod queue_paging;
 mod rules;
@@ -46,6 +47,7 @@ pub struct NativeAdminService {
     namespace: NamespaceName,
     authentication: Option<Authentication>,
     admission: Arc<Semaphore>,
+    development_maintenance_readiness: bool,
 }
 
 impl NativeAdminService {
@@ -55,6 +57,7 @@ impl NativeAdminService {
             namespace,
             authentication: None,
             admission: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            development_maintenance_readiness: false,
         }
     }
 

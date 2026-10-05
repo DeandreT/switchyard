@@ -39,6 +39,7 @@ mod atomic_work;
 mod bindings;
 mod guarded_atomic_messaging;
 mod guarded_receive;
+mod maintenance;
 mod native_atomic_messaging;
 mod native_atomic_protocol;
 mod protocol;
@@ -150,6 +151,9 @@ enum Request {
     /// against.
     LastApplied {
         reply: flume::Sender<Result<Timestamp, ProposeError>>,
+    },
+    MaintenanceClockAssessment {
+        reply: flume::Sender<crate::MaintenanceClockAssessment>,
     },
     Stop,
 }
@@ -729,6 +733,10 @@ impl Broker {
                                     .last_applied_time()
                                     .map_err(ProposeError::from),
                             );
+                        }
+                        Request::MaintenanceClockAssessment { reply } => {
+                            let assessed = proposer.maintenance_clock_assessment();
+                            let _ = reply.send(assessed);
                         }
                         Request::Stop => break,
                     }
