@@ -25,6 +25,7 @@ use crate::{decode_message, encode_message, read_frame};
 
 mod connection_identity;
 mod content_budget;
+mod diagnostics;
 mod error_deliveries;
 mod error_links;
 mod flow_control;
@@ -48,6 +49,13 @@ mod transactions;
 use connection_identity::ConnectionActorExit;
 pub use connection_identity::NativeConnectionIdentity;
 use content_budget::ContentLease;
+pub use diagnostics::{
+    DiagnosticCapture, DiagnosticConnectionPhase, DiagnosticEndClass, DiagnosticEvent,
+    DiagnosticFixtureBoundary, DiagnosticFrameClass, DiagnosticLossSummary, DiagnosticRecord,
+    DiagnosticRefusal, DiagnosticRetirementPhase, DiagnosticScope, DiagnosticScopeKind,
+    DiagnosticTaskPhase, DiagnosticWriterPhase, MAX_SERVER_DIAGNOSTIC_EVENTS,
+    MAX_SERVER_DIAGNOSTIC_FORMAT_BYTES, ServerDiagnosticRecorder,
+};
 use error_deliveries::{
     ErrorDeliveryHistory, ErrorDeliveryHistoryError, MAX_RETIRED_DELIVERIES_PER_DIRECTION,
 };
