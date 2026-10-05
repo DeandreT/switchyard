@@ -42,8 +42,8 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
-| Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE actions over HTTP/2 and authenticated TLS; other services not implemented |
-| Quorum replication | Pre-1.0 | No consensus runtime; production startup is refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup; none supplies quorum acknowledgements or snapshots. Development Fjall persistence remains local only |
+| Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE actions over HTTP/2 and authenticated TLS; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
+| Quorum replication | Pre-1.0 | An isolated [fixed-three-node in-process runtime](experimental-replica-runtime.md) exists for bounded Create/Send, but is not integrated with server listeners or the production proposer; production startup remains refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup. The runtime exposes no snapshots or production deployment activation. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
 | Cross-placement-group transactions | Later | Out of initial scope |
 | Geo-replication | Later | Out of initial scope |
@@ -433,7 +433,8 @@ is rejected atomically with `amqp:resource-limit-exceeded` (management status
 allocation. Lock tokens use `u64::MAX` as an exhausted sentinel, so `u64::MAX - 1`
 is the final allocation. Operations that need no fresh identifier, including
 receive-delete, cancellation, settlement, renewal, and cleanup, remain usable.
-Counters keep their existing stored shape and exhaustion survives restart.
+Counters keep their existing stored shape. Fjall preserves exhaustion across
+restart; Memory preserves it only while its shared in-process state remains live.
 This is a deliberate local bound, not Azure's documented rollover behavior;
 the official .NET [sequence-number property](https://learn.microsoft.com/en-us/dotnet/api/azure.messaging.servicebus.servicebusreceivedmessage.sequencenumber)
 is signed, while Azure documents rollover in its
@@ -498,8 +499,9 @@ Graceful connection Close has a two-second default deadline. Timeout or
 cancellation of its caller cancels the driver and its socket reader, including
 when application dispatch or a socket write is blocked. Explicit shutdown waits
 for both tasks to terminate before releasing the listener's admission slot.
-These are Switchyard resource policies, not Azure quotas. Connection-wide
-message-allocation budgets are not yet enforced.
+These are Switchyard resource policies, not Azure quotas. Each connection enforces a
+64 MiB logical retained encoded-content allowance described below; this is not
+a comprehensive allocation or RSS limit.
 Open advertises a 60-second receive-idle interval by default, with an actual
 120-second complete-frame silence deadline, following the
 [AMQP idle-timeout recommendation](https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html#doc-idle-timeout).
@@ -1089,8 +1091,9 @@ renewal. Scheduling and cancellation require Send authorization; receiving,
 peeking, settlement, and lock or session operations require Listen. Management
 links accept either permission, and every request rechecks its own permission
 when authentication is enabled. A transfer is accepted only after its command
-committed, so the
-acknowledgement means durable. One node still serves one namespace. A message
+committed. With Fjall, a successful acknowledgement follows a local durable
+batch; Memory acknowledges only in-process state. Neither supplies quorum
+durability. One node still serves one namespace. A message
 drained from a dead-letter queue carries its reason and description in the
 `DeadLetterReason` and `DeadLetterErrorDescription` application properties. The
 complete protocol coverage uses a Rust AMQP 1.0 client. The current and previous
@@ -1252,6 +1255,10 @@ These are local resource policies. The cluster, namespace,
 backup, and audit services return unimplemented
 rather than simulated success.
 This endpoint is not Azure Atom/XML administration compatibility.
+An explicit development-only [maintenance clock query](development-maintenance-clock.md)
+adds `MaintenanceService/GetClockReadiness` to this route only when enabled.
+It observes one existing command-stamping check; its result may already be stale
+and is not timer progress, storage health, whole-node or production readiness.
 The additive `RuleService` serves create/get/list/delete on a canonical
 subscription path with Manage authorization before filter/action parsing or store
 access. It preserves exact scalar constructors and SQL source/version, uses an
@@ -1341,7 +1348,7 @@ flag updated atomically with each privileged batch. Ordinary open refuses those
 directories, including on older format-14 builds; replica open does not adopt
 standalone directories. Their bounded progress record has its own version-1
 envelope and is not part of the ordinary message-value codec. There is no
-standalone-to-replica migration or runtime replication yet; see
+standalone-to-replica migration or production runtime replication; see
 [Committed Queue Apply](committed-queue-apply.md).
 
 Value format 11 appends optional source-only [SQL actions](sql-actions.md) with
@@ -1366,11 +1373,12 @@ earlier store directory is refused at open because its broker contract differs.
 There is no directory migration tooling yet; development directories
 from older builds must be recreated. A rollback likewise refuses a newer layout.
 
-All of it now runs on either backend. The Fjall backend fsyncs a command's batch
-before reporting it applied, and the same semantics suite runs against both
-backends, so a single node keeps its messages, locks, delivery counts, and
-sequence numbers across a restart. Preserving them across the loss of a node
-still needs replication.
+The same semantics suite runs against both backends. Fjall fsyncs a command's
+batch before reporting it applied and retains local messages, locks, delivery
+counts and sequence numbers across process restarts. Memory retains them only
+while its shared in-process state remains live; reopening a test handle is not
+disk or process recovery. Preserving acknowledged state across the loss of a
+node still requires production replication, which is not integrated.
 
 Switchyard intentionally does not reproduce Azure subscription, namespace
 capacity, or operations-per-second commercial quotas. It defaults to compatible

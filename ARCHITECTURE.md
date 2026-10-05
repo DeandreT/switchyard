@@ -8,16 +8,17 @@ receive, peek, both settlement modes, lock renewal and expiry, time-to-live
 expiry, scheduling and cancellation, deferral, duplicate detection,
 dead-lettering and dead-letter receive, and the session ownership and session state described under
 [Message Semantics](#message-semantics). It runs over
-either the Fjall backend or the memory backend, so a single node survives a
-restart.
+either the Fjall backend or the memory backend. Fjall provides local persistence
+across process restarts; Memory retains state only while its shared in-process
+handles remain live. Neither backend alone supplies replicated durability.
 
 The `switchyard` binary accepts AMQP connections over development plaintext or
 TLS and an optional WS/WSS listener, authenticates a configured shared-access
 policy through SASL PLAIN or CBS SAS, carries messages and sessions across that
 edge, and sweeps scheduled
 activation, lock, time-to-live, session-lock, and duplicate-history expiry.
-JWT/OIDC, mTLS, policy administration,
-Raft, and compliance implementations remain to be built. Production startup
+JWT/OIDC, mTLS, policy administration, production Raft integration,
+and compliance implementations remain to be built. Production startup
 is refused before storage is opened because no replicated command proposer
 exists. Development with Fjall provides local persistence only.
 
@@ -30,7 +31,11 @@ acknowledgements required below.
 [Owned replica preparation](docs/experimental-replica-preparation.md) validates
 the full applied fingerprint chain, membership, voting state, and store pairing
 without repairing or applying history; private retirement tokens preserve
-storage-thread join ownership for a later runtime.
+storage-thread join ownership for the explicit experimental runtime.
+A separate [fixed-three-node in-process runtime](docs/experimental-replica-runtime.md)
+runs bounded primary-queue Create/Send work over isolated replica writers. It is
+not integrated with the server listeners or local proposer and exposes no
+snapshots, socket transport or production deployment activation.
 
 Within the semantics below, topics have persisted definitions, bounded
 subscription topology, and atomic rule-selected fanout, parent-retained topic
@@ -285,8 +290,11 @@ is reported after both phases.
 Time reaches the state machine only through the proposer, which stamps each
 command: a host clock that steps back a little holds the applied timestamp still
 rather than regressing it, and one that steps back further has the command
-refused. Refusal is not yet wired to a readiness signal — the sweep is logged and
-retried on the next tick.
+refused. The sweep logs the refusal and retries on the next tick; it does not
+latch a timer pause. An optional development-only
+[maintenance clock query](docs/development-maintenance-clock.md) exposes one
+existing command-stamping assessment, which may already be stale. It is not
+timer progress, storage health, whole-node or production readiness.
 
 Duplicate detection is an opt-in queue or topic setting. Its history records the original
 submission deadline by message ID and expires independently of settlement or
