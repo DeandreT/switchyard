@@ -21,6 +21,8 @@ use super::{
 mod observed;
 #[path = "catalog/physical.rs"]
 mod physical;
+#[path = "catalog/replacement.rs"]
+mod replacement;
 #[path = "catalog/unbounded.rs"]
 mod unbounded;
 

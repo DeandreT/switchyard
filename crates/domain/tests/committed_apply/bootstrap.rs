@@ -20,7 +20,7 @@ use super::{
 #[path = "bootstrap/catalog.rs"]
 mod catalog;
 #[path = "bootstrap/crash.rs"]
-mod crash;
+pub(crate) mod crash;
 #[path = "bootstrap/observed.rs"]
 mod observed;
 use observed::{Counts, Fault, observed};

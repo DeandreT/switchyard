@@ -36,6 +36,8 @@ pub(super) enum Fault {
     CommitAfter,
     CommitLimit,
     CommitCorrupt,
+    ExitBefore,
+    ExitAfter,
 }
 
 #[derive(Clone)]
@@ -222,12 +224,15 @@ impl<W: CatalogCommittedStore> CatalogCommittedStore for Writer<W> {
                 Fault::CommitBefore
                 | Fault::CommitAfter
                 | Fault::CommitLimit
-                | Fault::CommitCorrupt => std::mem::take(&mut observation.fault),
+                | Fault::CommitCorrupt
+                | Fault::ExitBefore
+                | Fault::ExitAfter => std::mem::take(&mut observation.fault),
                 _ => Fault::None,
             }
         };
         match fault {
             Fault::CommitBefore => return Err(physical_error()),
+            Fault::ExitBefore => std::process::exit(71),
             Fault::CommitLimit => return Err(StorageError::ReadLimitExceeded),
             Fault::CommitCorrupt => return Err(corrupt_error()),
             _ => {}
@@ -236,6 +241,9 @@ impl<W: CatalogCommittedStore> CatalogCommittedStore for Writer<W> {
             .lock()
             .expect("test writer")
             .commit_with_catalog(business, record)?;
+        if matches!(fault, Fault::ExitAfter) {
+            std::process::exit(72);
+        }
         if matches!(fault, Fault::CommitAfter) {
             return Err(physical_error());
         }

@@ -171,7 +171,7 @@ fn run_child(directory: &Path, stage: &str) -> TestResult<(ExitStatus, String)> 
     run_child_for_test(directory, stage, CHILD_TEST, DIRECTORY, STAGE)
 }
 
-pub(super) fn run_child_for_test(
+pub(crate) fn run_child_for_test(
     directory: &Path,
     stage: &str,
     child_test: &str,

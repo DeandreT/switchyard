@@ -12,11 +12,14 @@ use super::{committed_prepare::CommittedPreparationError, *};
 mod image_bootstrap;
 mod image_catalog;
 mod image_export;
+mod image_replacement;
+mod image_selection;
 pub use image_bootstrap::{CommittedImageBootstrapError, TrustedCreateSendBootstrap};
 pub use image_catalog::{
     CommittedCatalogError, PreparedCreateSendCatalog, RetainedCreateSendCatalog,
 };
 pub use image_export::CommittedImageExportError;
+pub use image_replacement::{CommittedImageReplacementError, TrustedCreateSendReplacement};
 
 /// One synchronous committed-entry writer with a matching read-only machine.
 /// It does not implement consensus, retry deduplication, or runtime snapshot

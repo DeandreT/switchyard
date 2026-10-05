@@ -1,14 +1,13 @@
 use std::fmt;
 
-use sha2::{Digest, Sha256};
 use storage::{CommittedStore, StateStore, WriteBatch};
 
-use crate::{
-    CommittedCheckpoint, CommittedImageError, CommittedImageValidationError, CommittedStreamId,
-    DecodedCommittedImage, StateMachine, ValidatedCreateSendImage,
-};
+use crate::{CommittedCheckpoint, CommittedStreamId, StateMachine, ValidatedCreateSendImage};
 
-use super::CommittedStateMachine;
+use super::{
+    CommittedStateMachine,
+    image_selection::{self, SelectionError},
+};
 
 /// Deliberately trusted, immutable selection for a pristine-target bootstrap.
 ///
@@ -150,26 +149,13 @@ impl<W: CommittedStore> CommittedStateMachine<W> {
 fn validate_selection<'a>(
     request: &TrustedCreateSendBootstrap<'a>,
 ) -> Result<ValidatedCreateSendImage<'a>> {
-    request
-        .stream
-        .validate()
-        .map_err(|_| CommittedImageBootstrapError::InvalidSelection)?;
-    if request.checkpoint.stream() != request.stream {
-        return Err(CommittedImageBootstrapError::InvalidSelection);
-    }
-    let image = DecodedCommittedImage::decode(request.artifact).map_err(container_error)?;
-    if image.stream() != request.stream
-        || image.checkpoint() != request.checkpoint
-        || <[u8; 32]>::from(Sha256::digest(request.artifact)) != request.digest
-    {
-        return Err(CommittedImageBootstrapError::SelectionMismatch);
-    }
-    ValidatedCreateSendImage::validate(image).map_err(|error| match error {
-        CommittedImageValidationError::UnsupportedProfile => {
-            CommittedImageBootstrapError::UnsupportedProfile
-        }
-        _ => CommittedImageBootstrapError::InvalidImage,
-    })
+    image_selection::validate_selection(
+        request.stream,
+        request.checkpoint,
+        request.digest,
+        request.artifact,
+    )
+    .map_err(selection_error)
 }
 
 fn pristine_reader<W: CommittedStore>(writer: &W) -> Result<W::Reader> {
@@ -210,12 +196,14 @@ fn copy_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(copied)
 }
 
-fn container_error(error: CommittedImageError) -> CommittedImageBootstrapError {
+fn selection_error(error: SelectionError) -> CommittedImageBootstrapError {
     match error {
-        CommittedImageError::LimitExceeded => CommittedImageBootstrapError::LimitExceeded,
-        CommittedImageError::Allocation => CommittedImageBootstrapError::Allocation,
-        CommittedImageError::UnsupportedFormat => CommittedImageBootstrapError::UnsupportedProfile,
-        _ => CommittedImageBootstrapError::InvalidImage,
+        SelectionError::InvalidSelection => CommittedImageBootstrapError::InvalidSelection,
+        SelectionError::SelectionMismatch => CommittedImageBootstrapError::SelectionMismatch,
+        SelectionError::LimitExceeded => CommittedImageBootstrapError::LimitExceeded,
+        SelectionError::Allocation => CommittedImageBootstrapError::Allocation,
+        SelectionError::UnsupportedProfile => CommittedImageBootstrapError::UnsupportedProfile,
+        SelectionError::InvalidImage => CommittedImageBootstrapError::InvalidImage,
     }
 }
 

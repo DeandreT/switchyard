@@ -1,5 +1,8 @@
 use super::*;
 
+use crate::DecodedCommittedImage;
+use sha2::{Digest, Sha256};
+
 use crate::{
     CommittedCheckpointUpdate, CommittedEntryId, CommittedQueueCommand, CommittedQueueWork,
     CommittedSend, EntityPath, NamespaceName, QueueConfig, Timestamp,
