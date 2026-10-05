@@ -9,7 +9,10 @@ use tokio::task::Id;
 
 use super::super::retained_session::budget::Ticket;
 
-pub(super) type Original = Pin<Box<dyn Future<Output = Result<ServerSession, EngineError>> + Send>>;
+pub(in crate::listener) type Original =
+    Pin<Box<dyn Future<Output = Result<ServerSession, EngineError>> + Send>>;
+
+pub(in crate::listener) struct Reservation(pub(super) Ticket);
 
 pub(super) enum Outcome {
     Pending,
@@ -17,7 +20,7 @@ pub(super) enum Outcome {
     Launched { id: Id, ordinal: usize },
 }
 
-pub(super) struct Record {
+pub(in crate::listener) struct Record {
     pub(super) future: Original,
     pub(super) ticket: Option<Ticket>,
     pub(super) outcome: Outcome,
@@ -26,6 +29,15 @@ pub(super) struct Record {
 }
 
 impl Record {
+    pub(in crate::listener) fn original_address(&self) -> usize {
+        self.future.as_ref().get_ref() as *const _ as *const () as usize
+    }
+    pub(in crate::listener) fn refund(&mut self) {
+        drop(self.ticket.take());
+    }
+    pub(in crate::listener) fn reserved(future: Original, reservation: Reservation) -> Self {
+        Self::new(future, reservation.0)
+    }
     pub(super) fn new(future: Original, ticket: Ticket) -> Self {
         Self {
             future,

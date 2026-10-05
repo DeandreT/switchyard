@@ -27,14 +27,14 @@ use super::{
 };
 use crate::{NativeAtomicBroker, authorization::ConnectionAuthorization};
 
-mod admissions;
+pub(in crate::listener) mod admissions;
 mod controls;
 mod tests;
 
-use admissions::{Outcome, Record};
+use admissions::{Outcome, Record, Reservation};
 use controls::Controls;
 
-pub(super) struct Settings<B> {
+pub(in crate::listener) struct Settings<B> {
     pub(super) identity: NativeConnectionIdentity,
     pub(super) namespace: NamespaceName,
     pub(super) broker: B,
@@ -44,7 +44,7 @@ pub(super) struct Settings<B> {
     controls: Arc<Controls>,
 }
 
-pub(super) struct Refused<A, B> {
+pub(in crate::listener) struct Refused<A, B> {
     pub(super) settings: Settings<B>,
     pub(super) anchor: A,
     pub(super) limit: usize,
@@ -57,7 +57,7 @@ pub(super) struct SessionReport {
     pub(super) id: Id,
     pub(super) original: Result<SessionExit, JoinError>,
 }
-pub(super) struct Report<A> {
+pub(in crate::listener) struct Report<A> {
     admissions: [Option<Record>; 2],
     pub(super) sessions: [Option<SessionReport>; 2],
     pub(super) packets: [Packet; 2],
@@ -68,10 +68,11 @@ pub(super) struct Report<A> {
 }
 
 // Private one-shot root. Caller retains/drives root and captured Runtime A.
-pub(super) struct Root<A, B: NativeAtomicBroker> {
+pub(in crate::listener) struct Root<A, B: NativeAtomicBroker> {
     settings: Settings<B>,
     admissions: [Option<Record>; 2],
     sessions: [SessionSlot; 2],
+    pending_session_ready: Option<usize>,
     cells: [Arc<Cell>; 2],
     session_budget: Arc<Budget>,
     worker_budget: Arc<Budget>,
@@ -86,7 +87,7 @@ pub(super) struct Root<A, B: NativeAtomicBroker> {
 }
 
 impl<A, B: NativeAtomicBroker> Root<A, B> {
-    pub(super) fn new(
+    pub(in crate::listener) fn new(
         settings: Settings<B>,
         limit: usize,
         anchor: A,
@@ -104,6 +105,7 @@ impl<A, B: NativeAtomicBroker> Root<A, B> {
             settings,
             admissions: [None, None],
             sessions: [SessionSlot::NotLaunched, SessionSlot::NotLaunched],
+            pending_session_ready: None,
             cells: [Cell::new(limit), Cell::new(limit)],
             session_budget: Budget::new(2),
             worker_budget: Budget::new(limit),
@@ -123,6 +125,48 @@ impl<A, B: NativeAtomicBroker> Root<A, B> {
             self.session_budget.counts(),
             self.worker_budget.counts(),
         )
+    }
+    pub(in crate::listener) fn reserved_pair(&mut self) -> Option<[Reservation; 2]> {
+        if self.closed || self.attempts != 0 {
+            return None;
+        }
+        let first = self.session_budget.reserve().ok()?;
+        let second = self.session_budget.reserve().ok()?;
+        Some([Reservation(first), Reservation(second)])
+    }
+    pub(in crate::listener) fn install_reserved(
+        &mut self,
+        record: &mut Option<Record>,
+    ) -> Option<usize> {
+        if self.closed || self.attempts == 2 {
+            return None;
+        }
+        Some(self.install_record(record.take().expect("single retained original record")))
+    }
+    fn install_record(&mut self, record: Record) -> usize {
+        let index = self.attempts;
+        self.admissions[index] = Some(record);
+        self.attempts += 1;
+        index
+    }
+    pub(in crate::listener) fn is_closed(&self) -> bool {
+        self.closed
+    }
+    pub(in crate::listener) fn scoped_controls(&self) -> ScopedControls {
+        ScopedControls(
+            self.settings.controls.clone(),
+            self.session_budget.clone(),
+            self.worker_budget.clone(),
+        )
+    }
+    pub(in crate::listener) fn admission_observed_pending(&self) -> bool {
+        self.admissions
+            .iter()
+            .flatten()
+            .any(|record| record.observed_pending)
+    }
+    pub(in crate::listener) fn close_only(&mut self) {
+        self.close_authority();
     }
     pub(super) fn offer(
         &mut self,
@@ -159,13 +203,10 @@ impl<A, B: NativeAtomicBroker> Root<A, B> {
                 });
             }
         };
-        let index = self.attempts;
         let original = Box::pin(connection.accept_session(incoming));
-        self.admissions[index] = Some(Record::new(wrap(original), ticket));
-        self.attempts += 1;
-        Ok(index)
+        Ok(self.install_record(Record::new(wrap(original), ticket)))
     }
-    pub(super) fn stop(&mut self) {
+    pub(in crate::listener) fn stop(&mut self) {
         self.close_authority();
         for slot in &self.sessions {
             if let SessionSlot::Installed(handle) = slot {
@@ -260,6 +301,13 @@ impl<A, B: NativeAtomicBroker> Root<A, B> {
             self.close_authority();
         }
     }
+    // Cancellation after rooting the join must not skip its classification.
+    async fn finish_session_ready(&mut self) {
+        if let Some(index) = self.pending_session_ready {
+            self.session_ready(index).await;
+            self.pending_session_ready = None;
+        }
+    }
     async fn flush_acknowledgments(&mut self) {
         if self.acknowledgments.iter().any(Option::is_some) {
             self.settings.controls.close_ack.hold().await;
@@ -291,14 +339,25 @@ impl<A, B: NativeAtomicBroker> Root<A, B> {
         }
     }
     // Active operation, not production run_driver's discovery/Close/deadline policy.
-    pub(super) async fn drive(&mut self) {
+    pub(in crate::listener) async fn drive(&mut self) {
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             self.step(&mut tick, true).await;
         }
     }
+    pub(in crate::listener) async fn drive_closed(&mut self) {
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            self.step(&mut tick, false).await;
+        }
+    }
+    pub(in crate::listener) async fn step_scoped(&mut self, tick: &mut tokio::time::Interval) {
+        self.step(tick, true).await;
+    }
     async fn step(&mut self, tick: &mut tokio::time::Interval, admissions: bool) {
+        self.finish_session_ready().await;
         self.flush_acknowledgments().await;
         enum Ready {
             Admission(usize),
@@ -339,7 +398,10 @@ impl<A, B: NativeAtomicBroker> Root<A, B> {
         };
         match ready {
             Ready::Admission(index) => self.accepted(index).await,
-            Ready::Session(index) => self.session_ready(index).await,
+            Ready::Session(index) => {
+                self.pending_session_ready = Some(index);
+                self.finish_session_ready().await;
+            }
             Ready::Event(Some(event)) => self.process(event).await,
             Ready::Event(None) => {}
             Ready::Operation(operation) => self
@@ -354,14 +416,15 @@ impl<A, B: NativeAtomicBroker> Root<A, B> {
             }
         }
     }
-    pub(super) async fn finish(&mut self) -> Report<A> {
+    pub(in crate::listener) async fn finish(&mut self) -> Report<A> {
         self.stop();
         let mut tick = tokio::time::interval(Duration::from_millis(100));
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        while self
-            .sessions
-            .iter()
-            .any(|slot| matches!(slot, SessionSlot::Installed(_)))
+        while self.pending_session_ready.is_some()
+            || self
+                .sessions
+                .iter()
+                .any(|slot| matches!(slot, SessionSlot::Installed(_)))
         {
             self.step(&mut tick, false).await;
         }
@@ -502,6 +565,193 @@ impl<A, B: NativeAtomicBroker> Root<A, B> {
             }
         }
         assert_eq!(session_ids.len(), self.session_budget.counts().1);
+    }
+}
+
+impl<B> Settings<B> {
+    pub(in crate::listener) fn from_open(
+        identity: NativeConnectionIdentity,
+        namespace: NamespaceName,
+        broker: B,
+        authorization: Option<Arc<ConnectionAuthorization>>,
+        runtime: Handle,
+        messaging: bool,
+    ) -> Self {
+        Self {
+            identity,
+            namespace,
+            broker,
+            authorization,
+            runtime,
+            mode: if messaging {
+                IngressMode::Messaging
+            } else {
+                IngressMode::Posting
+            },
+            controls: Arc::new(Controls::default()),
+        }
+    }
+}
+
+impl<A> Report<A> {
+    pub(in crate::listener) fn session_error(&self, index: usize) -> Option<&super::IngressError> {
+        match &self.sessions.get(index)?.as_ref()?.original {
+            Ok(super::retained_session::SessionExit::Routing(error)) => Some(error),
+            _ => None,
+        }
+    }
+    pub(in crate::listener) fn worker_error(&self, index: usize) -> Option<&super::IngressError> {
+        self.packets
+            .get(index)?
+            .rows
+            .iter()
+            .find_map(|row| match &row.original {
+                Ok(Err(error)) => Some(error),
+                _ => None,
+            })
+    }
+    pub(in crate::listener) fn scope_counts(&self) -> (usize, usize, usize) {
+        (
+            self.attempts,
+            self.sessions.iter().flatten().count(),
+            self.packets.iter().map(|p| p.rows.len()).sum(),
+        )
+    }
+    pub(in crate::listener) fn dispose_scoped(self) -> bool {
+        let Self {
+            admissions,
+            sessions,
+            packets,
+            anchor,
+            ..
+        } = self;
+        fn caught<T>(value: T) -> bool {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value))).is_err()
+        }
+        let mut panicked = false;
+        for record in admissions.into_iter().flatten() {
+            panicked |= caught(record);
+        }
+        for session in sessions.into_iter().flatten() {
+            panicked |= caught(session.original);
+        }
+        for packet in packets {
+            panicked |= caught(packet.set);
+            panicked |= caught(packet.launches);
+            for row in packet.rows {
+                panicked |= caught(row.original);
+            }
+        }
+        panicked | caught(anchor)
+    }
+}
+
+// Closed cfg(test) view of the existing protocol-local gates, never engine controls.
+#[derive(Clone)]
+pub(in crate::listener) struct ScopedControls(Arc<Controls>, Arc<Budget>, Arc<Budget>);
+pub(in crate::listener) struct ScopedFault(super::retained_session::controls::Fault);
+impl ScopedFault {
+    pub(in crate::listener) fn dispose(self) {
+        match self.0 {
+            super::retained_session::controls::Fault::Error(error) => drop(error),
+            super::retained_session::controls::Fault::Panic(payload) => drop(payload),
+        }
+    }
+}
+impl ScopedControls {
+    pub(in crate::listener) fn session_commits(&self) -> usize {
+        self.1.counts().1
+    }
+    pub(in crate::listener) fn worker_commits(&self) -> usize {
+        self.2.counts().1
+    }
+    pub(in crate::listener) fn arm_worker(&self, index: usize) {
+        self.0.sessions[index].worker_start.arm();
+    }
+    pub(in crate::listener) fn worker_entered(&self, index: usize) -> bool {
+        self.0.sessions[index].worker_start.entered()
+    }
+    pub(in crate::listener) fn arm_session(&self, index: usize) {
+        self.0.sessions[index].session_start.arm();
+    }
+    pub(in crate::listener) fn session_entered(&self, index: usize) -> bool {
+        self.0.sessions[index].session_start.entered()
+    }
+    pub(in crate::listener) fn release_session(&self, index: usize) {
+        self.0.sessions[index].session_start.release();
+    }
+    pub(in crate::listener) fn arm_worker_final(&self, index: usize) {
+        self.0.sessions[index].worker_final.arm();
+    }
+    pub(in crate::listener) fn worker_final_entered(&self, index: usize) -> bool {
+        self.0.sessions[index].worker_final.entered()
+    }
+    pub(in crate::listener) fn release_worker_final(&self, index: usize) {
+        self.0.sessions[index].worker_final.release();
+    }
+    pub(in crate::listener) fn inject_worker_error(
+        &self,
+        index: usize,
+        error: super::IngressError,
+    ) -> Option<ScopedFault> {
+        let previous = self.0.sessions[index]
+            .fault
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(super::retained_session::controls::Fault::Error(error));
+        previous.map(ScopedFault)
+    }
+    pub(in crate::listener) fn arm_admission(&self, index: usize) {
+        self.0.admission_ready[index].arm();
+    }
+    pub(in crate::listener) fn admission_entered(&self, index: usize) -> bool {
+        self.0.admission_ready[index].entered()
+    }
+    pub(in crate::listener) fn arm_session_ready(&self, index: usize) {
+        self.0.session_ready[index].arm();
+    }
+    pub(in crate::listener) fn session_ready_entered(&self, index: usize) -> bool {
+        self.0.session_ready[index].entered()
+    }
+    pub(in crate::listener) fn arm_row(&self) {
+        self.0.row_ready.arm();
+    }
+    pub(in crate::listener) fn row_entered(&self) -> bool {
+        self.0.row_ready.entered()
+    }
+    pub(in crate::listener) fn inject_session_error(
+        &self,
+        index: usize,
+        error: super::IngressError,
+    ) -> Option<ScopedFault> {
+        let fault = super::retained_session::controls::Fault::Error(error);
+        let previous = self.0.sessions[index]
+            .session_fault
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(fault);
+        previous.map(ScopedFault)
+    }
+    pub(in crate::listener) fn release_observers(&self) {
+        self.0.release_observers();
+    }
+    pub(in crate::listener) fn release_all(&self) {
+        self.0.release_all();
+    }
+    pub(in crate::listener) fn worker_stopped(&self) -> usize {
+        self.0.worker_stopped.load(Ordering::SeqCst)
+    }
+    pub(in crate::listener) fn take_unused(&self) -> Vec<ScopedFault> {
+        let mut faults = Vec::new();
+        for session in &self.0.sessions {
+            if let Some(fault) = session.take_fault() {
+                faults.push(ScopedFault(fault));
+            }
+            if let Some(fault) = session.take_session_fault() {
+                faults.push(ScopedFault(fault));
+            }
+        }
+        faults
     }
 }
 

@@ -27,7 +27,7 @@ mod workers;
 mod retained_session;
 
 #[cfg(test)]
-mod retained_collector;
+pub(in crate::listener) mod retained_collector;
 
 #[cfg(test)]
 mod tests;

@@ -13,6 +13,36 @@ use crate::listener::retained_connection::{
     ready::{self, Attempt, Primary},
 };
 
+#[cfg(test)]
+mod socket_collector;
+
+trait RetainedDriver<B: Broker>: Send + 'static {
+    const ADMISSION: AdmissionMode;
+
+    fn serve_retained_open<'a>(
+        self,
+        connection: &'a mut ServerConnection,
+        namespace: domain::NamespaceName,
+        broker: B,
+        authorization: Option<Arc<ConnectionAuthorization>>,
+    ) -> impl Future<Output = crate::listener::retained_connection::RetainedConnectionResult> + Send + 'a;
+}
+
+impl<B: Broker, D: ConnectionDriver<B>> RetainedDriver<B> for D {
+    const ADMISSION: AdmissionMode = <D as ConnectionDriver<B>>::ADMISSION;
+
+    fn serve_retained_open<'a>(
+        self,
+        connection: &'a mut ServerConnection,
+        namespace: domain::NamespaceName,
+        broker: B,
+        authorization: Option<Arc<ConnectionAuthorization>>,
+    ) -> impl Future<Output = crate::listener::retained_connection::RetainedConnectionResult> + Send + 'a
+    {
+        self.serve_open(connection, namespace, broker, authorization)
+    }
+}
+
 impl<B: Broker> AmqpListener<B> {
     /// Starts ONE already accepted socket on the starter's captured live runtime.
     ///
@@ -34,7 +64,7 @@ impl<B: Broker> AmqpListener<B> {
         self.start_retained_with_driver(stream, starter, OrdinaryDriver)
     }
 
-    fn start_retained_with_driver<D: ConnectionDriver<B>>(
+    fn start_retained_with_driver<D: RetainedDriver<B>>(
         self,
         stream: TcpStream,
         starter: RetainedConnectionStarter,
@@ -101,7 +131,7 @@ impl<B: NativeAtomicBroker> AmqpListener<B> {
     }
 }
 
-async fn run_wrapper<B: Broker, D: ConnectionDriver<B>>(
+async fn run_wrapper<B: Broker, D: RetainedDriver<B>>(
     listener: AmqpListener<B>,
     stream: TcpStream,
     deadline: tokio::time::Instant,
@@ -182,7 +212,7 @@ async fn serve_owned_transport<Io, B, D>(
 ) where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     B: Broker,
-    D: ConnectionDriver<B>,
+    D: RetainedDriver<B>,
 {
     let Publisher {
         primary,
@@ -265,7 +295,7 @@ async fn serve_owned_connection<Io, B, D>(
 ) where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     B: Broker,
-    D: ConnectionDriver<B>,
+    D: RetainedDriver<B>,
 {
     let ConnectionSettings {
         container_id,
@@ -361,7 +391,7 @@ async fn serve_owned_connection<Io, B, D>(
         return;
     }
     ready::with_primary(
-        driver.serve_open(&mut connection, namespace, broker, authorization),
+        driver.serve_retained_open(&mut connection, namespace, broker, authorization),
         &primary,
         || (),
         |result, loan| {
@@ -394,7 +424,7 @@ async fn accept_owned<Io, B, D>(
 where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     B: Broker,
-    D: ConnectionDriver<B>,
+    D: RetainedDriver<B>,
 {
     let mapping = |result: Result<ScopedConnectionAcceptance<Io>, amqp::EngineError>,
                    loan: ready::PrimaryLoan<'_>| {
@@ -467,7 +497,7 @@ fn start_test<Io, B, D>(
 where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     B: Broker,
-    D: ConnectionDriver<B>,
+    D: RetainedDriver<B>,
 {
     let Some((claim, acceptor, publisher)) = starter.claim() else {
         return false;
