@@ -5,8 +5,9 @@ mod owner;
 mod state;
 mod store;
 pub use aligned_seed::{
-    AlignedSeedExpectation, AlignedSeedInspectionError, BorrowedAlignedSeed, InspectedAlignedSeed,
-    inspect_aligned_seed,
+    AlignedSeedExpectation, AlignedSeedInspectionError, BorrowedAlignedSeed,
+    EncodedAlignedSeedCandidate, InspectedAlignedSeed, inspect_aligned_seed,
+    prepare_aligned_seed_candidate,
 };
 pub use store::ExperimentalCompactionLogStore;
 

@@ -3,6 +3,7 @@ use super::*;
 mod controls;
 mod fixture;
 mod policy;
+mod prepared;
 
 use fixture::{Case, Image, TestResult};
 

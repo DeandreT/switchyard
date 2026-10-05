@@ -15,8 +15,9 @@ mod snapshot_data;
 pub use snapshot_data::{BoundedSnapshotData, MAX_SNAPSHOT_BYTES};
 
 pub use experimental_log::{
-    AlignedSeedExpectation, AlignedSeedInspectionError, BorrowedAlignedSeed, InspectedAlignedSeed,
-    inspect_aligned_seed,
+    AlignedSeedExpectation, AlignedSeedInspectionError, BorrowedAlignedSeed,
+    EncodedAlignedSeedCandidate, InspectedAlignedSeed, inspect_aligned_seed,
+    prepare_aligned_seed_candidate,
 };
 
 pub use experimental_log::{

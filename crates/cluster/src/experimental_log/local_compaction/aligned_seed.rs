@@ -10,6 +10,9 @@ use crate::{DecodedNativeSnapshotPair, LogProfile, LogVote, NativeSnapshotMetada
 
 use super::codec::{Baseline, MAX_BASELINE_BYTES, ObservedProfileError, decode_observed_profile};
 
+mod prepared;
+pub use prepared::{EncodedAlignedSeedCandidate, prepare_aligned_seed_candidate};
+
 /// Offered immutable data only, not a complete physical capture or trusted source.
 pub struct BorrowedAlignedSeed<'a> {
     pub metadata: &'a [u8],
@@ -30,7 +33,7 @@ pub struct AlignedSeedExpectation<'a> {
     pub baseline_ordinal: u64,
 }
 
-/// Static pure refusals; no source is poisoned or write outcome diagnosed.
+/// Static inspection/preparation refusals; no source is poisoned or write outcome diagnosed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AlignedSeedInspectionError {
     #[error("aligned seed exceeds a finite logical limit")]
@@ -168,12 +171,7 @@ pub fn inspect_aligned_seed<'a>(
     if pair.checkpoint().last().is_none() || pair.checkpoint().membership().is_none() {
         return Err(Error::UnsupportedSeedPolicy);
     }
-    if &profile != expected.profile
-        || pair.checkpoint() != expected.checkpoint
-        || observed.artifact.len() != expected.artifact_bytes
-        || <[u8; 32]>::from(Sha256::digest(observed.artifact)) != expected.artifact_sha256
-        || pair.snapshot_meta().map_err(metadata_error)? != *expected.native
-    {
+    if &profile != expected.profile || !pair_matches(&pair, expected)? {
         return Err(Error::IdentityMismatch);
     }
     if expected.baseline_ordinal == 0 || !expected.vote.committed {
@@ -225,14 +223,9 @@ pub fn inspect_aligned_seed<'a>(
 }
 
 fn shape(observed: &BorrowedAlignedSeed<'_>, expected: &AlignedSeedExpectation<'_>) -> Result<()> {
-    if observed.artifact.len() > MAX_COMMITTED_IMAGE_BYTES
-        || expected.artifact_bytes > MAX_COMMITTED_IMAGE_BYTES
+    if artifact_limits_exceeded(observed.artifact.len(), expected)
         || observed.metadata.len() > crate::MAX_NATIVE_SNAPSHOT_METADATA_BYTES
-        || expected.native.snapshot_id.len() > crate::MAX_NATIVE_SNAPSHOT_METADATA_BYTES
-        || expected
-            .checkpoint
-            .membership()
-            .is_some_and(|member| member.payload.len() > MAX_COMMITTED_MEMBERSHIP_BYTES)
+        || expectation_limits_exceeded(expected)
     {
         return Err(Error::LimitExceeded);
     }
@@ -254,12 +247,38 @@ fn shape(observed: &BorrowedAlignedSeed<'_>, expected: &AlignedSeedExpectation<'
             return Err(Error::LimitExceeded);
         }
     }
+    expectation_shape(expected)
+}
+
+fn artifact_limits_exceeded(bytes: usize, expected: &AlignedSeedExpectation<'_>) -> bool {
+    bytes > MAX_COMMITTED_IMAGE_BYTES || expected.artifact_bytes > MAX_COMMITTED_IMAGE_BYTES
+}
+
+fn expectation_limits_exceeded(expected: &AlignedSeedExpectation<'_>) -> bool {
+    expected.native.snapshot_id.len() > crate::MAX_NATIVE_SNAPSHOT_METADATA_BYTES
+        || expected
+            .checkpoint
+            .membership()
+            .is_some_and(|member| member.payload.len() > MAX_COMMITTED_MEMBERSHIP_BYTES)
+}
+
+fn expectation_shape(expected: &AlignedSeedExpectation<'_>) -> Result<()> {
     if expected.profile.stream() != expected.checkpoint.stream() {
         return Err(Error::InvalidExpectation);
     }
     crate::experimental_log::bounded_membership_len(expected.native.last_membership.membership())
         .map_err(|_| Error::LimitExceeded)?;
     Ok(())
+}
+
+fn pair_matches(
+    pair: &DecodedNativeSnapshotPair<'_>,
+    expected: &AlignedSeedExpectation<'_>,
+) -> Result<bool> {
+    Ok(pair.checkpoint() == expected.checkpoint
+        && pair.artifact_bytes().len() == expected.artifact_bytes
+        && <[u8; 32]>::from(Sha256::digest(pair.artifact_bytes())) == expected.artifact_sha256
+        && pair.snapshot_meta().map_err(metadata_error)? == *expected.native)
 }
 
 fn metadata_error(error: NativeSnapshotMetadataError) -> Error {

@@ -6,8 +6,9 @@
 pub(crate) mod local_compaction;
 pub use local_compaction::ExperimentalCompactionLogStore;
 pub use local_compaction::{
-    AlignedSeedExpectation, AlignedSeedInspectionError, BorrowedAlignedSeed, InspectedAlignedSeed,
-    inspect_aligned_seed,
+    AlignedSeedExpectation, AlignedSeedInspectionError, BorrowedAlignedSeed,
+    EncodedAlignedSeedCandidate, InspectedAlignedSeed, inspect_aligned_seed,
+    prepare_aligned_seed_candidate,
 };
 
 mod budget;
