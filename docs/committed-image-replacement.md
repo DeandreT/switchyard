@@ -61,6 +61,11 @@ installation, runtime adoption, or history-purge authority. Future native
 installation requires independent owner admission and a durable
 state/catalog-before-purge barrier across owners.
 
+The separate [owned native replacement API](native-image-replacement.md) supplies
+that domain operation through an explicitly enabled state owner. It checks the
+whole snapshot carrier and every actual native metadata field before target
+access. Its known-commit result still grants no engine or log-purge authority.
+
 Selected source, raw target, and encoded target can coexist during export, each
 with a separate 64 MiB logical bound. Source, Delete/Put copies, and backend
 staging can coexist during commit. Metadata, collection overhead, spare capacity,
