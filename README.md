@@ -155,6 +155,8 @@ The separate [trusted image replacement](docs/committed-image-replacement.md)
 replaces initialized business rows and their opaque catalog in one atomic commit.
 The [owned native replacement API](docs/native-image-replacement.md) checks the
 whole snapshot carrier before that commit without enabling engine installation.
+The private [paired-image model](docs/native-image-paired-model.md) tests bounded
+transition records and conservative classification without enabling adoption.
 The [sealed local compaction API](docs/sealed-local-compaction.md) retains a
 checked catalog before deleting an exact local prefix, without runtime activation.
 

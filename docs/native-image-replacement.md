@@ -8,6 +8,10 @@ installation, runtime adoption, history repair, or log-purge authorization.
 Existing constructors, profiles, formats, dependencies, engine traits, and
 server startup remain unchanged.
 
+The separate [paired-image model](native-image-paired-model.md) explores bounded
+cross-role records and conservative classification only; it grants no adoption
+authority or paired physical writer to this replacement API.
+
 ## Owned Selection
 
 The non-Clone request consumes a whole `Snapshot<LogTypes>` and independently
