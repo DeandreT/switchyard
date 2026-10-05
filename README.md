@@ -153,6 +153,9 @@ The [standalone catalog builder](docs/standalone-snapshot-builder.md) returns a
 sealed snapshot through the existing owner without enabling engine snapshot methods.
 The separate [trusted image replacement](docs/committed-image-replacement.md)
 replaces initialized business rows and their opaque catalog in one atomic commit.
+The [borrowed replacement planner](docs/committed-image-replacement-plan.md)
+validates two independently identified images and reports bounded read-only
+Delete/Put counts, without target access or mutation authority.
 The [owned native replacement API](docs/native-image-replacement.md) checks the
 whole snapshot carrier before that commit without enabling engine installation.
 The private [paired-image model](docs/native-image-paired-model.md) tests bounded

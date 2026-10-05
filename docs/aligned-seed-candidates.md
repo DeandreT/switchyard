@@ -6,6 +6,10 @@ It uses the existing SWYM/SWYI and SWLQ/SWLS/SWLF codecs. It does not create a
 paired physical directory, publish a seed, activate an engine or grant adoption
 authority. Successful equality does not establish independent trust.
 
+The separate [domain count planner](committed-image-replacement-plan.md) checks
+two offered CreateSendV1 images and reports logical Delete/Put counts. Neither
+its counts nor these canonical candidate bytes authorize physical publication.
+
 ## API
 
 `prepare_aligned_seed_candidate` borrows the complete artifact for its output

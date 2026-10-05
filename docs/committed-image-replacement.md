@@ -6,6 +6,11 @@ It requires `CatalogCommittedStore` and a bounded business reader. Ordinary
 constructors, pristine bootstrap, formats, profiles, dependencies, and runtime
 startup remain unchanged.
 
+The separate [borrowed count planner](committed-image-replacement-plan.md)
+validates both offered images and their independent identities without target
+access. Its immutable counts grant no writer capability and do not alter the
+trusted mutation path described here.
+
 The non-Clone `TrustedCreateSendReplacement` borrows immutable artifact bytes
 and two complete checkpoints: the expected old target and selected new source.
 It also pins stream identity and SHA-256 of the entire artifact, including the
