@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn graceful_close_preserves_exact_wire_and_both_actual_joins() -> TestResult {
     let (negotiated, mut peer, witness) = negotiated().await?;
-    let mut owner = PairOwner::new(Handle::current(), ());
+    let mut owner = PairOwner::new_for_test(Handle::current(), ());
     let connection = launch(&owner, negotiated);
     let closed = tokio::time::timeout(Duration::from_secs(2), async {
         tokio::join!(connection.close(), async {
@@ -59,7 +59,7 @@ async fn graceful_close_preserves_exact_wire_and_both_actual_joins() -> TestResu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parent_drop_after_reader_birth_joins_both_original_tokens() -> TestResult {
     let (negotiated, peer, witness) = negotiated().await?;
-    let mut owner = PairOwner::new(Handle::current(), ());
+    let mut owner = PairOwner::new_for_test(Handle::current(), ());
     let connection = launch(&owner, negotiated);
     let observed = fixture::observe_reader(&owner).await;
     drop(connection);
@@ -76,7 +76,7 @@ async fn parent_drop_after_reader_birth_joins_both_original_tokens() -> TestResu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actor_unwind_after_reader_installation_keeps_reader_rooted() -> TestResult {
     let (negotiated, peer, witness) = negotiated().await?;
-    let mut owner = PairOwner::new(Handle::current(), ());
+    let mut owner = PairOwner::new_for_test(Handle::current(), ());
     owner.controls = Arc::new(Controls {
         actor_panic: true,
         ..Controls::default()
@@ -107,7 +107,7 @@ async fn exit_signal_is_not_actor_join_and_lost_waiter_restores_token() -> TestR
     let (negotiated, peer, witness) = negotiated().await?;
     let gate = Arc::new(Gate::default());
     let anchor = std::rc::Rc::new(());
-    let mut owner = PairOwner::new(Handle::current(), anchor.clone());
+    let mut owner = PairOwner::new_for_test(Handle::current(), anchor.clone());
     owner.controls = Arc::new(Controls {
         actor_final: Some(gate.clone()),
         ..Controls::default()
@@ -149,7 +149,7 @@ async fn exit_signal_is_not_actor_join_and_lost_waiter_restores_token() -> TestR
 async fn actor_cancel_during_reader_loan_restores_same_pending_token() -> TestResult {
     let (negotiated, peer, witness) = negotiated().await?;
     let gate = Arc::new(Gate::default());
-    let mut owner = PairOwner::new(Handle::current(), ());
+    let mut owner = PairOwner::new_for_test(Handle::current(), ());
     owner.controls = Arc::new(Controls {
         before_reader_poll: Some(gate.clone()),
         ..Controls::default()
@@ -200,7 +200,7 @@ async fn reader_panic_payload_waits_for_actual_actor_barrier() -> TestResult {
     let (negotiated, peer, _) = negotiated().await?;
     let gate = Arc::new(Gate::default());
     let payload = Arc::new(PayloadCounter::default());
-    let mut owner = PairOwner::new(Handle::current(), ());
+    let mut owner = PairOwner::new_for_test(Handle::current(), ());
     owner.controls = Arc::new(Controls {
         actor_final: Some(gate.clone()),
         reader_panic: true,
@@ -238,7 +238,7 @@ async fn actor_panic_payload_waits_for_actual_reader_barrier() -> TestResult {
     let (negotiated, peer, _) = negotiated().await?;
     let gate = Arc::new(Gate::default());
     let payload = Arc::new(PayloadCounter::default());
-    let mut owner = PairOwner::new(Handle::current(), ());
+    let mut owner = PairOwner::new_for_test(Handle::current(), ());
     owner.controls = Arc::new(Controls {
         reader_final: Some(gate.clone()),
         actor_panic: true,

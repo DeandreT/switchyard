@@ -1,6 +1,7 @@
 mod fixture;
 mod joins;
 mod launch;
+mod public_api;
 mod runtime;
 
 use std::{

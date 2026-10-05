@@ -1,6 +1,5 @@
 use super::*;
 
-#[cfg(test)]
 use super::owned_connection_tasks::{ActorClaim, ReaderBirth as ScopedReaderBirth};
 
 pub(super) struct NegotiatedConnection<Io> {
@@ -98,21 +97,17 @@ where
 
 pub(super) enum ActorBirth {
     Legacy,
-    #[cfg(test)]
     Scoped(ActorClaim),
 }
 
 pub(super) enum ReaderBirth {
     Legacy,
-    #[cfg(test)]
     Scoped(ScopedReaderBirth),
 }
 
 pub(super) struct ReaderTask {
     legacy: Option<ConnectionReader>,
-    #[cfg(test)]
     scoped: Option<super::owned_connection_tasks::ReaderView>,
-    #[cfg(test)]
     absent: bool,
 }
 
@@ -121,13 +116,11 @@ impl ReaderTask {
         if let Some(reader) = &mut self.legacy {
             reader.shutdown().await;
         }
-        #[cfg(test)]
         if let Some(reader) = &self.scoped {
             reader.shutdown().await;
         }
     }
 
-    #[cfg(test)]
     pub(super) fn is_absent(&self) -> bool {
         self.absent
     }
@@ -141,12 +134,9 @@ impl ReaderBirth {
         match self {
             Self::Legacy => ReaderTask {
                 legacy: Some(ConnectionReader(Some(tokio::spawn(future)))),
-                #[cfg(test)]
                 scoped: None,
-                #[cfg(test)]
                 absent: false,
             },
-            #[cfg(test)]
             Self::Scoped(birth) => {
                 let scoped = birth.spawn(future);
                 ReaderTask {
@@ -161,11 +151,8 @@ impl ReaderBirth {
 
 impl ActorBirth {
     fn reader(&self, lifecycle: &ConnectionLifecycle) -> ReaderBirth {
-        #[cfg(not(test))]
-        let _ = lifecycle;
         match self {
             Self::Legacy => ReaderBirth::Legacy,
-            #[cfg(test)]
             Self::Scoped(claim) => {
                 claim.bind(lifecycle);
                 ReaderBirth::Scoped(claim.reader_birth())
@@ -179,7 +166,6 @@ impl ActorBirth {
     {
         match self {
             Self::Legacy => drop(tokio::spawn(future)),
-            #[cfg(test)]
             Self::Scoped(claim) => claim.spawn(future),
         }
     }
@@ -193,12 +179,13 @@ impl ActorBirth {
     }
 }
 
-impl<Io: AsyncRead + AsyncWrite + Send + Unpin + 'static> NegotiatedConnection<Io> {
-    #[cfg(test)]
+impl<Io> NegotiatedConnection<Io> {
     pub(super) fn into_transport(self) -> Io {
         self.stream
     }
+}
 
+impl<Io: AsyncRead + AsyncWrite + Send + Unpin + 'static> NegotiatedConnection<Io> {
     pub(super) fn launch(self, birth: ActorBirth) -> ServerConnection {
         let (commands, command_rx) = mpsc::channel(256);
         let (incoming_session_tx, incoming_sessions) = mpsc::channel(32);

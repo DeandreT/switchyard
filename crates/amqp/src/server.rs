@@ -39,7 +39,6 @@ mod native_transactions;
 mod outgoing_delivery_identity;
 mod outgoing_identity;
 mod outgoing_reservation;
-#[cfg(test)]
 mod owned_connection_tasks;
 mod receive_credit;
 mod retained_delivery;
@@ -92,6 +91,10 @@ pub use outgoing_delivery_identity::NativeOutgoingDeliveryIdentity;
 use outgoing_identity::AckIdentity;
 pub use outgoing_reservation::{ClaimedOutgoingSendReservation, OutgoingSendReservation};
 use outgoing_reservation::{OutgoingReservations, ReservationRequest};
+pub use owned_connection_tasks::{
+    RefusedServerConnection, ScopedConnectionAcceptance, ServerConnectionAcceptor,
+    ServerConnectionJoinReport, ServerConnectionOwner, ServerConnectionTaskJoins,
+};
 use receive_credit::{Consumption, ReceiveCredit};
 pub use retained_delivery::RetainedDelivery;
 pub use sender_identity::NativeSenderIdentity;
@@ -1439,7 +1442,6 @@ async fn run_connection<Io>(
             }
         }
     });
-    #[cfg(test)]
     if reader_task.is_absent() {
         return;
     }

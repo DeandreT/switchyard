@@ -13,7 +13,7 @@ fn claimed_actor_obligation_survives_stop_before_lifecycle_binding() -> TestResu
     let runtime = fallback()?;
     let (negotiated, peer, witness) = runtime.block_on(negotiated())?;
     let gate = Arc::new(Gate::default());
-    let mut owner = PairOwner::new(runtime.handle().clone(), ());
+    let mut owner = PairOwner::new_for_test(runtime.handle().clone(), ());
     owner.controls = Arc::new(Controls {
         before_bind: Some(gate.clone()),
         ..Controls::default()
@@ -49,7 +49,7 @@ fn claimed_reader_installation_survives_seal_before_spawn() -> TestResult {
     let runtime = fallback()?;
     let (negotiated, peer, witness) = runtime.block_on(negotiated())?;
     let gate = Arc::new(Gate::default());
-    let mut owner = PairOwner::new(runtime.handle().clone(), ());
+    let mut owner = PairOwner::new_for_test(runtime.handle().clone(), ());
     owner.controls = Arc::new(Controls {
         reader_claim: Some(gate.clone()),
         ..Controls::default()
@@ -76,7 +76,7 @@ fn claimed_reader_installation_survives_seal_before_spawn() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn panicked_connection_parent_is_separately_joined_from_pair() -> TestResult {
     let (negotiated, peer, witness) = negotiated().await?;
-    let mut owner = PairOwner::new(Handle::current(), ());
+    let mut owner = PairOwner::new_for_test(Handle::current(), ());
     let connection = launch(&owner, negotiated);
     let observed = fixture::observe_reader(&owner).await;
     let parent: tokio::task::JoinHandle<()> = tokio::spawn(async move {
@@ -99,7 +99,7 @@ fn distinct_current_runtime_death_before_actor_poll_keeps_fallback_handles() -> 
     // A does not poll queued work until B and its separately retained OS host exit.
     let runtime = Builder::new_current_thread().enable_all().build()?;
     let (negotiated, peer, witness) = runtime.block_on(negotiated())?;
-    let mut owner = PairOwner::new(runtime.handle().clone(), ());
+    let mut owner = PairOwner::new_for_test(runtime.handle().clone(), ());
     let host = std::thread::scope(|scope| {
         scope
             .spawn(
@@ -184,7 +184,7 @@ fn distinct_observer_runtime_death_during_cleanup_does_not_own_pair() -> TestRes
     let (negotiated, peer, witness) = runtime.block_on(negotiated())?;
     let installed = Arc::new(Gate::default());
     let reader_drop = Arc::new(Gate::default());
-    let mut owner = PairOwner::new(runtime.handle().clone(), ());
+    let mut owner = PairOwner::new_for_test(runtime.handle().clone(), ());
     owner.controls = Arc::new(Controls {
         after_reader: Some(installed.clone()),
         reader_final: Some(reader_drop.clone()),
@@ -233,7 +233,7 @@ fn real_host_panic_payload_disposal_waits_for_both_pair_barriers() -> TestResult
     let installed = Arc::new(Gate::default());
     let reader_drop = Arc::new(Gate::default());
     let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut owner = PairOwner::new(runtime.handle().clone(), ());
+    let mut owner = PairOwner::new_for_test(runtime.handle().clone(), ());
     owner.controls = Arc::new(Controls {
         after_reader: Some(installed.clone()),
         reader_final: Some(reader_drop.clone()),

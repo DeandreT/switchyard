@@ -7,7 +7,7 @@ use crate::server::{
 #[tokio::test]
 async fn empty_owner_and_cached_finish_do_not_invent_tasks() {
     let anchor = std::rc::Rc::new(());
-    let mut owner = PairOwner::new(Handle::current(), anchor.clone());
+    let mut owner = PairOwner::new_for_test(Handle::current(), anchor.clone());
     let report = owner.finish().await.expect("first report");
     assert!(report.actor.is_none() && report.reader.is_none());
     assert!(std::rc::Rc::ptr_eq(&report.anchor, &anchor));
@@ -18,7 +18,7 @@ async fn empty_owner_and_cached_finish_do_not_invent_tasks() {
 #[tokio::test]
 async fn closed_launch_returns_original_transport_without_identity() -> TestResult {
     let (negotiated, peer, witness) = negotiated().await?;
-    let mut owner = PairOwner::new(Handle::current(), ());
+    let mut owner = PairOwner::new_for_test(Handle::current(), ());
     let empty = owner.finish().await.expect("empty report");
     let refused = owner.launch(negotiated);
     let original = match refused {
@@ -42,7 +42,7 @@ async fn closed_launch_returns_original_transport_without_identity() -> TestResu
 async fn duplicate_launch_returns_input_and_keeps_original_identity() -> TestResult {
     let (first, first_peer, _) = negotiated().await?;
     let (second, second_peer, second_witness) = negotiated().await?;
-    let mut owner = PairOwner::new(Handle::current(), ());
+    let mut owner = PairOwner::new_for_test(Handle::current(), ());
     let connection = launch(&owner, first);
     let identity = connection.lifecycle.identity.clone();
     let original = match owner.launch(second) {
@@ -73,7 +73,7 @@ async fn duplicate_launch_returns_input_and_keeps_original_identity() -> TestRes
 #[tokio::test]
 async fn unpolled_negotiation_loss_creates_no_roles() {
     let (io, peer, witness) = fixture::transport();
-    let mut owner = PairOwner::new(Handle::current(), ());
+    let mut owner = PairOwner::new_for_test(Handle::current(), ());
     let future = connection_launch::negotiate(
         io,
         "server",
@@ -91,7 +91,7 @@ async fn unpolled_negotiation_loss_creates_no_roles() {
 #[tokio::test]
 async fn pending_negotiation_loss_creates_no_roles() {
     let (io, peer, witness) = fixture::transport();
-    let mut owner = PairOwner::new(Handle::current(), ());
+    let mut owner = PairOwner::new_for_test(Handle::current(), ());
     let mut future = Box::pin(connection_launch::negotiate(
         io,
         "server",
@@ -157,7 +157,7 @@ async fn options_validation_retains_original_timeout_variant() {
 #[tokio::test]
 async fn scoped_handshake_bytes_match_original_protocol() -> TestResult {
     let (negotiated, peer, witness) = negotiated().await?;
-    let mut owner = PairOwner::new(Handle::current(), ());
+    let mut owner = PairOwner::new_for_test(Handle::current(), ());
     let connection = launch(&owner, negotiated);
     drop(connection);
     let report = owner.finish().await.expect("actual report");
@@ -179,7 +179,7 @@ async fn scoped_handshake_bytes_match_original_protocol() -> TestResult {
 #[tokio::test(flavor = "current_thread")]
 async fn queued_unpolled_actor_abort_retires_identity_and_really_joins() -> TestResult {
     let (negotiated, peer, witness) = negotiated().await?;
-    let mut owner = PairOwner::new(Handle::current(), ());
+    let mut owner = PairOwner::new_for_test(Handle::current(), ());
     let connection = launch(&owner, negotiated);
     let identity = connection.lifecycle.identity.clone();
     fixture::actor_abort(&owner).abort();
@@ -201,7 +201,7 @@ async fn queued_unpolled_actor_abort_retires_identity_and_really_joins() -> Test
 #[tokio::test(flavor = "current_thread")]
 async fn parent_drop_before_actor_poll_seals_reader_without_new_abort_policy() -> TestResult {
     let (negotiated, peer, witness) = negotiated().await?;
-    let mut owner = PairOwner::new(Handle::current(), ());
+    let mut owner = PairOwner::new_for_test(Handle::current(), ());
     let connection = launch(&owner, negotiated);
     drop(connection);
     let report = owner.finish().await.expect("actual report");
