@@ -11,6 +11,10 @@ warmed and cold-first same-queue send, plus held Complete over TLS on this
 endpoint. It is not general SDK transaction compatibility or a durable
 transaction recovery log.
 
+The private [retained atomic session experiment](retained-atomic-session.md)
+exercises original routing-worker custody with a finite lifetime history budget.
+It does not activate that budget or retained descendant cleanup on this endpoint.
+
 ## Experimental Process Endpoint
 
 The broker process can expose this path at a separate development-only address:

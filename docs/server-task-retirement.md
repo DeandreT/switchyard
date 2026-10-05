@@ -109,6 +109,10 @@ The separate [retained protocol connection](retained-protocol-connection.md)
 covers an actual one-socket wrapper and its engine pair. It does not promote this
 synthetic model or retire the socket's session/link descendants.
 
+The private [retained atomic session experiment](retained-atomic-session.md)
+separately roots one actual session and its original routing workers. It does not
+promote this model, integrate into the connection API or complete fixture cleanup.
+
 The historical provisional-Complete SDK timeout remains unexplained as recorded
 in [client diagnostic evidence](atomic-sdk-evidence.md). Whole-resource custody
 and actual listener/engine integration require separate ownership and verification.

@@ -122,6 +122,10 @@ Panicking `tokio_unstable` task-spawn hooks are unsupported: a token that Tokio
 never returns cannot be retained or joined by this owner. No completion-report
 guarantee is claimed for that configuration.
 
+The separate private [retained atomic session experiment](retained-atomic-session.md)
+roots one actual session and its original routing workers. It is not integrated
+into this API and does not expand the three covered roles or SDK fixture cleanup.
+
 ## Verification
 
 The final focused suite passed 41 regular tests and three compile-fail examples.
