@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Closed {
+pub(in crate::listener::atomic_ingress) enum Closed {
     Sealed,
     Budget,
 }
@@ -13,20 +13,19 @@ struct State {
     sealed: bool,
 }
 
-pub(super) struct Budget(Mutex<State>);
+pub(in crate::listener::atomic_ingress) struct Budget(Mutex<State>);
 
-pub(super) struct Ticket {
+pub(in crate::listener::atomic_ingress) struct Ticket {
     budget: Arc<Budget>,
     reserved: bool,
 }
-pub(super) struct Claim {
+pub(in crate::listener::atomic_ingress) struct Claim {
     budget: Arc<Budget>,
-    ordinal: usize,
     reserved: bool,
 }
 
 impl Budget {
-    pub(super) fn new(limit: usize) -> Arc<Self> {
+    pub(in crate::listener::atomic_ingress) fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self(Mutex::new(State {
             limit,
             reserved: 0,
@@ -34,14 +33,14 @@ impl Budget {
             sealed: false,
         })))
     }
-    pub(super) fn seal(&self) {
+    pub(in crate::listener::atomic_ingress) fn seal(&self) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).sealed = true;
     }
-    pub(super) fn counts(&self) -> (usize, usize, bool) {
+    pub(in crate::listener::atomic_ingress) fn counts(&self) -> (usize, usize, bool) {
         let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         (state.reserved, state.committed, state.sealed)
     }
-    pub(super) fn reserve(self: &Arc<Self>) -> Result<Ticket, Closed> {
+    pub(in crate::listener::atomic_ingress) fn reserve(self: &Arc<Self>) -> Result<Ticket, Closed> {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.sealed {
             return Err(Closed::Sealed);
@@ -58,17 +57,15 @@ impl Budget {
 }
 
 impl Ticket {
-    pub(super) fn claim(mut self) -> Result<Claim, Closed> {
+    pub(in crate::listener::atomic_ingress) fn claim(mut self) -> Result<Claim, Closed> {
         {
             let state = self.budget.0.lock().unwrap_or_else(|e| e.into_inner());
             if state.sealed {
                 Err(Closed::Sealed)
             } else {
-                let ordinal = state.committed;
                 self.reserved = false;
                 Ok(Claim {
                     budget: Arc::clone(&self.budget),
-                    ordinal,
                     reserved: true,
                 })
             }
@@ -77,14 +74,15 @@ impl Ticket {
 }
 
 impl Claim {
-    pub(super) fn commit(mut self) -> usize {
+    pub(in crate::listener::atomic_ingress) fn commit(mut self) -> usize {
         {
             let mut state = self.budget.0.lock().unwrap_or_else(|e| e.into_inner());
+            let ordinal = state.committed;
             state.reserved -= 1;
             state.committed += 1;
             self.reserved = false;
+            ordinal
         }
-        self.ordinal
     }
 }
 

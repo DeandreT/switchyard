@@ -22,23 +22,23 @@ use super::{
 };
 use crate::{NativeAtomicBroker, authorization::ConnectionAuthorization};
 
-mod budget;
+pub(super) mod budget;
 pub(super) mod controls;
-mod packet;
+pub(super) mod packet;
 mod tests;
 
 use budget::{Budget, Closed};
 use controls::Controls;
 use packet::{Cell, Launch, Row};
 
-enum SessionExit {
+pub(super) enum SessionExit {
     Completed,
     Routing(IngressError),
     WorkerFailed(usize),
     Closed(Closed),
 }
 
-enum SessionSlot {
+pub(super) enum SessionSlot {
     NotLaunched,
     Installed(JoinHandle<SessionExit>),
     Joined {
@@ -104,46 +104,69 @@ pub(super) fn launch<A, B: NativeAtomicBroker>(
         anchor: Some(anchor),
         controls: Arc::clone(&controls),
     };
-    let mut packet = cell.loan(budget, runtime.clone(), Arc::clone(&controls));
-    let handle = runtime.spawn(async move {
-        controls.session_start.hold().await;
-        if let Some(fault) = controls.take_session_fault() {
-            match fault {
-                controls::Fault::Error(error) => return SessionExit::Routing(error),
-                controls::Fault::Panic(payload) => std::panic::resume_unwind(payload),
-            }
-        }
-        let mut session = session;
-        let result = routing::route_session(
-            &mut session,
-            &namespace,
-            &broker,
-            &authorization,
-            &sender,
-            &Arc::new(Semaphore::new(MAX_LINKS)),
-            mode,
-            &mut packet,
-        )
-        .await;
-        let acknowledged = matches!(
-            &result,
-            Err(RouteError::Closed {
-                acknowledged: true,
-                ..
-            })
-        );
-        if result.is_err() && !acknowledged {
-            routing::stop_connection(&sender).await;
-        }
-        match result {
-            Ok(()) => SessionExit::Completed,
-            Err(RouteError::Routing(error)) => SessionExit::Routing(error),
-            Err(RouteError::Worker(row)) => SessionExit::WorkerFailed(row),
-            Err(RouteError::Closed { reason, .. }) => SessionExit::Closed(reason),
-        }
-    });
+    let packet = cell.loan(budget, runtime.clone(), Arc::clone(&controls));
+    let handle = runtime.spawn(scoped_session(
+        session,
+        namespace,
+        broker,
+        authorization,
+        sender,
+        Arc::new(Semaphore::new(MAX_LINKS)),
+        mode,
+        packet,
+        controls,
+    ));
     root.session = SessionSlot::Installed(handle);
     Ok(root)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn scoped_session<B: NativeAtomicBroker>(
+    session: ServerSession,
+    namespace: NamespaceName,
+    broker: B,
+    authorization: Option<Arc<ConnectionAuthorization>>,
+    sender: mpsc::Sender<Event>,
+    links: Arc<Semaphore>,
+    mode: IngressMode,
+    mut packet: packet::Loan,
+    controls: Arc<Controls>,
+) -> SessionExit {
+    controls.session_start.hold().await;
+    if let Some(fault) = controls.take_session_fault() {
+        match fault {
+            controls::Fault::Error(error) => return SessionExit::Routing(error),
+            controls::Fault::Panic(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+    let mut session = session;
+    let result = routing::route_session(
+        &mut session,
+        &namespace,
+        &broker,
+        &authorization,
+        &sender,
+        &links,
+        mode,
+        &mut packet,
+    )
+    .await;
+    let acknowledged = matches!(
+        &result,
+        Err(RouteError::Closed {
+            acknowledged: true,
+            ..
+        })
+    );
+    if result.is_err() && !acknowledged {
+        routing::stop_connection(&sender).await;
+    }
+    match result {
+        Ok(()) => SessionExit::Completed,
+        Err(RouteError::Routing(error)) => SessionExit::Routing(error),
+        Err(RouteError::Worker(row)) => SessionExit::WorkerFailed(row),
+        Err(RouteError::Closed { reason, .. }) => SessionExit::Closed(reason),
+    }
 }
 
 impl<A, B: NativeAtomicBroker> Root<A, B> {
@@ -303,7 +326,7 @@ impl<A, B: NativeAtomicBroker> Root<A, B> {
     }
 }
 
-fn poll_original(slot: &mut SessionSlot, cx: &mut Context<'_>) -> Poll<()> {
+pub(super) fn poll_original(slot: &mut SessionSlot, cx: &mut Context<'_>) -> Poll<()> {
     let result = match slot {
         SessionSlot::Installed(handle) => match Pin::new(handle).poll(cx) {
             Poll::Pending => return Poll::Pending,

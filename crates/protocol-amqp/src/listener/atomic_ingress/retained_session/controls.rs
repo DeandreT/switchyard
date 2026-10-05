@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 use super::super::{IngressError, routing::Branch};
 
 #[derive(Default)]
-pub(super) struct Gate {
+pub(in crate::listener::atomic_ingress) struct Gate {
     armed: AtomicBool,
     entered: AtomicBool,
     released: AtomicBool,
@@ -21,17 +21,17 @@ pub(super) struct Gate {
 }
 
 impl Gate {
-    pub(super) fn arm(&self) {
+    pub(in crate::listener::atomic_ingress) fn arm(&self) {
         self.armed.store(true, Ordering::SeqCst);
     }
-    pub(super) fn entered(&self) -> bool {
+    pub(in crate::listener::atomic_ingress) fn entered(&self) -> bool {
         self.entered.load(Ordering::SeqCst)
     }
-    pub(super) fn release(&self) {
+    pub(in crate::listener::atomic_ingress) fn release(&self) {
         self.released.store(true, Ordering::SeqCst);
         self.changed.notify_waiters();
     }
-    pub(super) async fn hold(&self) {
+    pub(in crate::listener::atomic_ingress) async fn hold(&self) {
         if !self.armed.load(Ordering::SeqCst) {
             return;
         }
@@ -49,38 +49,38 @@ impl Gate {
     }
 }
 
-pub(super) enum Fault {
+pub(in crate::listener::atomic_ingress) enum Fault {
     Error(IngressError),
     Panic(Box<dyn std::any::Any + Send>),
 }
 
 #[derive(Default)]
 pub(in crate::listener::atomic_ingress) struct Controls {
-    pub(super) session_start: Gate,
-    pub(super) acceptance_pending: Gate,
-    pub(super) before_accept: Gate,
-    pub(super) before_claim: Gate,
-    pub(super) worker_start: Gate,
-    pub(super) worker_final: Gate,
-    pub(super) close_ack: Gate,
-    pub(super) finish_after_row: Gate,
-    pub(super) session_ready: Gate,
-    pub(super) worker_drops: AtomicUsize,
-    pub(super) joined_rows: AtomicUsize,
-    pub(super) worker_stopped_observed: AtomicUsize,
-    pub(super) authority_closed: AtomicBool,
-    pub(super) disposed_before_close: AtomicBool,
-    pub(super) receiver_torn_down: AtomicBool,
-    pub(super) owner_torn_down: AtomicBool,
-    pub(super) row_panic: AtomicBool,
-    pub(super) session_unwind_after_launch: AtomicBool,
-    pub(super) refused_future_dropped: AtomicBool,
-    pub(super) reply_registration_complete: AtomicBool,
-    pub(super) peer_end_entered: AtomicBool,
-    pub(super) fault: Mutex<Option<Fault>>,
-    pub(super) session_fault: Mutex<Option<Fault>>,
-    pub(super) branch: Mutex<Option<Branch>>,
-    pub(super) worker_branch: Mutex<Option<Branch>>,
+    pub(in crate::listener::atomic_ingress) session_start: Gate,
+    pub(in crate::listener::atomic_ingress) acceptance_pending: Gate,
+    pub(in crate::listener::atomic_ingress) before_accept: Gate,
+    pub(in crate::listener::atomic_ingress) before_claim: Gate,
+    pub(in crate::listener::atomic_ingress) worker_start: Gate,
+    pub(in crate::listener::atomic_ingress) worker_final: Gate,
+    pub(in crate::listener::atomic_ingress) close_ack: Gate,
+    pub(in crate::listener::atomic_ingress) finish_after_row: Gate,
+    pub(in crate::listener::atomic_ingress) session_ready: Gate,
+    pub(in crate::listener::atomic_ingress) worker_drops: AtomicUsize,
+    pub(in crate::listener::atomic_ingress) joined_rows: AtomicUsize,
+    pub(in crate::listener::atomic_ingress) worker_stopped_observed: AtomicUsize,
+    pub(in crate::listener::atomic_ingress) authority_closed: AtomicBool,
+    pub(in crate::listener::atomic_ingress) disposed_before_close: AtomicBool,
+    pub(in crate::listener::atomic_ingress) receiver_torn_down: AtomicBool,
+    pub(in crate::listener::atomic_ingress) owner_torn_down: AtomicBool,
+    pub(in crate::listener::atomic_ingress) row_panic: AtomicBool,
+    pub(in crate::listener::atomic_ingress) session_unwind_after_launch: AtomicBool,
+    pub(in crate::listener::atomic_ingress) refused_future_dropped: AtomicBool,
+    pub(in crate::listener::atomic_ingress) reply_registration_complete: AtomicBool,
+    pub(in crate::listener::atomic_ingress) peer_end_entered: AtomicBool,
+    pub(in crate::listener::atomic_ingress) fault: Mutex<Option<Fault>>,
+    pub(in crate::listener::atomic_ingress) session_fault: Mutex<Option<Fault>>,
+    pub(in crate::listener::atomic_ingress) branch: Mutex<Option<Branch>>,
+    pub(in crate::listener::atomic_ingress) worker_branch: Mutex<Option<Branch>>,
 }
 
 impl Controls {
@@ -112,16 +112,16 @@ impl Controls {
             self.before_claim.hold().await;
         }
     }
-    pub(super) fn take_fault(&self) -> Option<Fault> {
+    pub(in crate::listener::atomic_ingress) fn take_fault(&self) -> Option<Fault> {
         self.fault.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
-    pub(super) fn take_session_fault(&self) -> Option<Fault> {
+    pub(in crate::listener::atomic_ingress) fn take_session_fault(&self) -> Option<Fault> {
         self.session_fault
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
     }
-    pub(super) fn blocks_worker(&self, branch: Branch) -> bool {
+    pub(in crate::listener::atomic_ingress) fn blocks_worker(&self, branch: Branch) -> bool {
         self.worker_branch
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -133,7 +133,7 @@ impl Controls {
         }
         self.refused_future_dropped.store(true, Ordering::SeqCst);
     }
-    pub(super) fn release_all(&self) {
+    pub(in crate::listener::atomic_ingress) fn release_all(&self) {
         for gate in [
             &self.session_start,
             &self.acceptance_pending,
@@ -150,7 +150,9 @@ impl Controls {
     }
 }
 
-pub(super) struct WorkerDrop(pub(super) Arc<Controls>);
+pub(in crate::listener::atomic_ingress) struct WorkerDrop(
+    pub(in crate::listener::atomic_ingress) Arc<Controls>,
+);
 
 impl Drop for WorkerDrop {
     fn drop(&mut self) {

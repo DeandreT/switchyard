@@ -18,48 +18,48 @@ use super::{
     controls::{Controls, Fault, WorkerDrop},
 };
 
-pub(super) struct Launch {
-    pub(super) id: Id,
-    pub(super) ordinal: usize,
-    pub(super) branch: Branch,
+pub(in crate::listener::atomic_ingress) struct Launch {
+    pub(in crate::listener::atomic_ingress) id: Id,
+    pub(in crate::listener::atomic_ingress) ordinal: usize,
+    pub(in crate::listener::atomic_ingress) branch: Branch,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Drain {
+pub(in crate::listener::atomic_ingress) enum Drain {
     Live,
     PeerEnd,
     External,
 }
-pub(super) struct Row {
-    pub(super) id: Id,
-    pub(super) drain: Drain,
-    pub(super) original: Result<Result<(), IngressError>, JoinError>,
+pub(in crate::listener::atomic_ingress) struct Row {
+    pub(in crate::listener::atomic_ingress) id: Id,
+    pub(in crate::listener::atomic_ingress) drain: Drain,
+    pub(in crate::listener::atomic_ingress) original: Result<Result<(), IngressError>, JoinError>,
 }
 
-pub(super) struct Packet {
-    pub(super) set: JoinSet<Result<(), IngressError>>,
-    pub(super) launches: Vec<Launch>,
-    pub(super) rows: Vec<Row>,
+pub(in crate::listener::atomic_ingress) struct Packet {
+    pub(in crate::listener::atomic_ingress) set: JoinSet<Result<(), IngressError>>,
+    pub(in crate::listener::atomic_ingress) launches: Vec<Launch>,
+    pub(in crate::listener::atomic_ingress) rows: Vec<Row>,
 }
 
-pub(super) struct Cell(Mutex<Option<Packet>>);
-pub(super) struct Loan {
+pub(in crate::listener::atomic_ingress) struct Cell(Mutex<Option<Packet>>);
+pub(in crate::listener::atomic_ingress) struct Loan {
     cell: Arc<Cell>,
     packet: Option<Packet>,
-    pub(super) budget: Arc<Budget>,
+    pub(in crate::listener::atomic_ingress) budget: Arc<Budget>,
     runtime: Handle,
     controls: Arc<Controls>,
     drain: Drain,
 }
 
 impl Cell {
-    pub(super) fn new(limit: usize) -> Arc<Self> {
+    pub(in crate::listener::atomic_ingress) fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self(Mutex::new(Some(Packet {
             set: JoinSet::new(),
             launches: Vec::with_capacity(limit),
             rows: Vec::with_capacity(limit),
         }))))
     }
-    pub(super) fn loan(
+    pub(in crate::listener::atomic_ingress) fn loan(
         self: &Arc<Self>,
         budget: Arc<Budget>,
         runtime: Handle,
@@ -78,16 +78,16 @@ impl Cell {
 }
 
 impl Loan {
-    pub(super) fn packet(&self) -> &Packet {
+    pub(in crate::listener::atomic_ingress) fn packet(&self) -> &Packet {
         self.packet.as_ref().expect("armed packet loan")
     }
-    pub(super) fn packet_mut(&mut self) -> &mut Packet {
+    pub(in crate::listener::atomic_ingress) fn packet_mut(&mut self) -> &mut Packet {
         self.packet.as_mut().expect("armed packet loan")
     }
-    pub(super) fn finish(mut self) -> Packet {
+    pub(in crate::listener::atomic_ingress) fn finish(mut self) -> Packet {
         self.packet.take().expect("joined packet")
     }
-    pub(super) fn external_drain(&mut self) {
+    pub(in crate::listener::atomic_ingress) fn external_drain(&mut self) {
         self.drain = Drain::External;
     }
 }

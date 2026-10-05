@@ -27,6 +27,9 @@ mod workers;
 mod retained_session;
 
 #[cfg(test)]
+mod retained_collector;
+
+#[cfg(test)]
 mod tests;
 
 const MAX_SESSIONS: usize = 32;
