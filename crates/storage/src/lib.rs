@@ -13,6 +13,7 @@
 mod batch_reservation_tests;
 mod bounded;
 mod catalog;
+mod complete_catalog_state;
 mod durable;
 mod memory;
 mod replica;
@@ -25,6 +26,11 @@ pub use catalog::{
     CatalogBoundsError, CatalogCommittedStore, CatalogReadError, MAX_CATALOG_ARTIFACT_BYTES,
     MAX_CATALOG_METADATA_BYTES, SnapshotCatalogReader, SnapshotCatalogRecord,
     StoredSnapshotCatalog,
+};
+
+pub use complete_catalog_state::{
+    COMPLETE_CATALOG_STATE_RECORD_LIMITS, CompleteCatalogReplicaStateReader,
+    MAX_COMPLETE_CATALOG_STATE_BYTES, StoredCatalogReplicaState,
 };
 
 pub use crate::{

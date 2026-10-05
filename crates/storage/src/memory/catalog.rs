@@ -208,5 +208,7 @@ fn validate_state(state: &CatalogState) -> Result<(), StorageError> {
     Ok(())
 }
 
+mod complete;
+
 #[cfg(test)]
 mod tests;

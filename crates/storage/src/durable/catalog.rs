@@ -331,5 +331,7 @@ fn corrupt(detail: &'static str) -> StorageError {
     }
 }
 
+mod complete;
+
 #[cfg(test)]
 mod tests;
