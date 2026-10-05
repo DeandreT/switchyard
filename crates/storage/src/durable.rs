@@ -349,6 +349,9 @@ mod bounded_tests;
 mod paired_marker_tests;
 
 #[cfg(test)]
+mod paired_prototype;
+
+#[cfg(test)]
 mod tests {
     use tempfile::TempDir;
 
