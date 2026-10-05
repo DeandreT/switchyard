@@ -24,6 +24,7 @@ use crate::{
 use crate::{decode_message, encode_message, read_frame};
 
 mod connection_identity;
+mod connection_launch;
 mod content_budget;
 mod diagnostics;
 mod error_deliveries;
@@ -38,6 +39,8 @@ mod native_transactions;
 mod outgoing_delivery_identity;
 mod outgoing_identity;
 mod outgoing_reservation;
+#[cfg(test)]
+mod owned_connection_tasks;
 mod receive_credit;
 mod retained_delivery;
 mod sender_identity;
@@ -627,7 +630,7 @@ impl ServerConnection {
     }
 
     async fn accept_inner<Io>(
-        mut stream: Io,
+        stream: Io,
         container_id: impl Into<String>,
         sasl: Option<Arc<dyn SaslAuthenticator>>,
         options: ConnectionOptions,
@@ -636,103 +639,9 @@ impl ServerConnection {
     where
         Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        options.validate()?;
-        let local_max_frame_size = normalized_frame_size(DEFAULT_MAX_FRAME_SIZE)?;
-        let local_open = Open {
-            max_frame_size: local_max_frame_size,
-            idle_time_out: Some(options.advertised_idle_timeout()),
-            ..Open::new(container_id)
-        };
-        checked_open_frame(local_open.clone())?;
-        if let Some(authenticator) = sasl {
-            expect_header(&mut stream, ProtocolHeader::SASL).await?;
-            negotiation_header(&mut stream, ProtocolHeader::SASL, options).await?;
-            negotiation_frame(
-                &mut stream,
-                &Frame::Sasl(SaslPerformative::Mechanisms(SaslMechanisms {
-                    mechanisms: authenticator.mechanisms(),
-                })),
-                options,
-            )
-            .await?;
-            let init = match read_frame_with_max_size(&mut stream, local_max_frame_size).await? {
-                Frame::Sasl(SaslPerformative::Init(init)) => init,
-                _ => return Err(invalid_state("expected SASL init")),
-            };
-            let code = authenticator.authenticate(&init);
-            negotiation_frame(
-                &mut stream,
-                &Frame::Sasl(SaslPerformative::Outcome(SaslOutcome {
-                    code: code.clone(),
-                    additional_data: None,
-                })),
-                options,
-            )
-            .await?;
-            if code != SaslCode::Ok {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "SASL authentication failed",
-                )
-                .into());
-            }
-        }
-
-        expect_header(&mut stream, ProtocolHeader::AMQP).await?;
-        negotiation_header(&mut stream, ProtocolHeader::AMQP, options).await?;
-        let remote_open = match read_frame_with_max_size(&mut stream, MIN_MAX_FRAME_SIZE).await? {
-            Frame::Amqp {
-                channel: 0,
-                performative: Some(Performative::Open(open)),
-                ..
-            } => open,
-            _ => return Err(invalid_state("expected AMQP open")),
-        };
-        let remote_max_frame_size = normalized_frame_size(remote_open.max_frame_size)?;
-        let channel_max = local_open.channel_max;
-        negotiation_frame(&mut stream, &checked_open_frame(local_open)?, options).await?;
-        let peer_idle_millis = peer_idle_timeout(
-            &mut stream,
-            remote_open.idle_time_out,
-            remote_max_frame_size,
-            options,
-        )
-        .await?;
-
-        let (commands, command_rx) = mpsc::channel(256);
-        let (incoming_session_tx, incoming_sessions) = mpsc::channel(32);
-        let consumed = Arc::new(Notify::new());
-        let driver_consumed = consumed.clone();
-        let (lifecycle, cancellation, actor_exit) = ConnectionLifecycle::new();
-        tokio::spawn(async move {
-            let exit_guard = actor_exit;
-            run_connection(
-                stream,
-                ConnectionSettings {
-                    remote_max_frame_size,
-                    local_max_frame_size,
-                    channel_max,
-                    remote_channel_max: remote_open.channel_max,
-                    options,
-                    peer_idle_millis,
-                },
-                exit_guard.identity(),
-                native_policy,
-                command_rx,
-                incoming_session_tx,
-                driver_consumed,
-                cancellation,
-            )
-            .await;
-            drop(exit_guard);
-        });
-        Ok(Self {
-            commands,
-            incoming_sessions,
-            lifecycle,
-            close_timeout: DEFAULT_CLOSE_TIMEOUT,
-            consumed,
-        })
+        connection_launch::negotiate(stream, container_id, sasl, options, native_policy)
+            .await
+            .map(|negotiated| negotiated.launch(connection_launch::ActorBirth::Legacy))
     }
 
     /// Bounds graceful Close, including time waiting to enqueue or write it.
@@ -742,7 +651,8 @@ impl ServerConnection {
         self
     }
 
-    /// Cancels blocked driver work and waits until both socket tasks terminate.
+    /// Cancels driver work and observes the actor's exit notification.
+    /// This is not an actual actor task join.
     pub async fn shutdown(&self) {
         self.lifecycle.shutdown().await;
     }
@@ -1489,6 +1399,7 @@ async fn run_connection<Io>(
     incoming_sessions: mpsc::Sender<IncomingSession>,
     consumed: Arc<Notify>,
     mut cancellation: watch::Receiver<bool>,
+    reader_birth: connection_launch::ReaderBirth,
 ) where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
@@ -1508,7 +1419,7 @@ async fn run_connection<Io>(
     );
     let (frames_tx, mut frames) = mpsc::channel(MAX_QUEUED_FRAMES);
     let reader_activity = activity.clone();
-    let mut reader_task = ConnectionReader(Some(tokio::spawn(async move {
+    let mut reader_task = reader_birth.spawn(async move {
         loop {
             let frame = read_frame_with_max_size(&mut reader, settings.local_max_frame_size)
                 .await
@@ -1527,7 +1438,11 @@ async fn run_connection<Io>(
                 break;
             }
         }
-    })));
+    });
+    #[cfg(test)]
+    if reader_task.is_absent() {
+        return;
+    }
 
     let mut sessions = HashMap::<u16, SessionState>::new();
     let mut closing_replies = Vec::<oneshot::Sender<Result<(), EngineError>>>::new();
