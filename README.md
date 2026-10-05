@@ -276,6 +276,9 @@ join barriers while requiring a retained external owner; it is not fixture clean
 An explicit [retained connection-owner API](docs/server-connection-owner.md)
 pairs a public consuming acceptor with an external actor/reader owner, without
 changing default listeners or activating fixture cleanup.
+The explicit [retained protocol connection](docs/retained-protocol-connection.md)
+adds one accepted socket's wrapper and original protocol outcomes to those joins,
+without changing default ingress or claiming whole-descendant cleanup.
 Separate ordinary [receiving-batch gates](docs/dotnet-receiving-batches.md) hold
 three action copies on one receiver before completion and exercise out-of-order
 queue settlement with rolling count-prefetch replenishment on both SDK pins and

@@ -147,8 +147,12 @@ windows still bound observation rather than physical completion. It supplies no
 safe-reopen receipt, whole-run coverage, live SDK evidence, or explanation/fix
 for the historical provisional-Complete timeout in
 [client diagnostic evidence](atomic-sdk-evidence.md). Public engine ownership is
-opt-in; full descendant custody, protocol listener integration, and fixture
+opt-in; full descendant custody, default listener integration, and fixture
 activation remain separate work.
+
+The separate [retained protocol connection](retained-protocol-connection.md)
+offers explicit one-socket Wrapper/Actor/Reader ownership without activating
+default listeners or changing this page's earlier isolated-path evidence.
 
 ## Earlier Verification
 

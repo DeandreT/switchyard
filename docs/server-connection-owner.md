@@ -169,6 +169,10 @@ windows still bound observation, not guaranteed physical completion.
 Protocol wrapper and finite descendant ownership require separate design,
 source review and actual verification; none is activated by this public API.
 
+The separate [retained protocol connection](retained-protocol-connection.md)
+explicitly adds one accepted socket's wrapper and original protocol outcomes.
+It uses this pair's joins without retiring sessions, links or fixture resources.
+
 ## Verification
 
 The public source passed all 38 focused regular tests, including the 23 inherited

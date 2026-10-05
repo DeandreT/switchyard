@@ -105,6 +105,10 @@ The separate [retained connection-owner API](server-connection-owner.md) exposes
 opt-in ownership of original actor/reader tokens; it does not activate default
 listeners, descendant retirement or fixture cleanup.
 
+The separate [retained protocol connection](retained-protocol-connection.md)
+covers an actual one-socket wrapper and its engine pair. It does not promote this
+synthetic model or retire the socket's session/link descendants.
+
 The historical provisional-Complete SDK timeout remains unexplained as recorded
 in [client diagnostic evidence](atomic-sdk-evidence.md). Whole-resource custody
 and actual listener/engine integration require separate ownership and verification.
