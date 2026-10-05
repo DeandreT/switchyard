@@ -37,6 +37,8 @@ use crate::{
 
 mod atomic_ingress;
 mod connection;
+#[cfg(test)]
+mod owned_tasks;
 mod receiving;
 mod routing;
 mod websocket;
