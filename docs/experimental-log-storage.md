@@ -132,6 +132,11 @@ now rejects those inputs, validates applied fingerprints/membership/votes, and
 retains private storage-owner retirement/join tokens. It still starts no node
 or network.
 
+A disjoint [sealed local compaction API](sealed-local-compaction.md) now performs
+explicit catalog-backed deletion in a standalone quiescent pair. It does not
+implement this adapter's storage traits, change its ordinary role, or enable
+automatic engine/runtime compaction.
+
 ## Verification
 
 At the log-storage checkpoint, the cluster suite had 40 unit tests, 48 public

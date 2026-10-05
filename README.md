@@ -153,6 +153,8 @@ The [standalone catalog builder](docs/standalone-snapshot-builder.md) returns a
 sealed snapshot through the existing owner without enabling engine snapshot methods.
 The separate [trusted image replacement](docs/committed-image-replacement.md)
 replaces initialized business rows and their opaque catalog in one atomic commit.
+The [sealed local compaction API](docs/sealed-local-compaction.md) retains a
+checked catalog before deleting an exact local prefix, without runtime activation.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing
