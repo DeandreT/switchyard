@@ -95,7 +95,7 @@ adds bounded durable storage for the pinned replication library. It supplies
 neither a running Raft node nor quorum acknowledgements.
 A matching [experimental state-machine adapter](docs/experimental-state-machine.md)
 adds bounded durable apply, membership recovery, and typed replay/result metadata.
-The adapter itself supplies neither snapshots nor a replicated client proposer.
+The engine-facing adapter supplies neither snapshots nor a replicated client proposer.
 A separate [owned storage-pair preflight](docs/experimental-replica-preparation.md)
 checks applied fingerprints, membership, votes, and cleanup before a
 no-snapshot runtime can consume the adapters. It does not start a node.
@@ -149,6 +149,8 @@ the actual metadata/image pair before target access, then starts the owner after
 that single publication. Catalog operations remain an explicit constructor choice.
 The [sealed transport buffer](docs/sealed-image-transport.md) moves an owned image
 without a body copy and refuses writes while preserving bounded reads and seeks.
+The [standalone catalog builder](docs/standalone-snapshot-builder.md) returns a
+sealed snapshot through the existing owner without enabling engine snapshot methods.
 
 AMQP over WebSockets is opt-in with `--websocket-listen 127.0.0.1:8080`. It uses
 the exact `/$servicebus/websocket/` endpoint and `amqp` subprotocol. The existing

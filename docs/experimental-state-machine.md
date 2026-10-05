@@ -5,7 +5,7 @@
 [committed queue machine](committed-queue-apply.md). It is an isolated storage
 adapter, not a running Raft node or a replicated command proposer. Existing
 listeners, timers, standalone formats, and production startup remain unchanged.
-There is no network, quorum proof, leader clock/read barrier, snapshot support,
+There is no network, quorum proof, leader clock/read barrier, engine snapshot support,
 or new deployment mode in this increment.
 
 ## Ownership And Admission
@@ -103,9 +103,9 @@ fatal even if progress has already persisted. Public trait errors are static
 and sanitized; they never disclose message bodies, entity names, backend paths,
 or decoder details.
 
-## No Snapshots Or Runtime
+## Engine Snapshots
 
-Snapshot building, receiving, and installation explicitly return unsupported
+Engine snapshot building, receiving, and installation explicitly return unsupported
 storage errors without writing state. They do not create an empty or
 metadata-only snapshot of queue data. A healthy `get_current_snapshot` returns
 `None` after an owner health/recovery query; a poisoned adapter returns an error.
@@ -136,6 +136,12 @@ transport, compaction, startup, and on-disk schemas remain unchanged.
 The separate [owned image exporter](native-image-export.md) can be enabled only
 through explicit bounded-reader constructors. It captures and checks CreateSend
 bytes on this owner without implementing any of these snapshot trait methods.
+
+The additive [standalone catalog builder](standalone-snapshot-builder.md)
+implements the pinned build trait only through an explicitly obtained concrete
+builder. It uses the existing catalog operation and moves original owned bytes
+into sealed transport. The engine-facing associated builder/getter, current,
+receiving, installation, runtime, and purge paths remain unchanged.
 
 A later no-snapshot runtime must use `SnapshotPolicy::Never`, reject purged
 history without snapshots and applied-state-ahead-of-log pairings before
