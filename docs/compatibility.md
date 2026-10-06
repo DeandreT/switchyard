@@ -272,11 +272,11 @@ existing assertions, waits and ignore status are unchanged.
 
 Local verification adds 27 regular checks for paged next-session acceptance:
 14 domain, three native transport, four protocol and six raw AMQP checks. The
-default workspace run passes 5,291 tests, preserving all prior case statuses
-and the same 11 opt-in SDK ignore reasons. Those 11 existing SDK checks pass
+default and all-feature workspace runs each pass 5,291 tests, preserving all
+prior case statuses and the same 11 opt-in SDK ignore reasons. Those checks pass
 separately as regression evidence, not a new SDK paging workflow. Strict lint
 and builds pass in both configurations, along with formatting and protobuf
-validation. The additional full all-feature workspace run is not yet complete.
+validation. Both complete workspace runs use serial test execution with no skips.
 Initial compilation and new wire-fixture failures were corrected without
 changing existing assertions, waits or ignore status. An unchanged oversized
 storage fixture stalled in the first concurrent workspace run; the same test
