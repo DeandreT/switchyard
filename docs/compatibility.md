@@ -160,12 +160,24 @@ behavior it currently enforces:
   receiver that set it. A receiver holding the session can renew that lock and
   read, replace, or clear the opaque state through the management node.
 
-Four session behaviors differ from Azure Service Bus under the current local
+Ordinary queue ingress retains an optional `SessionId` as metadata for standalone
+send, atomic ingress batches and scheduling. The global ready index remains
+authoritative: metadata grants no session affinity or ownership and no per-session
+FIFO guarantee. Session-filtered browsing, receive with a session hold and session
+acquisition remain unsupported there. Microsoft describes the value as
+[ignored on session-unaware entities](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-messages-payloads);
+that does not establish an observed Azure metadata round-trip. This is a local
+retention policy, shared with ordinary subscription copies.
+
+Session-required ingress still requires an ID, and its ingress batches still
+require one common ID. Trusted atomic messaging still refuses normalized
+SessionId-bearing ingress; the frozen `CreateSendV1` committed profile keeps its
+strict admission and image agreement. Existing validation limits, DLQ stripping,
+record versions and store layout are unchanged by this ingress change.
+
+Three session behaviors differ from Azure Service Bus under the current local
 policies:
 
-- A session identifier on a queue that does not require sessions is refused
-  rather than carried, because it would promise an ordering that queue cannot
-  keep. Azure accepts and ignores it.
 - Settling a message inside a session needs the message's own lock token, not a
   live session lock. Azure fails settlement once the session lock is lost. The
   message lock is treated as the authority over that message, so a receiver that
@@ -325,7 +337,7 @@ the existing exclusive ownership, FIFO, state, renewal, release, and deferred
 receive machinery. Each subscription owns its sessions independently, even when
 sibling subscriptions receive the same identifier. Ordinary subscription copies
 preserve that identifier but use their global ready index and ordinary receive,
-settlement, and expiry rules; this does not relax ordinary queue ingress.
+settlement, and expiry rules, as do ordinary queue messages carrying metadata.
 Duplicate detection remains topic-local and based on message ID, independent of
 session ID, consistent with Microsoft's
 [nonpartitioned duplicate-detection description](https://learn.microsoft.com/en-us/azure/service-bus-messaging/duplicate-detection).
