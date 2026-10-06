@@ -200,7 +200,10 @@ presents the delivery's original session hold, including deferred receipts.
 An expired, released or replaced hold cannot extend the old message lock.
 Both the original session and message deadlines must remain live at the owner's
 timestamp; renewing a message does not renew its session. Trusted legacy
-`RenewLock` (tag 10) remains message-lock-only. Management uses appended
+`RenewLock` (tag 10) does not present a session hold, but an originally owned
+tracking row now requires its stored generation to match a live session lock.
+Trusted-unowned and ordinary message locks retain their lock-only renewal path.
+Management uses appended
 `RenewLockHeld` (tag 39); the closed atomic/`CreateSendV1`/`QueueV1` profiles and
 value format 11 are unchanged by renewal. This does not establish
 mixed-version command-log compatibility. Both pinned receivers,
@@ -269,9 +272,43 @@ generation against a coherently substituted positive token.
 
 Private ownership indexes require store layout 16. Message and session records,
 value format 11, command tags 0-40 and the closed committed/atomic profiles retain
-their existing shapes. Releasing or expiring a session does not itself retire its
-message locks. Trusted allocation or renewal can keep a session busy indefinitely;
-no bounded takeover completion, fairness or immediate requeue guarantee is added.
+their existing shapes. `RetireSessionGenerationPage` is appended at tag 41; an
+older command decoder refuses it. This is not mixed-version command-log support.
+
+Original-generation retirement inspects at most 32 tracked session groups and
+retires at most 32 owned message locks per command. A positive owned summary
+requires the actual stored session record: a released lock or the same expired
+generation is eligible; the same live generation is skipped. Missing or
+incoherent session records refuse local corruption. Each selected row must agree
+with its canonical forward key, reverse row, staged counts, actual locked
+message and present empty general lock index. A last-owned-row tail probe stays
+within the selected generation. Cursors are exclusive progress positions, not
+ownership, snapshots or certificates about omitted prefixes or reverse orphans.
+
+Retirement leaves session state and its lock/index unchanged. It uses existing
+TTL, maximum-delivery and dead-letter paths, or returns the message to Ready
+without incrementing delivery count. Trusted-unowned rows are never selected or
+converted; their continued allocation or renewal can keep takeover pending.
+Replacement acceptance still waits for every tracked message lock to exit.
+
+The timer proposes at most eight retirement pages per visited queue or
+subscription after session expiry and before duplicate-history cleanup. Zero
+progress with Continue still advances a private cursor; only actual successful
+results update it. Its insertion-order cache holds at most 1,024 entity scopes;
+End removes a cursor, errors retain the last completed position, and restart or
+eviction loses progress rather than authority. No fair or bounded-time takeover
+completion, immediate requeue or full session-lock umbrella is guaranteed.
+
+Handler admission caps 1,024 backing read calls, 256 KiB of read-key bytes and
+32 MiB of returned read-value bytes; mutations cap 512 entries, 256 KiB of key
+bytes and 32 MiB of value bytes, counting repeated overwrites. Requested keys
+are charged before calls and returned bytes before decoding; the common owner
+clock check precedes this handler budget. Every selected exit checks the exact
+possible clock Put, reserved once on preparation success. A late preparation
+error or cap refusal discards the whole staged command and clock, not a fitting
+prefix. A storage apply error may have an unknown commit decision. These logical
+caps are not pre-copy, allocator, RSS or elapsed-time bounds, global repair, or
+observed Azure parity.
 
 Microsoft documents a [session-lock umbrella](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sessions#session-features)
 and [settlement failure after session expiry](https://learn.microsoft.com/en-us/dotnet/api/azure.messaging.servicebus.servicebusreceiver.completemessageasync?view=azure-dotnet).
@@ -279,9 +316,10 @@ This boundary does not implement every umbrella behavior or establish full
 Azure error parity. Remaining local session limitations are:
 
 - Releasing or expiring a session does not immediately requeue its locked
-  messages; they remain locked until actual settlement or message-lock expiry
-  cleanup. Replacement acceptance waits for all tracked rows to exit. No
-  session-wide retirement or fixed completion deadline is implemented.
+  messages. Owned locks may exit through bounded retirement; trusted-unowned
+  locks still require actual settlement or message-lock expiry cleanup.
+  Replacement acceptance waits for all tracked rows to exit, without a fixed
+  completion deadline.
 - Expiration is applied to individual messages, not to every message in a session
   when one expires. Azure documents
   [session-wide TTL expiry](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sessions#message-expiration);
@@ -343,6 +381,20 @@ in an isolated diagnostic run and the complete SDK retry. The cause remains
 unestablished. Assertions, waits and ignore status were not changed. These are
 scoped regressions, not a new full-workspace run, a corrupt-index SDK workflow,
 or observed Azure parity.
+
+Local verification adds 49 regular checks for bounded original-generation
+retirement: 28 paired public domain checks, six private domain checks and 15
+timer, protocol and raw AMQP checks. Default and all-feature workspace runs
+each pass 5,383 tests, preserving all prior case statuses and the same 11 opt-in
+SDK ignore reasons. Those 11 checks pass separately as regression evidence,
+not a new SDK session-retirement workflow. Strict lint and builds pass in both
+configurations, along with formatting and unchanged protobuf validation. Both
+complete workspace runs use serial test execution with no skips. The declared
+trusted-renewal assertion now expects original-session expiry and checks
+unchanged state. An initial new-test compile failure called a private validation
+method; it was corrected to the existing public validator. Existing waits and
+ignore status are unchanged. The earlier SDK Accepted/Declared failure remains
+unattributed.
 
 An ordinary receiver can browse all sessions in a session-required queue or
 subscription through its management link, without attaching a data receiver or
