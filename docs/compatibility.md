@@ -9,7 +9,7 @@ coverage with the relevant client.
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
 | Official .NET SDK, current stable | Queue and topic send, both batch-send APIs, ordinary/session subscription workflows, queue/topic scheduling/cancellation, duplicate detection and message properties; queue session renew/state/scheduling; isolated offline JWT Send/Listen denial over TLS | Planned | Experimental gate on 7.21.0 |
-| Official .NET SDK, previous stable | Same SAS-gated workflows as current; offline JWT not gated | Planned | Experimental gate on 7.20.2 |
+| Official .NET SDK, previous stable | Same SAS-gated workflows as current; isolated offline JWT Send/Listen denial over TLS | Planned | Experimental gate on 7.20.2 |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
 ## Capability Matrix
@@ -22,7 +22,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | --- | --- | --- |
 | AMQP 1.0 over TLS | Pre-1.0 | Protocol edge, Rust client end to end |
 | AMQP over WebSockets | Pre-1.0 | Opt-in WS/WSS listener, bounded binary transport, both Rust backends and both pinned .NET clients; see [WebSocket Transport](websocket-transport.md) |
-| SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. Offline JWT: opt-in TLS CBS library path; isolated current .NET TokenCredential gate for Linux/Memory/raw TLS; optional TLS/SAS CLI policy-file loading |
+| SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. Offline JWT: opt-in TLS CBS library path; isolated current/previous .NET TokenCredential gates for Linux/Memory/raw TLS; optional TLS/SAS CLI policy-file loading |
 | Queue send, receive, and settlement | Pre-1.0 | State machine |
 | Atomic message batch send | Pre-1.0 | State machine, AMQP producer mapping, Rust clients on both backends and both pinned .NET batch APIs |
 | Message properties and AMQP body preservation | Pre-1.0 | State machine and AMQP mapping; typed properties, application values, annotations, footer and all body kinds. Rust clients on both backends and official .NET property gate |
@@ -753,8 +753,8 @@ passed without weakening peer-Close, native Reader identity or server-close
 checks. These fixture corrections do not establish a cause or fix for an
 earlier SDK failure, a whole-Broker cleanup guarantee or cloud parity.
 
-An official .NET 7.21.0 `TokenCredential` gate is scoped to
-Linux, MemoryStore and raw TLS. Its custom credential requires the exact SDK
+Official .NET 7.21.0 and 7.20.2 `TokenCredential` gates are scoped to
+Linux, MemoryStore and raw TLS. Their shared credential requires the exact SDK
 requested scope `https://servicebus.azure.net/.default`; that string is separate
 from the pinned JWT resource audience `urn:switchyard:tenant` and the CBS
 requested entity scope. The fixture signs a fresh local RS256 `at+jwt` token
@@ -779,8 +779,8 @@ pending Attach with null termini and the authorization error. A wire
 regression fails before this change, and the same scoped SDK case passes
 afterward. This does not explain unrelated earlier SDK failures.
 
-This gate does not cover the previous SDK, WSS, Fjall, CLI policy-file
-activation, token refresh, OIDC or cloud authentication. It is not a general
+These gates do not cover WSS, Fjall, CLI-started JWT wire authorization,
+token refresh, OIDC or cloud authentication. They are not a general
 official-client compatibility claim.
 
 Verification: the closed default workspace passed 5,426 tests with no failures
@@ -800,6 +800,15 @@ diagnostics distinguished a fixture-owned missing-denial assertion without
 printing token, key, argument or raw exception text. The final scoped gate
 preserves its specific unauthorized exception and canonical state checks.
 The value envelope remains version 11 and the durable base layout version 16.
+
+Verification: the previous-SDK extension passed both scoped JWT cases on
+7.21.0 and 7.20.2, including the exact unauthorized Listen error and canonical
+Memory state assertions. The unchanged shared procedure is extracted from
+the original current case, with only the SDK version parameter substituted.
+The target also passed all 30 regular cases, with thirteen SDK cases ignored;
+only the previous JWT case was added. Focused strict all-feature Clippy and
+formatting passed. This test-only increment does not repeat the full workspace
+or the other eleven SDK gates; preceding evidence remains historical.
 
 The `switchyard` CLI opts into this policy with
 `--offline-jwt-policy-file PATH`; omission leaves existing defaults unchanged.
