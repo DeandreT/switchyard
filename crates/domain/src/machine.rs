@@ -2382,14 +2382,23 @@ fn exceeded_delivery_limit(
 
 /// Rejects a command whose session argument disagrees with the queue.
 ///
-/// A session identifier on a queue that does not use sessions is refused rather
-/// than ignored: accepting it would promise an ordering the queue cannot keep.
+/// Session ownership and session-filtered browsing remain unavailable on
+/// ordinary queues; ingress metadata is checked separately below.
 fn require_session_agreement(config: &QueueConfig, names_session: bool) -> Result<(), BrokerError> {
     match (config.requires_session, names_session) {
         (true, false) => Err(BrokerError::SessionRequired),
         (false, true) => Err(BrokerError::SessionNotSupported),
         _ => Ok(()),
     }
+}
+
+/// Ingress needs a session ID only when the queue requires session affinity.
+/// Ordinary queues retain the optional metadata without creating a session.
+fn require_ingress_session(config: &QueueConfig, names_session: bool) -> Result<(), BrokerError> {
+    if config.requires_session && !names_session {
+        return Err(BrokerError::SessionRequired);
+    }
+    Ok(())
 }
 
 fn validate_message_id(message_id: &str) -> Result<(), BrokerError> {
@@ -2513,7 +2522,7 @@ fn validate_message_input(
     config: &QueueConfig,
     message: MessageInput<'_>,
 ) -> Result<(), BrokerError> {
-    require_session_agreement(config, message.session_id.is_some())?;
+    require_ingress_session(config, message.session_id.is_some())?;
     validate_message_content(config, message)
 }
 
@@ -2575,7 +2584,7 @@ fn validate_ingress_batch(
         MAX_INGRESS_BATCH_MESSAGES,
     )?;
     for message in messages {
-        require_session_agreement(config, message.session_id.is_some())?;
+        require_ingress_session(config, message.session_id.is_some())?;
     }
     if config.requires_session {
         let session = messages

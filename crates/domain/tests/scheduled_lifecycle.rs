@@ -524,24 +524,31 @@ fn scheduling_refuses_session_ids_on_plain_queues<P: StoreProvider>(
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
     let fixture = queue(provider)?;
-    let before = fixture.machine.store().scan_prefix(&[], usize::MAX)?;
+    let cart = SessionId::new("cart")?;
+    let handles = schedule(
+        &fixture,
+        10,
+        vec![
+            message("unnamed", 100),
+            ScheduledMessage {
+                session_id: Some(cart.clone()),
+                ..message("named", 100)
+            },
+        ],
+    )?;
     assert_eq!(
-        schedule(
-            &fixture,
-            10,
-            vec![
-                message("valid", 100),
-                ScheduledMessage {
-                    session_id: Some(SessionId::new("cart")?),
-                    ..message("invalid", 100)
-                },
-            ],
-        ),
-        Err(BrokerError::SessionNotSupported)
+        handles,
+        vec![SequenceNumber::new(1), SequenceNumber::new(2)]
     );
+    assert!(receive(&fixture, 99)?.is_none());
     assert_eq!(
-        fixture.machine.store().scan_prefix(&[], usize::MAX)?,
-        before
+        fixture.at(100, CommandKind::ActivateScheduled)?,
+        CommandOutcome::ScheduledActivated { activated: 2 }
+    );
+    assert_eq!(receive(&fixture, 101)?.expect("unnamed").session_id, None);
+    assert_eq!(
+        receive(&fixture, 102)?.expect("named").session_id,
+        Some(cart)
     );
     Ok(())
 }

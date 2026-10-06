@@ -2,6 +2,7 @@
 
 use std::{
     error::Error,
+    panic::{AssertUnwindSafe, resume_unwind},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -18,6 +19,7 @@ use domain::{
     NamespaceName, QueueConfig, QueueCounters, SequenceNumber, SessionId, StateMachine, Timestamp,
     codec, keys,
 };
+use futures_util::FutureExt;
 use server::{Broker, LocalProposer, ManualClock};
 use storage::{Key, StateStore, StorageError, StoreSnapshot, WriteBatch};
 use testkit::StoreProvider;
@@ -796,10 +798,157 @@ async fn unsupported_links<P: StoreProvider>(provider: P) -> TestResult {
     Ok(())
 }
 
+async fn ordinary_session_metadata<P: StoreProvider>(provider: P) -> TestResult {
+    let mut node = Node::start(provider, QueueConfig::default(), None).await?;
+    let mut connection = None;
+    let observed = AssertUnwindSafe(async {
+        timeout(DEADLINE, async {
+            connection = Some(node.connect().await?);
+            let connection = connection.as_mut().expect("rooted client connection");
+            let mut session = connection.begin().await?;
+            let mut sender =
+                ClientSender::attach(&mut session, "metadata-producer", "orders").await?;
+            let mut invalid = rich_message(9);
+            invalid.properties.as_mut().expect("properties").group_id = Some("cart\0bad".into());
+            let before = node.snapshot()?;
+            rejected(sender.send(invalid).await?);
+            assert_eq!(node.snapshot()?, before);
+            let mut messages = [
+                rich_message(0),
+                rich_message(1),
+                rich_message(2),
+                rich_message(3),
+            ];
+            for (message, id) in
+                messages
+                    .iter_mut()
+                    .zip([Some("cart-a"), Some("cart-b"), None, Some("cart-a")])
+            {
+                message.properties.as_mut().expect("properties").group_id = id.map(str::to_owned);
+            }
+            messages[3]
+                .message_annotations
+                .as_mut()
+                .expect("annotations")
+                .insert(
+                    Symbol::from(protocol_amqp::SCHEDULED_ENQUEUE_TIME_ANNOTATION),
+                    Value::Timestamp(2_000_i64.into()),
+                );
+            accepted(sender.send(messages[0].clone()).await?);
+            accepted(send_batch(&mut sender, batch(&messages[1..])?).await?);
+            let stored = node.peek(None).await?;
+            assert_eq!(stored.len(), 4);
+            for (index, delivery) in stored.iter().enumerate() {
+                assert_eq!(delivery.sequence, SequenceNumber::new(index as u64 + 1));
+                assert_eq!(
+                    delivery.session_id.as_ref().map(SessionId::as_str),
+                    messages[index]
+                        .properties
+                        .as_ref()
+                        .expect("properties")
+                        .group_id
+                        .as_deref()
+                );
+            }
+            assert_eq!(stored[3].status, MessageStatus::Scheduled);
+            node.clock.set(2_000);
+            assert_eq!(
+                node.submit(CommandKind::ActivateScheduled).await?,
+                CommandOutcome::ScheduledActivated { activated: 1 }
+            );
+            let store = node.store.as_ref().expect("open store");
+            assert!(
+                store
+                    .scan_prefix(
+                        &keys::entity_session_ready_prefix(&node.namespace, &node.entity),
+                        1
+                    )?
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .scan_prefix(
+                        &keys::entity_session_prefix(&node.namespace, &node.entity),
+                        1
+                    )?
+                    .is_empty()
+            );
+            let mut receiver = ClientReceiver::builder()
+                .name("ordinary-metadata-consumer")
+                .source("orders")
+                .attach(&mut session)
+                .await?;
+            for (index, expected_sequence) in [1_i64, 2, 3, 5].into_iter().enumerate() {
+                let delivery = receiver.recv().await?;
+                let actual = delivery.message();
+                assert_eq!(actual.body, messages[index].body);
+                let properties = actual.properties.as_ref().expect("received properties");
+                let expected = messages[index]
+                    .properties
+                    .as_ref()
+                    .expect("producer properties");
+                assert_eq!(properties.group_id, expected.group_id);
+                assert_eq!(properties.message_id, expected.message_id);
+                assert_eq!(properties.correlation_id, expected.correlation_id);
+                assert_eq!(actual.footer, messages[index].footer);
+                assert_eq!(
+                    actual
+                        .message_annotations
+                        .as_ref()
+                        .expect("annotations")
+                        .get(Symbol::from("x-opt-sequence-number")),
+                    Some(&Value::Long(expected_sequence))
+                );
+                receiver.accept(&delivery).await?;
+            }
+            node.wait_empty().await?;
+            Ok::<(), Box<dyn Error>>(())
+        })
+        .await?
+    })
+    .catch_unwind()
+    .await;
+    let client_cleanup = AssertUnwindSafe(async {
+        if let Some(connection) = connection.as_mut() {
+            timeout(DEADLINE, connection.close()).await??;
+        }
+        Ok::<(), Box<dyn Error>>(())
+    })
+    .catch_unwind()
+    .await;
+    let listener_cleanup = if let Some(listener) = node.listener.take() {
+        listener.abort();
+        listener.await
+    } else {
+        panic!("the original listener is still owned");
+    };
+    drop(connection);
+    drop(node.broker.take());
+    match observed {
+        Ok(result) => {
+            result?;
+            match client_cleanup {
+                Ok(result) => result?,
+                Err(payload) => resume_unwind(payload),
+            }
+            assert!(
+                listener_cleanup.is_err_and(|error| error.is_cancelled()),
+                "original listener abort is joined"
+            );
+            Ok(())
+        }
+        Err(payload) => resume_unwind(payload),
+    }
+}
+
 macro_rules! suite {
     ($module:ident, $provider:expr) => {
         mod $module {
             use super::*;
+            #[tokio::test]
+            async fn ordinary_queue_session_metadata_survives_direct_batch_and_scheduled_wire_delivery() -> TestResult {
+                ordinary_session_metadata($provider).await
+            }
             #[tokio::test]
             async fn forced_single_and_multiple_rich_members_survive_restart_and_delivery() -> TestResult {
                 rich_members($provider).await

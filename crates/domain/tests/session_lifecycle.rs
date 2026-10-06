@@ -148,19 +148,10 @@ fn a_plain_queue_refuses_a_command_that_names_a_session<P: StoreProvider>(
 ) -> Result<(), Box<dyn Error>> {
     let fixture = plain_queue(provider)?;
 
-    // A session identifier here would promise an ordering the queue does not
-    // keep, so it is refused rather than ignored.
+    // Ingress metadata does not grant a session receiver or session ownership.
     assert_eq!(
-        fixture.at(
-            10,
-            CommandKind::Send {
-                message_id: String::from("first"),
-                body: Vec::new(),
-                time_to_live_millis: None,
-                session_id: Some(id("cart-1")),
-            }
-        ),
-        Err(BrokerError::SessionNotSupported)
+        send(&fixture, 10, "first", Some(id("cart-1")))?,
+        SequenceNumber::new(1)
     );
     assert_eq!(
         fixture.at(

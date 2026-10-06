@@ -26,6 +26,9 @@ impl<S: StateStore> StateMachine<S> {
                 ));
             }
         };
+        // The frozen CreateSendV1 image role still requires session agreement.
+        require_session_agreement(&config, message.session_id.is_some())
+            .map_err(CommittedPreparationError::refused)?;
         validate_message_input(&config, message).map_err(CommittedPreparationError::refused)?;
         let mut counters = self.committed_queue_counters(command)?;
         let sequence = counters

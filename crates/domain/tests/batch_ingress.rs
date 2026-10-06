@@ -520,12 +520,23 @@ fn session_presence_and_same_session_validation_are_atomic<P: StoreProvider>(
     unrelated.kind = CommandKind::SendBatch {
         messages: vec![with_session("one", &cart), with_session("two", &other)],
     };
-    let before = fixture.machine.store().snapshot()?;
     assert_eq!(
-        fixture.machine.apply(&unrelated),
-        Err(BrokerError::SessionNotSupported)
+        fixture.machine.apply(&unrelated)?,
+        CommandOutcome::BatchSent {
+            sequences: vec![SequenceNumber::new(1), SequenceNumber::new(2)]
+        }
     );
-    assert_eq!(fixture.machine.store().snapshot()?, before);
+    for (sequence, session) in [(1, &cart), (2, &other)] {
+        let record = fixture
+            .machine
+            .message(
+                &fixture.namespace,
+                &unrelated.entity,
+                SequenceNumber::new(sequence),
+            )?
+            .expect("ordinary metadata member");
+        assert_eq!(record.session_id.as_ref(), Some(session));
+    }
     Ok(())
 }
 

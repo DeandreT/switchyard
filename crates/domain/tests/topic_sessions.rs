@@ -693,17 +693,24 @@ fn ordinary_copy_session_properties_survive_settlement_updates_and_requeue<P: St
             .get("stage"),
         None
     );
-    let before = fixture.machine.store().snapshot()?;
+    let anchor = EntityPath::new("anchor")?;
     assert_eq!(
-        at(
-            &fixture,
-            &EntityPath::new("anchor")?,
-            9,
-            legacy("strict", Some("cart"))
-        ),
-        Err(BrokerError::SessionNotSupported)
+        at(&fixture, &anchor, 9, legacy("metadata", Some("cart")))?,
+        CommandOutcome::Sent {
+            sequence: SequenceNumber::new(1)
+        }
     );
-    assert_eq!(fixture.machine.store().snapshot()?, before);
+    let direct = fixture
+        .machine
+        .message(&fixture.namespace, &anchor, SequenceNumber::new(1))?
+        .expect("ordinary direct metadata");
+    assert_eq!(direct.session_id, Some(SessionId::new("cart")?));
+    assert_eq!(
+        fixture
+            .machine
+            .ready_sequences(&fixture.namespace, &anchor, 10)?,
+        vec![SequenceNumber::new(1)]
+    );
     Ok(())
 }
 
