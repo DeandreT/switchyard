@@ -42,7 +42,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
-| Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
+| Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; additive offline JWT Manage library opt-in, CLI SAS-only; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
 | Quorum replication | Pre-1.0 | An isolated [fixed-three-node in-process runtime](experimental-replica-runtime.md) exists for bounded Create/Send, but is not integrated with server listeners or the production proposer; production startup remains refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup. The runtime exposes no snapshots or production deployment activation. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
 | Cross-placement-group transactions | Later | Out of initial scope |
@@ -1658,6 +1658,56 @@ their backing queue through queue commands. Entity capacity and usage fields
 are absent because quota accounting
 is not implemented; they are not reported as zero-byte measurements.
 
+Library callers separately opt into offline JWT Manage authorization through
+`NativeAdminService::with_offline_jwt_policy(policy, audience_host)`. It accepts
+an `auth::JwtPolicy`, alone or alongside optional SAS. Default SAS-only and
+unauthenticated development behavior is unchanged. The CLI does not call this
+builder: native `--admin-listen` remains SAS-only.
+
+In JWT-configured mode, each request must carry exactly one `authorization`
+value, bounded to 8,199 encoded bytes. Bearer credentials require the exact
+`Bearer ` prefix and a nonempty token of at most 8,192 bytes without ASCII
+whitespace. Raw `SharedAccessSignature ` credentials select the original SAS
+branch, which still needs a configured SAS policy; they never authorize a
+JWT-only service. The single-header and encoded-value bounds also apply to that
+SAS fallback. Default SAS behavior without the JWT opt-in is unchanged.
+
+Bearer authorization requires Tonic's `TlsConnectInfo<TcpConnectInfo>` from the
+completed TLS transport, not a TLS setting, URL or forwarded metadata.
+In-process extension cloning is outside this transport trust boundary; the
+extension is not an attestation API. A JWT-configured listener refuses startup
+without TLS before accepting sockets. Each request reads a checked system epoch,
+validates the token against its locally pinned policy, and requires local Manage
+rights for the exact requested namespace or entity scope. Native validation keeps
+literal binding paths rather than AMQP control-name aliases. Subscription bindings
+use the native endpoint's canonical `/subscriptions/` spelling. The configured resource
+host is separate from the JWT claim audience; signed roles and scopes do not
+supply permissions. Authorization precedes substantive configuration, filter,
+action and cursor validation and owner operations, not every path parse: existing
+resource canonicalization and JWT resource-scope construction occur earlier.
+Credential failures use static responses without echoing token bytes. This
+library opt-in adds no discovery, OIDC/cloud authorization, refresh or revocation.
+
+Verification: the native JWT suite passed twelve regular cases on Memory and
+Fjall, covering actual trusted TLS, namespace and entity Manage rights,
+credential denials before owner access, SAS coexistence and plaintext/spoofed
+transport refusals. A pre-fix literal-control-name regression failed on both
+backends by wrongly creating the lowercase queue; both cases pass after native
+validation preserves literal binding paths. Existing AMQP alias handling is
+retained. The auth package passed 52 cases, including three new scope/profile
+checks, and the AMQP JWT wire suite passed all eight cases.
+
+The closed full workspace passed 5,457 tests with no failures and thirteen
+ignored SDK cases, across 155 printed groups, 149 canonical owners and 139
+executables. Every prior case name, status and ignore reason was preserved;
+the additions are twelve native cases, three auth cases and the preceding
+previous-SDK JWT gate. The separate SDK run passed all thirteen gates across
+the two pinned versions. Both strict lint and build configurations and final formatting passed
+with the shared cache and two-CPU policy. The earlier workspace attempt was
+intentionally interrupted to include the reproduced scope fix; it is not a
+completed gate. No CLI-native JWT wire claim is made by this library increment.
+Dependency versions, schemas, value format 11 and durable layout 16 are unchanged.
+
 The existing `EntityService` RPCs and field numbers are retained. Creation has
 separate presence-aware queue, topic, and subscription configurations; wrong-kind
 or mixed legacy settings are refused instead of ignored. Get returns the
@@ -1719,7 +1769,7 @@ so older clients do not silently receive incomplete definitions. Mutations are
 synchronous, with no upserts, retry deduplication, or post-commit reread. It shares the entity service's
 admission and transport bounds; see [Native Rule Administration](native-rules.md).
 Native rule binding preserves literal parent/control-name bytes without AMQP
-address parsing. Authenticated paths still require the existing SAS grammar,
+address parsing. SAS-authenticated paths retain the existing SAS grammar,
 which excludes leading empty segments; no native-name or SAS normalization is
 added by this API.
 `switchyardctl queue create|get|list|update|delete` exposes these operations with JSON
@@ -1749,8 +1799,8 @@ immediate global link-retirement parity is claimed.
 
 Updates use independent presence-aware patch fields: queue remains protobuf
 tag 3, with topic and subscription appended at tags 4 and 5. Exactly one family
-is required, and it must match the target kind. Authorization precedes path,
-patch, and owner access. Omitted settings stay unchanged; explicit false and
+is required, and it must match the target kind. Authorization precedes substantive
+patch validation and owner access. Omitted settings stay unchanged; explicit false and
 unlimited lifetime are distinct from omission. Empty or equal patches stage
 nothing and do not advance the applied clock, but still validate topology and
 pass the ordinary proposer clock check.
