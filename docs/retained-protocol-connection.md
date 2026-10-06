@@ -104,13 +104,36 @@ Root, report, requests and outcome diagnostics are redacted without formatting
 raw errors, payloads or anchors. Deliberate access to those originals is separate
 from wrapper formatting. Post-report disposal can still panic.
 
+## Native Observation Forwarding
+
+`report.native_observations()` borrows the native owner's complete
+`ServerConnectionObservations` carrier. `RetainedConnectionTaskJoins` also moves
+that carrier through its public `native_observations` field alongside the original
+Wrapper/Actor/Reader results. The existing `into_parts` tuple remains
+`(RetainedConnectionTaskJoins, RetainedConnectionOutcomes, A)`; no outcome or
+anchor is discarded. The added public parts field is a source break for external
+exhaustive struct literals or patterns, not a new authority token.
+
+The [native observation contract](server-connection-owner.md#native-close-and-abort-observations)
+retains the original peer Close, actual channel/payload and locally-closing fact,
+plus the original reply-write Result installed in its actual Ready poll before
+completed-future disposal. Pending, abandoned and NotRequired replies are not
+invented write successes. Optional original task IDs and same-token
+ActorReaderShutdown/OwnerFinish requests are data, not cancellation causes or
+general Close-call ordering proof. Debug remains opaque, raw errors and legacy
+launch remain unchanged, and these observations grant no health or safe-reopen
+authority. The separate [retained SDK ingress](retained-atomic-sdk-ingress.md)
+selects an explicit fixture policy without activating ordinary listeners.
+
 ## Exclusions
 
 Exactly three covered roles are not the whole connection's descendant tree.
 Socket acceptance, listener/session/link tasks, Broker/provider jobs, native
 workers, certificates and fixture resources need their own external custody and
 actual joins. A report certifies neither source health, physical termination nor
-safe reopen, and cannot explain an internally handled engine I/O failure.
+safe reopen. Native observations retain only the specific peer-Close reply-write
+Result described above; they do not surface other internally handled engine I/O
+failures or reconstruct discarded causes.
 
 Dropping an unfinished owner cannot await and may detach covered work. Root or
 runtime loss, uncooperative tasks/destructors, process abort and OOM remain

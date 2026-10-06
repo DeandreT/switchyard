@@ -310,6 +310,9 @@ it still requires separately retained socket tasks and changes no default policy
 A private [accepted-socket collector](docs/retained-socket-collector.md) composes
 those original socket and two-session barriers under one external root; it does
 not activate a public lifecycle API, default listener or SDK fixture cleanup.
+An explicit [retained atomic SDK ingress](docs/retained-atomic-sdk-ingress.md)
+adds one accepted-socket library root and a separate direct-Memory SDK fixture;
+it does not activate ordinary listeners or certify whole-fixture cleanup.
 Separate ordinary [receiving-batch gates](docs/dotnet-receiving-batches.md) hold
 three action copies on one receiver before completion and exercise out-of-order
 queue settlement with rolling count-prefetch replenishment on both SDK pins and

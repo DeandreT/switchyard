@@ -7,6 +7,10 @@ warmed and cold-first same-queue immediate send, plus held PeekLock Complete,
 not general transaction compatibility or production support. Ordinary listeners
 and the posting-only listener retain their previous policies.
 
+A separate [retained atomic SDK ingress](retained-atomic-sdk-ingress.md) fixture
+targets only current SDK 7.21.0, direct Memory storage and warmed immediate Send.
+It does not replace these two-pin/two-backend gates or broaden their evidence.
+
 ## Gated Workflows
 
 Each scope targets one primary non-session queue. Warmed cases reuse one

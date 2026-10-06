@@ -48,8 +48,9 @@ Its disposal belongs to the acceptance caller/parent, not the socket-task owner.
 ## Installation And Sticky Stop
 
 The owner retains two fixed role cells, sticky stop state, the captured runtime
-Handle and the caller's anchor. Test-only observations and controls are not
-public and are absent in normal dependency builds.
+Handle and the caller's anchor. Private test observations and controls remain
+absent in normal dependency builds; the native report observations below are
+separate data-only public views.
 
 Actor claim serializes against sealing. An accepted claim retains its no-await
 installation obligation even if stop wins immediately afterward. The original
@@ -98,8 +99,10 @@ after all created actor/reader barriers. Subsequent completed calls return inert
 The report's `actor()` and `reader()` return `Option<&Result<(), JoinError>>`;
 `anchor()` borrows the anchor. `into_parts()` moves the results into named
 `ServerConnectionTaskJoins` fields `actor` and `reader`, alongside the anchor.
-Those fields contain owned `Option<Result<(), JoinError>>`. The named parts are
-plain raw data, not a forgeable completion report or a new authority token.
+Those fields contain owned `Option<Result<(), JoinError>>`; the public
+`observations` field moves the complete native observation carrier with them.
+The tuple remains `(ServerConnectionTaskJoins, A)`. These named parts are plain
+raw data, not a forgeable completion report or a new authority token.
 
 Original JoinError objects and their panic payloads remain retained until both
 covered barriers. The actual tasks return unit; actor I/O failures already
@@ -115,6 +118,34 @@ It does not imply that unrelated descendants or native work have completed.
 Public `ServerConnection::shutdown` is unchanged: it requests driver cancellation
 and observes the actor's exit notification, not an actual actor-task join.
 The owner's separate borrowed finish is the actual socket-token barrier.
+
+## Native Close And Abort Observations
+
+`report.observations()` borrows `ServerConnectionObservations`. Its optional
+`peer_close()` retains the original decoded Close, actual channel and payload,
+native connection identity and whether the actor was already locally closing.
+The retained Close, its error and payload are not cloned or normalized.
+`reply_state()` distinguishes NotRequired, Pending, Ready and
+AbandonedBeforeReady; `reply_result()` borrows
+the original optional reply-write `io::Result`. Ready is installed inside the
+original write future's Ready poll, before that completed future can drop.
+Received-only or abandoned work is not a successful write. Local acknowledgment
+needs no second reply and supplies no invented write result.
+
+Optional `actor()` and `reader()` observations expose `id()`, `abort_requested()`
+and `requested_by(source)` data for their original tokens. Its two sources,
+ActorReaderShutdown and OwnerFinish, record requests immediately before the
+corresponding original Reader abort;
+cached joins receive no retroactive facts. A request can race already-completed
+work and establishes neither cancellation cause nor a general Close-call order.
+
+The new public `ServerConnectionTaskJoins.observations` field is a source break
+for external exhaustive struct literals or patterns. Constructors remain private
+on the report and observation carriers, and their Debug remains opaque. Tuple
+shapes, original raw errors, legacy launch and abort mechanics are unchanged.
+These finite observations are not source health, native-resource completion or
+safe-reopen authority. The separate [retained SDK ingress](retained-atomic-sdk-ingress.md)
+uses an explicit consumer policy; no default listener or SDK activation follows.
 
 ## External Root, Runtime And Anchor
 

@@ -7,6 +7,10 @@ original Wrapper, Actor, Reader, two Session tasks and their shared routing
 workers through two actual report barriers. This is not a public lifecycle API,
 default listener activation or SDK fixture cleanup.
 
+A separate [retained atomic SDK ingress](retained-atomic-sdk-ingress.md) adds an
+opt-in library owner and direct-Memory SDK fixture. This private experiment and
+its verification history remain unchanged.
+
 ## Construct Before Start
 
 The caller creates the external aggregate root and unique consuming launch
