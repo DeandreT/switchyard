@@ -22,7 +22,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | --- | --- | --- |
 | AMQP 1.0 over TLS | Pre-1.0 | Protocol edge, Rust client end to end |
 | AMQP over WebSockets | Pre-1.0 | Opt-in WS/WSS listener, bounded binary transport, both Rust backends and both pinned .NET clients; see [WebSocket Transport](websocket-transport.md) |
-| SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. JWT: not implemented |
+| SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. Offline JWT: opt-in TLS CBS library path; no CLI or official SDK JWT gate yet |
 | Queue send, receive, and settlement | Pre-1.0 | State machine |
 | Atomic message batch send | Pre-1.0 | State machine, AMQP producer mapping, Rust clients on both backends and both pinned .NET batch APIs |
 | Message properties and AMQP body preservation | Pre-1.0 | State machine and AMQP mapping; typed properties, application values, annotations, footer and all body kinds. Rust clients on both backends and official .NET property gate |
@@ -703,7 +703,55 @@ or Microsoft's equivalent `MSSBCBS` mechanism followed by a CBS SAS token. CBS
 grants are scoped to a namespace or entity and to Send, Listen, or Manage; they
 authorize links connection-wide and close an open link when its token expires.
 A connection without a valid grant gets 20 seconds to complete CBS
-authorization. JWT, OIDC, and mTLS are not implemented.
+authorization. OIDC and mTLS are not implemented.
+
+The protocol library separately opts into offline JWT CBS authentication with
+`SharedAccessAuthentication::with_offline_jwt_policy(JwtPolicy)`. Its default is
+disabled; existing SAS and PLAIN behavior is unchanged. The existing legal empty
+`SharedAccessPolicy::new([])` can be combined with this policy; that accepts no
+PLAIN credential and is not a separate JWT-only constructor. CBS accepts the
+exact token type `jwt`: an unknown type returns 400, while disabled or invalid
+JWT authorization returns 401. Signed roles and scopes never supply permissions;
+the CBS requested entity scope is checked against the local binding, separately
+from the JWT's configured resource audience.
+
+Ordinary and experimental atomic serving, including WebSocket mode, refuse a
+JWT-configured listener without TLS before accepting sockets. Retained variants
+refuse that configuration before claiming their starter. The private transport
+fact is supplied only by a successful actual TLS handshake, not by a URL, TLS
+configuration or WebSocket flag. A retained setup refusal returns its original
+listener/socket carrier before task launch or native engine acceptance; it does
+not certify descendant cleanup or general fixture health.
+
+JWT publication reads a checked system epoch before validation and again after
+both actual grant/control locks, before any mutation or notification. A failed
+pre-Unix epoch conversion refuses authorization rather than substituting zero;
+expiry or other validation failure after either wait also leaves grants and
+initial-control history unchanged. Cancelling a pending publication does not
+publish a grant or notification. Refresh replaces only the same typed principal
+and exact scope; SAS and JWT grants cannot erase each other through a shared
+subject string. This does not certify a trusted clock. No CLI startup flag or
+new official .NET JWT gate is included in this edge; no OIDC discovery, network
+key refresh, revocation, Entra/cloud authorization or storage change is implied.
+
+Verification: all sixteen new regular edge checks passed (eight private CBS
+checks and eight Memory/Fjall wire checks); the closed default workspace run
+passed 5,423 tests with no failures and the same eleven ignored SDK gates. Both
+strict Clippy configurations, both workspace builds, formatting and protobuf
+compilation passed. Fresh all-features no-run output supplied the same 138 test
+executable paths used by that workspace run; it is not a second runtime pass.
+Eleven existing official .NET SAS regression cases passed, not a JWT
+`TokenCredential` activation gate.
+
+Retained failures identified assumptions in the new fixture: unused queues may
+have no persisted counters, and the original client WebSocket must stay owned
+through its strict close exchange before the original server roles are joined.
+The fixture now distinguishes absent counters, retains that socket through its
+existing five-second borrowed cleanup, and uses `SinkExt::close` after a
+diagnostic probe recorded `SendAfterClosing`. All eight final wire checks
+passed without weakening peer-Close, native Reader identity or server-close
+checks. These fixture corrections do not establish a cause or fix for an
+earlier SDK failure, a whole-Broker cleanup guarantee or cloud parity.
 
 A separate pure `auth::JwtPolicy` library provides a narrow offline JWT
 validator; it does not activate the JWT wire path described above.
