@@ -10,8 +10,13 @@ mod maintenance_tests;
 #[path = "main/config_check_tests.rs"]
 mod config_check_tests;
 
+#[cfg(test)]
+#[path = "main/offline_jwt_policy_tests.rs"]
+mod offline_jwt_policy_tests;
+
 use std::{
     fs,
+    io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::ExitCode,
@@ -100,6 +105,11 @@ struct Arguments {
     /// command-line value because process arguments are commonly observable.
     #[arg(long, value_name = "PATH")]
     shared_access_key_file: Option<PathBuf>,
+
+    /// Load a pinned offline JWT policy for TLS/shared-access AMQP listeners.
+    /// The policy file is also read by --check-config. Native administration stays SAS-only.
+    #[arg(long, value_name = "PATH")]
+    offline_jwt_policy_file: Option<PathBuf>,
 
     /// The namespace this node serves. A hostname is accepted and its first
     /// label taken, so a deployment can name namespaces in DNS.
@@ -270,6 +280,77 @@ fn load_shared_access_authentication(
     )?))
 }
 
+const MAX_OFFLINE_JWT_POLICY_BYTES: usize = 64 * 1024;
+
+fn load_offline_jwt_policy(
+    path: Option<&Path>,
+    tls: bool,
+    authentication: Option<SharedAccessAuthentication>,
+) -> Result<Option<SharedAccessAuthentication>, StartupError> {
+    let Some(path) = path else {
+        return Ok(authentication);
+    };
+    if !tls {
+        return Err(StartupError::OfflineJwtRequiresTls);
+    }
+    let authentication = authentication.ok_or(StartupError::OfflineJwtRequiresSharedAccess)?;
+    let bytes = read_offline_jwt_policy_regular_file(open_offline_jwt_policy_file(path)?)?;
+    let configuration =
+        std::str::from_utf8(&bytes).map_err(|_| StartupError::OfflineJwtPolicyNotUtf8)?;
+    let policy = auth::JwtPolicy::from_json(configuration)?;
+    Ok(Some(authentication.with_offline_jwt_policy(policy)))
+}
+
+#[cfg(unix)]
+fn open_offline_jwt_policy_file(path: &Path) -> Result<fs::File, StartupError> {
+    use rustix::fs::{Mode, OFlags};
+
+    let descriptor = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|_| StartupError::ReadOfflineJwtPolicy)?;
+    Ok(fs::File::from(descriptor))
+}
+
+#[cfg(not(unix))]
+fn open_offline_jwt_policy_file(path: &Path) -> Result<fs::File, StartupError> {
+    if !path
+        .metadata()
+        .map_err(|_| StartupError::ReadOfflineJwtPolicy)?
+        .is_file()
+    {
+        return Err(StartupError::OfflineJwtPolicyNotRegularFile);
+    }
+    fs::File::open(path).map_err(|_| StartupError::ReadOfflineJwtPolicy)
+}
+
+fn read_offline_jwt_policy_regular_file(file: fs::File) -> Result<Vec<u8>, StartupError> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| StartupError::ReadOfflineJwtPolicy)?;
+    if !metadata.is_file() {
+        return Err(StartupError::OfflineJwtPolicyNotRegularFile);
+    }
+    if metadata.len() > MAX_OFFLINE_JWT_POLICY_BYTES as u64 {
+        return Err(StartupError::OfflineJwtPolicyTooLarge);
+    }
+    read_offline_jwt_policy_bytes(file)
+}
+
+fn read_offline_jwt_policy_bytes(reader: impl Read) -> Result<Vec<u8>, StartupError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_OFFLINE_JWT_POLICY_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| StartupError::ReadOfflineJwtPolicy)?;
+    if bytes.len() > MAX_OFFLINE_JWT_POLICY_BYTES {
+        return Err(StartupError::OfflineJwtPolicyTooLarge);
+    }
+    Ok(bytes)
+}
+
 /// Reports why startup failed in the words the error was written in, rather
 /// than in the derived debug form `Termination` would print.
 fn main() -> ExitCode {
@@ -327,6 +408,11 @@ fn prepare_configuration(arguments: &Arguments) -> Result<PreparedConfiguration,
         &arguments.namespace,
         arguments.shared_access_key_name.as_deref(),
         arguments.shared_access_key_file.as_deref(),
+    )?;
+    let shared_access_authentication = load_offline_jwt_policy(
+        arguments.offline_jwt_policy_file.as_deref(),
+        tls.is_some(),
+        shared_access_authentication,
     )?;
     let listen = listen_address(arguments.listen, tls.is_some());
     let storage = storage_choice(arguments)?;

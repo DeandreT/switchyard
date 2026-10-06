@@ -21,6 +21,7 @@ flume.workspace = true
 protocol-amqp.workspace = true
 prost.workspace = true
 rustls.workspace = true
+rustix.workspace = true
 storage.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -40,6 +40,10 @@ mod receive_batch;
 #[path = "amqp_dotnet_current/retained_ingress.rs"]
 mod retained_ingress;
 
+#[cfg(target_os = "linux")]
+#[path = "amqp_dotnet_current/offline_jwt_cli.rs"]
+mod offline_jwt_cli;
+
 struct TestTimer {
     shutdown: Arc<Shutdown>,
     thread: Option<JoinHandle<()>>,

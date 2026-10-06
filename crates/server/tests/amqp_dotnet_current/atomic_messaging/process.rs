@@ -477,6 +477,47 @@ pub(crate) async fn run_offline_jwt_client(
     .await
 }
 
+pub(crate) async fn run_switchyard_check_config(
+    arguments: &[std::ffi::OsString],
+) -> TestResult<Output> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_switchyard"));
+    command
+        .env("RUST_LOG", "off")
+        .arg("--check-config")
+        .args(arguments);
+    match run(
+        command,
+        "switchyard check-config",
+        Duration::from_secs(10),
+        MAX_OUTPUT_BYTES,
+    )
+    .await
+    {
+        Ok(output) => Ok(output),
+        Err(error) => match error.downcast::<RunError>() {
+            Ok(error)
+                if error.failure == Failure::Nonzero
+                    && error.status.is_some_and(|status| !status.success())
+                    && error.capture_eof == 2 =>
+            {
+                let RunError {
+                    status,
+                    stdout,
+                    stderr,
+                    ..
+                } = *error;
+                Ok(Output {
+                    status: status.expect("checked reaped status"),
+                    stdout,
+                    stderr,
+                })
+            }
+            Ok(error) => Err(error as Box<dyn Error>),
+            Err(error) => Err(error),
+        },
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OfflineJwtChildDiagnostic {
     stage: &'static str,

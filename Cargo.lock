@@ -2407,6 +2407,7 @@ dependencies = [
  "prost",
  "protocol-amqp",
  "rcgen",
+ "rustix",
  "rustls",
  "serde",
  "sha2",

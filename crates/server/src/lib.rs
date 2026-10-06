@@ -135,6 +135,20 @@ pub enum StartupError {
     AuthenticationRequiresTls,
     #[error("could not read the shared-access key from {path}: {detail}")]
     ReadSharedAccessKey { path: PathBuf, detail: String },
+    #[error("offline JWT authentication requires TLS")]
+    OfflineJwtRequiresTls,
+    #[error("offline JWT authentication requires configured shared-access authentication")]
+    OfflineJwtRequiresSharedAccess,
+    #[error("could not read the offline JWT policy file")]
+    ReadOfflineJwtPolicy,
+    #[error("the offline JWT policy must be a regular file")]
+    OfflineJwtPolicyNotRegularFile,
+    #[error("the offline JWT policy file exceeds 64 KiB")]
+    OfflineJwtPolicyTooLarge,
+    #[error("the offline JWT policy file must contain UTF-8 JSON")]
+    OfflineJwtPolicyNotUtf8,
+    #[error(transparent)]
+    OfflineJwtPolicyConfiguration(#[from] auth::JwtError),
     #[error(transparent)]
     AuthPolicy(#[from] auth::PolicyError),
     #[error(transparent)]
