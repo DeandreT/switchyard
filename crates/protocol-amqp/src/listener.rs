@@ -316,6 +316,14 @@ async fn serve_session<B: Broker>(
                 Err(error) => Err(error_for(AmqpError::InvalidField, error.to_string())),
             };
 
+            let plan = match plan {
+                Ok(plan) => Ok::<_, AmqpProtocolError>(plan),
+                Err(error) => match session.reject_attach(attach, error).await {
+                    Ok(()) | Err(EngineError::RemoteDetached) => continue,
+                    Err(error) => return Err(error.into()),
+                },
+            };
+
             debug!(%address, ?attach, "accepting management link");
             let endpoint = match session
                 .accept_attach(attach, crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64)
@@ -414,6 +422,16 @@ async fn serve_session<B: Broker>(
             authorization.as_ref(),
         )
         .await;
+        let plan = match plan {
+            Ok(plan) => Ok::<_, AmqpProtocolError>(plan),
+            Err(error) => {
+                warn!(%address, condition = ?error.condition, "refusing link");
+                match session.reject_attach(attach, error).await {
+                    Ok(()) | Err(EngineError::RemoteDetached) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        };
         if let Ok((_, Some(accepted), _, _)) = &plan
             && let Some(source) = attach.source.as_mut()
         {
@@ -788,6 +806,9 @@ mod session_provenance_tests;
 
 #[cfg(test)]
 mod binding_tests;
+
+#[cfg(test)]
+mod pending_refusal_tests;
 
 #[cfg(test)]
 mod retained_tests;

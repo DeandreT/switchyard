@@ -40,6 +40,7 @@ mod outgoing_delivery_identity;
 mod outgoing_identity;
 mod outgoing_reservation;
 mod owned_connection_tasks;
+mod pending_attach_refusal;
 mod receive_credit;
 mod retained_delivery;
 mod sender_identity;
@@ -1074,6 +1075,13 @@ enum Command {
         consumption: Arc<Consumption>,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
+    RejectAttach {
+        channel: u16,
+        session: SessionIdentity,
+        attach: Box<IncomingAttach>,
+        error: Error,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
     Send {
         channel: u16,
         handle: u32,
@@ -1128,6 +1136,7 @@ fn reject_closed_command(command: Command) {
         }
         Command::AcceptSession { reply, .. }
         | Command::AcceptLink { reply, .. }
+        | Command::RejectAttach { reply, .. }
         | Command::Settle { reply, .. }
         | Command::SettleOutgoing { reply, .. }
         | Command::Detach { reply, .. }
@@ -2602,6 +2611,18 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 apply_link_flow(channel, flow, writer, sessions).await?;
             }
             let _ = reply.send(Ok(()));
+        }
+        Command::RejectAttach {
+            channel,
+            session,
+            attach,
+            error,
+            reply,
+        } => {
+            pending_attach_refusal::handle_rejection(
+                channel, session, *attach, error, reply, sessions, writer,
+            )
+            .await?;
         }
         Command::ReserveSend(request) => {
             outgoing_reservation::handle_reserve(request, sessions, writer.reservation_cleanup());

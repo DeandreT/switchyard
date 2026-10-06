@@ -540,6 +540,7 @@ fn wrapper_entry(channel: u16, role: Role) -> WrapperEntry {
             reply,
             link,
             consumption,
+            refused_response: None,
         },
         result,
         owner,

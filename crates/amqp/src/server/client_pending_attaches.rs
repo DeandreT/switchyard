@@ -13,6 +13,10 @@ impl PendingAttaches {
         self.map(local_role).get(name)
     }
 
+    pub(super) fn get_mut(&mut self, name: &str, local_role: &Role) -> Option<&mut PendingAttach> {
+        self.map_mut(local_role).get_mut(name)
+    }
+
     pub(super) fn contains_key(&self, name: &str, local_role: &Role) -> bool {
         self.map(local_role).contains_key(name)
     }

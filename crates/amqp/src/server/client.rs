@@ -11,6 +11,9 @@ use crate::{Source, Target, TargetTerminus};
 #[path = "client_pending_attaches.rs"]
 mod client_pending_attaches;
 
+#[path = "client_refusal.rs"]
+mod client_refusal;
+
 use client_pending_attaches::PendingAttaches;
 
 pub struct ClientConnection {
@@ -815,6 +818,7 @@ struct PendingAttach {
     reply: oneshot::Sender<Result<(u32, Attach), EngineError>>,
     link: LinkState,
     consumption: Arc<Consumption>,
+    refused_response: Option<Attach>,
 }
 
 fn pending_attach_matches(
@@ -1169,6 +1173,13 @@ where
                                         if !session.local_begin_sent { writer.encoded_frame(&local_begin_frame(channel, session)?)?; }
                                         Some((refusal, snapshot))
                                     } else { None };
+                                    if recovery_reply.is_none() && client_refusal::is_refusal(&attach) {
+                                        if let Err(error) = client_refusal::park(attach, channel, &mut pending_attaches, &mut sessions) {
+                                            refuse_session(channel, "amqp:invalid-field", error.to_string(), &mut writer, &mut sessions).await?;
+                                            fail_pending_session(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches, &mut pending_ends);
+                                        }
+                                        continue;
+                                    }
                                     if let Some(pending) = pending_attaches.remove(&attach.name, &local_role) {
                                         let session = sessions.get_mut(&channel).expect("validated pending session");
                                         session.handle_aliases.get_mut(&pending.handle).expect("validated pending handle alias").peer_handle = Some(attach.handle);
@@ -1255,10 +1266,10 @@ where
                                     let pending_name = pending_attaches.iter().find_map(|(name, role, pending)| {
                                         (pending.channel == channel && pending.handle == detach.handle).then_some((name.to_owned(), role))
                                     });
+                                    let mut refused_completion = None;
                                     if let Some((name, role)) = pending_name {
-                                        let mut pending = pending_attaches.remove(&name, &role).expect("pending attach exists");
-                                        stop_link(&mut pending.link);
-                                        let _ = pending.reply.send(Err(EngineError::RemoteDetached));
+                                        let pending = pending_attaches.remove(&name, &role).expect("pending attach exists");
+                                        refused_completion = client_refusal::pending_detach(pending);
                                         if let Some(session) = sessions.get_mut(&channel) {
                                             session.pending_attaches.remove(&detach.handle);
                                         }
@@ -1289,6 +1300,9 @@ where
                                         && let Some(identity) = alias_identity
                                     {
                                         remove_handle_alias(session, detach.handle, &identity);
+                                    }
+                                    if let Some(completion) = refused_completion {
+                                        completion.publish();
                                     }
                                     Ok(false)
                                 }
@@ -1502,7 +1516,7 @@ where
                                         }
                                     };
                                     session.pending_attaches.insert(handle, PendingLinkFlow::new(peer_role, None));
-                                    pending_attaches.insert(request.name, PendingAttach { channel, session: owner, handle, reply, link, consumption });
+                                    pending_attaches.insert(request.name, PendingAttach { channel, session: owner, handle, reply, link, consumption, refused_response: None });
                                     writer.write_frame(&attach_frame).await?;
                                     session.handle_aliases.get_mut(&handle).expect("published pending handle alias").own_attach_sent = true;
                                     Ok(())
