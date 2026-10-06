@@ -61,7 +61,14 @@ struct PreparedKey {
 
 struct Binding {
     scope: ResourceScope,
+    amqp_scope: ResourceScope,
     permissions: PermissionSet,
+}
+
+#[derive(Clone, Copy)]
+enum ScopeMode {
+    Amqp,
+    Native,
 }
 
 #[derive(Deserialize)]
@@ -240,8 +247,8 @@ impl JwtPolicy {
                 return Err(JwtError::InvalidConfiguration);
             }
             let scope = ResourceScope::parse(&principal.scope)
-                .map_err(|_| JwtError::InvalidConfiguration)?
-                .into_amqp_scope();
+                .map_err(|_| JwtError::InvalidConfiguration)?;
+            let amqp_scope = scope.clone().into_amqp_scope();
             let mut permissions = PermissionSet::NONE;
             let mut seen = HashSet::new();
             for permission in principal.permissions {
@@ -256,7 +263,14 @@ impl JwtPolicy {
                 };
             }
             if bindings
-                .insert(principal.subject, Binding { scope, permissions })
+                .insert(
+                    principal.subject,
+                    Binding {
+                        scope,
+                        amqp_scope,
+                        permissions,
+                    },
+                )
                 .is_some()
             {
                 return Err(JwtError::DuplicateIdentity);
@@ -277,6 +291,27 @@ impl JwtPolicy {
         token: &str,
         requested: &ResourceScope,
         now_epoch_seconds: u64,
+    ) -> Result<AccessGrant, JwtError> {
+        self.validate_with_scope(token, requested, now_epoch_seconds, ScopeMode::Amqp)
+    }
+
+    /// Validates a native resource scope without AMQP control-name aliases.
+    /// The returned grant retains the configured binding's literal path spelling.
+    pub fn validate_native_scope(
+        &self,
+        token: &str,
+        requested: &ResourceScope,
+        now_epoch_seconds: u64,
+    ) -> Result<AccessGrant, JwtError> {
+        self.validate_with_scope(token, requested, now_epoch_seconds, ScopeMode::Native)
+    }
+
+    fn validate_with_scope(
+        &self,
+        token: &str,
+        requested: &ResourceScope,
+        now_epoch_seconds: u64,
+        scope_mode: ScopeMode,
     ) -> Result<AccessGrant, JwtError> {
         if token.len() > MAX_TOKEN_BYTES || !scope_is_bounded(requested) {
             return Err(JwtError::TooLarge);
@@ -348,13 +383,17 @@ impl JwtPolicy {
             .bindings
             .get(&claims.sub)
             .ok_or(JwtError::UnknownSubject)?;
-        if !binding.scope.contains(&requested.clone().into_amqp_scope()) {
+        let (scope, requested) = match scope_mode {
+            ScopeMode::Amqp => (&binding.amqp_scope, requested.clone().into_amqp_scope()),
+            ScopeMode::Native => (&binding.scope, requested.clone()),
+        };
+        if !scope.contains(&requested) {
             return Err(JwtError::ScopeMismatch);
         }
         Ok(AccessGrant::verified_jwt(
             claims.sub,
             self.0.issuer.clone(),
-            binding.scope.clone(),
+            scope.clone(),
             claims.exp,
             binding.permissions,
         ))

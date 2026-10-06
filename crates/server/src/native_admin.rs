@@ -24,6 +24,7 @@ use crate::{AdminTarget, BrokerHandle, ProposeError, SubmitError};
 
 mod deletion;
 mod maintenance;
+mod offline_jwt;
 mod paging;
 mod queue_paging;
 mod rules;
@@ -46,6 +47,7 @@ pub struct NativeAdminService {
     broker: BrokerHandle,
     namespace: NamespaceName,
     authentication: Option<Authentication>,
+    offline_jwt: Option<offline_jwt::Authentication>,
     admission: Arc<Semaphore>,
     development_maintenance_readiness: bool,
 }
@@ -56,6 +58,7 @@ impl NativeAdminService {
             broker,
             namespace,
             authentication: None,
+            offline_jwt: None,
             admission: Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS)),
             development_maintenance_readiness: false,
         }
@@ -71,8 +74,20 @@ impl NativeAdminService {
         Ok(self)
     }
 
+    /// Enables locally pinned offline JWT Manage authorization over actual TLS.
+    ///
+    /// This is independent of the optional SAS policy and performs no discovery.
+    pub fn with_offline_jwt_policy(
+        mut self,
+        policy: auth::JwtPolicy,
+        audience_host: impl AsRef<str>,
+    ) -> Result<Self, ResourceScopeError> {
+        self.offline_jwt = Some(offline_jwt::Authentication::new(policy, audience_host)?);
+        Ok(self)
+    }
+
     pub(crate) fn requires_authentication(&self) -> bool {
-        self.authentication.is_some()
+        self.authentication.is_some() || self.offline_jwt.is_some()
     }
 
     fn begin_request<T>(
@@ -86,7 +101,18 @@ impl NativeAdminService {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("administration request limit reached"))?;
-        if let Some(authentication) = &self.authentication {
+        let jwt_authorized = self
+            .offline_jwt
+            .as_ref()
+            .map(|authentication| authentication.authorize(request, entity_path))
+            .transpose()?
+            .unwrap_or(false);
+        if self.offline_jwt.is_some() && !jwt_authorized && self.authentication.is_none() {
+            return Err(Status::unauthenticated(
+                "shared-access authentication is not configured",
+            ));
+        }
+        if !jwt_authorized && let Some(authentication) = &self.authentication {
             let token = request
                 .metadata()
                 .get("authorization")

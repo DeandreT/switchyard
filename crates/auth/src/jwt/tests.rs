@@ -762,3 +762,159 @@ fn debug_and_errors_do_not_traverse_keys_tokens_or_issuer_configuration() {
         "JWT signature verification failed"
     );
 }
+
+#[test]
+fn native_bindings_preserve_control_names_without_changing_amqp_aliases() {
+    let token = signed(&header(), &claims());
+    for path in [
+        "orders/$Management",
+        "orders/$DeadLetterQueue",
+        "events/Subscriptions/sub",
+        "events/Subscriptions/sub/$Management",
+    ] {
+        let mut config = configuration();
+        config["bindings"][0]["scope"] = json!(format!("amqps://tenant.example/{path}"));
+        config["bindings"][0]["permissions"] = json!(["manage"]);
+        let policy = JwtPolicy::from_json(&config.to_string()).unwrap();
+        let literal = ResourceScope::entity("tenant.example", path).unwrap();
+        let canonical = literal.clone().into_amqp_scope();
+        assert_ne!(literal, canonical);
+        let native = policy.validate_native_scope(&token, &literal, 100).unwrap();
+        assert_eq!(native.scope(), &literal);
+        assert!(native.allows(&literal, Permission::Manage, 100));
+        assert!(!native.allows(&canonical, Permission::Manage, 100));
+        assert_eq!(
+            policy.validate_native_scope(&token, &canonical, 100),
+            Err(JwtError::ScopeMismatch)
+        );
+        for requested in [&literal, &canonical] {
+            let amqp = policy.validate(&token, requested, 100).unwrap();
+            assert_eq!(amqp.scope(), &canonical);
+            assert!(amqp.allows(&canonical, Permission::Manage, 100));
+        }
+    }
+}
+
+#[test]
+fn native_and_amqp_bindings_keep_ordinary_case_and_namespace_boundaries() {
+    let mut config = configuration();
+    config["bindings"][0]["scope"] = json!("amqps://tenant.example/Orders");
+    config["bindings"][0]["permissions"] = json!(["manage"]);
+    let policy = JwtPolicy::from_json(&config.to_string()).unwrap();
+    let token = signed(&header(), &claims());
+    let bound = ResourceScope::entity("tenant.example", "Orders").unwrap();
+    for path in ["Orders", "Orders/child"] {
+        let requested = ResourceScope::entity("tenant.example", path).unwrap();
+        let native = policy
+            .validate_native_scope(&token, &requested, 100)
+            .unwrap();
+        let amqp = policy.validate(&token, &requested, 100).unwrap();
+        assert_eq!(native.scope(), &bound);
+        assert_eq!(amqp.scope(), &bound);
+        assert!(native.allows(&requested, Permission::Manage, 100));
+        assert!(amqp.allows(&requested, Permission::Manage, 100));
+    }
+    for requested in [
+        ResourceScope::entity("tenant.example", "orders").unwrap(),
+        ResourceScope::entity("tenant.example", "Orders-archive").unwrap(),
+        ResourceScope::entity("other.example", "Orders").unwrap(),
+        ResourceScope::namespace("tenant.example").unwrap(),
+    ] {
+        assert_eq!(
+            policy.validate_native_scope(&token, &requested, 100),
+            Err(JwtError::ScopeMismatch)
+        );
+        assert_eq!(
+            policy.validate(&token, &requested, 100),
+            Err(JwtError::ScopeMismatch)
+        );
+    }
+    config["bindings"][0]["scope"] = json!("amqps://tenant.example");
+    let policy = JwtPolicy::from_json(&config.to_string()).unwrap();
+    for requested in [
+        ResourceScope::namespace("tenant.example").unwrap(),
+        ResourceScope::entity("tenant.example", "Orders/child").unwrap(),
+    ] {
+        assert!(
+            policy
+                .validate_native_scope(&token, &requested, 100)
+                .is_ok()
+        );
+        assert!(policy.validate(&token, &requested, 100).is_ok());
+    }
+    let foreign = ResourceScope::namespace("other.example").unwrap();
+    assert_eq!(
+        policy.validate_native_scope(&token, &foreign, 100),
+        Err(JwtError::ScopeMismatch)
+    );
+    assert_eq!(
+        policy.validate(&token, &foreign, 100),
+        Err(JwtError::ScopeMismatch)
+    );
+}
+
+#[test]
+fn native_scope_validation_keeps_credential_time_and_resource_bounds() {
+    let policy = policy();
+    let requested = requested();
+    let token = signed(&header(), &claims());
+    let (input, signature) = token.rsplit_once('.').unwrap();
+    let mut signature = URL_SAFE_NO_PAD.decode(signature).unwrap();
+    signature[0] ^= 1;
+    let mut bad_header = header();
+    bad_header["alg"] = json!("HS256");
+    let mut invalid = vec![
+        ("x.x.x".to_owned(), 100, JwtError::InvalidEncoding),
+        ("x".repeat(MAX_TOKEN_BYTES + 1), 100, JwtError::TooLarge),
+        (token.clone(), 99, JwtError::NotYetValid),
+        (token.clone(), 200, JwtError::Expired),
+        (
+            format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature)),
+            100,
+            JwtError::InvalidSignature,
+        ),
+        (signed(&bad_header, &claims()), 100, JwtError::InvalidHeader),
+    ];
+    for (field, value, error) in [
+        (
+            "iss",
+            json!("https://other.example/"),
+            JwtError::IssuerMismatch,
+        ),
+        ("aud", json!("urn:other"), JwtError::AudienceMismatch),
+        ("sub", json!("unknown"), JwtError::UnknownSubject),
+        ("iat", json!(101), JwtError::NotYetValid),
+        ("exp", json!(100), JwtError::InvalidClaims),
+        ("nbf", json!(101), JwtError::NotYetValid),
+    ] {
+        let mut claims = claims();
+        claims[field] = value;
+        invalid.push((signed(&header(), &claims), 100, error));
+    }
+    for (token, now, error) in invalid {
+        assert_eq!(
+            policy.validate_native_scope(&token, &requested, now),
+            Err(error)
+        );
+        assert_eq!(policy.validate(&token, &requested, now), Err(error));
+    }
+    let oversized =
+        ResourceScope::entity("tenant.example", "x".repeat(MAX_RESOURCE_BYTES)).unwrap();
+    assert_eq!(
+        policy.validate_native_scope(&token, &oversized, 100),
+        Err(JwtError::TooLarge)
+    );
+    assert_eq!(
+        policy.validate(&token, &oversized, 100),
+        Err(JwtError::TooLarge)
+    );
+    let mut claims = claims();
+    claims["roles"] = json!(["manage"]);
+    claims["scope"] = json!("manage");
+    let token = signed(&header(), &claims);
+    let native = policy
+        .validate_native_scope(&token, &requested, 100)
+        .unwrap();
+    assert_eq!(native.permissions(), PermissionSet::SEND);
+    assert!(!native.allows(&requested, Permission::Manage, 100));
+}
