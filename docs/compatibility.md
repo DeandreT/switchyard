@@ -210,6 +210,32 @@ reject `RenewMessageLockAsync` on session receivers before transport. Raw AMQP
 is the applicable local surface, not a new pinned SDK workflow or observed
 Azure error parity.
 
+Next-available AMQP receivers follow bounded session-acceptance pages instead
+of treating the first held page as exhaustion. Each owner command inspects at
+most 32 distinct ready-index session groups, skipping each held group's entire
+backlog. A full held page returns an exclusive, namespace/entity-scoped keyset
+cursor. The receiver follows it until a grant, actual exhaustion or a private
+10-second budget for admitting another page. Every new page rechecks configured
+Listen authorization and the original incoming attach, retaining the original
+entity incarnation binding. A cursor is a position, not authority or a frozen snapshot;
+insertions behind it may wait for a later walk. This is not a starvation bound.
+
+The page-admission budget does not cancel an already admitted owner command or
+bound its completion time. A valid admitted grant may be handed off after that
+cutoff. If authorization or the original native attach has become invalid, the
+planner awaits release of that exact granted hold through the same fenced
+binding before returning its refusal. Final native acceptance failure likewise
+awaits release. Cleanup failures retain the primary failure and actual release
+result. Pure origin validation does not certify actor-owned pending membership;
+final native acceptance remains authoritative. Arbitrary planner cancellation
+and backend panic are not covered by this cleanup guarantee.
+
+This uses appended `AcceptNextSessionPage` (tag 40); legacy `AcceptSession`
+(tag 12), including named acceptance and its bounded next-session operation,
+keeps its wire encoding. The closed atomic/`CreateSendV1`/`QueueV1` profiles,
+value format 11 and store layout 15 are unchanged. This does not establish
+mixed-version command-log compatibility.
+
 Microsoft documents a [session-lock umbrella](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sessions#session-features)
 and [settlement failure after session expiry](https://learn.microsoft.com/en-us/dotnet/api/azure.messaging.servicebus.servicebusreceiver.completemessageasync?view=azure-dotnet).
 This boundary does not implement every umbrella behavior or establish full
@@ -219,9 +245,6 @@ Azure error parity. Remaining local session limitations are:
   messages; they remain locked until their own deadlines. A replacement holder
   can receive later ready messages while earlier ones remain locked, so the FIFO
   guarantee above does not extend across that takeover.
-- Accepting the next available session examines a bounded number of sessions and
-  reports none available if they are all held, rather than walking the entity.
-  The receiver retries.
 - Expiration is applied to individual messages, not to every message in a session
   when one expires. Azure documents
   [session-wide TTL expiry](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sessions#message-expiration);
@@ -246,6 +269,19 @@ message-lock renewal workflow. Strict lint and builds pass in both
 configurations, along with formatting and protobuf validation. The initial
 format check was corrected only by formatting the three new test modules;
 existing assertions, waits and ignore status are unchanged.
+
+Local verification adds 27 regular checks for paged next-session acceptance:
+14 domain, three native transport, four protocol and six raw AMQP checks. The
+default workspace run passes 5,291 tests, preserving all prior case statuses
+and the same 11 opt-in SDK ignore reasons. Those 11 existing SDK checks pass
+separately as regression evidence, not a new SDK paging workflow. Strict lint
+and builds pass in both configurations, along with formatting and protobuf
+validation. The additional full all-feature workspace run is not yet complete.
+Initial compilation and new wire-fixture failures were corrected without
+changing existing assertions, waits or ignore status. An unchanged oversized
+storage fixture stalled in the first concurrent workspace run; the same test
+binary passed alone, and the complete workspace passed on a serial retry with
+no skips. The cause of that stall remains unestablished.
 
 An ordinary receiver can browse all sessions in a session-required queue or
 subscription through its management link, without attaching a data receiver or
