@@ -2276,7 +2276,7 @@ impl<S: StateStore> StateMachine<S> {
         let locks = self.store.scan_prefix(&prefix, TIMER_SCAN_LIMIT)?;
 
         let mut released = 0;
-        for (key, _) in locks {
+        for (key, value) in locks {
             let (locked_until, session_id) =
                 keys::session_lock_parts(&prefix, &key).ok_or(BrokerError::MalformedIndexKey)?;
             // Ordered by deadline, so the first lock still held ends the sweep.
@@ -2286,6 +2286,14 @@ impl<S: StateStore> StateMachine<S> {
 
             let session_id = SessionId::new(session_id)?;
             let record = self.load_session(command, &session_id)?;
+            let lock = record.lock.ok_or(BrokerError::MalformedIndexKey)?;
+            if lock.token.as_u64() == 0
+                || lock.locked_until != locked_until
+                || key != keys::session_lock(namespace, entity, locked_until, &session_id)
+                || !value.is_empty()
+            {
+                return Err(BrokerError::MalformedIndexKey);
+            }
             self.clear_session_lock(command, &session_id, record, batch)?;
             released += 1;
         }
