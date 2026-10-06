@@ -195,13 +195,26 @@ an older command decoder is expected to refuse tag 38 as an unknown payload
 variant, not as a new value-format header. This is not a mixed-version command
 log guarantee.
 
+Management message-lock renewal on session-required queues and subscriptions
+presents the delivery's original session hold, including deferred receipts.
+An expired, released or replaced hold cannot extend the old message lock.
+Both the original session and message deadlines must remain live at the owner's
+timestamp; renewing a message does not renew its session. Trusted legacy
+`RenewLock` (tag 10) remains message-lock-only. Management uses appended
+`RenewLockHeld` (tag 39); the closed atomic/`CreateSendV1`/`QueueV1` profiles,
+value format 11 and store layout 15 are unchanged. This does not establish
+mixed-version command-log compatibility. Both pinned receivers,
+[7.21.0](https://raw.githubusercontent.com/Azure/azure-sdk-for-net/Azure.Messaging.ServiceBus_7.21.0/sdk/servicebus/Azure.Messaging.ServiceBus/src/Receiver/ServiceBusReceiver.cs)
+and [7.20.2](https://raw.githubusercontent.com/Azure/azure-sdk-for-net/Azure.Messaging.ServiceBus_7.20.2/sdk/servicebus/Azure.Messaging.ServiceBus/src/Receiver/ServiceBusReceiver.cs),
+reject `RenewMessageLockAsync` on session receivers before transport. Raw AMQP
+is the applicable local surface, not a new pinned SDK workflow or observed
+Azure error parity.
+
 Microsoft documents a [session-lock umbrella](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sessions#session-features)
 and [settlement failure after session expiry](https://learn.microsoft.com/en-us/dotnet/api/azure.messaging.servicebus.servicebusreceiver.completemessageasync?view=azure-dotnet).
 This boundary does not implement every umbrella behavior or establish full
 Azure error parity. Remaining local session limitations are:
 
-- Message-lock renewal remains message-lock-only. A live session hold does not
-  replace the independent message-lock deadline used by settlement.
 - Releasing or expiring a session does not immediately requeue its locked
   messages; they remain locked until their own deadlines. A replacement holder
   can receive later ready messages while earlier ones remain locked, so the FIFO
@@ -223,6 +236,16 @@ along with formatting and protobuf validation. The existing SDK gates are
 regression evidence, not a new stale-hold SDK workflow or observed Azure error
 parity. Initial formatter, test-wiring and controlled-fixture failures were
 corrected without changing existing test assertions, waits or ignore status.
+
+Local verification adds 20 regular checks for original-hold message-lock
+renewal: 12 domain checks, four protocol checks and four raw AMQP checks.
+Default and all-feature workspace runs each pass 5,264 tests, preserving all
+prior case statuses and the same 11 opt-in SDK ignore reasons. Those 11 existing
+SDK checks pass separately as regression evidence, not a new session-receiver
+message-lock renewal workflow. Strict lint and builds pass in both
+configurations, along with formatting and protobuf validation. The initial
+format check was corrected only by formatting the three new test modules;
+existing assertions, waits and ignore status are unchanged.
 
 An ordinary receiver can browse all sessions in a session-required queue or
 subscription through its management link, without attaching a data receiver or
