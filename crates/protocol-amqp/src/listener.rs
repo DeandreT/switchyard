@@ -167,6 +167,21 @@ impl<B: Broker> AmqpListener<B> {
         self.shared_access_authentication = Some(authentication);
         self
     }
+
+    fn validate_authentication_transport(&self) -> std::io::Result<()> {
+        if self.tls_acceptor.is_none()
+            && self
+                .shared_access_authentication
+                .as_ref()
+                .is_some_and(SharedAccessAuthentication::requires_tls)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "offline JWT authentication requires a TLS listener",
+            ));
+        }
+        Ok(())
+    }
 }
 async fn serve_open_connection<B: Broker>(
     connection: &mut ServerConnection,

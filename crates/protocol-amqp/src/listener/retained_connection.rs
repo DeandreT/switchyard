@@ -291,7 +291,7 @@ pub enum RetainedConnectionStartCause {
 
 /// Original configured listener/socket returned without any new task creation.
 ///
-/// Setup follows original option validation -> TCP_NODELAY -> checked deadline
+/// Setup follows option validation -> authentication transport -> TCP_NODELAY -> checked deadline
 /// order before stopped refusal. TCP_NODELAY may already be set. No socket read
 /// or TLS/HTTP/AMQP negotiation occurred; the caller retains/disposes this request.
 pub struct RetainedConnectionRequest<B> {

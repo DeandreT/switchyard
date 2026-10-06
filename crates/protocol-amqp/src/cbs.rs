@@ -9,6 +9,7 @@ use crate::authorization::ConnectionAuthorization;
 
 pub(crate) const PUT_TOKEN_OPERATION: &str = "put-token";
 pub(crate) const SAS_TOKEN_TYPE: &str = "servicebus.windows.net:sastoken";
+const JWT_TOKEN_TYPE: &str = "jwt";
 
 const OPERATION_PROPERTY: &str = "operation";
 const TOKEN_TYPE_PROPERTY: &str = "type";
@@ -111,8 +112,9 @@ async fn process_request(
     let Some(properties) = message.application_properties.as_ref() else {
         return CbsResponse::bad_request(message_id, "application properties are required");
     };
+    let token_type = string_property(properties, TOKEN_TYPE_PROPERTY);
     if string_property(properties, OPERATION_PROPERTY) != Some(PUT_TOKEN_OPERATION)
-        || string_property(properties, TOKEN_TYPE_PROPERTY) != Some(SAS_TOKEN_TYPE)
+        || !matches!(token_type, Some(SAS_TOKEN_TYPE | JWT_TOKEN_TYPE))
     {
         return CbsResponse::bad_request(message_id, "unsupported CBS operation or token type");
     }
@@ -120,12 +122,29 @@ async fn process_request(
         return CbsResponse::bad_request(message_id, "the token audience is required");
     };
     let Body::Value(Value::String(token)) = &message.body else {
-        return CbsResponse::bad_request(message_id, "the SAS token must be an AMQP value string");
+        let description = if token_type == Some(SAS_TOKEN_TYPE) {
+            "the SAS token must be an AMQP value string"
+        } else {
+            "the JWT token must be an AMQP value string"
+        };
+        return CbsResponse::bad_request(message_id, description);
     };
 
-    match authorization.validate_and_add(token, audience).await {
-        Ok(()) => CbsResponse::accepted(message_id),
-        Err(_) => CbsResponse::unauthorized(message_id),
+    let accepted = match token_type {
+        Some(SAS_TOKEN_TYPE) => authorization
+            .validate_and_add(token, audience)
+            .await
+            .is_ok(),
+        Some(JWT_TOKEN_TYPE) => authorization
+            .validate_jwt_and_add(token, audience)
+            .await
+            .is_ok(),
+        _ => unreachable!("CBS token type was checked before reading the token"),
+    };
+    if accepted {
+        CbsResponse::accepted(message_id)
+    } else {
+        CbsResponse::unauthorized(message_id)
     }
 }
 

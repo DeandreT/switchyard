@@ -12,6 +12,8 @@ use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use crate::cbs::CbsResponse;
 
 mod initial;
+mod jwt;
+pub(crate) use jwt::ConnectionTransport;
 
 use initial::InitialControlGrace;
 pub(crate) use initial::InitialControlState;
@@ -26,6 +28,7 @@ pub struct SharedAccessAuthentication {
     policy: SharedAccessPolicy,
     audience_host: String,
     authorization_timeout: Duration,
+    offline_jwt_policy: Option<auth::JwtPolicy>,
 }
 
 impl SharedAccessAuthentication {
@@ -38,6 +41,7 @@ impl SharedAccessAuthentication {
             policy,
             audience_host: namespace.host().to_owned(),
             authorization_timeout: DEFAULT_CBS_AUTHORIZATION_TIMEOUT,
+            offline_jwt_policy: None,
         })
     }
 
@@ -65,6 +69,8 @@ pub(crate) struct ConnectionAuthorization {
     policy: SharedAccessPolicy,
     audience_host: String,
     authorization_timeout: Duration,
+    offline_jwt_policy: Option<auth::JwtPolicy>,
+    transport: ConnectionTransport,
     grants: RwLock<Vec<AccessGrant>>,
     initial_control: Mutex<InitialControlGrace>,
     grant_changed: Notify,
@@ -82,6 +88,8 @@ impl ConnectionAuthorization {
             policy: config.policy,
             audience_host: config.audience_host,
             authorization_timeout: config.authorization_timeout,
+            offline_jwt_policy: config.offline_jwt_policy,
+            transport: ConnectionTransport::Plaintext,
             grants: RwLock::new(
                 initial_grant
                     .into_iter()
@@ -227,7 +235,7 @@ impl ConnectionAuthorization {
         let mut grants = self.grants.write().await;
         let mut initial_control = self.initial_control.lock().await;
         grants.retain(|existing| {
-            existing.subject() != grant.subject() || existing.scope() != grant.scope()
+            !existing.same_principal(&grant) || existing.scope() != grant.scope()
         });
         grants.push(grant);
         initial_control.authorized(tokio::time::Instant::now());

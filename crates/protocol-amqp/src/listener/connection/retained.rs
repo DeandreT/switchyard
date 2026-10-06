@@ -55,7 +55,7 @@ impl<B: Broker> AmqpListener<B> {
     /// cleanup, safe-reopen, SDK or physical termination deadline is implied.
     ///
     /// Setup failures return their original error plus listener/socket. Setup
-    /// validates options, sets TCP_NODELAY and computes the same one absolute
+    /// validates options and authentication transport, sets TCP_NODELAY and computes the same one absolute
     /// handshake deadline BEFORE a sealed-launch refusal. A successful call
     /// synchronously installs its original wrapper token before returning.
     pub fn start_retained_connection(
@@ -76,6 +76,7 @@ impl<B: Broker> AmqpListener<B> {
             .connection_options
             .validate()
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+            .and_then(|()| self.validate_authentication_transport())
             .and_then(|()| stream.set_nodelay(true))
             .and_then(|()| {
                 tokio::time::Instant::now()
@@ -182,6 +183,7 @@ async fn run_wrapper<B: Broker, D: RetainedDriver<B>>(
                 serve_owned_transport(
                     stream,
                     listener.websocket,
+                    ConnectionTransport::TlsEstablished,
                     settings,
                     driver,
                     acceptor,
@@ -194,6 +196,7 @@ async fn run_wrapper<B: Broker, D: RetainedDriver<B>>(
             serve_owned_transport(
                 stream,
                 listener.websocket,
+                ConnectionTransport::Plaintext,
                 settings,
                 driver,
                 acceptor,
@@ -207,6 +210,7 @@ async fn run_wrapper<B: Broker, D: RetainedDriver<B>>(
 async fn serve_owned_transport<Io, B, D>(
     stream: Io,
     websocket: bool,
+    transport: ConnectionTransport,
     settings: ConnectionSettings<B>,
     driver: D,
     acceptor: ServerConnectionAcceptor,
@@ -225,6 +229,7 @@ async fn serve_owned_transport<Io, B, D>(
     if !websocket {
         serve_owned_connection(
             stream,
+            transport,
             settings,
             driver,
             acceptor,
@@ -260,6 +265,7 @@ async fn serve_owned_transport<Io, B, D>(
     };
     serve_owned_connection(
         stream,
+        transport,
         settings,
         driver,
         acceptor,
@@ -289,6 +295,7 @@ enum Opened {
 
 async fn serve_owned_connection<Io, B, D>(
     stream: Io,
+    transport: ConnectionTransport,
     settings: ConnectionSettings<B>,
     driver: D,
     acceptor: ServerConnectionAcceptor,
@@ -329,7 +336,11 @@ async fn serve_owned_connection<Io, B, D>(
                 .await;
                 match acceptance {
                     Opened::Accepted(connection) => {
-                        let authorization = ConnectionAuthorization::new(config, sasl.grant());
+                        let authorization = ConnectionAuthorization::new_on_transport(
+                            config,
+                            sasl.grant(),
+                            transport,
+                        );
                         (Opened::Accepted(connection), Some(authorization))
                     }
                     Opened::AlreadyPublished => (Opened::AlreadyPublished, None),
@@ -510,7 +521,16 @@ where
             publisher.primary.publish(Outcome::SkippedExpiredDeadline);
             return;
         }
-        serve_owned_transport(stream, websocket, settings, driver, acceptor, publisher).await;
+        serve_owned_transport(
+            stream,
+            websocket,
+            ConnectionTransport::Plaintext,
+            settings,
+            driver,
+            acceptor,
+            publisher,
+        )
+        .await;
     });
     true
 }

@@ -14,7 +14,7 @@ use super::{AmqpListener, atomic_ingress, serve_open_connection, websocket};
 pub(super) mod retained;
 use crate::{
     Broker, NativeAtomicBroker, SharedAccessAuthentication,
-    authorization::{ConnectionAuthorization, SharedAccessSaslAcceptor},
+    authorization::{ConnectionAuthorization, ConnectionTransport, SharedAccessSaslAcceptor},
 };
 
 impl<B: Broker> AmqpListener<B> {
@@ -34,6 +34,7 @@ impl<B: Broker> AmqpListener<B> {
         self.connection_options
             .validate()
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        self.validate_authentication_transport()?;
         let admission = Arc::new(Semaphore::new(
             self.max_connections.get().min(Semaphore::MAX_PERMITS),
         ));
@@ -77,6 +78,7 @@ impl<B: Broker> AmqpListener<B> {
                                 serve_transport_connection(
                                     stream,
                                     websocket,
+                                    ConnectionTransport::TlsEstablished,
                                     ConnectionSettings {
                                         container_id,
                                         namespace,
@@ -97,6 +99,7 @@ impl<B: Broker> AmqpListener<B> {
                         serve_transport_connection(
                             stream,
                             websocket,
+                            ConnectionTransport::Plaintext,
                             ConnectionSettings {
                                 container_id,
                                 namespace,
@@ -236,6 +239,7 @@ struct ConnectionSettings<B> {
 async fn serve_transport_connection<Io, B, D>(
     stream: Io,
     websocket: bool,
+    transport: ConnectionTransport,
     settings: ConnectionSettings<B>,
     driver: D,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
@@ -245,7 +249,7 @@ where
     D: ConnectionDriver<B>,
 {
     if !websocket {
-        return serve_connection(stream, settings, driver).await;
+        return serve_connection(stream, transport, settings, driver).await;
     }
     let (stream, close) = tokio::time::timeout_at(
         settings.deadline,
@@ -253,13 +257,14 @@ where
     )
     .await
     .map_err(|_| handshake_timeout_error())??;
-    let result = serve_connection(stream, settings, driver).await;
+    let result = serve_connection(stream, transport, settings, driver).await;
     let closed = close.finish().await;
     result.and(closed)
 }
 
 async fn serve_connection<Io, B, D>(
     stream: Io,
+    transport: ConnectionTransport,
     settings: ConnectionSettings<B>,
     driver: D,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
@@ -290,7 +295,11 @@ where
                     connection_options,
                 )
                 .await?;
-                let authorization = ConnectionAuthorization::new(config, sasl_acceptor.grant());
+                let authorization = ConnectionAuthorization::new_on_transport(
+                    config,
+                    sasl_acceptor.grant(),
+                    transport,
+                );
                 (connection, Some(authorization))
             }
             None => (
