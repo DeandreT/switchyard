@@ -178,7 +178,7 @@ async fn replacing_an_entity_between_admission_and_session_acquisition_never_acq
         let task = tokio::spawn(async move {
             let namespace = NamespaceName::new("tenant").expect("namespace");
             let attach = receiver(address);
-            plan_link(&planning, &namespace, address, &attach, None).await
+            plan_link(&planning, &namespace, address, &attach, None, None).await
         });
         let captured = tokio::time::timeout(Duration::from_secs(2), observed.recv())
             .await
@@ -196,7 +196,7 @@ async fn replacing_an_entity_between_admission_and_session_acquisition_never_acq
             Ok(_) => panic!("stale plan must refuse"),
         };
         assert_eq!(
-            error.condition.as_symbol(),
+            error.primary.condition.as_symbol(),
             amqp::Symbol::from(crate::NOT_FOUND)
         );
         assert_eq!(*broker.attempts.lock().expect("attempts"), [captured]);
@@ -235,6 +235,7 @@ async fn authorization_denial_precedes_admission_even_when_a_session_filter_is_v
                 address,
                 &attach,
                 Some(&authorization),
+                None,
             ),
         )
         .await
@@ -244,7 +245,7 @@ async fn authorization_denial_precedes_admission_even_when_a_session_filter_is_v
             Ok(_) => panic!("Listen must be denied"),
         };
         assert_eq!(
-            error.condition.as_symbol(),
+            error.primary.condition.as_symbol(),
             amqp::Symbol::from("amqp:unauthorized-access")
         );
     }

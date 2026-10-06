@@ -459,6 +459,7 @@ impl Fixture {
             },
             &receipt,
             Some(&self.authorization),
+            self.session.as_ref().map(|session| (session, &receipt)),
         )
         .await;
         let error = match result {
@@ -469,7 +470,7 @@ impl Fixture {
             self.session
                 .as_ref()
                 .expect("session")
-                .reject_attach(receipt, error),
+                .reject_attach(receipt, error.primary.into_error()),
         )
         .await
         .expect("native pending denial");
@@ -655,6 +656,7 @@ impl Fixture {
             "orders",
             &receipt,
             Some(&self.authorization),
+            self.session.as_ref().map(|session| (session, &receipt)),
         ))
         .await
         .expect("authorized plan");
@@ -681,6 +683,7 @@ impl Fixture {
             "orders",
             &receipt,
             Some(&self.authorization),
+            self.session.as_ref().map(|session| (session, &receipt)),
         ))
         .await
         .expect("authorized listen plan");

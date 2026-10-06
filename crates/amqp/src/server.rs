@@ -42,6 +42,8 @@ mod outgoing_reservation;
 mod owned_connection_tasks;
 mod peer_close_observation;
 mod pending_attach_refusal;
+#[cfg(test)]
+mod pending_origin_tests;
 mod receive_credit;
 mod retained_delivery;
 mod sender_identity;
@@ -747,6 +749,17 @@ impl ServerConnection {
 }
 
 impl ServerSession {
+    /// Validates this receipt's original session, link generation and frozen identity.
+    /// This does not certify actor-owned pending-map membership or acceptance.
+    pub fn validate_incoming_attach_origin(
+        &self,
+        attach: &IncomingAttach,
+    ) -> Result<(), EngineError> {
+        attach
+            .validate_request(&self.identity)
+            .map_err(attach_approval_error)
+    }
+
     pub async fn next_incoming_attach(&mut self) -> Option<IncomingAttach> {
         while let Some(attach) = self.incoming_attaches.recv().await {
             if !self.identity.is_retired() && !attach.approval().link_identity().is_retired() {

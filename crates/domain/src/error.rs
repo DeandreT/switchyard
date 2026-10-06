@@ -1,6 +1,7 @@
 use storage::StorageError;
 use thiserror::Error;
 
+use crate::EntityPath;
 use crate::{
     AtomicMessagingLimit, CodecError, EntityDeleteLimit, IdentifierError, IngressBatchLimit,
     NamespaceName, QueueConfigError, QueueCounterKind, QueueImmutableProperty, RuleMatchLimit,
@@ -200,5 +201,16 @@ pub enum BrokerError {
     EntityDeleteTooLarge {
         limit: EntityDeleteLimit,
         maximum: usize,
+    },
+    #[error("session cursor identifiers are invalid")]
+    InvalidSessionCursor,
+    #[error(
+        "session cursor scope {cursor_namespace}/{cursor_entity} does not match requested scope {namespace}/{entity}"
+    )]
+    SessionCursorScopeMismatch {
+        namespace: NamespaceName,
+        entity: EntityPath,
+        cursor_namespace: NamespaceName,
+        cursor_entity: EntityPath,
     },
 }

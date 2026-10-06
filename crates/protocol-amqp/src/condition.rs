@@ -101,7 +101,9 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::QueuePageLimitExceeded { .. }
         | BrokerError::QueueCursorNamespaceMismatch { .. }
         | BrokerError::TopicPageLimitExceeded { .. }
-        | BrokerError::TopicCursorNamespaceMismatch { .. } => INVALID_FIELD,
+        | BrokerError::TopicCursorNamespaceMismatch { .. }
+        | BrokerError::InvalidSessionCursor
+        | BrokerError::SessionCursorScopeMismatch { .. } => INVALID_FIELD,
         BrokerError::QueueConfig(_)
         | BrokerError::TopicConfig(_)
         | BrokerError::SubscriptionConfig(_)

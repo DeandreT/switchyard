@@ -8,6 +8,7 @@ use crate::{
     SessionId, SqlAction, SubscriptionConfig, SubscriptionConfigUpdate, SubscriptionName,
     Timestamp, TopicConfig, TopicConfigUpdate,
 };
+use crate::{SessionCursor, SessionPageOutcome};
 
 /// One replicated instruction for the broker state machine.
 ///
@@ -366,6 +367,13 @@ pub enum CommandKind {
         /// Overrides the queue default when set.
         lock_duration_millis: Option<u64>,
     },
+    /// Inspects one bounded page of ready session groups and grants the first
+    /// one not held at this command's owner-authoritative timestamp.
+    AcceptNextSessionPage {
+        after: Option<SessionCursor>,
+        /// Overrides the queue default when set.
+        lock_duration_millis: Option<u64>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -435,4 +443,5 @@ pub enum CommandOutcome {
     QueueDeleted,
     TopicDeleted,
     SubscriptionDeleted,
+    SessionPage(SessionPageOutcome),
 }

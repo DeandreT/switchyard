@@ -31,6 +31,7 @@ mod entity_deletion;
 mod incarnations;
 mod message_retention;
 mod rules;
+mod session_paging;
 mod topic_fanout;
 mod topic_paging;
 mod topic_scheduling;
@@ -43,6 +44,7 @@ pub use entity_deletion::{
     MAX_ENTITY_DELETE_KEY_BYTES, MAX_ENTITY_DELETE_KEYS, MAX_ENTITY_DELETE_VALUE_BYTES,
 };
 
+pub use session_paging::{MAX_SESSION_PAGE_GROUPS, SessionCursor, SessionPageOutcome};
 pub use topic_fanout::{
     MAX_TOPIC_FANOUT_CONTENT_BYTES, MAX_TOPIC_FANOUT_COPIES, MAX_TOPIC_FANOUT_VALUE_ITEMS,
 };
@@ -602,6 +604,15 @@ impl<S: StateStore> StateMachine<S> {
             } => self.accept_session(
                 command,
                 session_id.as_ref(),
+                *lock_duration_millis,
+                &mut batch,
+            )?,
+            CommandKind::AcceptNextSessionPage {
+                after,
+                lock_duration_millis,
+            } => self.accept_next_session_page(
+                command,
+                after.as_ref(),
                 *lock_duration_millis,
                 &mut batch,
             )?,

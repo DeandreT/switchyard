@@ -78,6 +78,7 @@ pub use machine::{
     MAX_TOPIC_FANOUT_VALUE_ITEMS, MAX_TOPIC_PAGE_SIZE, QueueCursor, QueuePage, StateMachine,
     TIMER_SCAN_LIMIT, TopicCursor, TopicPage,
 };
+pub use machine::{MAX_SESSION_PAGE_GROUPS, SessionCursor, SessionPageOutcome};
 pub use message::{
     DeadLetterInfo, DeadLetterReason, Delivery, DeliveryGuarantee, DeliveryLock, LockToken,
     MAX_MESSAGE_ID_LENGTH, MessageRecord, MessageState, MessageStatus, ReceiveMode, SequenceNumber,

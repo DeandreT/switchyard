@@ -97,6 +97,12 @@ impl ConnectionAuthorization {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) async fn invalidate_grants_for_test(&self) {
+        self.grants.write().await.clear();
+        self.grant_changed.notify_waiters();
+    }
+
     pub(crate) fn authorization_timeout(&self) -> Duration {
         self.authorization_timeout
     }

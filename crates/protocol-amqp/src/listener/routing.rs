@@ -8,6 +8,7 @@ pub(super) async fn plan_link<B: Broker>(
     address: &str,
     attach: &Attach,
     authorization: Option<&Arc<ConnectionAuthorization>>,
+    original: Option<(&ServerSession, &amqp::IncomingAttach)>,
 ) -> Result<
     (
         EntityPath,
@@ -15,7 +16,7 @@ pub(super) async fn plan_link<B: Broker>(
         Option<LinkAuthorization>,
         BoundBroker<B>,
     ),
-    AmqpProtocolError,
+    super::session_paging::PlanningFailure,
 > {
     let target = parse_attachment(address)
         .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?;
@@ -49,7 +50,8 @@ pub(super) async fn plan_link<B: Broker>(
         return Err(error_for(
             AmqpError::NotAllowed,
             format!("{entity} does not support this data link role"),
-        ));
+        )
+        .into());
     }
     if attach.role != Role::Receiver {
         return Ok((entity, None, link_authorization, broker));
@@ -61,11 +63,22 @@ pub(super) async fn plan_link<B: Broker>(
     {
         return Err(rejection_error(&BrokerRejection::Refused(
             domain::BrokerError::SessionRequired,
-        )));
+        ))
+        .into());
     }
     let session_id = match session_request {
         SessionRequest::None => return Ok((entity, None, link_authorization, broker)),
-        SessionRequest::NextAvailable => None,
+        SessionRequest::NextAvailable => {
+            let accepted = super::session_paging::next_session(
+                &broker,
+                namespace,
+                &entity,
+                original,
+                link_authorization.as_ref(),
+            )
+            .await?;
+            return Ok((entity, Some(accepted), link_authorization, broker));
+        }
         SessionRequest::Named(session_id) => Some(session_id),
     };
     match broker
@@ -86,12 +99,14 @@ pub(super) async fn plan_link<B: Broker>(
             ErrorCondition::Custom(Symbol::from(crate::TIMEOUT)),
             String::from("no session is available to accept"),
             None,
-        )),
+        )
+        .into()),
         Ok(other) => Err(error_for(
             AmqpError::InternalError,
             format!("accepting a session produced an unexpected outcome: {other:?}"),
-        )),
-        Err(rejection) => Err(rejection_error(&rejection)),
+        )
+        .into()),
+        Err(rejection) => Err(rejection_error(&rejection).into()),
     }
 }
 

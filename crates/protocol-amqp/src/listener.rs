@@ -42,6 +42,9 @@ mod owned_tasks;
 mod receiving;
 mod retained_connection;
 mod routing;
+mod session_paging;
+#[cfg(test)]
+mod session_paging_tests;
 mod websocket;
 
 pub use retained_connection::{
@@ -429,13 +432,21 @@ async fn serve_session<B: Broker>(
             address,
             &attach,
             authorization.as_ref(),
+            Some((&session, &attach)),
         )
         .await;
         let plan = match plan {
-            Ok(plan) => Ok::<_, AmqpProtocolError>(plan),
-            Err(error) => {
-                warn!(%address, condition = ?error.condition, "refusing link");
-                match session.reject_attach(attach, error).await {
+            Ok(plan) => Ok::<_, session_paging::PlanningFailure>(plan),
+            Err(failure) => {
+                warn!(%address, condition = ?failure.primary.condition, "refusing link");
+                let refusal = session
+                    .reject_attach(attach, failure.primary.refusal())
+                    .await;
+                failure.report();
+                if failure.cleanup_failed() {
+                    return Err(Box::new(failure));
+                }
+                match refusal {
                     Ok(()) | Err(EngineError::RemoteDetached) => continue,
                     Err(error) => return Err(error.into()),
                 }
@@ -472,8 +483,21 @@ async fn serve_session<B: Broker>(
             Ok(endpoint) => endpoint,
             Err(error) => {
                 if let Ok((entity, Some(accepted), _, bound)) = &plan {
-                    let hold = accepted.hold();
-                    release_session(bound, &namespace, entity, Some(&hold)).await;
+                    let failure = session_paging::AcceptanceFailure {
+                        primary: error,
+                        release: session_paging::release_accepted(
+                            bound, &namespace, entity, accepted,
+                        )
+                        .await,
+                    };
+                    failure.report();
+                    if failure.cleanup_failed() {
+                        return Err(Box::new(failure));
+                    }
+                    if matches!(failure.primary, EngineError::RemoteDetached) {
+                        continue;
+                    }
+                    return Err(Box::new(failure));
                 }
                 if matches!(error, EngineError::RemoteDetached) {
                     continue;
@@ -486,8 +510,12 @@ async fn serve_session<B: Broker>(
             Err(error) => {
                 // Refusing the link rather than the connection: another link on
                 // the same session may be perfectly valid.
-                warn!(%address, condition = ?error.condition, "refusing link");
-                detach_with(endpoint, error).await;
+                warn!(%address, condition = ?error.primary.condition, "refusing link");
+                detach_with(endpoint, error.primary.refusal()).await;
+                error.report();
+                if error.cleanup_failed() {
+                    return Err(Box::new(error));
+                }
                 continue;
             }
         };
