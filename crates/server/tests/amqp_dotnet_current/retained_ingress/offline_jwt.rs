@@ -1,5 +1,6 @@
-//! Current-SDK conformance gate for offline JWT authorization over raw TLS.
+//! Current/previous SDK conformance gates for offline JWT authorization over raw TLS.
 
+use super::super::PREVIOUS_SDK;
 use super::*;
 
 const OFFLINE_SUCCESS: &str = "official .NET offline JWT Memory TLS send and LISTEN denial passed";
@@ -79,7 +80,18 @@ impl Error for OfflineGateFailure {
 #[ignore = "requires dotnet and a NuGet restore"]
 async fn current_stable_dotnet_client_uses_offline_jwt_for_tls_send_and_listen_denial() -> TestResult
 {
-    let artifacts = process::build_offline_jwt_client(CURRENT_SDK).await?;
+    run_offline_jwt_gate(CURRENT_SDK).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires dotnet and a NuGet restore"]
+async fn previous_stable_dotnet_client_uses_offline_jwt_for_tls_send_and_listen_denial()
+-> TestResult {
+    run_offline_jwt_gate(PREVIOUS_SDK).await
+}
+
+async fn run_offline_jwt_gate(sdk_version: &'static str) -> TestResult {
+    let artifacts = process::build_offline_jwt_client(sdk_version).await?;
     let dll = artifacts
         .path()
         .join("bin/Switchyard.Conformance.DotNetCurrent.dll");
