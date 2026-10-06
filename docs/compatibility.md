@@ -8,8 +8,8 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Queue and topic send, both batch-send APIs, ordinary/session subscription workflows, queue/topic scheduling/cancellation, duplicate detection and message properties; queue session renew/state/scheduling | Planned | Experimental gate on 7.21.0 |
-| Official .NET SDK, previous stable | Same gated workflows as current | Planned | Experimental gate on 7.20.2 |
+| Official .NET SDK, current stable | Queue and topic send, both batch-send APIs, ordinary/session subscription workflows, queue/topic scheduling/cancellation, duplicate detection and message properties; queue session renew/state/scheduling; isolated offline JWT Send/Listen denial over TLS | Planned | Experimental gate on 7.21.0 |
+| Official .NET SDK, previous stable | Same SAS-gated workflows as current; offline JWT not gated | Planned | Experimental gate on 7.20.2 |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
 ## Capability Matrix
@@ -22,7 +22,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | --- | --- | --- |
 | AMQP 1.0 over TLS | Pre-1.0 | Protocol edge, Rust client end to end |
 | AMQP over WebSockets | Pre-1.0 | Opt-in WS/WSS listener, bounded binary transport, both Rust backends and both pinned .NET clients; see [WebSocket Transport](websocket-transport.md) |
-| SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. Offline JWT: opt-in TLS CBS library path; no CLI or official SDK JWT gate yet |
+| SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. Offline JWT: opt-in TLS CBS library path; isolated current .NET TokenCredential gate for Linux/Memory/raw TLS; no CLI activation |
 | Queue send, receive, and settlement | Pre-1.0 | State machine |
 | Atomic message batch send | Pre-1.0 | State machine, AMQP producer mapping, Rust clients on both backends and both pinned .NET batch APIs |
 | Message properties and AMQP body preservation | Pre-1.0 | State machine and AMQP mapping; typed properties, application values, annotations, footer and all body kinds. Rust clients on both backends and official .NET property gate |
@@ -752,6 +752,54 @@ diagnostic probe recorded `SendAfterClosing`. All eight final wire checks
 passed without weakening peer-Close, native Reader identity or server-close
 checks. These fixture corrections do not establish a cause or fix for an
 earlier SDK failure, a whole-Broker cleanup guarantee or cloud parity.
+
+An official .NET 7.21.0 `TokenCredential` gate is scoped to
+Linux, MemoryStore and raw TLS. Its custom credential requires the exact SDK
+requested scope `https://servicebus.azure.net/.default`; that string is separate
+from the pinned JWT resource audience `urn:switchyard:tenant` and the CBS
+requested entity scope. The fixture signs a fresh local RS256 `at+jwt` token
+with a 3,300-second lifetime and returns an `AccessToken` whose expiry equals
+the signed `exp`. The listener combines the existing legal empty SAS policy
+with a JWT subject bound only to Send on one queue.
+
+The isolated procedure requires one successful send followed by the specific
+`UnauthorizedAccessException` for a Listen attempt, not merely an empty
+receive or any failure. Its completion marker is emitted only after the C#
+sender, receiver and client disposals. The Rust gate keeps the original client
+future and covered holder reports through their joins before propagating the
+original error or panic. Its canonical Memory assertions require the original
+message to remain Ready with delivery count zero, `next_sequence == 2`,
+`next_lock_token == 1` and no message/session lock-index rows. This is not a
+whole-Broker cleanup or native-health certificate.
+
+An initial current-JWT run returned null for Listen instead of the required
+`UnauthorizedAccessException`. The experimental atomic listener accepted
+ordinary Attach before detaching with an error; it now rejects the original
+pending Attach with null termini and the authorization error. A wire
+regression fails before this change, and the same scoped SDK case passes
+afterward. This does not explain unrelated earlier SDK failures.
+
+This gate does not cover the previous SDK, WSS, Fjall, CLI policy-file
+activation, token refresh, OIDC or cloud authentication. It is not a general
+official-client compatibility claim.
+
+Verification: the closed default workspace passed 5,426 tests with no failures
+and twelve ignored SDK gates. The three new regular checks (two finite-label
+diagnostic cases and the both-role refusal regression) passed. All twelve
+official .NET gates were then executed and passed, including the one new
+current-only JWT case and the unchanged eleven SAS case identities. The full
+protocol package passed 582 tests. Both strict Clippy configurations, both
+workspace builds and formatting passed. Fresh all-features no-run output
+supplied the same 138 test executable paths used in that workspace run; it
+is not a second runtime pass.
+
+Five failed attempts are retained: one new Rust test compilation error, three
+current-JWT runs and the before-fix wire regression. The compilation error
+was resolved by an explicit boxed-error coercion in the new test. Fixed-label
+diagnostics distinguished a fixture-owned missing-denial assertion without
+printing token, key, argument or raw exception text. The final scoped gate
+preserves its specific unauthorized exception and canonical state checks.
+The value envelope remains version 11 and the durable base layout version 16.
 
 A separate pure `auth::JwtPolicy` library provides a narrow offline JWT
 validator; it does not activate the JWT wire path described above.
