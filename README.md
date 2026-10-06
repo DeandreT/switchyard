@@ -67,10 +67,22 @@ Inspect the current development configuration:
 
 ```sh
 cargo run -p server -- \
+  --check-config \
   --mode development \
   --storage memory \
   --voters 1
 ```
+
+The opt-in check returns silently on success. Configured TLS and shared-access
+credential files are still read. It does not open or inspect a store, bind
+listeners, or establish readiness.
+
+A zero `--sweep-interval-millis` is refused before credential I/O, after the
+experimental-listener and maintenance feature guards. Positive values retain
+their existing range. The public `StartupError::ZeroSweepInterval` variant
+requires exhaustive library matches to be updated; the shared
+`server::validate_storage_configuration` helper checks cluster/backend policy
+without storage access.
 
 Inspect the compatibility status exposed by the CLI:
 
