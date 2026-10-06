@@ -18,7 +18,6 @@ use crate::{
 };
 
 mod adapter;
-#[cfg(test)]
 pub(super) use adapter::Branch;
 use adapter::{DefaultWorkers, accepted, launch};
 pub(super) use adapter::{RouteError, WorkerTasks, stop_connection};

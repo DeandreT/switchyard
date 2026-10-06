@@ -2,9 +2,12 @@ use std::sync::{Arc, Mutex};
 
 use tokio::{
     sync::watch,
-    task::{JoinError, JoinHandle},
+    task::{Id, JoinError, JoinHandle},
 };
 
+use super::super::peer_close_observation::{
+    ServerConnectionAbortSource, ServerConnectionTaskObservation,
+};
 use super::locked;
 
 pub(super) enum State {
@@ -20,6 +23,7 @@ pub(super) enum State {
 pub(super) struct Role {
     pub(super) state: Mutex<State>,
     changed: watch::Sender<()>,
+    original: Mutex<Option<(Id, u8)>>,
 }
 
 impl Role {
@@ -28,6 +32,7 @@ impl Role {
         Self {
             state: Mutex::new(State::Dormant),
             changed,
+            original: Mutex::new(None),
         }
     }
 
@@ -35,7 +40,11 @@ impl Role {
         self.changed.send_replace(());
     }
 
-    pub(super) async fn join(self: &Arc<Self>, abort: bool, finalize_absent: bool) {
+    pub(super) async fn join(
+        self: &Arc<Self>,
+        abort: Option<ServerConnectionAbortSource>,
+        finalize_absent: bool,
+    ) {
         let mut changed = self.changed.subscribe();
         loop {
             let lease = {
@@ -61,8 +70,15 @@ impl Role {
                 }
             };
             if let Some(mut lease) = lease {
-                if abort {
-                    lease.handle.as_ref().expect("leased token").abort();
+                if let Some(source) = abort {
+                    let handle = lease.handle.as_ref().expect("leased token");
+                    {
+                        let mut original = locked(&self.original);
+                        let (id, sources) = original.as_mut().expect("installed original ID");
+                        assert_eq!(*id, handle.id(), "same original abort token");
+                        *sources |= source.bit();
+                    }
+                    handle.abort();
                 }
                 lease.outcome = Some(lease.handle.as_mut().expect("leased token").await);
                 drop(lease);
@@ -70,6 +86,12 @@ impl Role {
             }
             let _ = changed.changed().await;
         }
+    }
+
+    pub(super) fn observation(&self) -> Option<ServerConnectionTaskObservation> {
+        locked(&self.original)
+            .as_ref()
+            .map(|(id, sources)| ServerConnectionTaskObservation::new(*id, *sources))
     }
 
     pub(super) fn take_result(&self) -> Option<Result<(), JoinError>> {
@@ -99,7 +121,13 @@ impl Installation {
 
 impl Drop for Installation {
     fn drop(&mut self) {
-        let next = self.handle.take().map_or(State::Absent, State::Pending);
+        let next = match self.handle.take() {
+            Some(handle) => {
+                *locked(&self.role.original) = Some((handle.id(), 0));
+                State::Pending(handle)
+            }
+            None => State::Absent,
+        };
         {
             let mut state = locked(&self.role.state);
             *state = next;

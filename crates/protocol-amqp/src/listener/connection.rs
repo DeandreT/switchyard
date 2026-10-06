@@ -142,7 +142,7 @@ impl<B: NativeAtomicBroker> AmqpListener<B> {
 }
 
 #[derive(Clone, Copy)]
-enum AdmissionMode {
+pub(super) enum AdmissionMode {
     Ordinary,
     AtomicPosting,
     AtomicMessaging,

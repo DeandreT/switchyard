@@ -40,6 +40,7 @@ mod outgoing_delivery_identity;
 mod outgoing_identity;
 mod outgoing_reservation;
 mod owned_connection_tasks;
+mod peer_close_observation;
 mod pending_attach_refusal;
 mod receive_credit;
 mod retained_delivery;
@@ -95,6 +96,10 @@ use outgoing_reservation::{OutgoingReservations, ReservationRequest};
 pub use owned_connection_tasks::{
     RefusedServerConnection, ScopedConnectionAcceptance, ServerConnectionAcceptor,
     ServerConnectionJoinReport, ServerConnectionOwner, ServerConnectionTaskJoins,
+};
+pub use peer_close_observation::{
+    ServerConnectionAbortSource, ServerConnectionObservations, ServerConnectionTaskObservation,
+    ServerPeerCloseObservation, ServerPeerCloseReplyState,
 };
 use receive_credit::{Consumption, ReceiveCredit};
 pub use retained_delivery::RetainedDelivery;
@@ -1412,6 +1417,7 @@ async fn run_connection<Io>(
     consumed: Arc<Notify>,
     mut cancellation: watch::Receiver<bool>,
     reader_birth: connection_launch::ReaderBirth,
+    peer_close: Option<Arc<peer_close_observation::PeerCloseCell>>,
 ) where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
@@ -1530,7 +1536,10 @@ async fn run_connection<Io>(
                                 remote_max_frame_size,
                                 settings.remote_channel_max,
                                 activity.is_closing(),
-                                ConnectionScope::Native(connection),
+                                match peer_close.as_deref() {
+                                    Some(cell) => ConnectionScope::Observed(connection, cell),
+                                    None => ConnectionScope::Native(connection),
+                                },
                                 &mut native_transactions,
                             ).await {
                                 Ok(FrameAction::Continue) => pump_ready = true,
@@ -1549,6 +1558,7 @@ async fn run_connection<Io>(
                                     }
                                     break;
                                 }
+                                Ok(FrameAction::ClosedReplyFailure) => break,
                                 Err(error) => {
                                     tracing::debug!(%error, "AMQP server frame handling failed");
                                     break;
@@ -1646,10 +1656,15 @@ enum FrameAction {
     Continue,
     CloseSent,
     Closed,
+    ClosedReplyFailure,
 }
 
 enum ConnectionScope<'a> {
     Native(&'a NativeConnectionIdentity),
+    Observed(
+        &'a NativeConnectionIdentity,
+        &'a peer_close_observation::PeerCloseCell,
+    ),
     #[cfg(test)]
     Unbound,
 }
@@ -1817,10 +1832,30 @@ async fn handle_frame_scoped<W: AsyncWrite + Unpin>(
         }
     }
 
+    if let ConnectionScope::Observed(identity, cell) = &connection
+        && let Performative::Close(close) = performative
+    {
+        let observed = cell.receive(identity, close, peer_channel, payload, locally_closing);
+        let reply = peer_close_observation::ReplyLoan::new(observed);
+        native_transactions.close_all();
+        outgoing_reservation::close_all(sessions);
+        if !locally_closing {
+            let failed = peer_close_observation::observe_reply(
+                reply,
+                writer.write_amqp(0, Performative::Close(Close::default()), Vec::new()),
+            )
+            .await;
+            if failed {
+                return Ok(FrameAction::ClosedReplyFailure);
+            }
+        }
+        return Ok(FrameAction::Closed);
+    }
+
     match performative {
         Performative::Begin(begin) => {
             let mut session = match connection {
-                ConnectionScope::Native(connection) => {
+                ConnectionScope::Native(connection) | ConnectionScope::Observed(connection, _) => {
                     SessionState::for_connection(&begin, connection)
                 }
                 #[cfg(test)]

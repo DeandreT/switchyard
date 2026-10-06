@@ -17,3 +17,7 @@ use tokio::runtime::Handle;
 use super::controls::{Gate, PayloadCounter};
 use super::*;
 use fixture::{TestResult, launch, negotiated, observe_gate, poll_once};
+
+mod abort_observations;
+mod observation_fixture;
+mod peer_close_observations;

@@ -393,6 +393,48 @@ fn receive_batch_command(
     command
 }
 
+pub(crate) async fn build_retained_client() -> TestResult<tempfile::TempDir> {
+    build_client(CURRENT_SDK).await
+}
+
+pub(crate) fn retained_client_command(
+    dll: &Path,
+    endpoint: &str,
+    queue: &str,
+    ca_file: &Path,
+    ca_directory: &Path,
+) -> Command {
+    let mut command = Command::new("dotnet");
+    command
+        .env("DOTNET_PROCESSOR_COUNT", "2")
+        .env("SSL_CERT_FILE", ca_file)
+        .env("SSL_CERT_DIR", ca_directory)
+        .arg(dll)
+        .arg("retained-ingress")
+        .arg(HOST)
+        .arg(endpoint)
+        .arg(queue)
+        .arg(RULE)
+        .arg(KEY);
+    command
+}
+
+pub(crate) async fn run_retained_client(
+    dll: &Path,
+    endpoint: &str,
+    queue: &str,
+    ca_file: &Path,
+    ca_directory: &Path,
+) -> TestResult<Output> {
+    run(
+        retained_client_command(dll, endpoint, queue, ca_file, ca_directory),
+        "official retained Memory transaction client",
+        RUN_DEADLINE,
+        MAX_OUTPUT_BYTES,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

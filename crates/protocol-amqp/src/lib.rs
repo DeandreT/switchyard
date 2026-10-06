@@ -28,6 +28,15 @@ mod transaction_registry;
 
 use thiserror::Error;
 
+pub use listener::{
+    RetainedAtomicMessagingAdmissionOutcome, RetainedAtomicMessagingBuildError,
+    RetainedAtomicMessagingControl, RetainedAtomicMessagingDrain, RetainedAtomicMessagingLimits,
+    RetainedAtomicMessagingLimitsError, RetainedAtomicMessagingOwner,
+    RetainedAtomicMessagingProgress, RetainedAtomicMessagingReport,
+    RetainedAtomicMessagingSessionOutcome, RetainedAtomicMessagingStarter,
+    RetainedAtomicMessagingWorkerBranch, RetainedAtomicMessagingWorkerOutcome,
+};
+
 pub use crate::{
     address::{
         Attachment, DEAD_LETTER_SUFFIX, SUBSCRIPTION_SEGMENT, namespace_from_hostname,

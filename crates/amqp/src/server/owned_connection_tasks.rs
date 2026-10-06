@@ -17,6 +17,9 @@ use tokio::{runtime::Handle, sync::watch, task::JoinError};
 #[cfg(test)]
 use super::NativeConnectionIdentity;
 use super::connection_launch::{ActorBirth, NegotiatedConnection};
+use super::peer_close_observation::{
+    PeerCloseCell, ServerConnectionAbortSource, ServerConnectionObservations,
+};
 use super::{
     ConnectionLifecycle, ConnectionOptions, EngineError, NativeIngressPolicy, SaslAuthenticator,
     ServerConnection,
@@ -73,6 +76,7 @@ pub struct ServerConnectionOwner<A> {
     actor: Arc<Role>,
     reader: Arc<Role>,
     stop: Arc<Mutex<Stop>>,
+    peer_close: Arc<PeerCloseCell>,
     #[cfg(test)]
     observations: Arc<Mutex<Observations>>,
     runtime: Handle,
@@ -100,6 +104,7 @@ pub struct ServerConnectionAcceptor {
     actor: Arc<Role>,
     reader: Arc<Role>,
     stop: Arc<Mutex<Stop>>,
+    peer_close: Arc<PeerCloseCell>,
     #[cfg(test)]
     observations: Arc<Mutex<Observations>>,
     runtime: Handle,
@@ -130,13 +135,16 @@ impl<Io> RefusedServerConnection<Io> {
 pub struct ServerConnectionTaskJoins {
     pub actor: Option<Result<(), JoinError>>,
     pub reader: Option<Result<(), JoinError>>,
+    pub observations: ServerConnectionObservations,
 }
 
 /// An opaque report emitted only after all CREATED socket tasks actually joined.
 ///
 /// Identity retirement, exit notifications, abort requests and driver return are
 /// not this barrier. Internally handled Actor I/O errors remain internal: these
-/// original unit-task results cannot newly explain them. Raw panic payloads and
+/// original unit-task results cannot explain arbitrary handled I/O errors. Scoped
+/// observations retain only original peer-Close/reply data and actual abort calls.
+/// They are not cancellation-cause or health certificates. Raw panic payloads and
 /// anchor were retained until both joins; dropping them afterward can still panic.
 ///
 /// ```compile_fail
@@ -144,10 +152,14 @@ pub struct ServerConnectionTaskJoins {
 ///     actor: None, reader: None, anchor: (),
 /// };
 /// ```
+/// ```compile_fail
+/// let _observation = amqp::ServerPeerCloseObservation {};
+/// ```
 #[must_use]
 pub struct ServerConnectionJoinReport<A> {
     actor: Option<Result<(), JoinError>>,
     reader: Option<Result<(), JoinError>>,
+    observations: ServerConnectionObservations,
     anchor: A,
 }
 
@@ -160,6 +172,10 @@ impl<A> ServerConnectionJoinReport<A> {
         self.reader.as_ref()
     }
 
+    pub fn observations(&self) -> &ServerConnectionObservations {
+        &self.observations
+    }
+
     pub fn anchor(&self) -> &A {
         &self.anchor
     }
@@ -169,6 +185,7 @@ impl<A> ServerConnectionJoinReport<A> {
             ServerConnectionTaskJoins {
                 actor: self.actor,
                 reader: self.reader,
+                observations: self.observations,
             },
             self.anchor,
         )
@@ -207,6 +224,7 @@ impl<A> ServerConnectionOwner<A> {
             actor: Arc::new(Role::new()),
             reader: Arc::new(Role::new()),
             stop: Arc::new(Mutex::new(Stop::default())),
+            peer_close: Arc::new(PeerCloseCell::new()),
             #[cfg(test)]
             observations: Arc::new(Mutex::new(Observations::default())),
             runtime,
@@ -224,6 +242,7 @@ impl<A> ServerConnectionOwner<A> {
             actor: self.actor.clone(),
             reader: self.reader.clone(),
             stop: self.stop.clone(),
+            peer_close: self.peer_close.clone(),
             #[cfg(test)]
             observations: self.observations.clone(),
             runtime: self.runtime.clone(),
@@ -258,14 +277,21 @@ impl<A> ServerConnectionOwner<A> {
         }
         self.stop();
         // The actual actor barrier eliminates its only reader creator/borrower.
-        self.actor.join(false, true).await;
-        self.reader.join(true, true).await;
+        self.actor.join(None, true).await;
+        self.reader
+            .join(Some(ServerConnectionAbortSource::OwnerFinish), true)
+            .await;
         let actor = self.actor.take_result();
         let reader = self.reader.take_result();
         self.reported = true;
         Some(ServerConnectionJoinReport {
             actor,
             reader,
+            observations: ServerConnectionObservations::new(
+                self.peer_close.clone(),
+                self.actor.observation(),
+                self.reader.observation(),
+            ),
             anchor: self.anchor.take().expect("live anchor"),
         })
     }
@@ -403,6 +429,7 @@ impl ServerConnectionAcceptor {
             installation: role::Installation::new(self.actor.clone()),
             reader: self.reader,
             stop: self.stop,
+            peer_close: self.peer_close,
             #[cfg(test)]
             observations: self.observations,
             runtime: self.runtime,
@@ -419,6 +446,7 @@ pub(super) struct ActorClaim {
     installation: role::Installation,
     reader: Arc<Role>,
     stop: Arc<Mutex<Stop>>,
+    peer_close: Arc<PeerCloseCell>,
     #[cfg(test)]
     observations: Arc<Mutex<Observations>>,
     runtime: Handle,
@@ -427,6 +455,10 @@ pub(super) struct ActorClaim {
 }
 
 impl ActorClaim {
+    pub(super) fn peer_close(&self) -> &Arc<PeerCloseCell> {
+        &self.peer_close
+    }
+
     pub(super) fn bind(&self, lifecycle: &ConnectionLifecycle) {
         #[cfg(test)]
         self.controls.before_bind();
@@ -529,7 +561,12 @@ pub(super) struct ReaderView {
 
 impl ReaderView {
     pub(super) async fn shutdown(&self) {
-        self.role.join(true, false).await;
+        self.role
+            .join(
+                Some(ServerConnectionAbortSource::ActorReaderShutdown),
+                false,
+            )
+            .await;
     }
 }
 

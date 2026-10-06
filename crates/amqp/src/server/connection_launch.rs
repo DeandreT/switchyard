@@ -150,6 +150,13 @@ impl ReaderBirth {
 }
 
 impl ActorBirth {
+    fn peer_close(&self) -> Option<&Arc<super::peer_close_observation::PeerCloseCell>> {
+        match self {
+            Self::Legacy => None,
+            Self::Scoped(claim) => Some(claim.peer_close()),
+        }
+    }
+
     fn reader(&self, lifecycle: &ConnectionLifecycle) -> ReaderBirth {
         match self {
             Self::Legacy => ReaderBirth::Legacy,
@@ -193,6 +200,7 @@ impl<Io: AsyncRead + AsyncWrite + Send + Unpin + 'static> NegotiatedConnection<I
         let driver_consumed = consumed.clone();
         let (lifecycle, cancellation, actor_exit) = ConnectionLifecycle::new();
         let reader_birth = birth.reader(&lifecycle);
+        let peer_close = birth.peer_close().cloned();
         #[cfg(test)]
         let final_guard = birth.final_guard();
         birth.spawn(async move {
@@ -209,6 +217,7 @@ impl<Io: AsyncRead + AsyncWrite + Send + Unpin + 'static> NegotiatedConnection<I
                 driver_consumed,
                 cancellation,
                 reader_birth,
+                peer_close,
             )
             .await;
             drop(exit_guard);

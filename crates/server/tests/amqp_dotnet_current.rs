@@ -36,6 +36,10 @@ mod rule_actions;
 #[path = "amqp_dotnet_current/receive_batch.rs"]
 mod receive_batch;
 
+#[cfg(target_os = "linux")]
+#[path = "amqp_dotnet_current/retained_ingress.rs"]
+mod retained_ingress;
+
 struct TestTimer {
     shutdown: Arc<Shutdown>,
     thread: Option<JoinHandle<()>>,

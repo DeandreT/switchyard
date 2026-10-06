@@ -16,6 +16,11 @@ if (args.Length > 0 && args[0] == "rule-actions")
     return await RuleActionCases.RunAsync(args);
 }
 
+if (args.Length > 0 && args[0] == "retained-ingress")
+{
+    return await RetainedIngressCases.RunAsync(args);
+}
+
 if (args.Length > 0 && args[0] == "atomic-messaging")
 {
     return await AtomicMessagingCases.RunAsync(args);

@@ -23,6 +23,16 @@ mod owner;
 mod routing;
 mod workers;
 
+mod retained_messaging;
+pub use retained_messaging::{
+    RetainedAtomicMessagingAdmissionOutcome, RetainedAtomicMessagingBuildError,
+    RetainedAtomicMessagingControl, RetainedAtomicMessagingDrain, RetainedAtomicMessagingLimits,
+    RetainedAtomicMessagingLimitsError, RetainedAtomicMessagingOwner,
+    RetainedAtomicMessagingProgress, RetainedAtomicMessagingReport,
+    RetainedAtomicMessagingSessionOutcome, RetainedAtomicMessagingStarter,
+    RetainedAtomicMessagingWorkerBranch, RetainedAtomicMessagingWorkerOutcome,
+};
+
 #[cfg(test)]
 mod retained_session;
 

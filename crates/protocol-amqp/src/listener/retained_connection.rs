@@ -7,13 +7,18 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use amqp::{ServerConnectionAcceptor, ServerConnectionJoinReport, ServerConnectionOwner};
+use amqp::{
+    ServerConnectionAcceptor, ServerConnectionJoinReport, ServerConnectionObservations,
+    ServerConnectionOwner,
+};
 use tokio::{net::TcpStream, runtime::Handle, task::JoinError};
 
 use super::AmqpListener;
 
 #[cfg(test)]
 pub(super) mod controls;
+#[cfg(test)]
+mod observation_tests;
 mod outcomes;
 pub(super) mod ready;
 mod wrapper;
@@ -47,6 +52,7 @@ pub struct RetainedConnectionTaskJoins {
     pub wrapper: Option<Result<(), JoinError>>,
     pub actor: Option<Result<(), JoinError>>,
     pub reader: Option<Result<(), JoinError>>,
+    pub native_observations: ServerConnectionObservations,
 }
 
 /// Observed values only; missing data is not an invented success or guessed cause.
@@ -65,7 +71,9 @@ pub struct RetainedConnectionOutcomes {
 /// The anchor need not be Send or 'static and never enters a task. These three
 /// joins do NOT cover socket acceptance, listener/session/link descendants,
 /// Broker jobs, certificates, native stores or fixture resources. A report does
-/// not certify safe reopen or explain internally handled engine I/O failures.
+/// not certify safe reopen or explain arbitrary internally handled engine failures.
+/// Native observations retain only original peer-Close/reply and abort-call data,
+/// never a cancellation-cause or health proof.
 ///
 /// Stop is cooperative and adds no wrapper/Actor hard abort or termination bound.
 /// Borrowed finish loss restores its token/results. Dropping the unfinished root
@@ -248,6 +256,10 @@ impl<A> RetainedConnectionJoinReport<A> {
         self.engine.reader()
     }
 
+    pub fn native_observations(&self) -> &ServerConnectionObservations {
+        self.engine.observations()
+    }
+
     pub fn outcomes(&self) -> &RetainedConnectionOutcomes {
         &self.outcomes
     }
@@ -263,6 +275,7 @@ impl<A> RetainedConnectionJoinReport<A> {
                 wrapper: self.wrapper,
                 actor: engine.actor,
                 reader: engine.reader,
+                native_observations: engine.observations,
             },
             self.outcomes,
             anchor,

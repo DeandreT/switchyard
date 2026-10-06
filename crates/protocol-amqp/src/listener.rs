@@ -51,6 +51,15 @@ pub use retained_connection::{
     RetainedConnectionTaskJoins,
 };
 
+pub use atomic_ingress::{
+    RetainedAtomicMessagingAdmissionOutcome, RetainedAtomicMessagingBuildError,
+    RetainedAtomicMessagingControl, RetainedAtomicMessagingDrain, RetainedAtomicMessagingLimits,
+    RetainedAtomicMessagingLimitsError, RetainedAtomicMessagingOwner,
+    RetainedAtomicMessagingProgress, RetainedAtomicMessagingReport,
+    RetainedAtomicMessagingSessionOutcome, RetainedAtomicMessagingStarter,
+    RetainedAtomicMessagingWorkerBranch, RetainedAtomicMessagingWorkerOutcome,
+};
+
 use receiving::serve_receiving_client;
 use routing::{management_target, plan_link, plan_management};
 

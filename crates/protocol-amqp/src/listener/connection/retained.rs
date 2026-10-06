@@ -16,7 +16,9 @@ use crate::listener::retained_connection::{
 #[cfg(test)]
 mod socket_collector;
 
-trait RetainedDriver<B: Broker>: Send + 'static {
+pub(in crate::listener) trait RetainedDriver<B: Broker>:
+    Send + 'static
+{
     const ADMISSION: AdmissionMode;
 
     fn serve_retained_open<'a>(
@@ -64,7 +66,7 @@ impl<B: Broker> AmqpListener<B> {
         self.start_retained_with_driver(stream, starter, OrdinaryDriver)
     }
 
-    fn start_retained_with_driver<D: RetainedDriver<B>>(
+    pub(in crate::listener) fn start_retained_with_driver<D: RetainedDriver<B>>(
         self,
         stream: TcpStream,
         starter: RetainedConnectionStarter,
