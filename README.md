@@ -316,6 +316,9 @@ to refuse cancelled or expired queued work before the proposer starts. Already
 Started work retains its existing commit and lock-expiry boundaries.
 The sender-side listener uses [retained ingress receipts](docs/retained-ingress.md)
 to preserve native content accounting through broker replies and acknowledgment flush.
+The [pending Attach refusal API](docs/pending-attach-refusal.md) rejects ordinary
+links before endpoint installation or credit. Its native client waits for the
+original peer Detach before returning an already-retired handle.
 [Native connection identities](docs/native-connection-identity.md) preserve exact
 receipt origin and expose actor retirement without granting transaction authority.
 [Native receiver identities](docs/native-receiver-provenance.md) distinguish
