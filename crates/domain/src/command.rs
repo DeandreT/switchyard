@@ -147,8 +147,8 @@ pub enum CommandKind {
         body: Vec<u8>,
         /// Requests a lifetime, capped by the queue default when it is finite.
         time_to_live_millis: Option<u64>,
-        /// Required on a queue that requires sessions, and refused on one that
-        /// does not.
+        /// Required on session-required queues. On ordinary queues this is
+        /// optional metadata, not session ownership or a FIFO guarantee.
         session_id: Option<SessionId>,
     },
     Schedule {
@@ -356,6 +356,15 @@ pub enum CommandKind {
         session: Option<SessionHold>,
         disposition: SettlementDisposition,
         properties_to_modify: BTreeMap<String, MessageValue>,
+    },
+    /// Renews a protocol delivery under its original session authority.
+    /// None is valid only for ordinary queues and dead-letter shadows.
+    RenewLockHeld {
+        sequence: SequenceNumber,
+        lock_token: LockToken,
+        session: Option<SessionHold>,
+        /// Overrides the queue default when set.
+        lock_duration_millis: Option<u64>,
     },
 }
 

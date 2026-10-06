@@ -1519,9 +1519,10 @@ async fn renew_message_lock<B: Broker>(
         .submit(
             namespace.clone(),
             entity.clone(),
-            CommandKind::RenewLock {
+            CommandKind::RenewLockHeld {
                 sequence: delivery.sequence,
                 lock_token,
+                session: delivery.session,
                 lock_duration_millis: None,
             },
         )
@@ -1889,6 +1890,9 @@ mod binding_tests;
 
 #[cfg(test)]
 mod held_settlement_tests;
+
+#[cfg(test)]
+mod held_renewal_tests;
 
 #[cfg(test)]
 mod tests {

@@ -516,8 +516,29 @@ impl<S: StateStore> StateMachine<S> {
                 *sequence,
                 *lock_token,
                 *lock_duration_millis,
+                None,
                 &mut batch,
             )?,
+            CommandKind::RenewLockHeld {
+                sequence,
+                lock_token,
+                session,
+                lock_duration_millis,
+            } => {
+                let config = self.load_config(command)?;
+                require_session_agreement(&config, session.is_some())?;
+                if let Some(hold) = session {
+                    self.held_session(command, hold)?;
+                }
+                self.renew_lock(
+                    command,
+                    *sequence,
+                    *lock_token,
+                    *lock_duration_millis,
+                    session.as_ref(),
+                    &mut batch,
+                )?
+            }
             CommandKind::ReceiveDeferred {
                 sequences,
                 mode,
@@ -2091,10 +2112,18 @@ impl<S: StateStore> StateMachine<S> {
         sequence: SequenceNumber,
         lock_token: LockToken,
         lock_duration_millis: Option<u64>,
+        original_session: Option<&SessionHold>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
         let config = self.load_config(command)?;
         let (mut record, previous_locked_until) = self.held_lock(command, sequence, lock_token)?;
+        if let Some(hold) = original_session
+            && record.session_id.as_ref() != Some(&hold.session_id)
+        {
+            return Err(BrokerError::SessionLockNotHeld {
+                session_id: hold.session_id.clone(),
+            });
+        }
         let locked_until = command
             .issued_at
             .saturating_add_millis(lock_duration_millis.unwrap_or(config.lock_duration_millis));
