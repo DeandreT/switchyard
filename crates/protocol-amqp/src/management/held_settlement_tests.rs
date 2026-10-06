@@ -91,9 +91,20 @@ impl Broker for Owner {
                 session: original.clone(),
             })
             .expect("release original");
+            let before = self.snapshot();
+            assert_eq!(
+                self.apply(CommandKind::AcceptSession {
+                    session_id: Some(original.session_id.clone()),
+                    lock_duration_millis: Some(1_000),
+                }),
+                Err(BrokerError::SessionTakeoverPending {
+                    session_id: original.session_id.clone()
+                })
+            );
+            assert_eq!(self.snapshot(), before);
             let CommandOutcome::SessionAccepted(Some(replacement)) = self
                 .apply(CommandKind::AcceptSession {
-                    session_id: Some(original.session_id),
+                    session_id: Some(SessionId::new("replacement").expect("different session")),
                     lock_duration_millis: Some(1_000),
                 })
                 .expect("takeover")
@@ -247,9 +258,20 @@ async fn reused_link_names_never_replace_a_deliverys_original_session_hold() {
         )
         .await;
     owner.now.store(111, Ordering::Release);
+    let before = owner.snapshot();
+    assert_eq!(
+        owner.apply(CommandKind::AcceptSession {
+            session_id: Some(original.session_id.clone()),
+            lock_duration_millis: Some(1_000),
+        }),
+        Err(BrokerError::SessionTakeoverPending {
+            session_id: original.session_id.clone()
+        })
+    );
+    assert_eq!(owner.snapshot(), before);
     let CommandOutcome::SessionAccepted(Some(replacement)) = owner
         .apply(CommandKind::AcceptSession {
-            session_id: Some(original.session_id.clone()),
+            session_id: Some(SessionId::new("replacement").expect("different session")),
             lock_duration_millis: Some(1_000),
         })
         .expect("takeover")
@@ -257,6 +279,7 @@ async fn reused_link_names_never_replace_a_deliverys_original_session_hold() {
         panic!("replacement")
     };
     assert_ne!(replacement.lock.token, original.token);
+    assert_ne!(replacement.session_id, original.session_id);
     owner
         .management
         .register_session(

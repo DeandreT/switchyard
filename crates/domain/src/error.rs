@@ -213,4 +213,6 @@ pub enum BrokerError {
         cursor_namespace: NamespaceName,
         cursor_entity: EntityPath,
     },
+    #[error("session {session_id} still has outstanding message locks")]
+    SessionTakeoverPending { session_id: SessionId },
 }

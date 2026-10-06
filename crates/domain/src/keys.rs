@@ -21,7 +21,8 @@
 //! byte and forge another scope's prefix.
 
 use crate::{
-    EntityPath, NamespaceName, RuleName, SequenceNumber, SessionId, SubscriptionName, Timestamp,
+    EntityPath, LockToken, NamespaceName, RuleName, SequenceNumber, SessionId, SubscriptionName,
+    Timestamp,
 };
 
 const TAG_CLOCK: u8 = 0x00;
@@ -44,6 +45,9 @@ const TAG_TOPIC_SUBSCRIPTION: u8 = 0x0F;
 const TAG_SUBSCRIPTION_RULE: u8 = 0x10;
 const TAG_ENTITY_INCARNATION: u8 = 0x11;
 const TAG_COMMITTED_CHECKPOINT: u8 = 0x12;
+const TAG_SESSION_MESSAGE_LOCK_REVERSE: u8 = 0x13;
+const TAG_SESSION_MESSAGE_LOCK_FORWARD: u8 = 0x14;
+const TAG_SESSION_MESSAGE_LOCK_SUMMARY: u8 = 0x15;
 
 const SEPARATOR: u8 = 0x00;
 
@@ -229,7 +233,7 @@ pub(crate) enum RuntimeKind {
     Other,
 }
 
-const RUNTIME_FAMILIES: [(u8, RuntimeKind); 10] = [
+const RUNTIME_FAMILIES: [(u8, RuntimeKind); 13] = [
     (TAG_MESSAGE, RuntimeKind::Message),
     (TAG_READY, RuntimeKind::Other),
     (TAG_LOCK, RuntimeKind::LocalToken),
@@ -240,19 +244,22 @@ const RUNTIME_FAMILIES: [(u8, RuntimeKind); 10] = [
     (TAG_SCHEDULED, RuntimeKind::Other),
     (TAG_DUPLICATE_HISTORY, RuntimeKind::Other),
     (TAG_DUPLICATE_HISTORY_EXPIRY, RuntimeKind::Other),
+    (TAG_SESSION_MESSAGE_LOCK_REVERSE, RuntimeKind::LocalToken),
+    (TAG_SESSION_MESSAGE_LOCK_FORWARD, RuntimeKind::LocalToken),
+    (TAG_SESSION_MESSAGE_LOCK_SUMMARY, RuntimeKind::LocalToken),
 ];
 
 pub(crate) fn entity_runtime_prefixes(
     namespace: &NamespaceName,
     entity: &EntityPath,
-) -> [(Vec<u8>, RuntimeKind); 10] {
+) -> [(Vec<u8>, RuntimeKind); 13] {
     RUNTIME_FAMILIES.map(|(tag, kind)| (entity_scope(tag, namespace, entity), kind))
 }
 
 pub(crate) fn subscription_runtime_prefixes(
     namespace: &NamespaceName,
     topic: &EntityPath,
-) -> [(Vec<u8>, RuntimeKind); 10] {
+) -> [(Vec<u8>, RuntimeKind); 13] {
     RUNTIME_FAMILIES.map(|(tag, kind)| (subscription_descendant_scope(tag, namespace, topic), kind))
 }
 
@@ -406,6 +413,142 @@ pub fn session(namespace: &NamespaceName, entity: &EntityPath, session_id: &Sess
 
 pub fn entity_session_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
     entity_scope(TAG_SESSION, namespace, entity)
+}
+
+pub fn session_message_lock_reverse_prefix(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+) -> Vec<u8> {
+    entity_scope(TAG_SESSION_MESSAGE_LOCK_REVERSE, namespace, entity)
+}
+
+pub fn session_message_lock_reverse(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
+    with_u64(
+        session_message_lock_reverse_prefix(namespace, entity),
+        sequence.as_u64(),
+    )
+}
+
+fn session_message_lock_scope_is_valid(prefix: &[u8], tag: u8, session_scoped: bool) -> bool {
+    if prefix.first().copied() != Some(tag) {
+        return false;
+    }
+    let Some((namespace, entity)) = entity_scope_parts(prefix) else {
+        return false;
+    };
+    let (Ok(namespace), Ok(entity)) = (NamespaceName::new(namespace), EntityPath::new(entity))
+    else {
+        return false;
+    };
+    let expected = entity_scope(tag, &namespace, &entity);
+    if !session_scoped {
+        return expected == prefix;
+    }
+    let Some(session) = prefix
+        .strip_prefix(expected.as_slice())
+        .and_then(|tail| tail.strip_suffix(&[SEPARATOR]))
+    else {
+        return false;
+    };
+    let Ok(session) = std::str::from_utf8(session) else {
+        return false;
+    };
+    let Ok(session) = SessionId::new(session) else {
+        return false;
+    };
+    session_scope(tag, &namespace, &entity, &session) == prefix
+}
+
+pub fn session_message_lock_reverse_parts(prefix: &[u8], key: &[u8]) -> Option<SequenceNumber> {
+    if !session_message_lock_scope_is_valid(prefix, TAG_SESSION_MESSAGE_LOCK_REVERSE, false) {
+        return None;
+    }
+    let bytes: [u8; 8] = key.strip_prefix(prefix)?.try_into().ok()?;
+    Some(SequenceNumber::new(u64::from_be_bytes(bytes)))
+}
+
+pub fn session_message_lock_forward_prefix(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    session_id: &SessionId,
+) -> Vec<u8> {
+    session_scope(
+        TAG_SESSION_MESSAGE_LOCK_FORWARD,
+        namespace,
+        entity,
+        session_id,
+    )
+}
+
+/// None means trusted ID-only acquisition, never an inferred session generation.
+pub fn session_message_lock_forward(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    session_id: &SessionId,
+    generation: Option<LockToken>,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
+    let mut key = session_message_lock_forward_prefix(namespace, entity, session_id);
+    key.push(u8::from(generation.is_some()));
+    let key = with_u64(key, generation.map_or(0, LockToken::as_u64));
+    with_u64(key, sequence.as_u64())
+}
+
+pub fn session_message_lock_forward_parts(
+    prefix: &[u8],
+    key: &[u8],
+) -> Option<(Option<LockToken>, SequenceNumber)> {
+    if !session_message_lock_scope_is_valid(prefix, TAG_SESSION_MESSAGE_LOCK_FORWARD, true) {
+        return None;
+    }
+    let rest = key.strip_prefix(prefix)?;
+    if rest.len() != 17 {
+        return None;
+    }
+    let generation = u64::from_be_bytes(rest[1..9].try_into().ok()?);
+    let generation = match (rest[0], generation) {
+        (0, 0) => None,
+        (1, token) if token > 0 => Some(LockToken::new(token)),
+        _ => return None,
+    };
+    Some((
+        generation,
+        SequenceNumber::new(u64::from_be_bytes(rest[9..17].try_into().ok()?)),
+    ))
+}
+
+pub fn session_message_lock_summary(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    session_id: &SessionId,
+) -> Vec<u8> {
+    session_scope(
+        TAG_SESSION_MESSAGE_LOCK_SUMMARY,
+        namespace,
+        entity,
+        session_id,
+    )
+}
+
+pub fn session_message_lock_summary_prefix(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+) -> Vec<u8> {
+    entity_scope(TAG_SESSION_MESSAGE_LOCK_SUMMARY, namespace, entity)
+}
+
+pub fn session_message_lock_summary_parts<'a>(prefix: &[u8], key: &'a [u8]) -> Option<&'a str> {
+    if !session_message_lock_scope_is_valid(prefix, TAG_SESSION_MESSAGE_LOCK_SUMMARY, false) {
+        return None;
+    }
+    let session =
+        std::str::from_utf8(key.strip_prefix(prefix)?.strip_suffix(&[SEPARATOR])?).ok()?;
+    SessionId::new(session).ok()?;
+    Some(session)
 }
 
 /// Ready messages of one session, ordered by sequence — the FIFO order a
@@ -618,10 +761,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             tags,
-            vec![0x03, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D]
+            vec![
+                0x03, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x13, 0x14, 0x15
+            ]
         );
         assert!(matches!(exact[0].1, RuntimeKind::Message));
-        for index in [2, 4, 6] {
+        for index in [2, 4, 6, 10, 11, 12] {
             assert!(matches!(exact[index].1, RuntimeKind::LocalToken));
         }
         assert_eq!(entity_session_prefix(&namespace(), &entity()), exact[4].0);

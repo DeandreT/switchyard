@@ -175,6 +175,40 @@ async fn close_unsettled_releases_hold_without_changing_message_lock<P: StorePro
         assert_eq!(node.record(&entity, number)?, Some(before.clone()));
         assert_eq!(node.session(&entity, "B")?.lock, Some(b_hold));
 
+        let pending_before = node.snapshot()?;
+        let mut pending = first_mode_receiver(
+            &mut session,
+            &format!("pending-A-{iteration}"),
+            &entity,
+            "A",
+        )
+        .await?;
+        assert!(pending.source().is_none());
+        assert!(matches!(
+            timeout(DEADLINE, pending.recv()).await?,
+            Err(amqp::EngineError::RemoteDetached)
+        ));
+        assert_eq!(node.snapshot()?, pending_before);
+        assert_eq!(node.record(&entity, number)?, Some(before.clone()));
+        let domain::MessageState::Locked { token, .. } = &before.state else {
+            unreachable!()
+        };
+        assert_eq!(
+            node.submit_entity(
+                &entity,
+                CommandKind::Settle {
+                    sequence: SequenceNumber::new(number),
+                    lock_token: *token,
+                    disposition: domain::SettlementDisposition::Complete,
+                    properties_to_modify: Default::default(),
+                }
+            )
+            .await?,
+            CommandOutcome::Completed
+        );
+        assert!(node.record(&entity, number)?.is_none());
+        assert_eq!(node.session(&entity, "B")?.lock, Some(b_hold));
+
         let replacement = first_mode_receiver(
             &mut session,
             &format!("replacement-A-{iteration}"),
@@ -192,7 +226,7 @@ async fn close_unsettled_releases_hold_without_changing_message_lock<P: StorePro
             node.wait_waiter_count(&entity, 2),
         )
         .await?;
-        assert_eq!(node.record(&entity, number)?, Some(before));
+        assert!(node.record(&entity, number)?.is_none());
         assert_eq!(node.session(&entity, "B")?.lock, Some(b_hold));
         timeout(DEADLINE, replacement.close()).await??;
         node.wait_released(&entity, "A").await?;

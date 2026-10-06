@@ -216,8 +216,44 @@ fn expired_released_and_reaccepted_original_holds_refuse_every_disposition<P: St
             })
         );
         assert_eq!(fixture.machine.store().snapshot()?, before);
+        assert_eq!(
+            accept(&fixture, at + 11, &id, 50),
+            Err(BrokerError::SessionTakeoverPending {
+                session_id: id.clone()
+            })
+        );
+        assert_eq!(fixture.machine.store().snapshot()?, before);
+        assert_eq!(
+            fixture.at(
+                at + 11,
+                CommandKind::Defer {
+                    sequence: delivery.sequence,
+                    lock_token: delivery.lock.expect("original message lock").token,
+                }
+            )?,
+            CommandOutcome::Deferred
+        );
         let replacement = accept(&fixture, at + 11, &id, 50)?;
         assert_ne!(replacement.token, hold.token);
+        let CommandOutcome::DeferredReceived(mut current) = fixture.at(
+            at + 11,
+            CommandKind::ReceiveDeferredHeld {
+                sequences: vec![delivery.sequence],
+                mode: ReceiveMode::PeekLock,
+                lock_duration_millis: Some(10_000),
+                session: Some(replacement.clone()),
+                budget: domain::DeliveryBudget {
+                    max_bytes: u64::MAX,
+                    per_message_overhead_bytes: 0,
+                },
+            },
+        )?
+        else {
+            panic!("genuine replacement delivery")
+        };
+        assert_eq!(current.len(), 1);
+        let relocked = current.remove(0);
+        assert_ne!(relocked.lock, delivery.lock);
         let before = fixture.machine.store().snapshot()?;
         assert_eq!(
             fixture.at(
@@ -246,8 +282,42 @@ fn expired_released_and_reaccepted_original_holds_refuse_every_disposition<P: St
             })
         );
         assert_eq!(fixture.machine.store().snapshot()?, before);
+        assert_eq!(
+            accept(&fixture, at + 15, &id, 50),
+            Err(BrokerError::SessionTakeoverPending {
+                session_id: id.clone()
+            })
+        );
+        assert_eq!(fixture.machine.store().snapshot()?, before);
+        assert_eq!(
+            fixture.at(
+                at + 15,
+                CommandKind::Defer {
+                    sequence: relocked.sequence,
+                    lock_token: relocked.lock.expect("replacement message lock").token,
+                }
+            )?,
+            CommandOutcome::Deferred
+        );
         let third = accept(&fixture, at + 15, &id, 50)?;
         assert_ne!(third.token, replacement.token);
+        let CommandOutcome::DeferredReceived(third_delivery) = fixture.at(
+            at + 15,
+            CommandKind::ReceiveDeferredHeld {
+                sequences: vec![delivery.sequence],
+                mode: ReceiveMode::PeekLock,
+                lock_duration_millis: Some(10_000),
+                session: Some(third),
+                budget: domain::DeliveryBudget {
+                    max_bytes: u64::MAX,
+                    per_message_overhead_bytes: 0,
+                },
+            },
+        )?
+        else {
+            panic!("third-generation delivery")
+        };
+        assert_eq!(third_delivery.len(), 1);
         let before = fixture.machine.store().snapshot()?;
         assert_eq!(
             fixture.at(at + 16, command(&delivery, Some(replacement), disposition)),

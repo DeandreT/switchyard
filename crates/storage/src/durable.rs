@@ -93,13 +93,17 @@ pub const STORE_FORMAT_V14: u32 = 14;
 /// REMOVE. All derived profiles advance with this record-meaning boundary.
 pub const STORE_FORMAT_V15: u32 = 15;
 
+/// Version 16: session-required message locks carry scoped ownership sidecars
+/// and block takeover until their actual lock exits commit.
+pub const STORE_FORMAT_V16: u32 = 16;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V15;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V16;
 
 /// Replica layouts use a disjoint version namespace so standalone and older
 /// binaries cannot mistake their records for an ordinary store. Record-layout
@@ -601,10 +605,10 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V13,
-                expected: STORE_FORMAT_V15,
+                expected: STORE_FORMAT_V16,
             })
         );
-        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V15);
+        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V16);
         Ok(())
     }
 
@@ -629,17 +633,17 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V14,
-                expected: STORE_FORMAT_V15
+                expected: STORE_FORMAT_V16
             })
         );
-        assert_eq!(ACTIVE_REPLICA_STORE_FORMAT, 0x8000_0000 | STORE_FORMAT_V15);
+        assert_eq!(ACTIVE_REPLICA_STORE_FORMAT, 0x8000_0000 | STORE_FORMAT_V16);
         assert_eq!(
             ACTIVE_CATALOG_REPLICA_STORE_FORMAT,
-            0xc000_0000 | STORE_FORMAT_V15
+            0xc000_0000 | STORE_FORMAT_V16
         );
         assert_eq!(
             ACTIVE_PROTECTED_STATE_STORE_FORMAT,
-            0xd000_0000 | STORE_FORMAT_V15
+            0xd000_0000 | STORE_FORMAT_V16
         );
         Ok(())
     }
@@ -647,7 +651,13 @@ mod tests {
     #[test]
     fn literal_set_layout_is_readable_only_as_version_fifteen() {
         let recorded = STORE_FORMAT_V15.to_be_bytes();
-        assert_eq!(require_readable_format(&recorded), Ok(()));
+        assert_eq!(
+            require_readable_format(&recorded),
+            Err(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V15,
+                expected: STORE_FORMAT_V16
+            })
+        );
         assert_eq!(require_format_version(&recorded, STORE_FORMAT_V15), Ok(()));
         assert_eq!(
             require_format_version(&recorded, STORE_FORMAT_V14),
@@ -660,9 +670,86 @@ mod tests {
             require_readable_format(&STORE_FORMAT_V14.to_be_bytes()),
             Err(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V14,
+                expected: STORE_FORMAT_V16
+            })
+        );
+    }
+
+    #[test]
+    fn session_message_lock_layout_refuses_version_fifteen_directories() -> Result<(), StorageError>
+    {
+        let directory = TempDir::new().expect("temporary previous layout");
+        stamp_format(directory.path(), &STORE_FORMAT_V15.to_be_bytes())?;
+        assert_eq!(
+            FjallStore::open(directory.path()).err(),
+            Some(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V15,
+                expected: STORE_FORMAT_V16
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn session_message_lock_layout_is_readable_only_as_version_sixteen() {
+        let recorded = STORE_FORMAT_V16.to_be_bytes();
+        assert_eq!(require_readable_format(&recorded), Ok(()));
+        assert_eq!(require_format_version(&recorded, STORE_FORMAT_V16), Ok(()));
+        assert_eq!(
+            require_format_version(&recorded, STORE_FORMAT_V15),
+            Err(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V16,
                 expected: STORE_FORMAT_V15
             })
         );
+        assert_eq!(
+            require_readable_format(&17_u32.to_be_bytes()),
+            Err(StorageError::UnsupportedStoreFormat {
+                found: 17,
+                expected: STORE_FORMAT_V16
+            })
+        );
+    }
+
+    #[test]
+    fn derived_store_layouts_follow_session_message_lock_version_sixteen() {
+        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V16);
+        assert_eq!(ACTIVE_REPLICA_STORE_FORMAT, 0x8000_0010);
+        assert_eq!(ACTIVE_CATALOG_REPLICA_STORE_FORMAT, 0xc000_0010);
+        assert_eq!(ACTIVE_PROTECTED_STATE_STORE_FORMAT, 0xd000_0010);
+        for format in [
+            ACTIVE_REPLICA_STORE_FORMAT,
+            ACTIVE_CATALOG_REPLICA_STORE_FORMAT,
+            ACTIVE_PROTECTED_STATE_STORE_FORMAT,
+        ] {
+            assert_eq!(
+                require_format_version(&format.to_be_bytes(), format),
+                Ok(())
+            );
+            for other in [format - 1, format + 1] {
+                assert_eq!(
+                    require_format_version(&other.to_be_bytes(), format),
+                    Err(StorageError::UnsupportedStoreFormat {
+                        found: other,
+                        expected: format
+                    })
+                );
+                assert_eq!(
+                    require_format_version(&format.to_be_bytes(), other),
+                    Err(StorageError::UnsupportedStoreFormat {
+                        found: format,
+                        expected: other
+                    })
+                );
+            }
+            assert_eq!(
+                require_readable_format(&format.to_be_bytes()),
+                Err(StorageError::UnsupportedStoreFormat {
+                    found: format,
+                    expected: STORE_FORMAT_V16
+                })
+            );
+        }
     }
 
     #[test]

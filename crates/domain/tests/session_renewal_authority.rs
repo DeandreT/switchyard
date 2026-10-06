@@ -208,7 +208,19 @@ fn expired_released_reaccepted_holds_cannot_extend_message_lock<P: StoreProvider
     {
         let at = 10 + index as u64 * 100;
         let id = SessionId::new(phase)?;
-        send(&fixture, at, phase, Some(id.clone()))?;
+        if phase == "reaccepted" {
+            fixture.at(
+                at,
+                CommandKind::Send {
+                    message_id: phase.to_owned(),
+                    body: vec![1, 2, 3],
+                    time_to_live_millis: None,
+                    session_id: Some(id.clone()),
+                },
+            )?;
+        } else {
+            send(&fixture, at, phase, Some(id.clone()))?;
+        }
         let hold = accept(&fixture, at, &id, 10)?;
         let delivery = receive(&fixture, at, Some(hold.clone()))?;
         let proposed = match phase {
@@ -223,8 +235,44 @@ fn expired_released_reaccepted_holds_cannot_extend_message_lock<P: StoreProvider
                 at + 2
             }
             "reaccepted" => {
+                let before = fixture.machine.store().snapshot()?;
+                assert_eq!(
+                    accept(&fixture, at + 10, &id, 1_000),
+                    Err(BrokerError::SessionTakeoverPending {
+                        session_id: id.clone()
+                    })
+                );
+                assert_eq!(fixture.machine.store().snapshot()?, before);
+                assert_eq!(
+                    fixture.at(
+                        at + 10,
+                        CommandKind::Defer {
+                            sequence: delivery.sequence,
+                            lock_token: delivery.lock.expect("original message lock").token,
+                        }
+                    )?,
+                    CommandOutcome::Deferred
+                );
                 let current = accept(&fixture, at + 10, &id, 1_000)?;
                 assert_ne!(current.token, hold.token);
+                let CommandOutcome::DeferredReceived(relocked) = fixture.at(
+                    at + 10,
+                    CommandKind::ReceiveDeferredHeld {
+                        sequences: vec![delivery.sequence],
+                        mode: ReceiveMode::PeekLock,
+                        lock_duration_millis: Some(10_000),
+                        session: Some(current),
+                        budget: domain::DeliveryBudget {
+                            max_bytes: u64::MAX,
+                            per_message_overhead_bytes: 0,
+                        },
+                    },
+                )?
+                else {
+                    panic!("genuine replacement delivery")
+                };
+                assert_eq!(relocked.len(), 1);
+                assert_ne!(relocked[0].lock, delivery.lock);
                 at + 11
             }
             _ => unreachable!(),

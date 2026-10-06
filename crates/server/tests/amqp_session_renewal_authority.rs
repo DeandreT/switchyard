@@ -454,9 +454,19 @@ async fn deferred_renewal_refuses_same_name_reaccepted_receiver<P: StoreProvider
         let token = token.clone();
         original.close().await?;
         node.released(&id).await?;
-        let replacement = receiving(&mut session, "owner", &id).await?;
-        let current = node.hold(&id)?;
+        let locked = node.machine().message(&node.namespace, &node.entity, sequence)?.expect("original locked message");
+        assert!(matches!(&locked.state, domain::MessageState::Locked { .. }));
+        let before_pending = node.store.snapshot()?;
+        let mut pending = receiving(&mut session, "pending-A", &id).await?;
+        assert!(pending.source().is_none());
+        assert!(matches!(pending.recv().await, Err(amqp::EngineError::RemoteDetached)));
+        assert_eq!(node.store.snapshot()?, before_pending);
+        let different_id = SessionId::new("B")?;
+        let replacement = receiving(&mut session, "owner", &different_id).await?;
+        let current = node.hold(&different_id)?;
+        assert_ne!(current.session_id, hold.session_id);
         assert_ne!(current.token, hold.token);
+        assert_eq!(node.machine().message(&node.namespace, &node.entity, sequence)?, Some(locked));
         let before: StoreSnapshot = node.store.snapshot()?;
         for index in 0..2 {
             let mut body = OrderedMap::new();

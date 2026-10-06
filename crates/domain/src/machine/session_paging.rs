@@ -74,11 +74,15 @@ impl<S: StateStore> StateMachine<S> {
             )?;
             let record = self.load_session(command, &session_id)?;
             if record.live_lock_at(command.issued_at).is_none() {
-                let accepted =
-                    self.lock_session(command, &session_id, record, locked_until, batch)?;
-                return Ok(CommandOutcome::SessionPage(SessionPageOutcome::Accepted(
-                    accepted,
-                )));
+                match self.lock_session(command, &session_id, record, locked_until, batch) {
+                    Ok(accepted) => {
+                        return Ok(CommandOutcome::SessionPage(SessionPageOutcome::Accepted(
+                            accepted,
+                        )));
+                    }
+                    Err(BrokerError::SessionTakeoverPending { .. }) => {}
+                    Err(error) => return Err(error),
+                }
             }
             remaining -= 1;
             if remaining == 0 {

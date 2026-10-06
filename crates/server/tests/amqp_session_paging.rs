@@ -359,7 +359,21 @@ async fn next_available_reaches_33rd_and_65th_and_echoes_granted_filter<P: Store
             drop(connection.take());
             for hold in holds { assert_eq!(node.submit(CommandKind::ReleaseSession { session: hold })?, CommandOutcome::SessionReleased); }
             if held == 32 {
-                // Release can be received again before Detach; restore ready work for the next walk.
+                // Retire any actual original lock left by release/prefetch before the second walk.
+                let sequence = domain::SequenceNumber::new(33);
+                let record = node.machine().message(&node.namespace, &node.entity, sequence)?.expect("original s032 message");
+                assert_eq!(record.session_id, Some(session_id(32)?));
+                match record.state {
+                    domain::MessageState::Locked { token, .. } => {
+                        assert_eq!(node.submit(CommandKind::Settle { sequence, lock_token: token,
+                            disposition: domain::SettlementDisposition::Complete, properties_to_modify: Default::default(),
+                        })?, CommandOutcome::Completed);
+                        assert!(node.machine().message(&node.namespace, &node.entity, sequence)?.is_none());
+                    }
+                    domain::MessageState::Ready => (),
+                    other => panic!("unexpected original s032 state: {other:?}"),
+                }
+                // An additional ready copy retains all 65 groups regardless of prefetch.
                 node.submit(CommandKind::Send {
                     message_id: "ready-for-second-walk".into(), body: vec![32],
                     time_to_live_millis: None, session_id: Some(session_id(32)?),

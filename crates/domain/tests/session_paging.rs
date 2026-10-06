@@ -223,12 +223,27 @@ impl<P: StoreProvider> Node<P> {
     fn assert_page_reads(&self, count: usize) {
         let prefix = keys::entity_session_ready_prefix(&self.namespace, &self.entity);
         let calls = self.scans.lock().expect("scan recorder").clone();
-        assert_eq!(calls.len(), count);
-        for call in &calls {
+        let ready: Vec<_> = calls.iter().filter(|call| call.prefix == prefix).collect();
+        let probes: Vec<_> = calls
+            .iter()
+            .filter(|call| call.prefix.first() == Some(&0x14))
+            .collect();
+        assert_eq!(ready.len(), count);
+        assert_eq!(calls.len(), ready.len() + probes.len());
+        assert!(probes.len() <= count);
+        let mut seen = std::collections::BTreeSet::new();
+        for call in &probes {
+            assert_eq!(call.limit, 1);
+            assert!(
+                seen.insert(&call.prefix),
+                "one grant probe per eligible session"
+            );
+        }
+        for call in &ready {
             assert_eq!(call.prefix, prefix);
             assert_eq!(call.limit, 1);
         }
-        assert!(calls.windows(2).all(|pair| pair[0].start < pair[1].start));
+        assert!(ready.windows(2).all(|pair| pair[0].start < pair[1].start));
     }
 
     fn session_reads(&self) -> Vec<Vec<u8>> {
@@ -744,7 +759,7 @@ fn page_command_is_appended_with_scoped_cursor_roundtrips_and_unchanged_versions
         assert_eq!(codec::decode::<CommandKind>(&encoded)?, command);
     }
     assert_eq!(codec::ACTIVE_VALUE_FORMAT, 11);
-    assert_eq!(storage::ACTIVE_STORE_FORMAT, 15);
+    assert_eq!(storage::ACTIVE_STORE_FORMAT, 16);
     Ok(())
 }
 

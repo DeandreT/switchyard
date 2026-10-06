@@ -48,9 +48,20 @@ impl Owner {
             session: original.clone(),
         })
         .expect("release original");
+        let before = self.snapshot();
+        assert_eq!(
+            self.apply(CommandKind::AcceptSession {
+                session_id: Some(original.session_id.clone()),
+                lock_duration_millis: Some(1_000),
+            }),
+            Err(BrokerError::SessionTakeoverPending {
+                session_id: original.session_id.clone()
+            })
+        );
+        assert_eq!(self.snapshot(), before);
         let CommandOutcome::SessionAccepted(Some(current)) = self
             .apply(CommandKind::AcceptSession {
-                session_id: Some(original.session_id.clone()),
+                session_id: Some(SessionId::new("replacement").expect("different session")),
                 lock_duration_millis: Some(1_000),
             })
             .expect("accept replacement")
@@ -59,6 +70,7 @@ impl Owner {
         };
         let hold = current.hold();
         assert_ne!(hold.token, original.token);
+        assert_ne!(hold.session_id, original.session_id);
         self.management
             .register_session(
                 LINK,
@@ -275,9 +287,20 @@ async fn renewal_uses_delivery_original_hold_after_same_name_session_replacement
         )
         .expect("owned receipt");
     owner.now.store(111, Ordering::Release);
+    let before = owner.snapshot();
+    assert_eq!(
+        owner.apply(CommandKind::AcceptSession {
+            session_id: Some(original.session_id.clone()),
+            lock_duration_millis: Some(1_000),
+        }),
+        Err(BrokerError::SessionTakeoverPending {
+            session_id: original.session_id.clone()
+        })
+    );
+    assert_eq!(owner.snapshot(), before);
     let CommandOutcome::SessionAccepted(Some(current)) = owner
         .apply(CommandKind::AcceptSession {
-            session_id: Some(original.session_id.clone()),
+            session_id: Some(SessionId::new("replacement").expect("different session")),
             lock_duration_millis: Some(1_000),
         })
         .expect("takeover")

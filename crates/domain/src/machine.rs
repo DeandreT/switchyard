@@ -31,6 +31,7 @@ mod entity_deletion;
 mod incarnations;
 mod message_retention;
 mod rules;
+mod session_message_locks;
 mod session_paging;
 mod topic_fanout;
 mod topic_paging;
@@ -39,6 +40,7 @@ mod topic_topology;
 mod topology_updates;
 
 use message_retention::message_record;
+use session_message_locks::SessionMessageLocks;
 
 pub use entity_deletion::{
     MAX_ENTITY_DELETE_KEY_BYTES, MAX_ENTITY_DELETE_KEYS, MAX_ENTITY_DELETE_VALUE_BYTES,
@@ -171,6 +173,7 @@ struct DeferredReceiveInput<'a> {
     mode: ReceiveMode,
     lock_duration_millis: Option<u64>,
     session_id: Option<&'a SessionId>,
+    original_session: Option<&'a SessionHold>,
     budget: Option<DeliveryBudget>,
 }
 
@@ -553,6 +556,7 @@ impl<S: StateStore> StateMachine<S> {
                     mode: *mode,
                     lock_duration_millis: *lock_duration_millis,
                     session_id: session_id.as_ref(),
+                    original_session: None,
                     budget: None,
                 },
                 &mut batch,
@@ -570,6 +574,7 @@ impl<S: StateStore> StateMachine<S> {
                     mode: *mode,
                     lock_duration_millis: *lock_duration_millis,
                     session_id: session_id.as_ref(),
+                    original_session: None,
                     budget: Some(*budget),
                 },
                 &mut batch,
@@ -593,6 +598,7 @@ impl<S: StateStore> StateMachine<S> {
                         mode: *mode,
                         lock_duration_millis: *lock_duration_millis,
                         session_id: session.as_ref().map(|hold| &hold.session_id),
+                        original_session: session.as_ref(),
                         budget: Some(*budget),
                     },
                     &mut batch,
@@ -1309,7 +1315,7 @@ impl<S: StateStore> StateMachine<S> {
         batch: &mut WriteBatch,
         subscription_enqueues: &mut Option<Vec<EntityPath>>,
     ) -> Result<CommandOutcome, BrokerError> {
-        let (_, topic) = self.load_browsable_config(command)?;
+        let (config, topic) = self.load_browsable_config(command)?;
         let namespace = &command.namespace;
         let entity = &command.entity;
         let mut cancelled = 0_u32;
@@ -1319,6 +1325,13 @@ impl<S: StateStore> StateMachine<S> {
             let MessageState::Scheduled { enqueue_at, .. } = record.state else {
                 return Err(BrokerError::MessageNotScheduled { sequence });
             };
+            if !topic {
+                if config.requires_session && record.sequence != sequence {
+                    return Err(BrokerError::MalformedIndexKey);
+                }
+                SessionMessageLocks::new(&self.store, command, &config, batch)
+                    .ensure_unlocked(&record)?;
+            }
             batch.push_delete(keys::message(namespace, entity, sequence));
             batch.push_delete(keys::scheduled(namespace, entity, enqueue_at, sequence));
             cancelled = cancelled.saturating_add(1);
@@ -1365,6 +1378,11 @@ impl<S: StateStore> StateMachine<S> {
                 } if stored_enqueue_at == enqueue_at => time_to_live_millis,
                 _ => return Err(BrokerError::MalformedIndexKey),
             };
+            if config.requires_session && record.sequence != scheduled_sequence {
+                return Err(BrokerError::MalformedIndexKey);
+            }
+            SessionMessageLocks::new(&self.store, command, &config, batch)
+                .ensure_unlocked(&record)?;
 
             // The scheduling sequence is only a cancellation handle. Activation
             // gets a new queue position so older scheduled work cannot jump
@@ -1423,6 +1441,17 @@ impl<S: StateStore> StateMachine<S> {
                 .message(namespace, entity, sequence)?
                 .ok_or(BrokerError::DanglingIndexEntry { sequence })?;
 
+            if config.requires_session
+                && (record.sequence != sequence
+                    || record.state != MessageState::Ready
+                    || session
+                        .is_some_and(|hold| record.session_id.as_ref() != Some(&hold.session_id)))
+            {
+                return Err(BrokerError::MalformedIndexKey);
+            }
+            SessionMessageLocks::new(&self.store, command, &config, batch)
+                .ensure_unlocked(&record)?;
+
             // A timer sweep normally reaps these, but a receive must never hand
             // out a message whose lifetime has already elapsed.
             if record.is_expired_at(command.issued_at) {
@@ -1434,49 +1463,48 @@ impl<S: StateStore> StateMachine<S> {
             let delivery_count = record.delivery_count;
             let ready_key = self.ready_key(command.into(), &config, &record);
 
-            let lock = match mode {
-                ReceiveMode::PeekLock => {
-                    let mut counters = self.load_counters(command)?;
-                    let token = counters.allocate_lock_token()?;
+            let lock =
+                match mode {
+                    ReceiveMode::PeekLock => {
+                        let mut counters = self.load_counters(command)?;
+                        let token = counters.allocate_lock_token()?;
 
-                    let locked_until = command.issued_at.saturating_add_millis(
-                        lock_duration_millis.unwrap_or(config.lock_duration_millis),
-                    );
-                    record.state = MessageState::Locked {
-                        token,
-                        locked_until,
-                    };
+                        let locked_until = command.issued_at.saturating_add_millis(
+                            lock_duration_millis.unwrap_or(config.lock_duration_millis),
+                        );
+                        SessionMessageLocks::new(&self.store, command, &config, batch)
+                            .install_locked(&record, token, locked_until, session)?;
+                        record.state = MessageState::Locked {
+                            token,
+                            locked_until,
+                        };
 
-                    batch.push_delete(ready_key.clone());
-                    remove_expiry_index(command, &record, batch);
-                    batch.push_put(
-                        keys::message(namespace, entity, sequence),
-                        codec::encode(&record)?,
-                    );
-                    batch.push_put(
-                        keys::lock(namespace, entity, locked_until, sequence),
-                        Vec::new(),
-                    );
-                    batch.push_put(
-                        keys::queue_counters(namespace, entity),
-                        codec::encode(&counters)?,
-                    );
-                    Some(DeliveryLock {
-                        token,
-                        locked_until,
-                    })
-                }
-                // At-most-once: the deletion commits before the transfer, so a
-                // client that never receives the reply loses this delivery.
-                ReceiveMode::ReceiveAndDelete => {
-                    batch.push_delete(ready_key.clone());
-                    batch.push_delete(keys::message(namespace, entity, sequence));
-                    if let Some(expires_at) = record.expires_at {
-                        batch.push_delete(keys::expiry(namespace, entity, expires_at, sequence));
+                        batch.push_delete(ready_key.clone());
+                        remove_expiry_index(command, &record, batch);
+                        batch.push_put(
+                            keys::message(namespace, entity, sequence),
+                            codec::encode(&record)?,
+                        );
+                        batch.push_put(
+                            keys::lock(namespace, entity, locked_until, sequence),
+                            Vec::new(),
+                        );
+                        batch.push_put(
+                            keys::queue_counters(namespace, entity),
+                            codec::encode(&counters)?,
+                        );
+                        Some(DeliveryLock {
+                            token,
+                            locked_until,
+                        })
                     }
-                    None
-                }
-            };
+                    // At-most-once: the deletion commits before the transfer, so a
+                    // client that never receives the reply loses this delivery.
+                    ReceiveMode::ReceiveAndDelete => {
+                        self.remove_message(command, &config, &record, batch)?;
+                        None
+                    }
+                };
 
             let time_to_live_millis = record.time_to_live_millis();
             return Ok(CommandOutcome::Received(Some(Delivery {
@@ -1626,6 +1654,11 @@ impl<S: StateStore> StateMachine<S> {
             return Err(BrokerError::DeadLetterQueueIsReserved);
         }
         let config = self.load_config(command)?;
+        if config.requires_session && record.sequence != sequence {
+            return Err(BrokerError::MalformedIndexKey);
+        }
+        SessionMessageLocks::new(&self.store, command, &config, batch)
+            .validate_locked(&record, original_session)?;
         if let Some(properties) = properties_to_modify.filter(|properties| !properties.is_empty()) {
             MessageEnvelope::validate_application_property_updates(properties)?;
             if record.envelope.is_none() {
@@ -1652,7 +1685,7 @@ impl<S: StateStore> StateMachine<S> {
         let entity = &command.entity;
         match disposition {
             SettlementDisposition::Complete => {
-                self.remove_message(command, &config, &record, batch);
+                self.remove_message(command, &config, &record, batch)?;
                 Ok(CommandOutcome::Completed)
             }
             SettlementDisposition::Abandon => {
@@ -1677,6 +1710,8 @@ impl<S: StateStore> StateMachine<S> {
                         dropped: false,
                     });
                 }
+                SessionMessageLocks::new(&self.store, command, &config, batch)
+                    .leave_locked(&record)?;
                 record.state = MessageState::Ready;
                 batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
                 batch.push_put(
@@ -1691,6 +1726,8 @@ impl<S: StateStore> StateMachine<S> {
                 })
             }
             SettlementDisposition::Defer => {
+                SessionMessageLocks::new(&self.store, command, &config, batch)
+                    .leave_locked(&record)?;
                 record.state = MessageState::Deferred;
                 remove_expiry_index(command, &record, batch);
                 batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
@@ -1730,6 +1767,7 @@ impl<S: StateStore> StateMachine<S> {
             mode,
             lock_duration_millis,
             session_id,
+            original_session,
             budget,
         } = input;
         let mut unique = BTreeSet::new();
@@ -1762,6 +1800,11 @@ impl<S: StateStore> StateMachine<S> {
                     sequence: *sequence,
                 });
             }
+            if config.requires_session && record.sequence != *sequence {
+                return Err(BrokerError::MalformedIndexKey);
+            }
+            SessionMessageLocks::new(&self.store, command, &config, batch)
+                .ensure_unlocked(&record)?;
             if let Some(budget) = &mut response_budget {
                 budget.charge(&record)?;
             }
@@ -1772,39 +1815,39 @@ impl<S: StateStore> StateMachine<S> {
 
             record.delivery_count = record.delivery_count.saturating_add(1);
             let delivery_count = record.delivery_count;
-            let lock = match mode {
-                ReceiveMode::PeekLock => {
-                    let counters = counters.get_or_insert(self.load_counters(command)?);
-                    let token = counters.allocate_lock_token()?;
-                    let locked_until = command.issued_at.saturating_add_millis(
-                        lock_duration_millis.unwrap_or(config.lock_duration_millis),
-                    );
-                    record.state = MessageState::Locked {
-                        token,
-                        locked_until,
-                    };
-                    remove_expiry_index(command, &record, batch);
-                    batch.push_put(
-                        keys::message(namespace, entity, *sequence),
-                        codec::encode(&record)?,
-                    );
-                    batch.push_put(
-                        keys::lock(namespace, entity, locked_until, *sequence),
-                        Vec::new(),
-                    );
-                    Some(DeliveryLock {
-                        token,
-                        locked_until,
-                    })
-                }
-                ReceiveMode::ReceiveAndDelete => {
-                    batch.push_delete(keys::message(namespace, entity, *sequence));
-                    if let Some(expires_at) = record.expires_at {
-                        batch.push_delete(keys::expiry(namespace, entity, expires_at, *sequence));
+            let lock =
+                match mode {
+                    ReceiveMode::PeekLock => {
+                        let counters = counters.get_or_insert(self.load_counters(command)?);
+                        let token = counters.allocate_lock_token()?;
+                        let locked_until = command.issued_at.saturating_add_millis(
+                            lock_duration_millis.unwrap_or(config.lock_duration_millis),
+                        );
+                        SessionMessageLocks::new(&self.store, command, &config, batch)
+                            .install_locked(&record, token, locked_until, original_session)?;
+                        record.state = MessageState::Locked {
+                            token,
+                            locked_until,
+                        };
+                        remove_expiry_index(command, &record, batch);
+                        batch.push_put(
+                            keys::message(namespace, entity, *sequence),
+                            codec::encode(&record)?,
+                        );
+                        batch.push_put(
+                            keys::lock(namespace, entity, locked_until, *sequence),
+                            Vec::new(),
+                        );
+                        Some(DeliveryLock {
+                            token,
+                            locked_until,
+                        })
                     }
-                    None
-                }
-            };
+                    ReceiveMode::ReceiveAndDelete => {
+                        self.remove_message(command, &config, &record, batch)?;
+                        None
+                    }
+                };
 
             let time_to_live_millis = record.time_to_live_millis();
             deliveries.push(Delivery {
@@ -1861,6 +1904,15 @@ impl<S: StateStore> StateMachine<S> {
                 .message(namespace, entity, sequence)?
                 .ok_or(BrokerError::DanglingIndexEntry { sequence })?;
 
+            if record.sequence != sequence
+                || !matches!(record.state, MessageState::Locked { locked_until: actual, .. } if actual == locked_until)
+                || key != keys::lock(namespace, entity, locked_until, sequence)
+            {
+                return Err(BrokerError::MalformedIndexKey);
+            }
+            SessionMessageLocks::new(&self.store, command, &config, batch)
+                .validate_locked(&record, None)?;
+
             if record.is_expired_at(command.issued_at) {
                 match self.expire_message(command, &config, record, batch)? {
                     ExpirationOutcome::DeadLettered => dead_lettered += 1,
@@ -1877,6 +1929,8 @@ impl<S: StateStore> StateMachine<S> {
                 )?;
                 dead_lettered += 1;
             } else {
+                SessionMessageLocks::new(&self.store, command, &config, batch)
+                    .leave_locked(&record)?;
                 record.state = MessageState::Ready;
                 batch.push_delete(key);
                 batch.push_put(
@@ -2003,9 +2057,11 @@ impl<S: StateStore> StateMachine<S> {
             )?;
             let record = self.load_session(command, &session_id)?;
             if record.live_lock_at(command.issued_at).is_none() {
-                let accepted =
-                    self.lock_session(command, &session_id, record, locked_until, batch)?;
-                return Ok(CommandOutcome::SessionAccepted(Some(accepted)));
+                match self.lock_session(command, &session_id, record, locked_until, batch) {
+                    Ok(accepted) => return Ok(CommandOutcome::SessionAccepted(Some(accepted))),
+                    Err(BrokerError::SessionTakeoverPending { .. }) => {}
+                    Err(error) => return Err(error),
+                }
             }
 
             // Held by someone else: resume past every message of this session
@@ -2024,6 +2080,22 @@ impl<S: StateStore> StateMachine<S> {
         locked_until: Timestamp,
         batch: &mut WriteBatch,
     ) -> Result<AcceptedSession, BrokerError> {
+        let config = self.load_config(command)?;
+        if !config.requires_session {
+            return Err(BrokerError::SessionNotSupported);
+        }
+        if record.live_lock_at(command.issued_at).is_some() {
+            return Err(BrokerError::SessionAlreadyLocked {
+                session_id: session_id.clone(),
+            });
+        }
+        if SessionMessageLocks::new(&self.store, command, &config, batch)
+            .takeover_pending(session_id)?
+        {
+            return Err(BrokerError::SessionTakeoverPending {
+                session_id: session_id.clone(),
+            });
+        }
         let namespace = &command.namespace;
         let entity = &command.entity;
         let mut counters = self.load_counters(command)?;
@@ -2139,6 +2211,14 @@ impl<S: StateStore> StateMachine<S> {
             .issued_at
             .saturating_add_millis(lock_duration_millis.unwrap_or(config.lock_duration_millis));
 
+        if config.requires_session && record.sequence != sequence {
+            return Err(BrokerError::MalformedIndexKey);
+        }
+        SessionMessageLocks::new(&self.store, command, &config, batch).renew_locked(
+            &record,
+            locked_until,
+            original_session,
+        )?;
         record.state = MessageState::Locked {
             token: lock_token,
             locked_until,
@@ -2313,7 +2393,7 @@ impl<S: StateStore> StateMachine<S> {
             )?;
             Ok(ExpirationOutcome::DeadLettered)
         } else {
-            self.remove_message(command, config, &record, batch);
+            self.remove_message(command, config, &record, batch)?;
             Ok(ExpirationOutcome::Dropped)
         }
     }
@@ -2324,7 +2404,13 @@ impl<S: StateStore> StateMachine<S> {
         config: &QueueConfig,
         record: &MessageRecord,
         batch: &mut WriteBatch,
-    ) {
+    ) -> Result<(), BrokerError> {
+        let mut tracking = SessionMessageLocks::new(&self.store, command, config, batch);
+        if matches!(record.state, MessageState::Locked { .. }) {
+            tracking.leave_locked(record)?;
+        } else {
+            tracking.ensure_unlocked(record)?;
+        }
         let namespace = &command.namespace;
         let entity = &command.entity;
         let sequence = record.sequence;
@@ -2342,6 +2428,7 @@ impl<S: StateStore> StateMachine<S> {
         }
         batch.push_delete(keys::message(namespace, entity, sequence));
         remove_expiry_index(command, record, batch);
+        Ok(())
     }
 
     /// Moves a message out of the active keyspace and into the dead-letter
@@ -2360,7 +2447,7 @@ impl<S: StateStore> StateMachine<S> {
         let entity = &command.entity;
         let sequence = record.sequence;
 
-        self.remove_message(command, config, &record, batch);
+        self.remove_message(command, config, &record, batch)?;
 
         // Into the shadow queue as an ordinary ready message under its original
         // sequence — the same receive and settlement machinery drains it.

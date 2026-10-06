@@ -77,6 +77,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         // Someone else holds it. Distinct from a lost lock: the client should
         // wait for another session rather than reacquire this one.
         BrokerError::SessionAlreadyLocked { .. } => SESSION_CANNOT_BE_LOCKED,
+        BrokerError::SessionTakeoverPending { .. } => RESOURCE_LOCKED,
 
         // The client used the entity in a way its configuration forbids, which
         // no retry fixes.
@@ -134,6 +135,7 @@ pub fn is_retryable(error: &BrokerError) -> bool {
     matches!(
         error,
         BrokerError::SessionAlreadyLocked { .. }
+            | BrokerError::SessionTakeoverPending { .. }
             | BrokerError::ClockRegression { .. }
             | BrokerError::Storage(_)
     )
@@ -361,6 +363,21 @@ mod tests {
                 session_id: session()
             }),
             SESSION_LOCK_LOST
+        );
+    }
+
+    #[test]
+    fn pending_session_takeover_maps_to_retryable_resource_locked() {
+        let error = BrokerError::SessionTakeoverPending {
+            session_id: session(),
+        };
+        assert_eq!(condition_for(&error), RESOURCE_LOCKED);
+        assert!(is_retryable(&error));
+        assert_eq!(
+            condition_for(&BrokerError::SessionAlreadyLocked {
+                session_id: session()
+            }),
+            SESSION_CANNOT_BE_LOCKED,
         );
     }
 
