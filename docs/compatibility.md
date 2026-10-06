@@ -259,6 +259,14 @@ the entire command without applying staged changes or advancing its clock.
 An absent summary permits only a one-entry forward-index orphan check at grant;
 this is not an arbitrary orphan or forged-count audit.
 
+Session-lock expiry requires every selected elapsed index row to be canonical,
+with an empty value and an actual positive session-lock token whose deadline
+equals the indexed deadline. A stale row cannot clear a renewed session lock;
+a malformed selected row refuses the entire batch without advancing its clock.
+The existing 256-row scan and first-future-deadline stop are unchanged. The
+deadline index contains no token, so this check does not certify an original
+generation against a coherently substituted positive token.
+
 Private ownership indexes require store layout 16. Message and session records,
 value format 11, command tags 0-40 and the closed committed/atomic profiles retain
 their existing shapes. Releasing or expiring a session does not itself retire its
@@ -323,6 +331,18 @@ complete workspace runs use serial test execution with no skips. Existing
 authority and paging fixtures now require actual lock exit for same-ID takeover,
 or use a different session for replacement-link checks. Initial target-wiring
 and lint failures were corrected without test suppression or ignore changes.
+
+Local verification adds 12 regular Memory/Fjall checks for session-lock expiry
+integrity. The complete domain run passes 1,528 tests, preserving the prior
+1,516 case names and statuses; nine selected server session/timer targets pass
+85 tests. Strict workspace lint and builds pass in both configurations, along
+with formatting and unchanged protobuf validation. The 11 existing opt-in SDK
+checks pass separately as regression evidence. An initial previous-client Fjall
+atomic check failed with an Accepted/Declared type mismatch; it passed unchanged
+in an isolated diagnostic run and the complete SDK retry. The cause remains
+unestablished. Assertions, waits and ignore status were not changed. These are
+scoped regressions, not a new full-workspace run, a corrupt-index SDK workflow,
+or observed Azure parity.
 
 An ordinary receiver can browse all sessions in a session-required queue or
 subscription through its management link, without attaching a data receiver or
