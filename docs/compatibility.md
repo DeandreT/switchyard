@@ -175,13 +175,37 @@ SessionId-bearing ingress; the frozen `CreateSendV1` committed profile keeps its
 strict admission and image agreement. Existing validation limits, DLQ stripping,
 record versions and store layout are unchanged by this ingress change.
 
-Three session behaviors differ from Azure Service Bus under the current local
-policies:
+Ordinary AMQP PeekLock settlement on session-required queues and subscriptions
+uses the original session hold captured with that delivery, including deferred
+management deliveries. Complete, Abandon, Defer and DeadLetter, with their
+property updates, require both that original live hold and the message's lock.
+The domain owner checks the original session token and deadline at the command's
+single authoritative timestamp, before changing properties or message state.
+An expired, released or replaced hold cannot settle the old delivery; a reused
+receiver link name does not confer its replacement's authority. A missing hold
+is accepted only for ordinary queues, ordinary subscriptions and dead-letter
+queues, including messages that retain a SessionId as ordinary metadata.
 
-- Settling a message inside a session needs the message's own lock token, not a
-  live session lock. Azure fails settlement once the session lock is lost. The
-  message lock is treated as the authority over that message, so a receiver that
-  did the work can still settle it.
+This uses the appended domain command `SettleHeld` (tag 38), not a new AMQP
+field. Trusted legacy `Settle` (tag 24), Complete, Abandon, Defer and DeadLetter
+commands remain message-lock-only APIs. Atomic messaging keeps its legacy mapper
+and refuses `SettleHeld`; the closed `CreateSendV1` committed profile and queue
+log schemas are unchanged. Value format 11 and store layout 15 are unchanged;
+an older command decoder is expected to refuse tag 38 as an unknown payload
+variant, not as a new value-format header. This is not a mixed-version command
+log guarantee.
+
+Microsoft documents a [session-lock umbrella](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sessions#session-features)
+and [settlement failure after session expiry](https://learn.microsoft.com/en-us/dotnet/api/azure.messaging.servicebus.servicebusreceiver.completemessageasync?view=azure-dotnet).
+This boundary does not implement every umbrella behavior or establish full
+Azure error parity. Remaining local session limitations are:
+
+- Message-lock renewal remains message-lock-only. A live session hold does not
+  replace the independent message-lock deadline used by settlement.
+- Releasing or expiring a session does not immediately requeue its locked
+  messages; they remain locked until their own deadlines. A replacement holder
+  can receive later ready messages while earlier ones remain locked, so the FIFO
+  guarantee above does not extend across that takeover.
 - Accepting the next available session examines a bounded number of sessions and
   reports none available if they are all held, rather than walking the entity.
   The receiver retries.
@@ -189,6 +213,16 @@ policies:
   when one expires. Azure documents
   [session-wide TTL expiry](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sessions#message-expiration);
   this increment does not add that policy.
+
+Local verification adds 21 regular domain, protocol and raw AMQP checks for
+original-hold settlement. Default and all-feature workspace runs each pass
+5,244 tests, with the same 11 opt-in SDK checks ignored; those 11 checks pass
+separately against the pinned .NET clients. Prior case statuses and ignore
+reasons are preserved. Strict lint and builds pass in both configurations,
+along with formatting and protobuf validation. The existing SDK gates are
+regression evidence, not a new stale-hold SDK workflow or observed Azure error
+parity. Initial formatter, test-wiring and controlled-fixture failures were
+corrected without changing existing test assertions, waits or ignore status.
 
 An ordinary receiver can browse all sessions in a session-required queue or
 subscription through its management link, without attaching a data receiver or
