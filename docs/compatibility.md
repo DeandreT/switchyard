@@ -22,7 +22,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | --- | --- | --- |
 | AMQP 1.0 over TLS | Pre-1.0 | Protocol edge, Rust client end to end |
 | AMQP over WebSockets | Pre-1.0 | Opt-in WS/WSS listener, bounded binary transport, both Rust backends and both pinned .NET clients; see [WebSocket Transport](websocket-transport.md) |
-| SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. Offline JWT: opt-in TLS CBS library path; isolated current .NET TokenCredential gate for Linux/Memory/raw TLS; no CLI activation |
+| SASL PLAIN and CBS SAS/JWT | Pre-1.0 | PLAIN and CBS SAS: protocol edge, Rust client end to end. Offline JWT: opt-in TLS CBS library path; isolated current .NET TokenCredential gate for Linux/Memory/raw TLS; optional TLS/SAS CLI policy-file loading |
 | Queue send, receive, and settlement | Pre-1.0 | State machine |
 | Atomic message batch send | Pre-1.0 | State machine, AMQP producer mapping, Rust clients on both backends and both pinned .NET batch APIs |
 | Message properties and AMQP body preservation | Pre-1.0 | State machine and AMQP mapping; typed properties, application values, annotations, footer and all body kinds. Rust clients on both backends and official .NET property gate |
@@ -800,6 +800,58 @@ diagnostics distinguished a fixture-owned missing-denial assertion without
 printing token, key, argument or raw exception text. The final scoped gate
 preserves its specific unauthorized exception and canonical state checks.
 The value envelope remains version 11 and the durable base layout version 16.
+
+The `switchyard` CLI opts into this policy with
+`--offline-jwt-policy-file PATH`; omission leaves existing defaults unchanged.
+The option requires the existing TLS certificate/private key and configured
+shared-access authentication before opening the policy path. CLI credential
+flags retain their existing rule construction; there is no new JWT-only startup
+mode or nonempty-policy restriction on the library's legal empty SAS policy.
+Normal startup and `--check-config` share this preparation before storage is
+opened or listener sockets are bound. Check-config still reads and validates
+configured TLS, SAS and policy files, then returns without opening storage.
+
+The opened policy must be a regular file containing at most 64 KiB of UTF-8
+configuration accepted by the strict `JwtPolicy::from_json` profile.
+Both metadata length and actual captured byte count are checked; the reader
+takes at most 65,537 bytes to detect an oversized input. New policy-file errors
+are static and omit paths and contents; existing TLS/SAS error behavior remains
+unchanged. These input caps are not allocator, RSS or wall-time guarantees.
+
+On Unix, the loader opens with `RDONLY | NONBLOCK | CLOEXEC` and checks the
+actual descriptor's metadata before reading; FIFOs and FIFO symlinks are refused.
+A symlink to a regular policy file remains supported. The descriptor anchors
+that opened file across path replacement, not an immutable snapshot against
+in-place writes. Non-Unix uses a weaker path-metadata precheck before ordinary
+open, then checks the opened file. Replacement between precheck and open is
+not excluded, and no Unix-style nonblocking-open guarantee is made. The FIFO
+unit checks an explicitly opened descriptor; separate bounded Linux binary
+probes exercise the production opener.
+
+The option supplies the policy to configured AMQP listeners. Native
+administration still receives only the original SAS policy; this flag does not
+authorize JWT Manage requests there. CLI preflight probes are not an actual
+CLI-started JWT wire gate. OIDC, network key refresh, cloud parity and existing
+production/quorum refusals are unchanged, as are value 11 and layout 16.
+
+Verification: the closed CLI increment workspace passed 5,442 tests with no
+failures and 12 ignored cases, across 154 printed groups and 148 canonical
+owners. Every prior case name, status and ignore reason was preserved; only
+13 policy-loading unit cases and three bounded Linux binary probes were added.
+The scoped binary suite passed 37 cases and the SDK target passed 30 regular
+cases with its 12 SDK gates ignored. All twelve existing SDK gates then passed
+in a separate closed run, including the current Memory/raw-TLS JWT case.
+Fresh all-feature no-run output contained 480 compiler artifacts, 34 build
+scripts, one successful finish and no compiler diagnostics; all 138 complete
+test executable paths matched the actual workspace run. This is compiler
+provenance, not a second runtime. Both strict lint and build configurations
+and final formatting passed, using the shared cache and two-CPU policy.
+Full offline metadata enumeration initially refused a missing cached, already
+locked fiat-crypto package; the no-deps enumeration completed. Cargo resolution
+changed only the server direct rustix edge, with no version changes. That
+retained metadata failure was not a runtime-test failure. Value 11, layout 16
+and schemas are unchanged; these CLI probes do not certify CLI-started JWT
+wire authorization or native JWT administration.
 
 A separate pure `auth::JwtPolicy` library provides a narrow offline JWT
 validator; it does not activate the JWT wire path described above.
