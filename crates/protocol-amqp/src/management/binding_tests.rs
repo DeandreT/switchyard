@@ -301,6 +301,7 @@ async fn same_path_old_delivery_receipts_cannot_renew_or_settle_and_remain_regis
                 entity: entity.clone(),
                 sequence: SequenceNumber::new(7),
                 binding: identity(1),
+                session: None,
             })
         );
     }
@@ -340,6 +341,7 @@ async fn late_delivery_cleanup_cannot_remove_a_reused_name_and_token_on_another_
                 entity: current.target().clone(),
                 sequence: SequenceNumber::new(8),
                 binding: current.clone(),
+                session: None,
             })
         );
         management

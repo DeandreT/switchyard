@@ -316,6 +316,7 @@ async fn a_foreign_associated_link_neither_redirects_nor_locks_a_peek() {
                 entity: foreign_entity.clone(),
                 sequence: SequenceNumber::new(77),
                 binding: foreign_binding.clone(),
+                session: None,
             })
         );
     }

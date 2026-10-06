@@ -78,6 +78,30 @@ pub(crate) fn settlement_command(
     })
 }
 
+pub(crate) fn held_settlement_command(
+    sequence: SequenceNumber,
+    lock_token: LockToken,
+    session: Option<domain::SessionHold>,
+    outcome: Outcome,
+) -> Result<CommandKind, SettlementError> {
+    let CommandKind::Settle {
+        sequence,
+        lock_token,
+        disposition,
+        properties_to_modify,
+    } = settlement_command(sequence, lock_token, outcome)?
+    else {
+        unreachable!("the legacy mapper produces only Settle")
+    };
+    Ok(CommandKind::SettleHeld {
+        sequence,
+        lock_token,
+        session,
+        disposition,
+        properties_to_modify,
+    })
+}
+
 pub(crate) fn read_properties_to_modify(
     value: Option<&Value>,
 ) -> Result<BTreeMap<String, MessageValue>, SettlementError> {
@@ -148,6 +172,9 @@ fn read_fields(fields: Option<Fields>) -> BTreeMap<String, MessageValue> {
             .collect()
     })
 }
+
+#[cfg(test)]
+mod held_tests;
 
 #[cfg(test)]
 mod tests {

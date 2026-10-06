@@ -3,7 +3,7 @@ use futures_util::future::BoxFuture;
 use tokio::sync::watch;
 
 use super::{budget::ContentLease, *};
-use crate::{management::DeliveryRegistration, settlement::settlement_command};
+use crate::{management::DeliveryRegistration, settlement::held_settlement_command};
 
 pub(super) type WorkFuture = BoxFuture<'static, Result<(), ReceiveExit>>;
 
@@ -15,6 +15,7 @@ struct Work<B> {
     broker: BoundBroker<B>,
     sequence: domain::SequenceNumber,
     lock: Option<domain::DeliveryLock>,
+    session: Option<SessionHold>,
     authorization: Option<LinkAuthorization>,
     retired: watch::Receiver<bool>,
     _content: ContentLease,
@@ -34,8 +35,12 @@ impl<B: Broker> Work<B> {
                 .await
                 .map_err(|_| ReceiveExit::Unauthorized)?;
         }
-        let kind = match settlement_command(self.sequence, lock.token, settlement.outcome().clone())
-        {
+        let kind = match held_settlement_command(
+            self.sequence,
+            lock.token,
+            self.session.clone(),
+            settlement.outcome().clone(),
+        ) {
             Ok(kind) => kind,
             Err(error) => {
                 let error = error_for(AmqpError::InvalidField, error.to_string());
@@ -88,6 +93,7 @@ pub(super) fn start<B: Broker>(
     entity: &EntityPath,
     broker: &BoundBroker<B>,
     protocol: &ReceivingLinkProtocol,
+    session: Option<&SessionHold>,
     delivery: Delivery,
     reservation: ClaimedOutgoingSendReservation,
     content: ContentLease,
@@ -97,12 +103,13 @@ pub(super) fn start<B: Broker>(
     let lock = delivery.lock;
     let registration = lock
         .map(|lock| {
-            protocol.management.register_delivery_owned(
+            protocol.management.register_delivery_owned_with_session(
                 sender.name(),
                 entity.clone(),
                 sequence,
                 lock.token,
                 broker.binding().clone(),
+                session.cloned(),
             )
         })
         .transpose()
@@ -117,7 +124,7 @@ pub(super) fn start<B: Broker>(
         |lock| lock_delivery_tag(lock.token),
     );
     let message = crate::write_delivery(&delivery);
-    // Retain only canonical lock metadata during outcome and ACK waits.
+    // Retain canonical lock metadata and the original session authority.
     drop(delivery);
     let sending = sender.send_reserved_with_settlement_owned(reservation, message, tag);
     let operation = Work {
@@ -128,6 +135,7 @@ pub(super) fn start<B: Broker>(
         broker: broker.clone(),
         sequence,
         lock,
+        session: session.cloned(),
         authorization: protocol.authorization.clone(),
         retired,
         _content: content,

@@ -104,6 +104,7 @@ struct ManagedDelivery {
     entity: EntityPath,
     sequence: SequenceNumber,
     binding: EntityBinding,
+    session: Option<SessionHold>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -142,6 +143,7 @@ impl ConnectionManagement {
         Arc::new(Self::default())
     }
 
+    #[cfg(test)]
     pub(crate) async fn register_delivery(
         &self,
         link_name: &str,
@@ -149,6 +151,19 @@ impl ConnectionManagement {
         sequence: SequenceNumber,
         lock_token: LockToken,
         binding: EntityBinding,
+    ) {
+        self.register_delivery_with_session(link_name, entity, sequence, lock_token, binding, None)
+            .await;
+    }
+
+    pub(crate) async fn register_delivery_with_session(
+        &self,
+        link_name: &str,
+        entity: EntityPath,
+        sequence: SequenceNumber,
+        lock_token: LockToken,
+        binding: EntityBinding,
+        session: Option<SessionHold>,
     ) {
         self.deliveries.register(
             DeliveryKey {
@@ -159,10 +174,12 @@ impl ConnectionManagement {
                 entity,
                 sequence,
                 binding,
+                session,
             },
         );
     }
 
+    #[cfg(test)]
     pub(crate) fn register_delivery_owned(
         self: &Arc<Self>,
         link_name: &str,
@@ -170,6 +187,20 @@ impl ConnectionManagement {
         sequence: SequenceNumber,
         lock_token: LockToken,
         binding: EntityBinding,
+    ) -> Result<DeliveryRegistration, DeliveryRegistrationError> {
+        self.register_delivery_owned_with_session(
+            link_name, entity, sequence, lock_token, binding, None,
+        )
+    }
+
+    pub(crate) fn register_delivery_owned_with_session(
+        self: &Arc<Self>,
+        link_name: &str,
+        entity: EntityPath,
+        sequence: SequenceNumber,
+        lock_token: LockToken,
+        binding: EntityBinding,
+        session: Option<SessionHold>,
     ) -> Result<DeliveryRegistration, DeliveryRegistrationError> {
         self.deliveries.register_owned(
             Arc::clone(self),
@@ -181,6 +212,7 @@ impl ConnectionManagement {
                 entity,
                 sequence,
                 binding,
+                session,
             },
         )
     }
@@ -1115,7 +1147,7 @@ async fn receive_by_sequence_number<B: Broker>(
                 sequences,
                 mode,
                 lock_duration_millis: None,
-                session,
+                session: session.clone(),
                 budget,
             },
         )
@@ -1142,12 +1174,13 @@ async fn receive_by_sequence_number<B: Broker>(
                 let lock = delivery.lock;
                 if let (Some(link_name), Some(lock)) = (link_name, lock) {
                     management
-                        .register_delivery(
+                        .register_delivery_with_session(
                             link_name,
                             entity.clone(),
                             delivery.sequence,
                             lock.token,
                             broker.binding().clone(),
+                            session.clone(),
                         )
                         .await;
                 }
@@ -1294,9 +1327,10 @@ async fn update_disposition<B: Broker>(
             );
         }
     };
-    let kind = CommandKind::Settle {
+    let kind = CommandKind::SettleHeld {
         sequence: delivery.sequence,
         lock_token,
+        session: delivery.session,
         disposition,
         properties_to_modify,
     };
@@ -1852,6 +1886,9 @@ mod peek_session_tests;
 
 #[cfg(test)]
 mod binding_tests;
+
+#[cfg(test)]
+mod held_settlement_tests;
 
 #[cfg(test)]
 mod tests {

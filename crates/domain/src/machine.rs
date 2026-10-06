@@ -172,6 +172,14 @@ struct DeferredReceiveInput<'a> {
     budget: Option<DeliveryBudget>,
 }
 
+struct SettlementInput<'a> {
+    sequence: SequenceNumber,
+    lock_token: LockToken,
+    disposition: &'a SettlementDisposition,
+    properties_to_modify: Option<&'a BTreeMap<String, MessageValue>>,
+    original_session: Option<&'a SessionHold>,
+}
+
 struct ResponseBudget {
     limits: DeliveryBudget,
     used: u64,
@@ -403,10 +411,13 @@ impl<S: StateStore> StateMachine<S> {
                 lock_token,
             } => self.settle(
                 command,
-                *sequence,
-                *lock_token,
-                &SettlementDisposition::Complete,
-                None,
+                SettlementInput {
+                    sequence: *sequence,
+                    lock_token: *lock_token,
+                    disposition: &SettlementDisposition::Complete,
+                    properties_to_modify: None,
+                    original_session: None,
+                },
                 &mut batch,
             )?,
             CommandKind::Abandon {
@@ -414,10 +425,13 @@ impl<S: StateStore> StateMachine<S> {
                 lock_token,
             } => self.settle(
                 command,
-                *sequence,
-                *lock_token,
-                &SettlementDisposition::Abandon,
-                None,
+                SettlementInput {
+                    sequence: *sequence,
+                    lock_token: *lock_token,
+                    disposition: &SettlementDisposition::Abandon,
+                    properties_to_modify: None,
+                    original_session: None,
+                },
                 &mut batch,
             )?,
             CommandKind::DeadLetter {
@@ -427,13 +441,16 @@ impl<S: StateStore> StateMachine<S> {
                 description,
             } => self.settle(
                 command,
-                *sequence,
-                *lock_token,
-                &SettlementDisposition::DeadLetter {
-                    reason: reason.clone(),
-                    description: description.clone(),
+                SettlementInput {
+                    sequence: *sequence,
+                    lock_token: *lock_token,
+                    disposition: &SettlementDisposition::DeadLetter {
+                        reason: reason.clone(),
+                        description: description.clone(),
+                    },
+                    properties_to_modify: None,
+                    original_session: None,
                 },
-                None,
                 &mut batch,
             )?,
             CommandKind::Defer {
@@ -441,10 +458,13 @@ impl<S: StateStore> StateMachine<S> {
                 lock_token,
             } => self.settle(
                 command,
-                *sequence,
-                *lock_token,
-                &SettlementDisposition::Defer,
-                None,
+                SettlementInput {
+                    sequence: *sequence,
+                    lock_token: *lock_token,
+                    disposition: &SettlementDisposition::Defer,
+                    properties_to_modify: None,
+                    original_session: None,
+                },
                 &mut batch,
             )?,
             CommandKind::Settle {
@@ -454,12 +474,39 @@ impl<S: StateStore> StateMachine<S> {
                 properties_to_modify,
             } => self.settle(
                 command,
-                *sequence,
-                *lock_token,
-                disposition,
-                Some(properties_to_modify),
+                SettlementInput {
+                    sequence: *sequence,
+                    lock_token: *lock_token,
+                    disposition,
+                    properties_to_modify: Some(properties_to_modify),
+                    original_session: None,
+                },
                 &mut batch,
             )?,
+            CommandKind::SettleHeld {
+                sequence,
+                lock_token,
+                session,
+                disposition,
+                properties_to_modify,
+            } => {
+                let config = self.load_config(command)?;
+                require_session_agreement(&config, session.is_some())?;
+                if let Some(hold) = session {
+                    self.held_session(command, hold)?;
+                }
+                self.settle(
+                    command,
+                    SettlementInput {
+                        sequence: *sequence,
+                        lock_token: *lock_token,
+                        disposition,
+                        properties_to_modify: Some(properties_to_modify),
+                        original_session: session.as_ref(),
+                    },
+                    &mut batch,
+                )?
+            }
             CommandKind::RenewLock {
                 sequence,
                 lock_token,
@@ -1523,13 +1570,24 @@ impl<S: StateStore> StateMachine<S> {
     fn settle(
         &self,
         command: &Command,
-        sequence: SequenceNumber,
-        lock_token: LockToken,
-        disposition: &SettlementDisposition,
-        properties_to_modify: Option<&BTreeMap<String, MessageValue>>,
+        input: SettlementInput<'_>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
+        let SettlementInput {
+            sequence,
+            lock_token,
+            disposition,
+            properties_to_modify,
+            original_session,
+        } = input;
         let (mut record, locked_until) = self.held_lock(command, sequence, lock_token)?;
+        if let Some(hold) = original_session
+            && record.session_id.as_ref() != Some(&hold.session_id)
+        {
+            return Err(BrokerError::SessionLockNotHeld {
+                session_id: hold.session_id.clone(),
+            });
+        }
         if command.entity.is_dead_letter_queue()
             && matches!(disposition, SettlementDisposition::DeadLetter { .. })
         {

@@ -146,6 +146,7 @@ fn packet(
             token: LockToken::new(7),
             locked_until: domain::Timestamp::from_millis(10_000),
         }),
+        session: None,
         authorization: None,
         retired,
         _content: content,

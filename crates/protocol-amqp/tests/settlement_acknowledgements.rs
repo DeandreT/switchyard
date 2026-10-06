@@ -134,7 +134,7 @@ impl Broker for ControlledBroker {
                     dead_letter: None,
                 })))
             }
-            kind @ CommandKind::Settle { .. } => {
+            kind @ CommandKind::SettleHeld { session: None, .. } => {
                 self.0
                     .started
                     .send(kind)
@@ -431,9 +431,10 @@ fn dead_letter_info() -> Fields {
 }
 
 fn assert_dead_letter_command(kind: CommandKind) {
-    let CommandKind::Settle {
+    let CommandKind::SettleHeld {
         sequence,
         lock_token,
+        session: None,
         disposition,
         properties_to_modify,
     } = kind

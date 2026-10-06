@@ -64,6 +64,7 @@ pub(super) async fn receive_until_stopped<B: Broker>(
                     entity,
                     broker,
                     protocol,
+                    session,
                     *acquired.delivery,
                     acquired.reservation,
                     content,

@@ -1634,6 +1634,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde_amqp",
+ "storage",
  "thiserror 2.0.19",
  "tokio",
  "tokio-rustls",

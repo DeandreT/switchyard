@@ -348,6 +348,15 @@ pub enum CommandKind {
         filter: RuleFilter,
         action: SqlAction,
     },
+    /// Settles a protocol delivery under its original session authority.
+    /// None is valid only for ordinary queues and dead-letter shadows.
+    SettleHeld {
+        sequence: SequenceNumber,
+        lock_token: LockToken,
+        session: Option<SessionHold>,
+        disposition: SettlementDisposition,
+        properties_to_modify: BTreeMap<String, MessageValue>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
