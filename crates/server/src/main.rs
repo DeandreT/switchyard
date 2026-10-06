@@ -6,6 +6,10 @@ mod logging;
 #[path = "main/maintenance_tests.rs"]
 mod maintenance_tests;
 
+#[cfg(test)]
+#[path = "main/config_check_tests.rs"]
+mod config_check_tests;
+
 use std::{
     fs,
     net::SocketAddr,
@@ -35,6 +39,11 @@ use tracing::info;
     about = "Azure Service Bus-compatible message broker"
 )]
 struct Arguments {
+    /// Validate startup configuration without opening storage or listeners.
+    /// Configured TLS and shared-access credential files are still read.
+    #[arg(long)]
+    check_config: bool,
+
     #[arg(long, value_enum, default_value_t = ModeArgument::Development)]
     mode: ModeArgument,
 
@@ -278,7 +287,17 @@ fn run() -> Result<(), StartupError> {
     run_with_arguments(Arguments::parse())
 }
 
-fn run_with_arguments(arguments: Arguments) -> Result<(), StartupError> {
+struct PreparedConfiguration {
+    cluster: ClusterConfig,
+    storage: StorageChoice,
+    namespace: domain::NamespaceName,
+    tls: Option<LoadedTls>,
+    shared_access_authentication: Option<SharedAccessAuthentication>,
+    listen: SocketAddr,
+    interval: Duration,
+}
+
+fn prepare_configuration(arguments: &Arguments) -> Result<PreparedConfiguration, StartupError> {
     let mode = DeploymentMode::from(arguments.mode);
     validate_experimental_atomic_messaging_listener(
         mode,
@@ -289,6 +308,9 @@ fn run_with_arguments(arguments: Arguments) -> Result<(), StartupError> {
         arguments.development_maintenance_readiness,
         arguments.admin_listen,
     )?;
+    if arguments.sweep_interval_millis == 0 {
+        return Err(StartupError::ZeroSweepInterval);
+    }
     let cluster = ClusterConfig {
         mode,
         voters: arguments.voters,
@@ -307,7 +329,36 @@ fn run_with_arguments(arguments: Arguments) -> Result<(), StartupError> {
         arguments.shared_access_key_file.as_deref(),
     )?;
     let listen = listen_address(arguments.listen, tls.is_some());
-    let state = server::open(cluster, storage_choice(&arguments)?)?;
+    let storage = storage_choice(arguments)?;
+    server::validate_storage_configuration(cluster, &storage)?;
+    let namespace = namespace_from_hostname(&arguments.namespace)?;
+    Ok(PreparedConfiguration {
+        cluster,
+        storage,
+        namespace,
+        tls,
+        shared_access_authentication,
+        listen,
+        interval: Duration::from_millis(arguments.sweep_interval_millis),
+    })
+}
+
+fn run_with_arguments(arguments: Arguments) -> Result<(), StartupError> {
+    let prepared = prepare_configuration(&arguments)?;
+    if arguments.check_config {
+        return Ok(());
+    }
+    let PreparedConfiguration {
+        cluster,
+        storage,
+        namespace,
+        tls,
+        shared_access_authentication,
+        listen,
+        interval,
+    } = prepared;
+    let mode = cluster.mode;
+    let state = server::open(cluster, storage)?;
 
     info!(
         ?mode,
@@ -315,7 +366,6 @@ fn run_with_arguments(arguments: Arguments) -> Result<(), StartupError> {
         storage = ?arguments.storage,
         "configuration is valid"
     );
-    let namespace = namespace_from_hostname(&arguments.namespace)?;
     let broker = match state {
         NodeState::Memory(machine) => Broker::spawn(LocalProposer::new(machine, SystemClock)),
         NodeState::Durable(machine) => Broker::spawn(LocalProposer::new(machine, SystemClock)),
@@ -325,7 +375,6 @@ fn run_with_arguments(arguments: Arguments) -> Result<(), StartupError> {
     // any point loses no acknowledged state. That is why there is no signal
     // handler yet: an abrupt stop is already safe.
     let shutdown = Arc::new(Shutdown::default());
-    let interval = Duration::from_millis(arguments.sweep_interval_millis);
     let sweeper = {
         let handle = broker.handle();
         let shutdown = Arc::clone(&shutdown);

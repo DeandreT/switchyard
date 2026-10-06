@@ -68,6 +68,23 @@ pub enum NodeState {
 /// state, and the quorum replication required for durable production is not yet
 /// implemented. Cluster validation takes precedence over either refusal.
 pub fn open(cluster: ClusterConfig, storage: StorageChoice) -> Result<NodeState, StartupError> {
+    validate_storage_configuration(cluster, &storage)?;
+    match storage {
+        StorageChoice::Memory => Ok(NodeState::Memory(StateMachine::new(MemoryStore::default()))),
+        StorageChoice::Durable { directory } => Ok(NodeState::Durable(StateMachine::new(
+            FjallStore::open(directory)?,
+        ))),
+    }
+}
+
+/// Checks cluster and backend policy without opening or inspecting storage.
+///
+/// This does not check directory access, store format, or runtime readiness.
+/// Cluster validation takes precedence over the production backend refusals.
+pub fn validate_storage_configuration(
+    cluster: ClusterConfig,
+    storage: &StorageChoice,
+) -> Result<(), StartupError> {
     cluster.validate()?;
     match (cluster.mode, storage) {
         (DeploymentMode::Production, StorageChoice::Memory) => {
@@ -76,12 +93,7 @@ pub fn open(cluster: ClusterConfig, storage: StorageChoice) -> Result<NodeState,
         (DeploymentMode::Production, StorageChoice::Durable { .. }) => {
             Err(StartupError::ReplicationUnavailableInProduction)
         }
-        (_, StorageChoice::Memory) => {
-            Ok(NodeState::Memory(StateMachine::new(MemoryStore::default())))
-        }
-        (_, StorageChoice::Durable { directory }) => Ok(NodeState::Durable(StateMachine::new(
-            FjallStore::open(directory)?,
-        ))),
+        _ => Ok(()),
     }
 }
 
@@ -101,6 +113,8 @@ pub enum StartupError {
     DevelopmentMaintenanceReadinessRequiresAdminListener,
     #[error("the durable backend needs a data directory")]
     MissingDataDirectory,
+    #[error("--sweep-interval-millis must be greater than zero")]
+    ZeroSweepInterval,
     #[error("could not listen on {address}: {detail}")]
     Listen { address: String, detail: String },
     #[error("production mode requires a TLS certificate and private key")]
