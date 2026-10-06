@@ -435,6 +435,151 @@ pub(crate) async fn run_retained_client(
     .await
 }
 
+pub(crate) async fn build_offline_jwt_client(
+    sdk_version: &'static str,
+) -> TestResult<tempfile::TempDir> {
+    build_client(sdk_version).await
+}
+
+pub(crate) fn offline_jwt_client_command(
+    dll: &Path,
+    endpoint: &str,
+    queue: &str,
+    ca_file: &Path,
+    ca_directory: &Path,
+) -> Command {
+    let mut command = Command::new("dotnet");
+    command
+        .env("DOTNET_PROCESSOR_COUNT", "2")
+        .env("SSL_CERT_FILE", ca_file)
+        .env("SSL_CERT_DIR", ca_directory)
+        .arg(dll)
+        .arg("offline-jwt")
+        .arg(HOST)
+        .arg(endpoint)
+        .arg(queue);
+    command
+}
+
+pub(crate) async fn run_offline_jwt_client(
+    dll: &Path,
+    endpoint: &str,
+    queue: &str,
+    ca_file: &Path,
+    ca_directory: &Path,
+) -> TestResult<Output> {
+    run(
+        offline_jwt_client_command(dll, endpoint, queue, ca_file, ca_directory),
+        "offline JWT client",
+        RUN_DEADLINE,
+        MAX_OUTPUT_BYTES,
+    )
+    .await
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OfflineJwtChildDiagnostic {
+    stage: &'static str,
+    exception: &'static str,
+    credential_requested: bool,
+    scope_refused: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OfflineJwtFailureSummary {
+    failure: &'static str,
+    status_present: bool,
+    status_success: Option<bool>,
+    capture_complete: bool,
+    child: Option<OfflineJwtChildDiagnostic>,
+}
+
+fn offline_jwt_child_diagnostic(stderr: &str) -> Option<OfflineJwtChildDiagnostic> {
+    if stderr.len() > MAX_OUTPUT_BYTES {
+        return None;
+    }
+    let mut found = None;
+    for line in stderr.lines() {
+        let Some(fields) = line.strip_prefix("offline JWT SDK diagnostic ") else {
+            continue;
+        };
+        if found.is_some() || fields.len() > 192 {
+            return None;
+        }
+        let mut fields = fields.split(' ');
+        let stage = fields.next()?.strip_prefix("stage=")?;
+        let stage = [
+            "arguments",
+            "credential",
+            "client",
+            "send",
+            "sender-disposal",
+            "listen",
+            "listen-unexpected-message",
+            "listen-denial-missing",
+            "receiver-disposal",
+            "client-disposal",
+            "credential-check",
+        ]
+        .into_iter()
+        .find(|allowed| *allowed == stage)?;
+        let exception = fields.next()?.strip_prefix("exception=")?;
+        let exception = [
+            "unauthorized",
+            "service-bus",
+            "cancelled",
+            "argument",
+            "invalid-operation",
+            "cryptographic",
+            "tls",
+            "io",
+            "other",
+        ]
+        .into_iter()
+        .find(|allowed| *allowed == exception)?;
+        let credential_requested = match fields.next()?.strip_prefix("credential_requested=")? {
+            "true" => true,
+            "false" => false,
+            _ => return None,
+        };
+        let scope_refused = match fields.next()?.strip_prefix("scope_refused=")? {
+            "true" => true,
+            "false" => false,
+            _ => return None,
+        };
+        if fields.next().is_some() {
+            return None;
+        }
+        found = Some(OfflineJwtChildDiagnostic {
+            stage,
+            exception,
+            credential_requested,
+            scope_refused,
+        });
+    }
+    found
+}
+
+pub(crate) fn offline_jwt_failure_summary(
+    error: &(dyn Error + 'static),
+) -> Option<OfflineJwtFailureSummary> {
+    let error = error.downcast_ref::<RunError>()?;
+    Some(OfflineJwtFailureSummary {
+        failure: match error.failure {
+            Failure::Nonzero => "nonzero",
+            Failure::Timeout => "timeout",
+            Failure::OutputLimit => "output-limit",
+            Failure::Reader => "reader",
+            Failure::Wait => "wait",
+            Failure::Cleanup => "cleanup",
+        },
+        status_present: error.status.is_some(),
+        status_success: error.status.map(|status| status.success()),
+        capture_complete: error.capture_eof == 2,
+        child: offline_jwt_child_diagnostic(&error.stderr),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,5 +729,118 @@ mod tests {
             error.capture_eof, 2,
             "both inherited pipes closed after group cleanup"
         );
+    }
+
+    #[test]
+    fn offline_jwt_summary_redacts_unknown_output_and_non_runner_errors() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let error = RunError {
+            label: "secret-label".into(),
+            failure: Failure::Nonzero,
+            status: Some(ExitStatus::from_raw(7 << 8)),
+            capture_eof: 2,
+            stdout: "secret-token secret-body".into(),
+            stderr: "secret-key secret-arguments secret-exception-message".into(),
+        };
+        let summary = offline_jwt_failure_summary(&error).expect("original runner type");
+        assert_eq!(summary.failure, "nonzero");
+        assert!(summary.status_present);
+        assert_eq!(summary.status_success, Some(false));
+        assert!(summary.capture_complete);
+        assert!(summary.child.is_none());
+        let printed = format!("{summary:?}");
+        assert!(!printed.contains("secret"));
+        assert!(!printed.contains('7'));
+
+        let other = io::Error::other("secret-non-runner-error");
+        assert!(offline_jwt_failure_summary(&other).is_none());
+        for (failure, label) in [
+            (Failure::Timeout, "timeout"),
+            (Failure::OutputLimit, "output-limit"),
+            (Failure::Reader, "reader"),
+            (Failure::Wait, "wait"),
+            (Failure::Cleanup, "cleanup"),
+        ] {
+            let error = RunError {
+                label: "secret-label".into(),
+                failure,
+                status: None,
+                capture_eof: 1,
+                stdout: "secret-stdout".into(),
+                stderr: "secret-stderr".into(),
+            };
+            let summary = offline_jwt_failure_summary(&error).expect("runner type");
+            assert_eq!(summary.failure, label);
+            assert!(!summary.status_present);
+            assert_eq!(summary.status_success, None);
+            assert!(!summary.capture_complete);
+            assert!(summary.child.is_none());
+            assert!(!format!("{summary:?}").contains("secret"));
+        }
+    }
+
+    #[test]
+    fn offline_jwt_summary_accepts_only_exact_static_child_labels() {
+        let prefix = "offline JWT SDK diagnostic ";
+        for stage in [
+            "arguments",
+            "credential",
+            "client",
+            "send",
+            "sender-disposal",
+            "listen",
+            "listen-unexpected-message",
+            "listen-denial-missing",
+            "receiver-disposal",
+            "client-disposal",
+            "credential-check",
+        ] {
+            for exception in [
+                "unauthorized",
+                "service-bus",
+                "cancelled",
+                "argument",
+                "invalid-operation",
+                "cryptographic",
+                "tls",
+                "io",
+                "other",
+            ] {
+                for (requested, refused) in
+                    [(false, false), (true, false), (false, true), (true, true)]
+                {
+                    let line = format!(
+                        "{prefix}stage={stage} exception={exception} credential_requested={requested} scope_refused={refused}"
+                    );
+                    let child = offline_jwt_child_diagnostic(&format!(
+                        "secret-before\n{line}\r\nsecret-after\n"
+                    ))
+                    .expect("only finite diagnostic labels");
+                    assert_eq!(child.stage, stage);
+                    assert_eq!(child.exception, exception);
+                    assert_eq!(child.credential_requested, requested);
+                    assert_eq!(child.scope_refused, refused);
+                    assert!(!format!("{child:?}").contains("secret"));
+                }
+            }
+        }
+        let valid = format!(
+            "{prefix}stage=send exception=service-bus credential_requested=true scope_refused=false"
+        );
+        for output in [
+            "secret-token".to_owned(),
+            valid.replace("stage=send", "stage=secret-token"),
+            valid.replace("exception=service-bus", "exception=secret-error"),
+            valid.replace("credential_requested=true", "credential_requested=secret"),
+            valid.replace("scope_refused=false", "scope_refused=secret"),
+            format!("{valid} secret-key"),
+            format!("{valid}\n{valid}\n"),
+            valid.replace(" exception=", "  exception="),
+            format!("{prefix}{}", "secret".repeat(40)),
+        ] {
+            assert!(offline_jwt_child_diagnostic(&output).is_none());
+        }
+        assert!(offline_jwt_child_diagnostic(&"secret".repeat(MAX_OUTPUT_BYTES / 6 + 1)).is_none());
     }
 }

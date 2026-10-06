@@ -16,6 +16,8 @@ use super::{CURRENT_SDK, HOST, KEY, RULE, atomic_messaging::process, websocket};
 mod disposal_tests;
 #[path = "retained_ingress/fixture.rs"]
 mod fixture;
+#[path = "retained_ingress/offline_jwt.rs"]
+mod offline_jwt;
 #[path = "retained_ingress/tests.rs"]
 mod tests;
 

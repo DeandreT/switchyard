@@ -186,15 +186,7 @@ async fn management_links_remain_refused_on_collected_endpoint() -> TestResult {
             .await?;
         assert_eq!(refused.role, Role::Receiver);
         assert_eq!(refused.name, "retained-management-refusal");
-        assert_eq!(
-            refused
-                .target
-                .as_ref()
-                .and_then(amqp::TargetTerminus::as_target)
-                .and_then(|target| target.address.as_deref()),
-            Some("orders/$management")
-        );
-        assert!(refused.source.is_none());
+        assert!(refused.source.is_none() && refused.target.is_none());
         let mut detached = false;
         for _ in 0..64 {
             match fixture.frame().await? {

@@ -353,6 +353,56 @@ impl Fixture {
         })
     }
 
+    pub(super) async fn start_with_offline_jwt(policy: auth::JwtPolicy) -> TestResult<Self> {
+        let (tls, ca_pem) = websocket::signed_localhost_config()?;
+        let authentication = SharedAccessAuthentication::new(SharedAccessPolicy::new([])?, HOST)?
+            .with_authorization_timeout(Duration::from_secs(15))
+            .with_offline_jwt_policy(policy);
+        let certificates = tempfile::TempDir::new()?;
+        let ca_file = certificates.path().join("trusted-ca.pem");
+        let ca_directory = certificates.path().join("empty-ca-directory");
+        std::fs::write(&ca_file, ca_pem)?;
+        std::fs::create_dir(&ca_directory)?;
+        let store = MemoryStore::default();
+        let namespace = NamespaceName::new("tenant")?;
+        let broker = Broker::spawn(LocalProposer::new(
+            StateMachine::new(store.clone()),
+            SystemClock,
+        ));
+        broker.handle().submit_blocking(
+            namespace.clone(),
+            EntityPath::new(QUEUE)?,
+            CommandKind::CreateQueue {
+                config: QueueConfig {
+                    lock_duration_millis: domain::MAX_LOCK_DURATION_MILLIS,
+                    default_time_to_live_millis: None,
+                    ..QueueConfig::default()
+                },
+            },
+        )?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("sb://localhost:{}", listener.local_addr()?.port());
+        let controller = Controller::new(
+            listener,
+            broker.handle(),
+            namespace.clone(),
+            Some(tls),
+            Some(authentication),
+        );
+        Ok(Self {
+            endpoint,
+            ca_file,
+            ca_directory,
+            store,
+            namespace,
+            controller,
+            client: None,
+            client_panic: None,
+            broker: Some(broker),
+            _certificates: certificates,
+        })
+    }
+
     pub(super) async fn connect_peer(&self) -> TestResult<TcpStream> {
         let address = self.endpoint.trim_start_matches("sb://localhost:");
         Ok(TcpStream::connect(format!("127.0.0.1:{address}")).await?)

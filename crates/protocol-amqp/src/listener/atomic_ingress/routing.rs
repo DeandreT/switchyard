@@ -18,6 +18,8 @@ use crate::{
 };
 
 mod adapter;
+#[cfg(test)]
+mod refusal_tests;
 pub(super) use adapter::Branch;
 use adapter::{DefaultWorkers, accepted, launch};
 pub(super) use adapter::{RouteError, WorkerTasks, stop_connection};
@@ -479,12 +481,8 @@ async fn refuse(
             Err(error) => return Err(error.into()),
         }
     } else {
-        match session
-            .accept_attach(attach, crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64)
-            .await
-        {
-            Ok(endpoint) => detach_with(endpoint, error).await,
-            Err(EngineError::RemoteDetached) => {}
+        match session.reject_attach(attach, error).await {
+            Ok(()) | Err(EngineError::RemoteDetached) => {}
             Err(error) => return Err(error.into()),
         }
     }
