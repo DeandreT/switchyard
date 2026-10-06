@@ -53,6 +53,7 @@ struct TopicCopy<'a> {
 }
 
 const SQL_FILTER_ERROR_REASON: &str = "SwitchyardSqlFilterError";
+const SQL_ACTION_ERROR_REASON: &str = "SwitchyardSqlActionError";
 
 #[derive(Clone, Copy)]
 enum RetentionRoute {
@@ -65,6 +66,7 @@ enum RetentionRoute {
 enum TopicDeadLetter {
     MissingSession,
     Sql(crate::SqlEvaluationError),
+    Action(crate::rule::SqlActionError),
 }
 
 impl TopicDeadLetter {
@@ -72,6 +74,7 @@ impl TopicDeadLetter {
         match self {
             Self::MissingSession => "Session ID is null",
             Self::Sql(_) => SQL_FILTER_ERROR_REASON,
+            Self::Action(_) => SQL_ACTION_ERROR_REASON,
         }
     }
 
@@ -79,6 +82,7 @@ impl TopicDeadLetter {
         match self {
             Self::MissingSession => DeadLetterReason::MissingSessionId,
             Self::Sql(_) => DeadLetterReason::Application(SQL_FILTER_ERROR_REASON.to_owned()),
+            Self::Action(_) => DeadLetterReason::Application(SQL_ACTION_ERROR_REASON.to_owned()),
         }
     }
 
@@ -86,6 +90,7 @@ impl TopicDeadLetter {
         use crate::SqlEvaluationError;
         match self {
             Self::MissingSession => MISSING_SESSION_ID_DESCRIPTION,
+            Self::Action(error) => error.description(),
             Self::Sql(SqlEvaluationError::TypeMismatch) => {
                 "SQL filter operands have incompatible types."
             }
@@ -111,6 +116,12 @@ impl TopicDeadLetter {
             Self::Sql(SqlEvaluationError::Limit { .. }) => "SQL filter evaluation failed.",
         }
     }
+}
+
+fn action_route(route: RetentionRoute, checked: &crate::rule::CheckedSqlAction) -> RetentionRoute {
+    checked.error().map_or(route, |error| {
+        RetentionRoute::DeadLetter(TopicDeadLetter::Action(error))
+    })
 }
 
 fn retention_route(
@@ -208,15 +219,20 @@ impl TopicBudget {
                     if *no_action {
                         self.charge_route(cost, message, route)?;
                     }
-                    for &rule in actions {
-                        let (program, name) = targets.rules[index].action(rule)?;
+                    for action in actions {
+                        let (program, name) = targets.rules[index].action(action.rule)?;
                         let projected = action_cost(
                             message,
                             program,
+                            &action.checked,
                             name,
                             &subscription.config.to_queue_config(),
                         )?;
-                        self.charge_route(projected, message, route)?;
+                        self.charge_route(
+                            projected,
+                            message,
+                            action_route(route, &action.checked),
+                        )?;
                     }
                 }
                 _ => self.charge_route(cost, message, route)?,
@@ -541,10 +557,10 @@ impl<S: StateStore> StateMachine<S> {
                     enqueued,
                 )?;
             }
-            for &rule in actions {
-                let (program, name) = targets.rules[index].action(rule)?;
+            for action in actions {
+                let (program, name) = targets.rules[index].action(action.rule)?;
                 let sequence = emission.counters.allocate_sequence()?;
-                let envelope = action_envelope(message, program, name);
+                let envelope = action_envelope(message, program, &action.checked, name);
                 self.emit_topic_copy(
                     command,
                     TopicCopy {
@@ -554,7 +570,7 @@ impl<S: StateStore> StateMachine<S> {
                         message,
                         sequence,
                         scheduled_enqueue_time: emission.scheduled_enqueue_time,
-                        route,
+                        route: action_route(route, &action.checked),
                         envelope: Some(envelope),
                     },
                     batch,
@@ -662,18 +678,17 @@ impl<S: StateStore> StateMachine<S> {
 fn action_cost(
     message: MessageInput<'_>,
     program: &crate::rule::SqlActionProgram,
+    checked: &crate::rule::CheckedSqlAction,
     name: &str,
     config: &QueueConfig,
 ) -> Result<TopicMessageCost, BrokerError> {
-    let (content, value_items, header) = match message.envelope {
-        Some(envelope) => envelope.removal_projection(program.targets(), "RuleName", name)?,
-        None => MessageEnvelope::legacy_annotation_projection(
-            message.message_id,
-            message.body.len(),
-            "RuleName",
-            name,
-        )?,
-    };
+    let (content, value_items, header) = MessageEnvelope::checked_action_projection(
+        message.envelope,
+        program,
+        checked,
+        "RuleName",
+        name,
+    )?;
     let overhead = message.envelope.map_or_else(
         || {
             message
@@ -685,6 +700,7 @@ fn action_cost(
         },
     );
     let header_bytes = header
+        .max(checked.peak().2)
         .saturating_add(overhead)
         .saturating_add(BROKER_HEADER_RESERVE_BYTES);
     if header_bytes > MAX_MESSAGE_HEADER_BYTES {
@@ -693,7 +709,10 @@ fn action_cost(
             maximum_bytes: MAX_MESSAGE_HEADER_BYTES,
         });
     }
-    let body_bytes = content.saturating_add(overhead).max(message.body.len());
+    let body_bytes = content
+        .max(checked.peak().0)
+        .saturating_add(overhead)
+        .max(message.body.len());
     if body_bytes > config.max_message_bytes {
         return Err(BrokerError::MessageTooLarge {
             body_bytes,
@@ -716,6 +735,7 @@ fn action_cost(
 fn action_envelope(
     message: MessageInput<'_>,
     program: &crate::rule::SqlActionProgram,
+    checked: &crate::rule::CheckedSqlAction,
     name: &str,
 ) -> MessageEnvelope {
     let mut envelope = message
@@ -729,7 +749,7 @@ fn action_envelope(
             body: crate::MessageBody::Data(vec![message.body.to_vec()]),
             ..MessageEnvelope::default()
         });
-    program.apply(&mut envelope);
+    program.apply_checked(checked, &mut envelope);
     envelope
         .application_properties
         .insert("RuleName".to_owned(), MessageValue::String(name.to_owned()));
@@ -786,6 +806,26 @@ mod tests {
             SqlEvaluationError::NonPredicate,
         ] {
             let info = TopicDeadLetter::Sql(error);
+            let original = MessageEnvelope::default();
+            let mut projected = original.clone();
+            projected.application_properties.insert(
+                "DeadLetterReason".into(),
+                MessageValue::String(info.reason_str().into()),
+            );
+            projected.application_properties.insert(
+                "DeadLetterErrorDescription".into(),
+                MessageValue::String(info.description().into()),
+            );
+            let extra = projected.header_content_size() - original.header_content_size();
+            assert!(extra <= BROKER_HEADER_RESERVE_BYTES - BROKER_BASE_HEADER_RESERVE_BYTES);
+            projected.validate_property_quotas()?;
+        }
+        for error in [
+            crate::rule::SqlActionError::TypeMismatch,
+            crate::rule::SqlActionError::UnsupportedTargetType,
+            crate::rule::SqlActionError::NumericOverflow,
+        ] {
+            let info = TopicDeadLetter::Action(error);
             let original = MessageEnvelope::default();
             let mut projected = original.clone();
             projected.application_properties.insert(

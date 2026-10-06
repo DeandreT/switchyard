@@ -95,7 +95,7 @@ pub(super) async fn round_trip<P: StoreProvider>(provider: P) -> TestResult {
             output.action,
             Some(SqlRuleAction {
                 expression: source.into(),
-                semantic_version: Some(domain::SQL_ACTION_SEMANTIC_VERSION)
+                semantic_version: Some(if index % 2 == 0 { 1 } else { 2 })
             })
         );
         let filter = match filter {
@@ -242,6 +242,76 @@ pub(super) async fn round_trip<P: StoreProvider>(provider: P) -> TestResult {
         .rules
         .is_empty()
     );
+    let literal = " /* wire */ SET member=11;SET nullable=TRUE;SET added='literal'; ";
+    timeout(
+        DEADLINE,
+        rules.create_rule_with_action(request(
+            create_action(
+                CHILD,
+                "LiteralSet",
+                Filter::TrueFilter(TrueRuleFilter {}),
+                literal,
+                None,
+            ),
+            Some(sas(CHILD, "manage")),
+        )),
+    )
+    .await??;
+    let output = timeout(
+        DEADLINE,
+        rules.get_rule(request(
+            get_actions(CHILD, "LiteralSet"),
+            Some(sas(CHILD, "manage")),
+        )),
+    )
+    .await??
+    .into_inner();
+    assert_eq!(
+        output.action,
+        Some(SqlRuleAction {
+            expression: literal.into(),
+            semantic_version: Some(2)
+        })
+    );
+    let before = node.snapshot()?;
+    assert_eq!(
+        timeout(
+            DEADLINE,
+            rules.create_rule_with_action(request(
+                create_action(
+                    CHILD,
+                    "V1Literal",
+                    Filter::TrueFilter(TrueRuleFilter {}),
+                    literal,
+                    Some(1)
+                ),
+                Some(sas(CHILD, "manage"))
+            ))
+        )
+        .await?
+        .expect_err("explicit v1 remains REMOVE-only")
+        .code(),
+        Code::Unimplemented
+    );
+    assert_eq!(node.snapshot()?, before);
+    timeout(
+        DEADLINE,
+        rules.delete_rule(request(
+            delete(CHILD, "LiteralSet"),
+            Some(sas(CHILD, "manage")),
+        )),
+    )
+    .await??;
+    assert!(
+        timeout(
+            DEADLINE,
+            rules.list_rules(request(list_actions(CHILD), Some(sas(CHILD, "manage"))))
+        )
+        .await??
+        .into_inner()
+        .rules
+        .is_empty()
+    );
     Ok(())
 }
 
@@ -289,7 +359,7 @@ pub(super) async fn refusals<P: StoreProvider>(provider: P) -> TestResult {
                 CHILD,
                 "Refused",
                 Filter::TrueFilter(TrueRuleFilter {}),
-                "SET private_source = 7",
+                "SET sys.Subject = 7",
                 None,
             ),
             Code::Unimplemented,
@@ -320,7 +390,7 @@ pub(super) async fn refusals<P: StoreProvider>(provider: P) -> TestResult {
                 "Refused",
                 Filter::TrueFilter(TrueRuleFilter {}),
                 "invalid private-source",
-                Some(2),
+                Some(3),
             ),
             Code::Unimplemented,
         ),

@@ -176,7 +176,7 @@ async fn exact_listen_grant_creates_lists_and_deletes_actions_on_the_canonical_c
             .as_ref()
             .expect("action version")
             .semantic_version(),
-        1
+        2
     );
     let before = node.store.snapshot()?;
     listed_action(

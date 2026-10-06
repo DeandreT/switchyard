@@ -1,5 +1,5 @@
 use sqlparser::{
-    ast::Expr,
+    ast::{BinaryOperator, Expr},
     dialect::Dialect,
     keywords::Keyword,
     parser::{Parser, ParserError},
@@ -14,6 +14,7 @@ use crate::{
 
 pub(super) fn compile(
     expression: &str,
+    semantic_version: u32,
     budget: &mut SqlCompileBudget,
 ) -> Result<SqlActionProgram, SqlCompileError> {
     source_limits(expression)?;
@@ -36,9 +37,12 @@ pub(super) fn compile(
         .with_recursion_limit(MAX_SQL_PARSER_DEPTH)
         .with_tokens(tokens);
     let mut targets = Vec::new();
+    let mut values = Vec::new();
 
     loop {
-        if !parser.parse_keyword(Keyword::REMOVE) {
+        let remove = parser.parse_keyword(Keyword::REMOVE);
+        let set = !remove && semantic_version == 2 && parser.parse_keyword(Keyword::SET);
+        if !remove && !set {
             return Err(match parser.peek_token().token {
                 Token::Word(_) => unsupported("SQL action statement"),
                 _ => SqlCompileError::Syntax,
@@ -50,10 +54,26 @@ pub(super) fn compile(
                 maximum: MAX_SQL_ACTION_STATEMENTS,
             });
         }
-        let target = parser.parse_expr().map_err(parser_error)?;
-        let name = target_name(&target)?;
-        budget.charge_node()?;
+        let expression = parser.parse_expr().map_err(parser_error)?;
+        let (name, value) = if remove {
+            let name = target_name(&expression)?;
+            budget.charge_node()?;
+            (name, None)
+        } else {
+            let Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } = &expression
+            else {
+                return Err(unsupported("SQL action assignment"));
+            };
+            let name = target_name(left)?;
+            budget.charge_node()?;
+            (name, Some(super::literals::parse(right, budget)?))
+        };
         targets.push(name.to_owned());
+        values.push(value);
 
         if parser.peek_token().token == Token::EOF {
             break;
@@ -66,7 +86,11 @@ pub(super) fn compile(
         }
     }
 
-    Ok(SqlActionProgram { targets })
+    Ok(SqlActionProgram {
+        semantic_version,
+        targets,
+        values,
+    })
 }
 
 #[derive(Debug)]

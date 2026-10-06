@@ -15,11 +15,11 @@ pub(super) fn check<S: StateStore>(store: &S, namespace: &NamespaceName) -> Test
     );
     let counters = store
         .get(&keys::queue_counters(namespace, &topic))?
-        .expect("the two topic publications retained their sequence counter");
+        .expect("the four topic publications retained their sequence counter");
     let counters: QueueCounters = codec::decode(&counters)?;
     assert_eq!(
-        counters.next_sequence, 7,
-        "two base sequences plus four independent action copies must consume six parent sequences"
+        counters.next_sequence, 14,
+        "four bases plus nine actions allocate thirteen distinct parent sequences, not seventeen physical subscription copies"
     );
     let subscriptions = machine.subscriptions(namespace, &topic)?;
     assert_eq!(subscriptions.len(), 2);

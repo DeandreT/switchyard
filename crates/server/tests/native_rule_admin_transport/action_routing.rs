@@ -4,7 +4,7 @@ use amqp::{
 };
 
 use super::{
-    actions::{create_action, list_actions},
+    actions::{create_action, get_actions, list_actions},
     *,
 };
 
@@ -40,6 +40,11 @@ fn expected(original: &Message, name: Option<&str>) -> Message {
         }
         Some("b-remove") => {
             properties.shift_remove("nullable");
+        }
+        Some("c-set") => {
+            properties.insert("member".into(), Value::Int(11));
+            properties.insert("nullable".into(), Value::Bool(true));
+            properties.insert("added".into(), Value::Long(23));
         }
         None => {}
         Some(_) => unreachable!("known native rule names"),
@@ -133,7 +138,7 @@ pub(super) async fn round_trip<P: StoreProvider>(provider: P) -> TestResult {
                 .action,
             Some(SqlRuleAction {
                 expression: source.into(),
-                semantic_version: Some(1)
+                semantic_version: Some(2)
             })
         );
     }
@@ -287,6 +292,159 @@ pub(super) async fn round_trip<P: StoreProvider>(provider: P) -> TestResult {
             .collect::<Vec<_>>(),
         [4, 5, 6]
     );
+    let literal_source = " /* native literal */ SET member=11;SET nullable=TRUE;SET added=23;SET RuleName='ignored'; ";
+    let failure_source = "REMOVE audit;SET member='incompatible'";
+    for (name, source) in [("c-set", literal_source), ("d-fail", failure_source)] {
+        timeout(
+            DEADLINE,
+            rules.create_rule_with_action(request(
+                create_action(
+                    CHILD,
+                    name,
+                    Filter::SqlFilter(SqlRuleFilter {
+                        expression: "member=7".into(),
+                        semantic_version: None,
+                    }),
+                    source,
+                    None,
+                ),
+                Some(sas(CHILD, "manage")),
+            )),
+        )
+        .await??;
+        let stored = timeout(
+            DEADLINE,
+            rules.get_rule(request(
+                get_actions(CHILD, name),
+                Some(sas(CHILD, "manage")),
+            )),
+        )
+        .await??
+        .into_inner();
+        assert_eq!(
+            stored.action,
+            Some(SqlRuleAction {
+                expression: source.into(),
+                semantic_version: Some(2)
+            })
+        );
+    }
+    let literal_original = message();
+    assert!(matches!(
+        timeout(DEADLINE, sender.send(literal_original.clone())).await??,
+        Outcome::Accepted(_)
+    ));
+    let copies = node.peek(CHILD).await?;
+    assert_eq!(
+        copies
+            .iter()
+            .map(|copy| copy.sequence.as_u64())
+            .collect::<Vec<_>>(),
+        [4, 5, 6, 7, 8, 9, 10]
+    );
+    let changed = copies
+        .iter()
+        .find(|copy| copy.sequence.as_u64() == 10)
+        .expect("new native SET copy");
+    let values = &changed
+        .envelope
+        .as_ref()
+        .expect("typed SET copy")
+        .application_properties;
+    assert_eq!(values["member"], domain::MessageValue::Int(11));
+    assert_eq!(values["nullable"], domain::MessageValue::Bool(true));
+    assert_eq!(values["added"], domain::MessageValue::Long(23));
+    assert_eq!(
+        values["RuleName"],
+        domain::MessageValue::String("c-set".into())
+    );
+    let shadow = format!("{CHILD}/$deadletterqueue");
+    let dead = node.peek(&shadow).await?;
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].sequence.as_u64(), 11);
+    let values = &dead[0]
+        .envelope
+        .as_ref()
+        .expect("original failure copy")
+        .application_properties;
+    assert_eq!(
+        values["audit"],
+        domain::MessageValue::String("lower".into())
+    );
+    assert_eq!(values["member"], domain::MessageValue::Int(7));
+    assert_eq!(
+        dead[0]
+            .dead_letter
+            .as_ref()
+            .expect("finite conversion reason")
+            .description,
+        "TypeMismatch"
+    );
+    let mut receiver = timeout(
+        DEADLINE,
+        ClientReceiver::attach(&mut session, "native-literal-copies", CHILD),
+    )
+    .await??;
+    for name in [
+        None,
+        Some("a-remove"),
+        Some("b-remove"),
+        None,
+        Some("a-remove"),
+        Some("b-remove"),
+        Some("c-set"),
+    ] {
+        let delivery = timeout(DEADLINE, receiver.recv()).await??;
+        let expected = expected(&literal_original, name);
+        assert_eq!(
+            delivery.message().application_properties,
+            expected.application_properties
+        );
+        assert_eq!(delivery.message().properties, expected.properties);
+        assert_eq!(delivery.message().body, literal_original.body);
+        timeout(DEADLINE, receiver.accept(&delivery)).await??;
+    }
+    node.wait_empty(CHILD).await?;
+    timeout(DEADLINE, receiver.close()).await??;
+    let mut dead_receiver = timeout(
+        DEADLINE,
+        ClientReceiver::attach(&mut session, "native-literal-dlq", shadow.as_str()),
+    )
+    .await??;
+    let failure = timeout(DEADLINE, dead_receiver.recv()).await??;
+    assert_eq!(failure.message().body, literal_original.body);
+    let values = failure
+        .message()
+        .application_properties
+        .as_ref()
+        .expect("DLQ wire properties");
+    assert_eq!(values.get("audit"), Some(&Value::String("lower".into())));
+    assert_eq!(values.get("member"), Some(&Value::Int(7)));
+    assert_eq!(
+        values.get("DeadLetterReason"),
+        Some(&Value::String("SwitchyardSqlActionError".into()))
+    );
+    assert_eq!(
+        values.get("DeadLetterErrorDescription"),
+        Some(&Value::String("TypeMismatch".into()))
+    );
+    timeout(DEADLINE, dead_receiver.accept(&failure)).await??;
+    node.wait_empty(&shadow).await?;
+    timeout(DEADLINE, dead_receiver.close()).await??;
+    let beta = node.peek("Orders/subscriptions/Beta").await?;
+    assert_eq!(
+        beta.iter()
+            .map(|copy| copy.sequence.as_u64())
+            .collect::<Vec<_>>(),
+        [1, 4, 7]
+    );
+    assert!(beta.iter().all(|copy| {
+        copy.envelope
+            .as_ref()
+            .expect("unchanged sibling")
+            .application_properties["member"]
+            == domain::MessageValue::Int(7)
+    }));
     timeout(DEADLINE, sender.close()).await??;
     timeout(DEADLINE, session.end()).await??;
     timeout(DEADLINE, connection.close()).await??;

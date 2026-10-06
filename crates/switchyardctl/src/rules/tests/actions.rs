@@ -28,7 +28,7 @@ fn documented_action_file_is_a_complete_sql_input() {
 #[test]
 fn sql_action_sources_and_typed_versions_remain_server_decisions() {
     let source = " /* exact source */ REMOVE user.[colour];\n";
-    for version in [None, Some(0), Some(1), Some(u32::MAX)] {
+    for version in [None, Some(0), Some(1), Some(2), Some(u32::MAX)] {
         let mut input = json!({"type":"sql","expression":source});
         if let Some(version) = version {
             input["semantic_version"] = json!(version);
@@ -313,7 +313,14 @@ fn action_output_preserves_exact_source_and_omits_absent_actions() {
 
 #[test]
 fn action_output_requires_supported_present_versions_and_source_bounds() {
-    for version in [None, Some(0), Some(2), Some(u32::MAX)] {
+    assert!(
+        action::from_protobuf(v1::SqlRuleAction {
+            expression: "SET number=7".into(),
+            semantic_version: Some(2)
+        })
+        .is_ok()
+    );
+    for version in [None, Some(0), Some(3), Some(u32::MAX)] {
         assert!(
             action::from_protobuf(v1::SqlRuleAction {
                 expression: "REMOVE x".into(),

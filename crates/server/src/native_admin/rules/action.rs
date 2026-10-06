@@ -6,10 +6,10 @@ use super::status;
 
 pub(super) fn read(input: Option<&v1::SqlRuleAction>) -> Result<SqlAction, Status> {
     let input = input.ok_or_else(|| Status::invalid_argument("a SQL rule action is required"))?;
-    if input
+    let version = input
         .semantic_version
-        .is_some_and(|version| version != domain::SQL_ACTION_SEMANTIC_VERSION)
-    {
+        .unwrap_or(domain::SQL_ACTION_SEMANTIC_VERSION);
+    if !matches!(version, 1 | 2) {
         return Err(Status::unimplemented(
             "unsupported SQL action semantic version",
         ));
@@ -24,7 +24,7 @@ pub(super) fn read(input: Option<&v1::SqlRuleAction>) -> Result<SqlAction, Statu
     {
         return Err(Status::resource_exhausted("SQL source limit reached"));
     }
-    SqlAction::new(input.expression.clone())
+    SqlAction::with_semantic_version(input.expression.clone(), version)
         .map_err(|error| status::input(BrokerError::SqlActionCompilation(error)))
 }
 

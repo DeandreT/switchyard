@@ -36,7 +36,7 @@ pub(super) async fn action_bearing_reads_refuse_without_omitting_metadata<P: Sto
     }
     assert_eq!(
         node.get_actions(PATH, "annotated").await?.action,
-        sql_action(action.expression(), Some(1))
+        sql_action(action.expression(), Some(2))
     );
     assert_eq!(node.list_actions(PATH).await?.len(), 3);
     assert!(node.get_actions(PATH, "plain").await?.action.is_none());

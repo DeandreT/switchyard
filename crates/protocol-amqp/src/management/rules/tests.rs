@@ -350,7 +350,7 @@ async fn malformed_and_unsupported_inputs_never_reach_the_owner() {
         Value::String(SQL_ACTION.into()),
         Value::Map(map([(
             EXPRESSION,
-            Value::String("SET colour = 'red'".into()),
+            Value::String("SET sys.Subject = 'red'".into()),
         )])),
     );
     let cases = [

@@ -328,5 +328,7 @@ mod atomicity;
 mod lifecycle;
 #[path = "rule_actions/limits.rs"]
 mod limits;
+#[path = "rule_actions/literal_set.rs"]
+mod literal_set;
 #[path = "rule_actions/scheduling.rs"]
 mod scheduling;

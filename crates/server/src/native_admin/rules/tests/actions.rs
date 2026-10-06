@@ -52,12 +52,25 @@ fn actions_require_presence_and_preserve_original_source_with_semantic_version()
         Code::InvalidArgument
     );
     let source = "  remove [Secret]; /* retained source */ REMOVE user.marker;  ";
-    for version in [None, Some(domain::SQL_ACTION_SEMANTIC_VERSION)] {
+    for version in [None, Some(1), Some(domain::SQL_ACTION_SEMANTIC_VERSION)] {
         let output = action::write(&action::read(Some(&input(source, version))).unwrap());
         assert_eq!(output.expression, source);
-        assert_eq!(output.semantic_version, Some(1));
+        assert_eq!(output.semantic_version, Some(version.unwrap_or(2)));
         assert_ne!(output.semantic_version, Some(20));
     }
+    let literal = " SET colour='Blue';SET number=-7;SET enabled=TRUE; ";
+    for version in [None, Some(2)] {
+        let output = action::write(
+            &action::read(Some(&input(literal, version))).expect("local literal SET"),
+        );
+        assert_eq!(output, input(literal, Some(2)));
+    }
+    assert_eq!(
+        action::read(Some(&input(literal, Some(1))))
+            .unwrap_err()
+            .code(),
+        Code::Unimplemented
+    );
 }
 
 #[test]
@@ -66,7 +79,7 @@ fn action_version_refusal_precedes_source_bounds_and_does_not_echo_source() {
         "private-action-source{}",
         "x".repeat(domain::MAX_SQL_EXPRESSION_BYTES + 1)
     );
-    for version in [0, 2, 20, u32::MAX] {
+    for version in [0, 3, 20, u32::MAX] {
         let error = action::read(Some(&input(&source, Some(version)))).unwrap_err();
         assert_eq!(error.code(), Code::Unimplemented);
         assert_eq!(error.message(), "unsupported SQL action semantic version");
@@ -108,7 +121,7 @@ fn action_grammar_tokens_and_statement_limits_have_static_statuses() {
         ("REMOVE", Code::InvalidArgument, "invalid SQL action syntax"),
         ("", Code::InvalidArgument, "invalid SQL action syntax"),
         (
-            "SET private_action = 1",
+            "SET sys.Subject = 1",
             Code::Unimplemented,
             "unsupported SQL action",
         ),
@@ -194,7 +207,7 @@ fn action_opt_in_preserves_no_action_responses_and_refuses_whole_legacy_lists() 
     assert_eq!(complete.rules[0].action, None);
     assert_eq!(
         complete.rules[1].action,
-        Some(input(" REMOVE[p]; ", Some(1)))
+        Some(input(" REMOVE[p]; ", Some(2)))
     );
 }
 
@@ -228,7 +241,7 @@ fn complete_action_lists_fit_the_exact_response_limit_or_refuse_without_truncati
         response
             .rules
             .iter()
-            .all(|rule| rule.action.as_ref() == Some(&input("REMOVE[p];", Some(1))))
+            .all(|rule| rule.action.as_ref() == Some(&input("REMOVE[p];", Some(2))))
     );
     payload(rules.last_mut().unwrap()).push(0);
     let error = service

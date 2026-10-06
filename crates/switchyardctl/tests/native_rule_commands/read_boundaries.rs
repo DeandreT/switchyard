@@ -23,7 +23,7 @@ pub(super) async fn actions() -> TestResult {
     .await??;
     let before = node.store.snapshot()?;
     let action =
-        json!({"type":"sql","expression":"REMOVE [private-action-source]","semantic_version":1});
+        json!({"type":"sql","expression":"REMOVE [private-action-source]","semantic_version":2});
     for command in [
         vec!["rule", "get", "Orders", "Alpha", "Action"],
         vec!["rule", "list", "Orders", "Alpha"],

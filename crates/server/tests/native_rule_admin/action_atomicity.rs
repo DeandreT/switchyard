@@ -134,7 +134,7 @@ pub(super) async fn corrupt_actions_refuse_complete_reads_without_repairs<P: Sto
     for bytes in [
         corrupt_rule("REMOVE", 1)?,
         corrupt_rule("SET private-field = 'private-source'", 1)?,
-        corrupt_rule("REMOVE private-source", 2)?,
+        corrupt_rule("REMOVE private-source", 3)?,
         corrupt_rule(&"x".repeat(domain::MAX_SQL_EXPRESSION_BYTES + 1), 1)?,
     ] {
         let mut batch = WriteBatch::default();
@@ -282,7 +282,7 @@ pub(super) async fn captured_action_bindings_fence_recreated_children<P: StorePr
         assert!(rules[0].action.is_none());
         assert_eq!(rules[0].created_at_unix_millis, 2_000 + action);
         assert_eq!(rules[1].name, "a-action");
-        assert_eq!(rules[1].action, sql_action("REMOVE replacement", Some(1)));
+        assert_eq!(rules[1].action, sql_action("REMOVE replacement", Some(2)));
         node.unchanged(&before, writes, clocks)?;
         node.clock.manual.set(2_000 + action);
         node.delete(PATH, "a-action").await?;
@@ -296,7 +296,7 @@ pub(super) async fn captured_action_bindings_fence_recreated_children<P: StorePr
     .await?;
     assert_eq!(
         node.get_actions(PATH, "fresh").await?.action,
-        sql_action("REMOVE current", Some(1))
+        sql_action("REMOVE current", Some(2))
     );
     Ok(())
 }

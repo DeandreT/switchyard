@@ -6,6 +6,7 @@ struct ScheduledTopicMessage {
     key: Vec<u8>,
     record: MessageRecord,
     time_to_live_millis: Option<u64>,
+    // Checked action plans retain only owned indices/scalars, never this record.
     matches: Vec<SubscriptionMatch>,
 }
 

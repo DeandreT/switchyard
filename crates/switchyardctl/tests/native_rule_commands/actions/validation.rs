@@ -15,12 +15,12 @@ pub(super) async fn server_statuses() -> TestResult {
         ),
         (
             "Unsupported",
-            json!({"type":"sql","expression":"SET user.private = 'secret'"}),
+            json!({"type":"sql","expression":"SET sys.Subject = 'secret'"}),
             "Unimplemented",
         ),
         (
             "Future",
-            json!({"type":"sql","expression":"REMOVE","semantic_version":2}),
+            json!({"type":"sql","expression":"REMOVE","semantic_version":3}),
             "Unimplemented",
         ),
         (
@@ -79,7 +79,7 @@ pub(super) async fn server_statuses() -> TestResult {
     assert_eq!(
         node.json(&["rule", "get", "Orders", "Alpha", "Healthy"])
             .await?["action"],
-        json!({"type":"sql","expression":"REMOVE [private]","semantic_version":1})
+        json!({"type":"sql","expression":"REMOVE [private]","semantic_version":2})
     );
     node.json(&["rule", "delete", "Orders", "Alpha", "Healthy"])
         .await?;

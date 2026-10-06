@@ -5,7 +5,7 @@ using Azure.Messaging.ServiceBus.Administration;
 internal static partial class RuleActionCases
 {
     private const string Success =
-        "official .NET SQL REMOVE actions/source/independent copies/unsupported SET passed";
+        "official .NET SQL REMOVE/literal SET actions/source/independent copies/conversion DLQ/unsupported system SET passed";
     private const string ColourRule = "a-remove-colour";
     private const string AuditRule = "b-remove-audit";
     private const string PublisherRule = "publisher-rule-name";
@@ -103,12 +103,14 @@ internal static partial class RuleActionCases
         try
         {
             await BoundedAsync(ct => alphaRules.CreateRuleAsync(new CreateRuleOptions("unsupported-set",
-                new TrueRuleFilter()) { Action = new SqlRuleAction("SET user.colour = 'changed'") }, ct), token);
+                new TrueRuleFilter()) { Action = new SqlRuleAction("SET sys.Subject = 'changed'") }, ct), token);
         }
         catch (NotSupportedException) { refused = true; }
-        Require(refused, "unsupported SET did not produce an awaited NotSupportedException");
+        Require(refused, "unsupported system SET did not produce an awaited NotSupportedException");
         await RequireRulesAsync(alphaRules, token);
         await CheckPublicationAsync(sender, alpha, beta, Message(run, "after-refusal"), token);
+
+        await LiteralWorkflowAsync(alphaRules, sender, alpha, beta, alphaDead, betaDead, run, token);
 
         foreach (RuleProperties rule in await ListRulesAsync(alphaRules, token))
         {

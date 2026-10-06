@@ -88,7 +88,7 @@ impl RuleService for LegacyEndpoint {
             bad.name = "Z-invalid-action".into();
             bad.action = Some(SqlRuleAction {
                 expression: "REMOVE private-reply-source".into(),
-                semantic_version: Some(2),
+                semantic_version: Some(3),
             });
             response.rules.push(bad);
         }

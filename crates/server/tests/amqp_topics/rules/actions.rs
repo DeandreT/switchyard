@@ -314,6 +314,125 @@ async fn create_list_delete_and_three_private_copies_preserve_original_and_legac
         ["$Default"]
     );
     assert!(described(&remaining[0].2, EMPTY_ACTION_CODE).is_empty());
+    let set_source =
+        " /* wire literal */ SET member=11;SET nullable=TRUE;SET added=23;SET RuleName='ignored'; ";
+    for (name, source) in [
+        ("a-set", set_source),
+        ("b-fail", "REMOVE marker;SET member='bad'"),
+    ] {
+        status(
+            &rules.add_action(name, "member=7", action(source)).await?,
+            200,
+        );
+    }
+    let listed = action_rules(&rules.list(100, 0).await?);
+    assert_eq!(
+        described(&listed[1].2, SQL_ACTION_CODE),
+        [Value::String(set_source.into()), Value::Int(20)]
+    );
+    let mut publisher = timeout(
+        DEADLINE,
+        ClientSender::attach(&mut session, "literal-publisher", "Orders"),
+    )
+    .await??;
+    accepted(timeout(DEADLINE, publisher.send(original.clone())).await??);
+    let shadow = alpha.dead_letter_queue()?;
+    assert_eq!(
+        node.peek(&alpha)
+            .await?
+            .iter()
+            .map(|copy| copy.sequence.as_u64())
+            .collect::<Vec<_>>(),
+        [7, 8]
+    );
+    let dead = node.peek(&shadow).await?;
+    assert_eq!(dead.len(), 1);
+    assert_eq!(dead[0].sequence.as_u64(), 9);
+    assert_eq!(
+        dead[0]
+            .dead_letter
+            .as_ref()
+            .expect("conversion details")
+            .reason,
+        domain::DeadLetterReason::Application("SwitchyardSqlActionError".into())
+    );
+    assert_eq!(
+        dead[0]
+            .dead_letter
+            .as_ref()
+            .expect("conversion details")
+            .description,
+        "TypeMismatch"
+    );
+    let mut receiver = timeout(
+        DEADLINE,
+        ClientReceiver::attach(&mut session, "literal-private-copies", alpha.as_str()),
+    )
+    .await??;
+    let base = recv(&mut receiver).await?;
+    let changed = recv(&mut receiver).await?;
+    assert_eq!(sequence(base.message()), 7);
+    assert_eq!(sequence(changed.message()), 8);
+    for (delivery, is_action) in [(&base, false), (&changed, true)] {
+        let mut expected = original.clone();
+        let values = &mut expected
+            .application_properties
+            .as_mut()
+            .expect("properties")
+            .0;
+        if is_action {
+            values.insert("member".into(), Value::Int(11));
+            values.insert("nullable".into(), Value::Bool(true));
+            values.insert("added".into(), Value::Long(23));
+            values.insert("RuleName".into(), Value::String("a-set".into()));
+        }
+        let sorted: std::collections::BTreeMap<_, _> = values
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        *values = sorted.into_iter().collect();
+        content(delivery.message(), &expected);
+    }
+    timeout(DEADLINE, receiver.accept(&changed)).await??;
+    node.wait_len(&alpha, 1).await?;
+    assert_eq!(node.peek(&alpha).await?[0].sequence.as_u64(), 7);
+    assert_eq!(node.peek(&shadow).await?.len(), 1);
+    timeout(DEADLINE, receiver.accept(&base)).await??;
+    node.wait_len(&alpha, 0).await?;
+    let mut dead_receiver = timeout(
+        DEADLINE,
+        ClientReceiver::attach(&mut session, "literal-dead-copies", shadow.as_str()),
+    )
+    .await??;
+    let failure = recv(&mut dead_receiver).await?;
+    assert_eq!(sequence(failure.message()), 9);
+    assert_eq!(failure.message().body, original.body);
+    assert_eq!(failure.message().footer, original.footer);
+    let values = failure
+        .message()
+        .application_properties
+        .as_ref()
+        .expect("failure properties");
+    assert_eq!(values.get("member"), Some(&Value::Int(7)));
+    assert_eq!(values.get("marker"), Some(&Value::String("lower".into())));
+    assert_eq!(
+        values.get("RuleName"),
+        Some(&Value::String("b-fail".into()))
+    );
+    assert_eq!(
+        values.get("DeadLetterReason"),
+        Some(&Value::String("SwitchyardSqlActionError".into()))
+    );
+    assert_eq!(
+        values.get("DeadLetterErrorDescription"),
+        Some(&Value::String("TypeMismatch".into()))
+    );
+    timeout(DEADLINE, dead_receiver.accept(&failure)).await??;
+    node.wait_len(&shadow, 0).await?;
+    for name in ["a-set", "b-fail"] {
+        status(&rules.remove(name).await?, 200);
+    }
+    assert_eq!(action_rules(&rules.list(100, 0).await?), remaining);
     timeout(DEADLINE, connection.close()).await??;
     Ok(())
 }
@@ -337,7 +456,7 @@ async fn unsupported_action_refuses_without_clock_or_snapshot_changes_and_recove
     node.clock.set(2_000);
     for (action, expected, error) in [
         (
-            action("SET secret = 'sensitive-source'"),
+            action("SET sys.Subject = 'sensitive-source'"),
             501,
             protocol_amqp::NOT_IMPLEMENTED,
         ),

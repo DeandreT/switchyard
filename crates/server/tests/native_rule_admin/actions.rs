@@ -26,7 +26,7 @@ pub(super) async fn action_crud_is_explicit_clock_free_and_create_only<P: StoreP
     node.clock.manual.set(0);
     assert!(node.get(PATH, "$Default").await?.action.is_none());
     assert_eq!(node.get(PATH, "plain").await?.filter, false_filter());
-    for (name, source, _) in sources {
+    for (name, source, version) in sources {
         let error = code(node.get(PATH, name).await, Code::Unimplemented);
         assert_eq!(error.message(), "rule action metadata was not requested");
         assert!(!error.message().contains(source));
@@ -36,7 +36,7 @@ pub(super) async fn action_crud_is_explicit_clock_free_and_create_only<P: StoreP
         assert_eq!(rule.name, name);
         assert_eq!(rule.filter, true_filter());
         assert_eq!(rule.created_at_unix_millis, 1_000);
-        assert_eq!(rule.action, sql_action(source, Some(1)));
+        assert_eq!(rule.action, sql_action(source, Some(version.unwrap_or(2))));
     }
     let error = code(node.list(PATH).await, Code::Unimplemented);
     assert_eq!(error.message(), "rule action metadata was not requested");
@@ -49,7 +49,7 @@ pub(super) async fn action_crud_is_explicit_clock_free_and_create_only<P: StoreP
         ["$Default", "a-action", "plain", "z-action"]
     );
     assert!(listed[0].action.is_none() && listed[2].action.is_none());
-    assert_eq!(listed[1].action, sql_action(sources[0].1, Some(1)));
+    assert_eq!(listed[1].action, sql_action(sources[0].1, Some(2)));
     assert_eq!(listed[3].action, sql_action(sources[1].1, Some(1)));
     node.unchanged(&before, writes, clocks)?;
     node.clock.manual.set(2_000);
@@ -92,7 +92,7 @@ pub(super) async fn action_crud_is_explicit_clock_free_and_create_only<P: StoreP
     let literal_rule = node.get_actions(literal, " Literal Action ").await?;
     assert_eq!(literal_rule.subscription_path, literal);
     assert_eq!(literal_rule.name, " Literal Action ");
-    assert_eq!(literal_rule.action, sql_action("REMOVE [audit]", Some(1)));
+    assert_eq!(literal_rule.action, sql_action("REMOVE [audit]", Some(2)));
     let before = node.snapshot()?;
     let node = node.reopen()?;
     node.clock.manual.set(0);
@@ -122,6 +122,30 @@ pub(super) async fn action_crud_is_explicit_clock_free_and_create_only<P: StoreP
     let node = node.reopen()?;
     assert_eq!(node.list(PATH).await?, remaining);
     node.unchanged(&before, 0, 0)?;
+    node.clock.manual.set(4_000);
+    let source = " /* native */ SET colour='Blue';SET number=-7;SET enabled=TRUE; ";
+    node.create_action(PATH, "literal-set", true_filter(), sql_action(source, None))
+        .await?;
+    assert_eq!(
+        node.get_actions(PATH, "literal-set").await?.action,
+        sql_action(source, Some(2))
+    );
+    let before = node.snapshot()?;
+    let writes = node.writes();
+    let clocks = node.clocks();
+    code(
+        node.create_action(
+            PATH,
+            "v1-literal",
+            true_filter(),
+            sql_action(source, Some(1)),
+        )
+        .await,
+        Code::Unimplemented,
+    );
+    node.unchanged(&before, writes, clocks)?;
+    node.delete(PATH, "literal-set").await?;
+    assert_eq!(node.list(PATH).await?, remaining);
     Ok(())
 }
 
@@ -162,7 +186,7 @@ pub(super) async fn action_validation_and_combined_limits_precede_owner<P: Store
         assert!(!error.message().contains("sensitive-action"));
         assert!(!error.message().contains("private-secret"));
     }
-    for version in [0, 2, u32::MAX] {
+    for version in [0, 3, u32::MAX] {
         code(
             node.create_action(
                 PATH,
@@ -246,7 +270,7 @@ pub(super) async fn action_validation_and_combined_limits_precede_owner<P: Store
     .await?;
     assert_eq!(
         node.get_actions(PATH, "healthy").await?.action,
-        sql_action("REMOVE [missing]", Some(1))
+        sql_action("REMOVE [missing]", Some(2))
     );
     node.delete(PATH, "healthy").await?;
     Ok(())

@@ -10,7 +10,7 @@ mod action;
 mod scalar;
 mod sql;
 
-pub(crate) use action::SqlActionProgram;
+pub(crate) use action::{CheckedSqlAction, SqlActionError, SqlActionProgram};
 pub use action::{SQL_ACTION_SEMANTIC_VERSION, SqlAction};
 pub use sql::{SQL_FILTER_SEMANTIC_VERSION, SqlFilter};
 

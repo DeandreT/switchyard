@@ -128,7 +128,7 @@ fn malformed_replayed_and_stored_actions_refuse_before_metadata_or_fanout_is_sta
         publish(&fixture, 1, vec![member("known")])?;
         let (version, source, expected) = match damage {
             0 => (
-                2,
+                3,
                 "REMOVE missing".into(),
                 BrokerError::Codec(codec::CodecError::Decode),
             ),

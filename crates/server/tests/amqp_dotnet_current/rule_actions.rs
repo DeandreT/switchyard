@@ -1,4 +1,4 @@
-//! Isolated official SDK proof for the bounded REMOVE-only action subset.
+//! Isolated official SDK gate for REMOVE and the bounded local literal SET subset.
 
 use std::{error::Error, path::Path, time::Duration};
 
@@ -12,8 +12,7 @@ mod postconditions;
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const TOPIC: &str = "sdk-rule-actions";
-const SUCCESS: &str =
-    "official .NET SQL REMOVE actions/source/independent copies/unsupported SET passed";
+const SUCCESS: &str = "official .NET SQL REMOVE/literal SET actions/source/independent copies/conversion DLQ/unsupported system SET passed";
 
 fn success_marker_present(stdout: &str) -> bool {
     stdout.split_inclusive('\n').any(|line| {

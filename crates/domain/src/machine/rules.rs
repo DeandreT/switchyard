@@ -7,7 +7,7 @@ use crate::{
 };
 
 use super::*;
-use crate::rule::SqlActionProgram;
+use crate::rule::{CheckedSqlAction, SqlActionProgram};
 
 struct StoredRules {
     definitions: Vec<RuleDefinition>,
@@ -100,8 +100,12 @@ impl<S: StateStore> StateMachine<S> {
                     .action
                     .as_ref()
                     .map(|action| {
-                        SqlActionProgram::compile_with_budget(action.expression(), budget)
-                            .map_err(stored_action_compile_error)
+                        SqlActionProgram::compile_version_with_budget(
+                            action.expression(),
+                            action.semantic_version(),
+                            budget,
+                        )
+                        .map_err(stored_action_compile_error)
                     })
                     .transpose()?,
             );
@@ -197,7 +201,7 @@ impl<S: StateStore> StateMachine<S> {
             action
                 .validate_source()
                 .map_err(BrokerError::SqlActionCompilation)?;
-            SqlActionProgram::compile(action.expression())
+            SqlActionProgram::compile_version(action.expression(), action.semantic_version())
                 .map_err(BrokerError::SqlActionCompilation)?;
         }
         let size = rule_definition_size(name, filter, command.issued_at, action)?;
@@ -297,9 +301,15 @@ pub(super) enum SubscriptionMatch {
     NoMatch,
     Matched {
         no_action: bool,
-        actions: Vec<usize>,
+        actions: Vec<MatchedAction>,
     },
     FilterError(SqlEvaluationError),
+}
+
+#[derive(Debug)]
+pub(super) struct MatchedAction {
+    pub(super) rule: usize,
+    pub(super) checked: CheckedSqlAction,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -308,9 +318,8 @@ pub(super) struct RuleMatchBudget {
 }
 
 impl RuleMatchBudget {
-    /// Charges every possible comparison, independently of match short circuits.
-    /// Custom keys are scanned linearly after this admission so the upper bound
-    /// does not depend on a library map's internal search strategy.
+    /// Precharges possible filter comparisons and action-planning visits before
+    /// matching short circuits. These counters are not allocation or time limits.
     pub(super) fn charge(
         &mut self,
         message: MessageInput<'_>,
@@ -334,6 +343,60 @@ impl RuleMatchBudget {
         let value_items = message
             .envelope
             .map_or(Ok(0), MessageEnvelope::validate_value_limits)?;
+        let has_actions = subscriptions
+            .iter()
+            .any(|rules| rules.actions.iter().any(Option::is_some));
+        let (
+            application_items,
+            annotation_items,
+            sequence_sections,
+            data_sections,
+            metadata_entries,
+        ) = if has_actions {
+            message.envelope.map_or((0, 0, 0, 0, 0), |envelope| {
+                let application_items = envelope
+                    .application_properties
+                    .values()
+                    .fold(0_usize, |items, value| {
+                        items.saturating_add(MessageEnvelope::action_value_items(value))
+                    });
+                let annotation_items = envelope
+                    .message_annotations
+                    .values()
+                    .fold(0_usize, |items, value| {
+                        items.saturating_add(MessageEnvelope::action_value_items(value))
+                    });
+                let (sequence_sections, data_sections) = match &envelope.body {
+                    crate::MessageBody::Sequence(sections) => (sections.len(), 0),
+                    crate::MessageBody::Data(sections) => (0, sections.len()),
+                    _ => (0, 0),
+                };
+                let metadata_entries = property_count
+                    .saturating_mul(3)
+                    .saturating_add(envelope.message_annotations.len().saturating_mul(2))
+                    .saturating_add(envelope.footer.len());
+                (
+                    application_items,
+                    annotation_items,
+                    sequence_sections,
+                    data_sections,
+                    metadata_entries,
+                )
+            })
+        } else {
+            (0, 0, 0, 0, 0)
+        };
+        if has_actions {
+            // This shared profiling walks all values once, then app/annotation
+            // values once each; flattening also visits empty sequence sections.
+            self.add_work(
+                value_items
+                    .saturating_add(application_items)
+                    .saturating_add(annotation_items)
+                    .saturating_add(sequence_sections)
+                    .saturating_add(property_count),
+            )?;
+        }
         for rules in subscriptions {
             for rule in &rules.definitions {
                 self.add_work(1)?;
@@ -360,16 +423,68 @@ impl RuleMatchBudget {
                 }
             }
             for program in rules.actions.iter().flatten() {
-                self.add_work(value_items.saturating_add(property_count))?;
+                let overlay_count = program.targets().len();
+                // Baseline sizing/counting: 2N+2A+H+2S+D. Original target
+                // sizing/counting visits each first-unmodified app subtree at
+                // most once (2A); final RuleName may independently revisit 2A.
+                // Two positional property tallies each visit two IDs and six
+                // strings. Other fixed scalar bookkeeping is not a node walk.
+                self.add_work(
+                    value_items
+                        .saturating_mul(2)
+                        .saturating_add(application_items.saturating_mul(6))
+                        .saturating_add(annotation_items)
+                        .saturating_add(sequence_sections.saturating_mul(2))
+                        .saturating_add(data_sections)
+                        .saturating_add(metadata_entries)
+                        .saturating_add(16),
+                )?;
+                // Four overlay scans per SET plus the final RuleName scan;
+                // two original-map lookups per SET plus the final lookup.
+                self.add_work(
+                    overlay_count
+                        .saturating_mul(overlay_count)
+                        .saturating_mul(4)
+                        .saturating_add(overlay_count)
+                        .saturating_add(
+                            overlay_count
+                                .saturating_mul(2)
+                                .saturating_add(1)
+                                .saturating_mul(property_count),
+                        )
+                        .saturating_add(overlay_count.saturating_mul(3)),
+                )?;
+                let overlay_key_bytes = program
+                    .targets()
+                    .iter()
+                    .fold(0_usize, |bytes, key| bytes.saturating_add(key.len()));
+                let literal_bytes = program.literal_bytes();
                 for target in program.targets() {
-                    self.add_work(property_count.saturating_add(1))?;
                     self.add_bytes(
                         target
                             .len()
                             .saturating_mul(property_count)
-                            .saturating_add(key_bytes),
+                            .saturating_add(key_bytes)
+                            .saturating_mul(2)
+                            .saturating_add(
+                                target
+                                    .len()
+                                    .saturating_mul(overlay_count)
+                                    .saturating_add(overlay_key_bytes)
+                                    .saturating_mul(4),
+                            )
+                            .saturating_add(value_bytes)
+                            .saturating_add(literal_bytes),
                     )?;
                 }
+                self.add_bytes(
+                    "RuleName"
+                        .len()
+                        .saturating_mul(overlay_count)
+                        .saturating_add(overlay_key_bytes)
+                        .saturating_add("RuleName".len().saturating_mul(property_count))
+                        .saturating_add(key_bytes),
+                )?;
             }
         }
         Ok(())
@@ -436,6 +551,18 @@ pub(super) fn matching_subscriptions(
         matches.push(match first_error {
             Some(error) => SubscriptionMatch::FilterError(error),
             None if no_action || !actions.is_empty() => {
+                let actions = actions
+                    .into_iter()
+                    .map(|rule| {
+                        let (program, _) = rules.action(rule)?;
+                        let checked = program.check(
+                            message.message_id,
+                            message.body.len(),
+                            message.envelope,
+                        )?;
+                        Ok(MatchedAction { rule, checked })
+                    })
+                    .collect::<Result<Vec<_>, BrokerError>>()?;
                 SubscriptionMatch::Matched { no_action, actions }
             }
             None => SubscriptionMatch::NoMatch,

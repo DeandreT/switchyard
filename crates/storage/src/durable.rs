@@ -89,13 +89,17 @@ pub const STORE_FORMAT_V13: u32 = 13;
 /// copies. Earlier builds cannot interpret action-bearing rules or that fanout.
 pub const STORE_FORMAT_V14: u32 = 14;
 
+/// Version 15: version-2 SQL actions interpret bounded literal SET as well as
+/// REMOVE. All derived profiles advance with this record-meaning boundary.
+pub const STORE_FORMAT_V15: u32 = 15;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V14;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V15;
 
 /// Replica layouts use a disjoint version namespace so standalone and older
 /// binaries cannot mistake their records for an ordinary store. Record-layout
@@ -597,22 +601,66 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V13,
-                expected: STORE_FORMAT_V14,
+                expected: STORE_FORMAT_V15,
             })
         );
-        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V14);
+        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V15);
         Ok(())
     }
 
     #[test]
     fn action_layout_is_not_readable_as_the_previous_layout() {
         let recorded = STORE_FORMAT_V14.to_be_bytes();
-        assert_eq!(require_readable_format(&recorded), Ok(()));
+        assert_eq!(require_format_version(&recorded, STORE_FORMAT_V14), Ok(()));
         assert_eq!(
             require_format_version(&recorded, STORE_FORMAT_V13),
             Err(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V14,
                 expected: STORE_FORMAT_V13,
+            })
+        );
+    }
+
+    #[test]
+    fn literal_set_layout_refuses_version_fourteen_directories() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("temporary old layout");
+        stamp_format(directory.path(), &STORE_FORMAT_V14.to_be_bytes())?;
+        assert_eq!(
+            FjallStore::open(directory.path()).err(),
+            Some(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V14,
+                expected: STORE_FORMAT_V15
+            })
+        );
+        assert_eq!(ACTIVE_REPLICA_STORE_FORMAT, 0x8000_0000 | STORE_FORMAT_V15);
+        assert_eq!(
+            ACTIVE_CATALOG_REPLICA_STORE_FORMAT,
+            0xc000_0000 | STORE_FORMAT_V15
+        );
+        assert_eq!(
+            ACTIVE_PROTECTED_STATE_STORE_FORMAT,
+            0xd000_0000 | STORE_FORMAT_V15
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn literal_set_layout_is_readable_only_as_version_fifteen() {
+        let recorded = STORE_FORMAT_V15.to_be_bytes();
+        assert_eq!(require_readable_format(&recorded), Ok(()));
+        assert_eq!(require_format_version(&recorded, STORE_FORMAT_V15), Ok(()));
+        assert_eq!(
+            require_format_version(&recorded, STORE_FORMAT_V14),
+            Err(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V15,
+                expected: STORE_FORMAT_V14
+            })
+        );
+        assert_eq!(
+            require_readable_format(&STORE_FORMAT_V14.to_be_bytes()),
+            Err(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V14,
+                expected: STORE_FORMAT_V15
             })
         );
     }

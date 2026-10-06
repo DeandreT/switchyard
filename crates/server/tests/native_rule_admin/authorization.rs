@@ -454,7 +454,7 @@ pub(super) async fn manage_scope_precedes_action_validation_and_reads<P: StorePr
             None,
             Code::Unimplemented,
         ),
-        ("broken-private-source", Some(2), Code::Unimplemented),
+        ("broken-private-source", Some(3), Code::Unimplemented),
     ] {
         code(
             tokio::time::timeout(
@@ -521,7 +521,7 @@ pub(super) async fn manage_scope_precedes_action_validation_and_reads<P: StorePr
     assert_eq!(rule.namespace, "tenant");
     assert_eq!(rule.subscription_path, literal);
     assert_eq!(rule.name, " Literal Action ");
-    assert_eq!(rule.action, sql_action(source, Some(1)));
+    assert_eq!(rule.action, sql_action(source, Some(2)));
     let mut input = list(literal);
     input.include_actions = true;
     let listed = tokio::time::timeout(

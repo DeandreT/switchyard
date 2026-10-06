@@ -51,7 +51,7 @@ pub use crate::{
         FjallCatalogReader, FjallCatalogReplicaStore, FjallReplicaStore, FjallStore,
         STORE_FORMAT_V1, STORE_FORMAT_V2, STORE_FORMAT_V3, STORE_FORMAT_V4, STORE_FORMAT_V5,
         STORE_FORMAT_V6, STORE_FORMAT_V7, STORE_FORMAT_V8, STORE_FORMAT_V9, STORE_FORMAT_V10,
-        STORE_FORMAT_V11, STORE_FORMAT_V12, STORE_FORMAT_V13, STORE_FORMAT_V14,
+        STORE_FORMAT_V11, STORE_FORMAT_V12, STORE_FORMAT_V13, STORE_FORMAT_V14, STORE_FORMAT_V15,
     },
     memory::{MemoryCatalogReader, MemoryCatalogReplicaStore, MemoryReplicaStore, MemoryStore},
 };

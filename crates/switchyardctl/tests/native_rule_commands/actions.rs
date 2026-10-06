@@ -139,7 +139,7 @@ async fn workflow<S: StateStore>(node: &ActionNode<S>) -> TestResult<Value> {
         let output = node.json(&["rule", "get", "Orders", "Alpha", name]).await?;
         assert_eq!(
             output["action"],
-            json!({"type":"sql","expression":source,"semantic_version":1})
+            json!({"type":"sql","expression":source,"semantic_version":2})
         );
     }
     let before = node.store().snapshot()?;

@@ -6,7 +6,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 use super::super::{CliError, read_file};
 use super::MAX_ACTION_FILE_BYTES;
 
-const SQL_SEMANTIC_VERSION: u32 = 1;
 const MAX_SOURCE_BYTES: usize = 4096;
 const MAX_SOURCE_UTF16_UNITS: usize = 1024;
 
@@ -55,7 +54,7 @@ pub(super) fn load(path: &Path) -> Result<v1::SqlRuleAction, CliError> {
 }
 
 pub(super) fn from_protobuf(input: v1::SqlRuleAction) -> Result<JsonAction, CliError> {
-    if input.semantic_version != Some(SQL_SEMANTIC_VERSION)
+    if !matches!(input.semantic_version, Some(1 | 2))
         || input.expression.len() > MAX_SOURCE_BYTES
         || input
             .expression

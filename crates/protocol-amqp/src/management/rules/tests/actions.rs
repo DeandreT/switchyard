@@ -1,5 +1,114 @@
 use super::*;
 
+#[tokio::test]
+async fn literal_set_management_submits_v2_and_preserves_exact_source() {
+    let source = " /* local */ SET user.[colour]='it''s blue';SET number=-7;SET enabled=TRUE; ";
+    let broker = ObservedBroker::default();
+    let response = process_request_for(
+        &action_request("literal", source),
+        ENTITY,
+        &broker,
+        None,
+        BUDGET,
+    )
+    .await;
+    assert_eq!(response.status_code, 200);
+    assert_eq!(response.correlation_id, MessageId::Ulong(7));
+    {
+        let submissions = broker.submissions.lock().expect("commands");
+        let [
+            (
+                _,
+                _,
+                CommandKind::CreateRuleWithAction {
+                    action,
+                    filter: RuleFilter::True,
+                    ..
+                },
+            ),
+        ] = submissions.as_slice()
+        else {
+            panic!("one typed v2 command")
+        };
+        assert_eq!(action.expression(), source);
+        assert_eq!(action.semantic_version(), 2);
+    }
+    assert!(broker.reads.lock().expect("reads").is_empty());
+    let denied = ObservedBroker::default();
+    let grant = authorization(PermissionSet::SEND, &format!("{ENTITY}/$management"));
+    let response = process_request_for(
+        &action_request("denied", source),
+        ENTITY,
+        &denied,
+        Some(&grant),
+        BUDGET,
+    )
+    .await;
+    assert_eq!(response.status_code, 401);
+    assert!(denied.submissions.lock().expect("commands").is_empty());
+    assert!(denied.reads.lock().expect("reads").is_empty());
+    let too_large = ObservedBroker::default();
+    let response = process_request_for(
+        &action_request("large", &"x".repeat(domain::MAX_SQL_EXPRESSION_BYTES + 1)),
+        ENTITY,
+        &too_large,
+        None,
+        BUDGET,
+    )
+    .await;
+    assert_eq!(response.status_code, 403);
+    assert!(too_large.submissions.lock().expect("commands").is_empty());
+}
+
+#[tokio::test]
+async fn literal_set_enumeration_retains_signed_wire_twenty_for_both_local_versions() {
+    let broker = ObservedBroker::default();
+    let mut old = definition("a-old", RuleFilter::True);
+    old.action =
+        Some(SqlAction::with_semantic_version(" REMOVE marker; ", 1).expect("explicit v1"));
+    let mut current = definition("b-current", RuleFilter::True);
+    current.action = Some(SqlAction::new(" SET marker='literal'; ").expect("local v2"));
+    *broker.definitions.lock().expect("definitions") = vec![old, current];
+    let response = process_request_for(
+        &enumeration(Value::Int(100), Value::Int(0)),
+        ENTITY,
+        &broker,
+        None,
+        BUDGET,
+    )
+    .await;
+    assert_eq!(response.status_code, 200);
+    for (entry, source) in entries(&response)
+        .iter()
+        .zip([" REMOVE marker; ", " SET marker='literal'; "])
+    {
+        assert_eq!(
+            fields(&rule_fields(entry)[1], SQL_ACTION_CODE),
+            [Value::String(source.into()), Value::Int(20)]
+        );
+    }
+    assert_eq!(entries(&response).len(), 2);
+    assert!(broker.submissions.lock().expect("commands").is_empty());
+    assert_eq!(broker.reads.lock().expect("reads").len(), 1);
+    let definitions = broker.definitions.lock().expect("definitions");
+    assert_eq!(
+        definitions[0]
+            .action
+            .as_ref()
+            .expect("old")
+            .semantic_version(),
+        1
+    );
+    assert_eq!(
+        definitions[1]
+            .action
+            .as_ref()
+            .expect("current")
+            .semantic_version(),
+        2
+    );
+}
+
 fn set_action(message: &mut Message, action: Option<Value>) {
     let Body::Value(Value::Map(body)) = &mut message.body else {
         panic!("request map")
@@ -126,7 +235,7 @@ async fn compiled_remove_actions_preserve_exact_source_and_typed_filters() {
         assert_eq!(name.as_str(), "action");
         assert_eq!(filter, &expected);
         assert_eq!(action.expression(), source);
-        assert_eq!(action.semantic_version(), 1);
+        assert_eq!(action.semantic_version(), 2);
         assert!(broker.reads.lock().expect("reads").is_empty());
     }
 }
@@ -190,7 +299,7 @@ async fn action_syntax_and_unsupported_features_refuse_before_submission_without
         ("REMOVE [private-marker", 400, crate::INVALID_FIELD),
         ("REMOVE private_marker;;", 400, crate::INVALID_FIELD),
         (
-            "SET private_marker = 'private-value'",
+            "SET sys.Subject = 'private-value'",
             501,
             crate::NOT_IMPLEMENTED,
         ),
@@ -272,7 +381,7 @@ async fn source_token_and_statement_limits_are_checked_before_owner_work() {
 
 #[test]
 fn action_validation_keeps_its_priority_over_filter_parsing() {
-    let mut message = action_request("priority", "SET private_marker = 1");
+    let mut message = action_request("priority", "SET sys.Subject = 1");
     let Body::Value(Value::Map(body)) = &mut message.body else {
         panic!("map")
     };

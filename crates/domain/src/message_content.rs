@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::BrokerError;
 
+mod action_projection;
+#[cfg(test)]
 mod removal_projection;
 
 /// Maximum child nesting for a retained value. Root values have depth zero;

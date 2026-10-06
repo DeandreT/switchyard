@@ -56,7 +56,7 @@ fn semicolon_separation_and_optional_final_semicolon_are_explicit() {
 #[test]
 fn set_system_scope_and_dynamic_or_computed_targets_are_unsupported() {
     for source in [
-        "SET a = 1",
+        "SET sys.Subject = 1",
         "REMOVE sys.CorrelationId",
         "REMOVE SYS.[ReplyTo]",
         "REMOVE foreign.a",
@@ -312,9 +312,9 @@ fn failed_compilation_keeps_prior_aggregate_charges_without_exceeding_caps() {
 #[test]
 fn serialization_stores_only_version_and_exact_source() -> Result<(), crate::CodecError> {
     let source = "  REMOVE Secret; /* original */ ";
-    let action = SqlAction::new(source).expect("bounded action");
+    let action = SqlAction::with_semantic_version(source, 1).expect("bounded v1 action");
     assert_eq!(action.expression(), source);
-    assert_eq!(action.semantic_version(), SQL_ACTION_SEMANTIC_VERSION);
+    assert_eq!(action.semantic_version(), 1);
     let expected = crate::codec::encode(&(1_u32, source))?;
     assert_eq!(crate::codec::encode(&action)?, expected);
     assert_eq!(crate::codec::decode::<SqlAction>(&expected)?, action);
@@ -328,11 +328,11 @@ fn deserialize_validates_source_and_version_without_compiling() -> Result<(), cr
         let action = crate::codec::decode::<SqlAction>(&encoded)?;
         assert_eq!(action.expression(), source);
         assert!(action.validate_source().is_ok());
-        assert!(SqlActionProgram::compile(source).is_err());
+        assert!(SqlActionProgram::compile_version(source, action.semantic_version()).is_err());
     }
     for (version, source) in [
         (0_u32, String::from("REMOVE a")),
-        (2_u32, String::from("REMOVE a")),
+        (3_u32, String::from("REMOVE a")),
         (1_u32, "x".repeat(MAX_SQL_EXPRESSION_UTF16_UNITS + 1)),
         (1_u32, "x".repeat(MAX_SQL_EXPRESSION_BYTES + 1)),
     ] {
