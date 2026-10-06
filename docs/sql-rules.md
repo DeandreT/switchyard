@@ -4,7 +4,8 @@ Switchyard supports a bounded SQL predicate subset through the domain state
 machine, AMQP rule management, native gRPC, and CLI. This is not complete Azure SQL
 filter or action compatibility. The exact Boolean aliases `1=1` and `1=0` keep
 their existing filter representation.
-The same surfaces separately support bounded [REMOVE actions](sql-actions.md).
+The same surfaces separately support bounded [REMOVE and literal SET actions](sql-actions.md),
+with their own version-1/version-2 interpretation; filter semantic version 1 is unchanged.
 
 ## Storage And Compilation
 
@@ -99,9 +100,12 @@ failure wins even after an earlier finite error, refusing the entire command
 without writes, counters, history, clock advancement, or notifications. Future
 publications retain only their parent record at admission and use current rules
 at activation; existing active, locked, and deferred copies are not reselected.
-Activation takes a fitting due prefix, or leaves the first resource-unfit head
-pending and cancelable. Corrupt metadata aborts rather than being treated as an
-unfit prefix.
+Activation permits a fitting due prefix only for aggregate ingress, fanout and
+rule-match admission limits. An aggregate-unfit head remains pending and
+cancelable. Later selected per-copy size/value or shape failures and malformed
+metadata refuse the whole activation without effects, not merely its suffix.
+The exact three soft-error variants and action-conversion route are in
+[SQL Actions](sql-actions.md#atomic-admission); filter-error precedence is unchanged.
 
 ## Resource And Diagnostic Boundaries
 
@@ -115,7 +119,13 @@ allocation. The complete topic load shares 1 MiB source, 32,768 tokens, and
 
 All correlation and SQL evaluation shares one command allowance of 1,048,576
 work units and 32 MiB comparison bytes. Property scans and potential comparisons
-are charged before the corresponding work. Finite failures stay in the flat
+are charged before the corresponding work. Possible action plans also precharge
+section-sensitive value-node/body-container and metadata-entry visits, repeated
+original-target/final-RuleName measurements, map/overlay candidates and bounded
+statement/literal/target scans, even when a filter is false or ingress duplicates.
+These visit/comparison counters are not all-instruction, CPU/wall-time, allocator
+or RSS bounds; the finite action subset is specified separately in
+[SQL Actions](sql-actions.md). Finite failures stay in the flat
 evaluation arena so they cannot conceal independent limits; dependent operations
 retain conservative possible string bounds. Generated `LIKE` patterns are
 limited to 16 KiB, with 1 MiB compiled engine and DFA-cache limits. These are local

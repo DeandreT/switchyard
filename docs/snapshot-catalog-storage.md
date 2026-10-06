@@ -18,8 +18,10 @@ The durable layout uses
 `ACTIVE_CATALOG_REPLICA_STORE_FORMAT = 0xc000_0000 | ACTIVE_STORE_FORMAT` and the
 exact profile `committed-state-catalog-v1`. Its record-layout version advances
 with existing formats; a catalog-header change also needs an explicit profile
-version change. Existing standalone and ordinary replica format constants are
-unchanged.
+version change. The current global base is 15, so this profile uses
+`0xc000000f`; standalone and ordinary replica layouts are 15 and `0x8000000f`.
+The catalog profile tag remains version 1. This profile does not bypass the
+shared base-format guard or convert an earlier directory.
 
 A fresh directory is stamped with three headers in one synchronous batch:
 `format_version`, `replica_profile`, and `replica_initialized`. Only those headers
@@ -30,8 +32,12 @@ business records nor a catalog.
 
 Existing standalone and ordinary replica directories are not adopted, even if
 their records are empty. Their normal open paths also refuse catalog directories,
-including pristine and initialized-empty ones. There is no automatic migration,
-conversion, or new requirement to wipe existing ordinary directories.
+including pristine and initialized-empty ones. There is no automatic migration
+or conversion. All earlier base-format directories, including ordinary layouts
+and catalog directories with no action records, are refused by the current
+build. Recreating development directories is a consequence of that global
+version boundary, not adoption by the catalog API; see
+[Durable Format](compatibility.md#durable-format).
 
 All three generic durable openers also [refuse reserved paired metadata
 markers](paired-marker-refusal.md) before record-keyspace acquisition or

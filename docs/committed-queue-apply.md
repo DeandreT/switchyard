@@ -23,14 +23,16 @@ service: custom implementations and privileged raw batch writers must preserve
 the single-writer contract. Expected-previous checks are not storage CAS.
 
 Replica directories use `0x80000000 | ACTIVE_STORE_FORMAT`, currently
-`0x8000000e`, and exact `committed-state-v1` metadata. Fresh creation stamps the
+`0x8000000f`, and exact `committed-state-v1` metadata. Fresh creation stamps the
 format, profile, and initialized-zero flag in one fsynced metadata batch.
 Every privileged commit sets initialized-one in the same atomic batch as its
-record mutations. Standalone format 14 is unchanged. Standalone open refuses
-replica metadata and replica layouts; old format-14 binaries refuse the
-disjoint version. Replica open rejects standalone directories, partial or
-malformed headers, and populated unversioned data. There is no implicit
-adoption, rollback conversion, or migration.
+record mutations. The current standalone format is 15; every ACTIVE-derived
+profile advances at the same global interpretation boundary, even without SET
+actions. Standalone open refuses replica metadata and replica layouts, and an
+older format-14 binary refuses the new layout. Replica open rejects earlier
+replica layouts, standalone directories, partial or malformed headers and
+populated unversioned data. There is no implicit adoption, rollback conversion
+or migration; see [Durable Format](compatibility.md#durable-format).
 
 `create` requires an uninitialized, empty replica and durably writes its baseline
 checkpoint. `open` requires initialized, valid progress for the exact stream.

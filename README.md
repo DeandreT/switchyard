@@ -250,13 +250,14 @@ subscription deletion is synchronous and destructive, with atomic cleanup limits
 and retained recreation fences described in [Entity Deletion](docs/entity-deletion.md).
 The same endpoint also exposes typed subscription rule create/get/list/delete
 through [Native Rule Administration](docs/native-rules.md), including bounded
-REMOVE actions but not upserts. The rule CLI uses bounded, typed JSON filter
-and optional action files and preserves
-scalar widths and bits. Subscription creation keeps an explicit `$Default`
+REMOVE and literal-valued SET actions but not upserts. The rule CLI uses bounded,
+typed JSON filter and optional action files and preserves scalar widths and bits.
+Subscription creation keeps an explicit `$Default`
 true rule; delete that rule when selection should depend only on custom filters.
 Other native services and Azure administration compatibility remain unfinished.
 AMQP rule management, native administration, the CLI, and the domain provide bounded
-[REMOVE rule actions](docs/sql-actions.md) with independent selected copies.
+[REMOVE and literal SET rule actions](docs/sql-actions.md) with independent selected
+copies and finite local conversion-error dead letters, not full Azure actions.
 Native action creation uses a separate RPC, with no action-free fallback on
 older servers. Native reads require action opt-in; the CLI requests it automatically.
 

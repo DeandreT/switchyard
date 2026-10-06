@@ -32,7 +32,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
 | Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; Azure administration not implemented |
-| Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD/CLI; bounded REMOVE actions with independent copies across these surfaces, not SET/full Azure actions |
+| Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD/CLI; bounded REMOVE and String/Boolean/Int64-literal SET actions with independent copies and finite local conversion-error dead letters, not full Azure/CLR actions |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Dead-letter | Pre-1.0 | State machine, AMQP mapping |
@@ -42,7 +42,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
-| Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE actions over HTTP/2 and authenticated TLS; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
+| Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
 | Quorum replication | Pre-1.0 | An isolated [fixed-three-node in-process runtime](experimental-replica-runtime.md) exists for bounded Create/Send, but is not integrated with server listeners or the production proposer; production startup remains refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup. The runtime exposes no snapshots or production deployment activation. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
 | Cross-placement-group transactions | Later | Out of initial scope |
@@ -223,8 +223,8 @@ Duplicate detection runs once at topic ingress;
 duplicate publications consume a sequence but create no copies. A topic with
 no subscriptions acknowledges publications without retaining messages, and a
 later subscription sees only later publications. Each copy preserves its body
-and system fields; [REMOVE actions](sql-actions.md) transform only their private
-application properties. Copies take the shortest requested/topic/subscription TTL and have
+and system fields; [REMOVE and literal SET actions](sql-actions.md) transform only
+their private application properties. Copies take the shortest requested/topic/subscription TTL and have
 independent receive, settlement, lock expiry, deferral, and dead-letter state.
 All input and destination validation precedes commit, including duplicate inputs;
 one invalid destination or exhausted topic sequence rejects the whole command.
@@ -249,9 +249,18 @@ final rule selects nothing, with no implicit default fallback. These Boolean,
 default, and combination semantics follow Microsoft's
 [topic filter documentation](https://learn.microsoft.com/en-us/azure/service-bus-messaging/topic-filters).
 Bounded SQL predicates are supported alongside those filters. AMQP, native, CLI,
-and domain [REMOVE actions](sql-actions.md) add independent copies; `SET` actions
-and compound correlation predicates remain explicitly unsupported rather than
-treated as successful matches.
+and domain [REMOVE and literal SET actions](sql-actions.md) add independent copies.
+Version 1 remains REMOVE-only; new, omitted-version and unversioned AMQP actions
+use version 2. SET assigns only String, Boolean or signed-Int64 literals under
+exact-key, checked target-family/integer-width rules. Unsupported right-hand
+expressions, system mutation, wider Azure/CLR conversions and compound correlation
+predicates remain refused rather than treated as successful matches. A finite
+local SET conversion failure discards that action's intermediate changes and
+retains one original-envelope dead letter plus final RuleName, without replacing
+base or healthy sibling outcomes. Its fixed `SwitchyardSqlActionError` description
+is TypeMismatch, UnsupportedTargetType or NumericOverflow and contains no source
+or producer value. Filter-error precedence and its subscription flag are unchanged;
+the independent action-error route precedes missing-session routing.
 
 Correlation rules select the eight retained system string properties and scalar
 application properties. `label` maps to subject; message and session identifiers
@@ -279,11 +288,17 @@ rule metadata can total 8 MiB independently of the message fanout budget.
 
 Matching has its own deterministic limits: 1,048,576 work units and 32 MiB of
 potential comparison bytes per command. All inputs precharge every rule and
-condition, including custom-property lookup work and potential key/value
-comparisons, before retained content is cloned. Duplicates, nonmatches, and
-short-circuit success do not bypass these charges. Immediate and scheduled
-admission reject an over-budget command atomically. Activation selects a fitting
-due prefix, or leaves the first unfit publication pending and cancelable. Rule
+condition, including custom-property lookup and potential key/value comparisons.
+Possible action planning also charges section-sensitive value-node/body-container
+and metadata-entry visits, repeated original-target/final-RuleName measurements,
+map/overlay candidates and bounded statement/literal/target scans before action
+checks and retained clones. Duplicates, nonmatches and short-circuit success do
+not bypass these allowances, which are not all-instruction, allocator, RSS, CPU
+or wall-time limits. Immediate and scheduled admission reject an over-budget
+command atomically. Activation permits a fitting prefix only for aggregate
+ingress/fanout/rule-match limits; an aggregate-unfit head remains pending and
+cancelable. A selected per-copy size/value or shape failure, or malformed metadata,
+refuses the whole activation without effects, even after earlier candidates fit. Rule
 matching precedes missing-session routing, so an excluded publication creates
 no dead-letter copy on that subscription.
 
@@ -372,13 +387,16 @@ those operations.
 
 Scheduled batches budget one retained parent copy per accepted future input.
 Every future input must also fit an individual fanout against current matching membership
-before retention. Activation processes a fitting due prefix within the existing
-ingress budgets and at most 256 inspected scheduling entries, 1,024 copies,
-4 MiB retained content, and 65,536 projected values. A later input that would
-overflow remains pending for another command. If later membership makes the
-first input unfit, activation rejects without mutation and the schedule remains
-cancelable; it is not silently skipped or partially delivered. These bounds and
-head-of-line behavior are local resource policies, not Azure quotas.
+before retention. Activation inspects at most 256 scheduling entries and retains
+at most 1,024 copies, 4 MiB content and 65,536 projected values. Only
+`IngressBatchLimitExceeded`, `TopicFanoutTooLarge` and `TopicRuleMatchTooLarge`
+permit an earlier fitting prefix to commit while the next aggregate-unfit source
+remains pending. An aggregate-unfit first source is refused without mutation and
+remains cancelable. Per-copy property/header/message/value limits, invalid shape
+and malformed metadata instead refuse the whole selected command, including
+earlier fitting sources. No prefix is applied for those errors. Source and index
+deletions, counters, active/dead-letter copies and clock share one atomic batch.
+These bounds and head-of-line policies are local, not Azure quotas or replication.
 
 Plain producer addresses resolve committed metadata and permit queue or topic
 send. Ordinary topic receivers and senders to subscriptions or dead-letter
@@ -416,7 +434,7 @@ the normal atomic stamped-command path. Enumeration accepts `top` 1 through 100
 and a nonnegative `skip` against the complete bounded, sorted rule set. A requested
 page that exceeds the response allowance fails rather than returning a shortened
 successful page, which could prematurely stop the SDK's enumeration loop.
-SQL filter and [REMOVE action](sql-actions.md) enumeration returns exact stored
+SQL filter and [bounded action](sql-actions.md) enumeration returns exact stored
 source and AMQP int compatibility level 20. Actions use the full-width SQL-action
 descriptor, distinct from the SQL-filter descriptor; no-action rules retain the
 empty-action descriptor. Optional action creation is accepted through the same
@@ -1128,6 +1146,9 @@ Azure administration remains
 ungated. These checks establish local interoperability, not cloud parity for the
 documented SQL semantic choices.
 
+The REMOVE-only action results above record the earlier baseline, not
+version-2 literal SET verification.
+
 The SDK gates build into separate temporary directories and run the resulting
 assemblies directly. Run them explicitly with
 `cargo test -j 2 -p server --test amqp_dotnet_current -- --ignored --test-threads=1`;
@@ -1263,7 +1284,7 @@ The additive `RuleService` serves create/get/list/delete on a canonical
 subscription path with Manage authorization before filter/action parsing or store
 access. It preserves exact scalar constructors and SQL source/version, uses an
 in-flight subscription-incarnation fence, and returns complete sorted lists
-under the existing 32-rule limit. Bounded REMOVE actions use a separate
+under the existing 32-rule limit. Bounded REMOVE and literal SET actions use a separate
 `CreateRuleWithAction` method; the original `CreateRule` remains action-free.
 Get/List default to refusing action metadata unless `include_actions` is true,
 so older clients do not silently receive incomplete definitions. Mutations are
@@ -1341,18 +1362,29 @@ as `queue update`.
 
 ## Durable Format
 
-The current value format is version 11 and durable store layout is version 14.
-These remain the standalone formats. Isolated replica directories use the
-disjoint layout `0x8000000e`, an exact committed-state profile, and an initialized
-flag updated atomically with each privileged batch. Ordinary open refuses those
-directories, including on older format-14 builds; replica open does not adopt
-standalone directories. Their bounded progress record has its own version-1
-envelope and is not part of the ordinary message-value codec. There is no
+The current value envelope remains version 11; the active durable base layout
+is version 15. Isolated replicas derive `0x8000000f`, catalog replicas derive
+`0xc000000f`, and protected publication derives `0xd000000f` from that same
+`ACTIVE_STORE_FORMAT`. Their exact profile-v1 tags are unchanged. Existing v14
+directories in every derived namespace are refused, even without SET-bearing
+rules; older builds likewise refuse new v15 directories. No automatic relabeling,
+repair, migration or rollback conversion is provided.
+
+Replica profiles have an initialized flag updated with each privileged batch;
+ordinary open refuses those profiles, and replica open does not adopt standalone
+directories. The bounded committed progress record has its own version-1 envelope,
+not the ordinary message-value codec. Separate [catalog](snapshot-catalog-storage.md)
+and [protected](durable-protected-publication.md) APIs remain explicit selections.
+The private paired-storage fixture also derives its State/Log numbers from the
+active base; that is not a production creation or migration API. There is no
 standalone-to-replica migration or production runtime replication; see
 [Committed Queue Apply](committed-queue-apply.md).
 
 Value format 11 appends optional source-only [SQL actions](sql-actions.md) with
-semantic version 1; legacy rule definitions decode with no action. Maximum-sized
+stored semantic version 1 or 2; legacy rule definitions decode with no action.
+New and unversioned actions default to 2, while explicit and stored version 1
+retain REMOVE-only interpretation. Compilation dispatches on that exact stored
+version, so a version-1 SET source never becomes executable after reopen. Maximum-sized
 old rules are validated and charged by their actual stored envelopes, not a
 larger rewritten shape. Relabeling the new rule shape as an older format is
 refused. Value format 10 introduced the subscription filter-error policy and a

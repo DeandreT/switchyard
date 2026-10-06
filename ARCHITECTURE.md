@@ -50,7 +50,8 @@ independent session receivers; registration precedes each receive attempt.
 Boolean, scalar correlation, and bounded SQL rules are persisted and managed
 through AMQP and the native gRPC [rule API](docs/native-rules.md).
 SQL error routing has an explicit subscription policy. AMQP, native, CLI, and domain
-[REMOVE actions](docs/sql-actions.md) create independently transformed copies;
+[REMOVE and literal SET actions](docs/sql-actions.md) create independently transformed
+copies with finite local conversion-error dead letters;
 Azure administration remains unimplemented. Native
 administration creates, reads, lists, partially updates, and atomically deletes
 queues, topics, and subscriptions. Deletion purges owned state under explicit
@@ -228,8 +229,11 @@ live directory is refused rather than shared.
 Isolated replica directories have a disjoint durable layout and a unique
 privileged writer with read-only views. The committed queue machine and the
 experimental log adapter retain distinct inner profiles in separate directories;
-neither adopts the other's records. Standalone format 14 is unchanged. These
-prerequisites do not implement production keyspace placement or online upgrades.
+neither adopts the other's records. The current standalone format is 15; the
+replica, catalog and protected formats derive from that same active version.
+Earlier directories are refused even when they contain no SET actions, with no
+automatic migration. These prerequisites do not implement production keyspace
+placement or online upgrades.
 
 The memory backend implements the same atomic batch and snapshot contract, and
 one conformance suite runs against both backends so they cannot drift. It is
@@ -332,23 +336,33 @@ lifetime-free copy to its shadow with fixed local error fields; disabling the
 subscription option drops only that copy. Resource limits instead refuse the
 entire command atomically, including limits found after a finite error.
 The domain action command adds one independently annotated copy per matching
-REMOVE action, beyond the single OR-combined action-free copy. Those copies use
-additional parent counter sequences after all original input acknowledgements;
-the exact-key removal and final RuleName collision policy are local. AMQP
+action, beyond the single OR-combined action-free copy. Version 1 remains
+REMOVE-only; new and unversioned actions use version 2, adding bounded String,
+Boolean and signed-Int64 literal SET. Exact-key target lookup, checked integer
+widths and final RuleName replacement are local policies, not CLR or cloud
+conversion parity. A finite conversion failure discards that action's changes
+and routes one original-envelope action copy to its shadow; healthy action and
+subscription siblings remain independent. These copies use additional parent
+counter sequences after all original input acknowledgements; AMQP
 enumeration preserves complete actions; native reads expose actions only with
 explicit opt-in, which the CLI requests automatically. A separate native action
 creation method prevents silent downgrade on older servers. Detailed policies
 are in [SQL Rules](docs/sql-rules.md) and [SQL Actions](docs/sql-actions.md).
 Fanout admission bounds retained copies, content, and typed value items before
 cloning; committed application effects name only actual ready destinations.
-Topic activation commits a fitting due prefix of at most 256 inspected sources,
-1,024 copies, 4 MiB retained content, and 65,536 projected values per command.
-The timer continues positive prefixes for at most eight rounds per visited
-topic, so the sweep bound is eight command budgets, not one. An unfit first
-publication remains pending and cancelable rather than partially fanning out.
-Rule metadata has separate per-rule, per-subscription, and count bounds, while
-every input precharges all possible rule work and comparison bytes before
-payload cloning. Duplicate and nonmatching inputs do not bypass those limits.
+Topic activation inspects at most 256 sources and permits a fitting prefix only
+for aggregate ingress, fanout or rule-match admission limits: at most 1,024 copies,
+4 MiB retained content and 65,536 projected values per command. An aggregate-unfit
+head remains pending and cancelable. Later selected per-copy size/value or shape
+failures and malformed metadata instead refuse the entire selected activation
+without effects; they do not commit its earlier fitting candidates. The timer
+continues positive prefixes for at most eight rounds per visited topic, so the
+sweep bound is eight command budgets, not one. Rule metadata has separate
+per-rule, per-subscription and count bounds. Every input precharges possible
+filter comparisons and action-planning node/container/entry visits, map and
+overlay candidates and bounded statement/literal/target scans before action
+checks and payload cloning. Duplicate and nonmatching inputs do not bypass these
+allowances, which are not all-instruction, allocator, wall-time or process-memory limits.
 Detailed scalar semantics and local limits are recorded in
 [compatibility.md](docs/compatibility.md).
 

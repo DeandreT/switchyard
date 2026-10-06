@@ -2,8 +2,9 @@
 
 The optional `--admin-listen` gRPC listener serves `RuleService` alongside
 `EntityService`. It creates, gets, lists, and deletes subscription rules through
-the existing broker owner, including bounded [REMOVE actions](sql-actions.md).
-It does not provide Azure Atom/XML administration, `SET` actions, updates, or upserts.
+the existing broker owner, including bounded [REMOVE and literal SET actions](sql-actions.md).
+It does not provide Azure Atom/XML administration, full action expressions or
+conversions, updates, or upserts.
 
 ## Requests and Authorization
 
@@ -92,9 +93,14 @@ explicit null. Compound values are not part of this contract.
 The existing domain limits remain authoritative: 32 rules per subscription,
 32 total conditions per correlation filter, 64 KiB per versioned stored rule,
 and 256 KiB per complete subscription rule set. Existing SQL compilation and
-evaluation budgets are unchanged. Action-bearing definitions count filter and
-action together under the stored-rule limit. This additive API uses the existing
-domain action command and changes neither command encoding nor stored-record versions.
+evaluation ceilings are unchanged; action planning precharges conservative
+node/container/entry visits, map/overlay candidates and bounded statement/literal/
+target scans, not allocator, RSS or time usage. Action-bearing definitions count
+filter and action together under the stored-rule limit. The source-only value
+envelope stays version 11 while actions preserve semantic version 1 or 2. The
+global active directory format is 15, including derived replica/catalog/protected
+layouts; earlier directories are refused, not migrated. See
+[Durable Format](compatibility.md#durable-format).
 
 Rule and entity services share listener admission and transport bounds:
 128 concurrent requests across service clones, at most 32 HTTP/2 streams per
@@ -146,10 +152,11 @@ original action-free `CreateRule`.
 
 Action JSON requires `type: "sql"` and a string `expression`, with optional
 unsigned `semantic_version`. Explicit null, unknown/duplicate fields, and other
-action types are refused. Omitted versions select the server's current version 1;
-unsupported supplied versions and well-typed invalid source are forwarded for
-authoritative refusal. Responses require explicit supported version 1 and bounded
-source. The checked-in [removal action](../examples/rules/remove-audit.json) is:
+action types are refused. Omitted action versions select the server's current
+version 2; explicit 1 remains REMOVE-only and explicit 2 permits the local literal
+SET subset. Unsupported supplied versions and well-typed invalid source are
+forwarded for authoritative refusal. Responses require explicit supported
+version 1 or 2 and bounded source. The checked-in [removal action](../examples/rules/remove-audit.json) is:
 
 ```json
 {
@@ -159,10 +166,15 @@ source. The checked-in [removal action](../examples/rules/remove-audit.json) is:
 }
 ```
 
-Only bounded static user-property removal is implemented. The action compiler
-runs after authorization and before binding, with owner-side validation repeated
-under the captured child generation. The language and independent-copy behavior
-remain those in [SQL Actions](sql-actions.md).
+The checked-in explicit-version-1 removal remains valid. Version-2 SET supports
+only String, Boolean and signed-Int64 literals with exact-key, checked target
+family/width conversions. Unknown action versions are refused before the server
+copies or compiles source. The action compiler runs after authorization and
+before binding, with owner-side version-aware validation repeated under the
+captured child generation. Finite conversion failures produce original-envelope
+per-action dead letters with fixed local fields, while size/work/shape limits
+refuse the whole command. These are not full Azure/CLR conversion semantics;
+the matrix, sibling isolation and privacy boundaries are in [SQL Actions](sql-actions.md).
 
 Filters use an explicit `type` field. True and false are `{"type":"true"}` and
 `{"type":"false"}`. SQL uses `expression` and optional `semantic_version`; the
