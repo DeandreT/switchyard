@@ -18,8 +18,8 @@ The durable layout uses
 `ACTIVE_CATALOG_REPLICA_STORE_FORMAT = 0xc000_0000 | ACTIVE_STORE_FORMAT` and the
 exact profile `committed-state-catalog-v1`. Its record-layout version advances
 with existing formats; a catalog-header change also needs an explicit profile
-version change. The current global base is 15, so this profile uses
-`0xc000000f`; standalone and ordinary replica layouts are 15 and `0x8000000f`.
+version change. The current global base is 16, so this profile uses
+`0xc0000010`; standalone and ordinary replica layouts are 16 and `0x80000010`.
 The catalog profile tag remains version 1. This profile does not bypass the
 shared base-format guard or convert an earlier directory.
 

@@ -190,7 +190,7 @@ This uses the appended domain command `SettleHeld` (tag 38), not a new AMQP
 field. Trusted legacy `Settle` (tag 24), Complete, Abandon, Defer and DeadLetter
 commands remain message-lock-only APIs. Atomic messaging keeps its legacy mapper
 and refuses `SettleHeld`; the closed `CreateSendV1` committed profile and queue
-log schemas are unchanged. Value format 11 and store layout 15 are unchanged;
+log schemas and value format 11 are unchanged by settlement;
 an older command decoder is expected to refuse tag 38 as an unknown payload
 variant, not as a new value-format header. This is not a mixed-version command
 log guarantee.
@@ -201,8 +201,8 @@ An expired, released or replaced hold cannot extend the old message lock.
 Both the original session and message deadlines must remain live at the owner's
 timestamp; renewing a message does not renew its session. Trusted legacy
 `RenewLock` (tag 10) remains message-lock-only. Management uses appended
-`RenewLockHeld` (tag 39); the closed atomic/`CreateSendV1`/`QueueV1` profiles,
-value format 11 and store layout 15 are unchanged. This does not establish
+`RenewLockHeld` (tag 39); the closed atomic/`CreateSendV1`/`QueueV1` profiles and
+value format 11 are unchanged by renewal. This does not establish
 mixed-version command-log compatibility. Both pinned receivers,
 [7.21.0](https://raw.githubusercontent.com/Azure/azure-sdk-for-net/Azure.Messaging.ServiceBus_7.21.0/sdk/servicebus/Azure.Messaging.ServiceBus/src/Receiver/ServiceBusReceiver.cs)
 and [7.20.2](https://raw.githubusercontent.com/Azure/azure-sdk-for-net/Azure.Messaging.ServiceBus_7.20.2/sdk/servicebus/Azure.Messaging.ServiceBus/src/Receiver/ServiceBusReceiver.cs),
@@ -232,9 +232,38 @@ and backend panic are not covered by this cleanup guarantee.
 
 This uses appended `AcceptNextSessionPage` (tag 40); legacy `AcceptSession`
 (tag 12), including named acceptance and its bounded next-session operation,
-keeps its wire encoding. The closed atomic/`CreateSendV1`/`QueueV1` profiles,
-value format 11 and store layout 15 are unchanged. This does not establish
+keeps its wire encoding. The closed atomic/`CreateSendV1`/`QueueV1` profiles and
+value format 11 are unchanged by paging. This does not establish
 mixed-version command-log compatibility.
+
+Session-required queues and subscriptions now track every PeekLock message
+lock independently of the session lock. Held receives retain the exact original
+session token; identifier-only trusted deferred commands retain a separate
+unowned class, even when that session currently has a holder. Renewing or settling
+an unowned row does not convert it into original-generation evidence. Ordinary
+session metadata, dead-letter queues and ReceiveAndDelete do not create these rows.
+
+Named, legacy next-session and paged acceptance cannot grant a replacement while
+any tracked message lock remains. The new pending-takeover refusal is retryable
+`amqp:resource-locked`; management maps it through the existing 503 refusal.
+A still-live session retains its earlier lock refusal priority. Next-available
+acceptance skips busy sessions and can grant healthy siblings within the existing
+32-ready-group page budget. A deadline alone does not prove that a lock exited.
+
+Actual settlement, abandonment, deferral, dead-letter/drop cleanup and message-lock
+expiry remove the corresponding ownership rows and decrement their session count
+in the same command batch. Renewal changes the deadlines without changing the
+original generation, message token or counts. Staged reads see earlier changes in
+that same batch, including deletions. Local row/index/summary disagreement refuses
+the entire command without applying staged changes or advancing its clock.
+An absent summary permits only a one-entry forward-index orphan check at grant;
+this is not an arbitrary orphan or forged-count audit.
+
+Private ownership indexes require store layout 16. Message and session records,
+value format 11, command tags 0-40 and the closed committed/atomic profiles retain
+their existing shapes. Releasing or expiring a session does not itself retire its
+message locks. Trusted allocation or renewal can keep a session busy indefinitely;
+no bounded takeover completion, fairness or immediate requeue guarantee is added.
 
 Microsoft documents a [session-lock umbrella](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sessions#session-features)
 and [settlement failure after session expiry](https://learn.microsoft.com/en-us/dotnet/api/azure.messaging.servicebus.servicebusreceiver.completemessageasync?view=azure-dotnet).
@@ -242,9 +271,9 @@ This boundary does not implement every umbrella behavior or establish full
 Azure error parity. Remaining local session limitations are:
 
 - Releasing or expiring a session does not immediately requeue its locked
-  messages; they remain locked until their own deadlines. A replacement holder
-  can receive later ready messages while earlier ones remain locked, so the FIFO
-  guarantee above does not extend across that takeover.
+  messages; they remain locked until actual settlement or message-lock expiry
+  cleanup. Replacement acceptance waits for all tracked rows to exit. No
+  session-wide retirement or fixed completion deadline is implemented.
 - Expiration is applied to individual messages, not to every message in a session
   when one expires. Azure documents
   [session-wide TTL expiry](https://learn.microsoft.com/en-us/azure/service-bus-messaging/message-sessions#message-expiration);
@@ -282,6 +311,18 @@ changing existing assertions, waits or ignore status. An unchanged oversized
 storage fixture stalled in the first concurrent workspace run; the same test
 binary passed alone, and the complete workspace passed on a serial retry with
 no skips. The cause of that stall remains unestablished.
+
+Local verification adds 31 regular checks for session message-lock tracking:
+23 domain, three storage-layout, one protocol-condition and four raw AMQP
+checks. Default and all-feature workspace runs each pass 5,322 tests, preserving
+all prior case statuses and the same 11 opt-in SDK ignore reasons. Those 11 SDK
+checks pass separately as regression evidence, not a new SDK stale-lock or
+takeover workflow or observed Azure error parity. Strict lint and builds pass
+in both configurations, along with formatting and protobuf validation. Both
+complete workspace runs use serial test execution with no skips. Existing
+authority and paging fixtures now require actual lock exit for same-ID takeover,
+or use a different session for replacement-link checks. Initial target-wiring
+and lint failures were corrected without test suppression or ignore changes.
 
 An ordinary receiver can browse all sessions in a session-required queue or
 subscription through its management link, without attaching a data receiver or
@@ -1468,12 +1509,12 @@ as `queue update`.
 ## Durable Format
 
 The current value envelope remains version 11; the active durable base layout
-is version 15. Isolated replicas derive `0x8000000f`, catalog replicas derive
-`0xc000000f`, and protected publication derives `0xd000000f` from that same
-`ACTIVE_STORE_FORMAT`. Their exact profile-v1 tags are unchanged. Existing v14
-directories in every derived namespace are refused, even without SET-bearing
-rules; older builds likewise refuse new v15 directories. No automatic relabeling,
-repair, migration or rollback conversion is provided.
+is version 16. Isolated replicas derive `0x80000010`, catalog replicas derive
+`0xc0000010`, and protected publication derives `0xd0000010` from that same
+`ACTIVE_STORE_FORMAT`. Their exact profile-v1 tags are unchanged. Existing v15
+and older directories in every derived namespace are refused, including stores
+without session-message locks; older builds likewise refuse new v16 directories.
+No automatic relabeling, repair, migration or rollback conversion is provided.
 
 Replica profiles have an initialized flag updated with each privileged batch;
 ordinary open refuses those profiles, and replica open does not adopt standalone
@@ -1502,9 +1543,9 @@ The layout also requires retained [entity incarnations](entity-incarnations.md),
 which prevent old admitted endpoints from addressing recreated names. The
 layout protects SQL filter/action interpretation and the subscription policy,
 in addition to explicit rules, session-bearing ordinary subscription indexes,
-and parent-retained topic schedules. An older build could otherwise decode the
-wrong configuration shape, fail to interpret SQL, or route publications under
-an older contract.
+parent-retained topic schedules, and session-message-lock ownership indexes.
+An older build could otherwise decode the wrong configuration shape, fail to
+interpret SQL, or route publications under an older contract.
 Earlier message and queue-configuration shapes have tested decoders, but an
 earlier store directory is refused at open because its broker contract differs.
 There is no directory migration tooling yet; development directories
