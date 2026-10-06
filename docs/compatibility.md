@@ -1019,6 +1019,17 @@ the accommodations alone are not an SDK gate. The separate
 cold-first same-queue immediate send, plus held Complete over experimental TLS.
 The messaging listener's separate initial control window is socket-tested;
 cold-first SDK support is limited to immediate Send, not acquisition or Complete.
+
+Three native regression checks exercise ordinary Accepted versus coordinator
+Declared outcomes across ordering, independent sessions and settled delivery-ID
+reuse, in both receiver settlement modes. Native package runs pass 810 checks
+without `test-client` and 882 with all features, including the same 23 credit and
+32 documentation checks; the additional 72 cases are the opt-in client suites.
+Two feature-gated test warnings were corrected without changing assertions,
+deadlines or ignore status. Strict workspace lint and formatting pass. These
+scoped checks add no production routing change, new full-workspace or SDK run,
+explanation or fix for the earlier SDK type mismatch, or cloud parity claim.
+
 An End on an unmapped channel is refused without manufacturing a session reply.
 Client Begin searches only vacant channels within the peer's inclusive channel
 limit. Pending, live, and ending sessions cannot be overwritten. Client End
