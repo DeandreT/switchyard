@@ -610,12 +610,12 @@ async fn tiny_positive_peer_idle_is_refused_explicitly_after_open() {
 
 #[tokio::test(start_paused = true)]
 async fn local_invalid_options_emit_no_handshake_bytes() {
-    for &client in sides() {
+    for &_client in sides() {
         let (wire, mut peer) = tokio::io::duplex(4096);
         let options = ConnectionOptions::default().idle_timeout_millis(999);
         let result = async {
             #[cfg(feature = "test-client")]
-            if client {
+            if _client {
                 return ClientConnection::builder()
                     .connection_options(options)
                     .open_with_stream(wire)

@@ -84,3 +84,6 @@ async fn default_connection_refuses_coordinator_without_publishing_approval() {
     );
     fixture.connection.shutdown().await;
 }
+
+#[path = "native_transaction_tests/correlation.rs"]
+mod correlation;

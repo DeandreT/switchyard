@@ -50,9 +50,12 @@ async fn ordinary_outbound_frame_delays_heartbeat_but_not_receive_deadline() {
         4096,
     )
     .await;
+    #[cfg(feature = "test-client")]
     let TestConnection::Server(mut connection) = connection else {
         unreachable!()
     };
+    #[cfg(not(feature = "test-client"))]
+    let TestConnection::Server(mut connection) = connection;
     advance(Duration::from_millis(400)).await;
     write_amqp(
         &mut peer,
