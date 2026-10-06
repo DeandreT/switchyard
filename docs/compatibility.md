@@ -704,6 +704,48 @@ grants are scoped to a namespace or entity and to Send, Listen, or Manage; they
 authorize links connection-wide and close an open link when its token expires.
 A connection without a valid grant gets 20 seconds to complete CBS
 authorization. JWT, OIDC, and mTLS are not implemented.
+
+A separate pure `auth::JwtPolicy` library provides a narrow offline JWT
+validator; it does not activate the JWT wire path described above.
+`JwtPolicy::from_json` pins an exact HTTPS issuer, a distinct resource audience,
+public RSA keys and one local scope/permission binding per unique subject.
+Validation accepts only RS256 with exact protected-header `typ: at+jwt`, a
+configured key identifier, RSA moduli of 2,048--4,096 bits and exponent 65,537.
+Signatures use the maintained `jsonwebtoken` RustCrypto backend. Signed role or
+scope claims never supply rights; the requested `ResourceScope` must be contained
+in the subject's local binding.
+
+Configuration is limited to 64 KiB, eight keys and 64 bindings; compact tokens
+to 8 KiB, decoded headers to 2 KiB and claims to 6 KiB. Structured JSON checks
+reject duplicate members and excessive depth/node counts, including ignored
+claim values. The policy, each key/binding record, the protected header and claims
+must be JSON objects; positional-array encodings of those records are rejected.
+The protected header admits only `alg`, `kid` and `typ`, not remote
+key URLs or algorithm selection. Required `iat`/`exp` and optional `nbf` are
+unsigned integral NumericDates. Validation uses the caller's epoch, zero clock
+skew and a checked positive lifetime of at most 3,600 seconds; it does not obtain
+or certify a trusted clock. Typed issuer identity distinguishes SAS principals
+from JWT principals and separates identical subjects issued by different issuers
+through `AccessGrant::same_principal`, without encoding provenance into a string.
+
+This is not OIDC discovery, network JWKS refresh, operational revocation, Entra
+RBAC, workload identity or full RFC 9068 validation. It adds no TLS proof, CBS
+token handling, listener/CLI activation, default authorization change, or storage
+format change. No runtime, SDK, cloud, RSS or wall-time validation guarantee is
+implied by these input and algorithm limits.
+
+Local verification of this foundation passed all 21 new JWT cases (49 auth tests
+total) and 5,407 workspace tests, with the same 11 ignored cases. An all-features
+no-run build reused the same 137 fresh test executables as the corrected workspace
+run; this was not a second runtime suite. Strict lint and build gates passed in
+both feature modes, with formatting and protobuf checks. A pre-fix shape probe
+had 18 passes and three failures; explicit object guards corrected those refusals.
+The existing pinned .NET regression suite initially passed ten cases and failed
+the previous client's batch-identity assertion before settlement. That unchanged
+case passed alone, then all eleven cases passed on a full recheck. The first SDK
+failure remains unexplained, not resolved; these SAS regressions do not validate
+JWT on CBS or resolve earlier transaction-outcome incidents.
+
 Only the experimental atomic messaging listener permits bounded coordinator
 declaration and explicit rollback during that fixed
 [initial window](initial-transaction-authorization.md). Queue access and every
