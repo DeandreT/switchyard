@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
+mod jwt;
 mod policy;
 mod sas;
 
 use serde::{Deserialize, Serialize};
 
 pub use crate::{
+    jwt::{JwtError, JwtPolicy},
     policy::{
         PermissionSet, PolicyError, ResourceScope, ResourceScopeError, SharedAccessKey,
         SharedAccessPolicy, SharedAccessRule,

@@ -38,6 +38,7 @@ fjall = "3.1.8"
 flume = "0.12"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 hmac = "0.12"
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["rust_crypto"] }
 log = "0.4"
 openraft = { version = "=0.9.25", default-features = false, features = ["serde", "storage-v2"] }
 percent-encoding = "2.3"

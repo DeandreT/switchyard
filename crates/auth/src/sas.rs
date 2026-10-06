@@ -14,12 +14,49 @@ const TOKEN_PREFIX: &str = "SharedAccessSignature ";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccessGrant {
     subject: String,
+    issuer: GrantIssuer,
     scope: ResourceScope,
     expires_at_epoch_seconds: u64,
     permissions: PermissionSet,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+enum GrantIssuer {
+    SharedAccess,
+    Jwt(String),
+}
+
+impl std::fmt::Debug for GrantIssuer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::SharedAccess => "SharedAccess",
+            Self::Jwt(_) => "Jwt(<redacted>)",
+        })
+    }
+}
+
 impl AccessGrant {
+    /// Compares the verified issuer namespace and principal, not the resource scope.
+    pub fn same_principal(&self, other: &Self) -> bool {
+        self.issuer == other.issuer && self.subject == other.subject
+    }
+
+    pub(crate) fn verified_jwt(
+        subject: String,
+        issuer: String,
+        scope: ResourceScope,
+        expires_at_epoch_seconds: u64,
+        permissions: PermissionSet,
+    ) -> Self {
+        Self {
+            subject,
+            issuer: GrantIssuer::Jwt(issuer),
+            scope,
+            expires_at_epoch_seconds,
+            permissions,
+        }
+    }
+
     pub fn subject(&self) -> &str {
         &self.subject
     }
@@ -70,6 +107,7 @@ impl SharedAccessPolicy {
         }
         Ok(AccessGrant {
             subject: key_name.to_owned(),
+            issuer: GrantIssuer::SharedAccess,
             scope: rule.scope().clone(),
             expires_at_epoch_seconds: u64::MAX,
             permissions: rule.permissions(),
@@ -151,6 +189,7 @@ impl SharedAccessPolicy {
 
         Ok(AccessGrant {
             subject: token.key_name,
+            issuer: GrantIssuer::SharedAccess,
             scope: token_scope,
             expires_at_epoch_seconds: token.expiry,
             permissions: rule.permissions(),
