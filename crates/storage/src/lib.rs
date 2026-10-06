@@ -34,6 +34,11 @@ pub use complete_catalog_state::{
     MAX_COMPLETE_CATALOG_STATE_BYTES, StoredCatalogReplicaState,
 };
 
+pub use durable::{
+    ACTIVE_PROTECTED_STATE_STORE_FORMAT, FjallProtectedStateOpenError, FjallProtectedStateReader,
+    FjallProtectedStateStore,
+};
+
 pub use memory::{MemoryProtectedStateReader, MemoryProtectedStateStore};
 pub use protected_state::{
     MAX_PROTECTED_STATE_BYTES, MAX_PROTECTED_STATE_FENCE_BYTES, PROTECTED_STATE_RECORD_LIMITS,

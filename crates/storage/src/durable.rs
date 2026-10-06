@@ -24,6 +24,12 @@ pub use catalog::{FjallCatalogReader, FjallCatalogReplicaStore};
 mod replica;
 pub use replica::FjallReplicaStore;
 
+mod protected_state;
+pub use protected_state::{
+    ACTIVE_PROTECTED_STATE_STORE_FORMAT, FjallProtectedStateOpenError, FjallProtectedStateReader,
+    FjallProtectedStateStore,
+};
+
 /// Version 1 of the durable layout: caller keys verbatim in `records`, and a
 /// big-endian format version in `meta`.
 pub const STORE_FORMAT_V1: u32 = 1;
