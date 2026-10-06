@@ -122,6 +122,19 @@ pub(super) struct SessionMessageLocks<'a, S> {
     batch: &'a mut WriteBatch,
 }
 
+pub(super) struct RetirementGroup {
+    pub(super) generation: Option<LockToken>,
+    pub(super) owned_count: u64,
+    pub(super) eligible: bool,
+}
+
+pub(super) struct RetirementEntry {
+    pub(super) sequence: SequenceNumber,
+    pub(super) message_token: LockToken,
+    pub(super) locked_until: Timestamp,
+    pub(super) owned_count: u64,
+}
+
 impl<'a, S: StateStore> SessionMessageLocks<'a, S> {
     pub(super) fn new(
         store: &'a S,
@@ -362,6 +375,11 @@ impl<'a, S: StateStore> SessionMessageLocks<'a, S> {
         hold: Option<&SessionHold>,
     ) -> Result<(), BrokerError> {
         if let Some((mut row, _)) = self.validated(record, hold)? {
+            if hold.is_none()
+                && let Owner::HeldGeneration(generation) = row.owner
+            {
+                self.renewal_liveness(&row.session_id, generation)?;
+            }
             row.locked_until = locked_until;
             let bytes = codec::encode(&row)?;
             self.batch
@@ -369,6 +387,156 @@ impl<'a, S: StateStore> SessionMessageLocks<'a, S> {
             self.batch.push_put(self.forward_key(&row), bytes);
         }
         Ok(())
+    }
+
+    fn actual_session(&self, session_id: &SessionId) -> Result<Option<SessionRecord>, BrokerError> {
+        StateMachine::new((*self.store).clone()).session(
+            &self.command.namespace,
+            &self.command.entity,
+            session_id,
+        )
+    }
+
+    fn renewal_liveness(
+        &self,
+        session_id: &SessionId,
+        generation: LockToken,
+    ) -> Result<(), BrokerError> {
+        let lock = self
+            .actual_session(session_id)?
+            .and_then(|record| record.lock)
+            .filter(|lock| lock.token == generation)
+            .ok_or_else(|| BrokerError::SessionLockNotHeld {
+                session_id: session_id.clone(),
+            })?;
+        if lock.locked_until <= self.command.issued_at {
+            return Err(BrokerError::SessionLockExpired {
+                session_id: session_id.clone(),
+                locked_until: lock.locked_until,
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn retirement_group(
+        &self,
+        session_id: &SessionId,
+        selected: Option<(&[u8], &[u8])>,
+    ) -> Result<Option<RetirementGroup>, BrokerError> {
+        let Some(summary) = self.summary(session_id)? else {
+            return if selected.is_some() {
+                Err(BrokerError::MalformedIndexKey)
+            } else {
+                Ok(None)
+            };
+        };
+        if let Some((key, raw)) = selected {
+            let (version, payload) = codec::split(raw)?;
+            if version != codec::VALUE_FORMAT_V11 {
+                return Err(crate::CodecError::UnsupportedVersion { version }.into());
+            }
+            let selected: Summary = codec::decode_payload(payload)?;
+            if selected != summary
+                || key
+                    != keys::session_message_lock_summary(
+                        &self.command.namespace,
+                        &self.command.entity,
+                        session_id,
+                    )
+            {
+                return Err(BrokerError::MalformedIndexKey);
+            }
+        }
+        let eligible = if let Some(generation) = summary.owned_generation {
+            let record = self
+                .actual_session(session_id)?
+                .ok_or(BrokerError::MalformedIndexKey)?;
+            match record.lock {
+                None => true,
+                Some(lock) if lock.token.as_u64() == 0 || lock.token != generation => {
+                    return Err(BrokerError::MalformedIndexKey);
+                }
+                Some(lock) => lock.locked_until <= self.command.issued_at,
+            }
+        } else {
+            false
+        };
+        Ok(Some(RetirementGroup {
+            generation: summary.owned_generation,
+            owned_count: summary.owned_count,
+            eligible,
+        }))
+    }
+
+    pub(super) fn retirement_entry(
+        &self,
+        session_id: &SessionId,
+        generation: LockToken,
+        selected: (&[u8], &[u8]),
+    ) -> Result<(RetirementEntry, MessageRecord), BrokerError> {
+        let (key, raw) = selected;
+        let (version, payload) = codec::split(raw)?;
+        if version != codec::VALUE_FORMAT_V11 {
+            return Err(crate::CodecError::UnsupportedVersion { version }.into());
+        }
+        let row: Row = codec::decode_payload(payload)?;
+        if generation.as_u64() == 0
+            || row.owner != Owner::HeldGeneration(generation)
+            || row.namespace != self.command.namespace
+            || row.entity != self.command.entity
+            || &row.session_id != session_id
+            || row.sequence.as_u64() == 0
+            || key != self.forward_key(&row)
+        {
+            return Err(BrokerError::MalformedIndexKey);
+        }
+        let record = StateMachine::new((*self.store).clone())
+            .message(&self.command.namespace, &self.command.entity, row.sequence)?
+            .ok_or(BrokerError::DanglingIndexEntry {
+                sequence: row.sequence,
+            })?;
+        let (actual, summary) = self
+            .validated(&record, None)?
+            .ok_or(BrokerError::MalformedIndexKey)?;
+        if actual != row {
+            return Err(BrokerError::MalformedIndexKey);
+        }
+        let lock_key = keys::lock(
+            &self.command.namespace,
+            &self.command.entity,
+            row.locked_until,
+            row.sequence,
+        );
+        if self
+            .read_staged(&lock_key)?
+            .is_none_or(|value| !value.is_empty())
+        {
+            return Err(BrokerError::MalformedIndexKey);
+        }
+        if summary.owned_count == 1 {
+            let prefix = keys::session_message_lock_generation_prefix(
+                &self.command.namespace,
+                &self.command.entity,
+                session_id,
+                generation,
+            );
+            if !self
+                .store
+                .scan_from(&prefix, &keys::session_message_lock_exclusive_start(key), 1)?
+                .is_empty()
+            {
+                return Err(BrokerError::MalformedIndexKey);
+            }
+        }
+        Ok((
+            RetirementEntry {
+                sequence: row.sequence,
+                message_token: row.message_token,
+                locked_until: row.locked_until,
+                owned_count: summary.owned_count,
+            },
+            record,
+        ))
     }
 
     pub(super) fn leave_locked(&mut self, record: &MessageRecord) -> Result<(), BrokerError> {

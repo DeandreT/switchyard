@@ -33,6 +33,7 @@ mod message_retention;
 mod rules;
 mod session_message_locks;
 mod session_paging;
+mod session_retirement;
 mod topic_fanout;
 mod topic_paging;
 mod topic_scheduling;
@@ -47,6 +48,14 @@ pub use entity_deletion::{
 };
 
 pub use session_paging::{MAX_SESSION_PAGE_GROUPS, SessionCursor, SessionPageOutcome};
+pub use session_retirement::{
+    MAX_SESSION_RETIREMENT_GROUPS, MAX_SESSION_RETIREMENT_MUTATION_ENTRIES,
+    MAX_SESSION_RETIREMENT_MUTATION_KEY_BYTES, MAX_SESSION_RETIREMENT_MUTATION_VALUE_BYTES,
+    MAX_SESSION_RETIREMENT_READ_KEY_BYTES, MAX_SESSION_RETIREMENT_READ_OPERATIONS,
+    MAX_SESSION_RETIREMENT_READ_VALUE_BYTES, MAX_SESSION_RETIREMENT_ROWS, SessionRetirementCursor,
+    SessionRetirementLimit, SessionRetirementOutcome, SessionRetirementPage,
+    SessionRetirementPosition,
+};
 pub use topic_fanout::{
     MAX_TOPIC_FANOUT_CONTENT_BYTES, MAX_TOPIC_FANOUT_COPIES, MAX_TOPIC_FANOUT_VALUE_ITEMS,
 };
@@ -636,6 +645,9 @@ impl<S: StateStore> StateMachine<S> {
             CommandKind::ExpireLocks => self.expire_locks(command, &mut batch)?,
             CommandKind::ExpireMessages => self.expire_messages(command, &mut batch)?,
             CommandKind::ExpireSessionLocks => self.expire_session_locks(command, &mut batch)?,
+            CommandKind::RetireSessionGenerationPage { after } => {
+                self.retire_session_generation_page(command, after.as_ref(), &mut batch)?
+            }
             CommandKind::ActivateScheduled => {
                 self.activate_scheduled(command, &mut batch, &mut subscription_enqueues)?
             }

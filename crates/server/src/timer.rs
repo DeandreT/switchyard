@@ -10,13 +10,14 @@
 //! directly and only the surrounding loop deals in real time.
 
 use std::{
+    collections::VecDeque,
     sync::{Condvar, Mutex},
     time::Duration,
 };
 
 use domain::{
-    CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueCursor, TIMER_SCAN_LIMIT,
-    TopicCursor,
+    CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueCursor, SessionRetirementCursor,
+    SessionRetirementPage, TIMER_SCAN_LIMIT, TopicCursor,
 };
 use tracing::{debug, warn};
 
@@ -72,6 +73,60 @@ pub struct TimerWorker<'a> {
 struct SweepCursors {
     queues: Option<QueueCursor>,
     topics: Option<TopicCursor>,
+    retirements: RetirementCursors,
+}
+
+const MAX_RETIREMENT_CURSORS: usize = 1_024;
+
+#[derive(Default)]
+struct RetirementCursors {
+    entries: VecDeque<((NamespaceName, EntityPath), SessionRetirementCursor)>,
+}
+
+impl RetirementCursors {
+    fn get(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+    ) -> Option<SessionRetirementCursor> {
+        self.entries
+            .iter()
+            .find(|((ns, path), _)| ns == namespace && path == entity)
+            .map(|(_, cursor)| cursor.clone())
+    }
+
+    fn record(
+        &mut self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+        result: &Result<CommandOutcome, SubmitError>,
+    ) {
+        let Ok(CommandOutcome::SessionRetired(outcome)) = result else {
+            return;
+        };
+        let index = self
+            .entries
+            .iter()
+            .position(|((ns, path), _)| ns == namespace && path == entity);
+        match &outcome.page {
+            SessionRetirementPage::End => {
+                if let Some(index) = index {
+                    self.entries.remove(index);
+                }
+            }
+            SessionRetirementPage::Continue(cursor) => {
+                if let Some(index) = index {
+                    self.entries[index].1 = cursor.clone();
+                } else {
+                    if self.entries.len() == MAX_RETIREMENT_CURSORS {
+                        self.entries.pop_front();
+                    }
+                    self.entries
+                        .push_back(((namespace.clone(), entity.clone()), cursor.clone()));
+                }
+            }
+        }
+    }
 }
 
 impl<'a> TimerWorker<'a> {
@@ -92,8 +147,13 @@ impl<'a> TimerWorker<'a> {
             .lock()
             .expect("the timer cursor lock is not poisoned");
         let mut report = SweepReport::default();
-        let queues = self.sweep_queues(&mut cursors.queues, &mut report);
-        let topics = self.sweep_topics(&mut cursors.topics, &mut report);
+        let SweepCursors {
+            queues,
+            topics,
+            retirements,
+        } = &mut *cursors;
+        let queues = self.sweep_queues(queues, retirements, &mut report);
+        let topics = self.sweep_topics(topics, &mut report);
         queues?;
         topics?;
         Ok(report)
@@ -102,6 +162,7 @@ impl<'a> TimerWorker<'a> {
     fn sweep_queues(
         &self,
         cursor: &mut Option<QueueCursor>,
+        retirements: &mut RetirementCursors,
         report: &mut SweepReport,
     ) -> Result<(), SubmitError> {
         let mut page =
@@ -123,6 +184,7 @@ impl<'a> TimerWorker<'a> {
             self.expire_locks(&namespace, &entity, report)?;
             self.expire_messages(&namespace, &entity, report)?;
             self.expire_session_locks(&namespace, &entity, report)?;
+            self.retire_session_messages(&namespace, &entity, retirements, report)?;
             self.expire_duplicate_history(&namespace, &entity, report)?;
         }
         *cursor = page.continuation;
@@ -282,6 +344,36 @@ impl<'a> TimerWorker<'a> {
             report.sessions_released += released;
 
             if (released as usize) < TIMER_SCAN_LIMIT {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn retire_session_messages(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+        cursors: &mut RetirementCursors,
+        report: &mut SweepReport,
+    ) -> Result<(), SubmitError> {
+        for _ in 0..MAX_ROUNDS_PER_INDEX {
+            let result = self.broker.submit_blocking(
+                namespace.clone(),
+                entity.clone(),
+                CommandKind::RetireSessionGenerationPage {
+                    after: cursors.get(namespace, entity),
+                },
+            );
+            cursors.record(namespace, entity, &result);
+            let outcome = result?;
+            let CommandOutcome::SessionRetired(outcome) = outcome else {
+                return Err(unexpected(outcome));
+            };
+            report.locks_returned_to_ready += outcome.returned_to_ready;
+            report.messages_dead_lettered += outcome.dead_lettered;
+            report.messages_dropped += outcome.dropped;
+            if matches!(outcome.page, SessionRetirementPage::End) {
                 break;
             }
         }
@@ -485,5 +577,67 @@ mod tests {
             6
         );
         Ok(())
+    }
+    #[test]
+    fn retirement_cursor_cache_evicts_oldest_inserted_entity_at_capacity() {
+        let namespace = NamespaceName::new("tenant").expect("namespace");
+        let entity = |index| EntityPath::new(format!("queue-{index}")).expect("entity");
+        let cursor = |path: EntityPath, suffix: &str| SessionRetirementCursor {
+            namespace: namespace.clone(),
+            entity: path,
+            session_id: domain::SessionId::new(suffix).expect("session"),
+            position: domain::SessionRetirementPosition::AfterSession,
+        };
+        let continued = |cursor| {
+            Ok(CommandOutcome::SessionRetired(
+                domain::SessionRetirementOutcome {
+                    returned_to_ready: 0,
+                    dead_lettered: 0,
+                    dropped: 0,
+                    page: SessionRetirementPage::Continue(cursor),
+                },
+            ))
+        };
+        let mut cache = RetirementCursors::default();
+        for index in 0..MAX_RETIREMENT_CURSORS {
+            let path = entity(index);
+            cache.record(&namespace, &path, &continued(cursor(path.clone(), "first")));
+        }
+        assert_eq!(cache.entries.len(), 1_024);
+        let oldest = entity(0);
+        let updated = cursor(oldest.clone(), "updated");
+        cache.record(&namespace, &oldest, &continued(updated.clone()));
+        assert_eq!(cache.get(&namespace, &oldest), Some(updated));
+        assert_eq!(cache.entries.len(), 1_024);
+        assert_eq!(cache.entries.front().expect("oldest").0.1, oldest);
+        let overflow = entity(MAX_RETIREMENT_CURSORS);
+        cache.record(
+            &namespace,
+            &overflow,
+            &continued(cursor(overflow.clone(), "overflow")),
+        );
+        assert_eq!(cache.entries.len(), 1_024);
+        assert_eq!(cache.get(&namespace, &oldest), None);
+        assert_eq!(cache.entries.front().expect("next oldest").0.1, entity(1));
+        let retained = entity(2);
+        let before = cache
+            .get(&namespace, &retained)
+            .expect("completed position");
+        cache.record(&namespace, &retained, &Err(SubmitError::BrokerStopped));
+        assert_eq!(cache.get(&namespace, &retained), Some(before));
+        cache.record(
+            &namespace,
+            &entity(1),
+            &Ok(CommandOutcome::SessionRetired(
+                domain::SessionRetirementOutcome {
+                    returned_to_ready: 0,
+                    dead_lettered: 0,
+                    dropped: 0,
+                    page: SessionRetirementPage::End,
+                },
+            )),
+        );
+        assert_eq!(cache.entries.len(), 1_023);
+        assert_eq!(cache.get(&namespace, &entity(1)), None);
     }
 }

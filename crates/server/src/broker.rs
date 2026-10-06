@@ -272,6 +272,7 @@ fn makes_deliverable(outcome: &CommandOutcome) -> bool {
         CommandOutcome::LocksExpired {
             returned_to_ready, ..
         } => *returned_to_ready > 0,
+        CommandOutcome::SessionRetired(outcome) => outcome.returned_to_ready > 0,
         CommandOutcome::SessionReleased => true,
         CommandOutcome::SessionLocksExpired { released } => *released > 0,
         _ => false,
@@ -913,6 +914,25 @@ mod tests {
             ),
             (CommandOutcome::Received(None), false),
         ] {
+            assert_eq!(makes_deliverable(&outcome), expected);
+        }
+    }
+
+    #[test]
+    fn retirement_wakes_only_for_actual_positive_ready_count() {
+        for (ready, dead_lettered, dropped, expected) in [
+            (0, 0, 0, false),
+            (0, 1, 0, false),
+            (0, 0, 1, false),
+            (1, 0, 0, true),
+            (1, 1, 1, true),
+        ] {
+            let outcome = CommandOutcome::SessionRetired(domain::SessionRetirementOutcome {
+                returned_to_ready: ready,
+                dead_lettered,
+                dropped,
+                page: domain::SessionRetirementPage::End,
+            });
             assert_eq!(makes_deliverable(&outcome), expected);
         }
     }

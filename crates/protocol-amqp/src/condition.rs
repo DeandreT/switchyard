@@ -49,7 +49,8 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::EntityDeleteTooLarge { .. }
         | BrokerError::EntityIncarnationExhausted
         | BrokerError::AtomicMessagingTooLarge { .. }
-        | BrokerError::TopicRuleMatchTooLarge { .. } => RESOURCE_LIMIT_EXCEEDED,
+        | BrokerError::TopicRuleMatchTooLarge { .. }
+        | BrokerError::SessionRetirementTooLarge { .. } => RESOURCE_LIMIT_EXCEEDED,
         BrokerError::TopicDataPlaneNotImplemented => NOT_IMPLEMENTED,
         BrokerError::SqlRuleCompilation(error) | BrokerError::SqlActionCompilation(error) => {
             match error {
@@ -146,6 +147,22 @@ mod tests {
     use domain::{QueueCounterKind, QueueImmutableProperty, SequenceNumber, SessionId, Timestamp};
 
     use super::*;
+
+    #[test]
+    fn retirement_caps_are_nonretryable_resource_limits() {
+        for limit in [
+            domain::SessionRetirementLimit::ReadOperations,
+            domain::SessionRetirementLimit::ReadKeyBytes,
+            domain::SessionRetirementLimit::ReadValueBytes,
+            domain::SessionRetirementLimit::MutationEntries,
+            domain::SessionRetirementLimit::MutationKeyBytes,
+            domain::SessionRetirementLimit::MutationValueBytes,
+        ] {
+            let error = BrokerError::SessionRetirementTooLarge { limit, maximum: 1 };
+            assert_eq!(condition_for(&error), RESOURCE_LIMIT_EXCEEDED);
+            assert!(!is_retryable(&error));
+        }
+    }
 
     #[test]
     fn action_compilation_refusals_have_nonretryable_conditions() {

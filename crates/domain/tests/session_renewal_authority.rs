@@ -451,6 +451,7 @@ fn held_and_message_deadline_guards_are_independent_and_legacy_renewal_remains_t
         })
     );
     assert_eq!(fixture.machine.store().snapshot()?, before);
+    let clock = fixture.machine.last_applied_time()?;
     assert_eq!(
         fixture.at(
             10_012,
@@ -459,11 +460,14 @@ fn held_and_message_deadline_guards_are_independent_and_legacy_renewal_remains_t
                 lock_token: delivery.lock.expect("lock").token,
                 lock_duration_millis: Some(100)
             }
-        )?,
-        CommandOutcome::LockRenewed {
-            locked_until: Timestamp::from_millis(10_112)
-        }
+        ),
+        Err(BrokerError::SessionLockExpired {
+            session_id: delivery.session_id.clone().expect("original session ID"),
+            locked_until: Timestamp::from_millis(10_012)
+        })
     );
+    assert_eq!(fixture.machine.store().snapshot()?, before);
+    assert_eq!(fixture.machine.last_applied_time()?, clock);
     Ok(())
 }
 

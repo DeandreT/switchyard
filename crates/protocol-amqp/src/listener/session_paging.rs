@@ -198,6 +198,7 @@ fn outcome_class(outcome: &CommandOutcome) -> &'static str {
         CommandOutcome::TopicDeleted => "topic-deleted",
         CommandOutcome::SubscriptionDeleted => "subscription-deleted",
         CommandOutcome::SessionPage(_) => "session-page",
+        CommandOutcome::SessionRetired(_) => "session-retired",
     }
 }
 

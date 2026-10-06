@@ -521,6 +521,25 @@ pub fn session_message_lock_forward_parts(
     ))
 }
 
+/// Exactly one original owned generation, excluding trusted-unowned rows.
+pub fn session_message_lock_generation_prefix(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    session_id: &SessionId,
+    generation: LockToken,
+) -> Vec<u8> {
+    let mut prefix = session_message_lock_forward_prefix(namespace, entity, session_id);
+    prefix.push(1);
+    with_u64(prefix, generation.as_u64())
+}
+
+/// Excludes exactly this key, without skipping malformed descendants or wrapping.
+pub fn session_message_lock_exclusive_start(key: &[u8]) -> Vec<u8> {
+    let mut start = key.to_vec();
+    start.push(0);
+    start
+}
+
 pub fn session_message_lock_summary(
     namespace: &NamespaceName,
     entity: &EntityPath,

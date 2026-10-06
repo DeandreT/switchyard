@@ -79,6 +79,14 @@ pub use machine::{
     TIMER_SCAN_LIMIT, TopicCursor, TopicPage,
 };
 pub use machine::{MAX_SESSION_PAGE_GROUPS, SessionCursor, SessionPageOutcome};
+pub use machine::{
+    MAX_SESSION_RETIREMENT_GROUPS, MAX_SESSION_RETIREMENT_MUTATION_ENTRIES,
+    MAX_SESSION_RETIREMENT_MUTATION_KEY_BYTES, MAX_SESSION_RETIREMENT_MUTATION_VALUE_BYTES,
+    MAX_SESSION_RETIREMENT_READ_KEY_BYTES, MAX_SESSION_RETIREMENT_READ_OPERATIONS,
+    MAX_SESSION_RETIREMENT_READ_VALUE_BYTES, MAX_SESSION_RETIREMENT_ROWS, SessionRetirementCursor,
+    SessionRetirementLimit, SessionRetirementOutcome, SessionRetirementPage,
+    SessionRetirementPosition,
+};
 pub use message::{
     DeadLetterInfo, DeadLetterReason, Delivery, DeliveryGuarantee, DeliveryLock, LockToken,
     MAX_MESSAGE_ID_LENGTH, MessageRecord, MessageState, MessageStatus, ReceiveMode, SequenceNumber,

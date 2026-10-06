@@ -9,6 +9,7 @@ use crate::{
     Timestamp, TopicConfig, TopicConfigUpdate,
 };
 use crate::{SessionCursor, SessionPageOutcome};
+use crate::{SessionRetirementCursor, SessionRetirementOutcome};
 
 /// One replicated instruction for the broker state machine.
 ///
@@ -374,6 +375,11 @@ pub enum CommandKind {
         /// Overrides the queue default when set.
         lock_duration_millis: Option<u64>,
     },
+    /// Retires one bounded page of original session-owned message locks.
+    /// The cursor is progress only; each generation is revalidated at owner time.
+    RetireSessionGenerationPage {
+        after: Option<SessionRetirementCursor>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -444,4 +450,5 @@ pub enum CommandOutcome {
     TopicDeleted,
     SubscriptionDeleted,
     SessionPage(SessionPageOutcome),
+    SessionRetired(SessionRetirementOutcome),
 }

@@ -2,6 +2,7 @@ use storage::StorageError;
 use thiserror::Error;
 
 use crate::EntityPath;
+use crate::SessionRetirementLimit;
 use crate::{
     AtomicMessagingLimit, CodecError, EntityDeleteLimit, IdentifierError, IngressBatchLimit,
     NamespaceName, QueueConfigError, QueueCounterKind, QueueImmutableProperty, RuleMatchLimit,
@@ -215,4 +216,9 @@ pub enum BrokerError {
     },
     #[error("session {session_id} still has outstanding message locks")]
     SessionTakeoverPending { session_id: SessionId },
+    #[error("session retirement {limit} exceeds the maximum of {maximum}")]
+    SessionRetirementTooLarge {
+        limit: SessionRetirementLimit,
+        maximum: usize,
+    },
 }
