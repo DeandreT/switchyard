@@ -76,6 +76,58 @@ struct RuntimeEvidence {
 }
 
 impl<S: StateStore> StateMachine<S> {
+    /// Reads a live finite queue's deletion binding without a clock or mutation.
+    /// Usage and Charge remain opaque; this is not a successful purge or an atomic owner turn.
+    pub fn bind_finite_queue_for_deletion(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+    ) -> Result<crate::EntityBinding, BrokerError> {
+        NamespaceName::new(namespace.as_str())?;
+        EntityPath::new(entity.as_str())?;
+        Self::require_primary_entity_path(entity)?;
+        let queue = self.store.get(&keys::queue_config(namespace, entity))?;
+        let topic = self.store.get(&keys::topic_config(namespace, entity))?;
+        if queue.is_some() && topic.is_some() {
+            return Err(BrokerError::DanglingEntityMetadata);
+        }
+        if topic.is_some() {
+            return Err(BrokerError::EntityKindMismatch);
+        }
+        let Some(bytes) = queue else {
+            // Existing absent-target diagnostics use only the command's scope.
+            let command = Command::new(
+                namespace.clone(),
+                entity.clone(),
+                Timestamp::UNIX_EPOCH,
+                CommandKind::DeleteEntity {
+                    target: DeleteEntityTarget::Queue,
+                },
+            );
+            self.require_missing_delete_target(&command, &mut DeletionPlan::default())?;
+            return Err(BrokerError::QueueNotFound);
+        };
+        QueueConfig::decode(&bytes)?.validate()?;
+        let record =
+            self.require_live_incarnation(namespace, entity, crate::EntityIncarnationKind::Queue)?;
+        let binding = crate::EntityBinding::new(
+            namespace.clone(),
+            entity.clone(),
+            entity.clone(),
+            crate::EntityIncarnationKind::Queue,
+            record.generation(),
+        )?;
+        self.validate_binding_identity(&binding, namespace, entity)?;
+        let owner = queue_capacity::validate_owner_mode(self, namespace, entity)?;
+        if owner.generation() != binding.generation() {
+            return Err(BrokerError::EntityBindingStale);
+        }
+        if owner.mode().limit_bytes().is_none() {
+            return Err(BrokerError::QueueCapacityNotSupported);
+        }
+        Ok(binding)
+    }
+
     pub(super) fn delete_entity(
         &self,
         command: &Command,
@@ -127,29 +179,7 @@ impl<S: StateStore> StateMachine<S> {
                 (CommandOutcome::TopicDeleted, removed)
             }
             _ => {
-                self.reject_unowned_topology(command, &command.entity, &mut plan)?;
-                self.require_no_runtime(command, &command.entity, &mut plan)?;
-                if self
-                    .entity_incarnation(&command.namespace, &command.entity)?
-                    .is_some_and(|record| !record.is_retired())
-                {
-                    return Err(BrokerError::DanglingEntityMetadata);
-                }
-                if let Ok(shadow) = command.entity.dead_letter_queue() {
-                    if self
-                        .store
-                        .get(&keys::queue_config(&command.namespace, &shadow))?
-                        .is_some()
-                        || self
-                            .store
-                            .get(&keys::topic_config(&command.namespace, &shadow))?
-                            .is_some()
-                    {
-                        return Err(BrokerError::DanglingEntityMetadata);
-                    }
-                    self.reject_unowned_topology(command, &shadow, &mut plan)?;
-                    self.require_no_runtime(command, &shadow, &mut plan)?;
-                }
+                self.require_missing_delete_target(command, &mut plan)?;
                 return Err(if matches!(target, DeleteEntityTarget::Topic) {
                     BrokerError::TopicNotFound
                 } else {
@@ -191,6 +221,37 @@ impl<S: StateStore> StateMachine<S> {
             batch.push_delete(key);
         }
         Ok((outcome, removed))
+    }
+
+    fn require_missing_delete_target(
+        &self,
+        command: &Command,
+        plan: &mut DeletionPlan,
+    ) -> Result<(), BrokerError> {
+        self.reject_unowned_topology(command, &command.entity, plan)?;
+        self.require_no_runtime(command, &command.entity, plan)?;
+        if self
+            .entity_incarnation(&command.namespace, &command.entity)?
+            .is_some_and(|record| !record.is_retired())
+        {
+            return Err(BrokerError::DanglingEntityMetadata);
+        }
+        if let Ok(shadow) = command.entity.dead_letter_queue() {
+            if self
+                .store
+                .get(&keys::queue_config(&command.namespace, &shadow))?
+                .is_some()
+                || self
+                    .store
+                    .get(&keys::topic_config(&command.namespace, &shadow))?
+                    .is_some()
+            {
+                return Err(BrokerError::DanglingEntityMetadata);
+            }
+            self.reject_unowned_topology(command, &shadow, plan)?;
+            self.require_no_runtime(command, &shadow, plan)?;
+        }
+        Ok(())
     }
 
     fn plan_queue_delete(

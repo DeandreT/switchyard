@@ -383,6 +383,8 @@ fn reset<P: StoreProvider>(fixture: &QueueFixture<ObservedProvider<P>>) {
 mod atomicity;
 #[path = "entity_deletion/fencing.rs"]
 mod fencing;
+#[path = "entity_deletion/finite_binding.rs"]
+mod finite_binding;
 #[path = "entity_deletion/lifecycle.rs"]
 mod lifecycle;
 #[path = "entity_deletion/limits.rs"]
