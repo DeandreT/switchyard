@@ -8,8 +8,8 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Queue and topic send, both batch-send APIs, ordinary/session subscription workflows, queue/topic scheduling/cancellation, duplicate detection and message properties; queue session renew/state/scheduling; isolated offline JWT Send/Listen denial over TLS | Finite ordinary queue profile; other administration planned | Experimental gate on 7.21.0 |
-| Official .NET SDK, previous stable | Same SAS-gated workflows as current; isolated offline JWT Send/Listen denial over TLS | Finite ordinary queue profile; other administration planned | Experimental gate on 7.20.2 |
+| Official .NET SDK, current stable | Queue and topic send, both batch-send APIs, ordinary/session subscription workflows, queue/topic scheduling/cancellation, duplicate detection and message properties; queue session renew/state/scheduling; finite queue quota/credit recovery and message-size refusal over WSS; isolated offline JWT Send/Listen denial over TLS | Finite ordinary queue profile; other administration planned | Experimental gate on 7.21.0 |
+| Official .NET SDK, previous stable | Same SAS-gated workflows as current, including finite ingress; isolated offline JWT Send/Listen denial over TLS | Finite ordinary queue profile; other administration planned | Experimental gate on 7.20.2 |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
 ## Capability Matrix
@@ -40,7 +40,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Duplicate detection | Pre-1.0 | State machine, AMQP send/scheduling mappings, Rust and current .NET clients end to end |
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API; library HTTPS full-definition replacement for finite ordinary queues |
-| Finite queue capacity | Pre-1.0 | Opt-in trusted owner API and HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage, Rust AMQP socket tests, both pinned .NET administration/limit-update gates and explicit CLI activation. SDK send-capacity gates are not implemented; see [Finite Queue Capacity](finite-queue-capacity.md) |
+| Finite queue capacity | Pre-1.0 | Opt-in trusted owner API and HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage, Rust AMQP socket tests, both pinned .NET administration/limit-update and WSS ingress/credit-recovery gates, explicit CLI activation; see [Finite Queue Capacity](finite-queue-capacity.md) |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
 | Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; rules, topics and subscriptions are not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; offline JWT Manage via library opt-in or the CLI policy-file option; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
@@ -1813,7 +1813,9 @@ Duplicate creation and unsupported definitions refuse without partial mutation.
 Trusted owner seeds provide five real 256-KiB messages for below-retained-usage
 limit refusals and real retained messages for lowering the future message limit
 and clearing TTL. Their records, reservations and original deadlines survive.
-These are SDK administration/limit-update gates, not SDK send-capacity gates.
+These are SDK administration/limit-update gates. Separate
+[ordinary ingress gates](finite-queue-capacity.md#official-net-ingress-gates)
+cover SDK quota refusal, reservation recovery and message-size admission.
 The complete committed image matches an independent native Memory oracle, and
 Fjall is reopened only after original listener/broker/store ownership is released.
 A separate initially empty namespace exercises SDK-parsed pages for 101 queues

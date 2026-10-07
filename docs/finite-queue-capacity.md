@@ -66,7 +66,8 @@ including below-retained-usage limit-update refusal with real trusted-owner seed
 see [Official .NET Queue Administration](compatibility.md#official-net-queue-administration).
 The server can explicitly enable this endpoint with dedicated TLS/audience/key
 options; see [HTTPS Administration CLI](compatibility.md#https-administration-cli).
-SDK send-capacity gates remain absent.
+Both pinned .NET clients also exercise ordinary message ingress and reservation
+recovery over private-CA WSS; see [Official .NET Ingress Gates](#official-net-ingress-gates).
 
 ## Reservation Model
 
@@ -155,8 +156,84 @@ the existing entry or fingerprint.
 Tests exercise both memory and Fjall stores, physical Fjall reopen, ordered
 atomic credit reuse, ledger corruption, opaque fenced deletion, actual AMQP
 socket rejection/recovery, and the separate library/CLI HTTPS queue path. These
-socket checks use in-tree Rust clients. The separate pinned .NET gates cover
-administration and capacity updates, not SDK message-ingress quotas. Injected
+socket checks use in-tree Rust clients. Separate pinned .NET gates cover
+administration, capacity updates and the ordinary ingress profile below. Injected
 pre-apply backend failures establish no
 partial batch in those fixtures; they do not establish the outcome of an
 indeterminate physical commit.
+
+## Official .NET Ingress Gates
+
+The independently executed Linux gates passed with Service Bus packages `7.21.0`
+and `7.20.2`, each on Memory and Fjall with both named-key and connection-string
+constructors. Each pin completes 48 child stages: twelve per constructor per
+backend, including repeated quota and completion checks. The ordinary WSS
+listener uses isolated private-CA trust and normal hostname verification, without
+a certificate bypass or global trust changes. These gates do not enable
+experimental transactions or claim all SDK workflows.
+
+Trusted owner operations create the finite queues and set an exact observed
+logical reservation limit after an SDK seed. This is not an Atom MiB quota,
+physical disk usage or measured Azure accounting. Another SDK send then raises
+`QuotaExceeded`, with one isolated proposer clock stamp, no store apply attempt
+or committed batch, and an unchanged complete persisted image. Peek-lock receive
+and abandon retain the exact original charge and aggregate. Completion must reach
+zero native-observed reserved bytes and message count, with no retained message
+or charge rows, before the same SDK message can be sent within the unchanged
+limit. The retry is completed and checked at zero again.
+
+A separate queue retains an SDK-produced 20-KiB message. A full-definition update
+reduces its future configured message maximum to 4 KiB without rewriting that
+message, its ledger or deadlines. A cold 20-KiB send is then refused by the broker
+as `MessageSizeExceeded`, with one proposer stamp and no store apply attempt or
+image change. A 300-KiB message exceeds the independently advertised 256-KiB link
+maximum and is refused by the SDK before submission, with zero proposer stamps
+and the same unchanged-image checks. Both cases use the same SDK exception
+reason; their distinction combines isolated effects with the pinned client and
+edge source, not a new wire trace or SDK usage metric. A 512-byte message remains
+admissible, and the SDK drains both retained messages with exact body, identifier,
+subject, content type and application-property checks.
+
+Every child retains its original bounded process/pipe custody. The fixture waits
+for each original connection Wrapper before requesting engine stop, then consumes
+the unchanged original Wrapper/Actor/Reader report. A Wrapper deadline is a
+failure followed by original stop/finish containment, not successful closure.
+Successful primary processing and a clean peer AMQP Close with its actual reply
+are required. A cancelled Reader additionally requires its original task identity
+and the recorded ActorReaderShutdown request; the request is not proof of the
+cancellation's cause.
+
+Actual WSS close failures remain raw errors. The fixture only classifies exact
+original IO kinds `UnexpectedEof`, `ConnectionReset` or `BrokenPipe` as a qualified
+SDK disposal disposition when the clean peer reply and original reader-shutdown
+facts also hold. Missing, opaque, nested, lookalike and other failures are refused.
+The two pinned runs observed EOF and reset; the broken-pipe branch has a controlled
+original duplex-transport test. None establishes a successful WSS/TLS close
+handshake or the cause of the peer transport ending. The pinned caller source
+initiates connection closure without awaiting a transport join, as shown in
+[7.21.0 AmqpClient](https://github.com/Azure/azure-sdk-for-net/blob/4e4c19469fe598b9f28a73d065514106985e7560/sdk/servicebus/Azure.Messaging.ServiceBus/src/Amqp/AmqpClient.cs)
+and [7.20.2 AmqpClient](https://github.com/Azure/azure-sdk-for-net/blob/f81988005453a91be7a974bba8c1b69012758e0f/sdk/servicebus/Azure.Messaging.ServiceBus/src/Amqp/AmqpClient.cs).
+That source observation is not installed-binary equivalence or a runtime cause
+certificate.
+
+Facade leases must disappear before a serialized owner read checks the final
+stage effects. The fixture separately drops the original broker owner and
+requires the original counted store to become unique before dropping it and
+reopening the backend. Memory reopens a shared-provider handle, not a process or
+disk; Fjall physically reopens its directory. Both complete persisted images and
+empty message/charge indexes must match. These boundaries do not prove universal
+task termination, bound synchronous BrokerDrop, or turn fallback Drop into a
+successful cleanup receipt.
+
+Verification: both opt-in SDK gates closed successfully on the same frozen
+fourteen-path source. The focused protocol/server/SDK run passed 880 regular
+tests with seventeen ignored SDK cases. The closed full workspace passed 5,806
+tests with no failures and seventeen ignored cases, preserving every case
+identity, status and ignore reason from the preceding 5,790-test run across the
+same 154 source owners and 160 result groups. The sixteen regular additions are
+seven connection/close-diagnostic cases and nine SDK harness/effect support cases;
+the two added ignored ingress gates were executed separately as described above.
+Both strict workspace lint configurations, both all-target builds and formatting
+passed serially on CPUs 14,15 with two build jobs and the shared cache. The fifteen
+older opt-in SDK gates were not rerun. No dependency, CLI, domain encoding,
+message-admission rule or durable layout change is included.
