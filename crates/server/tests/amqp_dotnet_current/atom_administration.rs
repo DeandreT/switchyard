@@ -15,6 +15,8 @@ mod evidence;
 mod fixture;
 #[path = "atom_administration/postconditions.rs"]
 mod postconditions;
+#[path = "atom_administration/rules.rs"]
+mod rules;
 #[path = "atom_administration/stages.rs"]
 mod stages;
 #[path = "atom_administration/subscriptions.rs"]

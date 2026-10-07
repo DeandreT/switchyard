@@ -15,6 +15,8 @@ internal static class AtomAdministrationCases
         "subscriptions-empty", "subscriptions-create", "subscriptions-inspect", "subscriptions-update",
         "subscriptions-refusals", "subscriptions-delete", "subscriptions-recreate",
         "subscriptions-denied", "subscriptions-tls-refused",
+        "rules-empty", "rules-create", "rules-inspect", "rules-refusals",
+        "rules-delete", "rules-recreate", "rules-opaque", "rules-denied", "rules-tls-refused",
     };
 
     internal static async Task<int> RunAsync(string[] args)
@@ -25,7 +27,8 @@ internal static class AtomAdministrationCases
             || endpoint.UserInfo.Length != 0 || endpoint.Query.Length != 0
             || endpoint.Fragment.Length != 0 || endpoint.AbsolutePath != "/"
             || (endpoint.Host != "localhost"
-                && !((args[1] == "tls-refused" || args[1] == "subscriptions-tls-refused")
+                && !((args[1] == "tls-refused" || args[1] == "subscriptions-tls-refused"
+                        || args[1] == "rules-tls-refused")
                     && endpoint.Host == "127.0.0.1")))
         {
             Console.Error.WriteLine("Atom SDK diagnostic scenario=arguments exception=argument");
@@ -107,6 +110,17 @@ internal static class AtomAdministrationCases
     {
         switch (scenario)
         {
+            case "rules-empty":
+            case "rules-create":
+            case "rules-inspect":
+            case "rules-refusals":
+            case "rules-delete":
+            case "rules-recreate":
+            case "rules-opaque":
+            case "rules-denied":
+            case "rules-tls-refused":
+                await AtomRuleAdministrationCases.RunAsync(client, other, scenario, suffix, token);
+                break;
             case "subscriptions-empty":
             case "subscriptions-create":
             case "subscriptions-inspect":

@@ -167,6 +167,17 @@ impl Oracle {
                     )?;
                 }
             }
+            AtomScenario::RulesEmpty
+            | AtomScenario::RulesCreate
+            | AtomScenario::RulesInspect
+            | AtomScenario::RulesRefusals
+            | AtomScenario::RulesDelete
+            | AtomScenario::RulesRecreate
+            | AtomScenario::RulesOpaque
+            | AtomScenario::RulesDenied
+            | AtomScenario::RulesTlsRefused => {
+                return Err("rule scenario cannot use queue replay".into());
+            }
             AtomScenario::SubscriptionsEmpty
             | AtomScenario::SubscriptionsCreate
             | AtomScenario::SubscriptionsInspect
@@ -548,6 +559,28 @@ mod tests {
             AtomScenario::SubscriptionsRecreate,
             AtomScenario::SubscriptionsDenied,
             AtomScenario::SubscriptionsTlsRefused,
+        ] {
+            assert!(oracle.advance(&namespace, scenario).is_err());
+            assert_eq!(oracle.store.snapshot()?, before);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rule_scenarios_refuse_queue_replay_without_mutation() -> TestResult {
+        let oracle = Oracle::new();
+        let namespace = NamespaceName::new("tenant")?;
+        let before = oracle.store.snapshot()?;
+        for scenario in [
+            AtomScenario::RulesEmpty,
+            AtomScenario::RulesCreate,
+            AtomScenario::RulesInspect,
+            AtomScenario::RulesRefusals,
+            AtomScenario::RulesDelete,
+            AtomScenario::RulesRecreate,
+            AtomScenario::RulesOpaque,
+            AtomScenario::RulesDenied,
+            AtomScenario::RulesTlsRefused,
         ] {
             assert!(oracle.advance(&namespace, scenario).is_err());
             assert_eq!(oracle.store.snapshot()?, before);

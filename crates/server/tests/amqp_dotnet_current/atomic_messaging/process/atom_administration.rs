@@ -24,6 +24,15 @@ pub(crate) enum AtomScenario {
     SubscriptionsRecreate,
     SubscriptionsDenied,
     SubscriptionsTlsRefused,
+    RulesEmpty,
+    RulesCreate,
+    RulesInspect,
+    RulesRefusals,
+    RulesDelete,
+    RulesRecreate,
+    RulesOpaque,
+    RulesDenied,
+    RulesTlsRefused,
 }
 
 impl AtomScenario {
@@ -49,6 +58,15 @@ impl AtomScenario {
             Self::SubscriptionsRecreate => "subscriptions-recreate",
             Self::SubscriptionsDenied => "subscriptions-denied",
             Self::SubscriptionsTlsRefused => "subscriptions-tls-refused",
+            Self::RulesEmpty => "rules-empty",
+            Self::RulesCreate => "rules-create",
+            Self::RulesInspect => "rules-inspect",
+            Self::RulesRefusals => "rules-refusals",
+            Self::RulesDelete => "rules-delete",
+            Self::RulesRecreate => "rules-recreate",
+            Self::RulesOpaque => "rules-opaque",
+            Self::RulesDenied => "rules-denied",
+            Self::RulesTlsRefused => "rules-tls-refused",
         }
     }
 
@@ -445,6 +463,15 @@ mod tests {
             AtomScenario::SubscriptionsRecreate,
             AtomScenario::SubscriptionsDenied,
             AtomScenario::SubscriptionsTlsRefused,
+            AtomScenario::RulesEmpty,
+            AtomScenario::RulesCreate,
+            AtomScenario::RulesInspect,
+            AtomScenario::RulesRefusals,
+            AtomScenario::RulesDelete,
+            AtomScenario::RulesRecreate,
+            AtomScenario::RulesOpaque,
+            AtomScenario::RulesDenied,
+            AtomScenario::RulesTlsRefused,
         ];
         for scenario in scenarios {
             let marker = scenario.marker();
