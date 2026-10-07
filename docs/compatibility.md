@@ -1798,10 +1798,17 @@ address parsing. SAS-authenticated paths retain the existing SAS grammar,
 which excludes leading empty segments; no native-name or SAS normalization is
 added by this API.
 `switchyardctl queue create|get|list|update|delete` exposes these operations with JSON
-responses and nonzero errors. It reads SAS tokens only from bounded regular
-files, marks their metadata sensitive, and verifies TLS against explicitly
-supplied CA certificates. Plaintext is opt-in, loopback-only, and cannot carry a
-token. Command-line settings preserve omitted, false, zero, and unlimited TTL.
+responses and nonzero errors. Authorization headers are supplied only through
+`--token-file`, from regular files bounded to 16 KiB. The CLI trims surrounding
+whitespace and accepts the existing `SharedAccessSignature ` scheme or the exact
+`Bearer ` prefix followed by a nonempty opaque ASCII token of at most 8,192 bytes
+without internal whitespace. It does not decode JWTs or verify their signatures;
+the server's configured policy remains the authority. Authorization metadata is
+marked sensitive, including request clones, and token-file errors are static.
+Token-bearing connections require HTTPS, checked before credential-file I/O;
+TLS verifies against explicitly supplied CA certificates. Plaintext is opt-in,
+loopback-only, and cannot carry a token. Command-line settings preserve omitted,
+false, zero, and unlimited TTL.
 `switchyardctl rule create|get|list|delete` addresses a topic/subscription member
 and uses a bounded typed filter file plus an optional `--action-file` for creation.
 An action selects only the new RPC, with no action-free retry on older servers.
@@ -1819,6 +1826,23 @@ pollable job. Receiver wakeups, exact ownership validation, cleanup limits, and
 live-link incarnation fencing are defined in
 [Entity Deletion](entity-deletion.md). No Azure administration endpoint or
 immediate global link-retirement parity is claimed.
+
+Verification: the client Bearer increment passed four regular authorization
+cases, three Linux binary/cleanup cases, and all 105 client-package tests. The
+built `switchyardctl` exercised Manage-authorized queue CRUD, Send-only denials,
+an invalid opaque credential, and SAS coexistence against the library native
+listener over trusted TLS. Denials performed no owner reads or writes and left
+the complete Memory business snapshot, including its clock, unchanged. This
+fixture does not install the client, start the server CLI, or reopen Fjall;
+the preceding server-CLI verification covers that separate path. Child cleanup
+signals the original unreaped process group, waits for the original child, and
+observes both output EOFs; it is not an all-descendant cleanup guarantee.
+The closed full workspace passed 5,470 tests with no failures and thirteen
+ignored cases, preserving every prior test name, status, and ignore reason.
+Both strict workspace lint configurations, both build configurations, and
+formatting passed. No SDK gates were rerun for this client-only increment.
+The lockfile adds only the client's test edge to the already-locked
+`futures-util`; package versions, durable layout, and value formats are unchanged.
 
 ### Configuration Updates
 
