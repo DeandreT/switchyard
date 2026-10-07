@@ -25,6 +25,7 @@ fn definition(name: &str, filter: RuleFilter) -> AtomRuleDefinition {
     AtomRuleDefinition {
         name: RuleName::new(name).expect("valid test name"),
         filter,
+        action: None,
     }
 }
 
@@ -234,7 +235,11 @@ fn sql_unsupported_parameters_actions_and_types_are_closed() {
             Err(error)
         );
     }
-    for extra in ["<Action/>", "<Unknown/>", "<CreatedAt/>"] {
+    for extra in [
+        "<Action xmlns:i=\"http://www.w3.org/2001/XMLSchema-instance\" i:type=\"EmptyRuleAction\"/>",
+        "<Unknown/>",
+        "<CreatedAt/>",
+    ] {
         assert_eq!(
             decode(&format!("{valid}{extra}")),
             Err(RuleXmlError::UnsupportedDefinition)
@@ -421,8 +426,8 @@ fn optional_empty_parameters_are_closed() {
 fn actions_and_unsupported_properties_are_refused() {
     let valid = properties("x", "TrueFilter", "1=1");
     for extra in [
-        "<Action/>",
-        "<Action xmlns:i=\"http://www.w3.org/2001/XMLSchema-instance\" i:type=\"SqlRuleAction\"><SqlExpression>SET x=1</SqlExpression></Action>",
+        "<Action xmlns:i=\"http://www.w3.org/2001/XMLSchema-instance\" i:type=\"EmptyRuleAction\"/>",
+        "<Action xmlns:i=\"http://www.w3.org/2001/XMLSchema-instance\" i:type=\"UnknownRuleAction\"><SqlExpression>SET x=1</SqlExpression></Action>",
         "<CreatedAt>2026-01-01T00:00:00Z</CreatedAt>",
         "<Unknown/>",
         "<DefaultRuleDescription/>",
@@ -1650,5 +1655,300 @@ fn correlation_ordinal_model_keeps_static_latin1_and_scalar_width() {
     assert_eq!(
         original.encode_utf16().count(),
         mapped.encode_utf16().count()
+    );
+}
+
+fn action(kind: &str, expression: &str, parameters: &str) -> String {
+    format!(
+        "<Action xmlns:i=\"{XSI_NS}\" i:type=\"{kind}\"><SqlExpression>{expression}</SqlExpression>{parameters}</Action>"
+    )
+}
+
+fn definition_with_action(name: &str, filter: RuleFilter, source: &str) -> AtomRuleDefinition {
+    let mut value = definition(name, filter);
+    value.action = Some(domain::SqlAction::new(source).expect("bounded v2 test action"));
+    value
+}
+
+#[test]
+fn sql_actions_decode_all_native_v2_literals_and_keep_filter_fields_separate() {
+    for source in [
+        "REMOVE user.[a.b]; REMOVE \"USER\".\"Case\";",
+        "SET user.text='it''s'; SET enabled=TRUE; SET disabled=FALSE;",
+        "SET minimum=-9223372036854775808; SET maximum=9223372036854775807; SET positive=+7;",
+        " SET user.[caf\u{e9} & <\u{03bb}>]=' Red & <\u{03bb}>\nline '; REMOVE user.marker; ",
+    ] {
+        let escaped = quick_xml::escape::escape(source);
+        for parameters in ["", "<Parameters/>", "<Parameters> \n\t </Parameters>"] {
+            let action = action("SqlRuleAction", &escaped, parameters);
+            for (filter_xml, filter) in [
+                (
+                    filter("TrueFilter", "1=1", "<Parameters/>"),
+                    RuleFilter::True,
+                ),
+                (
+                    filter("FalseFilter", "1=0", "<Parameters></Parameters>"),
+                    RuleFilter::False,
+                ),
+                (
+                    filter("SqlFilter", " user.colour = 'Red' ", "<Parameters/>"),
+                    RuleFilter::Sql(domain::SqlFilter::new(" user.colour = 'Red' ").unwrap()),
+                ),
+                (
+                    format!("<Filter xmlns:i=\"{XSI_NS}\" i:type=\"CorrelationFilter\"/>"),
+                    RuleFilter::Correlation(CorrelationFilter::default()),
+                ),
+            ] {
+                let expected = definition_with_action("Action", filter, source);
+                for body in [
+                    format!("{filter_xml}{action}<Name>Action</Name>"),
+                    format!("<Name>Action</Name>{action}{filter_xml}"),
+                ] {
+                    assert_eq!(decode(&body), Ok(expected.clone()), "{body}");
+                }
+                assert_eq!(
+                    expected.action.as_ref().unwrap().semantic_version(),
+                    domain::SQL_ACTION_SEMANTIC_VERSION
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn sql_actions_reject_parameters_missing_fields_and_ambiguous_shapes() {
+    let base = properties("Action", "TrueFilter", "1=1");
+    let valid = action("SqlRuleAction", "REMOVE x", "<Parameters/>");
+    for (extra, error) in [
+        ("<Action/>".to_owned(), RuleXmlError::InvalidDefinition),
+        (
+            format!("<Action xmlns:i=\"{XSI_NS}\" i:type=\"SqlRuleAction\"/>"),
+            RuleXmlError::InvalidDefinition,
+        ),
+        (
+            action("SqlRuleAction", "", ""),
+            RuleXmlError::InvalidDefinition,
+        ),
+        (
+            action("EmptyRuleAction", "REMOVE x", ""),
+            RuleXmlError::UnsupportedDefinition,
+        ),
+        (
+            action("UnknownRuleAction", "REMOVE x", ""),
+            RuleXmlError::UnsupportedDefinition,
+        ),
+        (format!("{valid}{valid}"), RuleXmlError::Malformed),
+        (
+            valid.replace("<Parameters/>", "<Parameters/><Parameters/>"),
+            RuleXmlError::Malformed,
+        ),
+        (
+            valid.replace(
+                "</SqlExpression>",
+                "</SqlExpression><SqlExpression>REMOVE y</SqlExpression>",
+            ),
+            RuleXmlError::Malformed,
+        ),
+        (
+            valid.replace(
+                "<Parameters/>",
+                "<Parameters><KeyValueOfstringanyType/></Parameters>",
+            ),
+            RuleXmlError::UnsupportedDefinition,
+        ),
+        (
+            valid.replace("<Parameters/>", "<Parameters>x</Parameters>"),
+            RuleXmlError::Malformed,
+        ),
+        (
+            valid.replace("<Parameters/>", "<Parameters>&#32;</Parameters>"),
+            RuleXmlError::Malformed,
+        ),
+        (
+            valid.replace("<Parameters/>", "<Unknown/>"),
+            RuleXmlError::UnsupportedDefinition,
+        ),
+        (
+            valid.replace("i:type=\"SqlRuleAction\"", "i:nil=\"true\""),
+            RuleXmlError::Malformed,
+        ),
+        (
+            valid.replace("i:type=\"SqlRuleAction\"", "type=\"SqlRuleAction\""),
+            RuleXmlError::Malformed,
+        ),
+        (
+            valid.replace(XSI_NS, SERVICE_BUS_NS),
+            RuleXmlError::Malformed,
+        ),
+        (
+            valid.replace("i:type=\"SqlRuleAction\"", "i:type=\"i:SqlRuleAction\""),
+            RuleXmlError::UnsupportedDefinition,
+        ),
+    ] {
+        assert_eq!(decode(&format!("{base}{extra}")), Err(error), "{extra}");
+    }
+    for (filter_parameters, action_parameters) in [
+        ("<Parameters><Parameter/></Parameters>", "<Parameters/>"),
+        ("<Parameters/>", "<Parameters><Parameter/></Parameters>"),
+    ] {
+        assert_eq!(
+            decode(&format!(
+                "{}{}<Name>Action</Name>",
+                filter("SqlFilter", "1=1", filter_parameters),
+                action("SqlRuleAction", "REMOVE x", action_parameters),
+            )),
+            Err(RuleXmlError::UnsupportedDefinition)
+        );
+    }
+}
+
+#[test]
+fn sql_actions_reuse_native_compile_and_source_bounds() {
+    let base = properties("Action", "FalseFilter", "1=0");
+    for source in [
+        "SET sys.Label='changed'".to_owned(),
+        "SET x=NULL".to_owned(),
+        "SET x=y".to_owned(),
+        "SET x=1+2".to_owned(),
+        "SET x=1.5".to_owned(),
+        "SET x=1e2".to_owned(),
+        "SET x=9223372036854775808".to_owned(),
+        "REMOVE[x];".repeat(33),
+        format!(
+            "{}REMOVE x",
+            " ".repeat(domain::MAX_SQL_EXPRESSION_TOKENS + 1)
+        ),
+        "x".repeat(domain::MAX_SQL_EXPRESSION_BYTES + 1),
+        format!(
+            "SET x='{}'",
+            "x".repeat(domain::MAX_SQL_EXPRESSION_UTF16_UNITS)
+        ),
+    ] {
+        assert!(domain::SqlAction::new(&source).is_err());
+        assert_eq!(
+            decode(&format!(
+                "{base}{}",
+                action(
+                    "SqlRuleAction",
+                    &quick_xml::escape::escape(&source),
+                    "<Parameters/>"
+                ),
+            )),
+            Err(RuleXmlError::InvalidDefinition),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn sql_actions_refuse_version_loss_and_invalid_stored_sources() {
+    let mut value = definition("Action", RuleFilter::False);
+    value.action =
+        Some(domain::SqlAction::with_semantic_version("REMOVE user.marker;", 1).unwrap());
+    assert_eq!(
+        validate_definition(&value),
+        Err(RuleXmlError::UnsupportedDefinition)
+    );
+    assert_eq!(
+        encode_entry(&value),
+        Err(RuleXmlError::UnsupportedDefinition)
+    );
+    let mut feed = vec![definition("Keep", RuleFilter::True); 2];
+    feed[1] = value;
+    assert_eq!(encode_feed(&feed), Err(RuleXmlError::UnsupportedDefinition));
+
+    let invalid = domain::codec::decode::<domain::SqlAction>(
+        &domain::codec::encode(&(2_u32, "SET x=y")).unwrap(),
+    )
+    .unwrap();
+    let mut value = definition("Action", RuleFilter::True);
+    value.action = Some(invalid);
+    assert_eq!(
+        validate_definition(&value),
+        Err(RuleXmlError::InvalidDefinition)
+    );
+    assert_eq!(encode_entry(&value), Err(RuleXmlError::InvalidDefinition));
+
+    value.action = Some(domain::SqlAction::new("SET text='\u{1}'").unwrap());
+    assert_eq!(
+        validate_definition(&value),
+        Err(RuleXmlError::UnsupportedDefinition)
+    );
+    assert_eq!(
+        encode_entry(&value),
+        Err(RuleXmlError::UnsupportedDefinition)
+    );
+}
+
+#[test]
+fn sql_action_replies_preserve_source_and_checked_budgets() {
+    let source = " \r\nSET user.[a&<b>]='caf\u{e9} & <\u{03bb}>\r\n'; REMOVE user.marker;\r\n ";
+    let value = definition_with_action(
+        "Action &",
+        RuleFilter::Sql(domain::SqlFilter::new("1=0").unwrap()),
+        source,
+    );
+    let bytes = encode_entry(&value).unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.contains("i:type=\"SqlRuleAction\""));
+    assert!(text.contains(&format!(
+        "<SqlExpression>{}</SqlExpression>",
+        quick_xml::escape::escape(source)
+    )));
+    assert!(text.contains("&#13;\n"));
+    assert_eq!(text.matches("<Parameters>").count(), 2);
+    assert!(text.find("</Filter>").unwrap() < text.find("<Action").unwrap());
+    assert!(text.find("</Action>").unwrap() < text.find("<Name>").unwrap());
+    let title = format!(
+        "<title>{}</title>",
+        quick_xml::escape::escape(value.name.as_str())
+    );
+    assert_eq!(
+        decode_definition(text.replace(&title, "").as_bytes()),
+        Ok(value.clone())
+    );
+
+    let text_bytes = 2 * value.name.as_str().len() + 3 + source.len();
+    let reservation = 6 * text_bytes + 1_024 + 256;
+    let mut total = 0;
+    definition_budget(&mut total, &value).unwrap();
+    assert_eq!(total, reservation);
+    assert!(bytes.len() <= reservation);
+    let mut at_limit = MAX_REPLY_BYTES - reservation;
+    definition_budget(&mut at_limit, &value).unwrap();
+    assert_eq!(at_limit, MAX_REPLY_BYTES);
+    assert_eq!(
+        definition_budget(&mut at_limit, &value),
+        Err(RuleXmlError::ReplyLimitExceeded)
+    );
+    let mut overflow = usize::MAX;
+    assert_eq!(
+        definition_budget(&mut overflow, &value),
+        Err(RuleXmlError::ReplyLimitExceeded)
+    );
+    let action_markup = format!(
+        "<Action xmlns:i=\"{XSI_NS}\" i:type=\"SqlRuleAction\"><SqlExpression></SqlExpression><Parameters></Parameters></Action>"
+    );
+    assert!(action_markup.len() <= ACTION_MARKUP_BYTES);
+    let feed = encode_feed(&[definition("Keep", RuleFilter::True), value]).unwrap();
+    assert_eq!(
+        std::str::from_utf8(&feed)
+            .unwrap()
+            .matches("<Action")
+            .count(),
+        1
+    );
+
+    let source = format!("user.text='{}'", "&".repeat(1_000));
+    let mut value = definition(
+        "x",
+        RuleFilter::Sql(domain::SqlFilter::new(source).unwrap()),
+    );
+    assert!(encode_feed(&vec![value.clone(); MAX_FEED_ENTRIES]).is_ok());
+    value.action =
+        Some(domain::SqlAction::new(format!("SET text='{}'", "&".repeat(1_000))).unwrap());
+    assert_eq!(
+        encode_feed(&vec![value; MAX_FEED_ENTRIES]),
+        Err(RuleXmlError::ReplyLimitExceeded)
     );
 }

@@ -93,6 +93,7 @@ fn definition(name: &str, filter: RuleFilter) -> TestResult<AtomRuleDefinition> 
     Ok(AtomRuleDefinition {
         name: RuleName::new(name)?,
         filter,
+        action: None,
     })
 }
 
@@ -155,7 +156,7 @@ pub(super) fn seed(handle: &BrokerHandle, namespace: &NamespaceName) -> TestResu
                 subscription: opaque,
                 name: RuleName::new("NativeAction")?,
                 filter: RuleFilter::False,
-                action: SqlAction::new("SET user.marker = 'native';")?,
+                action: SqlAction::with_semantic_version("REMOVE user.marker;", 1)?,
             }
         )?,
         CommandOutcome::RuleCreated
@@ -655,7 +656,7 @@ pub(super) fn check<S: StateStore>(
                 stored(
                     "NativeAction",
                     RuleFilter::False,
-                    Some(SqlAction::new("SET user.marker = 'native';")?),
+                    Some(SqlAction::with_semantic_version("REMOVE user.marker;", 1)?),
                 )?,
             ]
         } else {

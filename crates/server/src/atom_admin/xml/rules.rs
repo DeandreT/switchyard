@@ -88,5 +88,17 @@ pub(crate) fn validate_definition(definition: &AtomRuleDefinition) -> Result<(),
                 .map_err(|_| RuleXmlError::InvalidDefinition)
         }
         RuleFilter::Correlation(filter) => correlation::validate(filter),
+    }?;
+    // The Atom shape cannot carry a native action semantic version.
+    if let Some(action) = &definition.action {
+        if action.semantic_version() != domain::SQL_ACTION_SEMANTIC_VERSION
+            || !lexical::legal_chars(action.expression())
+        {
+            return Err(RuleXmlError::UnsupportedDefinition);
+        }
+        domain::SqlAction::new(action.expression())
+            .map(|_| ())
+            .map_err(|_| RuleXmlError::InvalidDefinition)?;
     }
+    Ok(())
 }

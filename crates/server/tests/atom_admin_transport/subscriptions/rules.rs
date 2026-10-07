@@ -355,7 +355,8 @@ async fn rule_crud_empty_feed_and_default_recreation_reopen<P: StoreProvider>(
                 .await?,
             Some(AtomRuleDefinition {
                 name: RuleName::new("$Default")?,
-                filter: RuleFilter::False
+                filter: RuleFilter::False,
+                action: None,
             })
         );
         expected = Some(node.snapshot()?);
@@ -560,7 +561,7 @@ async fn rule_listing_never_hides_opaque_rules_outside_the_page<P: StoreProvider
                     subscription: SubscriptionName::new("worker")?,
                     name: RuleName::new("Opaque")?,
                     filter: RuleFilter::False,
-                    action: SqlAction::new("SET user.marker = 'native';")?,
+                    action: SqlAction::with_semantic_version("REMOVE user.marker;", 1)?,
                 },
             )
             .await?;
@@ -891,6 +892,7 @@ async fn sql_rule_crud_preserves_exact_source_and_retained_tls_state<P: StorePro
             Some(AtomRuleDefinition {
                 name,
                 filter: RuleFilter::Sql(filter),
+                action: None,
             })
         );
         let (status, feed) = exchange(
@@ -1246,7 +1248,8 @@ async fn correlation_rule_crud_preserves_typed_source_and_retained_tls_state<P: 
                 .await?,
             Some(AtomRuleDefinition {
                 name: name.clone(),
-                filter: RuleFilter::Correlation(filter)
+                filter: RuleFilter::Correlation(filter),
+                action: None,
             })
         );
         let (status, feed) = exchange(
@@ -1419,7 +1422,8 @@ async fn correlation_rule_crud_preserves_typed_source_and_retained_tls_state<P: 
                     .await?,
                 Some(AtomRuleDefinition {
                     name: name.clone(),
-                    filter: RuleFilter::Correlation(filter)
+                    filter: RuleFilter::Correlation(filter),
+                    action: None,
                 })
             );
             let (status, feed) = exchange(
@@ -1698,6 +1702,493 @@ async fn correlation_wire_refusals_and_stored_health_keep_http_priorities<P: Sto
     Ok(())
 }
 
+const SQL_ACTION_SOURCE: &str = " \r\nREMOVE user.[ Drop ]; REMOVE Plain; SET user.[Text-Case] = ' Red & <\u{03BB}> ''quoted'' \r\n'; SET user.flag = TRUE; SET user.minimum = -9223372036854775808; SET user.maximum = +9223372036854775807; ";
+
+fn with_sql_action(body: Vec<u8>, source: &str) -> Vec<u8> {
+    let source = quick_xml::escape::escape(source);
+    String::from_utf8(body).unwrap().replace("</RuleDescription>", &format!(
+        r#"<Action xmlns:i="http://www.w3.org/2001/XMLSchema-instance" i:type="SqlRuleAction"><SqlExpression>{source}</SqlExpression><Parameters /></Action></RuleDescription>"#,
+    )).into_bytes()
+}
+
+fn action_dto(name: &str, filter: RuleFilter, action: &SqlAction) -> AtomRuleDefinition {
+    AtomRuleDefinition {
+        name: RuleName::new(name).unwrap(),
+        filter,
+        action: Some(action.clone()),
+    }
+}
+
+fn action_put_batch(
+    namespace: &NamespaceName,
+    topic: &EntityPath,
+    subscription: &SubscriptionName,
+    value: &AtomRuleDefinition,
+) -> TestResult<WriteBatch> {
+    Ok(WriteBatch::default()
+        .put(
+            domain::keys::rule(namespace, topic, subscription, &value.name),
+            domain::codec::encode(&domain::RuleDefinition {
+                name: value.name.clone(),
+                filter: value.filter.clone(),
+                created_at: Timestamp::from_millis(1_000),
+                action: value.action.clone(),
+            })?,
+        )
+        .put(
+            domain::keys::clock(),
+            domain::codec::encode(&Timestamp::from_millis(1_000))?,
+        ))
+}
+
+async fn sql_action_rule_crud_preserves_typed_source_and_retained_tls_state<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    use protocol_amqp::Broker as _;
+    use std::{
+        future::{Future, poll_fn},
+        task::Poll,
+    };
+
+    let node = Node::start(provider).await?;
+    let mut expected = None;
+    let outcome = AssertUnwindSafe(async {
+        seed(&node, "orders", "worker").await?;
+        let namespace = NamespaceName::new("tenant")?;
+        let topic = EntityPath::new("orders")?;
+        let subscription = SubscriptionName::new("worker")?;
+        let child = topic.subscription(&subscription)?;
+        let native_action = SqlAction::new("REMOVE user.marker;")?;
+        node.handle()
+            .submit(
+                namespace.clone(),
+                topic.clone(),
+                CommandKind::CreateRuleWithAction {
+                    subscription: subscription.clone(),
+                    name: RuleName::new("native-supported")?,
+                    filter: RuleFilter::False,
+                    action: native_action.clone(),
+                },
+            )
+            .await?;
+        node.handle()
+            .submit(
+                namespace.clone(),
+                topic.clone(),
+                CommandKind::CreateSubscription {
+                    name: SubscriptionName::new("sibling")?,
+                    config: configured(),
+                },
+            )
+            .await?;
+        for sequence in 1..=3 {
+            node.handle()
+                .submit(
+                    namespace.clone(),
+                    topic.clone(),
+                    CommandKind::Send {
+                        message_id: format!("action-retained-{sequence}"),
+                        body: vec![sequence as u8; 32],
+                        time_to_live_millis: None,
+                        session_id: None,
+                    },
+                )
+                .await?;
+            if sequence < 3 {
+                let CommandOutcome::Received(Some(delivery)) = node
+                    .handle()
+                    .submit(
+                        namespace.clone(),
+                        child.clone(),
+                        CommandKind::Receive {
+                            mode: domain::ReceiveMode::PeekLock,
+                            lock_duration_millis: None,
+                            session: None,
+                        },
+                    )
+                    .await?
+                else {
+                    panic!("trusted TLS action retention seed must be deliverable");
+                };
+                if sequence == 1 {
+                    node.handle()
+                        .submit(
+                            namespace.clone(),
+                            child.clone(),
+                            CommandKind::DeadLetter {
+                                sequence: delivery.sequence,
+                                lock_token: delivery.lock.unwrap().token,
+                                reason: "action-retention".into(),
+                                description: "trusted seed".into(),
+                            },
+                        )
+                        .await?;
+                }
+            }
+        }
+        let shadow = child.dead_letter_queue()?;
+        {
+            let machine = StateMachine::new(node.store.as_ref().unwrap().inner.clone());
+            let ready = machine
+                .message(&namespace, &child, domain::SequenceNumber::new(3))?
+                .unwrap();
+            assert_eq!(ready.state, domain::MessageState::Ready);
+            assert_eq!(ready.body, vec![3; 32]);
+            assert_eq!(ready.expires_at, Some(Timestamp::from_millis(61_000)));
+            let locked = machine
+                .message(&namespace, &child, domain::SequenceNumber::new(2))?
+                .unwrap();
+            assert!(matches!(locked.state, domain::MessageState::Locked { .. }));
+            let dead = machine
+                .message(&namespace, &shadow, domain::SequenceNumber::new(1))?
+                .unwrap();
+            assert_eq!(dead.body, vec![1; 32]);
+            assert_eq!(
+                dead.dead_letter.unwrap().reason,
+                domain::DeadLetterReason::Application("action-retention".into())
+            );
+        }
+        let handle = node.handle();
+        let mut child_wait = Box::pin(handle.deliverable(&namespace, &child));
+        let mut shadow_wait = Box::pin(handle.deliverable(&namespace, &shadow));
+        poll_fn(|cx| {
+            assert!(child_wait.as_mut().poll(cx).is_pending());
+            assert!(shadow_wait.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let action = SqlAction::new(SQL_ACTION_SOURCE)?;
+        let (fields, properties, correlation) = correlation_wire();
+        let shapes = [
+            (RuleFilter::True, definition("Action-0", true)),
+            (RuleFilter::False, definition("Action-1", false)),
+            (
+                RuleFilter::Sql(SqlFilter::new(" 1=1 ")?),
+                sql_definition("Action-2", " 1=1 "),
+            ),
+            (
+                RuleFilter::Correlation(correlation),
+                correlation_definition("Action-3", &fields, &properties),
+            ),
+        ];
+        for (index, (filter, body)) in shapes.into_iter().enumerate() {
+            let name = format!("Action-{index}");
+            let value = action_dto(&name, filter, &action);
+            let key = domain::keys::rule(&namespace, &topic, &subscription, &value.name);
+            let mut wire = with_sql_action(body, SQL_ACTION_SOURCE);
+            if index == 1 {
+                wire = String::from_utf8(wire)?
+                    .replace("<Parameters /></Action>", "</Action>")
+                    .into_bytes();
+            }
+            let before = node.snapshot()?;
+            let clock = node.clock.0.load(Ordering::SeqCst);
+            let (status, created) = exchange(
+                &node,
+                Method::PUT,
+                &member(&name),
+                Some(management_token()),
+                &wire,
+                false,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::CREATED);
+            let text = std::str::from_utf8(&created)?;
+            assert!(text.contains("i:type=\"SqlRuleAction\""));
+            assert!(text.contains(&format!(
+                "<SqlExpression>{}</SqlExpression>",
+                quick_xml::escape::escape(SQL_ACTION_SOURCE)
+            )));
+            assert!(!text.contains("CreatedAt"));
+            assert_sql_image(
+                &before,
+                &node.snapshot()?,
+                action_put_batch(&namespace, &topic, &subscription, &value)?,
+            )?;
+            assert_eq!(node.clock.0.load(Ordering::SeqCst), clock + 1);
+            let retained = node.snapshot()?;
+            let (status, read) = exchange(
+                &node,
+                Method::GET,
+                &member(&name),
+                Some(management_token()),
+                b"",
+                false,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(read, created);
+            assert_eq!(
+                node.handle()
+                    .get_atom_rule(
+                        namespace.clone(),
+                        topic.clone(),
+                        subscription.clone(),
+                        value.name.clone()
+                    )
+                    .await?,
+                Some(value.clone())
+            );
+            let (status, feed) = exchange(
+                &node,
+                Method::GET,
+                &collection(0, 100),
+                Some(management_token()),
+                b"",
+                false,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK);
+            let feed = std::str::from_utf8(&feed)?;
+            assert_eq!(feed.matches("<entry").count(), 3);
+            assert_eq!(feed.matches("i:type=\"SqlRuleAction\"").count(), 2);
+            assert!(feed.contains(text));
+            let mut listed = vec![
+                AtomRuleDefinition {
+                    name: RuleName::new("$Default")?,
+                    filter: RuleFilter::True,
+                    action: None,
+                },
+                value.clone(),
+                action_dto("native-supported", RuleFilter::False, &native_action),
+            ];
+            listed.sort_by(|left, right| left.name.cmp(&right.name));
+            assert_eq!(
+                node.handle()
+                    .list_atom_rules(
+                        namespace.clone(),
+                        topic.clone(),
+                        subscription.clone(),
+                        0,
+                        100
+                    )
+                    .await?,
+                listed
+            );
+            let (status, page) = exchange(
+                &node,
+                Method::GET,
+                &collection(1_000, 1),
+                Some(management_token()),
+                b"",
+                false,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(std::str::from_utf8(&page)?.matches("<entry").count(), 0);
+            assert_eq!(node.clock.0.load(Ordering::SeqCst), clock + 1);
+            assert_eq!(node.snapshot()?, retained);
+            let (status, _) = exchange(
+                &node,
+                Method::PUT,
+                &member(&name),
+                Some(management_token()),
+                &wire,
+                false,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(node.clock.0.load(Ordering::SeqCst), clock + 2);
+            assert_eq!(node.snapshot()?, retained);
+            let (status, deleted) = exchange(
+                &node,
+                Method::DELETE,
+                &member(&name),
+                Some(management_token()),
+                b"",
+                false,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK);
+            assert!(deleted.is_empty());
+            assert_eq!(node.clock.0.load(Ordering::SeqCst), clock + 3);
+            assert_sql_image(
+                &retained,
+                &node.snapshot()?,
+                WriteBatch::default().delete(key).put(
+                    domain::keys::clock(),
+                    domain::codec::encode(&Timestamp::from_millis(1_000))?,
+                ),
+            )?;
+            assert_eq!(node.snapshot()?, before);
+        }
+        poll_fn(|cx| {
+            assert!(child_wait.as_mut().poll(cx).is_pending());
+            assert!(shadow_wait.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(child_wait);
+        drop(shadow_wait);
+        drop(handle);
+        expected = Some(node.snapshot()?);
+        Ok(())
+    })
+    .catch_unwind()
+    .await;
+    let provider = node.finish(outcome).await?;
+    assert_eq!(provider.open()?.snapshot()?, expected.unwrap());
+    Ok(())
+}
+
+async fn sql_action_wire_refusals_and_stored_health_keep_http_priorities<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    let node = Node::start(provider).await?;
+    let mut expected = None;
+    let outcome = AssertUnwindSafe(async {
+        seed(&node, "orders", "worker").await?;
+        let before = node.snapshot()?;
+        let effects = node.effects();
+        let token_limit = format!("{}REMOVE user.value;", " ".repeat(domain::MAX_SQL_EXPRESSION_TOKENS));
+        let statement_limit = "REMOVE[x];".repeat(33);
+        let source_limit = format!("SET user.value = '{}';", "x".repeat(domain::MAX_SQL_EXPRESSION_UTF16_UNITS));
+        let invalid_sources = [
+            "", "REMOVE", "SET user.value =", "SET user.value = NULL;",
+            "SET user.value = 1.0;", "SET user.value = user.other;", "SET user.value = 1 + 2;",
+            "SET sys.message_id = 'secret';", "SET user.value = 9223372036854775808;",
+            "SET user.value = -9223372036854775809;", token_limit.as_str(),
+            statement_limit.as_str(), source_limit.as_str(),
+        ];
+        let mut refused = invalid_sources.into_iter().map(|source| {
+            assert!(SqlAction::new(source).is_err());
+            with_sql_action(definition("$Default", true), source)
+        }).collect::<Vec<_>>();
+        let valid = String::from_utf8(with_sql_action(definition("$Default", true), "REMOVE user.secret;"))?;
+        for request in [
+            valid.replace("i:type=\"SqlRuleAction\"", ""),
+            valid.replace("i:type=\"SqlRuleAction\"", "i:type=\"UnknownAction\""),
+            valid.replace("i:type=\"SqlRuleAction\"", "i:type=\"sb:SqlRuleAction\""),
+            valid.replace("<Parameters /></Action>", "<Parameters>secret</Parameters></Action>"),
+            valid.replace("<Parameters /></Action>", "<Parameters><Parameter>secret</Parameter></Parameters></Action>"),
+            valid.replace("<Parameters /></Action>", "<Parameters /><Parameters /></Action>"),
+            valid.replace("<SqlExpression>REMOVE user.secret;</SqlExpression>", ""),
+            valid.replace("<SqlExpression>REMOVE user.secret;</SqlExpression>", "<SqlExpression>REMOVE user.secret;</SqlExpression><SqlExpression>REMOVE user.secret;</SqlExpression>"),
+            valid.replace("</Action>", "</Action><Action />"),
+            valid.replace("<Action xmlns:i=", "<Action xmlns=\"urn:foreign\" xmlns:i="),
+            valid.replace("<Parameters /></Action>", "<SemanticVersion>2</SemanticVersion></Action>"),
+        ] {
+            refused.push(request.into_bytes());
+        }
+        for request in &refused {
+            let (status, body) = exchange(&node, Method::PUT, &member("$Default"), Some(management_token()), request, false).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(!std::str::from_utf8(&body)?.contains("secret"));
+            assert_eq!(node.snapshot()?, before);
+            assert_eq!(node.effects(), effects, "invalid action XML must precede duplicate owner work");
+        }
+        let namespace = NamespaceName::new("tenant")?;
+        let topic = EntityPath::new("orders")?;
+        let subscription = SubscriptionName::new("worker")?;
+        let supported = action_dto("supported", RuleFilter::Sql(SqlFilter::new(" 1=0 ")?), &SqlAction::new(SQL_ACTION_SOURCE)?);
+        let request = with_sql_action(sql_definition("supported", " 1=0 "), SQL_ACTION_SOURCE);
+        let before = node.snapshot()?;
+        let (status, created) = exchange(&node, Method::PUT, &member("supported"), Some(management_token()), &request, false).await?;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_sql_image(&before, &node.snapshot()?, action_put_batch(&namespace, &topic, &subscription, &supported)?)?;
+        for (name, action) in [
+            ("v1-remove", SqlAction::with_semantic_version("REMOVE user.secret;", 1)?),
+            ("xml-illegal-action", SqlAction::new("SET user.value = '\u{FFFE}';")?),
+        ] {
+            assert_eq!(node.handle().submit(namespace.clone(), topic.clone(), CommandKind::CreateRuleWithAction {
+                subscription: subscription.clone(), name: RuleName::new(name)?,
+                filter: RuleFilter::False, action,
+            }).await?, CommandOutcome::RuleCreated);
+        }
+        assert!(StateMachine::new(node.store.as_ref().unwrap().inner.clone()).rules(&namespace, &topic, &subscription).is_ok());
+        let healthy = node.snapshot()?;
+        let clock = node.clock.0.load(Ordering::SeqCst);
+        for (name, expected_status) in [("$Default", StatusCode::OK), ("supported", StatusCode::OK), ("absent", StatusCode::NOT_FOUND)] {
+            let (status, body) = exchange(&node, Method::GET, &member(name), Some(management_token()), b"", false).await?;
+            assert_eq!(status, expected_status);
+            if name == "supported" {
+                assert_eq!(body, created);
+                assert_eq!(node.handle().get_atom_rule(namespace.clone(), topic.clone(), subscription.clone(), RuleName::new(name)?).await?, Some(supported.clone()));
+            }
+            assert_eq!(node.snapshot()?, healthy);
+            assert_eq!(node.clock.0.load(Ordering::SeqCst), clock);
+        }
+        for path in [member("v1-remove"), member("xml-illegal-action"), collection(0, 1), collection(1_000, 1)] {
+            let (status, body) = exchange(&node, Method::GET, &path, Some(management_token()), b"", false).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(!std::str::from_utf8(&body)?.contains("secret"));
+            assert!(!std::str::from_utf8(&body)?.contains("SqlRuleAction"));
+            assert_eq!(node.snapshot()?, healthy);
+            assert_eq!(node.clock.0.load(Ordering::SeqCst), clock);
+        }
+        let transient = action_dto("transient", RuleFilter::True, &SqlAction::new("SET user.flag = FALSE;")?);
+        let (status, _) = exchange(&node, Method::PUT, &member("transient"), Some(management_token()), &with_sql_action(definition("transient", true), "SET user.flag = FALSE;"), false).await?;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(node.clock.0.load(Ordering::SeqCst), clock + 1);
+        let retained = node.snapshot()?;
+        assert_sql_image(&healthy, &retained, action_put_batch(&namespace, &topic, &subscription, &transient)?)?;
+        let (status, _) = exchange(&node, Method::DELETE, &member("transient"), Some(management_token()), b"", false).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(node.clock.0.load(Ordering::SeqCst), clock + 2);
+        assert_sql_image(&retained, &node.snapshot()?, WriteBatch::default().delete(
+            domain::keys::rule(&namespace, &topic, &subscription, &transient.name),
+        ).put(domain::keys::clock(), domain::codec::encode(&Timestamp::from_millis(1_000))?))?;
+        assert_eq!(node.snapshot()?, healthy);
+        let (status, _) = exchange(&node, Method::DELETE, &member("v1-remove"), Some(management_token()), b"", false).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(node.clock.0.load(Ordering::SeqCst), clock + 3);
+        assert_sql_image(&healthy, &node.snapshot()?, WriteBatch::default().delete(
+            domain::keys::rule(&namespace, &topic, &subscription, &RuleName::new("v1-remove")?),
+        ).put(domain::keys::clock(), domain::codec::encode(&Timestamp::from_millis(1_000))?))?;
+        let key = domain::keys::rule(&namespace, &topic, &subscription, &RuleName::new("corrupt-action")?);
+        let mut corrupted = Vec::new();
+        for source in ["secret =", "SET sys.message_id = 'secret';", "SET user.value = 1.0;"] {
+            let action = domain::codec::decode::<SqlAction>(&domain::codec::encode(&(2_u32, source))?)?;
+            assert!(SqlAction::new(action.expression()).is_err());
+            corrupted.push(domain::codec::encode(&domain::RuleDefinition {
+                name: RuleName::new("corrupt-action")?, filter: RuleFilter::False,
+                created_at: Timestamp::from_millis(1_000), action: Some(action),
+            })?);
+        }
+        // Postcard tuples retain the field layout while bypassing the typed version constructor.
+        let unknown = domain::codec::encode(&(RuleName::new("corrupt-action")?, RuleFilter::False,
+            Timestamp::from_millis(1_000), Some((3_u32, "REMOVE user.secret;"))))?;
+        assert!(domain::RuleDefinition::decode(&unknown).is_err());
+        corrupted.push(unknown);
+        for bytes in corrupted {
+            node.store.as_ref().unwrap().inner.apply(WriteBatch::default().put(key.clone(), bytes))?;
+            assert!(StateMachine::new(node.store.as_ref().unwrap().inner.clone()).rules(&namespace, &topic, &subscription).is_err());
+            let stored = node.snapshot()?;
+            let clock = node.clock.0.load(Ordering::SeqCst);
+            let effects = node.effects();
+            let (status, _) = exchange(&node, Method::PUT, &member("$Default"), Some(management_token()), &refused[0], false).await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(node.effects(), effects, "invalid desired action must precede stored health work");
+            assert_eq!(node.snapshot()?, stored);
+            for path in [member("$Default"), member("supported"), member("absent"), collection(0, 1), collection(1_000, 1)] {
+                let (status, body) = exchange(&node, Method::GET, &path, Some(management_token()), b"", false).await?;
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(!std::str::from_utf8(&body)?.contains("secret"));
+                assert!(!std::str::from_utf8(&body)?.contains("SqlRuleAction"));
+                assert_eq!(node.snapshot()?, stored);
+                assert_eq!(node.clock.0.load(Ordering::SeqCst), clock);
+            }
+            for (method, body) in [
+                (Method::PUT, with_sql_action(definition("safe-action", false), "REMOVE user.value;")),
+                (Method::DELETE, Vec::new()),
+            ] {
+                let name = if method == Method::PUT { "safe-action" } else { "$Default" };
+                let clock = node.clock.0.load(Ordering::SeqCst);
+                let (status, body) = exchange(&node, method, &member(name), Some(management_token()), &body, false).await?;
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+                assert!(!std::str::from_utf8(&body)?.contains("secret"));
+                assert_eq!(node.snapshot()?, stored);
+                assert_eq!(node.clock.0.load(Ordering::SeqCst), clock + 1);
+            }
+        }
+        expected = Some(node.snapshot()?);
+        Ok(())
+    }).catch_unwind().await;
+    let provider = node.finish(outcome).await?;
+    assert_eq!(provider.open()?.snapshot()?, expected.unwrap());
+    Ok(())
+}
+
 subscription_transport_backends! {
     rule_crud_empty_feed_and_default_recreation_reopen,
     rule_marker_authorization_preserves_literal_names,
@@ -1708,4 +2199,6 @@ subscription_transport_backends! {
     sql_wire_refusals_and_stored_compile_health_keep_http_priorities,
     correlation_rule_crud_preserves_typed_source_and_retained_tls_state,
     correlation_wire_refusals_and_stored_health_keep_http_priorities,
+    sql_action_rule_crud_preserves_typed_source_and_retained_tls_state,
+    sql_action_wire_refusals_and_stored_health_keep_http_priorities,
 }

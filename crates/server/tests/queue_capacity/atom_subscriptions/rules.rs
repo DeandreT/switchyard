@@ -7,6 +7,7 @@ fn definition(name: &str, filter: RuleFilter) -> AtomRuleDefinition {
     AtomRuleDefinition {
         name: RuleName::new(name).unwrap(),
         filter,
+        action: None,
     }
 }
 
@@ -256,7 +257,7 @@ fn native_opaque_rules<S: StateStore>(fixture: &Fixture<S>) -> TestResult {
                 subscription: fixture.name.clone(),
                 name: RuleName::new("native-action")?,
                 filter: RuleFilter::False,
-                action: SqlAction::new("SET user.marker = 'native';")?,
+                action: SqlAction::with_semantic_version("REMOVE user.marker;", 1)?,
             }
         )?,
         CommandOutcome::RuleCreated
@@ -2022,6 +2023,613 @@ async fn stored_correlation_health_precedes_projection_lookup_and_paging<P: Stor
     Ok(())
 }
 
+const SQL_ACTION_SOURCE: &str = " \r\nREMOVE user.[ Drop ]; REMOVE Plain; SET user.[Text-Case] = ' Red & <\u{03BB}> ''quoted'' \r\n'; SET user.flag = TRUE; SET user.minimum = -9223372036854775808; SET user.maximum = +9223372036854775807; ";
+
+fn action_definition(name: &str, filter: RuleFilter, action: SqlAction) -> AtomRuleDefinition {
+    AtomRuleDefinition {
+        name: RuleName::new(name).unwrap(),
+        filter,
+        action: Some(action),
+    }
+}
+
+fn create_action_rule<S: StateStore>(
+    fixture: &Fixture<S>,
+    value: AtomRuleDefinition,
+) -> Result<AtomRuleDefinition, AtomRuleOwnerError> {
+    fixture.handle().create_atom_rule_blocking(
+        fixture.namespace.clone(),
+        fixture.topic.clone(),
+        fixture.name.clone(),
+        value,
+    )
+}
+
+fn expected_action_put<S: StateStore>(
+    fixture: &Fixture<S>,
+    value: &AtomRuleDefinition,
+    millis: u64,
+) -> TestResult<Vec<Mutation>> {
+    Ok(vec![
+        Mutation::Put {
+            key: rule_key(fixture, value.name.as_str()),
+            value: codec::encode(&RuleDefinition {
+                name: value.name.clone(),
+                filter: value.filter.clone(),
+                created_at: Timestamp::from_millis(millis),
+                action: value.action.clone(),
+            })?,
+        },
+        Mutation::Put {
+            key: keys::clock(),
+            value: codec::encode(&Timestamp::from_millis(millis))?,
+        },
+    ])
+}
+
+async fn sql_action_rule_mutations_preserve_source_and_retained_raw_state<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    use protocol_amqp::Broker as _;
+    use std::{future::poll_fn, task::Poll};
+
+    let fixture = Fixture::new(provider.open()?)?;
+    fixture.create(SubscriptionConfig {
+        default_time_to_live_millis: Some(120_000),
+        ..SubscriptionConfig::default()
+    })?;
+    fixture.submit(
+        &fixture.topic,
+        CommandKind::CreateRuleWithAction {
+            subscription: fixture.name.clone(),
+            name: RuleName::new("native-supported")?,
+            filter: RuleFilter::False,
+            action: SqlAction::new("REMOVE user.marker;")?,
+        },
+    )?;
+    fixture.submit(
+        &fixture.topic,
+        CommandKind::CreateSubscription {
+            name: SubscriptionName::new("sibling")?,
+            config: SubscriptionConfig::default(),
+        },
+    )?;
+    for sequence in 1..=3 {
+        fixture.submit(
+            &fixture.topic,
+            CommandKind::Send {
+                message_id: format!("action-retained-{sequence}"),
+                body: vec![sequence as u8; 32],
+                time_to_live_millis: None,
+                session_id: None,
+            },
+        )?;
+        if sequence < 3 {
+            let CommandOutcome::Received(Some(delivery)) = fixture.submit(
+                &fixture.child()?,
+                CommandKind::Receive {
+                    mode: ReceiveMode::PeekLock,
+                    lock_duration_millis: None,
+                    session: None,
+                },
+            )?
+            else {
+                panic!("trusted action retention seed must be deliverable");
+            };
+            if sequence == 1 {
+                fixture.submit(
+                    &fixture.child()?,
+                    CommandKind::DeadLetter {
+                        sequence: delivery.sequence,
+                        lock_token: delivery.lock.unwrap().token,
+                        reason: "action-retention".into(),
+                        description: "trusted seed".into(),
+                    },
+                )?;
+            }
+        }
+    }
+    let child = fixture.child()?;
+    let shadow = child.dead_letter_queue()?;
+    {
+        let machine = StateMachine::new(fixture.store.inner.clone());
+        let ready = machine
+            .message(&fixture.namespace, &child, SequenceNumber::new(3))?
+            .unwrap();
+        assert_eq!(ready.state, domain::MessageState::Ready);
+        assert_eq!(ready.body, vec![3; 32]);
+        assert_eq!(ready.expires_at, Some(Timestamp::from_millis(121_000)));
+        let locked = machine
+            .message(&fixture.namespace, &child, SequenceNumber::new(2))?
+            .unwrap();
+        assert!(matches!(locked.state, domain::MessageState::Locked { .. }));
+        let dead = machine
+            .message(&fixture.namespace, &shadow, SequenceNumber::new(1))?
+            .unwrap();
+        assert_eq!(dead.body, vec![1; 32]);
+        assert_eq!(
+            dead.dead_letter.unwrap().reason,
+            domain::DeadLetterReason::Application("action-retention".into())
+        );
+    }
+    let handle = fixture.handle();
+    let mut child_wait = Box::pin(handle.deliverable(&fixture.namespace, &child));
+    let mut shadow_wait = Box::pin(handle.deliverable(&fixture.namespace, &shadow));
+    poll_fn(|cx| {
+        assert!(child_wait.as_mut().poll(cx).is_pending());
+        assert!(shadow_wait.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let action = SqlAction::new(SQL_ACTION_SOURCE)?;
+    assert_eq!(
+        action.semantic_version(),
+        domain::SQL_ACTION_SEMANTIC_VERSION
+    );
+    assert_eq!(action.expression(), SQL_ACTION_SOURCE);
+    let initial_clock = fixture.clock.reads.load(Ordering::SeqCst);
+    for (index, filter) in [
+        RuleFilter::True,
+        RuleFilter::False,
+        RuleFilter::Sql(SqlFilter::new(" 1=1 ")?),
+        RuleFilter::Correlation(correlation_filter()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("Action-{index}");
+        let desired = action_definition(&name, filter, action.clone());
+        let before = fixture.store.snapshot()?;
+        let millis = 1_500 + index as u64 * 100;
+        fixture.clock.manual.set(millis);
+        let put = expected_action_put(&fixture, &desired, millis)?;
+        fixture.store.arm(false);
+        fixture.store.observation.lock().unwrap().fail_next = true;
+        assert!(matches!(
+            create_action_rule(&fixture, desired.clone()),
+            Err(AtomRuleOwnerError::Submit(SubmitError::Propose(
+                ProposeError::Broker(BrokerError::Storage(StorageError::Backend { .. }))
+            )))
+        ));
+        let failed = fixture.store.disarm();
+        assert_owner(&failed, 1);
+        assert!(!failed.committed);
+        assert_eq!(failed.mutations, put);
+        assert_eq!(fixture.store.snapshot()?, before);
+        fixture.store.arm(false);
+        assert_eq!(create_action_rule(&fixture, desired.clone())?, desired);
+        let observed = fixture.store.disarm();
+        assert_owner(&observed, 1);
+        assert!(observed.committed);
+        assert_eq!(observed.mutations, put);
+        exact_image(&before, &fixture.store.snapshot()?, &put)?;
+        assert_eq!(
+            stored(&fixture, &name)?.unwrap().action,
+            Some(action.clone())
+        );
+        let retained = fixture.store.snapshot()?;
+        fixture.clock.forbidden.store(true, Ordering::SeqCst);
+        fixture.store.arm(true);
+        assert_eq!(get_rule(&fixture, &name)?, Some(desired.clone()));
+        assert_owner(&fixture.store.disarm(), 0);
+        let mut expected = vec![
+            definition("$Default", RuleFilter::True),
+            desired.clone(),
+            action_definition(
+                "native-supported",
+                RuleFilter::False,
+                SqlAction::new("REMOVE user.marker;")?,
+            ),
+        ];
+        expected.sort_by(|left, right| left.name.cmp(&right.name));
+        fixture.store.arm(true);
+        assert_eq!(list_rules(&fixture, 0, 100)?, expected);
+        assert_owner(&fixture.store.disarm(), 0);
+        fixture.store.arm(true);
+        assert!(list_rules(&fixture, 1_000, 1)?.is_empty());
+        assert_owner(&fixture.store.disarm(), 0);
+        assert_eq!(fixture.store.snapshot()?, retained);
+        fixture.clock.forbidden.store(false, Ordering::SeqCst);
+        fixture.store.arm(false);
+        assert_eq!(
+            create_action_rule(&fixture, desired),
+            Err(rule_error(BrokerError::RuleAlreadyExists))
+        );
+        assert_owner(&fixture.store.disarm(), 0);
+        assert_eq!(fixture.store.snapshot()?, retained);
+        let deleted_at = millis + 50;
+        fixture.clock.manual.set(deleted_at);
+        let deletion = expected_delete(&fixture, &name, deleted_at)?;
+        fixture.store.arm(false);
+        fixture.store.observation.lock().unwrap().fail_next = true;
+        assert!(matches!(
+            delete_rule(&fixture, &name),
+            Err(AtomRuleOwnerError::Submit(SubmitError::Propose(
+                ProposeError::Broker(BrokerError::Storage(StorageError::Backend { .. }))
+            )))
+        ));
+        let failed = fixture.store.disarm();
+        assert_owner(&failed, 1);
+        assert!(!failed.committed);
+        assert_eq!(failed.mutations, deletion);
+        assert_eq!(fixture.store.snapshot()?, retained);
+        fixture.store.arm(false);
+        assert_eq!(delete_rule(&fixture, &name)?, CommandOutcome::RuleDeleted);
+        let observed = fixture.store.disarm();
+        assert_owner(&observed, 1);
+        assert!(observed.committed);
+        assert_eq!(observed.mutations, deletion);
+        exact_image(&retained, &fixture.store.snapshot()?, &deletion)?;
+        assert_eq!(
+            fixture.clock.reads.load(Ordering::SeqCst),
+            initial_clock + (index + 1) * 5
+        );
+    }
+    poll_fn(|cx| {
+        assert!(child_wait.as_mut().poll(cx).is_pending());
+        assert!(shadow_wait.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(child_wait);
+    drop(shadow_wait);
+    drop(handle);
+    let image = fixture.store.snapshot()?;
+    drop(fixture);
+    assert_eq!(provider.open()?.snapshot()?, image);
+    Ok(())
+}
+
+async fn invalid_sql_action_dto_priority_and_native_size_remain_original<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    let fixture = Fixture::new(provider.open()?)?;
+    fixture.create(SubscriptionConfig::default())?;
+    let session = SubscriptionName::new("session")?;
+    fixture.submit(
+        &fixture.topic,
+        CommandKind::CreateSubscription {
+            name: session.clone(),
+            config: SubscriptionConfig {
+                requires_session: true,
+                ..SubscriptionConfig::default()
+            },
+        },
+    )?;
+    let token_limit = format!(
+        "{}REMOVE user.value;",
+        " ".repeat(domain::MAX_SQL_EXPRESSION_TOKENS)
+    );
+    let statement_limit = "REMOVE[x];".repeat(33);
+    let invalid_sources = [
+        "",
+        "REMOVE",
+        "SET user.value =",
+        "SET user.value = NULL;",
+        "SET user.value = 1.0;",
+        "SET user.value = user.other;",
+        "SET user.value = 1 + 2;",
+        "SET sys.message_id = 'secret';",
+        "SET user.value = 9223372036854775808;",
+        "SET user.value = -9223372036854775809;",
+        token_limit.as_str(),
+        statement_limit.as_str(),
+    ];
+    let mut invalid = invalid_sources
+        .into_iter()
+        .map(|source| {
+            assert!(SqlAction::new(source).is_err());
+            codec::decode::<SqlAction>(&codec::encode(&(2_u32, source)).unwrap()).unwrap()
+        })
+        .collect::<Vec<_>>();
+    invalid.push(SqlAction::with_semantic_version("REMOVE user.value;", 1)?);
+    invalid.push(SqlAction::new("SET user.value = '\u{FFFE}';")?);
+    let before = fixture.store.snapshot()?;
+    let clocks = fixture.clock.reads.load(Ordering::SeqCst);
+    fixture.clock.forbidden.store(true, Ordering::SeqCst);
+    for action in invalid {
+        for subscription in [
+            fixture.name.clone(),
+            SubscriptionName::new("absent")?,
+            session.clone(),
+        ] {
+            fixture.store.arm(true);
+            assert_eq!(
+                fixture.handle().create_atom_rule_blocking(
+                    fixture.namespace.clone(),
+                    fixture.topic.clone(),
+                    subscription,
+                    action_definition("$Default", RuleFilter::True, action.clone()),
+                ),
+                Err(AtomRuleOwnerError::UnsupportedDefinition)
+            );
+            let observed = fixture.store.disarm();
+            assert_eq!(observed.commits, 0);
+            assert!(
+                observed.threads.is_empty(),
+                "invalid action DTO read stored state"
+            );
+            assert_eq!(fixture.store.snapshot()?, before);
+        }
+    }
+    assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), clocks);
+    let action = SqlAction::new(SQL_ACTION_SOURCE)?;
+    let valid = action_definition("$Default", RuleFilter::True, action.clone());
+    for (subscription, expected) in [
+        (
+            SubscriptionName::new("absent")?,
+            rule_error(BrokerError::SubscriptionNotFound),
+        ),
+        (session, AtomRuleOwnerError::UnsupportedDefinition),
+    ] {
+        fixture.store.arm(true);
+        assert_eq!(
+            fixture.handle().create_atom_rule_blocking(
+                fixture.namespace.clone(),
+                fixture.topic.clone(),
+                subscription,
+                valid.clone(),
+            ),
+            Err(expected)
+        );
+        assert_owner(&fixture.store.disarm(), 0);
+        assert_eq!(fixture.store.snapshot()?, before);
+    }
+    fixture.clock.forbidden.store(false, Ordering::SeqCst);
+    fixture.store.arm(false);
+    assert_eq!(
+        create_action_rule(&fixture, valid),
+        Err(rule_error(BrokerError::RuleAlreadyExists))
+    );
+    assert_owner(&fixture.store.disarm(), 0);
+    assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), clocks + 1);
+    assert_eq!(fixture.store.snapshot()?, before);
+    let large = RuleFilter::Correlation(correlation_value(MessageValue::String(
+        "x".repeat(domain::MAX_RULE_BYTES + 1),
+    )));
+    for (name, expected) in [
+        (
+            "oversized-action",
+            BrokerError::RuleTooLarge {
+                maximum_bytes: domain::MAX_RULE_BYTES,
+            },
+        ),
+        ("$Default", BrokerError::RuleAlreadyExists),
+    ] {
+        let desired = action_definition(name, large.clone(), action.clone());
+        let clocks = fixture.clock.reads.load(Ordering::SeqCst);
+        fixture.store.arm(false);
+        assert_eq!(
+            create_action_rule(&fixture, desired),
+            Err(rule_error(expected))
+        );
+        assert_owner(&fixture.store.disarm(), 0);
+        assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), clocks + 1);
+        assert_eq!(fixture.store.snapshot()?, before);
+    }
+    let bounded = action_definition(
+        "bounded-action",
+        RuleFilter::False,
+        SqlAction::new("REMOVE[x];".repeat(32))?,
+    );
+    let clocks = fixture.clock.reads.load(Ordering::SeqCst);
+    fixture.store.arm(false);
+    assert_eq!(create_action_rule(&fixture, bounded.clone())?, bounded);
+    let observed = fixture.store.disarm();
+    assert_owner(&observed, 1);
+    assert_eq!(
+        observed.mutations,
+        expected_action_put(&fixture, &bounded, 1_000)?
+    );
+    exact_image(&before, &fixture.store.snapshot()?, &observed.mutations)?;
+    assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), clocks + 1);
+    let retained = fixture.store.snapshot()?;
+    fixture.store.arm(false);
+    assert_eq!(
+        delete_rule(&fixture, "bounded-action")?,
+        CommandOutcome::RuleDeleted
+    );
+    let observed = fixture.store.disarm();
+    assert_owner(&observed, 1);
+    assert_eq!(
+        observed.mutations,
+        expected_delete(&fixture, "bounded-action", 1_000)?
+    );
+    exact_image(&retained, &fixture.store.snapshot()?, &observed.mutations)?;
+    assert_eq!(fixture.store.snapshot()?, before);
+    Ok(())
+}
+
+async fn stored_sql_action_health_and_v1_projection_keep_lookup_and_paging_priority<
+    P: StoreProvider,
+>(
+    provider: P,
+) -> TestResult {
+    let fixture = Fixture::new(provider.open()?)?;
+    fixture.create(SubscriptionConfig::default())?;
+    let supported = action_definition(
+        "supported",
+        RuleFilter::Sql(SqlFilter::new(" 1=0 ")?),
+        SqlAction::new(SQL_ACTION_SOURCE)?,
+    );
+    create_action_rule(&fixture, supported.clone())?;
+    for (name, action) in [
+        (
+            "v1-remove",
+            SqlAction::with_semantic_version("REMOVE user.marker;", 1)?,
+        ),
+        (
+            "xml-illegal-action",
+            SqlAction::new("SET user.value = '\u{FFFE}';")?,
+        ),
+    ] {
+        assert_eq!(
+            fixture.submit(
+                &fixture.topic,
+                CommandKind::CreateRuleWithAction {
+                    subscription: fixture.name.clone(),
+                    name: RuleName::new(name)?,
+                    filter: RuleFilter::False,
+                    action,
+                }
+            )?,
+            CommandOutcome::RuleCreated
+        );
+    }
+    assert!(
+        StateMachine::new(fixture.store.inner.clone())
+            .rules(&fixture.namespace, &fixture.topic, &fixture.name)
+            .is_ok()
+    );
+    let before = fixture.store.snapshot()?;
+    let clocks = fixture.clock.reads.load(Ordering::SeqCst);
+    fixture.clock.forbidden.store(true, Ordering::SeqCst);
+    for (name, expected) in [
+        ("$Default", Some(definition("$Default", RuleFilter::True))),
+        ("supported", Some(supported.clone())),
+        ("absent", None),
+    ] {
+        fixture.store.arm(true);
+        assert_eq!(get_rule(&fixture, name)?, expected);
+        assert_owner(&fixture.store.disarm(), 0);
+    }
+    for name in ["v1-remove", "xml-illegal-action"] {
+        fixture.store.arm(true);
+        assert_eq!(
+            get_rule(&fixture, name),
+            Err(AtomRuleOwnerError::UnsupportedDefinition)
+        );
+        assert_owner(&fixture.store.disarm(), 0);
+    }
+    for (skip, top) in [(0, 1), (1_000, 1)] {
+        fixture.store.arm(true);
+        assert_eq!(
+            list_rules(&fixture, skip, top),
+            Err(AtomRuleOwnerError::UnsupportedDefinition)
+        );
+        assert_owner(&fixture.store.disarm(), 0);
+    }
+    assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), clocks);
+    assert_eq!(fixture.store.snapshot()?, before);
+    fixture.clock.forbidden.store(false, Ordering::SeqCst);
+    let transient = action_definition(
+        "transient",
+        RuleFilter::True,
+        SqlAction::new("SET user.flag = FALSE;")?,
+    );
+    fixture.store.arm(false);
+    assert_eq!(create_action_rule(&fixture, transient.clone())?, transient);
+    let observed = fixture.store.disarm();
+    assert_owner(&observed, 1);
+    assert_eq!(
+        observed.mutations,
+        expected_action_put(&fixture, &transient, 1_000)?
+    );
+    exact_image(&before, &fixture.store.snapshot()?, &observed.mutations)?;
+    let retained = fixture.store.snapshot()?;
+    fixture.store.arm(false);
+    assert_eq!(
+        delete_rule(&fixture, "transient")?,
+        CommandOutcome::RuleDeleted
+    );
+    let observed = fixture.store.disarm();
+    assert_owner(&observed, 1);
+    assert_eq!(
+        observed.mutations,
+        expected_delete(&fixture, "transient", 1_000)?
+    );
+    exact_image(&retained, &fixture.store.snapshot()?, &observed.mutations)?;
+    assert_eq!(fixture.store.snapshot()?, before);
+    fixture.store.arm(false);
+    assert_eq!(
+        delete_rule(&fixture, "v1-remove")?,
+        CommandOutcome::RuleDeleted
+    );
+    let observed = fixture.store.disarm();
+    assert_owner(&observed, 1);
+    assert_eq!(
+        observed.mutations,
+        expected_delete(&fixture, "v1-remove", 1_000)?
+    );
+    exact_image(&before, &fixture.store.snapshot()?, &observed.mutations)?;
+    let corrupt_key = rule_key(&fixture, "corrupt-action");
+    let mut corrupted = Vec::new();
+    for source in [
+        "secret =",
+        "SET sys.message_id = 'secret';",
+        "SET user.value = 1.0;",
+    ] {
+        let action = codec::decode::<SqlAction>(&codec::encode(&(2_u32, source))?)?;
+        assert!(SqlAction::new(action.expression()).is_err());
+        corrupted.push(codec::encode(&RuleDefinition {
+            name: RuleName::new("corrupt-action")?,
+            filter: RuleFilter::False,
+            created_at: Timestamp::from_millis(1_000),
+            action: Some(action),
+        })?);
+    }
+    // Postcard tuples retain the same field layout while bypassing the typed version constructor.
+    let unknown = codec::encode(&(
+        RuleName::new("corrupt-action")?,
+        RuleFilter::False,
+        Timestamp::from_millis(1_000),
+        Some((3_u32, "REMOVE user.marker;")),
+    ))?;
+    assert!(RuleDefinition::decode(&unknown).is_err());
+    corrupted.push(unknown);
+    for bytes in corrupted {
+        fixture
+            .store
+            .inner
+            .apply(WriteBatch::default().put(corrupt_key.clone(), bytes))?;
+        let expected = StateMachine::new(fixture.store.inner.clone())
+            .rules(&fixture.namespace, &fixture.topic, &fixture.name)
+            .unwrap_err();
+        let before = fixture.store.snapshot()?;
+        let clocks = fixture.clock.reads.load(Ordering::SeqCst);
+        fixture.clock.forbidden.store(true, Ordering::SeqCst);
+        for operation in 0..4 {
+            fixture.store.arm(true);
+            let result = match operation {
+                0 => get_rule(&fixture, "$Default").map(|_| ()),
+                1 => get_rule(&fixture, "supported").map(|_| ()),
+                2 => get_rule(&fixture, "absent").map(|_| ()),
+                _ => list_rules(&fixture, 1_000, 1).map(|_| ()),
+            };
+            assert_eq!(result, Err(rule_error(expected.clone())));
+            assert_owner(&fixture.store.disarm(), 0);
+            assert_eq!(fixture.store.snapshot()?, before);
+        }
+        assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), clocks);
+        fixture.clock.forbidden.store(false, Ordering::SeqCst);
+        for create in [true, false] {
+            let clocks = fixture.clock.reads.load(Ordering::SeqCst);
+            fixture.store.arm(false);
+            let result = if create {
+                create_action_rule(
+                    &fixture,
+                    action_definition(
+                        "safe-action",
+                        RuleFilter::False,
+                        SqlAction::new("REMOVE user.value;")?,
+                    ),
+                )
+                .map(|_| CommandOutcome::RuleCreated)
+            } else {
+                delete_rule(&fixture, "$Default")
+            };
+            assert_eq!(result, Err(rule_error(expected.clone())));
+            assert_owner(&fixture.store.disarm(), 0);
+            assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), clocks + 1);
+            assert_eq!(fixture.store.snapshot()?, before);
+        }
+    }
+    let image = fixture.store.snapshot()?;
+    drop(fixture);
+    assert_eq!(provider.open()?.snapshot()?, image);
+    Ok(())
+}
+
 for_each_subscription_backend! {
     rule_mutations_preserve_retained_state_and_exact_timestamps,
     prepared_rule_returns_and_preapply_failures_have_no_postcommit_reads,
@@ -2042,4 +2650,7 @@ for_each_subscription_backend! {
     correlation_rule_prepared_mutations_preserve_retained_raw_state,
     invalid_correlation_dto_priority_precedes_admission_and_command_clock,
     stored_correlation_health_precedes_projection_lookup_and_paging,
+    sql_action_rule_mutations_preserve_source_and_retained_raw_state,
+    invalid_sql_action_dto_priority_and_native_size_remain_original,
+    stored_sql_action_health_and_v1_projection_keep_lookup_and_paging_priority,
 }

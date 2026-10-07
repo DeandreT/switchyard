@@ -16,16 +16,21 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
         rules::validate_definition(&definition)
             .map_err(|_| AtomRuleOwnerError::UnsupportedDefinition)?;
         let binding = self.atom_rule_admission(namespace, topic, subscription)?;
+        let command = match &definition.action {
+            Some(action) => CommandKind::CreateRuleWithAction {
+                subscription: subscription.clone(),
+                name: definition.name.clone(),
+                filter: definition.filter.clone(),
+                action: action.clone(),
+            },
+            None => CommandKind::CreateRule {
+                subscription: subscription.clone(),
+                name: definition.name.clone(),
+                filter: definition.filter.clone(),
+            },
+        };
         let outcome = self
-            .propose_fenced_with_effects(
-                &binding,
-                topic,
-                CommandKind::CreateRule {
-                    subscription: subscription.clone(),
-                    name: definition.name.clone(),
-                    filter: definition.filter.clone(),
-                },
-            )?
+            .propose_fenced_with_effects(&binding, topic, command)?
             .outcome;
         if outcome != CommandOutcome::RuleCreated {
             return Err(ProposeError::UnexpectedOutcome {
@@ -126,12 +131,10 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
 }
 
 fn project_rule(rule: RuleDefinition) -> Result<AtomRuleDefinition, AtomRuleOwnerError> {
-    if rule.action.is_some() {
-        return Err(AtomRuleOwnerError::UnsupportedDefinition);
-    }
     let definition = AtomRuleDefinition {
         name: rule.name,
         filter: rule.filter,
+        action: rule.action,
     };
     rules::validate_definition(&definition)
         .map_err(|_| AtomRuleOwnerError::UnsupportedDefinition)?;

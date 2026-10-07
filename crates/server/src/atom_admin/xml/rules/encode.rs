@@ -9,6 +9,8 @@ use super::super::{ATOM_NS, MAX_FEED_ENTRIES, MAX_REPLY_BYTES, SERVICE_BUS_NS, X
 use super::{RuleXmlError, correlation, validate_definition};
 use crate::AtomRuleDefinition;
 
+const ACTION_MARKUP_BYTES: usize = 256;
+
 #[derive(Default)]
 struct Reply(Vec<u8>);
 
@@ -81,9 +83,24 @@ fn definition_budget(
         .len()
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_add(filter_bytes))
+        .and_then(|bytes| {
+            bytes.checked_add(
+                definition
+                    .action
+                    .as_ref()
+                    .map_or(0, |action| action.expression().len()),
+            )
+        })
         .ok_or(RuleXmlError::ReplyLimitExceeded)?;
     let static_bytes = 1_024_usize
         .checked_add(markup_bytes)
+        .and_then(|bytes| {
+            bytes.checked_add(if definition.action.is_some() {
+                ACTION_MARKUP_BYTES
+            } else {
+                0
+            })
+        })
         .ok_or(RuleXmlError::ReplyLimitExceeded)?;
     preflight(total, text_bytes, static_bytes)
 }
@@ -141,6 +158,16 @@ fn entry(writer: &mut Writer<Reply>, definition: &AtomRuleDefinition) -> Result<
         close(writer, "Parameters")?;
     }
     close(writer, "Filter")?;
+    if let Some(action) = &definition.action {
+        let mut start = BytesStart::new("Action");
+        start.push_attribute(("xmlns:i", XSI_NS));
+        start.push_attribute(("i:type", "SqlRuleAction"));
+        event(writer, Event::Start(start))?;
+        scalar(writer, "SqlExpression", action.expression())?;
+        open(writer, "Parameters")?;
+        close(writer, "Parameters")?;
+        close(writer, "Action")?;
+    }
     scalar(writer, "Name", definition.name.as_str())?;
     close(writer, "RuleDescription")?;
     close(writer, "content")?;

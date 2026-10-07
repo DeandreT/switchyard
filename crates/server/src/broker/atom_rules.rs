@@ -1,12 +1,13 @@
-use domain::{RuleFilter, RuleName, SubscriptionName};
+use domain::{RuleFilter, RuleName, SqlAction, SubscriptionName};
 
 use super::*;
 
-/// The complete static rule profile; no action or creation date is projected.
+/// The complete static rule profile; no creation date is projected.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AtomRuleDefinition {
     pub name: RuleName,
     pub filter: RuleFilter,
+    pub action: Option<SqlAction>,
 }
 
 /// Closed-profile failures for ordinary subscription rule administration.

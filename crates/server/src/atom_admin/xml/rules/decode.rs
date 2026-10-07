@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use domain::{CorrelationFilter, MessageValue, RuleFilter, RuleName, SqlFilter};
+use domain::{CorrelationFilter, MessageValue, RuleFilter, RuleName, SqlAction, SqlFilter};
 use quick_xml::{
     Reader, XmlVersion,
     events::{BytesRef, BytesStart, Event},
@@ -55,6 +55,9 @@ enum Node {
     Filter,
     SqlExpression,
     Parameters,
+    Action,
+    ActionExpression,
+    ActionParameters,
     System(Field),
     Properties,
     Property,
@@ -66,7 +69,12 @@ impl Node {
     fn scalar(self) -> bool {
         matches!(
             self,
-            Self::Name | Self::SqlExpression | Self::System(_) | Self::Key | Self::Value
+            Self::Name
+                | Self::SqlExpression
+                | Self::ActionExpression
+                | Self::System(_)
+                | Self::Key
+                | Self::Value
         )
     }
 }
@@ -115,7 +123,11 @@ struct Parser {
     filter_seen: bool,
     expression_seen: bool,
     parameters_seen: bool,
+    action_seen: bool,
+    action_expression_seen: bool,
+    action_parameters_seen: bool,
     name: Option<RuleName>,
+    action: Option<SqlAction>,
     filter: Option<FilterKind>,
     definition_filter: Option<RuleFilter>,
     correlation: CorrelationFilter,
@@ -142,7 +154,11 @@ impl Parser {
             filter_seen: false,
             expression_seen: false,
             parameters_seen: false,
+            action_seen: false,
+            action_expression_seen: false,
+            action_parameters_seen: false,
             name: None,
+            action: None,
             filter: None,
             definition_filter: None,
             correlation: CorrelationFilter::default(),
@@ -258,7 +274,11 @@ impl Parser {
                         self.filter_seen = true;
                         Node::Filter
                     }
-                    "Name" | "Filter" => return Err(RuleXmlError::Malformed),
+                    "Action" if !self.action_seen => {
+                        self.action_seen = true;
+                        Node::Action
+                    }
+                    "Name" | "Filter" | "Action" => return Err(RuleXmlError::Malformed),
                     _ => return Err(RuleXmlError::UnsupportedDefinition),
                 }
             }
@@ -299,6 +319,24 @@ impl Parser {
                 }
             }
             Some(parent)
+                if matches!(parent.node, Node::Action)
+                    && namespace == Some(NamespaceKind::ServiceBus) =>
+            {
+                self.budget.property()?;
+                match local {
+                    "SqlExpression" if !self.action_expression_seen => {
+                        self.action_expression_seen = true;
+                        Node::ActionExpression
+                    }
+                    "Parameters" if !self.action_parameters_seen => {
+                        self.action_parameters_seen = true;
+                        Node::ActionParameters
+                    }
+                    "SqlExpression" | "Parameters" => return Err(RuleXmlError::Malformed),
+                    _ => return Err(RuleXmlError::UnsupportedDefinition),
+                }
+            }
+            Some(parent)
                 if matches!(parent.node, Node::Properties)
                     && namespace == Some(NamespaceKind::ServiceBus)
                     && local == "KeyValueOfstringanyType" =>
@@ -329,7 +367,12 @@ impl Parser {
                     _ => return Err(RuleXmlError::UnsupportedDefinition),
                 }
             }
-            Some(parent) if matches!(parent.node, Node::Parameters | Node::Properties) => {
+            Some(parent)
+                if matches!(
+                    parent.node,
+                    Node::Parameters | Node::ActionParameters | Node::Properties
+                ) =>
+            {
                 return Err(RuleXmlError::UnsupportedDefinition);
             }
             _ => return Err(RuleXmlError::Malformed),
@@ -337,6 +380,7 @@ impl Parser {
         let mut expanded = BTreeSet::new();
         let mut content_type = false;
         let mut filter_type = None;
+        let mut action_type = false;
         let mut value_kind = None;
         for attribute in &attributes {
             if attribute.name == "xmlns" || attribute.name.starts_with("xmlns:") {
@@ -370,6 +414,18 @@ impl Parser {
                     return Err(RuleXmlError::Malformed);
                 }
                 filter_type = Some(kind);
+            } else if matches!(node, Node::Action)
+                && namespace == Some(NamespaceKind::Xsi)
+                && local == "type"
+            {
+                if attribute.value != "SqlRuleAction" {
+                    return Err(RuleXmlError::UnsupportedDefinition);
+                }
+                let (namespace, _) = self.resolver.resolve_element(QName(&attribute.value));
+                if resolved_namespace(namespace)? != Some(NamespaceKind::ServiceBus) {
+                    return Err(RuleXmlError::Malformed);
+                }
+                action_type = true;
             } else if matches!(node, Node::Value)
                 && namespace == Some(NamespaceKind::Xsi)
                 && local == "type"
@@ -389,6 +445,9 @@ impl Parser {
         }
         if matches!(node, Node::Filter) {
             self.filter = Some(filter_type.ok_or(RuleXmlError::InvalidDefinition)?);
+        }
+        if matches!(node, Node::Action) && !action_type {
+            return Err(RuleXmlError::InvalidDefinition);
         }
         if matches!(node, Node::Value) && value_kind.is_none() {
             return Err(RuleXmlError::InvalidDefinition);
@@ -434,6 +493,14 @@ impl Parser {
                 self.definition_filter = Some(RuleFilter::Correlation(std::mem::take(
                     &mut self.correlation,
                 )));
+            }
+            Node::Action if !self.action_expression_seen => {
+                return Err(RuleXmlError::InvalidDefinition);
+            }
+            Node::ActionExpression => {
+                self.action = Some(
+                    SqlAction::new(frame.scalar).map_err(|_| RuleXmlError::InvalidDefinition)?,
+                );
             }
             Node::System(field) => field.set(&mut self.correlation, frame.scalar),
             Node::Key => {
@@ -635,6 +702,7 @@ pub(crate) fn decode_definition(body: &[u8]) -> Result<AtomRuleDefinition, RuleX
                     filter: parser
                         .definition_filter
                         .ok_or(RuleXmlError::InvalidDefinition)?,
+                    action: parser.action,
                 };
                 validate_definition(&definition)?;
                 return Ok(definition);
