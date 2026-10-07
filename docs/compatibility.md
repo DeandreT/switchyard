@@ -31,7 +31,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; closed ordinary subscription HTTPS create/get/full-update/delete under native-created topics (gated with both pinned .NET clients on both backends), plus a closed True/False and bounded native SQL no-action/no-parameter Atom rule create/get/list/delete profile (library codec/owner/actual-TLS and narrow native-SQL-Get/parameter-refusal SDK regressions verified; dedicated SDK SQL lifecycle remains separate); Azure topic administration remains unimplemented |
+| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; closed ordinary subscription HTTPS create/get/full-update/delete under native-created topics (gated with both pinned .NET clients on both backends), plus a closed True/False and bounded native SQL no-action/no-parameter Atom rule create/get/list/delete profile (library codec/owner/actual-TLS and dedicated exact-source SQL Create/Get/List/Delete SDK lifecycle verified with both pins, backends and constructors); Azure topic administration remains unimplemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD/CLI; bounded REMOVE and String/Boolean/Int64-literal SET actions with independent copies and finite local conversion-error dead letters, not full Azure/CLR actions |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -42,7 +42,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API; native generation-fenced and HTTPS full-definition replacement for finite ordinary queues; closed ordinary subscription HTTPS full-definition replacement |
 | Finite queue capacity | Pre-1.0 | Trusted owner API, separate native create/get/full-definition service, and HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage, Rust AMQP socket tests, both pinned .NET administration/limit-update and WSS ingress/credit-recovery gates, explicit CLI activation; see [Finite Queue Capacity](finite-queue-capacity.md) |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
-| Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; closed ordinary subscription create/get/full-update/delete under native-created topics is library gated with both pinned .NET clients on both backends; the preceding True/False no-action rule lifecycle is separately gated with both pinned .NET clients on both backends, while bounded native SQL no-action/no-parameter library support and native-seeded SQL Get/parameter-refusal regressions are verified (dedicated SDK SQL lifecycle remains separate); rule updates, correlation filters/actions, topic creation and subscription list/runtime are not implemented |
+| Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; closed ordinary subscription create/get/full-update/delete under native-created topics is library gated with both pinned .NET clients on both backends; closed True/False and bounded native SQL no-action/no-parameter rule Create/Get/List/Delete are separately gated with both pinned .NET clients on both backends and constructors; rule updates, correlation filters/actions, topic creation and subscription list/runtime are not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete, separate finite queue create/get/full-definition replacement, and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; offline JWT Manage via library opt-in or the CLI policy-file option; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
 | Quorum replication | Pre-1.0 | An isolated [fixed-three-node in-process runtime](experimental-replica-runtime.md) exists for bounded Create/Send, but is not integrated with server listeners or the production proposer; production startup remains refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup. The runtime exposes no snapshots or production deployment activation. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
@@ -1991,6 +1991,9 @@ map 500; mutators retain original after-stamp planner priority. Native rule-coun
 stored-byte and XML-work 503, header 431, HTTP admission 400 and reply-limit 500
 remain unchanged, with static redacted diagnostics.
 
+The following receipt describes the preceding SQL library increment; its native-seeded
+Get/parameter-refusal SDK regression is not the new SQL lifecycle verified below.
+
 Verification passed on the same seven changed source images and twenty-five
 unchanged library/test images throughout nine serial gates: the complete focused
 run, both separately executed Rule SDK gates, strict workspace lint and all-target
@@ -2024,6 +2027,62 @@ suite. The preceding 493/19, 5,986/19, 494/21 and 5,987/21 receipts remain histo
 No dates, multipage paging, SDK message-selection/settlement, CLI activation,
 production readiness or general Azure SQL claim is added. See
 [Bounded SQL Profile](atom-rules.md#bounded-sql-profile).
+
+### Official .NET SQL Rule Lifecycle
+
+Both Rule SDK opt-ins passed separately with pins 7.21.0 and 7.20.2 on Memory
+and Fjall using named-key and connection-string clients. A new SQL stage after
+delete and before recreate checks Create 201, cross-client Get 200, one complete
+one-row List 200, Delete 200, typed missing Get and one complete empty List. Each
+constructor uses its owned, already-empty child. Exact ordinal Name/original
+source, concrete SqlRuleFilter rather than True/False, empty Parameters and null
+Action are required. The source retains surrounding spaces, Unicode, XML-special
+characters and a literal LF through the actual writer/parser; no original
+SDK-constructor literal CR preservation is claimed.
+
+The measured SQL stage has four applies/four stamps across both constructors,
+with exact constructor-ordered owned Rule Put/Delete plus Clock batches, native
+semantic version 1 and timestamp 1,000. Complete mutation projection plus
+all-non-Clock equality preserve retained
+ready/locked/DLQ messages, TTL/lock/expiry indexes, configurations, identities,
+counters, native siblings, opaque rules and unrelated rows. Native canonical
+replay remains the same-domain oracle. Earlier controls, strict CA/name failures,
+Send-only Manage denial, exit/marker/deadline checks and cleanup are unchanged.
+
+Thirteen ordered children per backend/pin total fifty-two completed children and
+104 verified loaded assembly records, including SQL: empty, wrong-CA, wrong-name,
+denied, empty, create, inspect, refusals, inspect, opaque, delete, SQL, recreate.
+The earlier twelve positions retain relative order. Four stage/cleanup finishes
+are successful; all four versions/file fingerprints match the preceding SDK
+table. Loaded owned-file matching is bounded execution custody, not package
+provenance, ongoing DLL custody, loaded memory equivalence or adversarial
+filesystem TOCTOU protection. Memory/Fjall reopen and inherited blocking-drop
+and secondary-cleanup limitations remain unchanged.
+
+Focused verification passed 511P/0F/21I across four targets, preserving all 531
+preceding result tuples with statuses, reasons and multiplicities, plus one
+passing pure source/batch guard. Its C# check is fixed declaration presence, not
+dynamic decoding/comparison of changing constants; reviewed declarations agree,
+and actual SDK stage matching separately requires exact stored bytes. Both
+selected SDK gates passed 1P/0F/0I with 75 filtered tests apiece.
+
+All nine serial gates closed successfully against six test-source images and
+twenty-six unchanged library/profile images, checked before and after each gate:
+focused tests, both separate Rule SDK gates, strict workspace lint and all-target
+builds with default/all features, formatting and the full workspace. The full
+run passed 6,004P/0F/21I across 162 groups and 6,025 rows, preserving all 6,024
+preceding tuples with statuses, reasons and multiplicities; only the same single
+passing pure guard was added. All 156 owners/146 executables remain, including
+unchanged 119 CLI results across eight owners/eight executables. Shared cache,
+two cores/jobs and domain/store layouts 17/11 remain; no production, dependency
+or CLI-flag change is added.
+
+The other nineteen SDK opt-ins were not rerun; all twenty-one remain ignored in
+the regular suite. All preceding receipts, including the SQL-library/native-seeded
+Get-only receipt above, remain historical with their exact counts/fingerprints.
+No SDK message selection/settlement, rule dates, multipage listing, CLI-launched
+broker, production readiness or general Azure SQL administration is certified.
+See [SQL SDK Lifecycle Verification](atom-rules.md#sql-sdk-lifecycle-verification).
 
 ### Official .NET Subscription Administration
 

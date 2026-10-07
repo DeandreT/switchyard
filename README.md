@@ -250,10 +250,10 @@ Subscription listing and runtime properties are excluded; see
 the verified library profile and separate SDK verification status. A closed
 [Atom Rule Administration](docs/atom-rules.md) profile adds True/False and bounded
 native SQL no-action/no-parameter rule create/get/list/delete. The SQL library
-profile passed codec, owner and actual-TLS checks; both pinned .NET clients on
-Memory and Fjall verified native-seeded SQL Get and parameter refusal. Dedicated
-SDK SQL Create/List/Delete lifecycle remains separate. Correlation filters and
-actions remain native/AMQP.
+profile passed codec, owner and actual-TLS checks. Both pinned .NET clients on
+Memory and Fjall also passed the dedicated [SQL rule lifecycle](docs/atom-rules.md#sql-sdk-lifecycle-verification)
+with both constructors, checking exact typed source through Create/Get/List/Delete
+and unchanged retained state. Correlation filters and actions remain native/AMQP.
 
 The CLI also supports `queue list` and `queue update`, and emits JSON. Topics
 and subscriptions have separate create/get/list/update commands:
