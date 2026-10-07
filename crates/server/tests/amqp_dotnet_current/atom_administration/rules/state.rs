@@ -1,11 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use domain::{
-    BrokerError, CommandKind, CommandOutcome, DeadLetterInfo, DeadLetterReason, EntityIncarnation,
-    EntityIncarnationKind, EntityPath, LockToken, MessageRecord, MessageState, NamespaceName,
-    QueueConfig, QueueCounters, ReceiveMode, RuleDefinition, RuleFilter, RuleName, SequenceNumber,
-    SqlAction, SqlFilter, SubscriptionConfig, SubscriptionName, Timestamp, TopicConfig, codec,
-    keys,
+    BrokerError, CommandKind, CommandOutcome, CorrelationFilter, DeadLetterInfo, DeadLetterReason,
+    EntityIncarnation, EntityIncarnationKind, EntityPath, LockToken, MessageRecord, MessageState,
+    MessageValue, NamespaceName, QueueConfig, QueueCounters, ReceiveMode, RuleDefinition,
+    RuleFilter, RuleName, SequenceNumber, SqlAction, SqlFilter, SubscriptionConfig,
+    SubscriptionName, Timestamp, TopicConfig, codec, keys,
 };
 use server::{AtomRuleDefinition, AtomRuleOwnerError, BrokerHandle, ProposeError, SubmitError};
 use storage::{MemoryStore, Mutation, StateStore, StoreSnapshot, WriteBatch};
@@ -42,6 +42,50 @@ fn config() -> SubscriptionConfig {
         default_time_to_live_millis: Some(45_000),
         dead_lettering_on_message_expiration: true,
         ..SubscriptionConfig::default()
+    }
+}
+
+fn correlation_filter() -> CorrelationFilter {
+    CorrelationFilter {
+        correlation_id: Some(" Correlation caf\u{e9} & <\u{3bb}>\nline ".into()),
+        message_id: Some(" Message caf\u{e9} & <\u{3bb}>\nline ".into()),
+        to: Some(" To caf\u{e9} & <\u{3bb}>\nline ".into()),
+        reply_to: Some(" ReplyTo caf\u{e9} & <\u{3bb}>\nline ".into()),
+        subject: Some(" Subject caf\u{e9} & <\u{3bb}>\nline ".into()),
+        session_id: Some(" Session caf\u{e9} & <\u{3bb}>\nline ".into()),
+        reply_to_session_id: Some(" ReplySession caf\u{e9} & <\u{3bb}>\nline ".into()),
+        content_type: Some(" ContentType caf\u{e9} & <\u{3bb}>\nline ".into()),
+        properties: BTreeMap::from([
+            (
+                "Text".into(),
+                MessageValue::String(" Text caf\u{e9} & <\u{3bb}>\nline ".into()),
+            ),
+            ("Int32".into(), MessageValue::Int(i32::MIN)),
+            ("Int64".into(), MessageValue::Long(i64::MAX)),
+            ("Boolean".into(), MessageValue::Bool(true)),
+            ("Double".into(), MessageValue::Double(0x3ff0_0000_0000_0001)),
+            (
+                "DateTime".into(),
+                MessageValue::Timestamp(1_700_000_000_123),
+            ),
+            (
+                "NegativeZero".into(),
+                MessageValue::Double(0x8000_0000_0000_0000),
+            ),
+            (
+                "PositiveInfinity".into(),
+                MessageValue::Double(f64::INFINITY.to_bits()),
+            ),
+            (
+                "NegativeInfinity".into(),
+                MessageValue::Double(f64::NEG_INFINITY.to_bits()),
+            ),
+            ("SmallestDouble".into(), MessageValue::Double(1)),
+            (
+                "LargestDouble".into(),
+                MessageValue::Double(f64::MAX.to_bits()),
+            ),
+        ]),
     }
 }
 
@@ -293,6 +337,17 @@ pub(super) fn advance(
                     subscription.clone(),
                     &name,
                     RuleFilter::Sql(SqlFilter::new(SQL_EXPRESSION)?),
+                )?;
+                delete(handle, namespace, subscription, &name)?;
+            }
+            AtomScenario::RulesCorrelation => {
+                let name = format!("Correlation-{suffix}");
+                create(
+                    handle,
+                    namespace,
+                    subscription.clone(),
+                    &name,
+                    RuleFilter::Correlation(correlation_filter()),
                 )?;
                 delete(handle, namespace, subscription, &name)?;
             }
@@ -657,6 +712,19 @@ pub(super) fn check_batches(
                 });
                 changes.push(Mutation::Delete { key });
             }
+            AtomScenario::RulesCorrelation => {
+                let rule = stored(
+                    &format!("Correlation-{suffix}"),
+                    RuleFilter::Correlation(correlation_filter()),
+                    None,
+                )?;
+                let key = keys::rule(namespace, &topic(), &subscription, &rule.name);
+                changes.push(Mutation::Put {
+                    key: key.clone(),
+                    value: codec::encode(&rule)?,
+                });
+                changes.push(Mutation::Delete { key });
+            }
             AtomScenario::RulesRecreate => {
                 let rule = stored("$Default", RuleFilter::True, None)?;
                 changes.push(Mutation::Put {
@@ -727,7 +795,10 @@ pub(super) fn check_batches(
         &projected.snapshot()?,
         "rule stage changed retained messages, expiry/DLQ/config/rules/identities/counters or unrelated rows"
     );
-    if scenario == AtomScenario::RulesSql {
+    if matches!(
+        scenario,
+        AtomScenario::RulesSql | AtomScenario::RulesCorrelation
+    ) {
         let clock = keys::clock();
         let retained = |snapshot: &StoreSnapshot| {
             snapshot
@@ -740,7 +811,7 @@ pub(super) fn check_batches(
         assert_eq!(
             retained(before),
             retained(after),
-            "SQL cycle changed retained rows"
+            "transient rule cycle changed retained rows"
         );
     }
     Ok(())
@@ -807,6 +878,115 @@ mod tests {
             &batches,
         )?;
         assert_eq!(after, before, "transient SQL cycle retained a row");
+        Ok(())
+    }
+
+    #[test]
+    fn correlation_cycle_source_and_batches_are_exact() -> TestResult {
+        let source = include_str!(
+            "../../../../../conformance/dotnet-current/AtomRuleAdministrationCases.cs"
+        );
+        for literal in [
+            r#"CorrelationId = " Correlation caf\u00E9 & <\u03BB>\nline ","#,
+            r#"MessageId = " Message caf\u00E9 & <\u03BB>\nline ","#,
+            r#"To = " To caf\u00E9 & <\u03BB>\nline ","#,
+            r#"ReplyTo = " ReplyTo caf\u00E9 & <\u03BB>\nline ","#,
+            r#"Subject = " Subject caf\u00E9 & <\u03BB>\nline ","#,
+            r#"SessionId = " Session caf\u00E9 & <\u03BB>\nline ","#,
+            r#"ReplyToSessionId = " ReplySession caf\u00E9 & <\u03BB>\nline ","#,
+            r#"ContentType = " ContentType caf\u00E9 & <\u03BB>\nline ","#,
+            r#"filter.ApplicationProperties.Add("Text", " Text caf\u00E9 & <\u03BB>\nline ");"#,
+            r#"filter.ApplicationProperties.Add("Int32", int.MinValue);"#,
+            r#"filter.ApplicationProperties.Add("Int64", long.MaxValue);"#,
+            r#"filter.ApplicationProperties.Add("Boolean", true);"#,
+            r#"filter.ApplicationProperties.Add("Double", BitConverter.Int64BitsToDouble(0x3ff0_0000_0000_0001));"#,
+            r#"filter.ApplicationProperties.Add("DateTime", new DateTime(2023, 11, 14, 22, 13, 20, 123, DateTimeKind.Utc));"#,
+            r#"filter.ApplicationProperties.Add("NegativeZero", BitConverter.Int64BitsToDouble(unchecked((long)0x8000_0000_0000_0000UL)));"#,
+            r#"filter.ApplicationProperties.Add("PositiveInfinity", double.PositiveInfinity);"#,
+            r#"filter.ApplicationProperties.Add("NegativeInfinity", double.NegativeInfinity);"#,
+            r#"filter.ApplicationProperties.Add("SmallestDouble", double.Epsilon);"#,
+            r#"filter.ApplicationProperties.Add("LargestDouble", double.MaxValue);"#,
+        ] {
+            assert!(
+                source.contains(literal),
+                "fixed C# correlation fixture literal changed"
+            );
+        }
+        let filter = correlation_filter();
+        filter.validate()?;
+        assert_eq!(filter.properties.len(), 11);
+        assert!(
+            [
+                filter.correlation_id.as_deref(),
+                filter.message_id.as_deref(),
+                filter.to.as_deref(),
+                filter.reply_to.as_deref(),
+                filter.subject.as_deref(),
+                filter.session_id.as_deref(),
+                filter.reply_to_session_id.as_deref(),
+                filter.content_type.as_deref(),
+            ]
+            .into_iter()
+            .all(|field| field.is_some_and(|value| !value.trim().is_empty()
+                && value.contains('\n')
+                && value.contains('&')
+                && value.contains('<')))
+        );
+        assert_eq!(
+            filter.properties["Double"],
+            MessageValue::Double(0x3ff0_0000_0000_0001)
+        );
+        assert_eq!(
+            filter.properties["NegativeZero"],
+            MessageValue::Double(0x8000_0000_0000_0000)
+        );
+        assert_eq!(
+            filter.properties["DateTime"],
+            MessageValue::Timestamp(1_700_000_000_123)
+        );
+        let namespace = NamespaceName::new("tenant")?;
+        let clock = codec::encode(&Timestamp::from_millis(1_000))?;
+        let store = MemoryStore::default();
+        store.apply(
+            WriteBatch::default()
+                .put(b"retained-fixture-row".to_vec(), b"retained bytes".to_vec())
+                .put(keys::clock(), clock.clone()),
+        )?;
+        let before = store.snapshot()?;
+        let mut batches = Vec::new();
+        for suffix in SUFFIXES {
+            let rule = RuleDefinition {
+                name: RuleName::new(format!("Correlation-{suffix}"))?,
+                filter: RuleFilter::Correlation(filter.clone()),
+                action: None,
+                created_at: Timestamp::from_millis(1_000),
+            };
+            let encoded = codec::encode(&rule)?;
+            assert_eq!(codec::decode::<RuleDefinition>(&encoded)?, rule);
+            let key = keys::rule(&namespace, &topic(), &owned(suffix), &rule.name);
+            batches.push(
+                WriteBatch::default()
+                    .put(key.clone(), encoded)
+                    .put(keys::clock(), clock.clone()),
+            );
+            batches.push(
+                WriteBatch::default()
+                    .delete(key)
+                    .put(keys::clock(), clock.clone()),
+            );
+        }
+        for batch in &batches {
+            store.apply(batch.clone())?;
+        }
+        let after = store.snapshot()?;
+        check_batches(
+            &namespace,
+            AtomScenario::RulesCorrelation,
+            &before,
+            &after,
+            &batches,
+        )?;
+        assert_eq!(after, before, "transient correlation cycle retained a row");
         Ok(())
     }
 }

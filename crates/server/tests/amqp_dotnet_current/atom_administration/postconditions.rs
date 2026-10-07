@@ -173,6 +173,7 @@ impl Oracle {
             | AtomScenario::RulesRefusals
             | AtomScenario::RulesDelete
             | AtomScenario::RulesSql
+            | AtomScenario::RulesCorrelation
             | AtomScenario::RulesRecreate
             | AtomScenario::RulesOpaque
             | AtomScenario::RulesDenied
@@ -579,6 +580,7 @@ mod tests {
             AtomScenario::RulesRefusals,
             AtomScenario::RulesDelete,
             AtomScenario::RulesSql,
+            AtomScenario::RulesCorrelation,
             AtomScenario::RulesRecreate,
             AtomScenario::RulesOpaque,
             AtomScenario::RulesDenied,

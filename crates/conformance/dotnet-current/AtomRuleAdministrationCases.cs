@@ -52,6 +52,9 @@ internal static class AtomRuleAdministrationCases
             case "rules-sql":
                 await SqlCycleAsync(client, other, subscription, suffix, token);
                 break;
+            case "rules-correlation":
+                await CorrelationCycleAsync(client, other, subscription, suffix, token);
+                break;
             case "rules-recreate":
                 await CreateAsync(client, other, subscription, CreateRuleOptions.DefaultRuleName, true, token);
                 await RequireRulesAsync(other, subscription, token, (CreateRuleOptions.DefaultRuleName, true));
@@ -181,6 +184,105 @@ internal static class AtomRuleAdministrationCases
             && filter.GetType() == typeof(SqlRuleFilter)
             && string.Equals(filter.SqlExpression, SqlExpression, StringComparison.Ordinal)
             && filter.Parameters.Count == 0 && rule.Action is null, "Exact original SQL rule definition.");
+    }
+
+    private static CorrelationRuleFilter CorrelationDefinition()
+    {
+        var filter = new CorrelationRuleFilter
+        {
+            CorrelationId = " Correlation caf\u00E9 & <\u03BB>\nline ",
+            MessageId = " Message caf\u00E9 & <\u03BB>\nline ",
+            To = " To caf\u00E9 & <\u03BB>\nline ",
+            ReplyTo = " ReplyTo caf\u00E9 & <\u03BB>\nline ",
+            Subject = " Subject caf\u00E9 & <\u03BB>\nline ",
+            SessionId = " Session caf\u00E9 & <\u03BB>\nline ",
+            ReplyToSessionId = " ReplySession caf\u00E9 & <\u03BB>\nline ",
+            ContentType = " ContentType caf\u00E9 & <\u03BB>\nline ",
+        };
+        filter.ApplicationProperties.Add("Text", " Text caf\u00E9 & <\u03BB>\nline ");
+        filter.ApplicationProperties.Add("Int32", int.MinValue);
+        filter.ApplicationProperties.Add("Int64", long.MaxValue);
+        filter.ApplicationProperties.Add("Boolean", true);
+        filter.ApplicationProperties.Add("Double", BitConverter.Int64BitsToDouble(0x3ff0_0000_0000_0001));
+        filter.ApplicationProperties.Add("DateTime", new DateTime(2023, 11, 14, 22, 13, 20, 123, DateTimeKind.Utc));
+        filter.ApplicationProperties.Add("NegativeZero", BitConverter.Int64BitsToDouble(unchecked((long)0x8000_0000_0000_0000UL)));
+        filter.ApplicationProperties.Add("PositiveInfinity", double.PositiveInfinity);
+        filter.ApplicationProperties.Add("NegativeInfinity", double.NegativeInfinity);
+        filter.ApplicationProperties.Add("SmallestDouble", double.Epsilon);
+        filter.ApplicationProperties.Add("LargestDouble", double.MaxValue);
+        return filter;
+    }
+
+    private static async Task CorrelationCycleAsync(
+        ServiceBusAdministrationClient client, ServiceBusAdministrationClient other,
+        string subscription, string suffix, CancellationToken token)
+    {
+        string name = $"Correlation-{suffix}";
+        Response<RuleProperties> created = await client.CreateRuleAsync(
+            Topic, subscription, new CreateRuleOptions(name, CorrelationDefinition()), token);
+        RequireStatus(created.GetRawResponse(), 201);
+        RequireCorrelationRule(created.Value, name);
+        Response<RuleProperties> fetched = await other.GetRuleAsync(Topic, subscription, name, token);
+        RequireStatus(fetched.GetRawResponse(), 200);
+        RequireCorrelationRule(fetched.Value, name);
+        int pages = 0;
+        await foreach (Page<RuleProperties> page in other.GetRulesAsync(Topic, subscription, token).AsPages())
+        {
+            Require(++pages == 1, "Correlation rule page work bound.");
+            RequireStatus(page.GetRawResponse(), 200);
+            Require(page.Values.Count == 1, "Exact single correlation rule page size.");
+            RequireCorrelationRule(page.Values[0], name);
+        }
+        Require(pages == 1, "Complete single correlation rule page.");
+        RequireStatus(await client.DeleteRuleAsync(Topic, subscription, name, token), 200);
+        await RequireMissingGetAsync(other, subscription, name, token);
+        await RequireRulesAsync(other, subscription, token);
+    }
+
+    private static void RequireCorrelationRule(RuleProperties rule, string name)
+    {
+        Require(string.Equals(rule.Name, name, StringComparison.Ordinal), "Ordinal correlation rule name.");
+        Require(rule.Filter is CorrelationRuleFilter && rule.Filter.GetType() == typeof(CorrelationRuleFilter)
+            && rule.Action is null, "Concrete correlation rule without action.");
+        var actual = (CorrelationRuleFilter)rule.Filter;
+        CorrelationRuleFilter expected = CorrelationDefinition();
+        foreach ((string actualValue, string expectedValue) in new[]
+        {
+            (actual.CorrelationId, expected.CorrelationId),
+            (actual.MessageId, expected.MessageId),
+            (actual.To, expected.To),
+            (actual.ReplyTo, expected.ReplyTo),
+            (actual.Subject, expected.Subject),
+            (actual.SessionId, expected.SessionId),
+            (actual.ReplyToSessionId, expected.ReplyToSessionId),
+            (actual.ContentType, expected.ContentType),
+        })
+        {
+            Require(string.Equals(actualValue, expectedValue, StringComparison.Ordinal),
+                "Exact ordinal correlation system field.");
+        }
+        var actualKeys = new HashSet<string>(actual.ApplicationProperties.Keys, StringComparer.Ordinal);
+        Require(actual.ApplicationProperties.Count == expected.ApplicationProperties.Count
+            && actualKeys.SetEquals(expected.ApplicationProperties.Keys), "Exact ordinal correlation property keys.");
+        foreach ((string key, object expectedValue) in expected.ApplicationProperties)
+        {
+            Require(actual.ApplicationProperties.TryGetValue(key, out object? actualValue)
+                && actualValue?.GetType() == expectedValue.GetType(), "Exact correlation CLR property type.");
+            bool matches = expectedValue switch
+            {
+                string value => actualValue is string actualString
+                    && string.Equals(actualString, value, StringComparison.Ordinal),
+                int value => actualValue is int actualInt && actualInt == value,
+                long value => actualValue is long actualLong && actualLong == value,
+                bool value => actualValue is bool actualBoolean && actualBoolean == value,
+                double value => actualValue is double actualDouble
+                    && BitConverter.DoubleToInt64Bits(actualDouble) == BitConverter.DoubleToInt64Bits(value),
+                DateTime value => actualValue is DateTime actualDate
+                    && actualDate.Kind == DateTimeKind.Utc && actualDate.Ticks == value.Ticks,
+                _ => false,
+            };
+            Require(matches, "Exact correlation typed property value.");
+        }
     }
 
     private static async Task RefusalsAsync(

@@ -222,6 +222,16 @@ pub(super) async fn run<P: StoreProvider>(
         fixture,
         oracle,
         dll,
+        AtomScenario::RulesCorrelation,
+        4,
+        4,
+        OwnedRules::Empty,
+    )
+    .await?;
+    stage(
+        fixture,
+        oracle,
+        dll,
         AtomScenario::RulesRecreate,
         2,
         2,

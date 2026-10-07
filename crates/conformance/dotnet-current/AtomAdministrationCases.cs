@@ -16,7 +16,7 @@ internal static class AtomAdministrationCases
         "subscriptions-refusals", "subscriptions-delete", "subscriptions-recreate",
         "subscriptions-denied", "subscriptions-tls-refused",
         "rules-empty", "rules-create", "rules-inspect", "rules-refusals",
-        "rules-delete", "rules-sql", "rules-recreate", "rules-opaque", "rules-denied", "rules-tls-refused",
+        "rules-delete", "rules-sql", "rules-correlation", "rules-recreate", "rules-opaque", "rules-denied", "rules-tls-refused",
     };
 
     internal static async Task<int> RunAsync(string[] args)
@@ -116,6 +116,7 @@ internal static class AtomAdministrationCases
             case "rules-refusals":
             case "rules-delete":
             case "rules-sql":
+            case "rules-correlation":
             case "rules-recreate":
             case "rules-opaque":
             case "rules-denied":
