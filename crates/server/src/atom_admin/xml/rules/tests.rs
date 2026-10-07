@@ -100,18 +100,289 @@ fn filter_type_and_expression_must_match_exactly() {
             Err(RuleXmlError::InvalidDefinition)
         );
     }
-    for kind in [
-        "SqlFilter",
-        "CorrelationFilter",
-        "truefilter",
-        "i:TrueFilter",
-        "",
-    ] {
+    for kind in ["CorrelationFilter", "truefilter", "i:TrueFilter", ""] {
         assert_eq!(
             decode(&properties("x", kind, "1=1")),
             Err(RuleXmlError::UnsupportedDefinition)
         );
     }
+}
+
+#[test]
+fn sql_filter_sources_and_both_pin_shapes_are_exact() {
+    for expression in [
+        "1=1",
+        "1=0",
+        "  user.colour = 'Red & <x>' OR sys.Label IS NULL  ",
+        "p('@literal') = 1",
+        "[\u{03B1}] = '\u{00E9}'",
+        "user.colour = 'Red'\r\n",
+    ] {
+        let escaped = quick_xml::escape::escape(expression);
+        let expected = definition(
+            " SQL ",
+            RuleFilter::Sql(domain::SqlFilter::new(expression).unwrap()),
+        );
+        for parameters in ["", "<Parameters/>", "<Parameters></Parameters>"] {
+            let value = format!(
+                "{}<Name> SQL </Name>",
+                filter("SqlFilter", &escaped, parameters)
+            );
+            assert_eq!(decode(&value), Ok(expected.clone()));
+            let reordered = format!(
+                "<Name> SQL </Name>{}",
+                filter("SqlFilter", &escaped, parameters)
+            );
+            assert_eq!(decode(&reordered), Ok(expected.clone()));
+        }
+        let RuleFilter::Sql(sql) = &expected.filter else {
+            panic!("SQL constants must not be relabelled as Boolean filters");
+        };
+        assert_eq!(sql.expression(), expression);
+        assert_eq!(sql.semantic_version(), domain::SQL_FILTER_SEMANTIC_VERSION);
+    }
+    assert_eq!(
+        decode(&properties(
+            "x",
+            "SqlFilter",
+            "&#32;user.colour&#32;=&#32;'Red'&#13;&#10;"
+        )),
+        Ok(definition(
+            "x",
+            RuleFilter::Sql(domain::SqlFilter::new(" user.colour = 'Red'\r\n").unwrap())
+        ))
+    );
+}
+
+#[test]
+fn sql_source_width_and_compile_limits_stay_definition_errors() {
+    use domain::{SqlCompileError, SqlCompileLimit, SqlProgram};
+
+    let exact = format!(
+        "'{}'",
+        "a".repeat(domain::MAX_SQL_EXPRESSION_UTF16_UNITS - 2)
+    );
+    assert!(decode(&properties("x", "SqlFilter", &exact)).is_ok());
+    let tokens = format!("{}TRUE", " ".repeat(domain::MAX_SQL_EXPRESSION_TOKENS - 1));
+    assert!(decode(&properties("x", "SqlFilter", &tokens)).is_ok());
+    let in_items = std::iter::repeat_n("1", domain::MAX_SQL_IN_ITEMS)
+        .collect::<Vec<_>>()
+        .join(",");
+    assert!(decode(&properties("x", "SqlFilter", &format!("x IN ({in_items})"))).is_ok());
+    for (expression, kind) in [
+        (
+            "a".repeat(domain::MAX_SQL_EXPRESSION_BYTES + 1),
+            SqlCompileLimit::SourceBytes,
+        ),
+        (
+            "a".repeat(domain::MAX_SQL_EXPRESSION_UTF16_UNITS + 1),
+            SqlCompileLimit::SourceUtf16Units,
+        ),
+        (format!(" {tokens}"), SqlCompileLimit::PhysicalTokens),
+        (
+            format!(
+                "{}TRUE{}",
+                "(".repeat(domain::MAX_SQL_PARSER_DEPTH + 1),
+                ")".repeat(domain::MAX_SQL_PARSER_DEPTH + 1)
+            ),
+            SqlCompileLimit::ParserDepth,
+        ),
+        (
+            std::iter::repeat_n("x", domain::MAX_SQL_EXPRESSION_DEPTH + 1)
+                .collect::<Vec<_>>()
+                .join("+"),
+            SqlCompileLimit::ExpressionDepth,
+        ),
+        (format!("x IN ({in_items},1)"), SqlCompileLimit::InItems),
+    ] {
+        assert!(matches!(
+            SqlProgram::compile(&expression),
+            Err(SqlCompileError::Limit { kind: actual, .. }) if actual == kind
+        ));
+        assert_eq!(
+            decode(&properties("x", "SqlFilter", &expression)),
+            Err(RuleXmlError::InvalidDefinition)
+        );
+    }
+    for expression in ["", "broken =", "lower(name)", "?", "1=1;"] {
+        assert_eq!(
+            decode(&properties("x", "SqlFilter", expression)),
+            Err(RuleXmlError::InvalidDefinition)
+        );
+    }
+}
+
+#[test]
+fn sql_unsupported_parameters_actions_and_types_are_closed() {
+    let valid = properties("x", "SqlFilter", "1=1");
+    for (parameters, error) in [
+        ("<Parameters>x</Parameters>", RuleXmlError::Malformed),
+        ("<Parameters>&#32;</Parameters>", RuleXmlError::Malformed),
+        (
+            "<Parameters><KeyValueOfstringanyType><Key>p</Key><Value>1</Value></KeyValueOfstringanyType></Parameters>",
+            RuleXmlError::UnsupportedDefinition,
+        ),
+        ("<Parameters/><Parameters/>", RuleXmlError::Malformed),
+    ] {
+        assert_eq!(
+            decode(&format!(
+                "{}<Name>x</Name>",
+                filter("SqlFilter", "1=1", parameters)
+            )),
+            Err(error)
+        );
+    }
+    for extra in ["<Action/>", "<Unknown/>", "<CreatedAt/>"] {
+        assert_eq!(
+            decode(&format!("{valid}{extra}")),
+            Err(RuleXmlError::UnsupportedDefinition)
+        );
+    }
+    for kind in ["sqlfilter", "i:SqlFilter", "CorrelationFilter"] {
+        assert_eq!(
+            decode(&properties("x", kind, "1=1")),
+            Err(RuleXmlError::UnsupportedDefinition)
+        );
+    }
+    assert_eq!(
+        decode(&properties("x", "SqlFilter", "1=1").replace(
+            "<SqlExpression>1=1</SqlExpression>",
+            "<SqlExpression><Name>x</Name></SqlExpression>"
+        )),
+        Err(RuleXmlError::Malformed)
+    );
+}
+
+#[test]
+fn sql_filter_type_qname_reuses_current_namespace_proof() {
+    let prefixed = format!(
+        "<entry xmlns=\"{ATOM_NS}\" xmlns:s=\"{SERVICE_BUS_NS}\"><content type=\"application/xml\"><s:RuleDescription><s:Filter xmlns:i=\"{XSI_NS}\" i:type=\"SqlFilter\"><s:SqlExpression>1=1</s:SqlExpression><s:Parameters/></s:Filter><s:Name>x</s:Name></s:RuleDescription></content></entry>"
+    );
+    assert_eq!(
+        decode_definition(prefixed.as_bytes()),
+        Err(RuleXmlError::Malformed)
+    );
+    let bound = prefixed.replace(
+        "<s:Filter ",
+        &format!("<s:Filter xmlns=\"{SERVICE_BUS_NS}\" "),
+    );
+    assert_eq!(
+        decode_definition(bound.as_bytes()),
+        Ok(definition(
+            "x",
+            RuleFilter::Sql(domain::SqlFilter::new("1=1").unwrap())
+        ))
+    );
+    let no_default = bound.replace(
+        &format!("<s:Filter xmlns=\"{SERVICE_BUS_NS}\" "),
+        "<s:Filter xmlns=\"\" ",
+    );
+    assert_eq!(
+        decode_definition(no_default.as_bytes()),
+        Err(RuleXmlError::Malformed)
+    );
+}
+
+#[test]
+fn sql_projection_validates_decoded_source_and_xml_chars() {
+    let bytes = domain::codec::encode(&(1_u32, "broken =")).unwrap();
+    let malformed = domain::codec::decode::<domain::SqlFilter>(&bytes).unwrap();
+    let value = definition("x", RuleFilter::Sql(malformed));
+    assert_eq!(
+        validate_definition(&value),
+        Err(RuleXmlError::InvalidDefinition)
+    );
+    assert_eq!(encode_entry(&value), Err(RuleXmlError::InvalidDefinition));
+    assert!(
+        domain::codec::decode::<domain::SqlFilter>(
+            &domain::codec::encode(&(2_u32, "1=1")).unwrap()
+        )
+        .is_err()
+    );
+    let source = "'\u{FFFE}' = 'x'";
+    let value = definition(
+        "x",
+        RuleFilter::Sql(domain::SqlFilter::new(source).unwrap()),
+    );
+    assert_eq!(
+        validate_definition(&value),
+        Err(RuleXmlError::UnsupportedDefinition)
+    );
+    assert_eq!(
+        encode_entry(&value),
+        Err(RuleXmlError::UnsupportedDefinition)
+    );
+    assert_eq!(
+        decode(&properties("x", "SqlFilter", "'&#xFFFE;' = 'x'")),
+        Err(RuleXmlError::Malformed)
+    );
+    let mut values = vec![definition("x", RuleFilter::True); MAX_FEED_ENTRIES];
+    values[MAX_FEED_ENTRIES - 1] = value;
+    assert_eq!(
+        encode_feed(&values),
+        Err(RuleXmlError::UnsupportedDefinition)
+    );
+}
+
+#[test]
+fn sql_responses_preserve_cr_source_and_expression_preflight() {
+    let source = " \r\nuser.colour = 'Red & <x>'\r\n ";
+    let value = definition(
+        " SQL & ",
+        RuleFilter::Sql(domain::SqlFilter::new(source).unwrap()),
+    );
+    let bytes = encode_entry(&value).unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.contains("<title> SQL &amp; </title>"));
+    assert!(text.contains("<Name> SQL &amp; </Name>"));
+    assert!(text.contains("i:type=\"SqlFilter\""));
+    assert!(text.contains("&#13;\n"));
+    assert!(text.contains("<Parameters></Parameters>"));
+    for absent in ["<Action", "CreatedAt", "MessageCount", "SizeInBytes"] {
+        assert!(!text.contains(absent), "{absent}");
+    }
+    let mut reader = quick_xml::Reader::from_str(text);
+    let mut in_expression = false;
+    let mut decoded = String::new();
+    loop {
+        match reader.read_event().unwrap() {
+            Event::Start(start) if start.name().as_ref() == "SqlExpression" => {
+                in_expression = true;
+            }
+            Event::End(end) if end.name().as_ref() == "SqlExpression" => {
+                in_expression = false;
+            }
+            Event::Text(text) if in_expression => decoded.push_str(&text.xml10_content()),
+            Event::GeneralRef(reference) if in_expression => {
+                if let Some(value) = reference.resolve_char_ref().unwrap() {
+                    decoded.push(value);
+                } else {
+                    decoded.push_str(
+                        quick_xml::escape::resolve_xml_entity(reference.as_ref()).unwrap(),
+                    );
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    assert_eq!(decoded, source);
+    let text_bytes = value.name.as_str().len() * 2 + source.len();
+    let reserved = text_bytes * 6 + 1_024;
+    let mut total = MAX_REPLY_BYTES - reserved;
+    assert_eq!(definition_budget(&mut total, &value), Ok(()));
+    assert_eq!(total, MAX_REPLY_BYTES);
+    assert_eq!(
+        definition_budget(&mut total, &value),
+        Err(RuleXmlError::ReplyLimitExceeded)
+    );
+    let mut one_short = MAX_REPLY_BYTES - reserved + 1;
+    let before = one_short;
+    assert_eq!(
+        definition_budget(&mut one_short, &value),
+        Err(RuleXmlError::ReplyLimitExceeded)
+    );
+    assert_eq!(one_short, before);
 }
 
 #[test]

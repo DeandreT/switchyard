@@ -75,6 +75,12 @@ fn definition_budget(
         .as_str()
         .len()
         .checked_mul(2)
+        .and_then(|bytes| {
+            bytes.checked_add(match &definition.filter {
+                domain::RuleFilter::Sql(filter) => filter.expression().len(),
+                _ => 0,
+            })
+        })
         .ok_or(RuleXmlError::ReplyLimitExceeded)?;
     preflight(total, text_bytes, 1_024)
 }
@@ -90,9 +96,10 @@ fn entry(writer: &mut Writer<Reply>, definition: &AtomRuleDefinition) -> Result<
     let mut description = BytesStart::new("RuleDescription");
     description.push_attribute(("xmlns", SERVICE_BUS_NS));
     event(writer, Event::Start(description))?;
-    let (kind, expression) = match definition.filter {
+    let (kind, expression) = match &definition.filter {
         domain::RuleFilter::True => ("TrueFilter", "1=1"),
         domain::RuleFilter::False => ("FalseFilter", "1=0"),
+        domain::RuleFilter::Sql(filter) => ("SqlFilter", filter.expression()),
         _ => return Err(RuleXmlError::UnsupportedDefinition),
     };
     let mut filter = BytesStart::new("Filter");

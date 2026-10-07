@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use domain::{RuleFilter, RuleName};
+use domain::{RuleFilter, RuleName, SqlFilter};
 use quick_xml::{
     Reader, XmlVersion,
     events::{BytesRef, BytesStart, Event},
@@ -61,20 +61,18 @@ impl Node {
 enum FilterKind {
     True,
     False,
+    Sql,
 }
 
 impl FilterKind {
-    fn expression(self) -> &'static str {
+    fn filter(self, expression: String) -> Result<RuleFilter, RuleXmlError> {
         match self {
-            Self::True => "1=1",
-            Self::False => "1=0",
-        }
-    }
-
-    fn filter(self) -> RuleFilter {
-        match self {
-            Self::True => RuleFilter::True,
-            Self::False => RuleFilter::False,
+            Self::True if expression == "1=1" => Ok(RuleFilter::True),
+            Self::False if expression == "1=0" => Ok(RuleFilter::False),
+            Self::Sql => SqlFilter::new(expression)
+                .map(RuleFilter::Sql)
+                .map_err(|_| RuleXmlError::InvalidDefinition),
+            _ => Err(RuleXmlError::InvalidDefinition),
         }
     }
 }
@@ -103,6 +101,7 @@ struct Parser {
     parameters_seen: bool,
     name: Option<RuleName>,
     filter: Option<FilterKind>,
+    definition_filter: Option<RuleFilter>,
 }
 
 impl Parser {
@@ -121,6 +120,7 @@ impl Parser {
             parameters_seen: false,
             name: None,
             filter: None,
+            definition_filter: None,
         }
     }
 
@@ -279,6 +279,7 @@ impl Parser {
                 let kind = match attribute.value.as_str() {
                     "TrueFilter" => FilterKind::True,
                     "FalseFilter" => FilterKind::False,
+                    "SqlFilter" => FilterKind::Sql,
                     _ => return Err(RuleXmlError::UnsupportedDefinition),
                 };
                 let (namespace, _) = self.resolver.resolve_element(QName(&attribute.value));
@@ -334,14 +335,12 @@ impl Parser {
                 self.name =
                     Some(RuleName::new(frame.scalar).map_err(|_| RuleXmlError::InvalidDefinition)?);
             }
-            Node::SqlExpression
-                if frame.scalar
-                    != self
-                        .filter
+            Node::SqlExpression => {
+                self.definition_filter = Some(
+                    self.filter
                         .ok_or(RuleXmlError::InvalidDefinition)?
-                        .expression() =>
-            {
-                return Err(RuleXmlError::InvalidDefinition);
+                        .filter(frame.scalar)?,
+                );
             }
             _ => {}
         }
@@ -492,9 +491,8 @@ pub(crate) fn decode_definition(body: &[u8]) -> Result<AtomRuleDefinition, RuleX
                 let definition = AtomRuleDefinition {
                     name: parser.name.ok_or(RuleXmlError::InvalidDefinition)?,
                     filter: parser
-                        .filter
-                        .ok_or(RuleXmlError::InvalidDefinition)?
-                        .filter(),
+                        .definition_filter
+                        .ok_or(RuleXmlError::InvalidDefinition)?,
                 };
                 validate_definition(&definition)?;
                 return Ok(definition);

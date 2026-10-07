@@ -153,9 +153,11 @@ internal static class AtomRuleAdministrationCases
             ServiceBusFailureReason.MessagingEntityAlreadyExists);
         var parameterized = new TrueRuleFilter();
         parameterized.Parameters.Add("unsupported", 1);
+        var parameterizedSql = new SqlRuleFilter("1=1");
+        parameterizedSql.Parameters.Add("unsupported", 1);
         foreach ((string label, CreateRuleOptions options) in new (string, CreateRuleOptions)[]
         {
-            ("sql", new CreateRuleOptions($"Refused-{suffix}-sql", new SqlRuleFilter("1=1"))),
+            ("sql", new CreateRuleOptions($"Refused-{suffix}-sql", parameterizedSql)),
             ("correlation", new CreateRuleOptions($"Refused-{suffix}-correlation", new CorrelationRuleFilter())),
             ("parameters", new CreateRuleOptions($"Refused-{suffix}-parameters", parameterized)),
             ("action", new CreateRuleOptions($"Refused-{suffix}-action", new TrueRuleFilter())
@@ -182,10 +184,16 @@ internal static class AtomRuleAdministrationCases
     {
         await GetAsync(client, OpaqueSubscription, CreateRuleOptions.DefaultRuleName, true, token);
         await ExpectArgumentAsync(() => RequireRulesAsync(client, OpaqueSubscription, token));
-        foreach (string name in new[] { "NativeSql", "NativeAction" })
-        {
-            await ExpectArgumentAsync(() => client.GetRuleAsync(Topic, OpaqueSubscription, name, token));
-        }
+        Response<RuleProperties> sql = await client.GetRuleAsync(
+            Topic, OpaqueSubscription, "NativeSql", token);
+        RequireStatus(sql.GetRawResponse(), 200);
+        Require(string.Equals(sql.Value.Name, "NativeSql", StringComparison.Ordinal)
+            && sql.Value.Filter is SqlRuleFilter filter
+            && filter.GetType() == typeof(SqlRuleFilter)
+            && string.Equals(filter.SqlExpression, "1=0", StringComparison.Ordinal)
+            && filter.Parameters.Count == 0 && sql.Value.Action is null, "Exact native SQL rule definition.");
+        await ExpectArgumentAsync(() => client.GetRuleAsync(
+            Topic, OpaqueSubscription, "NativeAction", token));
         string transient = $"Transient-{suffix}";
         await CreateAsync(client, other, OpaqueSubscription, transient, false, token);
         RequireStatus(await client.DeleteRuleAsync(Topic, OpaqueSubscription, transient, token), 200);

@@ -1,6 +1,6 @@
 use super::*;
 
-use domain::{RuleFilter, RuleName, SqlFilter};
+use domain::{RuleFilter, RuleName, SqlAction, SqlFilter};
 use server::AtomRuleDefinition;
 
 fn definition(name: &str, keep: bool) -> Vec<u8> {
@@ -354,7 +354,7 @@ async fn rule_auth_closed_xml_and_conditions_have_no_owner_effects<P: StoreProvi
         let body = String::from_utf8(definition("Keep", true))?;
         for refused in [
             body.replace("<Name>Keep", "<Name>keep"),
-            body.replace("TrueFilter", "SqlFilter"),
+            body.replace("TrueFilter", "CorrelationFilter"),
             body.replace("<SqlExpression>1=1", "<SqlExpression>1=0"),
             body.replace("<Parameters />", "<Parameters><Parameter /></Parameters>"),
             body.replace("</RuleDescription>", "<Action /></RuleDescription>"),
@@ -434,10 +434,11 @@ async fn rule_listing_never_hides_opaque_rules_outside_the_page<P: StoreProvider
             .submit(
                 NamespaceName::new("tenant")?,
                 EntityPath::new("orders")?,
-                CommandKind::CreateRule {
+                CommandKind::CreateRuleWithAction {
                     subscription: SubscriptionName::new("worker")?,
                     name: RuleName::new("Opaque")?,
-                    filter: RuleFilter::Sql(SqlFilter::new("1=1")?),
+                    filter: RuleFilter::False,
+                    action: SqlAction::new("SET user.marker = 'native';")?,
                 },
             )
             .await?;
@@ -480,7 +481,7 @@ async fn rule_listing_never_hides_opaque_rules_outside_the_page<P: StoreProvider
         assert_eq!(
             status,
             StatusCode::CREATED,
-            "other healthy SQL rows are opaque to ordinary rule mutations"
+            "other healthy action rows are opaque to ordinary rule mutations"
         );
         let (status, _) = exchange(
             &node,
@@ -569,10 +570,390 @@ async fn rule_native_count_limit_returns_service_busy_and_preserves_healthy_read
     Ok(())
 }
 
+fn sql_definition(name: &str, source: &str) -> Vec<u8> {
+    String::from_utf8(definition(name, true))
+        .unwrap()
+        .replace("TrueFilter", "SqlFilter")
+        .replace(
+            "<SqlExpression>1=1</SqlExpression>",
+            &format!(
+                "<SqlExpression>{}</SqlExpression>",
+                quick_xml::escape::escape(source)
+            ),
+        )
+        .into_bytes()
+}
+
+fn assert_sql_image(
+    before: &StoreSnapshot,
+    after: &StoreSnapshot,
+    batch: WriteBatch,
+) -> TestResult {
+    let expected = MemoryStore::default();
+    expected.apply(
+        before
+            .entries()
+            .iter()
+            .fold(WriteBatch::default(), |batch, (key, value)| {
+                batch.put(key.clone(), value.clone())
+            }),
+    )?;
+    expected.apply(batch)?;
+    assert_eq!(
+        after,
+        &expected.snapshot()?,
+        "complete raw SQL mutation projection, not an independent domain oracle"
+    );
+    Ok(())
+}
+
+async fn sql_rule_crud_preserves_exact_source_and_retained_tls_state<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    let node = Node::start(provider).await?;
+    let mut expected = None;
+    let outcome = AssertUnwindSafe(async {
+        seed(&node, "orders", "worker").await?;
+        let namespace = NamespaceName::new("tenant")?;
+        let topic = EntityPath::new("orders")?;
+        let subscription = SubscriptionName::new("worker")?;
+        let child = topic.subscription(&subscription)?;
+        node.handle()
+            .submit(
+                namespace.clone(),
+                topic.clone(),
+                CommandKind::CreateSubscription {
+                    name: SubscriptionName::new("sibling")?,
+                    config: configured(),
+                },
+            )
+            .await?;
+        for sequence in 1..=3 {
+            node.handle()
+                .submit(
+                    namespace.clone(),
+                    topic.clone(),
+                    CommandKind::Send {
+                        message_id: format!("sql-retained-{sequence}"),
+                        body: vec![sequence as u8; 32],
+                        time_to_live_millis: None,
+                        session_id: None,
+                    },
+                )
+                .await?;
+            if sequence < 3 {
+                let CommandOutcome::Received(Some(delivery)) = node
+                    .handle()
+                    .submit(
+                        namespace.clone(),
+                        child.clone(),
+                        CommandKind::Receive {
+                            mode: domain::ReceiveMode::PeekLock,
+                            lock_duration_millis: None,
+                            session: None,
+                        },
+                    )
+                    .await?
+                else {
+                    panic!("trusted TLS SQL retention seed must be deliverable");
+                };
+                if sequence == 1 {
+                    node.handle()
+                        .submit(
+                            namespace.clone(),
+                            child.clone(),
+                            CommandKind::DeadLetter {
+                                sequence: delivery.sequence,
+                                lock_token: delivery.lock.unwrap().token,
+                                reason: "sql-retention".into(),
+                                description: "trusted seed".into(),
+                            },
+                        )
+                        .await?;
+                }
+            }
+        }
+        {
+            let machine = StateMachine::new(node.store.as_ref().unwrap().inner.clone());
+            let ready = machine
+                .message(&namespace, &child, domain::SequenceNumber::new(3))?
+                .unwrap();
+            assert_eq!(ready.state, domain::MessageState::Ready);
+            assert_eq!(ready.body, vec![3; 32]);
+            assert_eq!(ready.expires_at, Some(Timestamp::from_millis(61_000)));
+            let locked = machine
+                .message(&namespace, &child, domain::SequenceNumber::new(2))?
+                .unwrap();
+            assert!(matches!(locked.state, domain::MessageState::Locked { .. }));
+            let dead = machine
+                .message(
+                    &namespace,
+                    &child.dead_letter_queue()?,
+                    domain::SequenceNumber::new(1),
+                )?
+                .unwrap();
+            assert_eq!(dead.body, vec![1; 32]);
+            assert_eq!(
+                dead.dead_letter.unwrap().reason,
+                domain::DeadLetterReason::Application("sql-retention".into())
+            );
+        }
+        let source = " \r\nuser.colour = 'Red & <x>' OR sys.Label IS NULL\r\n ";
+        let name = RuleName::new("Sql")?;
+        let filter = SqlFilter::new(source)?;
+        let key = domain::keys::rule(&namespace, &topic, &subscription, &name);
+        let before = node.snapshot()?;
+        let clock = node.clock.0.load(Ordering::SeqCst);
+        let (status, created) = exchange(
+            &node,
+            Method::PUT,
+            &member("Sql"),
+            Some(management_token()),
+            &sql_definition("Sql", source),
+            false,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        let text = std::str::from_utf8(&created)?;
+        assert!(text.contains("<title>Sql</title>"));
+        assert!(text.contains("<Name>Sql</Name>"));
+        assert!(text.contains("i:type=\"SqlFilter\""));
+        assert!(text.contains(&format!(
+            "<SqlExpression>{}</SqlExpression>",
+            quick_xml::escape::escape(source)
+        )));
+        assert!(text.contains("<Parameters></Parameters>"));
+        for absent in ["<Action", "CreatedAt", "MessageCount", "SizeInBytes"] {
+            assert!(!text.contains(absent), "{absent}");
+        }
+        assert_eq!(node.clock.0.load(Ordering::SeqCst), clock + 1);
+        assert_sql_image(
+            &before,
+            &node.snapshot()?,
+            WriteBatch::default()
+                .put(
+                    key.clone(),
+                    domain::codec::encode(&domain::RuleDefinition {
+                        name: name.clone(),
+                        filter: RuleFilter::Sql(filter.clone()),
+                        created_at: Timestamp::from_millis(1_000),
+                        action: None,
+                    })?,
+                )
+                .put(
+                    domain::keys::clock(),
+                    domain::codec::encode(&Timestamp::from_millis(1_000))?,
+                ),
+        )?;
+        let retained = node.snapshot()?;
+        let (status, read) = exchange(
+            &node,
+            Method::GET,
+            &member("Sql"),
+            Some(management_token()),
+            b"",
+            false,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(read, created);
+        assert_eq!(
+            node.handle()
+                .get_atom_rule(
+                    namespace.clone(),
+                    topic.clone(),
+                    subscription.clone(),
+                    name.clone(),
+                )
+                .await?,
+            Some(AtomRuleDefinition {
+                name,
+                filter: RuleFilter::Sql(filter),
+            })
+        );
+        let (status, feed) = exchange(
+            &node,
+            Method::GET,
+            &collection(0, 100),
+            Some(management_token()),
+            b"",
+            false,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(std::str::from_utf8(&feed)?.matches("<entry").count(), 2);
+        assert!(std::str::from_utf8(&feed)?.contains("i:type=\"SqlFilter\""));
+        assert_eq!(node.snapshot()?, retained);
+        assert_eq!(node.clock.0.load(Ordering::SeqCst), clock + 1);
+        let (status, _) = exchange(
+            &node,
+            Method::PUT,
+            &member("Sql"),
+            Some(management_token()),
+            &sql_definition("Sql", "1=0"),
+            false,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(node.snapshot()?, retained);
+        assert_eq!(node.clock.0.load(Ordering::SeqCst), clock + 2);
+        let (status, body) = exchange(
+            &node,
+            Method::DELETE,
+            &member("Sql"),
+            Some(management_token()),
+            b"",
+            false,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_empty());
+        assert_eq!(node.clock.0.load(Ordering::SeqCst), clock + 3);
+        assert_sql_image(
+            &retained,
+            &node.snapshot()?,
+            WriteBatch::default().delete(key).put(
+                domain::keys::clock(),
+                domain::codec::encode(&Timestamp::from_millis(1_000))?,
+            ),
+        )?;
+        expected = Some(node.snapshot()?);
+        Ok(())
+    })
+    .catch_unwind()
+    .await;
+    let provider = node.finish(outcome).await?;
+    assert_eq!(provider.open()?.snapshot()?, expected.unwrap());
+    Ok(())
+}
+
+async fn sql_wire_refusals_and_stored_compile_health_keep_http_priorities<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    let node = Node::start(provider).await?;
+    let outcome = AssertUnwindSafe(async {
+        seed(&node, "orders", "worker").await?;
+        let token_limit = format!("{}TRUE", " ".repeat(domain::MAX_SQL_EXPRESSION_TOKENS));
+        let too_wide = "a".repeat(domain::MAX_SQL_EXPRESSION_UTF16_UNITS + 1);
+        let before = node.snapshot()?;
+        let effects = node.effects();
+        for source in [
+            "secret =",
+            "lower(name)",
+            token_limit.as_str(),
+            too_wide.as_str(),
+        ] {
+            let (status, body) = exchange(
+                &node,
+                Method::PUT,
+                &member("$Default"),
+                Some(management_token()),
+                &sql_definition("$Default", source),
+                false,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(!std::str::from_utf8(&body)?.contains("secret"));
+            assert_eq!(node.snapshot()?, before);
+            assert_eq!(
+                node.effects(),
+                effects,
+                "invalid wire SQL never invokes BrokerHandle, even for a duplicate"
+            );
+        }
+        let valid = String::from_utf8(sql_definition("Sql", "1=1"))?;
+        for refused in [
+            valid.replace("<Parameters />", "<Parameters><Parameter /></Parameters>"),
+            valid.replace("</RuleDescription>", "<Action /></RuleDescription>"),
+            valid.replace("SqlFilter", "CorrelationFilter"),
+        ] {
+            let (status, _) = exchange(
+                &node,
+                Method::PUT,
+                &member("Sql"),
+                Some(management_token()),
+                refused.as_bytes(),
+                false,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(node.snapshot()?, before);
+            assert_eq!(node.effects(), effects);
+        }
+        let namespace = NamespaceName::new("tenant")?;
+        let topic = EntityPath::new("orders")?;
+        let subscription = SubscriptionName::new("worker")?;
+        let corrupt = domain::keys::rule(
+            &namespace,
+            &topic,
+            &subscription,
+            &RuleName::new("corrupt")?,
+        );
+        let filter =
+            domain::codec::decode::<SqlFilter>(&domain::codec::encode(&(1_u32, "secret ="))?)?;
+        node.store
+            .as_ref()
+            .unwrap()
+            .inner
+            .apply(WriteBatch::default().put(
+                corrupt,
+                domain::codec::encode(&domain::RuleDefinition {
+                    name: RuleName::new("corrupt")?,
+                    filter: RuleFilter::Sql(filter),
+                    created_at: Timestamp::from_millis(1_000),
+                    action: None,
+                })?,
+            ))?;
+        let stored = node.snapshot()?;
+        let clock = node.clock.0.load(Ordering::SeqCst);
+        for path in [member("$Default"), member("Absent"), collection(1_000, 1)] {
+            let (status, body) = exchange(
+                &node,
+                Method::GET,
+                &path,
+                Some(management_token()),
+                b"",
+                false,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(!std::str::from_utf8(&body)?.contains("secret"));
+            assert_eq!(node.snapshot()?, stored);
+            assert_eq!(node.clock.0.load(Ordering::SeqCst), clock);
+        }
+        for (method, body) in [
+            (Method::PUT, sql_definition("$Default", "1=1")),
+            (Method::DELETE, Vec::new()),
+        ] {
+            let clock = node.clock.0.load(Ordering::SeqCst);
+            let (status, public) = exchange(
+                &node,
+                method,
+                &member("$Default"),
+                Some(management_token()),
+                &body,
+                false,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(!std::str::from_utf8(&public)?.contains("secret"));
+            assert_eq!(node.snapshot()?, stored);
+            assert_eq!(node.clock.0.load(Ordering::SeqCst), clock + 1);
+        }
+        Ok(())
+    })
+    .catch_unwind()
+    .await;
+    node.finish(outcome).await?;
+    Ok(())
+}
+
 subscription_transport_backends! {
     rule_crud_empty_feed_and_default_recreation_reopen,
     rule_marker_authorization_preserves_literal_names,
     rule_auth_closed_xml_and_conditions_have_no_owner_effects,
     rule_listing_never_hides_opaque_rules_outside_the_page,
     rule_native_count_limit_returns_service_busy_and_preserves_healthy_reads,
+    sql_rule_crud_preserves_exact_source_and_retained_tls_state,
+    sql_wire_refusals_and_stored_compile_health_keep_http_priorities,
 }

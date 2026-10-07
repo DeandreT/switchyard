@@ -73,8 +73,18 @@ pub(crate) fn validate_name(name: &RuleName) -> Result<(), RuleXmlError> {
 
 pub(crate) fn validate_definition(definition: &AtomRuleDefinition) -> Result<(), RuleXmlError> {
     validate_name(&definition.name)?;
-    if !matches!(definition.filter, RuleFilter::True | RuleFilter::False) {
-        return Err(RuleXmlError::UnsupportedDefinition);
+    match &definition.filter {
+        RuleFilter::True | RuleFilter::False => Ok(()),
+        RuleFilter::Sql(filter) => {
+            if filter.semantic_version() != domain::SQL_FILTER_SEMANTIC_VERSION
+                || !lexical::legal_chars(filter.expression())
+            {
+                return Err(RuleXmlError::UnsupportedDefinition);
+            }
+            domain::SqlProgram::compile(filter.expression())
+                .map(|_| ())
+                .map_err(|_| RuleXmlError::InvalidDefinition)
+        }
+        RuleFilter::Correlation(_) => Err(RuleXmlError::UnsupportedDefinition),
     }
-    Ok(())
 }
