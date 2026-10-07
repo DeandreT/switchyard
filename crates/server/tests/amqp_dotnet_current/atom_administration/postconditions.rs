@@ -167,6 +167,16 @@ impl Oracle {
                     )?;
                 }
             }
+            AtomScenario::SubscriptionsEmpty
+            | AtomScenario::SubscriptionsCreate
+            | AtomScenario::SubscriptionsInspect
+            | AtomScenario::SubscriptionsRefusals
+            | AtomScenario::SubscriptionsDelete
+            | AtomScenario::SubscriptionsRecreate
+            | AtomScenario::SubscriptionsDenied
+            | AtomScenario::SubscriptionsTlsRefused => {
+                return Err("subscription scenario cannot use queue replay".into());
+            }
             AtomScenario::Empty
             | AtomScenario::Noop
             | AtomScenario::Refusals
@@ -520,5 +530,26 @@ mod tests {
             Some(600_000)
         );
         assert_eq!(retention_config(true).default_time_to_live_millis, None);
+    }
+
+    #[test]
+    fn subscription_scenarios_refuse_queue_replay_without_mutation() -> TestResult {
+        let oracle = Oracle::new();
+        let namespace = NamespaceName::new("tenant")?;
+        let before = oracle.store.snapshot()?;
+        for scenario in [
+            AtomScenario::SubscriptionsEmpty,
+            AtomScenario::SubscriptionsCreate,
+            AtomScenario::SubscriptionsInspect,
+            AtomScenario::SubscriptionsRefusals,
+            AtomScenario::SubscriptionsDelete,
+            AtomScenario::SubscriptionsRecreate,
+            AtomScenario::SubscriptionsDenied,
+            AtomScenario::SubscriptionsTlsRefused,
+        ] {
+            assert!(oracle.advance(&namespace, scenario).is_err());
+            assert_eq!(oracle.store.snapshot()?, before);
+        }
+        Ok(())
     }
 }

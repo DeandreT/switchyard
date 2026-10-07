@@ -12,6 +12,9 @@ internal static class AtomAdministrationCases
     {
         "empty", "create", "update", "noop", "refusals", "quota", "retention",
         "delete", "paging", "denied", "tls-refused",
+        "subscriptions-empty", "subscriptions-create", "subscriptions-inspect",
+        "subscriptions-refusals", "subscriptions-delete", "subscriptions-recreate",
+        "subscriptions-denied", "subscriptions-tls-refused",
     };
 
     internal static async Task<int> RunAsync(string[] args)
@@ -22,7 +25,8 @@ internal static class AtomAdministrationCases
             || endpoint.UserInfo.Length != 0 || endpoint.Query.Length != 0
             || endpoint.Fragment.Length != 0 || endpoint.AbsolutePath != "/"
             || (endpoint.Host != "localhost"
-                && !(args[1] == "tls-refused" && endpoint.Host == "127.0.0.1")))
+                && !((args[1] == "tls-refused" || args[1] == "subscriptions-tls-refused")
+                    && endpoint.Host == "127.0.0.1")))
         {
             Console.Error.WriteLine("Atom SDK diagnostic scenario=arguments exception=argument");
             return 2;
@@ -103,6 +107,16 @@ internal static class AtomAdministrationCases
     {
         switch (scenario)
         {
+            case "subscriptions-empty":
+            case "subscriptions-create":
+            case "subscriptions-inspect":
+            case "subscriptions-refusals":
+            case "subscriptions-delete":
+            case "subscriptions-recreate":
+            case "subscriptions-denied":
+            case "subscriptions-tls-refused":
+                await AtomSubscriptionAdministrationCases.RunAsync(client, other, scenario, suffix, token);
+                break;
             case "empty":
                 await AtomAdministrationPagingCases.RequireEmptyAsync(client, token);
                 await ExpectServiceBusAsync(() => client.GetQueueAsync("sdk-atom-missing", token),
@@ -353,7 +367,7 @@ internal static class AtomAdministrationCases
         }
     }
 
-    private static async Task ExpectServiceBusAsync(Func<Task> action, ServiceBusFailureReason reason)
+    internal static async Task ExpectServiceBusAsync(Func<Task> action, ServiceBusFailureReason reason)
     {
         try
         {
@@ -366,7 +380,7 @@ internal static class AtomAdministrationCases
         throw new InvalidOperationException("Expected Service Bus refusal was absent.");
     }
 
-    private static async Task ExpectArgumentAsync(Func<Task> action)
+    internal static async Task ExpectArgumentAsync(Func<Task> action)
     {
         try
         {
@@ -379,7 +393,7 @@ internal static class AtomAdministrationCases
         throw new InvalidOperationException("Expected unsupported-definition refusal was absent.");
     }
 
-    private static async Task ExpectUnauthorizedAsync(Func<Task> action)
+    internal static async Task ExpectUnauthorizedAsync(Func<Task> action)
     {
         try
         {
@@ -392,7 +406,7 @@ internal static class AtomAdministrationCases
         throw new InvalidOperationException("Expected Manage refusal was absent.");
     }
 
-    private static bool ContainsCertificateFailure(Exception error)
+    internal static bool ContainsCertificateFailure(Exception error)
     {
         static bool Contains<T>(Exception current, Func<T, bool> matches) where T : Exception =>
             (current is T typed && matches(typed))

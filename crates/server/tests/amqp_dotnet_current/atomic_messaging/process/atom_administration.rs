@@ -15,6 +15,14 @@ pub(crate) enum AtomScenario {
     Paging,
     Denied,
     TlsRefused,
+    SubscriptionsEmpty,
+    SubscriptionsCreate,
+    SubscriptionsInspect,
+    SubscriptionsRefusals,
+    SubscriptionsDelete,
+    SubscriptionsRecreate,
+    SubscriptionsDenied,
+    SubscriptionsTlsRefused,
 }
 
 impl AtomScenario {
@@ -31,6 +39,14 @@ impl AtomScenario {
             Self::Paging => "paging",
             Self::Denied => "denied",
             Self::TlsRefused => "tls-refused",
+            Self::SubscriptionsEmpty => "subscriptions-empty",
+            Self::SubscriptionsCreate => "subscriptions-create",
+            Self::SubscriptionsInspect => "subscriptions-inspect",
+            Self::SubscriptionsRefusals => "subscriptions-refusals",
+            Self::SubscriptionsDelete => "subscriptions-delete",
+            Self::SubscriptionsRecreate => "subscriptions-recreate",
+            Self::SubscriptionsDenied => "subscriptions-denied",
+            Self::SubscriptionsTlsRefused => "subscriptions-tls-refused",
         }
     }
 
@@ -418,6 +434,14 @@ mod tests {
             AtomScenario::Paging,
             AtomScenario::Denied,
             AtomScenario::TlsRefused,
+            AtomScenario::SubscriptionsEmpty,
+            AtomScenario::SubscriptionsCreate,
+            AtomScenario::SubscriptionsInspect,
+            AtomScenario::SubscriptionsRefusals,
+            AtomScenario::SubscriptionsDelete,
+            AtomScenario::SubscriptionsRecreate,
+            AtomScenario::SubscriptionsDenied,
+            AtomScenario::SubscriptionsTlsRefused,
         ];
         for scenario in scenarios {
             let marker = scenario.marker();

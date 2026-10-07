@@ -17,6 +17,8 @@ mod fixture;
 mod postconditions;
 #[path = "atom_administration/stages.rs"]
 mod stages;
+#[path = "atom_administration/subscriptions.rs"]
+mod subscriptions;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
