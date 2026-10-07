@@ -31,8 +31,8 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; closed ordinary subscription HTTPS create/get/full-update/delete under native-created topics (gated with both pinned .NET clients on both backends), plus a closed True/False and bounded native SQL no-action/no-parameter Atom rule create/get/list/delete profile (library codec/owner/actual-TLS and dedicated exact-source SQL Create/Get/List/Delete SDK lifecycle verified with both pins, backends and constructors); Azure topic administration remains unimplemented |
-| Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD/CLI; bounded REMOVE and String/Boolean/Int64-literal SET actions with independent copies and finite local conversion-error dead letters, not full Azure/CLR actions |
+| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; closed ordinary subscription HTTPS create/get/full-update/delete under native-created topics (gated with both pinned .NET clients on both backends), plus a closed True/False, bounded native SQL and typed correlation no-action/no-parameter Atom rule create/get/list/delete profile (True/False and dedicated exact-source SQL SDK lifecycles verified with both pins, backends and constructors; typed correlation library codec/owner/actual-TLS verification passed; positive correlation SDK lifecycle not yet verified); Azure topic administration remains unimplemented |
+| Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD/CLI; typed no-action correlation projection through the closed HTTPS rule profile; bounded REMOVE and String/Boolean/Int64-literal SET actions with independent copies and finite local conversion-error dead letters, not full Azure/CLR actions |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Dead-letter | Pre-1.0 | State machine, AMQP mapping |
@@ -42,7 +42,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API; native generation-fenced and HTTPS full-definition replacement for finite ordinary queues; closed ordinary subscription HTTPS full-definition replacement |
 | Finite queue capacity | Pre-1.0 | Trusted owner API, separate native create/get/full-definition service, and HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage, Rust AMQP socket tests, both pinned .NET administration/limit-update and WSS ingress/credit-recovery gates, explicit CLI activation; see [Finite Queue Capacity](finite-queue-capacity.md) |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
-| Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; closed ordinary subscription create/get/full-update/delete under native-created topics is library gated with both pinned .NET clients on both backends; closed True/False and bounded native SQL no-action/no-parameter rule Create/Get/List/Delete are separately gated with both pinned .NET clients on both backends and constructors; rule updates, correlation filters/actions, topic creation and subscription list/runtime are not implemented |
+| Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; closed ordinary subscription create/get/full-update/delete under native-created topics is library gated with both pinned .NET clients on both backends; closed True/False and bounded native SQL no-action/no-parameter rule Create/Get/List/Delete are separately gated with both pinned .NET clients on both backends and constructors; typed correlation rule projection passed codec/owner/actual-TLS gates with no positive SDK lifecycle claim; rule updates/actions, topic creation and subscription list/runtime are not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete, separate finite queue create/get/full-definition replacement, and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; offline JWT Manage via library opt-in or the CLI policy-file option; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
 | Quorum replication | Pre-1.0 | An isolated [fixed-three-node in-process runtime](experimental-replica-runtime.md) exists for bounded Create/Send, but is not integrated with server listeners or the production proposer; production startup remains refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup. The runtime exposes no snapshots or production deployment activation. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
@@ -1847,10 +1847,11 @@ gates are recorded separately below; finite-queue SDK receipts remain separate.
 
 ### Library HTTPS Rule Administration
 
-The existing HTTPS listener adds closed True/False and bounded native SQL
-no-action/no-parameter rule create/get/list/delete under compatible ordinary
-subscriptions and live native-created topics. No listener, credential, dependency or durable format
-changes. The exact XML, literal names, bounded list and owner semantics are in
+The existing HTTPS listener adds closed True/False, bounded native SQL and typed
+correlation no-action/no-parameter rule create/get/list/delete under compatible
+ordinary subscriptions and live native-created topics. No listener, credential or
+durable format changes. Correlation declares Chrono 0.4.45 and pinned ICU4X
+case-map/data providers 2.2.0 and 1.3.2; preceding lockfile versions are retained. The exact XML, literal names, bounded list and owner semantics are in
 [Atom Rule Administration](atom-rules.md).
 
 Only structural Subscriptions/subscriptions and Rules/rules markers map to
@@ -1862,7 +1863,8 @@ CreatedAt or runtime counts. Update/If-Match conditions remain unsupported.
 
 Get uses the complete bounded native rule getter before selecting a supported
 rule. List proves the whole set representable before skip/take; skipped or
-out-of-page correlation/action rules cannot be hidden by a short successful feed.
+out-of-page unsupported correlation/action rules cannot be hidden by a short
+successful feed; projectable correlation rules are included normally.
 Create/Delete preserve healthy opaque siblings through the existing child-fenced
 planners and return without postcommit reads. Only the owned rule and Clock
 change; retained records/configurations/deadlines/identities and other rule
@@ -1970,8 +1972,9 @@ native semantic version 1 and the existing compiler, not a new SQL grammar or
 wire action/parameter model. Original once-decoded source is retained without
 trim/case folding or relabeling SQL `1=1`/`1=0` as Boolean types. Existing limits are
 1,024 UTF-16 units, 4,096 UTF-8 bytes, 128 physical tokens/nodes, depth 32 and 32 IN
-items; complete-set compilation/evaluation budgets remain native. Correlation
-filters, nonempty Parameters, every Action and Rule Update remain unsupported.
+items; complete-set compilation/evaluation budgets remain native. Typed correlation
+is described below; nonempty Parameters, every Action and Rule Update remain
+unsupported.
 
 Raw XML 1.0 CR/CRLF normalizes once to LF; numeric `&#13;` survives as CR. Replies
 escape retained CR numerically, count source bytes in their sixfold preflight
@@ -1982,7 +1985,7 @@ No normalization of an expected SDK source is allowed to hide that boundary.
 Get completes stored-set health/compilation before selected projection. List
 proves every stored rule representable before skip/take, including rows outside
 the requested page. Action is rejected before constructing an action-free DTO.
-Create/Delete preserve healthy opaque correlation/action siblings and the
+Create/Delete preserve healthy unsupported correlation/action siblings and the
 original rule-plus-Clock mutation/retained-state semantics. Invalid desired SQL
 syntax/unsupported grammar/compile-limit failures map 400: HTTP decoding rejects
 before BrokerHandle, while direct DTO validation runs inside the owner turn
@@ -2083,6 +2086,90 @@ Get-only receipt above, remain historical with their exact counts/fingerprints.
 No SDK message selection/settlement, rule dates, multipage listing, CLI-launched
 broker, production readiness or general Azure SQL administration is certified.
 See [SQL SDK Lifecycle Verification](atom-rules.md#sql-sdk-lifecycle-verification).
+
+### Bounded Correlation Rule Administration
+
+The closed HTTPS rule profile accepts typed CorrelationFilter with all eight
+optional ordinal system strings, including Some-empty; Label maps to subject.
+Empty correlation remains typed. Properties uses KeyValueOfstringanyType with
+XSD-resolved string, int, long, boolean, double or dateTime Value QNames, preserving
+String/Int32/Int64/Boolean/Double/Timestamp without coercion. Negative zero and
+INF/-INF are retained; every NaN payload, Null, other scalar widths/types,
+compound values and duration/TimeSpan are refused. Duplicate/unknown nodes and
+keys are refused. At most 32 combined system/application conditions are admitted.
+
+DateTime requires lexical and normalized UTC years 1..9999, a valid calendar,
+explicit Z or +/-hh:mm up to +/-14:00 and exact whole milliseconds. Missing zones,
+leap seconds, sub-millisecond values and range crossings are refused; replies
+use UTC with three fractional digits. Exact XML-legal strings/keys retain spelling,
+Unicode and character-reference CR. Constructor values omitted or transformed by
+an SDK writer cannot be recovered from HTTP; no original SDK-constructor CR or
+empty-system-string preservation follows from codec/raw HTTPS evidence.
+
+Native case-distinct keys that collide under the declared equality-only .NET
+8.0.31 Linux ICU 78.3 model are refused without normalization or merging. The
+model uses Unicode 17 BMP with CLR fixed-page/Latin1 exceptions and Unicode 15
+supplementary data, not a universal NLS/invariant/other-runtime comparison.
+Non-colliding keys, including empty/whitespace keys, remain exact. Whole-set health
+precedes selected lookup; complete representability precedes pagination. Supported
+correlation can coexist with healthy unsupported scalar/key-collision/action rows,
+but those selected rows and whole List are refused rather than stripped/hidden.
+Native encoded-size errors keep original after-stamp 503 and duplicate priority.
+Checked property text/scalar/markup reservations retain the 1 MiB reply bound.
+
+Verification passed 532P/0F/21I across four focused targets and 553 rows,
+preserving all 532 preceding tuples with statuses, reasons and multiplicities.
+The only additions are eleven codec, six Memory/Fjall owner and four actual-TLS
+passing cases for typed values, empty filters, nine collision/twelve distinct key
+pairs, health/refusal priorities, lexical-year-zero offset crossings, original
+native-size errors and retained state/Clock/batches/reopen/wakeups.
+
+All nine serial gates closed successfully against twelve changed
+source/manifest/lock paths and twenty-seven unchanged references, checked before
+and after each gate: focused tests, both separate Rule SDK regressions, strict
+workspace lint/all-target builds with default/all features, formatting and the
+full workspace. The full run passed 6,025P/0F/21I across 162 groups and 6,046 rows,
+retaining all 6,025 preceding tuples plus only the same twenty-one passing cases.
+All 156 owners/146 executables remain, including unchanged 119 CLI rows across
+eight owners/eight executables. Two newly guarded domain paths remain unchanged
+references. Shared cache/two cores/two jobs, layouts 17/11 and CLI flags remain.
+The lock adds nineteen packages, retaining all 352 preceding package
+versions/sources/checksums and prior resolved dependency edges.
+
+Actual CLR V4 and final formatted/workspace-aligned Rust V3 match seventeen
+vectors and all 1,112,064 valid scalar mappings with zero mismatches. Shared
+versions/checksums and casing/provider/property feature nodes match the final
+workspace, closing the earlier isolated-graph qualification only for this declared
+model, not arbitrary-string pair equivalence, universal portability or SDK-process
+custody.
+
+A separate package-free .NET 8.0.31 framework probe passed 25 required checks:
+fourteen double bit patterns, nine exact UTC dates and two lexical-year-zero
+refusals. Selected framework writer roundtrips retain those observed values;
+NaN/precision/Kind outputs are observations, not extra required checks or
+constructor-fidelity guarantees. No Service Bus SDK was loaded; this is not
+an SDK constructor, transport or lifecycle result.
+
+The retained initial focused run failed one codec negative-feed assertion when
+reply reservation exhausted before unsupported-Null projection. Only its test
+fixture changed to admit a small valid full feed first; production is unchanged.
+That failed run is excluded from final passing gate evidence.
+
+Both existing Rule SDK regressions passed with pins 7.21.0/7.20.2 on Memory/Fjall
+and both constructors: one selected passing case and 75 filtered tests per pin.
+The unchanged thirteen-position sequence totals fifty-two completed children,
+104 verified loaded records and four successful stage/cleanup finishes; all four
+versions/owned-file fingerprints remain those in the preceding SDK table. The
+refusal fixture now uses 33 supported typed application conditions. Positive
+official correlation SDK Create/Get/List/Delete remains unverified in this
+increment. The other nineteen SDK opt-ins were not rerun; all twenty-one remain
+ignored in the ordinary suite. Prior True/False/SQL receipts remain exact
+historical evidence; same-domain replay, loaded-file custody, raw HTTPS versus
+SDK-constructor CR and cleanup limitations remain unchanged. No SDK message
+selection/settlement, rule dates, multipage listing, CLI-launched broker,
+production readiness or general Azure correlation claim follows. See
+[Bounded Correlation Profile](atom-rules.md#bounded-correlation-profile) and
+[Correlation Verification](atom-rules.md#correlation-verification).
 
 ### Official .NET Subscription Administration
 
