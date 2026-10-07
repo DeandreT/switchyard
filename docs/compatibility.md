@@ -42,7 +42,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
-| Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; additive offline JWT Manage library opt-in, CLI SAS-only; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
+| Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; offline JWT Manage via library opt-in or the CLI policy-file option; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
 | Quorum replication | Pre-1.0 | An isolated [fixed-three-node in-process runtime](experimental-replica-runtime.md) exists for bounded Create/Send, but is not integrated with server listeners or the production proposer; production startup remains refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup. The runtime exposes no snapshots or production deployment activation. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
 | Cross-placement-group transactions | Later | Out of initial scope |
@@ -837,11 +837,13 @@ not excluded, and no Unix-style nonblocking-open guarantee is made. The FIFO
 unit checks an explicitly opened descriptor; separate bounded Linux binary
 probes exercise the production opener.
 
-The option supplies the policy to configured AMQP listeners. Native
-administration still receives only the original SAS policy; this flag does not
-authorize JWT Manage requests there. CLI preflight probes are not an actual
-CLI-started JWT wire gate. OIDC, network key refresh, cloud parity and existing
-production/quorum refusals are unchanged, as are value 11 and layout 16.
+The option supplies the already-loaded policy to configured AMQP listeners and
+native `--admin-listen`. Native setup clones the pinned policy borrowed from the
+existing authentication configuration, without reopening or reparsing its file.
+It reuses the configured TLS identity and resource host, and preserves the
+optional development-maintenance readiness setup. CLI preflight probes alone
+are not a CLI-started JWT wire gate. OIDC, network key refresh, cloud parity and
+existing production/quorum refusals are unchanged, as are value 11 and layout 16.
 
 Verification: the closed CLI increment workspace passed 5,442 tests with no
 failures and 12 ignored cases, across 154 printed groups and 148 canonical
@@ -1647,9 +1649,10 @@ parity remain unverified.
 The optional `--admin-listen` endpoint serves native queue/topic/subscription
 create/get/list/update/delete through the broker owner. It is a
 separate HTTP/2 listener and reuses the AMQP
-TLS identity and shared-access policy when configured. Authenticated requests
-require TLS and a SAS token in `authorization` metadata with Manage permission
-for the requested entity. Queue and topic listings need namespace Manage;
+TLS identity and configured SAS/offline JWT policies. Authenticated requests
+require TLS and either a SAS token or, when an offline JWT policy is configured,
+a Bearer token in `authorization` metadata. The credential must grant Manage
+permission for the requested entity. Queue and topic listings need namespace Manage;
 subscription listing needs Manage on its parent topic, so an exact-child grant
 cannot enumerate siblings. The configured namespace is the only namespace
 accessible through that endpoint. Dead-letter shadows cannot be administered.
@@ -1658,11 +1661,14 @@ their backing queue through queue commands. Entity capacity and usage fields
 are absent because quota accounting
 is not implemented; they are not reported as zero-byte measurements.
 
-Library callers separately opt into offline JWT Manage authorization through
+Library callers opt into offline JWT Manage authorization through
 `NativeAdminService::with_offline_jwt_policy(policy, audience_host)`. It accepts
 an `auth::JwtPolicy`, alone or alongside optional SAS. Default SAS-only and
-unauthenticated development behavior is unchanged. The CLI does not call this
-builder: native `--admin-listen` remains SAS-only.
+unauthenticated development behavior is unchanged. Normal CLI startup calls this
+builder for native `--admin-listen` when `--offline-jwt-policy-file` is configured,
+using the already-loaded policy and the existing authentication resource host.
+The CLI still requires configured TLS and SAS before opening the policy file;
+it does not add a JWT-only startup mode.
 
 In JWT-configured mode, each request must carry exactly one `authorization`
 value, bounded to 8,199 encoded bytes. Bearer credentials require the exact
@@ -1686,7 +1692,7 @@ supply permissions. Authorization precedes substantive configuration, filter,
 action and cursor validation and owner operations, not every path parse: existing
 resource canonicalization and JWT resource-scope construction occur earlier.
 Credential failures use static responses without echoing token bytes. This
-library opt-in adds no discovery, OIDC/cloud authorization, refresh or revocation.
+policy opt-in adds no discovery, OIDC/cloud authorization, refresh or revocation.
 
 Verification: the native JWT suite passed twelve regular cases on Memory and
 Fjall, covering actual trusted TLS, namespace and entity Manage rights,
@@ -1707,6 +1713,25 @@ with the shared cache and two-CPU policy. The earlier workspace attempt was
 intentionally interrupted to include the reproduced scope fix; it is not a
 completed gate. No CLI-native JWT wire claim is made by this library increment.
 Dependency versions, schemas, value format 11 and durable layout 16 are unchanged.
+
+Verification: the CLI activation increment passed two regular binary/helper
+cases, three native setup cases and one borrowed-policy getter case. The actual
+server binary ran twice over trusted TLS against the same Fjall directory.
+Manage created the queue; after restart and removal of the loaded policy file,
+Manage Get/List and the original SAS branch still worked. Send-only mutations
+were denied, and physical reopen retained the exact independently constructed
+business snapshot, including the command clock. Setup checks retained default
+and SAS-only behavior, readiness opt-in and credential-before-owner ordering.
+The native library and AMQP JWT wire suites again passed twelve and eight cases.
+
+The closed full workspace passed 5,463 tests with no failures and thirteen
+ignored SDK cases, across 156 printed groups, 150 canonical owners and 140
+executables. Every preceding case name, status and ignore reason was retained;
+six regular cases were added. Both strict lint and build configurations and
+final formatting passed with the shared cache and two-CPU policy. The SDK gates
+were not rerun for this CLI increment. The test-only process feature uses the
+already-locked dependency; package versions, schemas, value format 11 and durable
+layout 16 are unchanged.
 
 The existing `EntityService` RPCs and field numbers are retained. Creation has
 separate presence-aware queue, topic, and subscription configurations; wrong-kind
