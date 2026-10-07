@@ -20,6 +20,7 @@ const SIBLING: &str = "NativeSibling";
 const OPAQUE: &str = "NativeOpaque";
 const DLQ_REASON: &str = "rule-retention";
 const DLQ_DESCRIPTION: &str = "trusted fixture seed";
+const SQL_EXPRESSION: &str = "  user.colour IN ('caf\u{e9} & <\u{3bb}>', 'blue') AND\n(sys.Label IS NULL OR user.count >= 2)  ";
 
 #[derive(Clone, Copy)]
 pub(super) enum OwnedRules {
@@ -283,6 +284,17 @@ pub(super) fn advance(
                     delete(handle, namespace, subscription.clone(), name)?;
                     missing_delete(handle, namespace, subscription.clone(), name)?;
                 }
+            }
+            AtomScenario::RulesSql => {
+                let name = format!("Sql-{suffix}");
+                create(
+                    handle,
+                    namespace,
+                    subscription.clone(),
+                    &name,
+                    RuleFilter::Sql(SqlFilter::new(SQL_EXPRESSION)?),
+                )?;
+                delete(handle, namespace, subscription, &name)?;
             }
             AtomScenario::RulesRecreate => create(
                 handle,
@@ -632,6 +644,19 @@ pub(super) fn check_batches(
                     });
                 }
             }
+            AtomScenario::RulesSql => {
+                let rule = stored(
+                    &format!("Sql-{suffix}"),
+                    RuleFilter::Sql(SqlFilter::new(SQL_EXPRESSION)?),
+                    None,
+                )?;
+                let key = keys::rule(namespace, &topic(), &subscription, &rule.name);
+                changes.push(Mutation::Put {
+                    key: key.clone(),
+                    value: codec::encode(&rule)?,
+                });
+                changes.push(Mutation::Delete { key });
+            }
             AtomScenario::RulesRecreate => {
                 let rule = stored("$Default", RuleFilter::True, None)?;
                 changes.push(Mutation::Put {
@@ -702,5 +727,86 @@ pub(super) fn check_batches(
         &projected.snapshot()?,
         "rule stage changed retained messages, expiry/DLQ/config/rules/identities/counters or unrelated rows"
     );
+    if scenario == AtomScenario::RulesSql {
+        let clock = keys::clock();
+        let retained = |snapshot: &StoreSnapshot| {
+            snapshot
+                .entries()
+                .iter()
+                .filter(|(key, _)| key != &clock)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            retained(before),
+            retained(after),
+            "SQL cycle changed retained rows"
+        );
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sql_cycle_source_and_batches_are_exact() -> TestResult {
+        domain::SqlProgram::compile(SQL_EXPRESSION)?;
+        assert!(
+            include_str!(
+                "../../../../../conformance/dotnet-current/AtomRuleAdministrationCases.cs"
+            )
+            .contains(r#"    private const string SqlExpression = "  user.colour IN ('caf\u00E9 & <\u03BB>', 'blue') AND\n(sys.Label IS NULL OR user.count >= 2)  ";"#)
+        );
+        let namespace = NamespaceName::new("tenant")?;
+        let clock = codec::encode(&Timestamp::from_millis(1_000))?;
+        let store = MemoryStore::default();
+        store.apply(
+            WriteBatch::default()
+                .put(b"retained-fixture-row".to_vec(), b"retained bytes".to_vec())
+                .put(keys::clock(), clock.clone()),
+        )?;
+        let before = store.snapshot()?;
+        let mut batches = Vec::new();
+        for suffix in SUFFIXES {
+            let rule = RuleDefinition {
+                name: RuleName::new(format!("Sql-{suffix}"))?,
+                filter: RuleFilter::Sql(SqlFilter::new(SQL_EXPRESSION)?),
+                action: None,
+                created_at: Timestamp::from_millis(1_000),
+            };
+            let RuleFilter::Sql(filter) = &rule.filter else {
+                panic!("SQL cycle was relabeled as a constant");
+            };
+            assert_eq!(filter.semantic_version(), 1);
+            assert_eq!(filter.expression(), SQL_EXPRESSION);
+            let encoded = codec::encode(&rule)?;
+            assert_eq!(codec::decode::<RuleDefinition>(&encoded)?, rule);
+            let key = keys::rule(&namespace, &topic(), &owned(suffix), &rule.name);
+            batches.push(
+                WriteBatch::default()
+                    .put(key.clone(), encoded)
+                    .put(keys::clock(), clock.clone()),
+            );
+            batches.push(
+                WriteBatch::default()
+                    .delete(key)
+                    .put(keys::clock(), clock.clone()),
+            );
+        }
+        for batch in &batches {
+            store.apply(batch.clone())?;
+        }
+        let after = store.snapshot()?;
+        check_batches(
+            &namespace,
+            AtomScenario::RulesSql,
+            &before,
+            &after,
+            &batches,
+        )?;
+        assert_eq!(after, before, "transient SQL cycle retained a row");
+        Ok(())
+    }
 }

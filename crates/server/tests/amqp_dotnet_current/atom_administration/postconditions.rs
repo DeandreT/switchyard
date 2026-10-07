@@ -172,6 +172,7 @@ impl Oracle {
             | AtomScenario::RulesInspect
             | AtomScenario::RulesRefusals
             | AtomScenario::RulesDelete
+            | AtomScenario::RulesSql
             | AtomScenario::RulesRecreate
             | AtomScenario::RulesOpaque
             | AtomScenario::RulesDenied
@@ -577,6 +578,7 @@ mod tests {
             AtomScenario::RulesInspect,
             AtomScenario::RulesRefusals,
             AtomScenario::RulesDelete,
+            AtomScenario::RulesSql,
             AtomScenario::RulesRecreate,
             AtomScenario::RulesOpaque,
             AtomScenario::RulesDenied,
