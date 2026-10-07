@@ -40,6 +40,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Duplicate detection | Pre-1.0 | State machine, AMQP send/scheduling mappings, Rust and current .NET clients end to end |
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API |
+| Finite queue capacity | Pre-1.0 | Opt-in trusted owner API for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage and Rust AMQP socket tests. Administration fields and official SDK capacity gates are not implemented; see [Finite Queue Capacity](finite-queue-capacity.md) |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
 | Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; offline JWT Manage via library opt-in or the CLI policy-file option; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
@@ -1589,6 +1590,35 @@ each build and client process has a 180-second deadline and bounded output captu
 owned-process cleanup and isolated certificate trust. This does not add process
 lifetime guarantees to the older ordinary-message or WebSocket gate runners.
 
+### Finite Queue Capacity
+
+The opt-in trusted owner API reserves logical bytes across an ordinary primary
+queue and its dead-letter shadow. It excludes required sessions and duplicate
+detection; native gRPC/CLI and Atom/XML capacity fields are not exposed. The
+reservation model, lifecycle refunds, bounded planner, and corruption boundaries
+are defined in [Finite Queue Capacity](finite-queue-capacity.md).
+
+Verification: the closed full workspace passed 5,620 tests with no failures and
+thirteen unchanged ignored SDK cases, adding 150 cases. Every prior case, status,
+and ignore reason was retained; doctest location changes were normalized with
+multiplicity. Both strict workspace lint configurations, both build
+configurations, and formatting passed. The only source changes after the broad
+runtime run were three function-local argument-count lint annotations; removing
+them restores the tested file byte-for-byte. All forty capacity lifecycle cases
+then passed against the final linted source on Memory and Fjall. Six server
+capacity cases passed across both backends, including two actual Rust AMQP socket
+cases exercising refusal and retry, not official SDK capacity parity. Scoped
+metadata/topology/binding probes retain the old diagnostics before
+their final capacity proofs; this is not a global command-priority or whole-ledger
+health guarantee. Injected pre-apply storage refusals do not establish the
+outcome of an indeterminate physical commit. No SDK gates were rerun.
+
+The durable layout is now 17, with no directory migration. Current paired image
+operations use role 2 and require canonical non-finite owner modes; finite image
+export, finite committed-entry replication, and ledger migration are unsupported.
+Historical role-1 pure codecs remain separate. The value envelope and existing
+command, configuration, protobuf, and committed-entry encodings are unchanged.
+
 ### Message Content
 
 Stored content has a protocol-neutral typed representation. Message and
@@ -1658,8 +1688,9 @@ cannot enumerate siblings. The configured namespace is the only namespace
 accessible through that endpoint. Dead-letter shadows cannot be administered.
 Subscription definitions use their typed configuration rather than exposing
 their backing queue through queue commands. Entity capacity and usage fields
-are absent because quota accounting
-is not implemented; they are not reported as zero-byte measurements.
+remain absent from this wire API. The separate trusted
+[finite queue capacity API](finite-queue-capacity.md) is not exposed here;
+unsupported usage measurements are not reported as zero-byte measurements.
 
 Library callers opt into offline JWT Manage authorization through
 `NativeAdminService::with_offline_jwt_policy(policy, audience_host)`. It accepts
@@ -1890,11 +1921,14 @@ as `queue update`.
 ## Durable Format
 
 The current value envelope remains version 11; the active durable base layout
-is version 16. Isolated replicas derive `0x80000010`, catalog replicas derive
-`0xc0000010`, and protected publication derives `0xd0000010` from that same
-`ACTIVE_STORE_FORMAT`. Their exact profile-v1 tags are unchanged. Existing v15
-and older directories in every derived namespace are refused, including stores
-without session-message locks; older builds likewise refuse new v16 directories.
+is version 17. Isolated replicas derive `0x80000011`, catalog replicas derive
+`0xc0000011`, and protected publication derives `0xd0000011` from that same
+`ACTIVE_STORE_FORMAT`. Their exact profile-v1 tags are unchanged. Existing v16
+and older directories in every derived namespace are refused; older builds
+likewise refuse new v17 directories. A nonempty unversioned ordinary directory
+is refused before a marker is written. Mandatory capacity-mode metadata and
+finite reservation sidecars are protected by this layout; see
+[Finite Queue Capacity](finite-queue-capacity.md).
 No automatic relabeling, repair, migration or rollback conversion is provided.
 
 Replica profiles have an initialized flag updated with each privileged batch;

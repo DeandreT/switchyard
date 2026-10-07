@@ -1,7 +1,17 @@
 # Pure Native Snapshot Metadata
 
+## Current Boundary (2026-10-06)
+
+Both public entry points require a role-2 `CreateSendLayout17V1` SWYI image,
+using `ValidatedCreateSendLayout17Image`; role 1 or a finite capacity profile
+is refused as `InvalidImage`. This changes image admission, not SWYM framing:
+its schema 1, metadata role 1, payload fields, checksum, and snapshot-ID prefix
+are unchanged. Agreement still names the complete original artifact. The
+verification receipts below describe the original increment, not new layout-17
+execution.
+
 `EncodedNativeSnapshotMetadata::encode(artifact)` derives immutable metadata
-from one complete, fully validated CreateSendV1 image. Both this entrypoint and
+from one complete, fully validated CreateSendLayout17V1 image. Both this entrypoint and
 `DecodedNativeSnapshotPair::decode(metadata, artifact)` require container
 framing, canonical encoding, checksum, business consistency, and compatible
 native checkpoint recovery. A declared container role alone is insufficient.
@@ -23,7 +33,7 @@ persist a catalog or certify historical voting or adoption authority.
 ## Frozen Format
 
 The complete metadata limit is 8 KiB. Its 12-byte frame contains `SWYM`,
-big-endian `u16` schema 1, big-endian `u16` CreateSendV1 role 1, and big-endian
+big-endian `u16` schema 1, big-endian `u16` metadata role 1, and big-endian
 `u32` payload length. A 32-byte SHA-256 trailer covers the frame and payload.
 
 The payload uses explicit versioned postcard fields in this order:

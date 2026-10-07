@@ -1,10 +1,19 @@
 # Exclusive Domain Image Retention
 
+## Current Boundary (2026-10-06)
+
+Preparation exports role 2, `CreateSendLayout17V1`, and catalog read requires
+that same current proof. Each primary has a canonical generation-1 NonFinite
+Mode; finite Modes and Usage/Charge are outside the closed profile. A retained
+role-1 artifact is a nonfatal `UnsupportedProfile` refusal, not a reason to
+poison, repair, or silently upgrade its catalog. The verification receipts
+below describe the original increment, not new layout-17 execution.
+
 `CommittedStateMachine::prepare_create_send_catalog()` captures one complete,
-validated CreateSendV1 image and returns a non-Clone token that exclusively
+validated CreateSendLayout17V1 image and returns a non-Clone token that exclusively
 borrows the machine. It requires `CatalogCommittedStore` and a bounded business
-reader. This is an opt-in domain API; existing constructors, generic bounds,
-formats, profiles, dependencies, and runtime startup are unchanged.
+reader. This is an opt-in domain API; its generic bounds, exclusive ownership,
+dependencies, and runtime startup are unchanged.
 
 The token exposes only immutable image bytes and its small captured checkpoint.
 It grants no raw writer, mutable image, public construction, or second machine
@@ -50,7 +59,7 @@ limits. No universal allocator-failure recovery is promised.
 bounded business reader. It makes one originating catalog-reader factory call
 and one complete read. An absent slot returns `None`.
 
-The exact stored artifact passes container, stream, and full CreateSendV1
+The exact stored artifact passes container, stream, and full CreateSendLayout17V1
 business validation. The returned non-Clone `RetainedCreateSendCatalog` wraps
 the original immutable owned storage result and a small captured checkpoint,
 without another image copy, self-referential decoded view, or backend handle.

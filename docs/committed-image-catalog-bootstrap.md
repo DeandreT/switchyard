@@ -1,10 +1,19 @@
 # Combined Image And Catalog Bootstrap
 
+## Current Boundary (2026-10-06)
+
+The selected source must pass the role-2 `CreateSendLayout17V1` proof, with one
+canonical generation-1 NonFinite Mode per primary queue. Role 1 and finite
+capacity profiles are not current restore inputs. These source refusals still
+precede target access; the combined publication remains one commit. Storage
+keeps metadata opaque. The verification receipts below describe the original
+increment, not new layout-17 execution.
+
 `CommittedStateMachine::bootstrap_create_send_image_with_catalog(writer,
 selection, metadata)` is an opt-in pristine-target constructor requiring
-`CatalogCommittedStore`. It needs no bounded business reader and does not broaden
-the existing [ordinary bootstrap](committed-image-bootstrap.md), constructors,
-formats, profiles, dependencies, or runtime behavior.
+`CatalogCommittedStore`. It needs no bounded business reader and preserves the
+existing [ordinary bootstrap](committed-image-bootstrap.md) capability bounds
+and target ordering. Runtime behavior remains unchanged.
 
 The trusted selection still pins stream, complete checkpoint, and SHA-256 of the
 entire selected artifact, including its checksum. Expectations come from an
@@ -17,7 +26,7 @@ interpret [native metadata](native-snapshot-metadata.md).
 Catalog component limits are checked first: 8 KiB metadata and 64 MiB artifact.
 An overlong component takes precedence over invalid selection or source bytes.
 The unchanged pure selection validator then checks the exact stream, all
-checkpoint fields, complete-artifact digest, container, and full CreateSendV1
+checkpoint fields, complete-artifact digest, container, and full CreateSendLayout17V1
 business semantics. Every source/metadata refusal precedes this function's first
 target operation. Opening or stamping the writer earlier is outside that claim.
 

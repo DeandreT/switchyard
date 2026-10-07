@@ -1,5 +1,15 @@
 # Bounded Domain Image Export
 
+## Current Boundary (2026-10-06)
+
+Current export encodes role 2, `CreateSendLayout17V1`, and validates that exact
+artifact with `ValidatedCreateSendLayout17Image`. One canonical generation-1
+NonFinite Mode is required per primary queue; missing Modes, finite capacity
+profiles, and broader lifecycle state are refused without normalization.
+Quota/profile refusal remains nonfatal; physical capture failure retains its
+existing poison policy. The verification receipts below describe the original
+increment, not new layout-17 execution.
+
 `CommittedStateMachine::export_create_send_image(&mut self)` captures one
 complete bounded view and returns an immutable `EncodedCommittedImage` only
 after [container checks](committed-image-container.md) and
@@ -8,8 +18,8 @@ when the writer's matching reader implements `storage::BoundedStateStore`.
 There is no allocating fallback for ordinary `StateStore` readers.
 
 This is a synchronous domain API, not a native-owner operation or runtime
-snapshot implementation. Constructors, application, store formats, and ordinary
-snapshot behavior remain unchanged. No writer or store capability is returned.
+snapshot implementation. Its capability bounds and ordinary snapshot behavior
+remain unchanged. No writer or store capability is returned.
 The method grants no installation, log purge, quorum, authentication, ancestry,
 anti-rollback, historical-request, or cluster-membership authority.
 

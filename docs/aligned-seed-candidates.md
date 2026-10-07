@@ -1,5 +1,15 @@
 # Canonical Aligned Seed Candidates
 
+## Current Boundary (2026-10-06)
+
+Candidate preparation now inherits role-2 `CreateSendLayout17V1` admission
+through the native metadata encoder and pair decoder. Generation-1 NonFinite
+Modes are required; finite Modes and Usage/Charge remain unsupported. The
+additive `plan_create_send_layout17_replacement` is the corresponding current
+pure count API; the existing role-1 planner remains separate. No codec relabeling
+or publication capability is introduced. The verification receipts below
+describe the original increment, not new layout-17 execution.
+
 The synchronous cluster preparer generates canonical candidate data
 from a borrowed immutable artifact and separately supplied expectations.
 It uses the existing SWYM/SWYI and SWLQ/SWLS/SWLF codecs. It does not create a

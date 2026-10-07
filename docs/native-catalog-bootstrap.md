@@ -1,5 +1,14 @@
 # Selected Native Catalog Bootstrap
 
+## Current Boundary (2026-10-06)
+
+Actual pair validation requires a role-2 `CreateSendLayout17V1` artifact before
+domain target access. Domain bootstrap independently requires the same narrow
+generation-1 NonFinite profile and trusted selection. Role 1 and finite Modes
+are refused, not upgraded. SWYM metadata framing is unchanged, and publication
+still uses one combined commit before owner startup. The verification receipts
+below describe the original increment, not new layout-17 execution.
+
 `ExperimentalStateMachine::bootstrap_create_send_image_with_catalog(writer,
 selection, metadata)` restores an exactly selected image and its matching native
 metadata into a pristine catalog store, then starts its unique state owner. It
@@ -23,7 +32,7 @@ mutation, provenance, commitment, or installation authority.
 
 The actual metadata/artifact pair is checked first by the
 [native pair codec](native-snapshot-metadata.md). This validates framing,
-checksums, full CreateSend business semantics, all captured checkpoint fields,
+checksums, full CreateSendLayout17V1 business semantics, all captured checkpoint fields,
 complete artifact digest, and native identity/membership recovery. Its owned
 `SnapshotMeta` is derived in the same pure preflight scope, then dropped before
 the first domain target API. Checking the caller's expected checkpoint alone is
@@ -77,7 +86,7 @@ spare-capacity, RSS, or universal allocator-failure guarantee.
 Pair agreement and trusted pristine restoration grant no populated replacement,
 source authenticity, ancestry, anti-rollback, quorum, engine adoption, snapshot
 network flow, or history-purge authority. Engine builder, receive, install, and
-get-current behavior, runtime configuration, storage formats, and dependencies
+get-current behavior, runtime configuration, and dependencies
 remain unchanged.
 
 ## Verification Scope

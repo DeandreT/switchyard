@@ -1,7 +1,16 @@
 # Native Pristine Image Bootstrap
 
+## Current Boundary (2026-10-06)
+
+Current domain admission requires role 2, `CreateSendLayout17V1`, including
+canonical generation-1 NonFinite Modes. Role 1 and finite capacity profiles
+are refused without target work. The expected-checkpoint-first native recovery
+ordering and one domain commit remain unchanged; no migration or Mode synthesis
+is added. The verification receipts below describe the original increment,
+not new layout-17 execution.
+
 `ExperimentalStateMachine::bootstrap_create_send_image(writer, selection)`
-restores an exactly selected CreateSendV1 image into a pristine committed store
+restores an exactly selected CreateSendLayout17V1 image into a pristine committed store
 and starts its unique native state owner. The export-enabled variant,
 `bootstrap_create_send_image_with_export`, additionally requires the matching
 reader to implement `storage::BoundedStateStore` and installs the existing
@@ -11,7 +20,7 @@ and their bounds are unchanged.
 
 This is not the replication library's snapshot installation or populated-target
 replacement. No runtime or server startup path uses these constructors. Snapshot
-build, receive, install, and current-snapshot behavior, disk formats, retained
+build, receive, install, and current-snapshot behavior, retained
 history requirements, transport, and production refusal remain unchanged.
 
 ## Validation And Commit

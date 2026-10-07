@@ -1,5 +1,16 @@
 # Borrowed Create/Send Replacement Counts
 
+## Current Boundary (2026-10-06)
+
+`plan_create_send_layout17_replacement` returns
+`PlannedCreateSendLayout17Replacement` for two role-2 artifacts. It retains the
+same independent expectations, paired policy, borrowing, and count limits,
+using `ValidatedCreateSendLayout17Image` on each side. Modes participate in
+ordinary row counts; finite Modes and Usage/Charge remain unsupported. This
+counterpart grants no mutation authority. The role-1 API described below and
+its historical verification receipts remain unchanged; those receipts are not
+new layout-17 execution evidence.
+
 `domain::plan_create_send_replacement` checks two offered CreateSendV1 business
 images and returns `PlannedCreateSendReplacement`. Each independent expectation
 contains a full `CommittedCheckpoint`, complete artifact length and whole-artifact
@@ -63,7 +74,8 @@ custody/joins/reopens remain separate prerequisites. The private
 
 The existing [trusted replacement writer](committed-image-replacement.md) retains
 its own target capture, copy order and one catalog commit. This new data API does
-not accept its counts as a replacement permit or alter the legacy selection path.
+not accept its counts as a replacement permit. Current mutation selects the
+separate role-2 proof, not either planner's counts as authority.
 The [aligned seed candidate](aligned-seed-candidates.md) remains a separate
 canonical data preparation boundary, not a publication capability.
 

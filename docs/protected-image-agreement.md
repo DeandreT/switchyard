@@ -1,5 +1,15 @@
 # Protected Image Agreement
 
+## Current Boundary (2026-10-06)
+
+`check_protected_create_send_layout17_image` returns
+`CheckedProtectedCreateSendLayout17Image` using the role-2 proof, with the same
+expectation, fence, exhaustive row agreement, and non-authority boundaries.
+Its current profile requires canonical generation-1 NonFinite Modes and
+refuses finite Modes and Usage/Charge. The role-1 checker described below is
+preserved as a separate pure API. Its historical verification receipts remain
+unchanged and are not new layout-17 execution evidence.
+
 `check_protected_create_send_image` checks one already-owned
 `storage::StoredProtectedState` against an independently selected
 `CreateSendImageExpectation` and expected opaque fence. It returns a borrowed

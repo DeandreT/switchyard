@@ -1,7 +1,15 @@
 # Committed Image Container
 
+## Current Boundary (2026-10-06)
+
+The schema-1 container recognizes historical role 1, `CreateSendV1`, and
+current role 2, `CreateSendLayout17V1`. Current export and restore paths use
+role 2; recognizing role 1 structurally does not make it a current restore
+input. The role-specific pure validators remain separate. The verification
+receipts below describe the original increment, not new layout-17 execution.
+
 `domain::EncodedCommittedImage` packages an already-owned `StoreSnapshot` with
-an explicit `CommittedImageRole::CreateSendV1` declaration and committed stream.
+an explicit `CommittedImageRole` declaration and committed stream.
 `DecodedCommittedImage` checks the container and borrows its encoded bytes.
 Neither API reads a store, obtains a writer, exports from a healthy owner,
 installs records, or purges history.
@@ -22,7 +30,7 @@ All integer fields are fixed-width, unsigned, and big-endian:
 | --- | --- |
 | Magic | Four bytes: `SWYI` |
 | Container schema | `u16`, currently `1` |
-| Declared role | `u16`, currently `1` for CreateSendV1 |
+| Declared role | `u16`: `1` for CreateSendV1 or `2` for CreateSendLayout17V1 |
 | Committed stream | Sixteen bytes; the all-zero identity is refused |
 | Row count | `u32` |
 | Each row | `u32` key length, `u32` value length, exact key and value bytes |

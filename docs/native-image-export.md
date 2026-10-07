@@ -1,5 +1,14 @@
 # Owned Committed Image Export
 
+## Current Boundary (2026-10-06)
+
+The enabled domain exporter returns role 2, `CreateSendLayout17V1`, with the
+exact NonFinite Mode per generation-1 primary. Native recovery still checks
+only the captured checkpoint after domain validation. Finite capacity profiles
+are outside this export role; no old role-1 row conversion, extra capture, or
+new installation authority is added. The verification receipts below describe
+the original increment, not new layout-17 execution.
+
 `ExperimentalStateMachine::create_with_image_export` and
 `open_with_image_export` explicitly enable the bounded domain exporter on the
 existing native state owner. Both require the matching reader to implement
@@ -10,7 +19,7 @@ recovery behavior are unchanged.
 This is not the replication library's snapshot implementation. Snapshot build,
 receive, install, and current-snapshot behavior remain unchanged and unsupported
 as described in [the state-machine adapter](experimental-state-machine.md).
-No runtime uses the new constructors. Server startup, transport, disk formats,
+No runtime uses the new constructors. Server startup, transport,
 history retention, and production refusal remain unchanged.
 
 ## Owned Work
@@ -41,7 +50,7 @@ it cannot keep the physical backend open.
 
 The owner checks adapter poison before invoking the capability. The
 [domain exporter](committed-image-export.md) performs exactly one complete
-bounded capture, structural encoding, and current CreateSend semantic validation.
+bounded capture, structural encoding, and CreateSendLayout17V1 semantic validation.
 The native adapter then decodes that returned artifact and applies its existing
 full-identity and membership recovery checks to the captured checkpoint only.
 Export issues no separate checkpoint query, point read, scan, initialization

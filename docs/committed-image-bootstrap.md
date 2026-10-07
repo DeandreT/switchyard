@@ -1,10 +1,19 @@
 # Pristine Committed Image Bootstrap
 
+## Current Boundary (2026-10-06)
+
+Current bootstrap requires the role-2 `CreateSendLayout17V1` proof, including
+the exact generation-1 NonFinite Mode for every primary queue. Historical
+role-1 images, missing Modes, and finite-capacity profiles are refused before
+the first target API call. No row repair, Mode synthesis, or format migration
+is performed. The verification receipts below describe the original increment,
+not new layout-17 execution.
+
 `CommittedStateMachine::bootstrap_create_send_image(writer, selection)` restores
-one explicitly selected CreateSendV1 image into a pristine replica store. It
+one explicitly selected CreateSendLayout17V1 image into a pristine replica store. It
 consumes the unique `storage::CommittedStore` writer and returns a machine only
-after one successful atomic commit. Ordinary create/open, record formats, native
-owners, server startup, and replication runtime behavior remain unchanged.
+after one successful atomic commit. Its pristine-target ordering and unique
+writer contract remain unchanged; it does not enable server or replication startup.
 
 This is not populated-target replacement or the replication library's snapshot
 installation. It provides no snapshot catalog, current-snapshot result, transport,

@@ -1,5 +1,20 @@
 # Committed Image Validation
 
+## Current Boundary (2026-10-06)
+
+`ValidatedCreateSendLayout17Image::validate` is the current role-2 proof. It
+retains the closed record and relation rules below and additionally requires
+exactly one canonical generation-1 `NonFinite` capacity Mode (`0x16`) per primary
+queue. Missing, orphan, or shadow Modes are refused. Finite Modes, Usage (`0x17`),
+Charge (`0x18`), and broader lifecycle state are outside this narrow profile;
+layout 17 is not a finite-capacity image installer. Checkpoint-only images need
+no invented Mode. Current operations neither synthesize Modes nor migrate rows.
+
+`ValidatedCreateSendImage` remains the historical role-1 pure proof, with its
+original bytes and semantics. It does not accept role 2 or capacity sidecars.
+The verification receipts below belong to that original role-1 increment, not
+new layout-17 execution.
+
 `domain::ValidatedCreateSendImage::validate` consumes a structurally decoded
 [committed image container](committed-image-container.md) and checks its complete
 business-record consistency against the closed CreateSendV1 profile. The opaque,
@@ -43,7 +58,7 @@ Every message has exactly its required ordinary/session ready index and optional
 expiry index, with empty marker values and no orphan or duplicate indexes.
 
 An expiry may equal enqueue time, including zero requested TTL or saturated
-timestamp arithmetic. A finite queue default requires expiry and supplies a
+timestamp arithmetic. A finite default TTL requires expiry and supplies a
 known upper bound. The original requested TTL is not stored and is not
 reconstructed. Expired messages remain valid because this role has no timer sweep.
 

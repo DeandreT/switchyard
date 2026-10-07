@@ -1,5 +1,14 @@
 # Owned Native Snapshot Catalogs
 
+## Current Boundary (2026-10-06)
+
+Build and read now require role-2 `CreateSendLayout17V1` images, including
+canonical generation-1 NonFinite Modes. Finite Modes and Usage/Charge are
+outside that closed profile. Domain catalog read refuses a retained role-1
+image nonfatally as `UnsupportedProfile`; native pair agreement does not
+upgrade it. SWYM framing remains schema 1/metadata role 1. The verification
+receipts below describe the original increment, not new layout-17 execution.
+
 `ExperimentalStateMachine::create_with_snapshot_catalog` and
 `open_with_snapshot_catalog` explicitly enable native catalog build/read work on
 the existing state owner. They require `CatalogCommittedStore` and a bounded
@@ -11,7 +20,7 @@ These APIs combine the [exclusive domain retention token](committed-image-retent
 with the [pure native metadata codec](native-snapshot-metadata.md). They do not
 implement the replication library's snapshot builder, current-snapshot,
 receiving, or installation traits. No runtime uses these constructors; startup,
-formats, profiles, dependencies, production refusal, and no-purge behavior are
+dependencies, production refusal, and no-purge behavior are
 unchanged.
 
 ## Owned Admission

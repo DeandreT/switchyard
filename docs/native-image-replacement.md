@@ -1,11 +1,21 @@
 # Owned Native Image Replacement
 
+## Current Boundary (2026-10-06)
+
+Actual native pair validation and domain source/target admission now require
+the role-2 `CreateSendLayout17V1` proof. The narrow profile includes exact
+generation-1 NonFinite Modes and excludes finite Modes and Usage/Charge. A
+role-1 offered image is not upgraded or adopted. Source refusals remain before
+target access, and the existing owned known-commit boundary does not become
+engine installation authority. The verification receipts below describe the
+original increment, not new layout-17 execution.
+
 `OwnedTrustedNativeReplacement` and the separately enabled
 `ExperimentalStateMachine::replace_create_send_image_with_catalog` operation
-replace initialized CreateSendV1 business state and its catalog through the
+replace initialized CreateSendLayout17V1 business state and its catalog through the
 existing serial owner. This is explicit trusted mutation, not engine snapshot
 installation, runtime adoption, history repair, or log-purge authorization.
-Existing constructors, profiles, formats, dependencies, engine traits, and
+Existing capability defaults, dependencies, engine traits, and
 server startup remain unchanged.
 
 The separate [paired-image model](native-image-paired-model.md) explores bounded

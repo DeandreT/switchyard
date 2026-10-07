@@ -1,5 +1,15 @@
 # Durable Protected Publication
 
+## Current Boundary (2026-10-06)
+
+With active base layout 17, this profile uses `0xd0000011`; its profile tag
+remains `protected-state-publication-v1`. Earlier base layouts are not migrated.
+Storage publication and capture remain opaque. For current role-2 business
+agreement, use `check_protected_create_send_layout17_image`; the role-1 pure
+checker remains available only for its historical declared profile. Neither
+checker grants publication authority. The verification receipts below describe
+the original increment, not new layout-17 execution.
+
 `storage::FjallProtectedStateStore` is an explicitly selected local durable
 profile for complete business, initialization, opaque catalog and fence
 publication. It uses the same borrowed input and owned capture types as the

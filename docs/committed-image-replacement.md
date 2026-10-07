@@ -1,10 +1,20 @@
 # Trusted Image And Catalog Replacement
 
+## Current Boundary (2026-10-06)
+
+Both selected source and captured target must pass the role-2
+`CreateSendLayout17V1` proof. Historical role-1 sources and unsupported finite
+capacity profiles refuse before target I/O; target profile refusals remain
+nonfatal after the one bounded capture. Exact NonFinite Mode rows are retained
+or removed by the existing ordered replacement, never synthesized. The
+verification receipts below describe the original increment, not new layout-17
+execution.
+
 `CommittedStateMachine::replace_create_send_image_with_catalog(request,
 metadata)` is a separate trusted mutation capability for an initialized target.
 It requires `CatalogCommittedStore` and a bounded business reader. Ordinary
-constructors, pristine bootstrap, formats, profiles, dependencies, and runtime
-startup remain unchanged.
+constructors, pristine target rules, dependencies, and runtime startup remain
+unchanged; current artifact admission uses the separate layout-17 proof.
 
 The separate [borrowed count planner](committed-image-replacement-plan.md)
 validates both offered images and their independent identities without target
@@ -22,7 +32,7 @@ it exposes neither artifact fields nor a writer. Domain metadata remains opaque.
 
 An already-poisoned machine refuses first. The 8 KiB metadata and 64 MiB artifact
 bounds then precede stream, full selected checkpoint, complete digest, container,
-and whole CreateSendV1 semantic checks. Every source or metadata refusal precedes
+and whole CreateSendLayout17V1 semantic checks. Every source or metadata refusal precedes
 the operation's first target access.
 
 The existing bounded exporter supplies one complete target capture and validates
