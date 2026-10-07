@@ -30,6 +30,9 @@ mod maintenance;
 mod rules;
 mod topology;
 
+#[cfg(test)]
+mod authorization_tests;
+
 use rules::RuleCommand;
 use topology::{
     SubscriptionCommand, SubscriptionConfigurationOutput, TopicCommand, TopicConfigurationOutput,
@@ -39,6 +42,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CA_FILE_BYTES: usize = 1024 * 1024;
 const MAX_TOKEN_FILE_BYTES: usize = 16 * 1024;
+const MAX_BEARER_TOKEN_BYTES: usize = 8192;
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_PAGE_TOKEN_BYTES: usize = 512;
@@ -54,6 +58,7 @@ struct Arguments {
     ca_certificate: Option<PathBuf>,
     #[arg(long, global = true)]
     tls_server_name: Option<String>,
+    /// Read a SharedAccessSignature or Bearer authorization header from a file.
     #[arg(long, global = true, value_name = "PATH")]
     token_file: Option<PathBuf>,
     /// Allow unauthenticated development HTTP on loopback only.
@@ -310,7 +315,7 @@ fn validate_endpoint(arguments: &Arguments) -> Result<Url, CliError> {
             ));
         }
         if arguments.token_file.is_some() {
-            return Err(CliError::Input("shared-access tokens require HTTPS"));
+            return Err(CliError::Input("authorization tokens require HTTPS"));
         }
         if arguments.ca_certificate.is_some() || arguments.tls_server_name.is_some() {
             return Err(CliError::Input("TLS options require HTTPS"));
@@ -411,17 +416,24 @@ fn validate_ca(pem: &[u8]) -> Result<(), CliError> {
 
 fn token_metadata(bytes: &[u8]) -> Result<MetadataValue<Ascii>, CliError> {
     let token = std::str::from_utf8(bytes)
-        .map_err(|_| CliError::Input("invalid shared-access token file"))?
+        .map_err(|_| CliError::Input("invalid authorization token file"))?
         .trim();
+    let supported = if let Some(bearer) = token.strip_prefix("Bearer ") {
+        !bearer.is_empty()
+            && bearer.len() <= MAX_BEARER_TOKEN_BYTES
+            && !bearer.bytes().any(|byte| byte.is_ascii_whitespace())
+    } else {
+        token.starts_with("SharedAccessSignature ")
+    };
     if token.is_empty()
-        || !token.starts_with("SharedAccessSignature ")
+        || !supported
         || !token.is_ascii()
         || token.bytes().any(|byte| byte.is_ascii_control())
     {
-        return Err(CliError::Input("invalid shared-access token file"));
+        return Err(CliError::Input("invalid authorization token file"));
     }
     let mut metadata = MetadataValue::try_from(token)
-        .map_err(|_| CliError::Input("invalid shared-access token file"))?;
+        .map_err(|_| CliError::Input("invalid authorization token file"))?;
     metadata.set_sensitive(true);
     Ok(metadata)
 }
@@ -974,7 +986,6 @@ mod tests {
         );
         for token in [
             &b""[..],
-            &b"Bearer secret"[..],
             &b"SharedAccessSignature sr=x\nsig=secret"[..],
             &b"SharedAccessSignature \xff"[..],
         ] {

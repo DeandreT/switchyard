@@ -1,0 +1,108 @@
+use std::{
+    error::Error,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use auth::{
+    JwtPolicy, PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule,
+};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
+use hmac::{Hmac, Mac};
+use rustls::{
+    SignatureScheme,
+    crypto::ring,
+    pki_types::{PrivateKeyDer, PrivatePkcs1KeyDer},
+};
+use sha2::Sha256;
+use url::form_urlencoded::byte_serialize;
+
+type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+pub(super) const HOST: &str = "tenant.servicebus.windows.net";
+const ISSUER: &str = "https://issuer.example/";
+const AUDIENCE: &str = "urn:switchyard:native-admin";
+pub(super) const SAS_KEY: &str = "native-cli-fixture-key";
+const MODULUS: &str = "yRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4l4sggh5_CYYi_cvI-SXVT9kPWSKXxJXBXd_4LkvcPuUakBoAkfh-eiFVMh2VrUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG_AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBIMc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi-yUod-j8MtvIj812dkS4QMiRVN_by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQ";
+// Public RSA PKCS1 fixture shared with the pure auth tests, never live credentials.
+const PRIVATE_DER: &str = concat!(
+    "MIIEpAIBAAKCAQEAyRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTL",
+    "UTv4l4sggh5/CYYi/cvI+SXVT9kPWSKXxJXBXd/4LkvcPuUakBoAkfh+eiFVMh2V",
+    "rUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8H",
+    "oGfG/AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBI",
+    "Mc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/",
+    "by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQIDAQABAoIBAHREk0I0O9DvECKd",
+    "WUpAmF3mY7oY9PNQiu44Yaf+AoSuyRpRUGTMIgc3u3eivOE8ALX0BmYUO5JtuRNZ",
+    "Dpvt4SAwqCnVUinIf6C+eH/wSurCpapSM0BAHp4aOA7igptyOMgMPYBHNA1e9A7j",
+    "E0dCxKWMl3DSWNyjQTk4zeRGEAEfbNjHrq6YCtjHSZSLmWiG80hnfnYos9hOr5Jn",
+    "LnyS7ZmFE/5P3XVrxLc/tQ5zum0R4cbrgzHiQP5RgfxGJaEi7XcgherCCOgurJSS",
+    "bYH29Gz8u5fFbS+Yg8s+OiCss3cs1rSgJ9/eHZuzGEdUZVARH6hVMjSuwvqVTFaE",
+    "8AgtleECgYEA+uLMn4kNqHlJS2A5uAnCkj90ZxEtNm3E8hAxUrhssktY5XSOAPBl",
+    "xyf5RuRGIImGtUVIr4HuJSa5TX48n3Vdt9MYCprO/iYl6moNRSPt5qowIIOJmIjY",
+    "2mqPDfDt/zw+fcDD3lmCJrFlzcnh0uea1CohxEbQnL3cypeLt+WbU6kCgYEAzSp1",
+    "9m1ajieFkqgoB0YTpt/OroDx38vvI5unInJlEeOjQ+oIAQdN2wpxBvTrRorMU6P0",
+    "7mFUbt1j+Co6CbNiw+X8HcCaqYLR5clbJOOWNR36PuzOpQLkfK8woupBxzW9B8gZ",
+    "mY8rB1mbJ+/WTPrEJy6YGmIEBkWylQ2VpW8O4O0CgYEApdbvvfFBlwD9YxbrcGz7",
+    "MeNCFbMz+MucqQntIKoKJ91ImPxvtc0y6e/Rhnv0oyNlaUOwJVu0yNgNG117w0g4",
+    "t/+Q38mvVC5xV7/cn7x9UMFk6MkqVir3dYGEqIl/OP1grY2Tq9HtB5iyG9L8NIam",
+    "QOLMyUqqMUILxdthHyFmiGkCgYEAn9+PjpjGMPHxL0gj8Q8VbzsFtou6b1deIRRA",
+    "2CHmSltltR1gYVTMwXxQeUhPMmgkMqUXzs4/WijgpthY44hK1TaZEKIuoxrS70nJ",
+    "4WQLf5a9k1065fDsFZD6yGjdGxvwEmlGMZgTwqV7t1I4X0Ilqhav5hcs5apYL7gn",
+    "PYPeRz0CgYALHCj/Ji8XSsDoF/MhVhnGdIs2P99NNdmo3R2Pv0CuZbDKMU559LJH",
+    "UvrKS8WkuWRDuKrz1W/EQKApFjDGpdqToZqriUFQzwy7mR3ayIiogzNtHcvbDHx8",
+    "oFnGY0OFksX/ye0/XGpy2SFxYRwGU98HPYeBvAQQrVjdkzfy7BmXQQ==",
+);
+
+pub(super) fn policy() -> TestResult<JwtPolicy> {
+    Ok(JwtPolicy::from_json(&format!(
+        r#"{{"version":1,"issuer":"{ISSUER}","audience":"{AUDIENCE}","keys":[{{"kid":"key-1","kty":"RSA","alg":"RS256","use":"sig","n":"{MODULUS}","e":"AQAB"}}],"bindings":[{{"subject":"administrator","scope":"amqps://{HOST}","permissions":["manage"]}},{{"subject":"sender","scope":"amqps://{HOST}","permissions":["send"]}}]}}"#
+    ))?)
+}
+
+pub(super) fn jwt(subject: &str) -> TestResult<String> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let expires = now.checked_add(120).ok_or("fixture epoch overflow")?;
+    let input = format!("{}.{}",
+        URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","kid":"key-1","typ":"at+jwt"}"#),
+        URL_SAFE_NO_PAD.encode(format!(r#"{{"iss":"{ISSUER}","sub":"{subject}","aud":"{AUDIENCE}","iat":{now},"exp":{expires}}}"#)));
+    let provider = ring::default_provider();
+    let key = provider
+        .key_provider
+        .load_private_key(PrivateKeyDer::Pkcs1(PrivatePkcs1KeyDer::from(
+            STANDARD.decode(PRIVATE_DER)?,
+        )))?;
+    let signer = key
+        .choose_scheme(&[SignatureScheme::RSA_PKCS1_SHA256])
+        .ok_or("public fixture RS256 signing unavailable")?;
+    Ok(format!(
+        "{input}.{}",
+        URL_SAFE_NO_PAD.encode(signer.sign(input.as_bytes())?)
+    ))
+}
+
+pub(super) fn sas_policy() -> TestResult<SharedAccessPolicy> {
+    Ok(SharedAccessPolicy::new([SharedAccessRule::new(
+        "fixture-rule",
+        ResourceScope::namespace(HOST)?,
+        SharedAccessKey::new(SAS_KEY)?,
+        None,
+        PermissionSet::MANAGE,
+    )?])?)
+}
+
+pub(super) fn sas_token() -> TestResult<String> {
+    let resource = byte_serialize(format!("amqps://{HOST}").as_bytes()).collect::<String>();
+    let expires = SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_secs()
+        .checked_add(120)
+        .ok_or("fixture epoch overflow")?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(SAS_KEY.as_bytes())?;
+    mac.update(format!("{resource}\n{expires}").as_bytes());
+    let signature =
+        byte_serialize(STANDARD.encode(mac.finalize().into_bytes()).as_bytes()).collect::<String>();
+    Ok(format!(
+        "SharedAccessSignature sr={resource}&sig={signature}&se={expires}&skn=fixture-rule"
+    ))
+}
