@@ -19,6 +19,7 @@ use route::{Operation, Target};
 
 mod response;
 mod route;
+mod rules;
 
 pub(super) const MAX_HEADER_COUNT: usize = 32;
 pub(super) const MAX_HEADER_BYTES: usize = 16_384;
@@ -126,10 +127,15 @@ where
     if matches!(target, Target::Subscription { .. }) {
         return process_subscription(target, operation, body, context, authorization, &epoch).await;
     }
+    if matches!(target, Target::Rule { .. } | Target::RuleCollection { .. }) {
+        return rules::process(target, operation, body, context, authorization, &epoch).await;
+    }
     let entity = match target {
         Target::Entity(_) => Some(target.entity()?),
         Target::Collection => None,
-        Target::Subscription { .. } => return Err(RequestFailure::Internal),
+        Target::Subscription { .. } | Target::Rule { .. } | Target::RuleCollection { .. } => {
+            return Err(RequestFailure::Internal);
+        }
     };
     let body = timeout(BODY_TIMEOUT, collect_body(body))
         .await

@@ -144,7 +144,7 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
         Ok(application)
     }
 
-    fn atom_subscription_admission(
+    pub(super) fn atom_subscription_admission(
         &self,
         namespace: &NamespaceName,
         topic: &EntityPath,
@@ -185,7 +185,7 @@ fn complete_update(config: SubscriptionConfig) -> SubscriptionConfigUpdate {
     }
 }
 
-fn validate_names(
+pub(super) fn validate_names(
     topic: &EntityPath,
     name: &SubscriptionName,
 ) -> Result<(), AtomSubscriptionOwnerError> {

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use domain::SubscriptionConfig;
+use domain::{RuleFilter, RuleName};
 use quick_xml::{
     Reader, XmlVersion,
     events::{BytesRef, BytesStart, Event},
@@ -9,9 +9,10 @@ use quick_xml::{
 
 use super::super::{
     ATOM_NS, Budget, MAX_BODY_BYTES, MAX_NAMESPACE_BINDINGS, SERVICE_BUS_NS, XML_NS, XSI_NS,
-    bounded_add, duration, lexical,
+    bounded_add, lexical,
 };
-use super::{SubscriptionXmlError, validate_config};
+use super::{RuleXmlError, validate_definition};
+use crate::AtomRuleDefinition;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum NamespaceKind {
@@ -21,53 +22,21 @@ enum NamespaceKind {
     Xml,
 }
 
-fn namespace_kind(uri: &str) -> Result<NamespaceKind, SubscriptionXmlError> {
+fn namespace_kind(uri: &str) -> Result<NamespaceKind, RuleXmlError> {
     match uri {
         ATOM_NS => Ok(NamespaceKind::Atom),
         SERVICE_BUS_NS => Ok(NamespaceKind::ServiceBus),
         XSI_NS => Ok(NamespaceKind::Xsi),
         XML_NS => Ok(NamespaceKind::Xml),
-        _ => Err(SubscriptionXmlError::Malformed),
+        _ => Err(RuleXmlError::Malformed),
     }
 }
 
-fn resolved_namespace(
-    result: ResolveResult<'_>,
-) -> Result<Option<NamespaceKind>, SubscriptionXmlError> {
+fn resolved_namespace(result: ResolveResult<'_>) -> Result<Option<NamespaceKind>, RuleXmlError> {
     match result {
         ResolveResult::Unbound => Ok(None),
         ResolveResult::Bound(uri) => namespace_kind(uri.as_ref()).map(Some),
-        ResolveResult::Unknown(_) => Err(SubscriptionXmlError::Malformed),
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum Property {
-    Lock,
-    Session,
-    Ttl,
-    ExpiryDeadLetter,
-    FilterDeadLetter,
-    Deliveries,
-    Batched,
-    Status,
-    DefaultRule,
-}
-
-impl Property {
-    fn parse(name: &str) -> Result<Self, SubscriptionXmlError> {
-        match name {
-            "LockDuration" => Ok(Self::Lock),
-            "RequiresSession" => Ok(Self::Session),
-            "DefaultMessageTimeToLive" => Ok(Self::Ttl),
-            "DeadLetteringOnMessageExpiration" => Ok(Self::ExpiryDeadLetter),
-            "DeadLetteringOnFilterEvaluationExceptions" => Ok(Self::FilterDeadLetter),
-            "MaxDeliveryCount" => Ok(Self::Deliveries),
-            "EnableBatchedOperations" => Ok(Self::Batched),
-            "Status" => Ok(Self::Status),
-            "DefaultRuleDescription" => Ok(Self::DefaultRule),
-            _ => Err(SubscriptionXmlError::UnsupportedDefinition),
-        }
+        ResolveResult::Unknown(_) => Err(RuleXmlError::Malformed),
     }
 }
 
@@ -76,20 +45,37 @@ enum Node {
     Entry,
     Content,
     Description,
-    Property(Property),
-    Rule,
+    Name,
     Filter,
-    RuleName,
     SqlExpression,
     Parameters,
 }
 
 impl Node {
     fn scalar(self) -> bool {
-        matches!(
-            self,
-            Self::Property(_) | Self::RuleName | Self::SqlExpression
-        )
+        matches!(self, Self::Name | Self::SqlExpression)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FilterKind {
+    True,
+    False,
+}
+
+impl FilterKind {
+    fn expression(self) -> &'static str {
+        match self {
+            Self::True => "1=1",
+            Self::False => "1=0",
+        }
+    }
+
+    fn filter(self) -> RuleFilter {
+        match self {
+            Self::True => RuleFilter::True,
+            Self::False => RuleFilter::False,
+        }
     }
 }
 
@@ -105,60 +91,50 @@ struct CheckedAttribute {
     value: String,
 }
 
-#[derive(Default)]
-struct DefaultRule {
-    name: bool,
-    filter: bool,
-    expression: bool,
-    parameters: bool,
-}
-
-#[derive(Clone, Copy)]
-enum DefinitionKind {
-    Create,
-    Update,
-}
-
 struct Parser {
-    kind: DefinitionKind,
     resolver: NamespaceResolver,
     budget: Budget,
     frames: Vec<Frame>,
-    properties: BTreeSet<Property>,
-    config: SubscriptionConfig,
-    rule: DefaultRule,
     root_seen: bool,
     complete: bool,
+    name_seen: bool,
+    filter_seen: bool,
+    expression_seen: bool,
+    parameters_seen: bool,
+    name: Option<RuleName>,
+    filter: Option<FilterKind>,
 }
 
 impl Parser {
-    fn new(kind: DefinitionKind) -> Self {
+    fn new() -> Self {
         let mut resolver = NamespaceResolver::default();
         resolver.set_max_namespace_bindings(MAX_NAMESPACE_BINDINGS);
         Self {
-            kind,
             resolver,
             budget: Budget::default(),
             frames: Vec::new(),
-            properties: BTreeSet::new(),
-            config: SubscriptionConfig::default(),
-            rule: DefaultRule::default(),
             root_seen: false,
             complete: false,
+            name_seen: false,
+            filter_seen: false,
+            expression_seen: false,
+            parameters_seen: false,
+            name: None,
+            filter: None,
         }
     }
 
     fn attributes(
         &mut self,
         start: &BytesStart<'_>,
-    ) -> Result<Vec<CheckedAttribute>, SubscriptionXmlError> {
+    ) -> Result<Vec<CheckedAttribute>, RuleXmlError> {
         let raw_name = start.name();
         lexical::qname(raw_name.as_ref())?;
         lexical::attribute_tail(&start.as_ref()[raw_name.as_ref().len()..])?;
         let mut attributes = Vec::new();
         for attribute in start.attributes().with_checks(true) {
             Budget::attributes(attributes.len() + 1)?;
-            let attribute = attribute.map_err(|_| SubscriptionXmlError::Malformed)?;
+            let attribute = attribute.map_err(|_| RuleXmlError::Malformed)?;
             lexical::qname(attribute.key.as_ref())?;
             let value = attribute
                 .normalized_value_with(
@@ -166,9 +142,9 @@ impl Parser {
                     1,
                     quick_xml::escape::resolve_xml_entity,
                 )
-                .map_err(|_| SubscriptionXmlError::Malformed)?;
+                .map_err(|_| RuleXmlError::Malformed)?;
             if !lexical::legal_chars(&value) {
-                return Err(SubscriptionXmlError::Malformed);
+                return Err(RuleXmlError::Malformed);
             }
             self.budget.decoded(value.len())?;
             attributes.push(CheckedAttribute {
@@ -179,7 +155,7 @@ impl Parser {
         Ok(attributes)
     }
 
-    fn open(&mut self, start: &BytesStart<'_>) -> Result<(), SubscriptionXmlError> {
+    fn open(&mut self, start: &BytesStart<'_>) -> Result<(), RuleXmlError> {
         let depth = self.frames.len() + 1;
         Budget::depth(depth)?;
         let attributes = self.attributes(start)?;
@@ -199,13 +175,13 @@ impl Parser {
             self.resolver
                 .add(prefix, Namespace(uri))
                 .map_err(|error| match error {
-                    NamespaceError::TooManyBindings(_) => SubscriptionXmlError::WorkLimitExceeded,
-                    _ => SubscriptionXmlError::Malformed,
+                    NamespaceError::TooManyBindings(_) => RuleXmlError::WorkLimitExceeded,
+                    _ => RuleXmlError::Malformed,
                 })?;
         }
         let raw_name = start.name();
         if raw_name.as_ref().starts_with("xmlns:") {
-            return Err(SubscriptionXmlError::Malformed);
+            return Err(RuleXmlError::Malformed);
         }
         let (namespace, local) = self.resolver.resolve_element(raw_name);
         let namespace = resolved_namespace(namespace)?;
@@ -231,7 +207,7 @@ impl Parser {
                 if matches!(parent.node, Node::Content)
                     && !parent.child_seen
                     && namespace == Some(NamespaceKind::ServiceBus)
-                    && local == "SubscriptionDescription" =>
+                    && local == "RuleDescription" =>
             {
                 parent.child_seen = true;
                 Node::Description
@@ -241,36 +217,17 @@ impl Parser {
                     && namespace == Some(NamespaceKind::ServiceBus) =>
             {
                 self.budget.property()?;
-                let property = Property::parse(local)?;
-                if property == Property::DefaultRule && matches!(self.kind, DefinitionKind::Update)
-                {
-                    return Err(SubscriptionXmlError::UnsupportedDefinition);
-                }
-                if !self.properties.insert(property) {
-                    return Err(SubscriptionXmlError::Malformed);
-                }
-                if property == Property::DefaultRule {
-                    Node::Rule
-                } else {
-                    Node::Property(property)
-                }
-            }
-            Some(parent)
-                if matches!(parent.node, Node::Rule)
-                    && namespace == Some(NamespaceKind::ServiceBus) =>
-            {
-                self.budget.property()?;
                 match local {
-                    "Name" if !self.rule.name => {
-                        self.rule.name = true;
-                        Node::RuleName
+                    "Name" if !self.name_seen => {
+                        self.name_seen = true;
+                        Node::Name
                     }
-                    "Filter" if !self.rule.filter => {
-                        self.rule.filter = true;
+                    "Filter" if !self.filter_seen => {
+                        self.filter_seen = true;
                         Node::Filter
                     }
-                    "Name" | "Filter" => return Err(SubscriptionXmlError::Malformed),
-                    _ => return Err(SubscriptionXmlError::UnsupportedDefinition),
+                    "Name" | "Filter" => return Err(RuleXmlError::Malformed),
+                    _ => return Err(RuleXmlError::UnsupportedDefinition),
                 }
             }
             Some(parent)
@@ -279,26 +236,26 @@ impl Parser {
             {
                 self.budget.property()?;
                 match local {
-                    "SqlExpression" if !self.rule.expression => {
-                        self.rule.expression = true;
+                    "SqlExpression" if !self.expression_seen => {
+                        self.expression_seen = true;
                         Node::SqlExpression
                     }
-                    "Parameters" if !self.rule.parameters => {
-                        self.rule.parameters = true;
+                    "Parameters" if !self.parameters_seen => {
+                        self.parameters_seen = true;
                         Node::Parameters
                     }
-                    "SqlExpression" | "Parameters" => return Err(SubscriptionXmlError::Malformed),
-                    _ => return Err(SubscriptionXmlError::UnsupportedDefinition),
+                    "SqlExpression" | "Parameters" => return Err(RuleXmlError::Malformed),
+                    _ => return Err(RuleXmlError::UnsupportedDefinition),
                 }
             }
             Some(parent) if matches!(parent.node, Node::Parameters) => {
-                return Err(SubscriptionXmlError::UnsupportedDefinition);
+                return Err(RuleXmlError::UnsupportedDefinition);
             }
-            _ => return Err(SubscriptionXmlError::Malformed),
+            _ => return Err(RuleXmlError::Malformed),
         };
         let mut expanded = BTreeSet::new();
         let mut content_type = false;
-        let mut true_filter = false;
+        let mut filter_type = None;
         for attribute in &attributes {
             if attribute.name == "xmlns" || attribute.name.starts_with("xmlns:") {
                 continue;
@@ -307,7 +264,7 @@ impl Parser {
             let namespace = resolved_namespace(namespace)?;
             let local = local.as_ref();
             if !expanded.insert((namespace, local.to_owned())) {
-                return Err(SubscriptionXmlError::Malformed);
+                return Err(RuleXmlError::Malformed);
             }
             if matches!(node, Node::Content)
                 && namespace.is_none()
@@ -319,23 +276,25 @@ impl Parser {
                 && namespace == Some(NamespaceKind::Xsi)
                 && local == "type"
             {
-                if attribute.value != "TrueFilter" {
-                    return Err(SubscriptionXmlError::UnsupportedDefinition);
-                }
+                let kind = match attribute.value.as_str() {
+                    "TrueFilter" => FilterKind::True,
+                    "FalseFilter" => FilterKind::False,
+                    _ => return Err(RuleXmlError::UnsupportedDefinition),
+                };
                 let (namespace, _) = self.resolver.resolve_element(QName(&attribute.value));
                 if resolved_namespace(namespace)? != Some(NamespaceKind::ServiceBus) {
-                    return Err(SubscriptionXmlError::Malformed);
+                    return Err(RuleXmlError::Malformed);
                 }
-                true_filter = true;
+                filter_type = Some(kind);
             } else {
-                return Err(SubscriptionXmlError::Malformed);
+                return Err(RuleXmlError::Malformed);
             }
         }
         if matches!(node, Node::Content) && !content_type {
-            return Err(SubscriptionXmlError::Malformed);
+            return Err(RuleXmlError::Malformed);
         }
-        if matches!(node, Node::Filter) && !true_filter {
-            return Err(SubscriptionXmlError::UnsupportedDefinition);
+        if matches!(node, Node::Filter) {
+            self.filter = Some(filter_type.ok_or(RuleXmlError::InvalidDefinition)?);
         }
         self.frames.push(Frame {
             raw_name: raw_name.as_ref().to_owned(),
@@ -346,11 +305,11 @@ impl Parser {
         Ok(())
     }
 
-    fn close(&mut self, raw_name: &str) -> Result<(), SubscriptionXmlError> {
+    fn close(&mut self, raw_name: &str) -> Result<(), RuleXmlError> {
         lexical::qname(raw_name)?;
-        let frame = self.frames.last().ok_or(SubscriptionXmlError::Malformed)?;
+        let frame = self.frames.last().ok_or(RuleXmlError::Malformed)?;
         if frame.raw_name != raw_name {
-            return Err(SubscriptionXmlError::Malformed);
+            return Err(RuleXmlError::Malformed);
         }
         let (namespace, _) = self.resolver.resolve_element(QName(raw_name));
         let expected = match frame.node {
@@ -358,26 +317,32 @@ impl Parser {
             _ => NamespaceKind::ServiceBus,
         };
         if resolved_namespace(namespace)? != Some(expected) {
-            return Err(SubscriptionXmlError::Malformed);
+            return Err(RuleXmlError::Malformed);
         }
-        let frame = self.frames.pop().ok_or(SubscriptionXmlError::Malformed)?;
+        let frame = self.frames.pop().ok_or(RuleXmlError::Malformed)?;
         match frame.node {
             Node::Entry | Node::Content if !frame.child_seen => {
-                return Err(SubscriptionXmlError::Malformed);
+                return Err(RuleXmlError::Malformed);
             }
-            Node::Rule if !self.rule.name || !self.rule.filter => {
-                return Err(SubscriptionXmlError::UnsupportedDefinition);
+            Node::Description if !self.name_seen || !self.filter_seen => {
+                return Err(RuleXmlError::InvalidDefinition);
             }
-            Node::Filter if !self.rule.expression => {
-                return Err(SubscriptionXmlError::UnsupportedDefinition);
+            Node::Filter if !self.expression_seen => {
+                return Err(RuleXmlError::InvalidDefinition);
             }
-            Node::RuleName if frame.scalar != "$Default" => {
-                return Err(SubscriptionXmlError::UnsupportedDefinition);
+            Node::Name => {
+                self.name =
+                    Some(RuleName::new(frame.scalar).map_err(|_| RuleXmlError::InvalidDefinition)?);
             }
-            Node::SqlExpression if frame.scalar != "1=1" => {
-                return Err(SubscriptionXmlError::UnsupportedDefinition);
+            Node::SqlExpression
+                if frame.scalar
+                    != self
+                        .filter
+                        .ok_or(RuleXmlError::InvalidDefinition)?
+                        .expression() =>
+            {
+                return Err(RuleXmlError::InvalidDefinition);
             }
-            Node::Property(property) => self.property(property, &frame.scalar)?,
             _ => {}
         }
         self.resolver.pop();
@@ -387,16 +352,16 @@ impl Parser {
         Ok(())
     }
 
-    fn text(&mut self, text: &str, reference: bool) -> Result<(), SubscriptionXmlError> {
+    fn text(&mut self, text: &str, reference: bool) -> Result<(), RuleXmlError> {
         if !lexical::legal_chars(text) {
-            return Err(SubscriptionXmlError::Malformed);
+            return Err(RuleXmlError::Malformed);
         }
         self.budget.decoded(text.len())?;
         let Some(frame) = self.frames.last_mut() else {
             return if !reference && text.chars().all(lexical::xml_space) {
                 Ok(())
             } else {
-                Err(SubscriptionXmlError::Malformed)
+                Err(RuleXmlError::Malformed)
             };
         };
         if frame.node.scalar() {
@@ -404,92 +369,48 @@ impl Parser {
             bounded_add(&mut length, text.len(), MAX_BODY_BYTES)?;
             frame.scalar.push_str(text);
         } else if reference || !text.chars().all(lexical::xml_space) {
-            return Err(SubscriptionXmlError::Malformed);
+            return Err(RuleXmlError::Malformed);
         }
         Ok(())
     }
 
-    fn reference(&mut self, reference: &BytesRef<'_>) -> Result<(), SubscriptionXmlError> {
+    fn reference(&mut self, reference: &BytesRef<'_>) -> Result<(), RuleXmlError> {
         if let Some(value) = reference
             .resolve_char_ref()
-            .map_err(|_| SubscriptionXmlError::Malformed)?
+            .map_err(|_| RuleXmlError::Malformed)?
         {
             let mut bytes = [0_u8; 4];
             self.text(value.encode_utf8(&mut bytes), true)
         } else {
             let value = quick_xml::escape::resolve_xml_entity(reference.as_ref())
-                .ok_or(SubscriptionXmlError::Malformed)?;
+                .ok_or(RuleXmlError::Malformed)?;
             self.text(value, true)
         }
-    }
-
-    fn property(&mut self, property: Property, scalar: &str) -> Result<(), SubscriptionXmlError> {
-        let value = lexical::trim(scalar);
-        match property {
-            Property::Lock => self.config.lock_duration_millis = duration::parse(value)?,
-            Property::Session if boolean(value)? => {
-                return Err(SubscriptionXmlError::UnsupportedDefinition);
-            }
-            Property::Session => self.config.requires_session = false,
-            Property::Ttl => {
-                self.config.default_time_to_live_millis = Some(duration::parse(value)?)
-            }
-            Property::ExpiryDeadLetter => {
-                self.config.dead_lettering_on_message_expiration = boolean(value)?
-            }
-            Property::FilterDeadLetter => {
-                self.config.dead_lettering_on_filter_evaluation_exceptions = boolean(value)?
-            }
-            Property::Deliveries => {
-                let count = duration::integer(value)?;
-                if !(1..=i32::MAX as u64).contains(&count) {
-                    return Err(SubscriptionXmlError::InvalidDefinition);
-                }
-                self.config.max_delivery_count = count as u32;
-            }
-            Property::Batched if boolean(value)? => {}
-            Property::Status if value == "Active" => {}
-            Property::Batched | Property::Status => {
-                return Err(SubscriptionXmlError::UnsupportedDefinition);
-            }
-            Property::DefaultRule => return Err(SubscriptionXmlError::Malformed),
-        }
-        Ok(())
-    }
-}
-
-fn boolean(value: &str) -> Result<bool, SubscriptionXmlError> {
-    match value {
-        "true" | "1" => Ok(true),
-        "false" | "0" => Ok(false),
-        _ => Err(SubscriptionXmlError::InvalidDefinition),
     }
 }
 
 fn checked_declaration<'a>(
     prefix: PrefixDeclaration<'_>,
     value: &'a str,
-) -> Result<&'a str, SubscriptionXmlError> {
+) -> Result<&'a str, RuleXmlError> {
     match prefix {
-        PrefixDeclaration::Named("xmlns") => Err(SubscriptionXmlError::Malformed),
+        PrefixDeclaration::Named("xmlns") => Err(RuleXmlError::Malformed),
         PrefixDeclaration::Named("xml") if value == XML_NS => Ok(XML_NS),
-        PrefixDeclaration::Named("xml") => Err(SubscriptionXmlError::Malformed),
+        PrefixDeclaration::Named("xml") => Err(RuleXmlError::Malformed),
         PrefixDeclaration::Default if value.is_empty() => Ok(""),
         _ => match value {
             ATOM_NS => Ok(ATOM_NS),
             SERVICE_BUS_NS => Ok(SERVICE_BUS_NS),
             XSI_NS => Ok(XSI_NS),
-            _ => Err(SubscriptionXmlError::Malformed),
+            _ => Err(RuleXmlError::Malformed),
         },
     }
 }
 
-fn declaration(raw: &str, budget: &mut Budget) -> Result<(), SubscriptionXmlError> {
-    let tail = raw
-        .strip_prefix("xml")
-        .ok_or(SubscriptionXmlError::Malformed)?;
+fn declaration(raw: &str, budget: &mut Budget) -> Result<(), RuleXmlError> {
+    let tail = raw.strip_prefix("xml").ok_or(RuleXmlError::Malformed)?;
     if !tail.chars().next().is_some_and(lexical::xml_space) {
-        return Err(SubscriptionXmlError::Malformed);
+        return Err(RuleXmlError::Malformed);
     }
     lexical::attribute_tail(tail)?;
     let start = BytesStart::from_content(raw, 3);
@@ -498,7 +419,7 @@ fn declaration(raw: &str, budget: &mut Budget) -> Result<(), SubscriptionXmlErro
     let mut standalone_seen = false;
     for attribute in start.attributes().with_checks(true) {
         Budget::attributes(position + 1)?;
-        let attribute = attribute.map_err(|_| SubscriptionXmlError::Malformed)?;
+        let attribute = attribute.map_err(|_| RuleXmlError::Malformed)?;
         budget.decoded(attribute.value.len())?;
         let key = attribute.key.as_ref();
         let value = attribute.value.as_ref();
@@ -517,34 +438,24 @@ fn declaration(raw: &str, budget: &mut Budget) -> Result<(), SubscriptionXmlErro
             {
                 standalone_seen = true
             }
-            _ => return Err(SubscriptionXmlError::Malformed),
+            _ => return Err(RuleXmlError::Malformed),
         }
         position += 1;
     }
     if position == 0 {
-        return Err(SubscriptionXmlError::Malformed);
+        return Err(RuleXmlError::Malformed);
     }
     Ok(())
 }
 
-pub(crate) fn decode_definition(body: &[u8]) -> Result<SubscriptionConfig, SubscriptionXmlError> {
-    decode(body, DefinitionKind::Create)
-}
-
-pub(crate) fn decode_update_definition(
-    body: &[u8],
-) -> Result<SubscriptionConfig, SubscriptionXmlError> {
-    decode(body, DefinitionKind::Update)
-}
-
-fn decode(body: &[u8], kind: DefinitionKind) -> Result<SubscriptionConfig, SubscriptionXmlError> {
+pub(crate) fn decode_definition(body: &[u8]) -> Result<AtomRuleDefinition, RuleXmlError> {
     if body.len() > MAX_BODY_BYTES {
-        return Err(SubscriptionXmlError::WorkLimitExceeded);
+        return Err(RuleXmlError::WorkLimitExceeded);
     }
-    let document = std::str::from_utf8(body).map_err(|_| SubscriptionXmlError::Malformed)?;
+    let document = std::str::from_utf8(body).map_err(|_| RuleXmlError::Malformed)?;
     let document = document.strip_prefix('\u{FEFF}').unwrap_or(document);
     if document.starts_with('\u{FEFF}') || !lexical::legal_chars(document) {
-        return Err(SubscriptionXmlError::Malformed);
+        return Err(RuleXmlError::Malformed);
     }
     let mut reader = Reader::from_str(document);
     let config = reader.config_mut();
@@ -555,13 +466,10 @@ fn decode(body: &[u8], kind: DefinitionKind) -> Result<SubscriptionConfig, Subsc
     config.expand_empty_elements = false;
     config.trim_markup_names_in_closing_tags = true;
     config.trim_text(false);
-    let mut parser = Parser::new(kind);
+    let mut parser = Parser::new();
     loop {
         parser.budget.event()?;
-        match reader
-            .read_event()
-            .map_err(|_| SubscriptionXmlError::Malformed)?
-        {
+        match reader.read_event().map_err(|_| RuleXmlError::Malformed)? {
             Event::Start(start) => parser.open(&start)?,
             Event::Empty(start) => {
                 parser.open(&start)?;
@@ -570,7 +478,7 @@ fn decode(body: &[u8], kind: DefinitionKind) -> Result<SubscriptionConfig, Subsc
             Event::End(end) => parser.close(end.name().as_ref())?,
             Event::Text(text) => {
                 if text.as_ref().contains("]]>") {
-                    return Err(SubscriptionXmlError::Malformed);
+                    return Err(RuleXmlError::Malformed);
                 }
                 parser.text(&text.xml10_content(), false)?;
             }
@@ -581,10 +489,17 @@ fn decode(body: &[u8], kind: DefinitionKind) -> Result<SubscriptionConfig, Subsc
             Event::Eof
                 if parser.complete && parser.frames.is_empty() && parser.resolver.level() == 0 =>
             {
-                validate_config(&parser.config)?;
-                return Ok(parser.config);
+                let definition = AtomRuleDefinition {
+                    name: parser.name.ok_or(RuleXmlError::InvalidDefinition)?,
+                    filter: parser
+                        .filter
+                        .ok_or(RuleXmlError::InvalidDefinition)?
+                        .filter(),
+                };
+                validate_definition(&definition)?;
+                return Ok(definition);
             }
-            _ => return Err(SubscriptionXmlError::Malformed),
+            _ => return Err(RuleXmlError::Malformed),
         }
     }
 }

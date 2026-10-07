@@ -320,7 +320,7 @@ async fn subscription_auth_xml_and_unsupported_operations_have_no_mutations<P: S
             ),
             (
                 Method::GET,
-                "/orders/Subscriptions/worker/Rules/$Default?api-version=2024-05",
+                "/orders/Subscriptions/worker/Rules/$Default?api-version=2024-05&enrich=True",
                 false,
             ),
         ] {
@@ -466,3 +466,6 @@ subscription_transport_backends! {
 
 #[path = "subscriptions/updates.rs"]
 mod updates;
+
+#[path = "subscriptions/rules.rs"]
+mod rules;

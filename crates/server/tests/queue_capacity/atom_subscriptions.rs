@@ -830,3 +830,6 @@ for_each_subscription_backend! {
 
 #[path = "atom_subscriptions/updates.rs"]
 mod updates;
+
+#[path = "atom_subscriptions/rules.rs"]
+mod rules;

@@ -213,10 +213,10 @@ internal static class AtomSubscriptionAdministrationCases
             await foreach (SubscriptionProperties _ in client.GetSubscriptionsAsync(Topic, token)) { }
         });
         await ExpectArgumentAsync(() => client.GetSubscriptionRuntimePropertiesAsync(Topic, DefaultName(suffix), token));
-        await ExpectArgumentAsync(async () =>
-        {
-            await foreach (RuleProperties _ in client.GetRulesAsync(Topic, DefaultName(suffix), token)) { }
-        });
+        RuleProperties unchangedRule = (await client.GetRuleAsync(
+            Topic, DefaultName(suffix), CreateRuleOptions.DefaultRuleName, token)).Value;
+        await ExpectArgumentAsync(() => client.UpdateRuleAsync(
+            Topic, DefaultName(suffix), unchangedRule, token));
         RequireDefault(await GetAsync(other, DefaultName(suffix), token), DefaultName(suffix));
         RequireDefinition(await GetAsync(other, DefinitionName(suffix), token), DefinitionName(suffix));
     }

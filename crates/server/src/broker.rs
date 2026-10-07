@@ -35,6 +35,7 @@ use crate::{AdminTarget, Clock, LocalProposer, ProposeError};
 
 mod admin_reads;
 mod atom_finite_queues;
+mod atom_rules;
 mod atom_subscriptions;
 mod atomic_messaging;
 mod atomic_work;
@@ -49,6 +50,7 @@ mod queue_capacity;
 mod request_queue;
 
 pub use atom_finite_queues::AtomQueueOwnerError;
+pub use atom_rules::{AtomRuleDefinition, AtomRuleOwnerError};
 pub use atom_subscriptions::AtomSubscriptionOwnerError;
 pub use guarded_atomic_messaging::GuardedAtomicSubmitError;
 pub use native_atomic_messaging::{NativeAtomicMessagingCompletion, NativeAtomicSubmitError};
@@ -61,6 +63,35 @@ pub use native_atomic_messaging::{NativeAtomicMessagingCompletion, NativeAtomicS
 const COMMAND_QUEUE_DEPTH: usize = 1_024;
 
 enum Request {
+    CreateAtomRule {
+        namespace: NamespaceName,
+        topic: EntityPath,
+        subscription: domain::SubscriptionName,
+        definition: Box<AtomRuleDefinition>,
+        reply: flume::Sender<Result<AtomRuleDefinition, AtomRuleOwnerError>>,
+    },
+    GetAtomRule {
+        namespace: NamespaceName,
+        topic: EntityPath,
+        subscription: domain::SubscriptionName,
+        name: domain::RuleName,
+        reply: flume::Sender<Result<Option<AtomRuleDefinition>, AtomRuleOwnerError>>,
+    },
+    ListAtomRules {
+        namespace: NamespaceName,
+        topic: EntityPath,
+        subscription: domain::SubscriptionName,
+        skip: usize,
+        top: usize,
+        reply: flume::Sender<Result<Vec<AtomRuleDefinition>, AtomRuleOwnerError>>,
+    },
+    DeleteAtomRule {
+        namespace: NamespaceName,
+        topic: EntityPath,
+        subscription: domain::SubscriptionName,
+        name: domain::RuleName,
+        reply: flume::Sender<Result<CommandOutcome, AtomRuleOwnerError>>,
+    },
     CreateAtomSubscription {
         namespace: NamespaceName,
         topic: EntityPath,
@@ -642,6 +673,64 @@ impl Broker {
             .spawn(move || {
                 while let Ok(request) = incoming.recv() {
                     match request {
+                        Request::CreateAtomRule {
+                            namespace,
+                            topic,
+                            subscription,
+                            definition,
+                            reply,
+                        } => {
+                            let _ = reply.send(proposer.create_atom_rule(
+                                &namespace,
+                                &topic,
+                                &subscription,
+                                *definition,
+                            ));
+                        }
+                        Request::GetAtomRule {
+                            namespace,
+                            topic,
+                            subscription,
+                            name,
+                            reply,
+                        } => {
+                            let _ = reply.send(proposer.get_atom_rule(
+                                &namespace,
+                                &topic,
+                                &subscription,
+                                &name,
+                            ));
+                        }
+                        Request::ListAtomRules {
+                            namespace,
+                            topic,
+                            subscription,
+                            skip,
+                            top,
+                            reply,
+                        } => {
+                            let _ = reply.send(proposer.list_atom_rules(
+                                &namespace,
+                                &topic,
+                                &subscription,
+                                skip,
+                                top,
+                            ));
+                        }
+                        Request::DeleteAtomRule {
+                            namespace,
+                            topic,
+                            subscription,
+                            name,
+                            reply,
+                        } => {
+                            let _ = reply.send(proposer.delete_atom_rule(
+                                &namespace,
+                                &topic,
+                                &subscription,
+                                &name,
+                            ));
+                        }
                         Request::CreateAtomSubscription {
                             namespace,
                             topic,

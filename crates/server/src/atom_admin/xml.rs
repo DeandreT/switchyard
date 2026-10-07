@@ -9,6 +9,7 @@ mod decode;
 mod duration;
 mod encode;
 mod lexical;
+pub(crate) mod rules;
 pub(crate) mod subscriptions;
 
 pub(crate) use decode::decode_definition;

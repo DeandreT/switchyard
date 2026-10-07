@@ -9,9 +9,12 @@ use quick_xml::{
     events::{BytesEnd, BytesStart, BytesText, Event},
 };
 
+use super::super::xml::rules::{self, RuleXmlError};
 use super::super::xml::subscriptions::{self, SubscriptionXmlError};
 use super::super::xml::{self, AtomXmlError};
-use crate::{AtomQueueOwnerError, AtomSubscriptionOwnerError, ProposeError, SubmitError};
+use crate::{
+    AtomQueueOwnerError, AtomRuleOwnerError, AtomSubscriptionOwnerError, ProposeError, SubmitError,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RequestFailure {
@@ -23,12 +26,15 @@ pub(super) enum RequestFailure {
     TopicNotFound,
     SubscriptionNotFound,
     SubscriptionConflict,
+    RuleNotFound,
+    RuleConflict,
     Conflict,
     Quota,
     Unavailable,
     Internal,
     Xml(AtomXmlError),
     SubscriptionXml(SubscriptionXmlError),
+    RuleXml(RuleXmlError),
 }
 
 impl From<AtomXmlError> for RequestFailure {
@@ -79,6 +85,8 @@ impl From<SubmitError> for RequestFailure {
                     BrokerError::TopicNotFound => Self::TopicNotFound,
                     BrokerError::SubscriptionNotFound => Self::SubscriptionNotFound,
                     BrokerError::SubscriptionAlreadyExists => Self::SubscriptionConflict,
+                    BrokerError::RuleNotFound => Self::RuleNotFound,
+                    BrokerError::RuleAlreadyExists => Self::RuleConflict,
                     BrokerError::QueueAlreadyExists | BrokerError::EntityPathAlreadyExists => {
                         Self::Conflict
                     }
@@ -91,6 +99,9 @@ impl From<SubmitError> for RequestFailure {
                     | BrokerError::SubscriptionPathIsReserved => Self::BadRequest,
                     BrokerError::QueueCapacityWorkLimitExceeded
                     | BrokerError::SubscriptionLimitExceeded { .. }
+                    | BrokerError::RuleLimitExceeded { .. }
+                    | BrokerError::RuleTooLarge { .. }
+                    | BrokerError::RuleSetTooLarge { .. }
                     | BrokerError::EntityDeleteTooLarge { .. }
                     | BrokerError::ClockRegression { .. } => Self::Unavailable,
                     // Desired input is validated before owner admission; remaining
@@ -98,6 +109,24 @@ impl From<SubmitError> for RequestFailure {
                     _ => Self::Internal,
                 }
             }
+        }
+    }
+}
+
+impl From<RuleXmlError> for RequestFailure {
+    fn from(error: RuleXmlError) -> Self {
+        Self::RuleXml(error)
+    }
+}
+
+impl From<AtomRuleOwnerError> for RequestFailure {
+    fn from(error: AtomRuleOwnerError) -> Self {
+        match error {
+            AtomRuleOwnerError::Submit(error) => error.into(),
+            AtomRuleOwnerError::UnsupportedDefinition => {
+                Self::RuleXml(RuleXmlError::UnsupportedDefinition)
+            }
+            AtomRuleOwnerError::InvalidPageBounds => Self::BadRequest,
         }
     }
 }
@@ -116,24 +145,30 @@ impl RequestFailure {
                 SubscriptionXmlError::Malformed
                 | SubscriptionXmlError::InvalidDefinition
                 | SubscriptionXmlError::UnsupportedDefinition,
+            )
+            | Self::RuleXml(
+                RuleXmlError::Malformed
+                | RuleXmlError::InvalidDefinition
+                | RuleXmlError::UnsupportedDefinition,
             ) => StatusCode::BAD_REQUEST,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::HeaderTooLarge => StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
-            Self::NotFound | Self::TopicNotFound | Self::SubscriptionNotFound => {
-                StatusCode::NOT_FOUND
+            Self::NotFound
+            | Self::TopicNotFound
+            | Self::SubscriptionNotFound
+            | Self::RuleNotFound => StatusCode::NOT_FOUND,
+            Self::Conflict | Self::SubscriptionConflict | Self::RuleConflict => {
+                StatusCode::CONFLICT
             }
-            Self::Conflict | Self::SubscriptionConflict => StatusCode::CONFLICT,
             Self::Quota => StatusCode::FORBIDDEN,
             Self::Unavailable
             | Self::Xml(AtomXmlError::WorkLimitExceeded)
-            | Self::SubscriptionXml(SubscriptionXmlError::WorkLimitExceeded) => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            | Self::SubscriptionXml(SubscriptionXmlError::WorkLimitExceeded)
+            | Self::RuleXml(RuleXmlError::WorkLimitExceeded) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal
             | Self::Xml(AtomXmlError::ReplyLimitExceeded)
-            | Self::SubscriptionXml(SubscriptionXmlError::ReplyLimitExceeded) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            | Self::SubscriptionXml(SubscriptionXmlError::ReplyLimitExceeded)
+            | Self::RuleXml(RuleXmlError::ReplyLimitExceeded) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -159,12 +194,14 @@ impl RequestFailure {
                 "The requested subscription already exists.",
             ),
             Self::Conflict => ("EntityAlreadyExists", "The requested queue already exists."),
+            Self::RuleNotFound => ("EntityNotFound", "The requested rule was not found."),
+            Self::RuleConflict => ("EntityAlreadyExists", "The requested rule already exists."),
             Self::Quota => ("QuotaExceeded", "The queue capacity would be exceeded."),
             Self::Unavailable => (
                 "ServiceBusy",
                 "The request could not be completed within the service limits.",
             ),
-            Self::Internal | Self::Xml(_) | Self::SubscriptionXml(_) => {
+            Self::Internal | Self::Xml(_) | Self::SubscriptionXml(_) | Self::RuleXml(_) => {
                 ("InternalError", "The request could not be completed.")
             }
         }
@@ -176,6 +213,8 @@ impl RequestFailure {
             Self::SubscriptionXml(error) => {
                 subscriptions::encode_error(error).map_err(|_| AtomXmlError::ReplyLimitExceeded)
             }
+            Self::RuleXml(error) => rules::encode_error(error.code(), error.detail())
+                .map_err(|_| AtomXmlError::ReplyLimitExceeded),
             _ => write_error(self.public_text()).map_err(|_| AtomXmlError::ReplyLimitExceeded),
         };
         match body {

@@ -176,7 +176,7 @@ fn duplicate_properties_rule_children_and_expanded_attributes_are_malformed() {
 #[test]
 fn namespace_aliases_are_resolved_and_filter_type_is_required() {
     let aliases = format!(
-        "<a:entry xmlns:a=\"{ATOM_NS}\" xmlns:s=\"{SERVICE_BUS_NS}\" xmlns:z=\"{XSI_NS}\"><a:content type=\"application/xml\"><s:SubscriptionDescription><s:DefaultRuleDescription><s:Name>$Default</s:Name><s:Filter z:type=\"TrueFilter\"><s:SqlExpression>1=1</s:SqlExpression></s:Filter></s:DefaultRuleDescription></s:SubscriptionDescription></a:content></a:entry>"
+        "<a:entry xmlns:a=\"{ATOM_NS}\" xmlns:s=\"{SERVICE_BUS_NS}\" xmlns:z=\"{XSI_NS}\"><a:content type=\"application/xml\"><s:SubscriptionDescription><s:DefaultRuleDescription><s:Name>$Default</s:Name><s:Filter xmlns=\"{SERVICE_BUS_NS}\" z:type=\"TrueFilter\"><s:SqlExpression>1=1</s:SqlExpression></s:Filter></s:DefaultRuleDescription></s:SubscriptionDescription></a:content></a:entry>"
     );
     assert_eq!(
         decode_definition(aliases.as_bytes()),
@@ -655,5 +655,32 @@ fn full_update_reuses_closed_grammar_and_existing_bounds() {
     assert_eq!(
         decode_update_definition(events.as_bytes()),
         Err(SubscriptionXmlError::WorkLimitExceeded)
+    );
+}
+
+#[test]
+fn default_rule_bare_type_requires_the_service_bus_default_namespace() {
+    let prefixed = format!(
+        "<entry xmlns=\"{ATOM_NS}\" xmlns:s=\"{SERVICE_BUS_NS}\"><content type=\"application/xml\"><s:SubscriptionDescription><s:DefaultRuleDescription><s:Filter xmlns:i=\"{XSI_NS}\" i:type=\"TrueFilter\"><s:SqlExpression>1=1</s:SqlExpression><s:Parameters/></s:Filter><s:Name>$Default</s:Name></s:DefaultRuleDescription></s:SubscriptionDescription></content></entry>"
+    );
+    assert_eq!(
+        decode_definition(prefixed.as_bytes()),
+        Err(SubscriptionXmlError::Malformed)
+    );
+    let bound = prefixed.replace(
+        "<s:Filter ",
+        &format!("<s:Filter xmlns=\"{SERVICE_BUS_NS}\" "),
+    );
+    assert_eq!(
+        decode_definition(bound.as_bytes()),
+        Ok(SubscriptionConfig::default())
+    );
+    let no_default = bound.replace(
+        &format!("<s:Filter xmlns=\"{SERVICE_BUS_NS}\" "),
+        "<s:Filter xmlns=\"\" ",
+    );
+    assert_eq!(
+        decode_definition(no_default.as_bytes()),
+        Err(SubscriptionXmlError::Malformed)
     );
 }

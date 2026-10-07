@@ -596,3 +596,5 @@ async fn codec_and_noncodec_failures_keep_distinct_static_redacted_xml() {
     assert!(!rendered.contains("InvalidXml"));
     assert!(rendered.contains("InternalError"));
 }
+
+mod rules;
