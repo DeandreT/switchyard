@@ -18,7 +18,8 @@ fn unique_deleted_key_limit_is_exact_and_overflow_keeps_every_key<P: StoreProvid
         keys::queue_counters(&fixture.namespace, &fixture.entity),
         codec::encode(&retained_counter)?,
     );
-    for index in 0..MAX_ENTITY_DELETE_KEYS - 2 {
+    // Both queue configs and the mandatory primary capacity mode are deleted.
+    for index in 0..MAX_ENTITY_DELETE_KEYS - 3 {
         batch.push_put(
             keys::duplicate_history(
                 &fixture.namespace,
@@ -111,7 +112,8 @@ fn unique_key_byte_limit_counts_metadata_and_rejects_one_more_byte<P: StoreProvi
     )?;
     let shadow = fixture.entity.dead_letter_queue()?;
     let metadata_bytes = keys::queue_config(&fixture.namespace, &fixture.entity).len()
-        + keys::queue_config(&fixture.namespace, &shadow).len();
+        + keys::queue_config(&fixture.namespace, &shadow).len()
+        + keys::queue_capacity_mode(&fixture.namespace, &fixture.entity).len();
     let prefix = keys::duplicate_history_prefix(&fixture.namespace, &fixture.entity);
     let full_size = prefix.len() + domain::MAX_MESSAGE_ID_LENGTH;
     let available = MAX_ENTITY_DELETE_KEY_BYTES - metadata_bytes;
@@ -146,7 +148,7 @@ fn unique_key_byte_limit_counts_metadata_and_rejects_one_more_byte<P: StoreProvi
         runtime.iter().map(Vec::len).sum::<usize>() + metadata_bytes,
         MAX_ENTITY_DELETE_KEY_BYTES
     );
-    assert!(runtime.len() + 2 < MAX_ENTITY_DELETE_KEYS);
+    assert!(runtime.len() + 3 < MAX_ENTITY_DELETE_KEYS);
     let value = codec::encode(&Timestamp::from_millis(10_000))?;
     let mut batch = WriteBatch::default().put(
         keys::queue_counters(&fixture.namespace, &fixture.entity),

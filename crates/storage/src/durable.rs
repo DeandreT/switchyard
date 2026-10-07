@@ -97,13 +97,17 @@ pub const STORE_FORMAT_V15: u32 = 15;
 /// and block takeover until their actual lock exits commit.
 pub const STORE_FORMAT_V16: u32 = 16;
 
+/// Version 17: primary queues carry a mandatory capacity profile and finite
+/// queues retain reservations across every message lifecycle transition.
+pub const STORE_FORMAT_V17: u32 = 17;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V16;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V17;
 
 /// Replica layouts use a disjoint version namespace so standalone and older
 /// binaries cannot mistake their records for an ordinary store. Record-layout
@@ -156,9 +160,21 @@ impl FjallStore {
             .map_err(|error| StorageError::backend("read the store format version", &error))?
         {
             Some(recorded) => require_readable_format(&recorded)?,
-            // No version record means nothing has ever been written here, so
-            // stamp the directory durably before it can hold a single record.
             None => {
+                // A missing marker is not evidence of a fresh directory.
+                for keyspace in [&meta, &records] {
+                    if keyspace
+                        .iter()
+                        .next()
+                        .map(read_entry)
+                        .transpose()?
+                        .is_some()
+                    {
+                        return Err(StorageError::CorruptMetadata {
+                            detail: "unversioned standalone directory is not empty".into(),
+                        });
+                    }
+                }
                 let mut batch = database.batch().durability(Some(PersistMode::SyncAll));
                 batch.insert(
                     &meta,
@@ -605,10 +621,10 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V13,
-                expected: STORE_FORMAT_V16,
+                expected: ACTIVE_STORE_FORMAT,
             })
         );
-        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V16);
+        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V17);
         Ok(())
     }
 
@@ -633,17 +649,20 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V14,
-                expected: STORE_FORMAT_V16
+                expected: ACTIVE_STORE_FORMAT
             })
         );
-        assert_eq!(ACTIVE_REPLICA_STORE_FORMAT, 0x8000_0000 | STORE_FORMAT_V16);
+        assert_eq!(
+            ACTIVE_REPLICA_STORE_FORMAT,
+            0x8000_0000 | ACTIVE_STORE_FORMAT
+        );
         assert_eq!(
             ACTIVE_CATALOG_REPLICA_STORE_FORMAT,
-            0xc000_0000 | STORE_FORMAT_V16
+            0xc000_0000 | ACTIVE_STORE_FORMAT
         );
         assert_eq!(
             ACTIVE_PROTECTED_STATE_STORE_FORMAT,
-            0xd000_0000 | STORE_FORMAT_V16
+            0xd000_0000 | ACTIVE_STORE_FORMAT
         );
         Ok(())
     }
@@ -655,7 +674,7 @@ mod tests {
             require_readable_format(&recorded),
             Err(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V15,
-                expected: STORE_FORMAT_V16
+                expected: ACTIVE_STORE_FORMAT
             })
         );
         assert_eq!(require_format_version(&recorded, STORE_FORMAT_V15), Ok(()));
@@ -670,7 +689,7 @@ mod tests {
             require_readable_format(&STORE_FORMAT_V14.to_be_bytes()),
             Err(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V14,
-                expected: STORE_FORMAT_V16
+                expected: ACTIVE_STORE_FORMAT
             })
         );
     }
@@ -684,7 +703,7 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V15,
-                expected: STORE_FORMAT_V16
+                expected: ACTIVE_STORE_FORMAT
             })
         );
         Ok(())
@@ -693,7 +712,13 @@ mod tests {
     #[test]
     fn session_message_lock_layout_is_readable_only_as_version_sixteen() {
         let recorded = STORE_FORMAT_V16.to_be_bytes();
-        assert_eq!(require_readable_format(&recorded), Ok(()));
+        assert_eq!(
+            require_readable_format(&recorded),
+            Err(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V16,
+                expected: STORE_FORMAT_V17,
+            })
+        );
         assert_eq!(require_format_version(&recorded, STORE_FORMAT_V16), Ok(()));
         assert_eq!(
             require_format_version(&recorded, STORE_FORMAT_V15),
@@ -703,7 +728,7 @@ mod tests {
             })
         );
         assert_eq!(
-            require_readable_format(&17_u32.to_be_bytes()),
+            require_format_version(&STORE_FORMAT_V17.to_be_bytes(), STORE_FORMAT_V16),
             Err(StorageError::UnsupportedStoreFormat {
                 found: 17,
                 expected: STORE_FORMAT_V16
@@ -713,10 +738,10 @@ mod tests {
 
     #[test]
     fn derived_store_layouts_follow_session_message_lock_version_sixteen() {
-        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V16);
-        assert_eq!(ACTIVE_REPLICA_STORE_FORMAT, 0x8000_0010);
-        assert_eq!(ACTIVE_CATALOG_REPLICA_STORE_FORMAT, 0xc000_0010);
-        assert_eq!(ACTIVE_PROTECTED_STATE_STORE_FORMAT, 0xd000_0010);
+        assert_eq!(STORE_FORMAT_V16, 16);
+        assert_eq!(0x8000_0000 | STORE_FORMAT_V16, 0x8000_0010);
+        assert_eq!(0xc000_0000 | STORE_FORMAT_V16, 0xc000_0010);
+        assert_eq!(0xd000_0000 | STORE_FORMAT_V16, 0xd000_0010);
         for format in [
             ACTIVE_REPLICA_STORE_FORMAT,
             ACTIVE_CATALOG_REPLICA_STORE_FORMAT,
@@ -746,10 +771,83 @@ mod tests {
                 require_readable_format(&format.to_be_bytes()),
                 Err(StorageError::UnsupportedStoreFormat {
                     found: format,
-                    expected: STORE_FORMAT_V16
+                    expected: ACTIVE_STORE_FORMAT
                 })
             );
         }
+    }
+
+    #[test]
+    fn capacity_layout_refuses_version_sixteen_directories() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("temporary previous layout");
+        stamp_format(directory.path(), &STORE_FORMAT_V16.to_be_bytes())?;
+        assert_eq!(
+            FjallStore::open(directory.path()).err(),
+            Some(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V16,
+                expected: STORE_FORMAT_V17,
+            })
+        );
+        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V17);
+        assert_eq!(ACTIVE_REPLICA_STORE_FORMAT, 0x8000_0011);
+        assert_eq!(ACTIVE_CATALOG_REPLICA_STORE_FORMAT, 0xc000_0011);
+        assert_eq!(ACTIVE_PROTECTED_STATE_STORE_FORMAT, 0xd000_0011);
+        for format in [
+            ACTIVE_REPLICA_STORE_FORMAT,
+            ACTIVE_CATALOG_REPLICA_STORE_FORMAT,
+            ACTIVE_PROTECTED_STATE_STORE_FORMAT,
+        ] {
+            assert_eq!(
+                require_format_version(&(format - 1).to_be_bytes(), format),
+                Err(StorageError::UnsupportedStoreFormat {
+                    found: format - 1,
+                    expected: format
+                })
+            );
+            assert_eq!(
+                require_format_version(&format.to_be_bytes(), format - 1),
+                Err(StorageError::UnsupportedStoreFormat {
+                    found: format,
+                    expected: format - 1
+                })
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unversioned_nonempty_directories_are_refused_without_stamping() -> Result<(), StorageError> {
+        for family in [META_KEYSPACE, RECORDS_KEYSPACE] {
+            let directory = TempDir::new().expect("temporary unversioned layout");
+            {
+                let database = Database::builder(directory.path()).open().unwrap();
+                let keyspace = database
+                    .keyspace(family, KeyspaceCreateOptions::default)
+                    .unwrap();
+                let mut batch = database.batch().durability(Some(PersistMode::SyncAll));
+                batch.insert(&keyspace, b"unowned", b"opaque");
+                batch.commit().unwrap();
+            }
+            assert_eq!(
+                FjallStore::open(directory.path()).err(),
+                Some(StorageError::CorruptMetadata {
+                    detail: "unversioned standalone directory is not empty".into(),
+                })
+            );
+            let database = Database::builder(directory.path()).open().unwrap();
+            let meta = database
+                .keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)
+                .unwrap();
+            assert_eq!(meta.get(FORMAT_VERSION_KEY).unwrap(), None);
+            let keyspace = database
+                .keyspace(family, KeyspaceCreateOptions::default)
+                .unwrap();
+            assert_eq!(
+                keyspace.get(b"unowned").unwrap().as_deref(),
+                Some(b"opaque".as_slice())
+            );
+        }
+        Ok(())
     }
 
     #[test]

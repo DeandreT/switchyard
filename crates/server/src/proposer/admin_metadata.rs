@@ -1,6 +1,7 @@
 use domain::{EntityIncarnationKind, SubscriptionDefinition, SubscriptionName};
 use protocol_amqp::{EntityAdmission, EntityMetadata};
 
+use super::entity_metadata::EntityMetadataTopology;
 use super::*;
 
 /// Native administration targets preserve literal primary entity names.
@@ -78,9 +79,22 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
         namespace: &NamespaceName,
         target: &AdminTarget,
     ) -> Result<Option<EntityAdmission>, ProposeError> {
-        let metadata = self.admin_entity_metadata(namespace, target)?;
+        NamespaceName::new(namespace.as_str()).map_err(BrokerError::from)?;
         let entity = target.canonical_entity()?;
-        let Some(metadata) = metadata else {
+        let topology = match target {
+            AdminTarget::Primary(entity) => {
+                self.primary_entity_metadata_topology(namespace, entity)?
+            }
+            AdminTarget::Subscription { topic, name } => {
+                let (config, capacity_owners) =
+                    self.subscription_entity_metadata_topology(namespace, topic, name)?;
+                EntityMetadataTopology {
+                    metadata: config.map(EntityMetadata::Subscription),
+                    capacity_owners,
+                }
+            }
+        };
+        let Some(metadata) = topology.metadata else {
             if self
                 .machine
                 .entity_incarnation(namespace, &entity)?
@@ -88,6 +102,7 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
             {
                 return Err(BrokerError::DanglingEntityMetadata.into());
             }
+            self.validate_metadata_capacity(namespace, &topology.capacity_owners, None)?;
             return Ok(None);
         };
         let kind = match metadata {
@@ -100,6 +115,11 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
             .machine
             .bind_entity(namespace, &entity, &entity, kind)?
             .ok_or(BrokerError::DanglingEntityMetadata)?;
+        self.validate_metadata_capacity(
+            namespace,
+            &topology.capacity_owners,
+            Some((&entity, kind)),
+        )?;
         Ok(Some(EntityAdmission { metadata, binding }))
     }
 
@@ -112,7 +132,10 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
         NamespaceName::new(namespace.as_str()).map_err(BrokerError::from)?;
         validate_primary(topic)?;
         if self.machine.queue_config(namespace, topic)?.is_some()
-            && self.machine.topic_config(namespace, topic)?.is_some()
+            && self
+                .machine
+                .topic_config_topology(namespace, topic)?
+                .is_some()
         {
             return Err(BrokerError::DanglingEntityMetadata.into());
         }

@@ -5,7 +5,7 @@ use domain::{
     CommittedImageRole, CommittedQueueCommand, CommittedQueueWork, CommittedSend,
     CommittedStateMachine, CommittedStreamId, DecodedCommittedImage, EncodedCommittedImage,
     EntityPath, NamespaceName, QueueConfig, SessionId, Timestamp, TrustedCreateSendBootstrap,
-    ValidatedCreateSendImage,
+    ValidatedCreateSendLayout17Image,
 };
 use openraft::{BasicNode, EntryPayload, Membership};
 use serde::Serialize;
@@ -143,8 +143,11 @@ pub(super) fn initial() -> TestResult<Selected> {
 }
 
 pub(super) fn from_snapshot(snapshot: StoreSnapshot) -> TestResult<Selected> {
-    let image =
-        EncodedCommittedImage::encode(CommittedImageRole::CreateSendV1, stream()?, &snapshot)?;
+    let image = EncodedCommittedImage::encode(
+        CommittedImageRole::CreateSendLayout17V1,
+        stream()?,
+        &snapshot,
+    )?;
     let checkpoint = DecodedCommittedImage::decode(image.as_bytes())?
         .checkpoint()
         .clone();
@@ -212,7 +215,7 @@ pub(super) fn altered_checkpoint(
 }
 
 pub(super) fn supported(source: &Selected) -> TestResult {
-    let checked = ValidatedCreateSendImage::validate(DecodedCommittedImage::decode(
+    let checked = ValidatedCreateSendLayout17Image::validate(DecodedCommittedImage::decode(
         source.image.as_bytes(),
     )?)?;
     assert_eq!(checked.checkpoint(), &source.checkpoint);

@@ -2,7 +2,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CommittedCheckpoint, CommittedImageError, CommittedImageValidationError, CommittedStreamId,
-    DecodedCommittedImage, ValidatedCreateSendImage,
+    DecodedCommittedImage, ValidatedCreateSendLayout17Image,
 };
 
 #[derive(Clone, Copy)]
@@ -21,7 +21,7 @@ pub(super) fn validate_selection<'a>(
     checkpoint: &CommittedCheckpoint,
     digest: [u8; 32],
     artifact: &'a [u8],
-) -> Result<ValidatedCreateSendImage<'a>, SelectionError> {
+) -> Result<ValidatedCreateSendLayout17Image<'a>, SelectionError> {
     stream
         .validate()
         .map_err(|_| SelectionError::InvalidSelection)?;
@@ -35,7 +35,7 @@ pub(super) fn validate_selection<'a>(
     {
         return Err(SelectionError::SelectionMismatch);
     }
-    ValidatedCreateSendImage::validate(image).map_err(|error| match error {
+    ValidatedCreateSendLayout17Image::validate(image).map_err(|error| match error {
         CommittedImageValidationError::UnsupportedProfile => SelectionError::UnsupportedProfile,
         _ => SelectionError::InvalidImage,
     })

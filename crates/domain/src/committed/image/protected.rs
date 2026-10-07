@@ -5,7 +5,10 @@ use std::fmt;
 use sha2::{Digest, Sha256};
 use storage::{MAX_PROTECTED_STATE_FENCE_BYTES, StoredProtectedState};
 
-use crate::{CreateSendImageExpectation, MAX_COMMITTED_MEMBERSHIP_BYTES};
+use crate::{
+    CommittedCheckpoint, CommittedImageRows, CreateSendImageExpectation,
+    MAX_COMMITTED_MEMBERSHIP_BYTES,
+};
 
 use super::{
     CommittedImageError, CommittedImageValidationError, DecodedCommittedImage,
@@ -14,6 +17,11 @@ use super::{
 
 #[cfg(test)]
 mod tests;
+
+mod layout17;
+pub use layout17::{
+    CheckedProtectedCreateSendLayout17Image, check_protected_create_send_layout17_image,
+};
 
 /// Static data refusals, not source-health, poison or mutation diagnostics.
 ///
@@ -183,6 +191,25 @@ pub fn check_protected_create_send_image<'a>(
     expected: &CreateSendImageExpectation<'_>,
     expected_fence: &[u8],
 ) -> Result<CheckedProtectedCreateSendImage<'a>> {
+    let artifact = captured_artifact(state, expected, expected_fence)?;
+    let decoded = DecodedCommittedImage::decode(artifact).map_err(container_error)?;
+    let image = ValidatedCreateSendImage::validate(decoded).map_err(business_error)?;
+    check_agreement(
+        state,
+        expected,
+        expected_fence,
+        image.checkpoint(),
+        image.rows(),
+        image.row_count(),
+    )?;
+    Ok(CheckedProtectedCreateSendImage { state, image })
+}
+
+fn captured_artifact<'a>(
+    state: &'a StoredProtectedState,
+    expected: &CreateSendImageExpectation<'_>,
+    expected_fence: &[u8],
+) -> Result<&'a [u8]> {
     check_expectation_shape(expected, expected_fence)?;
     expected
         .checkpoint
@@ -195,27 +222,39 @@ pub fn check_protected_create_send_image<'a>(
     let live = state
         .live_catalog()
         .ok_or(ProtectedCreateSendImageError::IncompleteState)?;
-    let fence = state
+    state
         .fence()
         .filter(|fence| !fence.is_empty())
         .ok_or(ProtectedCreateSendImageError::IncompleteState)?;
-    let artifact = live.artifact();
-    let decoded = DecodedCommittedImage::decode(artifact).map_err(container_error)?;
-    let image = ValidatedCreateSendImage::validate(decoded).map_err(business_error)?;
-    if image.checkpoint() != expected.checkpoint
+    Ok(live.artifact())
+}
+
+fn check_agreement(
+    state: &StoredProtectedState,
+    expected: &CreateSendImageExpectation<'_>,
+    expected_fence: &[u8],
+    checkpoint: &CommittedCheckpoint,
+    rows: CommittedImageRows<'_>,
+    row_count: usize,
+) -> Result<()> {
+    let artifact = state
+        .live_catalog()
+        .ok_or(ProtectedCreateSendImageError::IncompleteState)?
+        .artifact();
+    if checkpoint != expected.checkpoint
         || artifact.len() != expected.artifact_bytes
         || <[u8; 32]>::from(Sha256::digest(artifact)) != expected.artifact_sha256
     {
         return Err(ProtectedCreateSendImageError::IdentityMismatch);
     }
-    if fence != expected_fence {
+    if state.fence() != Some(expected_fence) {
         return Err(ProtectedCreateSendImageError::FenceMismatch);
     }
-    if state.records().entries().len() != image.row_count() {
+    if state.records().entries().len() != row_count {
         return Err(ProtectedCreateSendImageError::BusinessMismatch);
     }
     let mut business = state.records().entries().iter();
-    let mut rows = image.rows();
+    let mut rows = rows;
     loop {
         match (business.next(), rows.next()) {
             (Some((key, value)), Some(row))
@@ -224,7 +263,7 @@ pub fn check_protected_create_send_image<'a>(
             _ => return Err(ProtectedCreateSendImageError::BusinessMismatch),
         }
     }
-    Ok(CheckedProtectedCreateSendImage { state, image })
+    Ok(())
 }
 
 fn check_expectation_shape(expected: &CreateSendImageExpectation<'_>, fence: &[u8]) -> Result<()> {

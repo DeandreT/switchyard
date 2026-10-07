@@ -30,6 +30,8 @@ mod committed_prepare;
 mod entity_deletion;
 mod incarnations;
 mod message_retention;
+mod queue_capacity;
+mod queue_capacity_commands;
 mod rules;
 mod session_message_locks;
 mod session_paging;
@@ -40,8 +42,19 @@ mod topic_scheduling;
 mod topic_topology;
 mod topology_updates;
 
+use crate::queue_capacity::{QueueCapacityError, RecordChargeObservation, observe_record};
 use message_retention::message_record;
+use queue_capacity::CapacityPlan;
 use session_message_locks::SessionMessageLocks;
+
+type ChargeObservation = Result<RecordChargeObservation, QueueCapacityError>;
+
+fn observe_record_at(record: &MessageRecord, sequence: SequenceNumber) -> ChargeObservation {
+    if record.sequence != sequence {
+        return Err(QueueCapacityError::RecordMismatch);
+    }
+    observe_record(record)
+}
 
 pub use entity_deletion::{
     MAX_ENTITY_DELETE_KEY_BYTES, MAX_ENTITY_DELETE_KEYS, MAX_ENTITY_DELETE_VALUE_BYTES,
@@ -268,14 +281,15 @@ impl<S: StateStore> StateMachine<S> {
         }
 
         let mut batch = WriteBatch::default();
+        let mut capacity = CapacityPlan::existing(&command.namespace, &command.entity);
         let mut subscription_enqueues = None;
         let mut entity_deletions = None;
         let outcome = match &command.kind {
             CommandKind::CreateQueue { config } => {
-                self.create_queue(command, *config, &mut batch)?
+                self.create_queue(command, *config, &mut batch, &mut capacity)?
             }
             CommandKind::CreateTopic { config } => {
-                self.create_topic(command, *config, &mut batch)?
+                self.create_topic(command, *config, &mut batch, &mut capacity)?
             }
             CommandKind::CreateSubscription { name, config } => {
                 self.create_subscription(command, name, *config, &mut batch)?
@@ -311,7 +325,8 @@ impl<S: StateStore> StateMachine<S> {
                 self.update_subscription(command, name, *update, &mut batch)?
             }
             CommandKind::DeleteEntity { target } => {
-                let (outcome, removed) = self.delete_entity(command, target, &mut batch)?;
+                let (outcome, removed) =
+                    self.delete_entity(command, target, &mut batch, &mut capacity)?;
                 entity_deletions = Some(removed);
                 outcome
             }
@@ -331,6 +346,7 @@ impl<S: StateStore> StateMachine<S> {
                 },
                 &mut batch,
                 &mut subscription_enqueues,
+                &mut capacity,
             )?,
             CommandKind::SendEnvelope {
                 message_id,
@@ -349,10 +365,15 @@ impl<S: StateStore> StateMachine<S> {
                 },
                 &mut batch,
                 &mut subscription_enqueues,
+                &mut capacity,
             )?,
-            CommandKind::SendBatch { messages } => {
-                self.send_batch(command, messages, &mut batch, &mut subscription_enqueues)?
-            }
+            CommandKind::SendBatch { messages } => self.send_batch(
+                command,
+                messages,
+                &mut batch,
+                &mut subscription_enqueues,
+                &mut capacity,
+            )?,
             CommandKind::Schedule { messages } => self.schedule(
                 command,
                 messages.iter().map(|message| ScheduledInput {
@@ -367,6 +388,7 @@ impl<S: StateStore> StateMachine<S> {
                 }),
                 &mut batch,
                 &mut subscription_enqueues,
+                &mut capacity,
             )?,
             CommandKind::ScheduleEnvelopes { messages } => self.schedule(
                 command,
@@ -382,10 +404,15 @@ impl<S: StateStore> StateMachine<S> {
                 }),
                 &mut batch,
                 &mut subscription_enqueues,
+                &mut capacity,
             )?,
-            CommandKind::CancelScheduled { sequences } => {
-                self.cancel_scheduled(command, sequences, &mut batch, &mut subscription_enqueues)?
-            }
+            CommandKind::CancelScheduled { sequences } => self.cancel_scheduled(
+                command,
+                sequences,
+                &mut batch,
+                &mut subscription_enqueues,
+                &mut capacity,
+            )?,
             CommandKind::Receive {
                 mode,
                 lock_duration_millis,
@@ -396,6 +423,7 @@ impl<S: StateStore> StateMachine<S> {
                 *lock_duration_millis,
                 session.as_ref(),
                 &mut batch,
+                &mut capacity,
             )?,
             CommandKind::Peek {
                 from_sequence,
@@ -433,6 +461,7 @@ impl<S: StateStore> StateMachine<S> {
                     original_session: None,
                 },
                 &mut batch,
+                &mut capacity,
             )?,
             CommandKind::Abandon {
                 sequence,
@@ -447,6 +476,7 @@ impl<S: StateStore> StateMachine<S> {
                     original_session: None,
                 },
                 &mut batch,
+                &mut capacity,
             )?,
             CommandKind::DeadLetter {
                 sequence,
@@ -466,6 +496,7 @@ impl<S: StateStore> StateMachine<S> {
                     original_session: None,
                 },
                 &mut batch,
+                &mut capacity,
             )?,
             CommandKind::Defer {
                 sequence,
@@ -480,6 +511,7 @@ impl<S: StateStore> StateMachine<S> {
                     original_session: None,
                 },
                 &mut batch,
+                &mut capacity,
             )?,
             CommandKind::Settle {
                 sequence,
@@ -496,6 +528,7 @@ impl<S: StateStore> StateMachine<S> {
                     original_session: None,
                 },
                 &mut batch,
+                &mut capacity,
             )?,
             CommandKind::SettleHeld {
                 sequence,
@@ -519,6 +552,7 @@ impl<S: StateStore> StateMachine<S> {
                         original_session: session.as_ref(),
                     },
                     &mut batch,
+                    &mut capacity,
                 )?
             }
             CommandKind::RenewLock {
@@ -532,6 +566,7 @@ impl<S: StateStore> StateMachine<S> {
                 *lock_duration_millis,
                 None,
                 &mut batch,
+                &mut capacity,
             )?,
             CommandKind::RenewLockHeld {
                 sequence,
@@ -551,6 +586,7 @@ impl<S: StateStore> StateMachine<S> {
                     *lock_duration_millis,
                     session.as_ref(),
                     &mut batch,
+                    &mut capacity,
                 )?
             }
             CommandKind::ReceiveDeferred {
@@ -569,6 +605,7 @@ impl<S: StateStore> StateMachine<S> {
                     budget: None,
                 },
                 &mut batch,
+                &mut capacity,
             )?,
             CommandKind::ReceiveDeferredBounded {
                 sequences,
@@ -587,6 +624,7 @@ impl<S: StateStore> StateMachine<S> {
                     budget: Some(*budget),
                 },
                 &mut batch,
+                &mut capacity,
             )?,
             CommandKind::ReceiveDeferredHeld {
                 sequences,
@@ -611,6 +649,7 @@ impl<S: StateStore> StateMachine<S> {
                         budget: Some(*budget),
                     },
                     &mut batch,
+                    &mut capacity,
                 )?
             }
             CommandKind::AcceptSession {
@@ -642,19 +681,35 @@ impl<S: StateStore> StateMachine<S> {
                 self.set_session_state(command, session, state, &mut batch)?
             }
             CommandKind::GetSessionState { session } => self.get_session_state(command, session)?,
-            CommandKind::ExpireLocks => self.expire_locks(command, &mut batch)?,
-            CommandKind::ExpireMessages => self.expire_messages(command, &mut batch)?,
+            CommandKind::ExpireLocks => self.expire_locks(command, &mut batch, &mut capacity)?,
+            CommandKind::ExpireMessages => {
+                self.expire_messages(command, &mut batch, &mut capacity)?
+            }
             CommandKind::ExpireSessionLocks => self.expire_session_locks(command, &mut batch)?,
-            CommandKind::RetireSessionGenerationPage { after } => {
-                self.retire_session_generation_page(command, after.as_ref(), &mut batch)?
-            }
-            CommandKind::ActivateScheduled => {
-                self.activate_scheduled(command, &mut batch, &mut subscription_enqueues)?
-            }
+            CommandKind::RetireSessionGenerationPage { after } => self
+                .retire_session_generation_page(
+                    command,
+                    after.as_ref(),
+                    &mut batch,
+                    &mut capacity,
+                )?,
+            CommandKind::ActivateScheduled => self.activate_scheduled(
+                command,
+                &mut batch,
+                &mut subscription_enqueues,
+                &mut capacity,
+            )?,
             CommandKind::ExpireDuplicateHistory => {
                 self.expire_duplicate_history(command, &mut batch)?
             }
         };
+
+        if matches!(outcome, CommandOutcome::SessionLocksExpired { released: 0 })
+            && batch.is_empty()
+        {
+            capacity.allow_idle_absent_owner()?;
+        }
+        capacity.finish(self, &mut batch)?;
 
         // A command that changed nothing commits nothing. The clock advance is
         // bookkeeping for the mutations alongside it, and committing it alone
@@ -954,7 +1009,20 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         config: QueueConfig,
         batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, BrokerError> {
+        self.create_queue_with_capacity(command, config, None, batch, capacity)
+            .map(|(outcome, _)| outcome)
+    }
+
+    fn create_queue_with_capacity(
+        &self,
+        command: &Command,
+        config: QueueConfig,
+        limit: Option<crate::FiniteQueueCapacity>,
+        batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
+    ) -> Result<(CommandOutcome, crate::EntityIncarnation), BrokerError> {
         if command.entity.is_dead_letter_queue() {
             return Err(BrokerError::DeadLetterQueueIsReserved);
         }
@@ -973,6 +1041,9 @@ impl<S: StateStore> StateMachine<S> {
             return Err(BrokerError::EntityPathAlreadyExists);
         }
         let config = config.validate()?;
+        if limit.is_some() && (config.requires_session || config.requires_duplicate_detection) {
+            return Err(BrokerError::QueueCapacityNotSupported);
+        }
 
         // Every queue casts a dead-letter shadow: a queue with the same limits
         // that ignores lifetimes and sessions and never dead-letters again.
@@ -990,13 +1061,30 @@ impl<S: StateStore> StateMachine<S> {
         {
             return Err(BrokerError::EntityPathAlreadyExists);
         }
-        self.stage_create_incarnation(
+        let incarnation = self.stage_create_incarnation(
             &command.namespace,
             &command.entity,
             crate::EntityIncarnationKind::Queue,
             batch,
         )?;
-        self.stage_queue_configuration(command, config, &dead_letter_queue, batch)
+        let mode = match limit {
+            Some(limit) => crate::queue_capacity::QueueCapacityMode::finite_v1(
+                incarnation.generation(),
+                limit.nonzero(),
+            ),
+            None => crate::queue_capacity::QueueCapacityMode::non_finite(incarnation.generation()),
+        }
+        .map_err(|_| BrokerError::QueueCapacityCorrupt)?;
+        batch.push_put(
+            keys::queue_capacity_mode(&command.namespace, &command.entity),
+            mode.encode()
+                .map_err(|_| BrokerError::QueueCapacityCorrupt)?,
+        );
+        capacity.prepare_owner(config, incarnation, mode)?;
+        Ok((
+            self.stage_queue_configuration(command, config, &dead_letter_queue, batch)?,
+            incarnation,
+        ))
     }
 
     fn stage_queue_configuration(
@@ -1052,6 +1140,7 @@ impl<S: StateStore> StateMachine<S> {
         message: MessageInput<'_>,
         batch: &mut WriteBatch,
         subscription_enqueues: &mut Option<Vec<EntityPath>>,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, BrokerError> {
         if let Some(config) = self.topic_ingress_config(command)? {
             let sequences = self.publish_topic(
@@ -1070,9 +1159,12 @@ impl<S: StateStore> StateMachine<S> {
 
         let mut counters = self.load_counters(command)?;
         let sequence = counters.allocate_sequence()?;
-        self.stage_queue_message(command, &config, message, counters, sequence, batch)
+        self.stage_queue_message(
+            command, &config, message, counters, sequence, batch, capacity,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn stage_queue_message(
         &self,
         command: &Command,
@@ -1081,6 +1173,7 @@ impl<S: StateStore> StateMachine<S> {
         counters: QueueCounters,
         sequence: SequenceNumber,
         batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, BrokerError> {
         batch.push_put(
             keys::queue_counters(&command.namespace, &command.entity),
@@ -1096,7 +1189,9 @@ impl<S: StateStore> StateMachine<S> {
             return Ok(CommandOutcome::Sent { sequence });
         }
 
-        self.enqueue_message(command.into(), config, message, sequence, None, batch)?;
+        let record = message_record(command.into(), config, message, sequence, None);
+        capacity.record_new(&command.entity, sequence, observe_record(&record))?;
+        self.enqueue_record(command.into(), config, record, batch)?;
         Ok(CommandOutcome::Sent { sequence })
     }
 
@@ -1106,6 +1201,7 @@ impl<S: StateStore> StateMachine<S> {
         messages: &[IngressEnvelope],
         batch: &mut WriteBatch,
         subscription_enqueues: &mut Option<Vec<EntityPath>>,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, BrokerError> {
         if let Some(config) = self.topic_ingress_config(command)? {
             let sequences = self.publish_topic(
@@ -1121,6 +1217,7 @@ impl<S: StateStore> StateMachine<S> {
         }
         let config = self.load_config(command)?;
         validate_ingress_batch(&config, messages)?;
+        capacity.check_input_count(self, messages.len())?;
         if messages.is_empty() {
             return Ok(CommandOutcome::BatchSent {
                 sequences: Vec::new(),
@@ -1141,14 +1238,15 @@ impl<S: StateStore> StateMachine<S> {
             )? {
                 continue;
             }
-            self.enqueue_message(
+            let record = message_record(
                 command.into(),
                 &config,
                 message.into(),
                 sequence,
                 message.scheduled_enqueue_time,
-                batch,
-            )?;
+            );
+            capacity.record_new(&command.entity, sequence, observe_record(&record))?;
+            self.enqueue_record(command.into(), &config, record, batch)?;
         }
         batch.push_put(
             keys::queue_counters(&command.namespace, &command.entity),
@@ -1202,6 +1300,7 @@ impl<S: StateStore> StateMachine<S> {
         messages: impl ExactSizeIterator<Item = ScheduledInput<'a>>,
         batch: &mut WriteBatch,
         subscription_enqueues: &mut Option<Vec<EntityPath>>,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, BrokerError> {
         if let Some(config) = self.topic_ingress_config(command)? {
             let sequences = self.publish_topic(
@@ -1215,6 +1314,7 @@ impl<S: StateStore> StateMachine<S> {
         }
         self.require_queue_ingress_target(command)?;
         let config = self.load_config(command)?;
+        capacity.check_input_count(self, messages.len())?;
         let mut counters = self.load_counters(command)?;
         let namespace = &command.namespace;
         let entity = &command.entity;
@@ -1236,14 +1336,15 @@ impl<S: StateStore> StateMachine<S> {
             )? {
                 continue;
             }
-            self.enqueue_message(
+            let record = message_record(
                 command.into(),
                 &config,
                 message,
                 sequence,
                 Some(scheduled.enqueue_at),
-                batch,
-            )?;
+            );
+            capacity.record_new(entity, sequence, observe_record(&record))?;
+            self.enqueue_record(command.into(), &config, record, batch)?;
         }
         if message_count != 0 {
             batch.push_put(
@@ -1326,8 +1427,12 @@ impl<S: StateStore> StateMachine<S> {
         sequences: &[SequenceNumber],
         batch: &mut WriteBatch,
         subscription_enqueues: &mut Option<Vec<EntityPath>>,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, BrokerError> {
         let (config, topic) = self.load_browsable_config(command)?;
+        if !topic {
+            capacity.check_input_count(self, sequences.len())?;
+        }
         let namespace = &command.namespace;
         let entity = &command.entity;
         let mut cancelled = 0_u32;
@@ -1343,6 +1448,7 @@ impl<S: StateStore> StateMachine<S> {
                 }
                 SessionMessageLocks::new(&self.store, command, &config, batch)
                     .ensure_unlocked(&record)?;
+                capacity.record_remove(entity, sequence, observe_record_at(&record, sequence))?;
             }
             batch.push_delete(keys::message(namespace, entity, sequence));
             batch.push_delete(keys::scheduled(namespace, entity, enqueue_at, sequence));
@@ -1359,6 +1465,7 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         batch: &mut WriteBatch,
         subscription_enqueues: &mut Option<Vec<EntityPath>>,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, BrokerError> {
         let (config, topic) = self.load_browsable_config(command)?;
         if topic {
@@ -1395,6 +1502,7 @@ impl<S: StateStore> StateMachine<S> {
             }
             SessionMessageLocks::new(&self.store, command, &config, batch)
                 .ensure_unlocked(&record)?;
+            let original = observe_record_at(&record, scheduled_sequence);
 
             // The scheduling sequence is only a cancellation handle. Activation
             // gets a new queue position so older scheduled work cannot jump
@@ -1404,6 +1512,14 @@ impl<S: StateStore> StateMachine<S> {
             record.enqueued_at = command.issued_at;
             record.expires_at =
                 time_to_live_millis.map(|millis| command.issued_at.saturating_add_millis(millis));
+            capacity.record_transfer(
+                entity,
+                scheduled_sequence,
+                entity,
+                record.sequence,
+                original,
+                observe_record(&record),
+            )?;
             batch.push_delete(key);
             batch.push_delete(keys::message(namespace, entity, scheduled_sequence));
             batch.push_put(
@@ -1430,6 +1546,7 @@ impl<S: StateStore> StateMachine<S> {
         lock_duration_millis: Option<u64>,
         session: Option<&SessionHold>,
         batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, BrokerError> {
         let config = self.load_config(command)?;
         require_session_agreement(&config, session.is_some())?;
@@ -1464,10 +1581,11 @@ impl<S: StateStore> StateMachine<S> {
             SessionMessageLocks::new(&self.store, command, &config, batch)
                 .ensure_unlocked(&record)?;
 
+            let original = observe_record_at(&record, sequence);
             // A timer sweep normally reaps these, but a receive must never hand
             // out a message whose lifetime has already elapsed.
             if record.is_expired_at(command.issued_at) {
-                self.expire_message(command, &config, record, batch)?;
+                self.expire_message(command, &config, record, original, batch, capacity)?;
                 continue;
             }
 
@@ -1505,6 +1623,7 @@ impl<S: StateStore> StateMachine<S> {
                             keys::queue_counters(namespace, entity),
                             codec::encode(&counters)?,
                         );
+                        capacity.record_check(entity, sequence, original)?;
                         Some(DeliveryLock {
                             token,
                             locked_until,
@@ -1513,7 +1632,7 @@ impl<S: StateStore> StateMachine<S> {
                     // At-most-once: the deletion commits before the transfer, so a
                     // client that never receives the reply loses this delivery.
                     ReceiveMode::ReceiveAndDelete => {
-                        self.remove_message(command, &config, &record, batch)?;
+                        self.remove_message(command, &config, &record, original, batch, capacity)?;
                         None
                     }
                 };
@@ -1644,6 +1763,7 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         input: SettlementInput<'_>,
         batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, BrokerError> {
         let SettlementInput {
             sequence,
@@ -1671,6 +1791,7 @@ impl<S: StateStore> StateMachine<S> {
         }
         SessionMessageLocks::new(&self.store, command, &config, batch)
             .validate_locked(&record, original_session)?;
+        let original = observe_record_at(&record, sequence);
         if let Some(properties) = properties_to_modify.filter(|properties| !properties.is_empty()) {
             MessageEnvelope::validate_application_property_updates(properties)?;
             if record.envelope.is_none() {
@@ -1697,12 +1818,13 @@ impl<S: StateStore> StateMachine<S> {
         let entity = &command.entity;
         match disposition {
             SettlementDisposition::Complete => {
-                self.remove_message(command, &config, &record, batch)?;
+                self.remove_message(command, &config, &record, original, batch, capacity)?;
                 Ok(CommandOutcome::Completed)
             }
             SettlementDisposition::Abandon => {
                 if record.is_expired_at(command.issued_at) {
-                    let expiration = self.expire_message(command, &config, record, batch)?;
+                    let expiration =
+                        self.expire_message(command, &config, record, original, batch, capacity)?;
                     return Ok(CommandOutcome::Abandoned {
                         dead_lettered: expiration == ExpirationOutcome::DeadLettered,
                         dropped: expiration == ExpirationOutcome::Dropped,
@@ -1715,7 +1837,9 @@ impl<S: StateStore> StateMachine<S> {
                         record,
                         DeadLetterReason::MaxDeliveryCountExceeded,
                         String::from("the message reached its maximum delivery count"),
+                        original,
                         batch,
+                        capacity,
                     )?;
                     return Ok(CommandOutcome::Abandoned {
                         dead_lettered: true,
@@ -1732,6 +1856,7 @@ impl<S: StateStore> StateMachine<S> {
                 );
                 batch.push_put(self.ready_key(command.into(), &config, &record), Vec::new());
                 index_ready_expiry(command.into(), &record, batch);
+                capacity.record_replace(entity, sequence, original, observe_record(&record))?;
                 Ok(CommandOutcome::Abandoned {
                     dead_lettered: false,
                     dropped: false,
@@ -1747,6 +1872,7 @@ impl<S: StateStore> StateMachine<S> {
                     keys::message(namespace, entity, sequence),
                     codec::encode(&record)?,
                 );
+                capacity.record_replace(entity, sequence, original, observe_record(&record))?;
                 Ok(CommandOutcome::Deferred)
             }
             SettlementDisposition::DeadLetter {
@@ -1761,7 +1887,9 @@ impl<S: StateStore> StateMachine<S> {
                     record,
                     DeadLetterReason::Application(reason.clone()),
                     description.clone(),
+                    original,
                     batch,
+                    capacity,
                 )?;
                 Ok(CommandOutcome::DeadLettered)
             }
@@ -1773,6 +1901,7 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         input: DeferredReceiveInput<'_>,
         batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, BrokerError> {
         let DeferredReceiveInput {
             sequences,
@@ -1782,6 +1911,18 @@ impl<S: StateStore> StateMachine<S> {
             original_session,
             budget,
         } = input;
+        let input_preflight = if sequences.len() > queue_capacity::MAX_CAPACITY_MESSAGES {
+            let result = self.load_config(command).and_then(|config| {
+                require_session_agreement(&config, session_id.is_some())?;
+                capacity.check_input_count(self, sequences.len())
+            });
+            if result == Err(BrokerError::QueueCapacityWorkLimitExceeded) {
+                return Err(BrokerError::QueueCapacityWorkLimitExceeded);
+            }
+            Some(result)
+        } else {
+            None
+        };
         let mut unique = BTreeSet::new();
         if sequences.iter().any(|sequence| !unique.insert(*sequence)) {
             return Err(BrokerError::InvalidMessageContent {
@@ -1790,6 +1931,11 @@ impl<S: StateStore> StateMachine<S> {
         }
         let config = self.load_config(command)?;
         require_session_agreement(&config, session_id.is_some())?;
+        if let Some(result) = input_preflight {
+            result?;
+        } else {
+            capacity.check_input_count(self, sequences.len())?;
+        }
         let namespace = &command.namespace;
         let entity = &command.entity;
         let mut deliveries = if budget.is_some() {
@@ -1820,8 +1966,9 @@ impl<S: StateStore> StateMachine<S> {
             if let Some(budget) = &mut response_budget {
                 budget.charge(&record)?;
             }
+            let original = observe_record_at(&record, *sequence);
             if record.is_expired_at(command.issued_at) {
-                self.expire_message(command, &config, record, batch)?;
+                self.expire_message(command, &config, record, original, batch, capacity)?;
                 continue;
             }
 
@@ -1850,13 +1997,14 @@ impl<S: StateStore> StateMachine<S> {
                             keys::lock(namespace, entity, locked_until, *sequence),
                             Vec::new(),
                         );
+                        capacity.record_check(entity, *sequence, original)?;
                         Some(DeliveryLock {
                             token,
                             locked_until,
                         })
                     }
                     ReceiveMode::ReceiveAndDelete => {
-                        self.remove_message(command, &config, &record, batch)?;
+                        self.remove_message(command, &config, &record, original, batch, capacity)?;
                         None
                     }
                 };
@@ -1892,6 +2040,7 @@ impl<S: StateStore> StateMachine<S> {
         &self,
         command: &Command,
         batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, BrokerError> {
         let config = self.load_config(command)?;
         let namespace = &command.namespace;
@@ -1924,9 +2073,10 @@ impl<S: StateStore> StateMachine<S> {
             }
             SessionMessageLocks::new(&self.store, command, &config, batch)
                 .validate_locked(&record, None)?;
+            let original = observe_record_at(&record, sequence);
 
             if record.is_expired_at(command.issued_at) {
-                match self.expire_message(command, &config, record, batch)? {
+                match self.expire_message(command, &config, record, original, batch, capacity)? {
                     ExpirationOutcome::DeadLettered => dead_lettered += 1,
                     ExpirationOutcome::Dropped => dropped += 1,
                 }
@@ -1937,7 +2087,9 @@ impl<S: StateStore> StateMachine<S> {
                     record,
                     DeadLetterReason::MaxDeliveryCountExceeded,
                     String::from("the message reached its maximum delivery count"),
+                    original,
                     batch,
+                    capacity,
                 )?;
                 dead_lettered += 1;
             } else {
@@ -1952,6 +2104,7 @@ impl<S: StateStore> StateMachine<S> {
                 batch.push_put(self.ready_key(command.into(), &config, &record), Vec::new());
                 index_ready_expiry(command.into(), &record, batch);
                 returned_to_ready += 1;
+                capacity.record_check(entity, sequence, original)?;
             }
         }
 
@@ -1966,6 +2119,7 @@ impl<S: StateStore> StateMachine<S> {
         &self,
         command: &Command,
         batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, BrokerError> {
         let config = self.load_config(command)?;
         let namespace = &command.namespace;
@@ -1990,16 +2144,22 @@ impl<S: StateStore> StateMachine<S> {
             if record.expires_at != Some(expires_at) {
                 return Err(BrokerError::MalformedIndexKey);
             }
+            let original = observe_record_at(&record, sequence);
             match record.state {
                 MessageState::Ready => {
-                    match self.expire_message(command, &config, record, batch)? {
+                    match self
+                        .expire_message(command, &config, record, original, batch, capacity)?
+                    {
                         ExpirationOutcome::DeadLettered => dead_lettered += 1,
                         ExpirationOutcome::Dropped => dropped += 1,
                     }
                 }
                 // Older snapshots indexed every finite lifetime. Suspend those
                 // entries without letting protected locks pin later expirations.
-                MessageState::Locked { .. } | MessageState::Deferred => batch.push_delete(key),
+                MessageState::Locked { .. } | MessageState::Deferred => {
+                    batch.push_delete(key);
+                    capacity.record_check(entity, sequence, original)?;
+                }
                 MessageState::Scheduled { .. } => return Err(BrokerError::MalformedIndexKey),
             }
             processed += 1;
@@ -2201,6 +2361,7 @@ impl<S: StateStore> StateMachine<S> {
         Ok(CommandOutcome::SessionLockRenewed { locked_until })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn renew_lock(
         &self,
         command: &Command,
@@ -2209,6 +2370,7 @@ impl<S: StateStore> StateMachine<S> {
         lock_duration_millis: Option<u64>,
         original_session: Option<&SessionHold>,
         batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, BrokerError> {
         let config = self.load_config(command)?;
         let (mut record, previous_locked_until) = self.held_lock(command, sequence, lock_token)?;
@@ -2231,6 +2393,7 @@ impl<S: StateStore> StateMachine<S> {
             locked_until,
             original_session,
         )?;
+        let original = observe_record_at(&record, sequence);
         record.state = MessageState::Locked {
             token: lock_token,
             locked_until,
@@ -2249,6 +2412,7 @@ impl<S: StateStore> StateMachine<S> {
             keys::message(&command.namespace, &command.entity, sequence),
             codec::encode(&record)?,
         );
+        capacity.record_check(&command.entity, sequence, original)?;
         Ok(CommandOutcome::LockRenewed { locked_until })
     }
 
@@ -2400,7 +2564,9 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         config: &QueueConfig,
         record: MessageRecord,
+        original: ChargeObservation,
         batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
     ) -> Result<ExpirationOutcome, BrokerError> {
         if config.dead_lettering_on_message_expiration {
             self.move_to_dead_letter(
@@ -2409,16 +2575,31 @@ impl<S: StateStore> StateMachine<S> {
                 record,
                 DeadLetterReason::TimeToLiveExpired,
                 String::from("the message exceeded its time to live"),
+                original,
                 batch,
+                capacity,
             )?;
             Ok(ExpirationOutcome::DeadLettered)
         } else {
-            self.remove_message(command, config, &record, batch)?;
+            self.remove_message(command, config, &record, original, batch, capacity)?;
             Ok(ExpirationOutcome::Dropped)
         }
     }
 
     fn remove_message(
+        &self,
+        command: &Command,
+        config: &QueueConfig,
+        record: &MessageRecord,
+        original: ChargeObservation,
+        batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
+    ) -> Result<(), BrokerError> {
+        self.clear_message(command, config, record, batch)?;
+        capacity.record_remove(&command.entity, record.sequence, original)
+    }
+
+    fn clear_message(
         &self,
         command: &Command,
         config: &QueueConfig,
@@ -2453,6 +2634,7 @@ impl<S: StateStore> StateMachine<S> {
 
     /// Moves a message out of the active keyspace and into the dead-letter
     /// keyspace, clearing whichever index currently references it.
+    #[allow(clippy::too_many_arguments)]
     fn move_to_dead_letter(
         &self,
         command: &Command,
@@ -2460,14 +2642,16 @@ impl<S: StateStore> StateMachine<S> {
         mut record: MessageRecord,
         reason: DeadLetterReason,
         description: String,
+        original: ChargeObservation,
         batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
     ) -> Result<(), BrokerError> {
         validate_dead_letter_projection(&record, &reason, &description)?;
         let namespace = &command.namespace;
         let entity = &command.entity;
         let sequence = record.sequence;
 
-        self.remove_message(command, config, &record, batch)?;
+        self.clear_message(command, config, &record, batch)?;
 
         // Into the shadow queue as an ordinary ready message under its original
         // sequence — the same receive and settlement machinery drains it.
@@ -2490,6 +2674,14 @@ impl<S: StateStore> StateMachine<S> {
             keys::ready(namespace, &dead_letter_queue, sequence),
             Vec::new(),
         );
+        capacity.record_transfer(
+            entity,
+            sequence,
+            &dead_letter_queue,
+            sequence,
+            original,
+            observe_record(&record),
+        )?;
         Ok(())
     }
 }

@@ -647,6 +647,376 @@ fn native_typed_requests_reject_reserved_shapes_before_store_reads<P: StoreProvi
     Ok(())
 }
 
+fn old_metadata_errors_precede_missing_capacity_mode_without_clock_or_mutation<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    let node = Node::new(provider)?;
+    let config = QueueConfig::default();
+    node.queue("orders", config)?;
+    let entity = EntityPath::new("orders")?;
+    node.replace(keys::queue_capacity_mode(&namespace(), &entity), None)?;
+    node.clock.forbidden.store(true, Ordering::SeqCst);
+    for (key, replacement, target, bind, error) in [
+        (
+            keys::queue_config(&namespace(), &entity),
+            Some(codec::encode(&QueueConfig {
+                max_delivery_count: 0,
+                ..config
+            })?),
+            primary("orders"),
+            false,
+            BrokerError::QueueConfig(domain::QueueConfigError::MaxDeliveryCountTooSmall),
+        ),
+        (
+            keys::queue_config(&namespace(), &entity.dead_letter_queue()?),
+            None,
+            shadow("orders"),
+            false,
+            BrokerError::DanglingEntityMetadata,
+        ),
+        (
+            keys::entity_incarnation(&namespace(), &entity),
+            None,
+            primary("orders"),
+            true,
+            BrokerError::DanglingEntityMetadata,
+        ),
+    ] {
+        let original = node.store.get(&key)?;
+        node.replace(key.clone(), replacement)?;
+        let before = node.store.snapshot()?;
+        let result = if bind {
+            node.broker
+                .handle()
+                .bind_blocking(namespace(), target)
+                .map(|admission| admission.map(|admission| admission.metadata))
+        } else {
+            node.query(target)
+        };
+        assert_eq!(refused(result), error);
+        assert_eq!(node.store.snapshot()?, before);
+        node.replace(key, original)?;
+    }
+    let before = node.store.snapshot()?;
+    for target in [primary("orders"), shadow("orders")] {
+        assert_eq!(
+            refused(node.query(target.clone())),
+            BrokerError::QueueCapacityCorrupt
+        );
+        assert_eq!(
+            refused(
+                node.broker
+                    .handle()
+                    .bind_blocking(namespace(), target)
+                    .map(|admission| admission.map(|admission| admission.metadata))
+            ),
+            BrokerError::QueueCapacityCorrupt
+        );
+        assert_eq!(node.store.snapshot()?, before);
+    }
+    Ok(())
+}
+
+fn native_binding_metadata<P: StoreProvider>(
+    node: &Node<P>,
+    target: AdminTarget,
+) -> TestResult<Result<Option<EntityMetadata>, SubmitError>> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let handle = node.broker.handle();
+    let result = runtime.block_on(async {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle.bind_admin(namespace(), target),
+        )
+        .await
+    })?;
+    Ok(result.map(|admission| admission.map(|admission| admission.metadata)))
+}
+
+fn assert_metadata_and_binding_error<P: StoreProvider>(
+    node: &Node<P>,
+    target: Attachment,
+    error: &BrokerError,
+) -> TestResult {
+    macro_rules! one_scan {
+        ($read:expr) => {{
+            let before = node.store.observed.membership_limits.lock().unwrap().len();
+            let result = $read;
+            let after = node.store.observed.membership_limits.lock().unwrap().len();
+            assert!(
+                after <= before + 1,
+                "final capacity proof must not rescan membership"
+            );
+            result
+        }};
+    }
+    let before = node.store.snapshot()?;
+    assert_eq!(&refused(one_scan!(node.query(target.clone()))), error);
+    assert_eq!(
+        &refused(one_scan!(
+            node.broker
+                .handle()
+                .bind_blocking(namespace(), target.clone())
+                .map(|admission| admission.map(|admission| admission.metadata))
+        )),
+        error
+    );
+    let native = match target {
+        Attachment::Queue(entity) => Some(AdminTarget::Primary(entity)),
+        Attachment::Subscription {
+            topic,
+            subscription,
+        } => Some(AdminTarget::Subscription {
+            topic,
+            name: subscription,
+        }),
+        _ => None,
+    };
+    if let Some(native) = native {
+        assert_eq!(
+            &refused(one_scan!(
+                node.broker
+                    .handle()
+                    .admin_entity_metadata_blocking(namespace(), native.clone())
+            )),
+            error
+        );
+        assert_eq!(
+            &refused(one_scan!(native_binding_metadata(node, native)?)),
+            error
+        );
+    }
+    assert_eq!(node.store.snapshot()?, before);
+    Ok(())
+}
+
+fn excluded_owner_topology_and_identity_errors_precede_capacity_sidecars<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    let node = Node::new(provider)?;
+    node.topic("events", TopicConfig::default())?;
+    node.subscription("events", "Alpha", SubscriptionConfig::default())?;
+    let topic = EntityPath::new("events")?;
+    let child = topic.subscription(&SubscriptionName::new("Alpha")?)?;
+    let topic_mode = keys::queue_capacity_mode(&namespace(), &topic);
+    node.replace(topic_mode.clone(), Some(vec![255]))?;
+    node.clock.forbidden.store(true, Ordering::SeqCst);
+    let parent_queue = keys::queue_config(&namespace(), &topic);
+    node.replace(
+        parent_queue.clone(),
+        Some(codec::encode(&QueueConfig::default())?),
+    )?;
+    assert_metadata_and_binding_error(
+        &node,
+        primary("events"),
+        &BrokerError::DanglingEntityMetadata,
+    )?;
+    node.replace(parent_queue, None)?;
+
+    let child_backing = keys::queue_config(&namespace(), &child);
+    let original_backing = node.store.get(&child_backing)?;
+    node.replace(child_backing.clone(), None)?;
+    for target in [
+        primary("events"),
+        subscription("events", "Alpha", false),
+        subscription("events", "Alpha", true),
+    ] {
+        assert_metadata_and_binding_error(
+            &node,
+            target,
+            &BrokerError::DanglingSubscriptionMetadata,
+        )?;
+    }
+    node.replace(child_backing.clone(), original_backing.clone())?;
+
+    let topic_identity = keys::entity_incarnation(&namespace(), &topic);
+    let original_identity = node.store.get(&topic_identity)?;
+    node.replace(topic_identity.clone(), None)?;
+    let before = node.store.snapshot()?;
+    for target in [primary("events"), shadow("events")] {
+        assert_eq!(
+            refused(
+                node.broker
+                    .handle()
+                    .bind_blocking(namespace(), target)
+                    .map(|admission| admission.map(|admission| admission.metadata))
+            ),
+            BrokerError::DanglingEntityMetadata
+        );
+        assert_eq!(node.store.snapshot()?, before);
+    }
+    assert_eq!(
+        refused(native_binding_metadata(
+            &node,
+            AdminTarget::Primary(topic.clone())
+        )?),
+        BrokerError::DanglingEntityMetadata
+    );
+    assert_eq!(node.store.snapshot()?, before);
+    node.replace(topic_identity, original_identity)?;
+    for target in [
+        primary("events"),
+        shadow("events"),
+        subscription("events", "Alpha", false),
+    ] {
+        assert_metadata_and_binding_error(&node, target, &BrokerError::QueueCapacityCorrupt)?;
+    }
+    node.replace(topic_mode, None)?;
+
+    let child_mode = keys::queue_capacity_mode(&namespace(), &child);
+    node.replace(child_mode.clone(), Some(vec![255]))?;
+    node.replace(
+        child_backing.clone(),
+        Some(codec::encode(&QueueConfig {
+            max_delivery_count: SubscriptionConfig::default().max_delivery_count + 1,
+            ..SubscriptionConfig::default().to_queue_config()
+        })?),
+    )?;
+    for target in [
+        primary("events"),
+        subscription("events", "Alpha", false),
+        subscription("events", "Alpha", true),
+    ] {
+        assert_metadata_and_binding_error(
+            &node,
+            target,
+            &BrokerError::DanglingSubscriptionMetadata,
+        )?;
+    }
+    node.replace(child_backing, original_backing)?;
+    let child_identity = keys::entity_incarnation(&namespace(), &child);
+    let original_identity = node.store.get(&child_identity)?;
+    node.replace(child_identity.clone(), None)?;
+    let before = node.store.snapshot()?;
+    for target in [
+        subscription("events", "Alpha", false),
+        subscription("events", "Alpha", true),
+    ] {
+        assert_eq!(
+            refused(
+                node.broker
+                    .handle()
+                    .bind_blocking(namespace(), target)
+                    .map(|admission| admission.map(|admission| admission.metadata))
+            ),
+            BrokerError::DanglingEntityMetadata
+        );
+        assert_eq!(node.store.snapshot()?, before);
+    }
+    assert_eq!(
+        refused(native_binding_metadata(
+            &node,
+            AdminTarget::Subscription {
+                topic: topic.clone(),
+                name: SubscriptionName::new("Alpha")?,
+            }
+        )?),
+        BrokerError::DanglingEntityMetadata
+    );
+    assert_eq!(node.store.snapshot()?, before);
+    node.replace(child_identity, original_identity)?;
+    for target in [
+        primary("events"),
+        subscription("events", "Alpha", false),
+        subscription("events", "Alpha", true),
+    ] {
+        assert_metadata_and_binding_error(&node, target, &BrokerError::QueueCapacityCorrupt)?;
+    }
+    node.replace(child_mode, None)?;
+    Ok(())
+}
+
+fn scoped_absent_owners_refuse_primary_and_shadow_sidecars<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    let node = Node::new(provider)?;
+    node.queue("retired", QueueConfig::default())?;
+    node.submit(
+        "retired",
+        CommandKind::DeleteEntity {
+            target: domain::DeleteEntityTarget::Queue,
+        },
+    )?;
+    node.topic("events", TopicConfig::default())?;
+    node.clock.forbidden.store(true, Ordering::SeqCst);
+    for owner in [EntityPath::new("absent")?, EntityPath::new("retired")?] {
+        for physical in [&owner, &owner.dead_letter_queue()?] {
+            for key in [
+                keys::queue_capacity_mode(&namespace(), physical),
+                keys::queue_capacity_usage(&namespace(), physical),
+            ] {
+                node.replace(key.clone(), Some(vec![255]))?;
+                for target in [
+                    Attachment::Queue(owner.clone()),
+                    Attachment::DeadLetter(owner.clone()),
+                ] {
+                    assert_metadata_and_binding_error(
+                        &node,
+                        target,
+                        &BrokerError::QueueCapacityCorrupt,
+                    )?;
+                }
+                node.replace(key, None)?;
+            }
+        }
+    }
+    let topic = EntityPath::new("events")?;
+    let missing_child = topic.subscription(&SubscriptionName::new("missing")?)?;
+    for physical in [&missing_child, &missing_child.dead_letter_queue()?] {
+        for key in [
+            keys::queue_capacity_mode(&namespace(), physical),
+            keys::queue_capacity_usage(&namespace(), physical),
+        ] {
+            node.replace(key.clone(), Some(vec![255]))?;
+            for target in [
+                subscription("events", "missing", false),
+                subscription("events", "missing", true),
+            ] {
+                assert_metadata_and_binding_error(
+                    &node,
+                    target,
+                    &BrokerError::QueueCapacityCorrupt,
+                )?;
+            }
+            node.replace(key, None)?;
+        }
+    }
+    for physical in [&topic, &topic.dead_letter_queue()?] {
+        for key in [
+            keys::queue_capacity_mode(&namespace(), physical),
+            keys::queue_capacity_usage(&namespace(), physical),
+        ] {
+            node.replace(key.clone(), Some(vec![255]))?;
+            assert_metadata_and_binding_error(
+                &node,
+                shadow("events"),
+                &BrokerError::QueueCapacityCorrupt,
+            )?;
+            node.replace(key, None)?;
+        }
+    }
+    let before = node.store.snapshot()?;
+    for target in [
+        primary("absent"),
+        shadow("absent"),
+        primary("retired"),
+        shadow("retired"),
+        shadow("events"),
+        subscription("events", "missing", false),
+        subscription("events", "missing", true),
+    ] {
+        assert_eq!(node.query(target.clone())?, None);
+        assert_eq!(
+            node.broker.handle().bind_blocking(namespace(), target)?,
+            None
+        );
+    }
+    assert_eq!(node.store.snapshot()?, before);
+    Ok(())
+}
+
 macro_rules! for_each_backend {
     ($($case:ident,)+) => {
         mod memory { $(#[test] fn $case() -> super::TestResult { super::$case(::testkit::MemoryProvider::new()) })+ }
@@ -661,6 +1031,9 @@ for_each_backend! {
     malformed_typed_requests_fail_before_store_reads,
     numeric_config_and_storage_failures_preserve_their_source_and_state,
     native_typed_requests_reject_reserved_shapes_before_store_reads,
+    old_metadata_errors_precede_missing_capacity_mode_without_clock_or_mutation,
+    excluded_owner_topology_and_identity_errors_precede_capacity_sidecars,
+    scoped_absent_owners_refuse_primary_and_shadow_sidecars,
 }
 
 #[tokio::test]

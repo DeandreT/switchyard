@@ -81,6 +81,7 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         target: &DeleteEntityTarget,
         batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
     ) -> Result<(CommandOutcome, Vec<EntityPath>), BrokerError> {
         Self::require_primary_entity_path(&command.entity)?;
         let mut plan = DeletionPlan::default();
@@ -112,7 +113,7 @@ impl<S: StateStore> StateMachine<S> {
                     .as_deref()
                     .ok_or(BrokerError::DanglingEntityMetadata)?;
                 let config = QueueConfig::decode(bytes)?.validate()?;
-                let removed = self.plan_queue_delete(command, config, &mut plan)?;
+                let removed = self.plan_queue_delete(command, config, &mut plan, capacity)?;
                 (CommandOutcome::QueueDeleted, removed)
             }
             DeleteEntityTarget::Auto | DeleteEntityTarget::Topic if topic.is_some() => {
@@ -197,6 +198,7 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         config: QueueConfig,
         plan: &mut DeletionPlan,
+        capacity: &mut CapacityPlan,
     ) -> Result<Vec<EntityPath>, BrokerError> {
         let shadow = command.entity.dead_letter_queue()?;
         self.require_delete_shadow(command, &shadow, config.dead_letter_shadow())?;
@@ -207,6 +209,17 @@ impl<S: StateStore> StateMachine<S> {
         self.plan_runtime_delete(command, &shadow, source, false, plan)?;
         plan.add(keys::queue_config(&command.namespace, &command.entity))?;
         plan.add(keys::queue_config(&command.namespace, &shadow))?;
+        self.require_live_incarnation(
+            &command.namespace,
+            &command.entity,
+            crate::EntityIncarnationKind::Queue,
+        )?;
+        let owner = queue_capacity::validate_owner_mode(self, &command.namespace, &command.entity)?;
+        capacity.mark_retired(owner)?;
+        plan.add(keys::queue_capacity_mode(
+            &command.namespace,
+            &command.entity,
+        ))?;
         Ok(vec![command.entity.clone(), shadow])
     }
 
@@ -281,6 +294,16 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         plan: &mut DeletionPlan,
     ) -> Result<Vec<EntityPath>, BrokerError> {
+        if self
+            .store
+            .get(&keys::queue_capacity_mode(
+                &command.namespace,
+                &command.entity,
+            ))?
+            .is_some()
+        {
+            return Err(BrokerError::QueueCapacityCorrupt);
+        }
         let subscriptions = self.subscriptions(&command.namespace, &command.entity)?;
         let mut removed = vec![command.entity.clone()];
         let mut children = BTreeSet::new();
@@ -354,6 +377,13 @@ impl<S: StateStore> StateMachine<S> {
     ) -> Result<(), BrokerError> {
         if self
             .store
+            .get(&keys::queue_capacity_mode(&command.namespace, entity))?
+            .is_some()
+        {
+            return Err(BrokerError::QueueCapacityCorrupt);
+        }
+        if self
+            .store
             .get(&keys::topic_config(&command.namespace, entity))?
             .is_some()
         {
@@ -389,7 +419,7 @@ impl<S: StateStore> StateMachine<S> {
         let mut evidence = RuntimeEvidence::default();
         for (prefix, kind) in keys::entity_runtime_prefixes(&command.namespace, entity) {
             self.deletion_scan(&prefix, plan, |key, plan| {
-                evidence.any = true;
+                evidence.any |= kind != keys::RuntimeKind::OwnerAggregate;
                 evidence.message |= kind == keys::RuntimeKind::Message;
                 evidence.local_token |= kind == keys::RuntimeKind::LocalToken;
                 plan.add(key)
@@ -450,6 +480,12 @@ impl<S: StateStore> StateMachine<S> {
                 return Err(BrokerError::DanglingSubscriptionMetadata);
             }
         }
+        if self.deletion_probe(
+            &keys::subscription_capacity_mode_prefix(namespace, topic),
+            plan,
+        )? {
+            return Err(BrokerError::QueueCapacityCorrupt);
+        }
         let prefix = keys::subscription_backing_config_prefix(namespace, topic);
         self.deletion_scan(&prefix, plan, |key, plan| {
             let (ns, entity) =
@@ -495,6 +531,7 @@ impl<S: StateStore> StateMachine<S> {
             keys::subscription_backing_config_prefix(&command.namespace, entity),
             keys::subscription_topic_config_prefix(&command.namespace, entity),
             keys::subscription_membership_descendant_prefix(&command.namespace, entity),
+            keys::subscription_capacity_mode_prefix(&command.namespace, entity),
         ] {
             if self.deletion_probe(&prefix, plan)? {
                 return Err(BrokerError::DanglingSubscriptionMetadata);
@@ -514,6 +551,13 @@ impl<S: StateStore> StateMachine<S> {
         entity: &EntityPath,
         plan: &mut DeletionPlan,
     ) -> Result<(), BrokerError> {
+        if self
+            .store
+            .get(&keys::queue_capacity_mode(&command.namespace, entity))?
+            .is_some()
+        {
+            return Err(BrokerError::QueueCapacityCorrupt);
+        }
         for (prefix, _) in keys::entity_runtime_prefixes(&command.namespace, entity) {
             if self.deletion_probe(&prefix, plan)? {
                 return Err(BrokerError::DanglingEntityMetadata);

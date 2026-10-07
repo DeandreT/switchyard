@@ -323,7 +323,7 @@ fn all_truncated_prefixes_are_refused() {
 #[test]
 fn unknown_magic_schema_and_role_are_refused() {
     let encoded = encode(&entries());
-    for (offset, value) in [(0, b'X'), (4, 1), (5, 2), (6, 1), (7, 2)] {
+    for (offset, value) in [(0, b'X'), (4, 1), (5, 2), (6, 1), (7, 3)] {
         let mut bytes = encoded.as_bytes().to_vec();
         bytes[offset] = value;
         resign(&mut bytes);

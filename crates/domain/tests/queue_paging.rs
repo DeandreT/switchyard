@@ -179,6 +179,7 @@ fn limits_and_scope_reject_before_scans_and_pages_use_only_one_lookahead<P: Stor
     }
     fixture.machine.store().apply(batch)?;
     let snapshot = fixture.machine.store().snapshot()?;
+    calls.lock().expect("scan recorder").clear();
     for limit in [MAX_QUEUE_PAGE_SIZE + 1, usize::MAX] {
         assert_eq!(
             fixture.machine.queues_page(None, None, limit),

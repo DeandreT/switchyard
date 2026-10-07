@@ -242,7 +242,7 @@ fn healthy_pair_still_requires_the_exact_full_trusted_expectation_before_target(
     let reader = writer.reader();
     let _machine = domain::CommittedStateMachine::create(writer, foreign_stream)?;
     let foreign = domain::EncodedCommittedImage::encode(
-        domain::CommittedImageRole::CreateSendV1,
+        domain::CommittedImageRole::CreateSendLayout17V1,
         foreign_stream,
         &storage::StateStore::snapshot(&reader)?,
     )?;

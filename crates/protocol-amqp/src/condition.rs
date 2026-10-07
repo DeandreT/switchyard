@@ -50,6 +50,8 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::EntityIncarnationExhausted
         | BrokerError::AtomicMessagingTooLarge { .. }
         | BrokerError::TopicRuleMatchTooLarge { .. }
+        | BrokerError::QueueCapacityFull
+        | BrokerError::QueueCapacityWorkLimitExceeded
         | BrokerError::SessionRetirementTooLarge { .. } => RESOURCE_LIMIT_EXCEEDED,
         BrokerError::TopicDataPlaneNotImplemented => NOT_IMPLEMENTED,
         BrokerError::SqlRuleCompilation(error) | BrokerError::SqlActionCompilation(error) => {
@@ -85,6 +87,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         BrokerError::SessionRequired
         | BrokerError::SessionNotSupported
         | BrokerError::AtomicMessagingOperationNotSupported
+        | BrokerError::QueueCapacityNotSupported
         | BrokerError::DeadLetterQueueIsReserved
         | BrokerError::SubscriptionPathIsReserved => NOT_ALLOWED,
 
@@ -100,6 +103,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::EntityKindMismatch
         | BrokerError::InvalidEntityBinding
         | BrokerError::InvalidAtomicMessagingCommand
+        | BrokerError::InvalidQueueCapacity
         | BrokerError::QueuePageLimitExceeded { .. }
         | BrokerError::QueueCursorNamespaceMismatch { .. }
         | BrokerError::TopicPageLimitExceeded { .. }
@@ -124,6 +128,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::DanglingSubscriptionMetadata
         | BrokerError::DanglingEntityMetadata
         | BrokerError::DanglingRuleMetadata
+        | BrokerError::QueueCapacityCorrupt
         | BrokerError::MalformedIndexKey
         | BrokerError::Codec(_)
         | BrokerError::Identifier(_)
@@ -147,6 +152,24 @@ mod tests {
     use domain::{QueueCounterKind, QueueImmutableProperty, SequenceNumber, SessionId, Timestamp};
 
     use super::*;
+
+    #[test]
+    fn capacity_refusals_are_static_distinct_nonretryable_conditions() {
+        for (error, expected) in [
+            (BrokerError::QueueCapacityFull, RESOURCE_LIMIT_EXCEEDED),
+            (
+                BrokerError::QueueCapacityWorkLimitExceeded,
+                RESOURCE_LIMIT_EXCEEDED,
+            ),
+            (BrokerError::QueueCapacityNotSupported, NOT_ALLOWED),
+            (BrokerError::InvalidQueueCapacity, INVALID_FIELD),
+            (BrokerError::QueueCapacityCorrupt, INTERNAL_ERROR),
+        ] {
+            assert_eq!(condition_for(&error), expected);
+            assert!(!is_retryable(&error));
+            assert!(!error.to_string().contains("tenant"));
+        }
+    }
 
     #[test]
     fn retirement_caps_are_nonretryable_resource_limits() {

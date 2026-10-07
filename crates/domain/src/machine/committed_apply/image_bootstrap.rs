@@ -2,7 +2,9 @@ use std::fmt;
 
 use storage::{CommittedStore, StateStore, WriteBatch};
 
-use crate::{CommittedCheckpoint, CommittedStreamId, StateMachine, ValidatedCreateSendImage};
+use crate::{
+    CommittedCheckpoint, CommittedStreamId, StateMachine, ValidatedCreateSendLayout17Image,
+};
 
 use super::{
     CommittedStateMachine,
@@ -96,7 +98,8 @@ mod catalog;
 impl<W: CommittedStore> CommittedStateMachine<W> {
     /// Atomically seeds only a pristine replica with the exact selected image.
     ///
-    /// Full source validation precedes target I/O. The unique writer then
+    /// Full current role2 source validation precedes target I/O. Historical
+    /// role1 selections are refused before any target probe. The unique writer then
     /// proves the target uninitialized and empty. Every selected row, including
     /// the original checkpoint bytes, is copied into one Put-only batch before
     /// its sole commit. That commit also initializes the target atomically.
@@ -148,7 +151,7 @@ impl<W: CommittedStore> CommittedStateMachine<W> {
 
 fn validate_selection<'a>(
     request: &TrustedCreateSendBootstrap<'a>,
-) -> Result<ValidatedCreateSendImage<'a>> {
+) -> Result<ValidatedCreateSendLayout17Image<'a>> {
     image_selection::validate_selection(
         request.stream,
         request.checkpoint,
@@ -173,7 +176,7 @@ fn pristine_reader<W: CommittedStore>(writer: &W) -> Result<W::Reader> {
     Ok(reader)
 }
 
-fn copy_rows(image: &ValidatedCreateSendImage<'_>) -> Result<WriteBatch> {
+fn copy_rows(image: &ValidatedCreateSendLayout17Image<'_>) -> Result<WriteBatch> {
     let mut batch = WriteBatch::default();
     batch
         .try_reserve_mutations(image.row_count())

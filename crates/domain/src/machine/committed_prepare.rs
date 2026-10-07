@@ -48,9 +48,10 @@ impl<S: StateStore> StateMachine<S> {
         }
 
         let mut batch = WriteBatch::default();
+        let mut capacity = CapacityPlan::existing(&command.namespace, &command.entity);
         let outcome = match &command.kind {
             CommandKind::CreateQueue { config } => {
-                self.prepare_committed_create(command, *config, &mut batch)?
+                self.prepare_committed_create(command, *config, &mut batch, &mut capacity)?
             }
             CommandKind::Send {
                 message_id,
@@ -67,6 +68,7 @@ impl<S: StateStore> StateMachine<S> {
                     envelope: None,
                 },
                 &mut batch,
+                &mut capacity,
             )?,
             _ => {
                 return Err(CommittedPreparationError::business_state(
@@ -74,6 +76,9 @@ impl<S: StateStore> StateMachine<S> {
                 ));
             }
         };
+        capacity
+            .finish(self, &mut batch)
+            .map_err(CommittedPreparationError::business_state)?;
         let dead_letters_enqueued = committed_dead_letter_put(command, &batch);
         if !batch.is_empty() {
             batch.push_put(

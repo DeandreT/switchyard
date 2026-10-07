@@ -1061,7 +1061,7 @@ fn one_commit_and_counter_write_retries_storage_failure_without_losing_sequences
                 .iter()
                 .filter(|key| *key == &config_key)
                 .count(),
-            1
+            2
         );
         assert_eq!(
             observed
@@ -1093,7 +1093,7 @@ fn one_commit_and_counter_write_retries_storage_failure_without_losing_sequences
                 .iter()
                 .filter(|key| *key == &config_key)
                 .count(),
-            1
+            2
         );
         assert_eq!(
             observed

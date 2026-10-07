@@ -45,6 +45,17 @@ impl<S: StateStore> StateMachine<S> {
                 if shadow_queue != Some(config.dead_letter_shadow()) || shadow_topic.is_some() {
                     return Err(inconsistent_metadata());
                 }
+                let profile = queue_capacity::validate_owner_profile(
+                    self,
+                    &command.namespace,
+                    &command.entity,
+                )
+                .map_err(CommittedPreparationError::business_state)?;
+                if profile.mode().limit_bytes().is_some() {
+                    return Err(CommittedPreparationError::business_state(
+                        BrokerError::QueueCapacityNotSupported,
+                    ));
+                }
                 Ok(PrimaryMetadata::Queue(config))
             }
             (None, Some(_), Some(record))
@@ -53,6 +64,13 @@ impl<S: StateStore> StateMachine<S> {
                 if shadow_queue.is_some() || shadow_topic.is_some() {
                     return Err(inconsistent_metadata());
                 }
+                self.validate_capacity_binding_profile(
+                    &command.namespace,
+                    &command.entity,
+                    &command.entity,
+                    EntityIncarnationKind::Topic,
+                )
+                .map_err(CommittedPreparationError::business_state)?;
                 Ok(PrimaryMetadata::Topic)
             }
             _ => Err(inconsistent_metadata()),
@@ -80,6 +98,8 @@ impl<S: StateStore> StateMachine<S> {
         shadow: &EntityPath,
         previous: Option<EntityIncarnation>,
     ) -> Result<(), CommittedPreparationError> {
+        self.reject_orphaned_capacity(&command.namespace, &command.entity)
+            .map_err(CommittedPreparationError::business_state)?;
         for entity in [&command.entity, shadow] {
             let counters: Option<QueueCounters> = self
                 .read(&keys::queue_counters(&command.namespace, entity))

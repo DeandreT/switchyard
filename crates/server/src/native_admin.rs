@@ -582,6 +582,7 @@ fn submit_status(error: SubmitError) -> Status {
             | BrokerError::EntityPathAlreadyExists => Status::already_exists(error.to_string()),
             BrokerError::QueuePropertyIsImmutable { .. }
             | BrokerError::TopicPropertyIsImmutable { .. }
+            | BrokerError::QueueCapacityNotSupported
             | BrokerError::SubscriptionPropertyIsImmutable { .. } => {
                 Status::failed_precondition(error.to_string())
             }
@@ -590,6 +591,7 @@ fn submit_status(error: SubmitError) -> Status {
             | BrokerError::SubscriptionConfig(_)
             | BrokerError::EntityKindMismatch
             | BrokerError::InvalidEntityBinding
+            | BrokerError::InvalidQueueCapacity
             | BrokerError::Identifier(_)
             | BrokerError::DeadLetterQueueIsReserved
             | BrokerError::SubscriptionPathIsReserved
@@ -603,6 +605,8 @@ fn submit_status(error: SubmitError) -> Status {
             BrokerError::SubscriptionLimitExceeded { .. }
             | BrokerError::EntityIncarnationExhausted
             | BrokerError::EntityDeleteTooLarge { .. }
+            | BrokerError::QueueCapacityFull
+            | BrokerError::QueueCapacityWorkLimitExceeded
             | BrokerError::TopicFanoutTooLarge { .. } => {
                 Status::resource_exhausted(error.to_string())
             }

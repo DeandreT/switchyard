@@ -208,3 +208,82 @@ fn selection_and_every_error_are_static_and_source_private() -> TestResult {
     }
     Ok(())
 }
+
+// Test-owned malformed source artifacts, never a live export or admission path.
+pub(super) fn closed_profile_refusals() -> TestResult<
+    Vec<(
+        crate::EncodedCommittedImage,
+        CommittedCheckpoint,
+        CommittedImageBootstrapError,
+    )>,
+> {
+    let mut cases = Vec::new();
+    let stream = CommittedStreamId::new([9; 16])?;
+    let machine = CommittedStateMachine::create(MemoryReplicaStore::new(), stream)?;
+    let initial = crate::EncodedCommittedImage::encode(
+        crate::CommittedImageRole::CreateSendV1,
+        stream,
+        &machine.reader().snapshot()?,
+    )?;
+    let decoded = DecodedCommittedImage::decode(initial.as_bytes())?;
+    let checkpoint = decoded.checkpoint().clone();
+    assert!(crate::ValidatedCreateSendImage::validate(decoded).is_ok());
+    cases.push((
+        initial,
+        checkpoint,
+        CommittedImageBootstrapError::UnsupportedProfile,
+    ));
+    let (current, checkpoint) = selected()?;
+    for (mode, expected) in [
+        (None, CommittedImageBootstrapError::InvalidImage),
+        (
+            Some(vec![11, 1, 1, 0, 0]),
+            CommittedImageBootstrapError::InvalidImage,
+        ),
+        (
+            Some(vec![11, 1, 1, 1, 1]),
+            CommittedImageBootstrapError::UnsupportedProfile,
+        ),
+    ] {
+        let store = storage::MemoryStore::default();
+        let mut batch = WriteBatch::default();
+        let decoded = DecodedCommittedImage::decode(current.as_bytes())?;
+        let mut found = 0;
+        for row in decoded.rows() {
+            if row.key().first() == Some(&0x16) {
+                found += 1;
+                if let Some(value) = &mode {
+                    batch.push_put(row.key().to_vec(), value.clone());
+                }
+            } else {
+                batch.push_put(row.key().to_vec(), row.value().to_vec());
+            }
+        }
+        assert_eq!(found, 1);
+        store.apply(batch)?;
+        let image = crate::EncodedCommittedImage::encode(
+            crate::CommittedImageRole::CreateSendLayout17V1,
+            stream,
+            &store.snapshot()?,
+        )?;
+        cases.push((image, checkpoint.clone(), expected));
+    }
+    Ok(cases)
+}
+
+#[test]
+fn historical_role1_and_missing_malformed_or_finite_modes_reach_no_target_api() -> TestResult {
+    for (image, checkpoint, expected) in closed_profile_refusals()? {
+        let request = TrustedCreateSendBootstrap::new(
+            checkpoint.stream(),
+            &checkpoint,
+            Sha256::digest(image.as_bytes()).into(),
+            image.as_bytes(),
+        );
+        assert_eq!(
+            CommittedStateMachine::bootstrap_create_send_image(NoTargetIo, request).err(),
+            Some(expected)
+        );
+    }
+    Ok(())
+}

@@ -209,6 +209,7 @@ fn removed_topology_cannot_adopt_surviving_business_records<W: CommittedStore>(
         WriteBatch::default()
             .delete(keys::queue_config(&namespace()?, &entity()?))
             .delete(keys::queue_config(&namespace()?, &shadow))
+            .delete(keys::queue_capacity_mode(&namespace()?, &entity()?))
             .delete(keys::entity_incarnation(&namespace()?, &entity()?)),
     )?;
     let before = control.reader().snapshot()?;

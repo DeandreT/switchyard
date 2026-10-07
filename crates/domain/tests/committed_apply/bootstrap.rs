@@ -305,11 +305,11 @@ fn valid_changed_row_with_identical_checkpoint_cannot_replace_selected_digest<W:
     message.body = b"different-valid-body".to_vec();
     raw.commit(WriteBatch::default().put(key, codec::encode(&message)?))?;
     let changed = EncodedCommittedImage::encode(
-        CommittedImageRole::CreateSendV1,
+        CommittedImageRole::CreateSendLayout17V1,
         stream()?,
         &raw.reader().snapshot()?,
     )?;
-    let checked = domain::ValidatedCreateSendImage::validate(
+    let checked = domain::ValidatedCreateSendLayout17Image::validate(
         domain::DecodedCommittedImage::decode(changed.as_bytes())?,
     )?;
     assert_eq!(checked.checkpoint(), &selected.checkpoint);
@@ -478,7 +478,7 @@ fn unsupported_inconsistent_and_oversized_sources_refuse_without_target_io<W: Co
     );
     raw.commit(WriteBatch::default().delete(ready.clone()))?;
     let malformed = EncodedCommittedImage::encode(
-        CommittedImageRole::CreateSendV1,
+        CommittedImageRole::CreateSendLayout17V1,
         stream()?,
         &raw.reader().snapshot()?,
     )?;
@@ -498,7 +498,7 @@ fn unsupported_inconsistent_and_oversized_sources_refuse_without_target_io<W: Co
             .put(vec![0x7f], Vec::new()),
     )?;
     let unsupported = EncodedCommittedImage::encode(
-        CommittedImageRole::CreateSendV1,
+        CommittedImageRole::CreateSendLayout17V1,
         stream()?,
         &raw.reader().snapshot()?,
     )?;

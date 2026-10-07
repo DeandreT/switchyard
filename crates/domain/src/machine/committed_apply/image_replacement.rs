@@ -2,7 +2,10 @@ use std::fmt;
 
 use storage::{BoundedStateStore, CatalogCommittedStore, SnapshotCatalogRecord};
 
-use crate::{CommittedCheckpoint, CommittedImageError, CommittedStreamId, DecodedCommittedImage};
+use crate::{
+    CommittedCheckpoint, CommittedImageError, CommittedImageValidationError, CommittedStreamId,
+    DecodedCommittedImage, ValidatedCreateSendLayout17Image,
+};
 
 use super::{
     CommittedImageExportError, CommittedStateMachine,
@@ -13,7 +16,8 @@ mod batch;
 mod planning;
 pub use planning::{
     CreateSendImageExpectation, CreateSendReplacementCounts, CreateSendReplacementPlanError,
-    PlannedCreateSendReplacement, plan_create_send_replacement,
+    PlannedCreateSendLayout17Replacement, PlannedCreateSendReplacement,
+    plan_create_send_layout17_replacement, plan_create_send_replacement,
 };
 
 #[cfg(test)]
@@ -138,7 +142,7 @@ where
     /// Atomically replaces initialized CreateSend state and its opaque catalog.
     ///
     /// Poison refusal precedes all input validation and target I/O. Catalog
-    /// bounds and full trusted source selection/semantics are checked before
+    /// bounds and full trusted role2 source selection/semantics are checked before
     /// the sole complete bounded target capture, using the existing exporter.
     /// The expected old full checkpoint is compared only with that capture.
     /// There is no live checkpoint/init query, catalog read, ordinary snapshot,
@@ -251,11 +255,18 @@ where
         if old.checkpoint() != request.target_checkpoint {
             return Err(CommittedImageReplacementError::TargetMismatch);
         }
-        let plan = batch::plan(&old, &selected)?;
-        let mut batch = batch::copy_deletes(&old, &selected, &plan)?;
+        let old =
+            ValidatedCreateSendLayout17Image::validate(old).map_err(target_validation_error)?;
+        let plan = batch::plan_rows(
+            old.rows(),
+            selected.rows(),
+            old.row_count(),
+            selected.row_count(),
+        )?;
+        let mut batch = batch::copy_delete_rows(old.rows(), selected.rows(), &plan)?;
         drop(old);
         drop(old_artifact);
-        batch::copy_puts(&mut batch, &selected, &plan)?;
+        batch::copy_put_rows(&mut batch, selected.rows(), &plan)?;
         if self.writer.commit_with_catalog(batch, catalog).is_err() {
             self.poisoned = true;
             return Err(CommittedImageReplacementError::CommitUnknown);
@@ -296,5 +307,14 @@ fn target_export_error(error: CommittedImageExportError) -> CommittedImageReplac
             CommittedImageReplacementError::UnsupportedTargetProfile
         }
         CommittedImageExportError::InvalidImage => CommittedImageReplacementError::InvalidTarget,
+    }
+}
+
+fn target_validation_error(error: CommittedImageValidationError) -> CommittedImageReplacementError {
+    match error {
+        CommittedImageValidationError::UnsupportedProfile => {
+            CommittedImageReplacementError::UnsupportedTargetProfile
+        }
+        _ => CommittedImageReplacementError::InvalidTarget,
     }
 }

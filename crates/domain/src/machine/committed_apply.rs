@@ -21,8 +21,9 @@ pub use image_catalog::{
 pub use image_export::CommittedImageExportError;
 pub use image_replacement::{
     CommittedImageReplacementError, CreateSendImageExpectation, CreateSendReplacementCounts,
-    CreateSendReplacementPlanError, PlannedCreateSendReplacement, TrustedCreateSendReplacement,
-    plan_create_send_replacement,
+    CreateSendReplacementPlanError, PlannedCreateSendLayout17Replacement,
+    PlannedCreateSendReplacement, TrustedCreateSendReplacement,
+    plan_create_send_layout17_replacement, plan_create_send_replacement,
 };
 
 /// One synchronous committed-entry writer with a matching read-only machine.

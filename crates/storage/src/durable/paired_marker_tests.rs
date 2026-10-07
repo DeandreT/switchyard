@@ -408,18 +408,22 @@ fn no_marker_existing_refusal_order_and_unversioned_standalone_behavior_are_pres
         &[(b"unknown".to_vec(), vec![0])],
         Some(&records),
     )?;
+    let before = capture(standalone.path())?;
     assert_eq!(
-        Opener::Standalone
-            .read_records(standalone.path())?
-            .entries(),
-        records.as_slice()
+        Opener::Standalone.attempt(standalone.path()).err(),
+        Some(StorageError::CorruptMetadata {
+            detail: "unversioned standalone directory is not empty".into(),
+        })
     );
-    let after = capture(standalone.path())?;
-    assert!(after.metadata.contains(&(
-        FORMAT_VERSION_KEY.to_vec(),
-        ACTIVE_STORE_FORMAT.to_be_bytes().to_vec()
-    )));
-    assert!(after.metadata.contains(&(b"unknown".to_vec(), vec![0])));
+    assert_eq!(capture(standalone.path())?, before);
+    assert!(
+        !before
+            .metadata
+            .iter()
+            .any(|(key, _)| key == FORMAT_VERSION_KEY)
+    );
+    assert!(before.metadata.contains(&(b"unknown".to_vec(), vec![0])));
+    assert_eq!(before.records.as_deref(), Some(records.as_slice()));
     Ok(())
 }
 

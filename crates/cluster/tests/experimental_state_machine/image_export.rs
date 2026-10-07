@@ -13,7 +13,7 @@ use domain::{
     CommittedQueueWork, CommittedSend, CommittedStateMachine, DecodedCommittedImage,
     EncodedCommittedImage, MAX_COMMITTED_BODY_BYTES, MAX_COMMITTED_IMAGE_BYTES,
     MAX_COMMITTED_IMAGE_KEY_BYTES, MAX_COMMITTED_IMAGE_ROWS, MAX_COMMITTED_IMAGE_VALUE_BYTES,
-    QueueConfig, SequenceNumber, SessionId, Timestamp, ValidatedCreateSendImage, keys,
+    QueueConfig, SequenceNumber, SessionId, Timestamp, ValidatedCreateSendLayout17Image, keys,
 };
 use openraft::{EntryPayload, storage::RaftStateMachine};
 use storage::{
@@ -52,10 +52,11 @@ fn one_capture<W: CommittedStore>(control: &observed::Control<W>) {
 
 fn check_image(image: &EncodedCommittedImage, source: &StoreSnapshot) -> TestResult {
     let expected =
-        EncodedCommittedImage::encode(CommittedImageRole::CreateSendV1, stream()?, source)?;
+        EncodedCommittedImage::encode(CommittedImageRole::CreateSendLayout17V1, stream()?, source)?;
     assert_eq!(image.as_bytes(), expected.as_bytes());
-    let checked =
-        ValidatedCreateSendImage::validate(DecodedCommittedImage::decode(image.as_bytes())?)?;
+    let checked = ValidatedCreateSendLayout17Image::validate(DecodedCommittedImage::decode(
+        image.as_bytes(),
+    )?)?;
     assert_eq!(
         checked
             .rows()
@@ -222,8 +223,9 @@ where
         assert_eq!(machine.workload()?.accepted_jobs, 0);
         assert_eq!(machine.workload()?.encoded_bytes, 0);
         check_image(&image, &source)?;
-        let checked =
-            ValidatedCreateSendImage::validate(DecodedCommittedImage::decode(image.as_bytes())?)?;
+        let checked = ValidatedCreateSendLayout17Image::validate(DecodedCommittedImage::decode(
+            image.as_bytes(),
+        )?)?;
         assert_eq!((checked.queue_count(), checked.message_count()), (1, 1));
         assert_eq!(
             checked.checkpoint().last().map(|mark| mark.id),

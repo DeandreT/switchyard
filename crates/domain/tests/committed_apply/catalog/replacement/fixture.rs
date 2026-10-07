@@ -170,7 +170,7 @@ pub(super) fn changed_rows(
     raw.apply(batch)?;
     raw.apply(mutations)?;
     Ok(EncodedCommittedImage::encode(
-        CommittedImageRole::CreateSendV1,
+        CommittedImageRole::CreateSendLayout17V1,
         source.checkpoint.stream(),
         &raw.snapshot()?,
     )?)

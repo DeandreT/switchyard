@@ -260,3 +260,25 @@ fn shared_bootstrap_errors_keep_static_source_private_diagnostics() {
         assert!(!format!("{error:?}: {error}").contains("PRIVATE"));
     }
 }
+
+#[test]
+fn combined_bootstrap_refuses_historical_or_bad_mode_sources_before_any_target_api() -> TestResult {
+    for (image, checkpoint, expected) in super::super::tests::closed_profile_refusals()? {
+        let request = TrustedCreateSendBootstrap::new(
+            checkpoint.stream(),
+            &checkpoint,
+            Sha256::digest(image.as_bytes()).into(),
+            image.as_bytes(),
+        );
+        assert_eq!(
+            CommittedStateMachine::bootstrap_create_send_image_with_catalog(
+                NoTargetIo,
+                request,
+                b"opaque-metadata"
+            )
+            .err(),
+            Some(expected)
+        );
+    }
+    Ok(())
+}

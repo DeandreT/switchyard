@@ -17,18 +17,22 @@ mod image;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) mod layout17_test_fixture;
+
 pub(crate) use checkpoint::{decode_checkpoint, encode_checkpoint};
 pub(crate) use fingerprint::entry_fingerprint;
 pub use image::{
-    CheckedProtectedCreateSendImage, ProtectedCreateSendImageError,
-    check_protected_create_send_image,
+    CheckedProtectedCreateSendImage, CheckedProtectedCreateSendLayout17Image,
+    ProtectedCreateSendImageError, check_protected_create_send_image,
+    check_protected_create_send_layout17_image,
 };
 
 pub use image::{
     CommittedImageError, CommittedImageRole, CommittedImageRow, CommittedImageRows,
     CommittedImageValidationError, DecodedCommittedImage, EncodedCommittedImage,
     MAX_COMMITTED_IMAGE_BYTES, MAX_COMMITTED_IMAGE_KEY_BYTES, MAX_COMMITTED_IMAGE_ROWS,
-    MAX_COMMITTED_IMAGE_VALUE_BYTES, ValidatedCreateSendImage,
+    MAX_COMMITTED_IMAGE_VALUE_BYTES, ValidatedCreateSendImage, ValidatedCreateSendLayout17Image,
 };
 
 pub const MAX_COMMITTED_BODY_BYTES: usize = 256 * 1024;

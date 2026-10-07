@@ -1,4 +1,4 @@
-use domain::{MessageRecord, SequenceNumber, ValidatedCreateSendImage};
+use domain::{MessageRecord, SequenceNumber, ValidatedCreateSendLayout17Image};
 
 use super::{bootstrap_fixture as captured, *};
 
@@ -177,7 +177,7 @@ fn encoding_and_pair_decoding_both_require_business_semantics_not_a_structural_r
     for invalid in [&unknown, &inconsistent] {
         assert!(DecodedCommittedImage::decode(invalid.image.as_bytes()).is_ok());
         assert!(
-            ValidatedCreateSendImage::validate(DecodedCommittedImage::decode(
+            ValidatedCreateSendLayout17Image::validate(DecodedCommittedImage::decode(
                 invalid.image.as_bytes()
             )?)
             .is_err()

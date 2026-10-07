@@ -111,7 +111,7 @@ pub(in crate::experimental_state_machine) fn source<W: CatalogCommittedStore>(
 ) -> TestResult<captured::Selected> {
     let snapshot = control.reader().snapshot()?;
     let image = EncodedCommittedImage::encode(
-        CommittedImageRole::CreateSendV1,
+        CommittedImageRole::CreateSendLayout17V1,
         captured::stream()?,
         &snapshot,
     )?;

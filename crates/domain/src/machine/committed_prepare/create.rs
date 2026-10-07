@@ -8,6 +8,7 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         config: QueueConfig,
         batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, CommittedPreparationError> {
         Self::require_primary_entity_path(&command.entity)
             .map_err(CommittedPreparationError::refused)?;
@@ -37,13 +38,27 @@ impl<S: StateStore> StateMachine<S> {
             ));
         }
 
-        self.stage_create_incarnation(
-            &command.namespace,
-            &command.entity,
-            EntityIncarnationKind::Queue,
-            batch,
-        )
-        .map_err(CommittedPreparationError::business_state)?;
+        let incarnation = self
+            .stage_create_incarnation(
+                &command.namespace,
+                &command.entity,
+                EntityIncarnationKind::Queue,
+                batch,
+            )
+            .map_err(CommittedPreparationError::business_state)?;
+        let mode = crate::queue_capacity::QueueCapacityMode::non_finite(incarnation.generation())
+            .map_err(|_| {
+            CommittedPreparationError::business_state(BrokerError::QueueCapacityCorrupt)
+        })?;
+        batch.push_put(
+            keys::queue_capacity_mode(&command.namespace, &command.entity),
+            mode.encode().map_err(|_| {
+                CommittedPreparationError::business_state(BrokerError::QueueCapacityCorrupt)
+            })?,
+        );
+        capacity
+            .prepare_owner(config, incarnation, mode)
+            .map_err(CommittedPreparationError::business_state)?;
         self.stage_queue_configuration(command, config, &shadow, batch)
             .map_err(CommittedPreparationError::business_state)
     }

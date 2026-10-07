@@ -12,12 +12,15 @@ use super::{CommittedCheckpoint, CommittedStreamId, MAX_COMMITTED_ENTRY_BYTES, d
 
 mod protected;
 pub use protected::{
-    CheckedProtectedCreateSendImage, ProtectedCreateSendImageError,
-    check_protected_create_send_image,
+    CheckedProtectedCreateSendImage, CheckedProtectedCreateSendLayout17Image,
+    ProtectedCreateSendImageError, check_protected_create_send_image,
+    check_protected_create_send_layout17_image,
 };
 
 mod validated;
-pub use validated::{CommittedImageValidationError, ValidatedCreateSendImage};
+pub use validated::{
+    CommittedImageValidationError, ValidatedCreateSendImage, ValidatedCreateSendLayout17Image,
+};
 
 #[cfg(test)]
 mod tests;
@@ -35,6 +38,7 @@ pub const MAX_COMMITTED_IMAGE_VALUE_BYTES: usize = MAX_COMMITTED_ENTRY_BYTES;
 const MAGIC: &[u8; 4] = b"SWYI";
 const SCHEMA_VERSION: u16 = 1;
 const CREATE_SEND_ROLE: u16 = 1;
+const CREATE_SEND_LAYOUT17_ROLE: u16 = 2;
 const HEADER_BYTES: usize = 28;
 const ROW_HEADER_BYTES: usize = 8;
 const CHECKSUM_BYTES: usize = 32;
@@ -48,6 +52,8 @@ const CHECKPOINT_KEY: &[u8] = &[0x12];
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommittedImageRole {
     CreateSendV1,
+    /// Closed Create/Send business layout 17 with mandatory NonFinite queue modes.
+    CreateSendLayout17V1,
 }
 
 /// Static, source-private container failures.
@@ -136,6 +142,7 @@ pub struct DecodedCommittedImage<'a> {
     row_count: usize,
     stream: CommittedStreamId,
     checkpoint: CommittedCheckpoint,
+    role: CommittedImageRole,
 }
 
 impl<'a> DecodedCommittedImage<'a> {
@@ -144,7 +151,7 @@ impl<'a> DecodedCommittedImage<'a> {
     }
 
     pub fn role(&self) -> CommittedImageRole {
-        CommittedImageRole::CreateSendV1
+        self.role
     }
 
     pub fn stream(&self) -> CommittedStreamId {
@@ -338,10 +345,12 @@ fn decode_image(
     }
     if bytes.get(..4) != Some(MAGIC.as_slice())
         || read_u16(bytes.get(4..6).ok_or(CommittedImageError::Malformed)?)? != SCHEMA_VERSION
-        || read_u16(bytes.get(6..8).ok_or(CommittedImageError::Malformed)?)? != CREATE_SEND_ROLE
     {
         return Err(CommittedImageError::UnsupportedFormat);
     }
+    let role = decode_role(read_u16(
+        bytes.get(6..8).ok_or(CommittedImageError::Malformed)?,
+    )?)?;
     let stream_bytes: [u8; 16] = bytes
         .get(8..24)
         .ok_or(CommittedImageError::Malformed)?
@@ -385,6 +394,7 @@ fn decode_image(
         row_count,
         stream,
         checkpoint,
+        role,
     })
 }
 
@@ -475,6 +485,15 @@ fn allocate_output(bytes: usize) -> Result<Vec<u8>, CommittedImageError> {
 fn role_number(role: CommittedImageRole) -> u16 {
     match role {
         CommittedImageRole::CreateSendV1 => CREATE_SEND_ROLE,
+        CommittedImageRole::CreateSendLayout17V1 => CREATE_SEND_LAYOUT17_ROLE,
+    }
+}
+
+fn decode_role(role: u16) -> Result<CommittedImageRole, CommittedImageError> {
+    match role {
+        CREATE_SEND_ROLE => Ok(CommittedImageRole::CreateSendV1),
+        CREATE_SEND_LAYOUT17_ROLE => Ok(CommittedImageRole::CreateSendLayout17V1),
+        _ => Err(CommittedImageError::UnsupportedFormat),
     }
 }
 

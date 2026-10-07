@@ -10,7 +10,8 @@ use domain::{
     IngressEnvelope, LockToken, MAX_INGRESS_BATCH_CONTENT_BYTES, MessageBody, MessageEnvelope,
     MessageIdentifier, MessageProperties, MessageState, MessageValue, NamespaceName, QueueConfig,
     QueueConfigUpdate, ReceiveMode, ScheduledEnvelope, ScheduledMessage, SequenceNumber,
-    SessionHold, SessionId, SettlementDisposition, Timestamp, ValidatedCreateSendImage, keys,
+    SessionHold, SessionId, SettlementDisposition, Timestamp, ValidatedCreateSendLayout17Image,
+    keys,
 };
 use storage::{BoundedStateStore, CommittedStore, StateStore};
 use testkit::{QueueFixture, StoreProvider};
@@ -710,8 +711,9 @@ where
         }
     );
     let image = machine.export_create_send_image()?;
-    let checked =
-        ValidatedCreateSendImage::validate(DecodedCommittedImage::decode(image.as_bytes())?)?;
+    let checked = ValidatedCreateSendLayout17Image::validate(DecodedCommittedImage::decode(
+        image.as_bytes(),
+    )?)?;
     assert_eq!((checked.queue_count(), checked.message_count()), (1, 1));
     Ok(())
 }

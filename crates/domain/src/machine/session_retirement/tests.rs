@@ -84,6 +84,13 @@ fn install(
     hold: &SessionHold,
     owners: &[Option<LockToken>],
 ) -> Result<Vec<MessageRecord>, BrokerError> {
+    // Queue creation is setup, outside the selected-generation scan observation.
+    StateMachine::new(store.inner.clone()).apply(&Command::new(
+        command.namespace.clone(),
+        command.entity.clone(),
+        Timestamp::UNIX_EPOCH,
+        CommandKind::CreateQueue { config: *config },
+    ))?;
     let mut batch = WriteBatch::default()
         .put(
             keys::queue_config(&command.namespace, &command.entity),

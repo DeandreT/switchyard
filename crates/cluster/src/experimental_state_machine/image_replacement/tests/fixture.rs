@@ -128,8 +128,11 @@ pub(super) fn exact_target<W: CatalogCommittedStore>(
         .catalog_reader()
         .read_catalog()?
         .ok_or("catalog absent")?;
-    let image =
-        EncodedCommittedImage::encode(CommittedImageRole::CreateSendV1, checkpoint.stream(), rows)?;
+    let image = EncodedCommittedImage::encode(
+        CommittedImageRole::CreateSendLayout17V1,
+        checkpoint.stream(),
+        rows,
+    )?;
     assert_eq!(retained.artifact(), image.as_bytes());
     let pair = DecodedNativeSnapshotPair::decode(retained.metadata(), retained.artifact())?;
     assert_eq!(pair.checkpoint(), checkpoint);

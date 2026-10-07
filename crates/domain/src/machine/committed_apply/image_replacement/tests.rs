@@ -229,7 +229,133 @@ fn flat_source_target_and_container_error_mappings_preserve_nonfatal_limits() {
     ] {
         assert_eq!(target_container_error(source), expected);
     }
+    assert_eq!(
+        target_validation_error(CommittedImageValidationError::UnsupportedProfile),
+        CommittedImageReplacementError::UnsupportedTargetProfile
+    );
+    assert_eq!(
+        target_validation_error(CommittedImageValidationError::InvalidRecord),
+        CommittedImageReplacementError::InvalidTarget
+    );
 }
 
 use sha2::Digest;
 use storage::SnapshotCatalogReader;
+
+#[derive(Clone)]
+struct NoTargetReader;
+
+type StorageResult<T> = std::result::Result<T, storage::StorageError>;
+
+impl StateStore for NoTargetReader {
+    fn get(&self, _: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        panic!("source refusal reached target get")
+    }
+    fn apply(&self, _: storage::WriteBatch) -> StorageResult<()> {
+        panic!("source refusal reached target apply")
+    }
+    fn snapshot(&self) -> StorageResult<storage::StoreSnapshot> {
+        panic!("source refusal reached target snapshot")
+    }
+    fn scan_from(&self, _: &[u8], _: &[u8], _: usize) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        panic!("source refusal reached target scan")
+    }
+}
+
+impl storage::BoundedStateStore for NoTargetReader {
+    fn snapshot_bounded(&self, _: storage::ReadLimits) -> StorageResult<storage::StoreSnapshot> {
+        panic!("source refusal reached bounded target capture")
+    }
+}
+
+struct NoTargetWriter;
+
+impl storage::CommittedStore for NoTargetWriter {
+    type Reader = NoTargetReader;
+    fn reader(&self) -> Self::Reader {
+        panic!("source refusal reached target reader factory")
+    }
+    fn commit(&mut self, _: storage::WriteBatch) -> StorageResult<()> {
+        panic!("source refusal reached target commit")
+    }
+    fn is_initialized(&self) -> StorageResult<bool> {
+        panic!("source refusal reached target initialization")
+    }
+}
+
+impl CatalogCommittedStore for NoTargetWriter {
+    type CatalogReader = <MemoryCatalogReplicaStore as CatalogCommittedStore>::CatalogReader;
+    fn catalog_reader(&self) -> Self::CatalogReader {
+        panic!("source refusal reached target catalog factory")
+    }
+    fn commit_with_catalog(
+        &mut self,
+        _: storage::WriteBatch,
+        _: storage::SnapshotCatalogRecord<'_>,
+    ) -> StorageResult<()> {
+        panic!("source refusal reached target catalog commit")
+    }
+}
+
+#[test]
+fn current_replacement_refuses_historical_and_bad_modes_before_target_capture_or_writer_calls()
+-> TestResult {
+    use crate::{CommittedImageRole, committed::layout17_test_fixture as fixture};
+    let current = fixture::current(&["queue"], b"body")?;
+    let mut cases = vec![(
+        fixture::initial(CommittedImageRole::CreateSendV1)?,
+        CommittedImageReplacementError::UnsupportedProfile,
+    )];
+    for (value, expected) in [
+        (None, CommittedImageReplacementError::InvalidImage),
+        (
+            Some(vec![11, 1, 1, 0, 0]),
+            CommittedImageReplacementError::InvalidImage,
+        ),
+        (
+            Some(vec![11, 1, 1, 1, 1]),
+            CommittedImageReplacementError::UnsupportedProfile,
+        ),
+    ] {
+        let mut rows = current.rows()?;
+        if let Some(value) = value {
+            rows.iter_mut()
+                .find(|(key, _)| key.first() == Some(&0x16))
+                .ok_or("missing mode")?
+                .1 = value;
+        } else {
+            rows.retain(|(key, _)| key.first() != Some(&0x16));
+        }
+        cases.push((
+            fixture::from_rows(
+                CommittedImageRole::CreateSendLayout17V1,
+                rows,
+                current.checkpoint.clone(),
+            )?,
+            expected,
+        ));
+    }
+    for (image, expected) in cases {
+        let target = CommittedCheckpoint::initial(image.checkpoint.stream());
+        // Private test construction isolates preflight order; it is not a real initialized owner.
+        let mut machine = CommittedStateMachine {
+            writer: NoTargetWriter,
+            machine: crate::StateMachine::new(NoTargetReader),
+            stream: image.checkpoint.stream(),
+            poisoned: false,
+        };
+        let request = TrustedCreateSendReplacement::new(
+            image.checkpoint.stream(),
+            &target,
+            &image.checkpoint,
+            sha2::Sha256::digest(&image.artifact).into(),
+            &image.artifact,
+        );
+        assert_eq!(
+            machine.replace_create_send_image_with_catalog(request, b"opaque"),
+            Err(expected)
+        );
+        assert!(!machine.poisoned);
+    }
+    Ok(())
+}

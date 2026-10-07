@@ -6,20 +6,67 @@ use crate::{
 use super::*;
 
 impl<S: StateStore> StateMachine<S> {
-    /// Reads and validates the topic's distinct metadata record.
+    /// Reads and validates the topic's distinct metadata and capacity exclusion.
     pub fn topic_config(
         &self,
         namespace: &NamespaceName,
         entity: &EntityPath,
     ) -> Result<Option<TopicConfig>, BrokerError> {
-        self.read::<TopicConfig>(&keys::topic_config(namespace, entity))?
-            .map(|config| config.validate().map_err(BrokerError::TopicConfig))
-            .transpose()
+        let config = self.topic_config_topology(namespace, entity)?;
+        if config.is_some() {
+            self.validate_capacity_binding_profile(
+                namespace,
+                entity,
+                entity,
+                crate::EntityIncarnationKind::Topic,
+            )?;
+        }
+        Ok(config)
     }
 
+    /// Reads numeric topic topology only, without capacity or identity proof.
+    pub fn topic_config_topology(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+    ) -> Result<Option<TopicConfig>, BrokerError> {
+        let Some(config) = self.read::<TopicConfig>(&keys::topic_config(namespace, entity))? else {
+            return Ok(None);
+        };
+        let config = config.validate().map_err(BrokerError::TopicConfig)?;
+        Ok(Some(config))
+    }
+
+    /// Reads complete subscription metadata before validating capacity exclusion.
+    pub fn subscription_config(
+        &self,
+        namespace: &NamespaceName,
+        topic: &EntityPath,
+        name: &SubscriptionName,
+    ) -> Result<Option<SubscriptionConfig>, BrokerError> {
+        let config = self.subscription_config_topology(namespace, topic, name)?;
+        let entity = topic.subscription(name)?;
+        self.validate_capacity_binding_profile(
+            namespace,
+            &entity,
+            &entity,
+            crate::EntityIncarnationKind::Subscription,
+        )?;
+        if config.is_some() {
+            self.validate_capacity_binding_profile(
+                namespace,
+                topic,
+                topic,
+                crate::EntityIncarnationKind::Topic,
+            )?;
+        }
+        Ok(config)
+    }
+
+    /// Reads complete subscription topology without capacity or identity proof.
     /// An absent subscription has no membership, backing queue, or DLQ record.
     /// Any partial topology is reported rather than interpreted as absence.
-    pub fn subscription_config(
+    pub fn subscription_config_topology(
         &self,
         namespace: &NamespaceName,
         topic: &EntityPath,
@@ -53,8 +100,32 @@ impl<S: StateStore> StateMachine<S> {
         Ok(Some(config))
     }
 
-    /// Returns the complete bounded membership in canonical key order.
+    /// Returns complete bounded membership after validating all capacity exclusions.
     pub fn subscriptions(
+        &self,
+        namespace: &NamespaceName,
+        topic: &EntityPath,
+    ) -> Result<Vec<SubscriptionDefinition>, BrokerError> {
+        let definitions = self.subscriptions_topology(namespace, topic)?;
+        self.validate_capacity_binding_profile(
+            namespace,
+            topic,
+            topic,
+            crate::EntityIncarnationKind::Topic,
+        )?;
+        for definition in &definitions {
+            self.validate_capacity_binding_profile(
+                namespace,
+                &definition.entity,
+                &definition.entity,
+                crate::EntityIncarnationKind::Subscription,
+            )?;
+        }
+        Ok(definitions)
+    }
+
+    /// Reads complete bounded membership without capacity or identity proof.
+    pub fn subscriptions_topology(
         &self,
         namespace: &NamespaceName,
         topic: &EntityPath,
@@ -112,6 +183,7 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         config: TopicConfig,
         batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, BrokerError> {
         Self::require_primary_entity_path(&command.entity)?;
         let key = keys::topic_config(&command.namespace, &command.entity);
@@ -126,13 +198,14 @@ impl<S: StateStore> StateMachine<S> {
             return Err(BrokerError::EntityPathAlreadyExists);
         }
         let config = config.validate().map_err(BrokerError::TopicConfig)?;
-        self.stage_create_incarnation(
+        let incarnation = self.stage_create_incarnation(
             &command.namespace,
             &command.entity,
             crate::EntityIncarnationKind::Topic,
             batch,
         )?;
         batch.push_put(key, codec::encode(&config)?);
+        capacity.prepare_excluded_owner(incarnation)?;
         Ok(CommandOutcome::TopicCreated)
     }
 

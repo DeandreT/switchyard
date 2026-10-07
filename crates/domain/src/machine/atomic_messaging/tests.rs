@@ -47,10 +47,11 @@ impl StateStore for PointStore {
 }
 
 fn fixture() -> Result<(StateMachine<PointStore>, EntityBinding), BrokerError> {
-    let machine = StateMachine::new(PointStore::default());
+    let store = PointStore::default();
+    let setup = StateMachine::new(store.memory.clone());
     let namespace = NamespaceName::new("test")?;
     let entity = EntityPath::new("queue")?;
-    machine.apply(&Command::new(
+    setup.apply(&Command::new(
         namespace.clone(),
         entity.clone(),
         Timestamp::from_millis(1),
@@ -58,6 +59,7 @@ fn fixture() -> Result<(StateMachine<PointStore>, EntityBinding), BrokerError> {
             config: QueueConfig::default(),
         },
     ))?;
+    let machine = StateMachine::new(store);
     let binding = machine
         .bind_entity(&namespace, &entity, &entity, EntityIncarnationKind::Queue)?
         .ok_or(BrokerError::QueueNotFound)?;

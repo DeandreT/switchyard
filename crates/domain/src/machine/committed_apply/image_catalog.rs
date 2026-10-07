@@ -7,7 +7,7 @@ use storage::{
 
 use crate::{
     CommittedCheckpoint, CommittedImageError, CommittedImageValidationError, DecodedCommittedImage,
-    EncodedCommittedImage, ValidatedCreateSendImage,
+    EncodedCommittedImage, ValidatedCreateSendLayout17Image,
 };
 
 use super::{CommittedImageExportError, CommittedStateMachine};
@@ -147,7 +147,7 @@ impl<W: CatalogCommittedStore> fmt::Debug for PreparedCreateSendCatalog<'_, W> {
     }
 }
 
-/// An owned retained pair whose artifact passed CreateSendV1 validation.
+/// An owned retained pair whose artifact passed CreateSendLayout17V1 validation.
 ///
 /// Metadata is bounded and opaque, not interpreted or validated by this type.
 /// The checkpoint belongs to this retained artifact, which may be older than
@@ -269,7 +269,7 @@ impl<W: CatalogCommittedStore> CommittedStateMachine<W> {
     ///
     /// One originating catalog-reader factory and one read supply the exact
     /// stored pair. The returned artifact's container, stream, and complete
-    /// CreateSendV1 semantics are checked; its metadata remains opaque. No
+    /// CreateSendLayout17V1 semantics are checked; its metadata remains opaque. No
     /// business-reader bound, checkpoint/init query, ordinary or bounded business
     /// snapshot, clock, writer, live-progress comparison, or fallback is used.
     /// An absent slot is Ok(None). An older valid slot is not made invalid by
@@ -306,7 +306,8 @@ impl<W: CatalogCommittedStore> CommittedStateMachine<W> {
             if decoded.stream() != self.stream {
                 return Err(CommittedCatalogError::WrongStream);
             }
-            let checked = ValidatedCreateSendImage::validate(decoded).map_err(validation_error)?;
+            let checked =
+                ValidatedCreateSendLayout17Image::validate(decoded).map_err(validation_error)?;
             checked.checkpoint().clone()
         };
         Ok(Some(RetainedCreateSendCatalog { stored, checkpoint }))

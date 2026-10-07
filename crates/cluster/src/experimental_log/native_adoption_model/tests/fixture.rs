@@ -104,7 +104,7 @@ impl Image {
 
     pub(super) fn from_snapshot(snapshot: StoreSnapshot) -> TestResult<Self> {
         let artifact = EncodedCommittedImage::encode(
-            CommittedImageRole::CreateSendV1,
+            CommittedImageRole::CreateSendLayout17V1,
             CommittedStreamId::new([7; 16])?,
             &snapshot,
         )?;

@@ -1,4 +1,4 @@
-//! Pure consistency validation for the closed, current Create/Send image role.
+//! Pure consistency validation for the closed Create/Send image roles.
 //!
 //! This does not certify a source, committed history, membership, ancestry, or
 //! authority to export or install the bytes. No store or clock is accessed.
@@ -12,8 +12,11 @@ use crate::{
 use super::{CommittedImageRole, CommittedImageRows, DecodedCommittedImage};
 
 mod keys;
+mod layout17;
 mod records;
 mod relations;
+
+pub use layout17::ValidatedCreateSendLayout17Image;
 
 #[cfg(test)]
 mod tests;
@@ -69,8 +72,8 @@ pub struct ValidatedCreateSendImage<'a> {
 
 impl<'a> ValidatedCreateSendImage<'a> {
     pub fn validate(image: DecodedCommittedImage<'a>) -> Result<Self> {
-        match image.role() {
-            CommittedImageRole::CreateSendV1 => {}
+        if image.role() != CommittedImageRole::CreateSendV1 {
+            return Err(CommittedImageValidationError::UnsupportedProfile);
         }
         let mut rows = Rows::default();
         for row in image.rows() {

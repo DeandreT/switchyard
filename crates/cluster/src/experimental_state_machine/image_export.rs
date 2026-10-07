@@ -26,7 +26,7 @@ pub enum StateMachineImageExportError {
 }
 
 impl ExperimentalStateMachine {
-    /// Initializes a pristine owner with bounded CreateSendV1 export enabled.
+    /// Initializes a pristine owner with bounded CreateSendLayout17V1 export enabled.
     ///
     /// This adds no OpenRaft snapshot construction, installation, transport, or
     /// purge support. Existing constructors deliberately leave export disabled.

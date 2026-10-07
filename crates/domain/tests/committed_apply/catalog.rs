@@ -4,7 +4,7 @@ use domain::{
     CommittedStateMachine, CommittedStreamId, DecodedCommittedImage, EncodedCommittedImage,
     MAX_COMMITTED_BODY_BYTES, MAX_COMMITTED_IMAGE_BYTES, MAX_COMMITTED_IMAGE_KEY_BYTES,
     MAX_COMMITTED_IMAGE_ROWS, MAX_COMMITTED_IMAGE_VALUE_BYTES, QueueConfig, SequenceNumber,
-    SessionId, Timestamp, ValidatedCreateSendImage, keys,
+    SessionId, Timestamp, ValidatedCreateSendLayout17Image, keys,
 };
 use storage::{
     BoundedStateStore, CatalogCommittedStore, CommittedStore, MAX_CATALOG_METADATA_BYTES,
@@ -121,8 +121,11 @@ where
     );
     let source = control.reader().snapshot()?;
     let checkpoint = machine.checkpoint()?;
-    let expected =
-        EncodedCommittedImage::encode(CommittedImageRole::CreateSendV1, stream()?, &source)?;
+    let expected = EncodedCommittedImage::encode(
+        CommittedImageRole::CreateSendLayout17V1,
+        stream()?,
+        &source,
+    )?;
     let mut metadata = b"private-opaque-native-address\x00\xff".to_vec();
     metadata.resize(MAX_CATALOG_METADATA_BYTES, 7);
     control.reset();
@@ -161,8 +164,9 @@ where
     assert_eq!(retained.image_bytes(), image.as_bytes());
     assert_eq!(retained.metadata(), metadata);
     assert_eq!(retained.checkpoint(), &checkpoint);
-    let checked =
-        ValidatedCreateSendImage::validate(DecodedCommittedImage::decode(retained.image_bytes())?)?;
+    let checked = ValidatedCreateSendLayout17Image::validate(DecodedCommittedImage::decode(
+        retained.image_bytes(),
+    )?)?;
     assert_eq!((checked.queue_count(), checked.message_count()), (1, 1));
     assert!(!format!("{retained:?}").contains("private-opaque-native-address"));
     assert_eq!(control.reader().snapshot()?, source);
@@ -458,7 +462,7 @@ fn mutated_artifact(
     temporary.apply(batch)?;
     temporary.apply(mutation)?;
     Ok(EncodedCommittedImage::encode(
-        CommittedImageRole::CreateSendV1,
+        CommittedImageRole::CreateSendLayout17V1,
         stream()?,
         &temporary.snapshot()?,
     )?)

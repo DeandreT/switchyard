@@ -2,7 +2,10 @@ use std::iter::Peekable;
 
 use storage::WriteBatch;
 
-use crate::{CommittedImageRows, DecodedCommittedImage, ValidatedCreateSendImage};
+use crate::CommittedImageRows;
+
+#[cfg(test)]
+use crate::{DecodedCommittedImage, ValidatedCreateSendImage};
 
 use super::{CommittedImageReplacementError as Error, Result};
 
@@ -39,17 +42,26 @@ impl Plan {
     }
 }
 
+#[cfg(test)]
 pub(super) fn plan(
     old: &DecodedCommittedImage<'_>,
     selected: &ValidatedCreateSendImage<'_>,
 ) -> Result<Plan> {
-    Ok(count_rows(
+    plan_rows(
         old.rows(),
         selected.rows(),
         old.row_count(),
         selected.row_count(),
-    )?
-    .plan)
+    )
+}
+
+pub(super) fn plan_rows(
+    old_rows: CommittedImageRows<'_>,
+    selected_rows: CommittedImageRows<'_>,
+    old_row_count: usize,
+    selected_row_count: usize,
+) -> Result<Plan> {
+    Ok(count_rows(old_rows, selected_rows, old_row_count, selected_row_count)?.plan)
 }
 
 pub(super) struct CountedRows {
@@ -118,27 +130,36 @@ pub(super) fn count_rows(
     })
 }
 
+#[cfg(test)]
 pub(super) fn copy_deletes(
     old: &DecodedCommittedImage<'_>,
     selected: &ValidatedCreateSendImage<'_>,
+    plan: &Plan,
+) -> Result<WriteBatch> {
+    copy_delete_rows(old.rows(), selected.rows(), plan)
+}
+
+pub(super) fn copy_delete_rows(
+    old_rows: CommittedImageRows<'_>,
+    selected_rows: CommittedImageRows<'_>,
     plan: &Plan,
 ) -> Result<WriteBatch> {
     let mut batch = WriteBatch::default();
     batch
         .try_reserve_mutations(plan.mutations)
         .map_err(|_| Error::Allocation)?;
-    for key in StaleKeys::new(old.rows(), selected.rows()) {
+    for key in StaleKeys::new(old_rows, selected_rows) {
         batch.push_delete(copy_bytes(key)?);
     }
     Ok(batch)
 }
 
-pub(super) fn copy_puts(
+pub(super) fn copy_put_rows(
     batch: &mut WriteBatch,
-    selected: &ValidatedCreateSendImage<'_>,
+    selected_rows: CommittedImageRows<'_>,
     plan: &Plan,
 ) -> Result<()> {
-    for row in selected.rows() {
+    for row in selected_rows {
         batch.push_put(copy_bytes(row.key())?, copy_bytes(row.value())?);
     }
     if batch.mutations().len() != plan.mutations {

@@ -8,8 +8,8 @@ use crate::{
     CommittedCheckpoint, CommittedCheckpointUpdate, CommittedEntryId, CommittedImageRole,
     CommittedQueueCommand, CommittedQueueWork, CommittedSend, CommittedStateMachine,
     CommittedStreamId, CreateSendImageExpectation, DecodedCommittedImage, EncodedCommittedImage,
-    EntityPath, NamespaceName, ProtectedCreateSendImageError as Error, QueueConfig, Timestamp,
-    codec, keys,
+    EntityPath, NamespaceName, ProtectedCreateSendImageError as Error, QueueConfig, SequenceNumber,
+    Timestamp, codec, keys,
 };
 
 pub(super) type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -23,7 +23,7 @@ pub(super) struct Image {
 impl Image {
     pub(super) fn initial() -> TestResult<Self> {
         let mut machine = CommittedStateMachine::create(MemoryReplicaStore::new(), stream()?)?;
-        from_machine(&mut machine)
+        from_machine(&mut machine, &[])
     }
 
     pub(super) fn populated(names: &[&str], body: &[u8]) -> TestResult<Self> {
@@ -36,12 +36,15 @@ impl Image {
             },
         )?;
         let namespace = NamespaceName::new("protected-domain-sentinel")?;
+        let mut queues = Vec::new();
         for name in names {
+            let entity = EntityPath::new(*name)?;
+            queues.push((namespace.clone(), entity.clone()));
             append(
                 &mut machine,
                 CommittedQueueWork::Queue(CommittedQueueCommand::create_queue(
                     namespace.clone(),
-                    EntityPath::new(*name)?,
+                    entity,
                     Timestamp::from_millis(10),
                     QueueConfig::default(),
                 )),
@@ -63,7 +66,7 @@ impl Image {
                 )),
             )?;
         }
-        from_machine(&mut machine)
+        from_machine(&mut machine, &queues)
     }
 
     pub(super) fn one() -> TestResult<Self> {
@@ -145,12 +148,54 @@ fn append(
     Ok(())
 }
 
-fn from_machine(machine: &mut CommittedStateMachine<MemoryReplicaStore>) -> TestResult<Image> {
-    // Ordinary replica/storage is fixture setup, never a protected writer adapter.
-    Ok(Image {
-        checkpoint: machine.checkpoint()?,
-        artifact: machine.export_create_send_image()?.as_bytes().to_vec(),
-    })
+fn from_machine(
+    machine: &mut CommittedStateMachine<MemoryReplicaStore>,
+    queues: &[(NamespaceName, EntityPath)],
+) -> TestResult<Image> {
+    // Build test-owned historical rows, not a relabeled current export.
+    let snapshot = machine.reader().snapshot()?;
+    let mut historical_keys = vec![keys::committed_checkpoint()];
+    if !queues.is_empty() {
+        historical_keys.push(keys::clock());
+    }
+    let mut mode_keys = Vec::new();
+    for (namespace, entity) in queues {
+        let sequence = SequenceNumber::new(1);
+        historical_keys.extend([
+            keys::queue_config(namespace, entity),
+            keys::queue_config(namespace, &entity.dead_letter_queue()?),
+            keys::queue_counters(namespace, entity),
+            keys::message(namespace, entity, sequence),
+            keys::ready(namespace, entity, sequence),
+            keys::entity_incarnation(namespace, entity),
+        ]);
+        mode_keys.push(keys::queue_capacity_mode(namespace, entity));
+    }
+    historical_keys.sort();
+    let mut current_keys = historical_keys.clone();
+    current_keys.extend(mode_keys);
+    current_keys.sort();
+    assert_eq!(
+        snapshot
+            .entries()
+            .iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>(),
+        current_keys.iter().collect::<Vec<_>>(),
+        "historical fixture setup contains unexpected or missing current rows"
+    );
+    let mut rows = Vec::new();
+    for key in historical_keys {
+        rows.push(
+            snapshot
+                .entries()
+                .iter()
+                .find(|(found, _)| found == &key)
+                .ok_or("missing historical fixture row")?
+                .clone(),
+        );
+    }
+    from_rows(rows, machine.checkpoint()?)
 }
 
 pub(super) fn from_rows(rows: Rows, checkpoint: CommittedCheckpoint) -> TestResult<Image> {

@@ -38,7 +38,7 @@ impl<S: StateStore> StateMachine<S> {
         if binding.kind() != EntityIncarnationKind::Queue || binding.target() != binding.owner() {
             return Err(BrokerError::AtomicMessagingOperationNotSupported);
         }
-        self.validate_binding_target(binding, binding.namespace(), binding.target())?;
+        self.validate_binding_identity(binding, binding.namespace(), binding.target())?;
         let config = self
             .queue_config(binding.namespace(), binding.owner())?
             .ok_or(BrokerError::DanglingEntityMetadata)?
@@ -62,7 +62,12 @@ impl<S: StateStore> StateMachine<S> {
         {
             return Err(BrokerError::DanglingEntityMetadata);
         }
-        Ok(())
+        self.validate_capacity_binding_profile(
+            binding.namespace(),
+            binding.target(),
+            binding.owner(),
+            binding.kind(),
+        )
     }
 
     /// Applies all allowed operations through one bounded read-your-writes view,

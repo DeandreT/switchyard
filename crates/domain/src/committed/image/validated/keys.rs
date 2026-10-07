@@ -67,9 +67,7 @@ impl<'a> Key<'a> {
         ) {
             return Err(Error::UnsupportedProfile);
         }
-        let (namespace, rest) = segment(rest, MAX_NAMESPACE_NAME_BYTES)?;
-        let (entity, tail) = segment(rest, MAX_ENTITY_PATH_BYTES)?;
-        let scope = Scope { namespace, entity };
+        let (scope, tail) = scope(rest)?;
         Ok(match tag {
             0x01 | 0x02 | 0x11 => {
                 if !tail.is_empty() {
@@ -107,6 +105,12 @@ impl<'a> Key<'a> {
             _ => return Err(Error::InvalidKey),
         })
     }
+}
+
+pub(super) fn scope(bytes: &[u8]) -> Result<(Scope<'_>, &[u8])> {
+    let (namespace, rest) = segment(bytes, MAX_NAMESPACE_NAME_BYTES)?;
+    let (entity, tail) = segment(rest, MAX_ENTITY_PATH_BYTES)?;
+    Ok((Scope { namespace, entity }, tail))
 }
 
 fn segment(bytes: &[u8], maximum: usize) -> Result<(&str, &[u8])> {

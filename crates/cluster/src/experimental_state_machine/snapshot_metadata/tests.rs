@@ -72,3 +72,37 @@ fn wrappers_and_all_errors_are_source_private() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn current_native_metadata_and_pairs_refuse_valid_historical_role1_images() -> TestResult {
+    let source = bootstrap_fixture::initial()?;
+    // Frozen historical data and metadata are constructed only in this fixture.
+    let historical = domain::EncodedCommittedImage::encode(
+        domain::CommittedImageRole::CreateSendV1,
+        source.checkpoint.stream(),
+        &source.snapshot,
+    )?;
+    assert!(
+        domain::ValidatedCreateSendImage::validate(domain::DecodedCommittedImage::decode(
+            historical.as_bytes()
+        )?)
+        .is_ok()
+    );
+    assert_eq!(
+        EncodedNativeSnapshotMetadata::encode(historical.as_bytes()).err(),
+        Some(NativeSnapshotMetadataError::InvalidImage)
+    );
+    let wire = codec::MetadataV1::from_image(&source.checkpoint, historical.as_bytes())?;
+    let metadata = codec::encode(&wire)?;
+    assert_eq!(
+        DecodedNativeSnapshotPair::decode(&metadata, historical.as_bytes()).err(),
+        Some(NativeSnapshotMetadataError::InvalidImage)
+    );
+    let current = EncodedNativeSnapshotMetadata::encode(source.image.as_bytes())?;
+    let pair = DecodedNativeSnapshotPair::decode(current.as_bytes(), source.image.as_bytes())?;
+    assert_eq!(
+        pair.image().role(),
+        domain::CommittedImageRole::CreateSendLayout17V1
+    );
+    Ok(())
+}

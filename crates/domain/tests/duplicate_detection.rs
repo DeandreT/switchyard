@@ -893,6 +893,10 @@ fn stored_legacy_configurations_are_migrated_on_the_machine_read_path<P: StorePr
             keys::queue_config(&fixture.namespace, &fixture.entity),
             envelope,
         );
+        batch.push_put(
+            keys::queue_config(&fixture.namespace, &fixture.entity.dead_letter_queue()?),
+            codec::encode(&legacy.dead_letter_shadow())?,
+        );
         fixture.machine.store().apply(batch)?;
         assert_eq!(
             fixture

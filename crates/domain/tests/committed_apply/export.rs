@@ -4,7 +4,7 @@ use domain::{
     CommittedStateMachine, DecodedCommittedImage, EncodedCommittedImage, MAX_COMMITTED_BODY_BYTES,
     MAX_COMMITTED_IMAGE_BYTES, MAX_COMMITTED_IMAGE_KEY_BYTES, MAX_COMMITTED_IMAGE_ROWS,
     MAX_COMMITTED_IMAGE_VALUE_BYTES, QueueConfig, SequenceNumber, SessionId, Timestamp,
-    ValidatedCreateSendImage, keys,
+    ValidatedCreateSendLayout17Image, keys,
 };
 use storage::{
     BoundedStateStore, CommittedStore, FjallReplicaStore, ReadLimits, StateStore, StorageError,
@@ -99,8 +99,11 @@ where
     );
     let captured = control.reader().snapshot()?;
     let expected_checkpoint = machine.checkpoint()?;
-    let expected =
-        EncodedCommittedImage::encode(CommittedImageRole::CreateSendV1, stream()?, &captured)?;
+    let expected = EncodedCommittedImage::encode(
+        CommittedImageRole::CreateSendLayout17V1,
+        stream()?,
+        &captured,
+    )?;
     control.reset();
     let image = machine.export_create_send_image()?;
     assert_one_capture(&control);
@@ -118,7 +121,7 @@ where
             .collect::<Vec<_>>(),
         captured.entries()
     );
-    let checked = ValidatedCreateSendImage::validate(decoded)?;
+    let checked = ValidatedCreateSendLayout17Image::validate(decoded)?;
     assert_eq!((checked.queue_count(), checked.message_count()), (1, 1));
     assert_eq!(control.reader().snapshot()?, captured);
     assert_eq!(
@@ -160,8 +163,9 @@ where
         control.reset();
         let image = machine.export_create_send_image()?;
         assert_one_capture(&control);
-        let checked =
-            ValidatedCreateSendImage::validate(DecodedCommittedImage::decode(image.as_bytes())?)?;
+        let checked = ValidatedCreateSendLayout17Image::validate(DecodedCommittedImage::decode(
+            image.as_bytes(),
+        )?)?;
         assert_eq!((checked.queue_count(), checked.message_count()), (0, 0));
         assert_eq!(checked.checkpoint(), &checkpoint);
         assert_eq!(control.reader().snapshot()?, captured);

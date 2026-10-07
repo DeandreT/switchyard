@@ -5,14 +5,18 @@ use std::fmt;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CommittedCheckpoint, CommittedImageError, CommittedImageValidationError, DecodedCommittedImage,
-    MAX_COMMITTED_IMAGE_BYTES, MAX_COMMITTED_MEMBERSHIP_BYTES, ValidatedCreateSendImage,
+    CommittedCheckpoint, CommittedImageError, CommittedImageRows, CommittedImageValidationError,
+    DecodedCommittedImage, MAX_COMMITTED_IMAGE_BYTES, MAX_COMMITTED_MEMBERSHIP_BYTES,
+    ValidatedCreateSendImage,
 };
 
 use super::{CommittedImageReplacementError, batch};
 
 #[cfg(test)]
 mod tests;
+
+mod layout17;
+pub use layout17::{PlannedCreateSendLayout17Replacement, plan_create_send_layout17_replacement};
 
 /// Independently offered identity data, not trust or a replacement permit.
 pub struct CreateSendImageExpectation<'a> {
@@ -212,12 +216,43 @@ pub fn plan_create_send_replacement<'old, 'selected>(
     old_expected: &CreateSendImageExpectation<'_>,
     selected_expected: &CreateSendImageExpectation<'_>,
 ) -> Result<PlannedCreateSendReplacement<'old, 'selected>> {
-    check_shape(
+    check_expectations(
         old_artifact.len(),
         selected_artifact.len(),
         old_expected,
         selected_expected,
     )?;
+    let old_image = validate(old_artifact)?;
+    let selected_image = validate(selected_artifact)?;
+    check_identity(old_image.checkpoint(), old_artifact, old_expected)?;
+    check_identity(
+        selected_image.checkpoint(),
+        selected_artifact,
+        selected_expected,
+    )?;
+    check_pair(old_image.checkpoint(), selected_image.checkpoint())?;
+    let counts = count_pair(
+        old_image.rows(),
+        selected_image.rows(),
+        old_image.row_count(),
+        selected_image.row_count(),
+    )?;
+    Ok(PlannedCreateSendReplacement {
+        old_artifact,
+        selected_artifact,
+        old_image,
+        selected_image,
+        counts,
+    })
+}
+
+fn check_expectations(
+    old_bytes: usize,
+    selected_bytes: usize,
+    old_expected: &CreateSendImageExpectation<'_>,
+    selected_expected: &CreateSendImageExpectation<'_>,
+) -> Result<()> {
+    check_shape(old_bytes, selected_bytes, old_expected, selected_expected)?;
     old_expected
         .checkpoint
         .stream()
@@ -231,34 +266,32 @@ pub fn plan_create_send_replacement<'old, 'selected>(
     if old_expected.checkpoint.stream() != selected_expected.checkpoint.stream() {
         return Err(CreateSendReplacementPlanError::InvalidExpectation);
     }
-    let old_image = validate(old_artifact)?;
-    let selected_image = validate(selected_artifact)?;
-    check_identity(&old_image, old_artifact, old_expected)?;
-    check_identity(&selected_image, selected_artifact, selected_expected)?;
-    for image in [&old_image, &selected_image] {
-        if image.checkpoint().last().is_none() || image.checkpoint().membership().is_none() {
+    Ok(())
+}
+
+fn check_pair(old: &CommittedCheckpoint, selected: &CommittedCheckpoint) -> Result<()> {
+    for checkpoint in [old, selected] {
+        if checkpoint.last().is_none() || checkpoint.membership().is_none() {
             return Err(CreateSendReplacementPlanError::UnsupportedPairPolicy);
         }
     }
-    let counted = batch::count_rows(
-        old_image.rows(),
-        selected_image.rows(),
-        old_image.row_count(),
-        selected_image.row_count(),
-    )
-    .map_err(count_error)?;
+    Ok(())
+}
+
+fn count_pair(
+    old: CommittedImageRows<'_>,
+    selected: CommittedImageRows<'_>,
+    old_count: usize,
+    selected_count: usize,
+) -> Result<CreateSendReplacementCounts> {
+    let counted =
+        batch::count_rows(old, selected, old_count, selected_count).map_err(count_error)?;
     let (delete_rows, put_rows, total_mutations, logical_payload_bytes) = counted.counts();
-    Ok(PlannedCreateSendReplacement {
-        old_artifact,
-        selected_artifact,
-        old_image,
-        selected_image,
-        counts: CreateSendReplacementCounts {
-            delete_rows,
-            put_rows,
-            total_mutations,
-            logical_payload_bytes,
-        },
+    Ok(CreateSendReplacementCounts {
+        delete_rows,
+        put_rows,
+        total_mutations,
+        logical_payload_bytes,
     })
 }
 
@@ -295,11 +328,11 @@ fn validate(artifact: &[u8]) -> Result<ValidatedCreateSendImage<'_>> {
 }
 
 fn check_identity(
-    image: &ValidatedCreateSendImage<'_>,
+    checkpoint: &CommittedCheckpoint,
     artifact: &[u8],
     expected: &CreateSendImageExpectation<'_>,
 ) -> Result<()> {
-    if image.checkpoint() != expected.checkpoint
+    if checkpoint != expected.checkpoint
         || artifact.len() != expected.artifact_bytes
         || <[u8; 32]>::from(Sha256::digest(artifact)) != expected.artifact_sha256
     {

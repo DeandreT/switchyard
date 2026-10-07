@@ -5,7 +5,7 @@ use domain::{
     MAX_COMMITTED_BODY_BYTES, MAX_COMMITTED_IMAGE_BYTES, MAX_COMMITTED_IMAGE_KEY_BYTES,
     MAX_COMMITTED_IMAGE_ROWS, MAX_COMMITTED_IMAGE_VALUE_BYTES, MAX_MESSAGE_ID_LENGTH,
     MAX_SESSION_ID_BYTES, MessageState, QueueConfig, QueueCounters, SequenceNumber, SessionId,
-    StateMachine, Timestamp, ValidatedCreateSendImage, codec, keys,
+    StateMachine, Timestamp, ValidatedCreateSendLayout17Image, codec, keys,
 };
 use storage::{
     BoundedStateStore, CommittedStore, FjallReplicaStore, ReadLimits, StateStore, StorageError,
@@ -258,6 +258,7 @@ where
         keys::duplicate_history_expiry(&namespace, &entity, history_expires, &message_id),
         keys::entity_incarnation(&namespace, &entity),
         checkpoint_key,
+        keys::queue_capacity_mode(&namespace, &entity),
     ];
     expected_keys.sort();
     assert_eq!(
@@ -276,11 +277,14 @@ fn encode_exact<R: BoundedStateStore>(
     checkpoint: &CommittedCheckpoint,
 ) -> TestResult<(StoreSnapshot, EncodedCommittedImage)> {
     let source = bounded(reader)?;
-    let encoded =
-        EncodedCommittedImage::encode(CommittedImageRole::CreateSendV1, stream()?, &source)?;
+    let encoded = EncodedCommittedImage::encode(
+        CommittedImageRole::CreateSendLayout17V1,
+        stream()?,
+        &source,
+    )?;
     {
         let decoded = DecodedCommittedImage::decode(encoded.as_bytes())?;
-        assert_eq!(decoded.role(), CommittedImageRole::CreateSendV1);
+        assert_eq!(decoded.role(), CommittedImageRole::CreateSendLayout17V1);
         assert_eq!(decoded.stream(), stream()?);
         assert_eq!(decoded.checkpoint(), checkpoint);
         assert_eq!(decoded.row_count(), source.entries().len());
@@ -330,7 +334,7 @@ fn encode_exact<R: BoundedStateStore>(
                 encoded.as_bytes()[value_offset..].as_ptr()
             ));
         }
-        let validated = ValidatedCreateSendImage::validate(decoded)?;
+        let validated = ValidatedCreateSendLayout17Image::validate(decoded)?;
         assert_eq!(validated.checkpoint(), checkpoint);
         assert_eq!(validated.rows().count(), source.entries().len());
     }
@@ -383,7 +387,7 @@ where
     let checkpoint = machine.checkpoint()?;
     let reader = machine.reader();
     let (source, _) = encode_exact(&reader, &checkpoint)?;
-    assert_eq!(source.entries().len(), 11);
+    assert_eq!(source.entries().len(), 12);
     assert_eq!(machine.checkpoint()?, checkpoint);
     drop(reader);
     drop(machine);

@@ -20,6 +20,8 @@ mod machine;
 mod message;
 mod message_content;
 mod queue;
+mod queue_capacity;
+mod queue_capacity_command;
 mod rule;
 mod session;
 mod sql_filter;
@@ -41,8 +43,9 @@ pub use command::{
     IngressBatchLimit, IngressEnvelope, ScheduledEnvelope, ScheduledMessage, SettlementDisposition,
 };
 pub use committed::{
-    CheckedProtectedCreateSendImage, ProtectedCreateSendImageError,
-    check_protected_create_send_image,
+    CheckedProtectedCreateSendImage, CheckedProtectedCreateSendLayout17Image,
+    ProtectedCreateSendImageError, check_protected_create_send_image,
+    check_protected_create_send_layout17_image,
 };
 
 pub use committed::{
@@ -53,7 +56,7 @@ pub use committed::{
     CommittedStreamId, DecodedCommittedImage, EncodedCommittedImage, MAX_COMMITTED_BODY_BYTES,
     MAX_COMMITTED_CHECKPOINT_BYTES, MAX_COMMITTED_ENTRY_BYTES, MAX_COMMITTED_IMAGE_BYTES,
     MAX_COMMITTED_IMAGE_KEY_BYTES, MAX_COMMITTED_IMAGE_ROWS, MAX_COMMITTED_IMAGE_VALUE_BYTES,
-    MAX_COMMITTED_MEMBERSHIP_BYTES, ValidatedCreateSendImage,
+    MAX_COMMITTED_MEMBERSHIP_BYTES, ValidatedCreateSendImage, ValidatedCreateSendLayout17Image,
 };
 pub use entity_binding::{EntityBinding, EntityIncarnation, EntityIncarnationKind, FencedCommand};
 pub use error::BrokerError;
@@ -66,9 +69,10 @@ pub use identifier::{
 pub use machine::committed_apply::{
     CommittedCatalogError, CommittedImageBootstrapError, CommittedImageExportError,
     CommittedImageReplacementError, CommittedStateMachine, CreateSendImageExpectation,
-    CreateSendReplacementCounts, CreateSendReplacementPlanError, PlannedCreateSendReplacement,
-    PreparedCreateSendCatalog, RetainedCreateSendCatalog, TrustedCreateSendBootstrap,
-    TrustedCreateSendReplacement, plan_create_send_replacement,
+    CreateSendReplacementCounts, CreateSendReplacementPlanError,
+    PlannedCreateSendLayout17Replacement, PlannedCreateSendReplacement, PreparedCreateSendCatalog,
+    RetainedCreateSendCatalog, TrustedCreateSendBootstrap, TrustedCreateSendReplacement,
+    plan_create_send_layout17_replacement, plan_create_send_replacement,
 };
 pub use machine::{
     BROKER_HEADER_RESERVE_BYTES, CommandApplication, MAX_DEAD_LETTER_DETAIL_LENGTH,
@@ -102,6 +106,9 @@ pub use queue::{
     MAX_LOCK_DURATION_MILLIS, MAX_SEQUENCE_NUMBER, MIN_DUPLICATE_DETECTION_WINDOW_MILLIS,
     QueueConfig, QueueConfigError, QueueConfigUpdate, QueueCounterKind, QueueCounters,
     QueueImmutableProperty, QueueTimeToLiveUpdate,
+};
+pub use queue_capacity_command::{
+    FiniteQueueCapacity, QueueCapacityCommandV1, QueueCapacityStatus, QueueCapacityView,
 };
 pub use rule::{
     CorrelationFilter, MAX_CORRELATION_RULE_CONDITIONS, MAX_RULE_BYTES, MAX_RULE_NAME_LENGTH,

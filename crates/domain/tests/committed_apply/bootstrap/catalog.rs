@@ -338,11 +338,11 @@ fn a_valid_changed_business_row_cannot_replace_the_selected_complete_digest<
     message.body = b"different-valid-body".to_vec();
     raw.commit(WriteBatch::default().put(key, codec::encode(&message)?))?;
     let changed = EncodedCommittedImage::encode(
-        CommittedImageRole::CreateSendV1,
+        CommittedImageRole::CreateSendLayout17V1,
         stream()?,
         &raw.reader().snapshot()?,
     )?;
-    let checked = domain::ValidatedCreateSendImage::validate(
+    let checked = domain::ValidatedCreateSendLayout17Image::validate(
         domain::DecodedCommittedImage::decode(changed.as_bytes())?,
     )?;
     assert_eq!(checked.checkpoint(), &selected.checkpoint);
@@ -387,7 +387,7 @@ fn semantic_legacy_and_container_refusals_never_touch_the_target<W: CatalogCommi
     );
     raw.commit(WriteBatch::default().delete(ready.clone()))?;
     let missing_ready = EncodedCommittedImage::encode(
-        CommittedImageRole::CreateSendV1,
+        CommittedImageRole::CreateSendLayout17V1,
         stream()?,
         &raw.reader().snapshot()?,
     )?;
@@ -397,7 +397,7 @@ fn semantic_legacy_and_container_refusals_never_touch_the_target<W: CatalogCommi
             .put(vec![0x7f], Vec::new()),
     )?;
     let unsupported = EncodedCommittedImage::encode(
-        CommittedImageRole::CreateSendV1,
+        CommittedImageRole::CreateSendLayout17V1,
         stream()?,
         &raw.reader().snapshot()?,
     )?;
@@ -415,7 +415,7 @@ fn semantic_legacy_and_container_refusals_never_touch_the_target<W: CatalogCommi
     );
     raw.commit(WriteBatch::default().put(message_key, legacy))?;
     let legacy = EncodedCommittedImage::encode(
-        CommittedImageRole::CreateSendV1,
+        CommittedImageRole::CreateSendLayout17V1,
         stream()?,
         &raw.reader().snapshot()?,
     )?;

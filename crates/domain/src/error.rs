@@ -16,6 +16,16 @@ use crate::{
 /// command rejects it exactly where the leader did.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum BrokerError {
+    #[error("finite queue capacity is exhausted")]
+    QueueCapacityFull,
+    #[error("stored queue capacity metadata is inconsistent")]
+    QueueCapacityCorrupt,
+    #[error("finite capacity does not support this queue profile")]
+    QueueCapacityNotSupported,
+    #[error("queue capacity must be a positive supported limit")]
+    InvalidQueueCapacity,
+    #[error("queue capacity accounting exceeds its bounded work limit")]
+    QueueCapacityWorkLimitExceeded,
     #[error("atomic messaging commands must have one exact scope and timestamp")]
     InvalidAtomicMessagingCommand,
     #[error(

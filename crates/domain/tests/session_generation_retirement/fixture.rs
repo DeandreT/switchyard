@@ -748,7 +748,7 @@ pub(super) fn assert_serialization<P: StoreProvider>(node: &Node<P>) -> TestResu
         );
     }
     assert_eq!(codec::ACTIVE_VALUE_FORMAT, 11);
-    assert_eq!(storage::ACTIVE_STORE_FORMAT, 16);
+    assert_eq!(storage::ACTIVE_STORE_FORMAT, 17);
     assert_eq!(
         keys::session_message_lock_reverse_prefix(&node.namespace, &node.entity)[0],
         0x13

@@ -1,6 +1,6 @@
 use std::{future::Future, io::IoSlice, task::Waker};
 
-use domain::{DecodedCommittedImage, MAX_COMMITTED_BODY_BYTES, ValidatedCreateSendImage};
+use domain::{DecodedCommittedImage, MAX_COMMITTED_BODY_BYTES, ValidatedCreateSendLayout17Image};
 
 use super::*;
 
@@ -44,8 +44,10 @@ fn owned_constructor_keeps_the_original_allocation_and_starts_at_zero() -> TestR
 fn constructor_adds_no_business_semantics_or_native_metadata_admission() -> TestResult {
     let image = fixture::structural_only_image()?;
     assert!(
-        ValidatedCreateSendImage::validate(DecodedCommittedImage::decode(image.as_bytes())?)
-            .is_err()
+        ValidatedCreateSendLayout17Image::validate(DecodedCommittedImage::decode(
+            image.as_bytes()
+        )?)
+        .is_err()
     );
     let pointer = image.as_bytes().as_ptr() as usize;
     let length = image.len();
@@ -53,7 +55,7 @@ fn constructor_adds_no_business_semantics_or_native_metadata_admission() -> Test
     assert_sealed(&data, pointer, 0);
     assert_eq!(data.len(), length);
     assert!(
-        ValidatedCreateSendImage::validate(DecodedCommittedImage::decode(data.as_bytes())?)
+        ValidatedCreateSendLayout17Image::validate(DecodedCommittedImage::decode(data.as_bytes())?)
             .is_err()
     );
     Ok(())
@@ -98,7 +100,8 @@ async fn chunked_reads_reproduce_the_whole_maximum_body_frame_and_checksum() -> 
     }
     assert_eq!(received, data.as_bytes());
     assert_eq!(received.len(), length);
-    let checked = ValidatedCreateSendImage::validate(DecodedCommittedImage::decode(&received)?)?;
+    let checked =
+        ValidatedCreateSendLayout17Image::validate(DecodedCommittedImage::decode(&received)?)?;
     assert_eq!(checked.stream(), fixture::stream()?);
     assert_eq!(checked.message_count(), 1);
     assert_sealed(&data, pointer, u64::try_from(length)?);

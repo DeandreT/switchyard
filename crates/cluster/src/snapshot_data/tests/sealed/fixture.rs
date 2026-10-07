@@ -76,7 +76,7 @@ pub(super) fn structural_only_image() -> TestResult<EncodedCommittedImage> {
     batch.push_put(vec![0x7f], b"private-unsupported-business-row".to_vec());
     raw.apply(batch)?;
     Ok(EncodedCommittedImage::encode(
-        CommittedImageRole::CreateSendV1,
+        CommittedImageRole::CreateSendLayout17V1,
         stream()?,
         &raw.snapshot()?,
     )?)

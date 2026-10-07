@@ -9,9 +9,9 @@ use std::{
 };
 
 use domain::{
-    CommandKind, CommandOutcome, EntityPath, MAX_TOPIC_PAGE_SIZE, NamespaceName, QueueConfig,
-    StateMachine, SubscriptionConfig, SubscriptionName, TIMER_SCAN_LIMIT, Timestamp, TopicConfig,
-    TopicCursor, codec, keys,
+    CommandKind, CommandOutcome, DeleteEntityTarget, EntityPath, MAX_TOPIC_PAGE_SIZE,
+    NamespaceName, QueueConfig, StateMachine, SubscriptionConfig, SubscriptionName,
+    TIMER_SCAN_LIMIT, Timestamp, TopicConfig, TopicCursor, codec, keys,
 };
 use server::{
     Broker, BrokerHandle, Clock, LocalProposer, MAX_QUEUES_PER_SWEEP, MAX_ROUNDS_PER_INDEX,
@@ -38,6 +38,8 @@ struct PageScan {
 struct Observed {
     pages: Mutex<Vec<PageScan>>,
     topic_reads: Mutex<Vec<TopicCursor>>,
+    profile_topic_reads: Mutex<Vec<TopicCursor>>,
+    in_profile: AtomicBool,
     entity_scans: Mutex<Vec<(u8, EntityPath, usize)>>,
     fail_queue_page: AtomicUsize,
     fail_topic_page: AtomicUsize,
@@ -61,6 +63,12 @@ impl<S: StateStore> ObservedStore<S> {
             .lock()
             .expect("topic reads")
             .clear();
+        self.observed
+            .profile_topic_reads
+            .lock()
+            .expect("profile topic reads")
+            .clear();
+        self.observed.in_profile.store(false, Ordering::SeqCst);
         self.observed
             .entity_scans
             .lock()
@@ -87,6 +95,14 @@ impl<S: StateStore> ObservedStore<S> {
             .clone()
     }
 
+    fn profile_topic_reads(&self) -> Vec<TopicCursor> {
+        self.observed
+            .profile_topic_reads
+            .lock()
+            .expect("profile topic reads")
+            .clone()
+    }
+
     fn fail_page(&self, tag: u8, matching_scan: usize) {
         let counter = match tag {
             1 => &self.observed.fail_queue_page,
@@ -106,17 +122,28 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
                 .post_commit_reads
                 .fetch_add(1, Ordering::SeqCst);
         }
-        if key.starts_with(&keys::topic_config_prefix())
-            && let Some((namespace, entity)) = keys::entity_scope_parts(key)
-        {
-            self.observed
-                .topic_reads
-                .lock()
-                .expect("topic reads")
-                .push(TopicCursor {
-                    namespace: NamespaceName::new(namespace).expect("stored namespace"),
-                    entity: EntityPath::new(entity).expect("stored entity"),
-                });
+        // Original ordinary timer handlers finish before the first incarnation read.
+        // Reset for each command so later handlers remain observable in this sweep.
+        if key == keys::clock().as_slice() {
+            self.observed.in_profile.store(false, Ordering::SeqCst);
+        }
+        if let Some((namespace, entity)) = keys::entity_scope_parts(key) {
+            let namespace = NamespaceName::new(namespace).expect("stored namespace");
+            let entity = EntityPath::new(entity).expect("stored entity");
+            if key == keys::entity_incarnation(&namespace, &entity).as_slice() {
+                self.observed.in_profile.store(true, Ordering::SeqCst);
+            }
+            if key.starts_with(&keys::topic_config_prefix()) {
+                let reads = if self.observed.in_profile.load(Ordering::SeqCst) {
+                    &self.observed.profile_topic_reads
+                } else {
+                    &self.observed.topic_reads
+                };
+                reads
+                    .lock()
+                    .expect("topic configuration reads")
+                    .push(TopicCursor { namespace, entity });
+            }
         }
         self.inner.get(key)
     }
@@ -329,6 +356,29 @@ impl<P: StoreProvider> Node<P> {
             ))?
             .map(|bytes| codec::decode(&bytes))
             .transpose()?)
+    }
+
+    fn delete_poisoned_topic(&self, entity: &str) -> TestResult {
+        let mut batch = WriteBatch::default();
+        batch.push_put(
+            keys::topic_config(&NamespaceName::new("tenant")?, &EntityPath::new(entity)?),
+            codec::encode(&TopicConfig {
+                requires_duplicate_detection: true,
+                ..TopicConfig::default()
+            })?,
+        );
+        self.store.apply(batch)?;
+        assert_eq!(
+            self.submit(
+                "tenant",
+                entity,
+                CommandKind::DeleteEntity {
+                    target: DeleteEntityTarget::Topic
+                },
+            )?,
+            CommandOutcome::TopicDeleted
+        );
+        Ok(())
     }
 
     fn poison_topic(&self, entity: &str) -> TestResult {
@@ -586,12 +636,7 @@ fn deleted_cursor_empty_page_wraps_even_after_a_failed_wrap<P: StoreProvider>(
     let handle = node.handle();
     let worker = TimerWorker::new(&handle);
     assert!(worker.sweep_once().is_err());
-    let mut batch = WriteBatch::default();
-    batch.push_delete(keys::topic_config(
-        &NamespaceName::new("tenant")?,
-        &EntityPath::new("only")?,
-    ));
-    node.store.apply(batch)?;
+    node.delete_poisoned_topic("only")?;
     node.store.clear();
     node.store.fail_page(14, 2);
     assert!(worker.sweep_once().is_err());
@@ -678,6 +723,38 @@ fn topic_cleanup_bounds_backlogs_and_preserves_fresh_history<P: StoreProvider>(
     Ok(())
 }
 
+fn profile_reads_do_not_hide_later_commands_or_extra_handler_reads<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    let node = Node::new(provider)?;
+    node.topic("tenant", "one")?;
+    node.topic("tenant", "two")?;
+    let before = node.store.snapshot()?;
+    let namespace = NamespaceName::new("tenant")?;
+    let one = EntityPath::new("one")?;
+    let two = EntityPath::new("two")?;
+    let shadow = one.dead_letter_queue()?;
+    node.store.clear();
+    node.store.get(&keys::clock())?;
+    node.store.get(&keys::topic_config(&namespace, &one))?;
+    node.store.get(&keys::topic_config(&namespace, &one))?;
+    node.store
+        .get(&keys::entity_incarnation(&namespace, &one))?;
+    node.store.get(&keys::topic_config(&namespace, &shadow))?;
+    node.store.get(&keys::clock())?;
+    node.store.get(&keys::topic_config(&namespace, &two))?;
+    assert_eq!(
+        node.store.topic_reads(),
+        vec![cursor("one"), cursor("one"), cursor("two")]
+    );
+    assert_eq!(
+        node.store.profile_topic_reads(),
+        vec![cursor("one/$deadletterqueue")]
+    );
+    assert_eq!(node.store.snapshot()?, before);
+    Ok(())
+}
+
 macro_rules! for_each_backend {
     ($($case:ident,)+) => {
         mod memory { $(#[test] fn $case() -> super::TestResult { super::$case(::testkit::MemoryProvider::new()) })+ }
@@ -691,6 +768,7 @@ for_each_backend! {
     corrupt_topic_and_transient_discovery_advance_only_the_attempted_cursor,
     deleted_cursor_empty_page_wraps_even_after_a_failed_wrap,
     topic_cleanup_bounds_backlogs_and_preserves_fresh_history,
+    profile_reads_do_not_hide_later_commands_or_extra_handler_reads,
 }
 
 #[tokio::test]

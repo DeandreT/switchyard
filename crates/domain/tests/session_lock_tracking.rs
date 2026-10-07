@@ -1071,7 +1071,7 @@ fn tracking_preserves_command_record_and_value_version_bytes() -> TestResult {
         assert_eq!(postcard::from_bytes::<CommandKind>(&bytes)?, command);
     }
     assert_eq!(codec::ACTIVE_VALUE_FORMAT, 11);
-    assert_eq!(storage::ACTIVE_STORE_FORMAT, 16);
+    assert_eq!(storage::ACTIVE_STORE_FORMAT, 17);
     Ok(())
 }
 
@@ -1132,12 +1132,12 @@ fn tracking_does_not_widen_atomic_or_create_send_profiles() -> TestResult {
         domain::CommittedStateMachine::create(storage::MemoryReplicaStore::new(), stream)?;
     let original = committed.reader().snapshot()?;
     let image = domain::EncodedCommittedImage::encode(
-        domain::CommittedImageRole::CreateSendV1,
+        domain::CommittedImageRole::CreateSendLayout17V1,
         stream,
         &original,
     )?;
     assert!(
-        domain::ValidatedCreateSendImage::validate(domain::DecodedCommittedImage::decode(
+        domain::ValidatedCreateSendLayout17Image::validate(domain::DecodedCommittedImage::decode(
             image.as_bytes()
         )?,)
         .is_ok()
@@ -1151,14 +1151,14 @@ fn tracking_does_not_widen_atomic_or_create_send_profiles() -> TestResult {
         batch.push_put(vec![tag], vec![11, 0]);
         store.apply(batch)?;
         let image = domain::EncodedCommittedImage::encode(
-            domain::CommittedImageRole::CreateSendV1,
+            domain::CommittedImageRole::CreateSendLayout17V1,
             stream,
             &store.snapshot()?,
         )?;
         assert!(matches!(
-            domain::ValidatedCreateSendImage::validate(domain::DecodedCommittedImage::decode(
-                image.as_bytes()
-            )?,),
+            domain::ValidatedCreateSendLayout17Image::validate(
+                domain::DecodedCommittedImage::decode(image.as_bytes())?,
+            ),
             Err(domain::CommittedImageValidationError::UnsupportedProfile)
         ));
     }

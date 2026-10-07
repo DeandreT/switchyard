@@ -220,3 +220,38 @@ fn consuming_a_privately_poisoned_token_refuses_before_commit_even_if_metadata_i
         assert!(catalog_reader.read_catalog().unwrap().is_none());
     }
 }
+
+#[test]
+fn retained_historical_role1_catalog_is_refused_without_poisoning_current_machine()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    use storage::StateStore;
+    let stream = crate::CommittedStreamId::new([7; 16])?;
+    let mut machine = CommittedStateMachine::create(MemoryCatalogReplicaStore::new(), stream)?;
+    // Explicit historical initial data is test-owned; current export is not relabeled.
+    let historical = EncodedCommittedImage::encode(
+        crate::CommittedImageRole::CreateSendV1,
+        stream,
+        &machine.reader().snapshot()?,
+    )?;
+    assert!(
+        crate::ValidatedCreateSendImage::validate(DecodedCommittedImage::decode(
+            historical.as_bytes()
+        )?)
+        .is_ok()
+    );
+    machine.writer.commit_with_catalog(
+        WriteBatch::default(),
+        SnapshotCatalogRecord::new(b"opaque", historical.as_bytes())?,
+    )?;
+    assert_eq!(
+        machine.read_create_send_catalog().err(),
+        Some(CommittedCatalogError::UnsupportedProfile)
+    );
+    assert!(!machine.poisoned);
+    let current = machine.export_create_send_image()?;
+    assert_eq!(
+        DecodedCommittedImage::decode(current.as_bytes())?.role(),
+        crate::CommittedImageRole::CreateSendLayout17V1
+    );
+    Ok(())
+}

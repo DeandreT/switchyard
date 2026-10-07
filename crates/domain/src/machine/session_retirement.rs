@@ -331,12 +331,13 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         after: Option<&SessionRetirementCursor>,
         batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, BrokerError> {
         let reader = RetirementReadStore::new(self.store.clone());
         let machine = StateMachine::new(reader.clone());
         let mut mutations = MutationBudget::default();
         let outcome = machine
-            .retire_session_generations(command, after, batch, &mut mutations)
+            .retire_session_generations(command, after, batch, &mut mutations, capacity)
             .map_err(|error| reader.map_error(error))?;
         mutations.reserve_clock(command, batch)?;
         Ok(CommandOutcome::SessionRetired(outcome))
@@ -348,6 +349,7 @@ impl<S: StateStore> StateMachine<S> {
         after: Option<&SessionRetirementCursor>,
         batch: &mut WriteBatch,
         mutations: &mut MutationBudget,
+        capacity: &mut CapacityPlan,
     ) -> Result<SessionRetirementOutcome, BrokerError> {
         let config = self.load_config(command)?;
         let mut outcome = SessionRetirementOutcome {
@@ -446,8 +448,11 @@ impl<S: StateStore> StateMachine<S> {
                     {
                         return Err(BrokerError::MalformedIndexKey);
                     }
+                    let original = observe_record_at(&record, entry.sequence);
                     if record.is_expired_at(command.issued_at) {
-                        match self.expire_message(command, &config, record, batch)? {
+                        match self
+                            .expire_message(command, &config, record, original, batch, capacity)?
+                        {
                             ExpirationOutcome::Dropped => outcome.dropped += 1,
                             ExpirationOutcome::DeadLettered => outcome.dead_lettered += 1,
                         }
@@ -458,7 +463,9 @@ impl<S: StateStore> StateMachine<S> {
                             record,
                             DeadLetterReason::MaxDeliveryCountExceeded,
                             String::from("the message reached its maximum delivery count"),
+                            original,
                             batch,
+                            capacity,
                         )?;
                         outcome.dead_lettered += 1;
                     } else {
@@ -478,6 +485,7 @@ impl<S: StateStore> StateMachine<S> {
                         batch
                             .push_put(self.ready_key(command.into(), &config, &record), Vec::new());
                         index_ready_expiry(command.into(), &record, batch);
+                        capacity.record_check(entity, entry.sequence, original)?;
                         outcome.returned_to_ready += 1;
                     }
                     mutations.charge_new(batch)?;

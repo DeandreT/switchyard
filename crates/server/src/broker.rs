@@ -43,6 +43,7 @@ mod maintenance;
 mod native_atomic_messaging;
 mod native_atomic_protocol;
 mod protocol;
+mod queue_capacity;
 mod request_queue;
 
 pub use guarded_atomic_messaging::GuardedAtomicSubmitError;
@@ -56,6 +57,23 @@ pub use native_atomic_messaging::{NativeAtomicMessagingCompletion, NativeAtomicS
 const COMMAND_QUEUE_DEPTH: usize = 1_024;
 
 enum Request {
+    CreateFiniteQueue {
+        namespace: NamespaceName,
+        entity: EntityPath,
+        config: QueueConfig,
+        limit: domain::FiniteQueueCapacity,
+        reply: flume::Sender<Result<domain::QueueCapacityView, ProposeError>>,
+    },
+    SetQueueCapacityLimit {
+        binding: EntityBinding,
+        limit: domain::FiniteQueueCapacity,
+        reply: flume::Sender<Result<domain::QueueCapacityView, ProposeError>>,
+    },
+    DescribeQueueCapacity {
+        namespace: NamespaceName,
+        entity: EntityPath,
+        reply: flume::Sender<Result<Option<domain::QueueCapacityView>, ProposeError>>,
+    },
     ApplyReceiveOwned {
         submission: Box<protocol_amqp::OwnedReceiveSubmission>,
         reply: flume::Sender<Result<Option<domain::Delivery>, protocol_amqp::ReceiveSubmitError>>,
@@ -564,6 +582,33 @@ impl Broker {
             .spawn(move || {
                 while let Ok(request) = incoming.recv() {
                     match request {
+                        Request::CreateFiniteQueue {
+                            namespace,
+                            entity,
+                            config,
+                            limit,
+                            reply,
+                        } => {
+                            let _ = reply.send(
+                                proposer.create_finite_queue(&namespace, &entity, config, limit),
+                            );
+                        }
+                        Request::SetQueueCapacityLimit {
+                            binding,
+                            limit,
+                            reply,
+                        } => {
+                            let _ = reply
+                                .send(proposer.set_queue_capacity_limit_fenced(&binding, limit));
+                        }
+                        Request::DescribeQueueCapacity {
+                            namespace,
+                            entity,
+                            reply,
+                        } => {
+                            let _ =
+                                reply.send(proposer.describe_queue_capacity(&namespace, &entity));
+                        }
                         Request::ApplyNativeAtomicMessagingOwned { submission, reply } => {
                             native_atomic_messaging::apply_owned(
                                 &proposer,

@@ -3,7 +3,7 @@
 use std::{
     error::Error,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -493,6 +493,9 @@ struct StoreControls {
     fail_commit: Arc<AtomicBool>,
     refuse_shadow_reads: Arc<AtomicBool>,
     apply_calls: Arc<AtomicUsize>,
+    commit_boundary: Arc<AtomicBool>,
+    shadow_metadata: Arc<Mutex<Vec<Key>>>,
+    shadow_metadata_reads: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Debug)]
@@ -507,16 +510,31 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
             && keys::entity_scope_parts(key)
                 .is_some_and(|(_, entity)| entity.ends_with("/$deadletterqueue"))
         {
-            return Err(StorageError::Backend {
-                operation: "read",
-                detail: String::from("unexpected shadow read"),
-            });
+            // Mandatory owner proof is pre-commit; effect publication needs no reads.
+            if self.controls.commit_boundary.load(Ordering::Relaxed)
+                || !self
+                    .controls
+                    .shadow_metadata
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|allowed| allowed == key)
+            {
+                return Err(StorageError::Backend {
+                    operation: "read",
+                    detail: String::from("unexpected shadow read"),
+                });
+            }
+            self.controls
+                .shadow_metadata_reads
+                .fetch_add(1, Ordering::Relaxed);
         }
         self.inner.get(key)
     }
 
     fn apply(&self, batch: WriteBatch) -> Result<(), StorageError> {
         self.controls.apply_calls.fetch_add(1, Ordering::Relaxed);
+        self.controls.commit_boundary.store(true, Ordering::Relaxed);
         if self.controls.fail_commit.swap(false, Ordering::Relaxed) {
             return Err(StorageError::Backend {
                 operation: "commit",
@@ -586,8 +604,16 @@ fn storage_failure_cannot_publish_an_effect_and_success_needs_no_shadow_queries<
     let sequence = send(&fixture, 10, "expired", Some(5), None)?;
     let snapshot = fixture.machine.store().snapshot()?;
     let attempts = controls.apply_calls.load(Ordering::Relaxed);
+    let shadow = fixture.entity.dead_letter_queue()?;
+    *controls.shadow_metadata.lock().unwrap() = vec![
+        keys::queue_config(&fixture.namespace, &shadow),
+        keys::topic_config(&fixture.namespace, &shadow),
+        keys::queue_capacity_mode(&fixture.namespace, &shadow),
+        keys::queue_capacity_usage(&fixture.namespace, &shadow),
+    ];
     controls.fail_commit.store(true, Ordering::Relaxed);
     controls.refuse_shadow_reads.store(true, Ordering::Relaxed);
+    controls.commit_boundary.store(false, Ordering::Relaxed);
     let command = receive_kind(ReceiveMode::ReceiveAndDelete, None);
     assert_eq!(
         apply(&fixture, 20, command.clone()),
@@ -597,18 +623,23 @@ fn storage_failure_cannot_publish_an_effect_and_success_needs_no_shadow_queries<
         }))
     );
     assert_eq!(controls.apply_calls.load(Ordering::Relaxed), attempts + 1);
+    assert_eq!(controls.shadow_metadata_reads.load(Ordering::Relaxed), 4);
     assert_eq!(fixture.machine.store().snapshot()?, snapshot);
     fixture = fixture.restart()?;
     assert_eq!(fixture.machine.store().snapshot()?, snapshot);
+    controls.commit_boundary.store(false, Ordering::Relaxed);
     let result = apply(&fixture, 20, command.clone())?;
     assert_eq!(result.outcome, CommandOutcome::Received(None));
     assert!(result.dead_letters_enqueued);
     assert_eq!(controls.apply_calls.load(Ordering::Relaxed), attempts + 2);
+    assert_eq!(controls.shadow_metadata_reads.load(Ordering::Relaxed), 8);
     let snapshot = fixture.machine.store().snapshot()?;
+    controls.commit_boundary.store(false, Ordering::Relaxed);
     let no_op = apply(&fixture, 21, command)?;
     assert_eq!(no_op.outcome, CommandOutcome::Received(None));
     assert!(!no_op.dead_letters_enqueued);
     assert_eq!(controls.apply_calls.load(Ordering::Relaxed), attempts + 2);
+    assert_eq!(controls.shadow_metadata_reads.load(Ordering::Relaxed), 12);
     assert_eq!(fixture.machine.store().snapshot()?, snapshot);
     controls.refuse_shadow_reads.store(false, Ordering::Relaxed);
     assert_dead_letters(&fixture, &[sequence])?;

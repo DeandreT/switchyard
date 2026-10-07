@@ -107,7 +107,7 @@ async fn recover(stage: &str, code: i32, catalog_present: bool, compacted: bool)
     drop(log_reader);
     drop(business);
     let expected_image = domain::EncodedCommittedImage::encode(
-        domain::CommittedImageRole::CreateSendV1,
+        domain::CommittedImageRole::CreateSendLayout17V1,
         stream()?,
         &old_business,
     )?;

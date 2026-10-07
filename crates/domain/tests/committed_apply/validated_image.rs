@@ -4,7 +4,8 @@ use domain::{
     EncodedCommittedImage, EntityIncarnation, EntityIncarnationKind, MAX_COMMITTED_BODY_BYTES,
     MAX_COMMITTED_IMAGE_BYTES, MAX_COMMITTED_IMAGE_KEY_BYTES, MAX_COMMITTED_IMAGE_ROWS,
     MAX_COMMITTED_IMAGE_VALUE_BYTES, MAX_SEQUENCE_NUMBER, MessageRecord, MessageState, QueueConfig,
-    QueueCounters, SequenceNumber, SessionId, Timestamp, ValidatedCreateSendImage, codec, keys,
+    QueueCounters, SequenceNumber, SessionId, Timestamp, ValidatedCreateSendLayout17Image, codec,
+    keys,
 };
 use storage::{
     BoundedStateStore, CommittedStore, MemoryStore, ReadLimits, StateStore, StoreSnapshot,
@@ -25,10 +26,13 @@ fn bounded<R: BoundedStateStore>(reader: &R) -> TestResult<StoreSnapshot> {
 fn validate_snapshot(
     snapshot: &StoreSnapshot,
 ) -> TestResult<Result<(usize, usize), CommittedImageValidationError>> {
-    let image =
-        EncodedCommittedImage::encode(CommittedImageRole::CreateSendV1, stream()?, snapshot)?;
+    let image = EncodedCommittedImage::encode(
+        CommittedImageRole::CreateSendLayout17V1,
+        stream()?,
+        snapshot,
+    )?;
     let decoded = DecodedCommittedImage::decode(image.as_bytes())?;
-    Ok(ValidatedCreateSendImage::validate(decoded)
+    Ok(ValidatedCreateSendLayout17Image::validate(decoded)
         .map(|image| (image.queue_count(), image.message_count())))
 }
 
@@ -152,10 +156,14 @@ where
         machine.checkpoint()?.highest_timestamp(),
         Timestamp::from_millis(50_000)
     );
-    let encoded =
-        EncodedCommittedImage::encode(CommittedImageRole::CreateSendV1, stream()?, &snapshot)?;
-    let image =
-        ValidatedCreateSendImage::validate(DecodedCommittedImage::decode(encoded.as_bytes())?)?;
+    let encoded = EncodedCommittedImage::encode(
+        CommittedImageRole::CreateSendLayout17V1,
+        stream()?,
+        &snapshot,
+    )?;
+    let image = ValidatedCreateSendLayout17Image::validate(DecodedCommittedImage::decode(
+        encoded.as_bytes(),
+    )?)?;
     assert_eq!(image.rows().count(), snapshot.entries().len());
     assert_eq!(image.stream(), stream()?);
     assert_eq!(image.checkpoint(), &machine.checkpoint()?);

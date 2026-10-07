@@ -93,6 +93,7 @@ impl<S: StateStore> StateMachine<S> {
                 return Err(BrokerError::DanglingEntityMetadata);
             }
         }
+        self.validate_capacity_binding_profile(namespace, target, owner, kind)?;
         Ok(Some(EntityBinding::new(
             namespace.clone(),
             target.clone(),
@@ -123,7 +124,24 @@ impl<S: StateStore> StateMachine<S> {
             } => Some(entity.subscription(name)?),
             _ => None,
         };
-        self.validate_binding_target(binding, namespace, child.as_ref().unwrap_or(entity))
+        let target = child.as_ref().unwrap_or(entity);
+        if binding.kind() == EntityIncarnationKind::Queue
+            && binding.target() == binding.owner()
+            && matches!(
+                kind,
+                CommandKind::DeleteEntity {
+                    target: crate::DeleteEntityTarget::Auto | crate::DeleteEntityTarget::Queue,
+                }
+            )
+        {
+            self.validate_binding_identity(binding, namespace, target)?;
+            // Whole-owner deletion purges runtime values opaquely. The identity
+            // fence and authoritative mode still have to be intact.
+            queue_capacity::validate_owner_mode(self, namespace, target)?;
+            Ok(())
+        } else {
+            self.validate_binding_target(binding, namespace, target)
+        }
     }
 
     pub fn apply_fenced(&self, command: &FencedCommand) -> Result<CommandOutcome, BrokerError> {
@@ -162,6 +180,16 @@ impl<S: StateStore> StateMachine<S> {
         namespace: &NamespaceName,
         target: &EntityPath,
     ) -> Result<(), BrokerError> {
+        self.validate_binding_identity(binding, namespace, target)?;
+        self.validate_capacity_binding_profile(namespace, target, binding.owner(), binding.kind())
+    }
+
+    pub(super) fn validate_binding_identity(
+        &self,
+        binding: &EntityBinding,
+        namespace: &NamespaceName,
+        target: &EntityPath,
+    ) -> Result<(), BrokerError> {
         binding.validate()?;
         if binding.namespace() != namespace || binding.target() != target {
             return Err(BrokerError::InvalidEntityBinding);
@@ -186,6 +214,48 @@ impl<S: StateStore> StateMachine<S> {
         {
             self.validate_incarnation_metadata(namespace, binding.owner(), record)?;
             return Err(BrokerError::EntityBindingStale);
+        }
+        Ok(())
+    }
+
+    /// Checks capacity for a topology-checked owner, not binding identity or the whole ledger.
+    /// Queue targets require their complete owner profile; excluded kinds require sidecar absence.
+    pub fn validate_capacity_binding_profile(
+        &self,
+        namespace: &NamespaceName,
+        target: &EntityPath,
+        owner: &EntityPath,
+        kind: EntityIncarnationKind,
+    ) -> Result<(), BrokerError> {
+        if kind == EntityIncarnationKind::Queue {
+            queue_capacity::validate_owner_profile(self, namespace, target)?;
+            Ok(())
+        } else {
+            self.validate_capacity_sidecar_absence(namespace, owner)
+        }
+    }
+
+    /// Checks only Mode/Usage absence on a supplied owner and its representable DLQ.
+    /// Callers establish their required topology/identity checks first.
+    /// This is not a whole-ledger or metadata-absence proof.
+    pub fn validate_capacity_sidecar_absence(
+        &self,
+        namespace: &NamespaceName,
+        owner: &EntityPath,
+    ) -> Result<(), BrokerError> {
+        let shadow = owner.dead_letter_queue().ok();
+        for entity in std::iter::once(owner).chain(shadow.as_ref()) {
+            if self
+                .store
+                .get(&keys::queue_capacity_mode(namespace, entity))?
+                .is_some()
+                || self
+                    .store
+                    .get(&keys::queue_capacity_usage(namespace, entity))?
+                    .is_some()
+            {
+                return Err(BrokerError::QueueCapacityCorrupt);
+            }
         }
         Ok(())
     }
@@ -229,7 +299,8 @@ impl<S: StateStore> StateMachine<S> {
         owner: &EntityPath,
         kind: EntityIncarnationKind,
         batch: &mut WriteBatch,
-    ) -> Result<(), BrokerError> {
+    ) -> Result<EntityIncarnation, BrokerError> {
+        self.reject_orphaned_capacity(namespace, owner)?;
         let previous = self.entity_incarnation(namespace, owner)?;
         if let Some(previous) = previous
             && (!previous.is_retired()
@@ -249,6 +320,49 @@ impl<S: StateStore> StateMachine<S> {
             keys::entity_incarnation(namespace, owner),
             codec::encode(&record)?,
         );
+        Ok(record)
+    }
+
+    pub(super) fn reject_orphaned_capacity(
+        &self,
+        namespace: &NamespaceName,
+        owner: &EntityPath,
+    ) -> Result<(), BrokerError> {
+        let shadow = owner.dead_letter_queue().ok();
+        for entity in std::iter::once(owner).chain(shadow.as_ref()) {
+            if self
+                .store
+                .get(&keys::queue_capacity_mode(namespace, entity))?
+                .is_some()
+                || self
+                    .store
+                    .get(&keys::queue_capacity_usage(namespace, entity))?
+                    .is_some()
+                || !self
+                    .store
+                    .scan_prefix(&keys::message_charge_prefix(namespace, entity), 1)?
+                    .is_empty()
+            {
+                return Err(BrokerError::QueueCapacityCorrupt);
+            }
+        }
+        if !self
+            .store
+            .scan_prefix(
+                &keys::subscription_capacity_mode_prefix(namespace, owner),
+                1,
+            )?
+            .is_empty()
+        {
+            return Err(BrokerError::QueueCapacityCorrupt);
+        }
+        for (prefix, _) in keys::subscription_runtime_prefixes(namespace, owner) {
+            if matches!(prefix.first(), Some(0x17 | 0x18))
+                && !self.store.scan_prefix(&prefix, 1)?.is_empty()
+            {
+                return Err(BrokerError::QueueCapacityCorrupt);
+            }
+        }
         Ok(())
     }
 

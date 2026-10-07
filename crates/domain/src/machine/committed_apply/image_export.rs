@@ -3,7 +3,7 @@ use storage::{BoundedStateStore, CommittedStore, ReadLimits, StorageError};
 use crate::{
     CommittedImageError, CommittedImageRole, CommittedImageValidationError, DecodedCommittedImage,
     EncodedCommittedImage, MAX_COMMITTED_IMAGE_BYTES, MAX_COMMITTED_IMAGE_KEY_BYTES,
-    MAX_COMMITTED_IMAGE_ROWS, MAX_COMMITTED_IMAGE_VALUE_BYTES, ValidatedCreateSendImage,
+    MAX_COMMITTED_IMAGE_ROWS, MAX_COMMITTED_IMAGE_VALUE_BYTES, ValidatedCreateSendLayout17Image,
 };
 
 use super::CommittedStateMachine;
@@ -40,7 +40,10 @@ where
     W: CommittedStore,
     W::Reader: BoundedStateStore,
 {
-    /// Captures and checks one complete bounded CreateSendV1 image.
+    /// Captures and checks one complete bounded CreateSendLayout17V1 image.
+    ///
+    /// Actual mode rows remain in the capture. Historical role1 images are not
+    /// synthesized by removing sidecars or relabeling a live source.
     ///
     /// The checkpoint comes exclusively from the same captured rows as the
     /// business state. Constructor validation and the exclusive writer already
@@ -82,14 +85,17 @@ where
                 return Err(CommittedImageExportError::ReadFailed);
             }
         };
-        let image =
-            EncodedCommittedImage::encode(CommittedImageRole::CreateSendV1, self.stream, &snapshot)
-                .map_err(container_error)?;
+        let image = EncodedCommittedImage::encode(
+            CommittedImageRole::CreateSendLayout17V1,
+            self.stream,
+            &snapshot,
+        )
+        .map_err(container_error)?;
         drop(snapshot);
         {
             let decoded =
                 DecodedCommittedImage::decode(image.as_bytes()).map_err(container_error)?;
-            ValidatedCreateSendImage::validate(decoded).map_err(validation_error)?;
+            ValidatedCreateSendLayout17Image::validate(decoded).map_err(validation_error)?;
         }
         Ok(image)
     }

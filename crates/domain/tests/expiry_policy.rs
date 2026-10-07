@@ -684,6 +684,10 @@ fn genuine_v6_and_v7_queue_settings_keep_expiration_dead_letters_and_duplicate_d
             keys::queue_config(&fixture.namespace, &fixture.entity),
             stored,
         );
+        batch.push_put(
+            keys::queue_config(&fixture.namespace, &fixture.entity.dead_letter_queue()?),
+            codec::encode(&legacy.dead_letter_shadow())?,
+        );
         fixture.machine.store().apply(batch)?;
         assert_eq!(
             fixture

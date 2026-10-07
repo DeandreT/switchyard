@@ -847,11 +847,17 @@ fn read_and_mutation_caps_refuse_whole_selected_command<P: StoreProvider>(
     node.reset();
     counts(&node.retire(11, None)?, 0, 0, 0);
     let reads = node.reads();
-    let session_reads = reads.values.iter().filter(|(k, _)| k == &key).count();
+    // The capacity profile is checked after, outside the retirement read budget.
+    let profile_start = reads
+        .values
+        .iter()
+        .position(|(key, _)| key == &keys::entity_incarnation(&node.namespace, &node.entity))
+        .expect("capacity profile follows retirement preparation");
+    let retirement_values = &reads.values[..profile_start];
+    let session_reads = retirement_values.iter().filter(|(k, _)| k == &key).count();
     assert!(session_reads > 0);
     let other = reads.scan_value_bytes
-        + reads
-            .values
+        + retirement_values
             .iter()
             .filter(|(k, _)| k != &key && k.first() != Some(&0))
             .map(|(_, n)| *n)

@@ -10,7 +10,7 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
         namespace: &NamespaceName,
         target: &protocol_amqp::Attachment,
     ) -> Result<Option<EntityAdmission>, ProposeError> {
-        let metadata = self.entity_metadata(namespace, target)?;
+        let topology = self.entity_metadata_topology(namespace, target)?;
         let entity = target
             .canonical_entity()
             .map_err(|_| BrokerError::InvalidEntityBinding)?;
@@ -28,15 +28,23 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
                 .subscription(subscription)
                 .map_err(BrokerError::from)?,
         };
-        let Some(metadata) = metadata else {
+        let Some(metadata) = topology.metadata else {
             // A live topic owns no DLQ. Its absent shadow is not an orphaned
             // incarnation, but the owner's identity must still be consistent.
             if matches!(target, protocol_amqp::Attachment::DeadLetter(_))
-                && self.machine.topic_config(namespace, &owner)?.is_some()
+                && self
+                    .machine
+                    .topic_config_topology(namespace, &owner)?
+                    .is_some()
             {
                 self.machine
                     .bind_entity(namespace, &owner, &owner, EntityIncarnationKind::Topic)?
                     .ok_or(BrokerError::DanglingEntityMetadata)?;
+                self.validate_metadata_capacity(
+                    namespace,
+                    &topology.capacity_owners,
+                    Some((&owner, EntityIncarnationKind::Topic)),
+                )?;
                 return Ok(None);
             }
             if self
@@ -46,6 +54,7 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
             {
                 return Err(BrokerError::DanglingEntityMetadata.into());
             }
+            self.validate_metadata_capacity(namespace, &topology.capacity_owners, None)?;
             return Ok(None);
         };
         let kind = match metadata {
@@ -64,6 +73,11 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
             .machine
             .bind_entity(namespace, &entity, &owner, kind)?
             .ok_or(BrokerError::DanglingEntityMetadata)?;
+        self.validate_metadata_capacity(
+            namespace,
+            &topology.capacity_owners,
+            Some((&owner, kind)),
+        )?;
         Ok(Some(EntityAdmission { metadata, binding }))
     }
 

@@ -6,6 +6,7 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         message: MessageInput<'_>,
         batch: &mut WriteBatch,
+        capacity: &mut CapacityPlan,
     ) -> Result<CommandOutcome, CommittedPreparationError> {
         Self::require_primary_entity_path(&command.entity)
             .map_err(CommittedPreparationError::refused)?;
@@ -34,7 +35,9 @@ impl<S: StateStore> StateMachine<S> {
         let sequence = counters
             .allocate_sequence()
             .map_err(CommittedPreparationError::refused)?;
-        self.stage_queue_message(command, &config, message, counters, sequence, batch)
-            .map_err(CommittedPreparationError::business_state)
+        self.stage_queue_message(
+            command, &config, message, counters, sequence, batch, capacity,
+        )
+        .map_err(CommittedPreparationError::business_state)
     }
 }

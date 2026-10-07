@@ -14,7 +14,7 @@ impl<W: CatalogCommittedStore> CommittedStateMachine<W> {
     ///
     /// Catalog bounds are checked first, then the unchanged trusted selection
     /// validator checks the exact stream, full checkpoint, complete-artifact
-    /// digest, container and CreateSendV1 semantics. Every source or metadata
+    /// digest, container and CreateSendLayout17V1 semantics. Every source or metadata
     /// refusal precedes this function's first target operation. An overlong
     /// component takes precedence over other source-selection errors.
     ///

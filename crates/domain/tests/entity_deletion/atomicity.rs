@@ -515,6 +515,70 @@ fn failed_queue_and_topic_deletion_commits_reopen_and_retry_atomically<P: StoreP
     Ok(())
 }
 
+fn queue_topology_errors_precede_identity_and_capacity_metadata<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    let fixture = observed_queue(provider, QueueConfig::default())?;
+    let identity = keys::entity_incarnation(&fixture.namespace, &fixture.entity);
+    let rule = keys::rule(
+        &fixture.namespace,
+        &fixture.entity,
+        &SubscriptionName::new("ghost")?,
+        &RuleName::new("rule")?,
+    );
+    let mode = keys::queue_capacity_mode(&fixture.namespace, &fixture.entity);
+    for malformed in [false, true] {
+        let mut damage = WriteBatch::default()
+            .put(rule.clone(), vec![255])
+            .delete(mode.clone());
+        if malformed {
+            damage.push_put(identity.clone(), vec![255]);
+        } else {
+            damage.push_delete(identity.clone());
+        }
+        fixture.machine.store().apply(damage)?;
+        reset(&fixture);
+        reject(
+            &fixture,
+            &fixture.entity,
+            20,
+            CommandKind::DeleteEntity {
+                target: DeleteEntityTarget::Queue,
+            },
+            BrokerError::DanglingRuleMetadata,
+        )?;
+        fixture
+            .machine
+            .store()
+            .apply(WriteBatch::default().delete(rule.clone()))?;
+        reset(&fixture);
+        reject(
+            &fixture,
+            &fixture.entity,
+            20,
+            CommandKind::DeleteEntity {
+                target: DeleteEntityTarget::Queue,
+            },
+            if malformed {
+                BrokerError::Codec(domain::CodecError::UnsupportedVersion { version: 255 })
+            } else {
+                BrokerError::DanglingEntityMetadata
+            },
+        )?;
+        assert_eq!(
+            fixture
+                .machine
+                .store()
+                .observations
+                .lock()
+                .expect("observations")
+                .commits,
+            0
+        );
+    }
+    Ok(())
+}
+
 macro_rules! for_each_backend {
     ($($case:ident,)+) => {
         mod memory { $(#[test] fn $case() -> super::TestResult { super::$case(::testkit::MemoryProvider::new()) })+ }
@@ -526,4 +590,5 @@ for_each_backend! {
     orphan_metadata_and_counter_evidence_refuse_without_repair,
     opaque_owned_message_and_rule_values_can_be_purged_without_decoding,
     failed_queue_and_topic_deletion_commits_reopen_and_retry_atomically,
+    queue_topology_errors_precede_identity_and_capacity_metadata,
 }

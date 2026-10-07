@@ -48,6 +48,9 @@ const TAG_COMMITTED_CHECKPOINT: u8 = 0x12;
 const TAG_SESSION_MESSAGE_LOCK_REVERSE: u8 = 0x13;
 const TAG_SESSION_MESSAGE_LOCK_FORWARD: u8 = 0x14;
 const TAG_SESSION_MESSAGE_LOCK_SUMMARY: u8 = 0x15;
+const TAG_QUEUE_CAPACITY_MODE: u8 = 0x16;
+const TAG_QUEUE_CAPACITY_USAGE: u8 = 0x17;
+const TAG_MESSAGE_CHARGE: u8 = 0x18;
 
 const SEPARATOR: u8 = 0x00;
 
@@ -215,6 +218,13 @@ pub(crate) fn subscription_rule_descendant_prefix(
     subscription_descendant_scope(TAG_SUBSCRIPTION_RULE, namespace, topic)
 }
 
+pub(crate) fn subscription_capacity_mode_prefix(
+    namespace: &NamespaceName,
+    topic: &EntityPath,
+) -> Vec<u8> {
+    subscription_descendant_scope(TAG_QUEUE_CAPACITY_MODE, namespace, topic)
+}
+
 fn subscription_descendant_scope(
     tag: u8,
     namespace: &NamespaceName,
@@ -230,10 +240,12 @@ fn subscription_descendant_scope(
 pub(crate) enum RuntimeKind {
     Message,
     LocalToken,
+    /// Owner accounting exists even before any sequence or lock is allocated.
+    OwnerAggregate,
     Other,
 }
 
-const RUNTIME_FAMILIES: [(u8, RuntimeKind); 13] = [
+const RUNTIME_FAMILIES: [(u8, RuntimeKind); 15] = [
     (TAG_MESSAGE, RuntimeKind::Message),
     (TAG_READY, RuntimeKind::Other),
     (TAG_LOCK, RuntimeKind::LocalToken),
@@ -247,19 +259,21 @@ const RUNTIME_FAMILIES: [(u8, RuntimeKind); 13] = [
     (TAG_SESSION_MESSAGE_LOCK_REVERSE, RuntimeKind::LocalToken),
     (TAG_SESSION_MESSAGE_LOCK_FORWARD, RuntimeKind::LocalToken),
     (TAG_SESSION_MESSAGE_LOCK_SUMMARY, RuntimeKind::LocalToken),
+    (TAG_QUEUE_CAPACITY_USAGE, RuntimeKind::OwnerAggregate),
+    (TAG_MESSAGE_CHARGE, RuntimeKind::Other),
 ];
 
 pub(crate) fn entity_runtime_prefixes(
     namespace: &NamespaceName,
     entity: &EntityPath,
-) -> [(Vec<u8>, RuntimeKind); 13] {
+) -> [(Vec<u8>, RuntimeKind); 15] {
     RUNTIME_FAMILIES.map(|(tag, kind)| (entity_scope(tag, namespace, entity), kind))
 }
 
 pub(crate) fn subscription_runtime_prefixes(
     namespace: &NamespaceName,
     topic: &EntityPath,
-) -> [(Vec<u8>, RuntimeKind); 13] {
+) -> [(Vec<u8>, RuntimeKind); 15] {
     RUNTIME_FAMILIES.map(|(tag, kind)| (subscription_descendant_scope(tag, namespace, topic), kind))
 }
 
@@ -292,6 +306,28 @@ pub fn queue_counters(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8>
 /// Retained incarnation ownership; a DLQ uses its parent owner's key.
 pub fn entity_incarnation(namespace: &NamespaceName, owner: &EntityPath) -> Vec<u8> {
     entity_scope(TAG_ENTITY_INCARNATION, namespace, owner)
+}
+
+/// Mandatory capacity profile for a primary queue, never for its DLQ shadow.
+pub fn queue_capacity_mode(namespace: &NamespaceName, owner: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_QUEUE_CAPACITY_MODE, namespace, owner)
+}
+
+/// Aggregate reservations shared by a finite primary queue and its DLQ.
+pub fn queue_capacity_usage(namespace: &NamespaceName, owner: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_QUEUE_CAPACITY_USAGE, namespace, owner)
+}
+
+pub fn message_charge_prefix(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_MESSAGE_CHARGE, namespace, entity)
+}
+
+pub fn message_charge(
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    sequence: SequenceNumber,
+) -> Vec<u8> {
+    with_u64(message_charge_prefix(namespace, entity), sequence.as_u64())
 }
 
 pub fn message(
@@ -781,10 +817,12 @@ mod tests {
         assert_eq!(
             tags,
             vec![
-                0x03, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x13, 0x14, 0x15
+                0x03, 0x04, 0x05, 0x06, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x13, 0x14, 0x15, 0x17,
+                0x18
             ]
         );
         assert!(matches!(exact[0].1, RuntimeKind::Message));
+        assert!(matches!(exact[13].1, RuntimeKind::OwnerAggregate));
         for index in [2, 4, 6, 10, 11, 12] {
             assert!(matches!(exact[index].1, RuntimeKind::LocalToken));
         }
@@ -924,6 +962,38 @@ mod tests {
         let short_prefix = ready_prefix(&namespace(), &short);
         let long_prefix = ready_prefix(&namespace(), &long);
         assert!(!long_prefix.starts_with(&short_prefix));
+    }
+
+    #[test]
+    fn capacity_keys_have_new_tags_and_exact_owner_and_message_scopes() {
+        assert_eq!(
+            queue_capacity_mode(&namespace(), &entity()),
+            b"\x16tenant\0orders\0"
+        );
+        assert_eq!(
+            queue_capacity_usage(&namespace(), &entity()),
+            b"\x17tenant\0orders\0"
+        );
+        let prefix = message_charge_prefix(&namespace(), &entity());
+        assert_eq!(prefix, b"\x18tenant\0orders\0");
+        let key = message_charge(&namespace(), &entity(), SequenceNumber::new(42));
+        assert_eq!(&key[..prefix.len()], prefix);
+        assert_eq!(&key[prefix.len()..], &42_u64.to_be_bytes());
+        assert!(message_charge(&namespace(), &entity(), SequenceNumber::new(1)) < key);
+        let neighbor = EntityPath::new("orders-a").unwrap();
+        assert!(!message_charge_prefix(&namespace(), &neighbor).starts_with(&prefix));
+        let runtime = entity_runtime_prefixes(&namespace(), &entity());
+        assert!(
+            runtime
+                .iter()
+                .any(|(p, _)| p == &queue_capacity_usage(&namespace(), &entity()))
+        );
+        assert!(runtime.iter().any(|(p, _)| p == &prefix));
+        assert!(
+            !runtime
+                .iter()
+                .any(|(p, _)| p == &queue_capacity_mode(&namespace(), &entity()))
+        );
     }
 
     #[test]

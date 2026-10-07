@@ -244,6 +244,13 @@ fn exhausted_generations_can_retire_but_never_wrap_on_recreation<P: StoreProvide
             key.clone(),
             codec::encode(&EntityIncarnation::new(u64::MAX, kind, false)?)?,
         ))?;
+        if kind == EntityIncarnationKind::Queue {
+            // Test-owned canonical NonFinite mode follows the injected incarnation.
+            fixture.machine.store().apply(WriteBatch::default().put(
+                keys::queue_capacity_mode(&fixture.namespace, &owner),
+                codec::encode(&(1_u8, u64::MAX, 0_u32))?,
+            ))?;
+        }
         let old = bind(&fixture, &owner, &owner, kind)?;
         assert_eq!(old.generation(), u64::MAX);
         at(&fixture, &primary, base + 1, delete)?;

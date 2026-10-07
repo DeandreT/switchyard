@@ -4,13 +4,13 @@ use std::{
     error::Error,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
 use domain::{
-    CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueConfig, QueueCursor,
-    ScheduledMessage, StateMachine, Timestamp, keys,
+    CommandKind, CommandOutcome, DeleteEntityTarget, EntityPath, NamespaceName, QueueConfig,
+    QueueCursor, ScheduledMessage, StateMachine, Timestamp, codec, keys,
 };
 use server::{Broker, LocalProposer, MAX_QUEUES_PER_SWEEP, ManualClock, TimerWorker};
 use storage::{StateStore, StorageError, StoreSnapshot, WriteBatch};
@@ -22,6 +22,9 @@ type PageScan = (Vec<u8>, usize);
 #[derive(Default)]
 struct Observations {
     attempted: Mutex<Vec<QueueCursor>>,
+    profile_reads: Mutex<Vec<QueueCursor>>,
+    in_profile: AtomicBool,
+    fail_scheduled_scan: Mutex<Option<Vec<u8>>>,
     pages: Mutex<Vec<PageScan>>,
     fail_after_pages: AtomicUsize,
 }
@@ -42,6 +45,12 @@ impl<S: StateStore> ObservedStore<S> {
 
     fn clear(&self) {
         self.observed.attempted.lock().expect("attempts").clear();
+        self.observed
+            .profile_reads
+            .lock()
+            .expect("profile reads")
+            .clear();
+        self.observed.in_profile.store(false, Ordering::SeqCst);
         self.observed.pages.lock().expect("pages").clear();
     }
 
@@ -49,6 +58,30 @@ impl<S: StateStore> ObservedStore<S> {
         let mut attempted = self.observed.attempted.lock().expect("attempts").clone();
         attempted.dedup();
         attempted
+    }
+
+    fn raw_attempted(&self) -> Vec<QueueCursor> {
+        self.observed.attempted.lock().expect("attempts").clone()
+    }
+
+    fn profile_reads(&self) -> Vec<QueueCursor> {
+        self.observed
+            .profile_reads
+            .lock()
+            .expect("profile reads")
+            .clone()
+    }
+
+    fn fail_scheduled_scan(&self, namespace: &str, entity: &str) -> TestResult {
+        *self
+            .observed
+            .fail_scheduled_scan
+            .lock()
+            .expect("scheduled failure") = Some(keys::scheduled_prefix(
+            &NamespaceName::new(namespace)?,
+            &EntityPath::new(entity)?,
+        ));
+        Ok(())
     }
 
     fn pages(&self) -> Vec<PageScan> {
@@ -64,17 +97,28 @@ impl<S: StateStore> ObservedStore<S> {
 
 impl<S: StateStore> StateStore for ObservedStore<S> {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        if key.starts_with(&keys::queue_config_prefix())
-            && let Some((namespace, entity)) = keys::entity_scope_parts(key)
-        {
-            self.observed
-                .attempted
-                .lock()
-                .expect("attempts")
-                .push(QueueCursor {
-                    namespace: NamespaceName::new(namespace).expect("stored namespace"),
-                    entity: EntityPath::new(entity).expect("stored entity"),
-                });
+        // In these ordinary timer handlers, the incarnation starts capacity.finish.
+        // The clock read resets the boundary for every command, not every sweep.
+        if key == keys::clock().as_slice() {
+            self.observed.in_profile.store(false, Ordering::SeqCst);
+        }
+        if let Some((namespace, entity)) = keys::entity_scope_parts(key) {
+            let namespace = NamespaceName::new(namespace).expect("stored namespace");
+            let entity = EntityPath::new(entity).expect("stored entity");
+            if key == keys::entity_incarnation(&namespace, &entity).as_slice() {
+                self.observed.in_profile.store(true, Ordering::SeqCst);
+            }
+            if key.starts_with(&keys::queue_config_prefix()) {
+                let reads = if self.observed.in_profile.load(Ordering::SeqCst) {
+                    &self.observed.profile_reads
+                } else {
+                    &self.observed.attempted
+                };
+                reads
+                    .lock()
+                    .expect("configuration reads")
+                    .push(QueueCursor { namespace, entity });
+            }
         }
         self.inner.get(key)
     }
@@ -113,6 +157,19 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
                 });
             }
         }
+        let mut failure = self
+            .observed
+            .fail_scheduled_scan
+            .lock()
+            .expect("scheduled failure");
+        if failure.as_deref() == Some(prefix) {
+            *failure = None;
+            return Err(StorageError::Backend {
+                operation: "scan scheduled messages",
+                detail: "temporary scheduled scan failure".to_owned(),
+            });
+        }
+        drop(failure);
         self.inner.scan_from(prefix, start, limit)
     }
 }
@@ -163,6 +220,20 @@ impl<P: StoreProvider> Node<P> {
                 },
             )?,
             CommandOutcome::QueueCreated
+        );
+        Ok(())
+    }
+
+    fn delete(&self, namespace: &str, entity: &str) -> TestResult {
+        assert_eq!(
+            self.submit(
+                namespace,
+                entity,
+                CommandKind::DeleteEntity {
+                    target: DeleteEntityTarget::Queue
+                },
+            )?,
+            CommandOutcome::QueueDeleted
         );
         Ok(())
     }
@@ -297,16 +368,20 @@ fn failed_queues_and_deleted_cursors_do_not_starve_later_queues<P: StoreProvider
     node.create("tenant", "n-after")?;
     node.schedule("tenant", "a-before", 1_002)?;
     node.schedule("tenant", "n-after", 1_002)?;
-    node.replace_config("tenant", "m-poison", None)?;
+    node.replace_config(
+        "tenant",
+        "m-poison",
+        Some(codec::encode(&QueueConfig::default())?),
+    )?;
+    node.delete("tenant", "m-poison")?;
     node.clock.set(1_002);
     node.store.clear();
     let resumed = worker.sweep_once()?;
-    assert_eq!(resumed.queues_swept, 5);
+    assert_eq!(resumed.queues_swept, 4);
     assert_eq!(resumed.messages_activated, 2);
     assert_eq!(
         node.store.attempted(),
         vec![
-            cursor("tenant", "m-poison/$deadletterqueue"),
             cursor("tenant", "n-after"),
             cursor("tenant", "n-after/$deadletterqueue"),
             cursor("tenant", "z-due"),
@@ -315,7 +390,7 @@ fn failed_queues_and_deleted_cursors_do_not_starve_later_queues<P: StoreProvider
     );
     node.store.clear();
     let wrapped = worker.sweep_once()?;
-    assert_eq!(wrapped.queues_swept, 7);
+    assert_eq!(wrapped.queues_swept, 6);
     assert_eq!(wrapped.messages_activated, 1);
     assert_eq!(node.store.attempted()[0], cursor("tenant", "a-before"));
     Ok(())
@@ -341,6 +416,11 @@ fn a_transient_discovery_error_keeps_the_last_attempted_cursor<P: StoreProvider>
     assert_eq!(node.store.snapshot()?, before);
     let failed_start = node.store.pages()[0].0.clone();
 
+    node.replace_config(
+        "tenant",
+        "m-poison",
+        Some(codec::encode(&QueueConfig::default())?),
+    )?;
     node.store.clear();
     let resumed = worker.sweep_once()?;
     assert_eq!(resumed.queues_swept, 3);
@@ -362,12 +442,22 @@ fn an_empty_exclusive_page_wraps_in_the_same_tick_even_after_a_failed_wrap<P: St
 ) -> TestResult {
     let node = Node::start(provider)?;
     node.create("tenant", "only")?;
-    node.replace_config("tenant", "only/$deadletterqueue", Some(vec![0xff]))?;
+    node.store
+        .fail_scheduled_scan("tenant", "only/$deadletterqueue")?;
     let handle = node.broker.handle();
     let worker = TimerWorker::new(&handle);
+    let healthy = node.store.snapshot()?;
+    node.store.clear();
     assert!(worker.sweep_once().is_err());
-    node.replace_config("tenant", "only/$deadletterqueue", None)?;
-    node.schedule("tenant", "only", 1_001)?;
+    assert_eq!(
+        node.store.attempted(),
+        vec![
+            cursor("tenant", "only"),
+            cursor("tenant", "only/$deadletterqueue")
+        ]
+    );
+    assert_eq!(node.store.snapshot()?, healthy);
+    node.delete("tenant", "only")?;
     node.clock.set(1_001);
     let before = node.store.snapshot()?;
     node.store.clear();
@@ -377,14 +467,65 @@ fn an_empty_exclusive_page_wraps_in_the_same_tick_even_after_a_failed_wrap<P: St
     assert_eq!(node.store.snapshot()?, before);
     let failed_pages = node.store.pages();
     assert_eq!(failed_pages.len(), 2);
+    let mut exclusive_shadow = keys::queue_config(
+        &NamespaceName::new("tenant")?,
+        &EntityPath::new("only/$deadletterqueue")?,
+    );
+    exclusive_shadow.push(0);
+    assert_eq!(failed_pages[0].0, exclusive_shadow);
     assert_eq!(failed_pages[1].0, keys::queue_config_prefix());
 
+    node.create("tenant", "only")?;
+    node.schedule("tenant", "only", 1_002)?;
+    node.clock.set(1_002);
     node.store.clear();
     let wrapped = worker.sweep_once()?;
-    assert_eq!(wrapped.queues_swept, 1);
+    assert_eq!(wrapped.queues_swept, 2);
     assert_eq!(wrapped.messages_activated, 1);
     assert_eq!(node.store.pages(), failed_pages);
-    assert_eq!(node.store.attempted(), vec![cursor("tenant", "only")]);
+    assert_eq!(
+        node.store.attempted(),
+        vec![
+            cursor("tenant", "only"),
+            cursor("tenant", "only/$deadletterqueue")
+        ]
+    );
+    Ok(())
+}
+
+fn profile_reads_do_not_hide_later_commands_or_extra_handler_reads<P: StoreProvider>(
+    provider: P,
+) -> TestResult {
+    let node = Node::start(provider)?;
+    node.create("tenant", "one")?;
+    node.create("tenant", "two")?;
+    let before = node.store.snapshot()?;
+    let namespace = NamespaceName::new("tenant")?;
+    let one = EntityPath::new("one")?;
+    let two = EntityPath::new("two")?;
+    let shadow = one.dead_letter_queue()?;
+    node.store.clear();
+    node.store.get(&keys::clock())?;
+    node.store.get(&keys::queue_config(&namespace, &one))?;
+    node.store.get(&keys::queue_config(&namespace, &one))?;
+    node.store
+        .get(&keys::entity_incarnation(&namespace, &one))?;
+    node.store.get(&keys::queue_config(&namespace, &shadow))?;
+    node.store.get(&keys::clock())?;
+    node.store.get(&keys::queue_config(&namespace, &two))?;
+    assert_eq!(
+        node.store.raw_attempted(),
+        vec![
+            cursor("tenant", "one"),
+            cursor("tenant", "one"),
+            cursor("tenant", "two")
+        ]
+    );
+    assert_eq!(
+        node.store.profile_reads(),
+        vec![cursor("tenant", "one/$deadletterqueue")]
+    );
+    assert_eq!(node.store.snapshot()?, before);
     Ok(())
 }
 
@@ -445,6 +586,7 @@ for_each_backend! {
     failed_queues_and_deleted_cursors_do_not_starve_later_queues,
     a_transient_discovery_error_keeps_the_last_attempted_cursor,
     an_empty_exclusive_page_wraps_in_the_same_tick_even_after_a_failed_wrap,
+    profile_reads_do_not_hide_later_commands_or_extra_handler_reads,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

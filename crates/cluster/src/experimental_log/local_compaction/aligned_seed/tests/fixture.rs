@@ -133,8 +133,11 @@ impl Image {
     }
 
     fn from_snapshot(stream: CommittedStreamId, snapshot: StoreSnapshot) -> TestResult<Self> {
-        let artifact =
-            EncodedCommittedImage::encode(CommittedImageRole::CreateSendV1, stream, &snapshot)?;
+        let artifact = EncodedCommittedImage::encode(
+            CommittedImageRole::CreateSendLayout17V1,
+            stream,
+            &snapshot,
+        )?;
         let metadata = crate::EncodedNativeSnapshotMetadata::encode(artifact.as_bytes())?;
         let pair = DecodedNativeSnapshotPair::decode(metadata.as_bytes(), artifact.as_bytes())?;
         Ok(Self {

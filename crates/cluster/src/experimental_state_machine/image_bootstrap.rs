@@ -22,7 +22,7 @@ pub enum StateMachineImageBootstrapError {
 }
 
 impl ExperimentalStateMachine {
-    /// Bootstrap one selected CreateSendV1 image into a pristine native owner.
+    /// Bootstrap one selected CreateSendLayout17V1 image into a pristine native owner.
     ///
     /// Pure native recovery validates the selected full checkpoint identities
     /// and membership before domain source validation or target operations in

@@ -759,7 +759,7 @@ fn page_command_is_appended_with_scoped_cursor_roundtrips_and_unchanged_versions
         assert_eq!(codec::decode::<CommandKind>(&encoded)?, command);
     }
     assert_eq!(codec::ACTIVE_VALUE_FORMAT, 11);
-    assert_eq!(storage::ACTIVE_STORE_FORMAT, 16);
+    assert_eq!(storage::ACTIVE_STORE_FORMAT, 17);
     Ok(())
 }
 
