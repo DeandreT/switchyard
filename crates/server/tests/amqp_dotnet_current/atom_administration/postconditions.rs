@@ -174,6 +174,7 @@ impl Oracle {
             | AtomScenario::RulesDelete
             | AtomScenario::RulesSql
             | AtomScenario::RulesCorrelation
+            | AtomScenario::RulesAction
             | AtomScenario::RulesRecreate
             | AtomScenario::RulesOpaque
             | AtomScenario::RulesDenied

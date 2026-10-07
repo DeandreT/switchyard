@@ -21,6 +21,7 @@ const OPAQUE: &str = "NativeOpaque";
 const DLQ_REASON: &str = "rule-retention";
 const DLQ_DESCRIPTION: &str = "trusted fixture seed";
 const SQL_EXPRESSION: &str = "  user.colour IN ('caf\u{e9} & <\u{3bb}>', 'blue') AND\n(sys.Label IS NULL OR user.count >= 2)  ";
+const ACTION_EXPRESSION: &str = " /* exact v2 */ REMOVE marker; REMOVE user.[drop];\nSET [MiXeD Target]=' caf\u{e9} & <\u{3bb}>\nO''Brien '; SET user.enabled=TRUE; SET disabled=FALSE;\nSET minimum=-9223372036854775808; SET maximum=+9223372036854775807; ";
 
 #[derive(Clone, Copy)]
 pub(super) enum OwnedRules {
@@ -350,6 +351,24 @@ pub(super) fn advance(
                     &name,
                     RuleFilter::Correlation(correlation_filter()),
                 )?;
+                delete(handle, namespace, subscription, &name)?;
+            }
+            AtomScenario::RulesAction => {
+                let name = format!("Action-{suffix}");
+                let desired = AtomRuleDefinition {
+                    name: RuleName::new(&name)?,
+                    filter: RuleFilter::Sql(SqlFilter::new(SQL_EXPRESSION)?),
+                    action: Some(SqlAction::new(ACTION_EXPRESSION)?),
+                };
+                assert_eq!(
+                    handle.create_atom_rule_blocking(
+                        namespace.clone(),
+                        topic(),
+                        subscription.clone(),
+                        desired.clone(),
+                    )?,
+                    desired
+                );
                 delete(handle, namespace, subscription, &name)?;
             }
             AtomScenario::RulesRecreate => create(
@@ -726,6 +745,19 @@ pub(super) fn check_batches(
                 });
                 changes.push(Mutation::Delete { key });
             }
+            AtomScenario::RulesAction => {
+                let rule = stored(
+                    &format!("Action-{suffix}"),
+                    RuleFilter::Sql(SqlFilter::new(SQL_EXPRESSION)?),
+                    Some(SqlAction::new(ACTION_EXPRESSION)?),
+                )?;
+                let key = keys::rule(namespace, &topic(), &subscription, &rule.name);
+                changes.push(Mutation::Put {
+                    key: key.clone(),
+                    value: codec::encode(&rule)?,
+                });
+                changes.push(Mutation::Delete { key });
+            }
             AtomScenario::RulesRecreate => {
                 let rule = stored("$Default", RuleFilter::True, None)?;
                 changes.push(Mutation::Put {
@@ -798,7 +830,7 @@ pub(super) fn check_batches(
     );
     if matches!(
         scenario,
-        AtomScenario::RulesSql | AtomScenario::RulesCorrelation
+        AtomScenario::RulesSql | AtomScenario::RulesCorrelation | AtomScenario::RulesAction
     ) {
         let clock = keys::clock();
         let retained = |snapshot: &StoreSnapshot| {
@@ -879,6 +911,74 @@ mod tests {
             &batches,
         )?;
         assert_eq!(after, before, "transient SQL cycle retained a row");
+        Ok(())
+    }
+
+    #[test]
+    fn action_cycle_source_and_batches_are_exact() -> TestResult {
+        domain::SqlProgram::compile(SQL_EXPRESSION)?;
+        let action = SqlAction::new(ACTION_EXPRESSION)?;
+        assert_eq!(action.semantic_version(), 2);
+        assert_eq!(action.expression(), ACTION_EXPRESSION);
+        assert!(
+            include_str!(
+                "../../../../../conformance/dotnet-current/AtomRuleAdministrationCases.cs"
+            )
+            .contains(r#"    private const string ActionExpression = " /* exact v2 */ REMOVE marker; REMOVE user.[drop];\nSET [MiXeD Target]=' caf\u00E9 & <\u03BB>\nO''Brien '; SET user.enabled=TRUE; SET disabled=FALSE;\nSET minimum=-9223372036854775808; SET maximum=+9223372036854775807; ";"#)
+        );
+        let namespace = NamespaceName::new("tenant")?;
+        let clock = codec::encode(&Timestamp::from_millis(1_000))?;
+        let store = MemoryStore::default();
+        store.apply(
+            WriteBatch::default()
+                .put(b"retained-fixture-row".to_vec(), b"retained bytes".to_vec())
+                .put(keys::clock(), clock.clone()),
+        )?;
+        let before = store.snapshot()?;
+        let mut batches = Vec::new();
+        for suffix in SUFFIXES {
+            let rule = RuleDefinition {
+                name: RuleName::new(format!("Action-{suffix}"))?,
+                filter: RuleFilter::Sql(SqlFilter::new(SQL_EXPRESSION)?),
+                action: Some(action.clone()),
+                created_at: Timestamp::from_millis(1_000),
+            };
+            let RuleFilter::Sql(filter) = &rule.filter else {
+                panic!("action cycle filter was relabeled as a constant");
+            };
+            assert_eq!(filter.semantic_version(), 1);
+            assert_eq!(filter.expression(), SQL_EXPRESSION);
+            let encoded = codec::encode(&rule)?;
+            assert_eq!(codec::decode::<RuleDefinition>(&encoded)?, rule);
+            let key = keys::rule(&namespace, &topic(), &owned(suffix), &rule.name);
+            batches.push(
+                WriteBatch::default()
+                    .put(key.clone(), encoded)
+                    .put(keys::clock(), clock.clone()),
+            );
+            batches.push(
+                WriteBatch::default()
+                    .delete(key)
+                    .put(keys::clock(), clock.clone()),
+            );
+        }
+        assert_eq!(
+            batches.len(),
+            4,
+            "both constructors need one create and delete"
+        );
+        for batch in &batches {
+            store.apply(batch.clone())?;
+        }
+        let after = store.snapshot()?;
+        check_batches(
+            &namespace,
+            AtomScenario::RulesAction,
+            &before,
+            &after,
+            &batches,
+        )?;
+        assert_eq!(after, before, "transient action cycle retained a row");
         Ok(())
     }
 

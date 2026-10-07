@@ -10,6 +10,7 @@ internal static class AtomRuleAdministrationCases
     private const string MissingRuleName = "Missing";
     private const string OpaqueSubscription = "NativeOpaque";
     private const string SqlExpression = "  user.colour IN ('caf\u00E9 & <\u03BB>', 'blue') AND\n(sys.Label IS NULL OR user.count >= 2)  ";
+    private const string ActionExpression = " /* exact v2 */ REMOVE marker; REMOVE user.[drop];\nSET [MiXeD Target]=' caf\u00E9 & <\u03BB>\nO''Brien '; SET user.enabled=TRUE; SET disabled=FALSE;\nSET minimum=-9223372036854775808; SET maximum=+9223372036854775807; ";
 
     internal static async Task RunAsync(
         ServiceBusAdministrationClient client, ServiceBusAdministrationClient other,
@@ -54,6 +55,9 @@ internal static class AtomRuleAdministrationCases
                 break;
             case "rules-correlation":
                 await CorrelationCycleAsync(client, other, subscription, suffix, token);
+                break;
+            case "rules-action":
+                await ActionCycleAsync(client, other, subscription, suffix, token);
                 break;
             case "rules-recreate":
                 await CreateAsync(client, other, subscription, CreateRuleOptions.DefaultRuleName, true, token);
@@ -184,6 +188,47 @@ internal static class AtomRuleAdministrationCases
             && filter.GetType() == typeof(SqlRuleFilter)
             && string.Equals(filter.SqlExpression, SqlExpression, StringComparison.Ordinal)
             && filter.Parameters.Count == 0 && rule.Action is null, "Exact original SQL rule definition.");
+    }
+
+    private static async Task ActionCycleAsync(
+        ServiceBusAdministrationClient client, ServiceBusAdministrationClient other,
+        string subscription, string suffix, CancellationToken token)
+    {
+        string name = $"Action-{suffix}";
+        Response<RuleProperties> created = await client.CreateRuleAsync(
+            Topic, subscription, new CreateRuleOptions(name, new SqlRuleFilter(SqlExpression))
+            {
+                Action = new SqlRuleAction(ActionExpression),
+            }, token);
+        RequireStatus(created.GetRawResponse(), 201);
+        RequireActionRule(created.Value, name);
+        Response<RuleProperties> fetched = await other.GetRuleAsync(Topic, subscription, name, token);
+        RequireStatus(fetched.GetRawResponse(), 200);
+        RequireActionRule(fetched.Value, name);
+        int pages = 0;
+        await foreach (Page<RuleProperties> page in other.GetRulesAsync(Topic, subscription, token).AsPages())
+        {
+            Require(++pages == 1, "Action rule page work bound.");
+            RequireStatus(page.GetRawResponse(), 200);
+            Require(page.Values.Count == 1, "Exact single action rule page size.");
+            RequireActionRule(page.Values[0], name);
+        }
+        Require(pages == 1, "Complete single action rule page.");
+        RequireStatus(await client.DeleteRuleAsync(Topic, subscription, name, token), 200);
+        await RequireMissingGetAsync(other, subscription, name, token);
+        await RequireRulesAsync(other, subscription, token);
+    }
+
+    private static void RequireActionRule(RuleProperties rule, string name)
+    {
+        Require(string.Equals(rule.Name, name, StringComparison.Ordinal), "Ordinal action rule name.");
+        Require(rule.Filter is SqlRuleFilter filter
+            && filter.GetType() == typeof(SqlRuleFilter)
+            && string.Equals(filter.SqlExpression, SqlExpression, StringComparison.Ordinal)
+            && filter.Parameters.Count == 0, "Exact original action rule SQL filter.");
+        Require(rule.Action is SqlRuleAction action && action.GetType() == typeof(SqlRuleAction)
+            && string.Equals(action.SqlExpression, ActionExpression, StringComparison.Ordinal)
+            && action.Parameters.Count == 0, "Exact original SQL action definition.");
     }
 
     private static CorrelationRuleFilter CorrelationDefinition()
