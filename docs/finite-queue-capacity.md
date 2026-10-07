@@ -7,16 +7,17 @@ non-finite; it still writes mandatory generation-bound capacity-mode metadata.
 
 ## API And Scope
 
-The separate `QueueCapacityCommandV1` supports `CreateFinite` and
-`SetLimitFenced`. `FiniteQueueCapacity` accepts nonzero unsigned 64-bit limits.
+The separate `QueueCapacityCommandV1` supports `CreateFinite`,
+`SetLimitFenced`, and the append-only `SetDefinitionFenced` variant.
+`FiniteQueueCapacity` accepts nonzero unsigned 64-bit limits.
 `StateMachine::describe_queue_capacity` is clock-free. The broker handle's
 asynchronous and blocking describe methods run that read in one serialized owner
 turn. The view contains the binding, queue configuration, mode, reserved bytes,
 and message count. Capacity mutations stamp their time and prepare their return
 view before the storage batch commits, without a post-commit reread.
 Describing an owner checks its metadata and aggregate, not its entire message
-ledger. Existing command, queue configuration, protobuf, and committed-entry
-encodings are unchanged.
+ledger. Existing command variants, queue configuration, protobuf, and
+committed-entry encodings are unchanged.
 
 Finite queues currently exclude session-required queues and duplicate detection.
 An ordinary queue may retain an optional session identifier as metadata; that
@@ -25,17 +26,37 @@ state, duplicate-history storage, and namespace accounting are outside this
 policy. A dead-letter shadow shares its primary owner's limit and cannot have a
 separate capacity mode or aggregate.
 
-A limit change requires the live primary-queue binding. Stale bindings are
-refused before the proposer reads its host clock. Lowering a limit below retained
-reservations is refused atomically; restating the existing limit is a no-op and
-does not advance the stored command clock. Non-finite queues cannot be promoted
-in place, and finite queues cannot be demoted. Delete and recreate is explicit,
-with a new entity generation; there is no ledger backfill or migration API.
+Limit and desired-definition changes require the live primary-queue binding.
+Stale bindings are refused before the proposer reads its host clock. Deterministic
+apply repeats the fence before reading the stored command clock. Lowering a limit
+below retained reservations is refused atomically. Restating the existing limit,
+or the complete unchanged configuration and limit, is a no-op: no storage batch
+applies and the stored command clock does not advance. Proposer time stamping and
+stored-clock regression validation still occur for a no-op.
+
+The broker handle's `set_finite_queue_definition_fenced` and
+`set_finite_queue_definition_fenced_blocking` methods accept a complete
+`QueueConfig` and finite limit together. This replaces all eight configuration
+fields rather than patching them; an absent lifetime means unlimited. The current
+finite-owner profile is checked before the desired configuration. Existing
+queue-update validation applies: immutable session and duplicate-detection
+settings are rejected before other invalid desired configuration, and desired
+configuration is validated before a limit below retained usage is rejected.
+
+Changed primary and shadow configurations and/or owner capacity mode, together
+with the command clock, commit in one batch. Validation or capacity refusal
+commits none of them. Message records, charges, aggregates, counters, session
+metadata, and existing deadlines are not rewritten. A changed maximum message
+size constrains future message admission, not already retained messages. The
+operation does not repair corrupt usage or reconcile the ledger.
+
+Non-finite queues cannot be promoted in place, and finite queues cannot be
+demoted. Delete and recreate is explicit, with a new entity generation; there is
+no ledger backfill or migration API.
 
 These methods are trusted library APIs, not authorization boundaries. Neither
 native gRPC/CLI nor Atom/XML administration currently exposes capacity creation,
-updates, or usage. Configuration and limit updates are not yet one combined
-desired-definition operation.
+updates, or usage.
 
 ## Reservation Model
 

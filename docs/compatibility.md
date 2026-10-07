@@ -1619,6 +1619,34 @@ export, finite committed-entry replication, and ledger migration are unsupported
 Historical role-1 pure codecs remain separate. The value envelope and existing
 command, configuration, protobuf, and committed-entry encodings are unchanged.
 
+### Atomic Finite Queue Definitions
+
+The trusted asynchronous and blocking owner APIs can replace all eight queue
+configuration fields and the finite limit together using the appended
+`SetDefinitionFenced` instruction. The existing primary binding must still be
+live before host and stored-clock reads. Current profile validation precedes
+desired configuration checks; immutable session and duplicate-detection settings
+precede other invalid configuration, which precedes a limit below retained usage.
+An unchanged complete definition still stamps and validates time, but commits no
+batch and does not advance the stored clock.
+
+Changed primary/shadow configuration, capacity mode, and command clock share one
+batch. Existing messages, reservations, counters, session metadata, and deadlines
+are preserved; a smaller message-size limit constrains future admission only.
+The prepared result is returned without a post-commit read. This is neither
+in-place mode conversion nor ledger repair, and no native or Atom/XML fields are
+enabled by these library methods.
+
+Verification: the closed full workspace passed 5,651 tests with no failures and
+the same thirteen ignored SDK cases, adding 31 cases without losing any prior
+case, status, or ignore reason. The focused DTO, domain capacity, and server owner
+targets passed 78 cases, including the new Memory/Fjall definition checks. Both
+strict lint configurations, both builds, and formatting passed against the same
+frozen source. The new server cases exercise owner APIs, not additional AMQP
+sockets or official SDK administration. Injected pre-apply refusals do not prove
+rollback after an indeterminate physical commit. No SDK gates were rerun. Existing
+command/configuration/protobuf encodings and durable layout 17 remain unchanged.
+
 ### Message Content
 
 Stored content has a protocol-neutral typed representation. Message and
