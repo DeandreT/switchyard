@@ -263,7 +263,11 @@ The action projection reuses existing native REMOVE and typed literal SET, and
 passed [codec, owner and actual-TLS verification](docs/atom-rules.md#sql-action-verification).
 The dedicated [SQL-action SDK lifecycle](docs/atom-rules.md#sql-action-sdk-lifecycle-verification)
 passed both pins, backends and constructors, checking exact source through
-Create/Get/List/Delete. This is administration evidence, not SDK message transformation.
+Create/Get/List/Delete. A separate fixed [HTTPS-to-AMQP rule bridge](docs/atom-rules.md#https-rule-message-bridge-verification)
+passed both pins and backends: both administration constructors create the tested
+SQL-v1/action-v2 definition, while named-key AMQP checks transformed and untouched
+sibling copies with independent settlement. This is a fixed bridge, not general
+Azure action or CLR conversion compatibility.
 
 The CLI also supports `queue list` and `queue update`, and emits JSON. Topics
 and subscriptions have separate create/get/list/update commands:
