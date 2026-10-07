@@ -1675,6 +1675,33 @@ sockets or official SDK administration. Injected pre-apply refusals do not prove
 rollback after an indeterminate physical commit. No SDK gates were rerun. Existing
 command/configuration/protobuf encodings and durable layout 17 remain unchanged.
 
+### Finite Queue Deletion Bindings
+
+`StateMachine::bind_finite_queue_for_deletion` reads a live finite queue's
+deletion binding without consulting the stored clock or mutating state. It
+validates the queue configuration, live incarnation and authoritative primary/DLQ
+mode identity, but does not point-read or decode Usage or Charge. This permits
+the existing fenced deletion path to purge opaque usage records without first
+requiring an ordinary capacity description to succeed.
+
+The absent-target path retains the existing bounded topology and runtime
+diagnostics and their failure order. Actual deletion planning, bounded purge,
+generation retirement and committed effects are unchanged. A returned binding
+is not a successful purge, a whole-ledger health check, repair, or an atomic
+owner turn: callers must obtain it and perform the fenced deletion within the
+same serialized owner operation. Stale bindings and invalid mode metadata still
+refuse, and orphan runtime may make deletion fail after a binding was read.
+
+This library increment adds no HTTP endpoint, CLI operation, storage format or
+unknown-commit retry/rollback guarantee.
+
+Verification: all 555 focused domain cases and 102 existing administration/owner
+regressions passed, with no failures or ignored cases. The twelve new paired
+cases preserve every prior case, status and failure reason in those targets.
+Both strict workspace lint configurations, both builds and formatting passed
+against the same frozen source, serially on CPUs 14,15 with the shared cache.
+The full workspace and official SDK gates were not rerun for this increment.
+
 ### Message Content
 
 Stored content has a protocol-neutral typed representation. Message and
