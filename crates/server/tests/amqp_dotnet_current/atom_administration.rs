@@ -15,6 +15,8 @@ mod evidence;
 mod fixture;
 #[path = "atom_administration/postconditions.rs"]
 mod postconditions;
+#[path = "atom_administration/rule_message_flow.rs"]
+mod rule_message_flow;
 #[path = "atom_administration/rules.rs"]
 mod rules;
 #[path = "atom_administration/stages.rs"]

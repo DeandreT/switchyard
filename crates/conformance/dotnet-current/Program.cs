@@ -6,6 +6,11 @@ if (args.Length > 0 && args[0] == "capacity-ingress")
     return await CapacityIngressCases.RunAsync(args);
 }
 
+if (args.Length > 0 && args[0] == "atom-rule-message-flow")
+{
+    return await AtomRuleMessageFlowCases.RunAsync(args);
+}
+
 if (args.Length > 0 && args[0] == "atom-administration")
 {
     return await AtomAdministrationCases.RunAsync(args);

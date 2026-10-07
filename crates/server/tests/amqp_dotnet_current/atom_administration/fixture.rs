@@ -256,3 +256,211 @@ impl<P: StoreProvider> Drop for Fixture<P> {
         drop(self.broker.take());
     }
 }
+
+#[derive(Clone, Default)]
+struct ProbeSystemClock(Arc<Mutex<Vec<Timestamp>>>);
+
+impl Clock for ProbeSystemClock {
+    fn now(&self) -> Timestamp {
+        let now = server::SystemClock.now();
+        self.0.lock().expect("joint clock observations").push(now);
+        now
+    }
+}
+
+pub(super) struct JointFixture<P: StoreProvider> {
+    pub(super) https_endpoint: String,
+    pub(super) amqp_endpoint: String,
+    pub(super) ca_file: std::path::PathBuf,
+    pub(super) ca_directory: std::path::PathBuf,
+    pub(super) namespace: NamespaceName,
+    broker: Option<Broker>,
+    admin_listener: Option<JoinHandle<Result<(), server::AtomAdminError>>>,
+    admin_shutdown: Option<oneshot::Sender<()>>,
+    amqp_listener: Option<JoinHandle<std::io::Result<()>>>,
+    store: Option<ProbeStore<P::Store>>,
+    clock: ProbeSystemClock,
+    provider: Option<P>,
+    _certificates: tempfile::TempDir,
+}
+
+impl<P: StoreProvider> Fixture<P> {
+    pub(super) async fn start_joint(
+        provider: P,
+        namespace: NamespaceName,
+    ) -> TestResult<JointFixture<P>> {
+        let (tls, ca_pem) = certificate()?;
+        let certificates = tempfile::TempDir::new()?;
+        let ca_file = certificates.path().join("trusted-ca.pem");
+        let ca_directory = certificates.path().join("empty-ca-directory");
+        fs::write(&ca_file, ca_pem)?;
+        fs::create_dir(&ca_directory)?;
+        let admin_socket = TcpListener::bind("127.0.0.1:0").await?;
+        let amqp_socket = TcpListener::bind("127.0.0.1:0").await?;
+        let https_endpoint = format!("https://localhost:{}", admin_socket.local_addr()?.port());
+        let amqp_endpoint = format!("sb://localhost:{}/", amqp_socket.local_addr()?.port());
+        let scope = ResourceScope::namespace("localhost")?;
+        let policy = SharedAccessPolicy::new([SharedAccessRule::new(
+            "manage",
+            scope.clone(),
+            SharedAccessKey::new(KEY)?,
+            None,
+            PermissionSet::MANAGE,
+        )?])?;
+        let authentication = protocol_amqp::SharedAccessAuthentication::new(
+            SharedAccessPolicy::new([SharedAccessRule::new(
+                "manage",
+                ResourceScope::namespace(super::rule_message_flow::HOST)?,
+                SharedAccessKey::new(KEY)?,
+                None,
+                PermissionSet::MANAGE,
+            )?])?,
+            super::rule_message_flow::HOST,
+        )?
+        .with_authorization_timeout(Duration::from_secs(15));
+        let store = ProbeStore {
+            inner: provider.open()?,
+            reads: Arc::default(),
+            applies: Arc::default(),
+            batches: Arc::default(),
+        };
+        let clock = ProbeSystemClock::default();
+        let broker = Broker::spawn(LocalProposer::new(
+            StateMachine::new(store.clone()),
+            clock.clone(),
+        ));
+        let admin = AtomAdminListener::new(
+            broker.handle(),
+            namespace.clone(),
+            policy,
+            scope,
+            tls.clone(),
+        )?;
+        let amqp = protocol_amqp::AmqpListener::new(broker.handle(), namespace.clone())
+            .with_tls(tls)
+            .with_shared_access_authentication(authentication);
+        let (admin_shutdown, stopped) = oneshot::channel();
+        let mut fixture = JointFixture {
+            https_endpoint,
+            amqp_endpoint,
+            ca_file,
+            ca_directory,
+            namespace,
+            broker: Some(broker),
+            admin_listener: None,
+            admin_shutdown: Some(admin_shutdown),
+            amqp_listener: None,
+            store: Some(store),
+            clock,
+            provider: Some(provider),
+            _certificates: certificates,
+        };
+        fixture.admin_listener = Some(tokio::spawn(admin.serve_until(admin_socket, async {
+            let _ = stopped.await;
+        })));
+        fixture.amqp_listener = Some(tokio::spawn(amqp.serve(amqp_socket)));
+        Ok(fixture)
+    }
+}
+
+impl<P: StoreProvider> JointFixture<P> {
+    pub(super) fn handle(&self) -> BrokerHandle {
+        self.broker.as_ref().expect("joint broker").handle()
+    }
+
+    pub(super) fn snapshot(&self) -> Result<StoreSnapshot, StorageError> {
+        self.store.as_ref().expect("joint store").inner.snapshot()
+    }
+
+    pub(super) fn batches(&self) -> Vec<WriteBatch> {
+        self.store
+            .as_ref()
+            .expect("joint store")
+            .batches
+            .lock()
+            .expect("joint batches")
+            .clone()
+    }
+
+    pub(super) fn clock_readings(&self) -> Vec<Timestamp> {
+        self.clock
+            .0
+            .lock()
+            .expect("joint clock observations")
+            .clone()
+    }
+
+    pub(super) async fn stop(&mut self) -> TestResult {
+        let mut failure: Option<Box<dyn std::error::Error>> = None;
+        if let Some(shutdown) = self.admin_shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(mut listener) = self.admin_listener.take() {
+            match timeout(DEADLINE, &mut listener).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => failure = Some(Box::new(error)),
+                Ok(Err(error)) => failure = Some(Box::new(error)),
+                Err(error) => {
+                    listener.abort();
+                    let _ = timeout(DEADLINE, listener).await;
+                    failure = Some(Box::new(error));
+                }
+            }
+        }
+        if let Some(mut listener) = self.amqp_listener.take() {
+            listener.abort();
+            match timeout(DEADLINE, &mut listener).await {
+                Ok(Err(error)) if error.is_cancelled() => {}
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    if failure.is_none() {
+                        failure = Some(Box::new(error));
+                    }
+                }
+                Ok(Err(error)) => {
+                    if failure.is_none() {
+                        failure = Some(Box::new(error));
+                    }
+                }
+                Err(error) => {
+                    listener.abort();
+                    let _ = timeout(DEADLINE, listener).await;
+                    if failure.is_none() {
+                        failure = Some(Box::new(error));
+                    }
+                }
+            }
+        }
+        drop(self.broker.take());
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    pub(super) fn into_stopped_parts(mut self) -> (P, P::Store, NamespaceName) {
+        assert!(
+            self.broker.is_none() && self.admin_listener.is_none() && self.amqp_listener.is_none()
+        );
+        (
+            self.provider.take().expect("joint provider"),
+            self.store.take().expect("joint store").inner,
+            self.namespace.clone(),
+        )
+    }
+}
+
+impl<P: StoreProvider> Drop for JointFixture<P> {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.admin_shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(listener) = &self.admin_listener {
+            listener.abort();
+        }
+        if let Some(listener) = &self.amqp_listener {
+            listener.abort();
+        }
+        drop(self.broker.take());
+    }
+}

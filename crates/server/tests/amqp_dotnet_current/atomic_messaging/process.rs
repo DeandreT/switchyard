@@ -17,7 +17,9 @@ use super::*;
 
 #[path = "process/atom_administration.rs"]
 mod atom_administration;
-pub(crate) use atom_administration::{AtomScenario, build_atom_client, run_atom_client};
+pub(crate) use atom_administration::{
+    AtomScenario, build_atom_client, run_atom_client, run_atom_rule_message_flow_client,
+};
 
 #[path = "process/capacity_ingress.rs"]
 mod capacity_ingress;

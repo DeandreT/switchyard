@@ -540,3 +540,190 @@ mod tests {
         );
     }
 }
+
+const RULE_FLOW_MARKER: &str = "official .NET HTTPS rules to AMQP typed action copies passed";
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "fixed isolated bridge child command"
+)]
+fn rule_flow_command(
+    dll: &Path,
+    https: &str,
+    amqp: &str,
+    ca_file: &Path,
+    ca_directory: &Path,
+    host: &str,
+    topic: &str,
+    rule: &str,
+    key: &str,
+) -> Command {
+    let mut command = Command::new("dotnet");
+    command
+        .env("DOTNET_PROCESSOR_COUNT", "2")
+        .env("SSL_CERT_FILE", ca_file)
+        .env("SSL_CERT_DIR", ca_directory)
+        .arg(dll)
+        .arg("atom-rule-message-flow")
+        .arg(https)
+        .arg(amqp)
+        .arg(ca_file)
+        .arg(host)
+        .arg(rule)
+        .arg(key)
+        .arg(topic);
+    command
+}
+
+fn rule_flow_completed(output: &str) -> bool {
+    let mut matches = 0;
+    for raw in output.split_inclusive('\n') {
+        let Some(line) = raw.strip_suffix('\n') else {
+            if raw.contains(RULE_FLOW_MARKER) {
+                return false;
+            }
+            continue;
+        };
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line == RULE_FLOW_MARKER {
+            matches += 1;
+        }
+    }
+    matches == 1
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "fixed isolated bridge child command"
+)]
+pub(crate) async fn run_atom_rule_message_flow_client(
+    dll: &Path,
+    https: &str,
+    amqp: &str,
+    ca_file: &Path,
+    ca_directory: &Path,
+    host: &str,
+    topic: &str,
+    rule: &str,
+    key: &str,
+) -> TestResult {
+    let output = super::run(
+        rule_flow_command(
+            dll,
+            https,
+            amqp,
+            ca_file,
+            ca_directory,
+            host,
+            topic,
+            rule,
+            key,
+        ),
+        "official .NET HTTPS-to-AMQP rule bridge",
+        RUN_DEADLINE,
+        MAX_OUTPUT_BYTES,
+    )
+    .await?;
+    if !output.status.success() || !rule_flow_completed(&output.stdout) {
+        return Err(format!(
+            "HTTPS-to-AMQP bridge failed: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status, output.stdout, output.stderr
+        )
+        .into());
+    }
+    let loaded = verify_loaded_assemblies(dll, &output.stdout)?;
+    for (name, assembly) in [
+        ("Azure.Messaging.ServiceBus", loaded.service_bus),
+        ("Azure.Core", loaded.core),
+    ] {
+        let [major, minor, build, revision] = assembly.version;
+        eprintln!(
+            "atom-rule-flow loaded assembly={name} version={major}.{minor}.{build}.{revision} sha256={}",
+            hash_text(&assembly.sha256)
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod rule_flow_tests {
+    use super::*;
+
+    #[test]
+    fn rule_flow_command_has_fixed_arguments_and_private_child_trust() {
+        let command = rule_flow_command(
+            Path::new("client.dll"),
+            "https://localhost:123",
+            "sb://localhost:456/",
+            Path::new("private-ca.pem"),
+            Path::new("empty-ca"),
+            "tenant.servicebus.windows.net",
+            "sdk-atom-rule-flow",
+            "manage",
+            "fixed-key",
+        );
+        assert_eq!(command.as_std().get_program(), "dotnet");
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_str().expect("ASCII fixture arg"))
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "client.dll",
+                "atom-rule-message-flow",
+                "https://localhost:123",
+                "sb://localhost:456/",
+                "private-ca.pem",
+                "tenant.servicebus.windows.net",
+                "manage",
+                "fixed-key",
+                "sdk-atom-rule-flow"
+            ]
+        );
+        let env: std::collections::BTreeMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_str().expect("env key"),
+                    value.and_then(|value| value.to_str()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            env,
+            std::collections::BTreeMap::from([
+                ("DOTNET_PROCESSOR_COUNT", Some("2")),
+                ("SSL_CERT_FILE", Some("private-ca.pem")),
+                ("SSL_CERT_DIR", Some("empty-ca")),
+            ])
+        );
+    }
+
+    #[test]
+    fn rule_flow_marker_requires_one_exact_distinct_completion_line() {
+        assert!(rule_flow_completed(&format!("{RULE_FLOW_MARKER}\n")));
+        assert!(rule_flow_completed(&format!(
+            "diagnostic\n{RULE_FLOW_MARKER}\r\n"
+        )));
+        assert!(!rule_flow_completed(RULE_FLOW_MARKER));
+        assert!(!rule_flow_completed(&format!("{RULE_FLOW_MARKER}\r")));
+        assert!(!rule_flow_completed(&format!(
+            "{RULE_FLOW_MARKER}\n{RULE_FLOW_MARKER}"
+        )));
+        assert!(!rule_flow_completed(
+            "official .NET Atom rules-action passed\n"
+        ));
+        assert!(!rule_flow_completed(&format!(
+            "prefix {RULE_FLOW_MARKER}\n"
+        )));
+        assert!(!rule_flow_completed(&format!(
+            "{RULE_FLOW_MARKER} suffix\n"
+        )));
+        assert!(!rule_flow_completed(&format!(
+            "{RULE_FLOW_MARKER}\n{RULE_FLOW_MARKER}\n"
+        )));
+    }
+}
