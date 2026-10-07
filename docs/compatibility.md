@@ -39,11 +39,11 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Dead-letter receive and resubmit | Pre-1.0 | Receive: state machine, AMQP mapping. Resubmit: not implemented |
 | Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Duplicate detection | Pre-1.0 | State machine, AMQP send/scheduling mappings, Rust and current .NET clients end to end |
-| Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API; library HTTPS full-definition replacement for finite ordinary queues |
-| Finite queue capacity | Pre-1.0 | Opt-in trusted owner API and HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage, Rust AMQP socket tests, both pinned .NET administration/limit-update and WSS ingress/credit-recovery gates, explicit CLI activation; see [Finite Queue Capacity](finite-queue-capacity.md) |
+| Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API; native generation-fenced and HTTPS full-definition replacement for finite ordinary queues |
+| Finite queue capacity | Pre-1.0 | Trusted owner API, separate native create/get/full-definition service, and HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage, Rust AMQP socket tests, both pinned .NET administration/limit-update and WSS ingress/credit-recovery gates, explicit CLI activation; see [Finite Queue Capacity](finite-queue-capacity.md) |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
 | Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; rules, topics and subscriptions are not implemented |
-| Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; offline JWT Manage via library opt-in or the CLI policy-file option; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
+| Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete, separate finite queue create/get/full-definition replacement, and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; offline JWT Manage via library opt-in or the CLI policy-file option; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
 | Quorum replication | Pre-1.0 | An isolated [fixed-three-node in-process runtime](experimental-replica-runtime.md) exists for bounded Create/Send, but is not integrated with server listeners or the production proposer; production startup remains refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup. The runtime exposes no snapshots or production deployment activation. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
 | Cross-placement-group transactions | Later | Out of initial scope |
@@ -1622,7 +1622,8 @@ No SDK gates were rerun.
 
 The opt-in trusted owner API reserves logical bytes across an ordinary primary
 queue and its dead-letter shadow. It excludes required sessions and duplicate
-detection; native gRPC capacity fields remain unexposed. The separate opt-in
+detection. The separate native service below exposes finite definitions and
+logical usage without enabling legacy `EntityService` capacity fields. The opt-in
 HTTPS endpoint below exposes bounded Atom fields, including explicit CLI startup. The
 reservation model, lifecycle refunds, bounded planner, and corruption boundaries
 are defined in [Finite Queue Capacity](finite-queue-capacity.md).
@@ -1988,10 +1989,10 @@ subscription listing needs Manage on its parent topic, so an exact-child grant
 cannot enumerate siblings. The configured namespace is the only namespace
 accessible through that endpoint. Dead-letter shadows cannot be administered.
 Subscription definitions use their typed configuration rather than exposing
-their backing queue through queue commands. Entity capacity and usage fields
-remain absent from this wire API. The separate trusted
-[finite queue capacity API](finite-queue-capacity.md) is not exposed here;
-unsupported usage measurements are not reported as zero-byte measurements.
+their backing queue through queue commands. Capacity and usage fields remain
+absent from the legacy `EntityService` API. A separate `FiniteQueueService`
+exposes the ordinary finite queue profile described below; unsupported usage
+measurements are not reported as zero-byte measurements.
 
 Library callers opt into offline JWT Manage authorization through
 `NativeAdminService::with_offline_jwt_policy(policy, audience_host)`. It accepts
@@ -2175,6 +2176,68 @@ Both strict workspace lint configurations, both build configurations, and
 formatting passed. No SDK gates were rerun for this client-only increment.
 The lockfile adds only the client's test edge to the already-locked
 `futures-util`; package versions, durable layout, and value formats are unchanged.
+
+### Native Finite Queue Administration
+
+The existing native listener also registers `switchyard.admin.v1.FiniteQueueService`.
+It exposes three separate unary methods: `CreateFiniteQueue`, `GetFiniteQueue`
+and `SetFiniteQueueDefinition`. They share the existing Manage authorization,
+configured namespace, SAS/offline JWT policy and 128-request admission pool
+with legacy services. Authentication precedes definition conversion and owner
+work. No separate listener, credential policy or CLI command is added here.
+Plaintext remains an unauthenticated development option only under the existing
+native listener policy; authenticated use requires TLS.
+
+Create and update require a positive unsigned 64-bit `reservation_limit_bytes`
+and a complete `QueueConfiguration`: all eight settings must be present,
+including explicit false values and the TTL oneof. There are no creation
+defaults or patch semantics in this service. Numeric settings are passed to the
+owner unchanged after checked platform-width conversion. Required-session and
+duplicate-detection definitions remain unsupported for finite queues.
+
+Get does not stamp or consult the proposer command clock and returns the complete
+definition, owner `generation`, reservation limit, `reserved_logical_bytes` and
+`retained_message_count`. Authentication still checks credential expiry.
+The aggregate covers the primary and its dead-letter shadow, not just ready
+messages. It is Switchyard's logical reservation accounting, not disk usage,
+Azure quota parity or a whole-ledger health certificate. A non-finite queue
+returns `FailedPrecondition`, not invented zero-byte capacity measurements.
+
+Update additionally requires the positive `expected_generation` returned by
+the service. The owner fences that identity before consulting the host clock;
+delete/recreate makes the old generation stale. This is an incarnation fence,
+not a definition revision or compare-and-swap between concurrent updates.
+Each mutation submits one existing owner operation and returns its prepared
+view without a postcommit storage read. Full definition and limit changes
+commit atomically; retained records, charges, usage and existing deadlines are
+not rewritten. Equal definitions still validate the clock but commit nothing.
+Injected pre-apply failures do not prove rollback after an indeterminate commit.
+
+The legacy `EntityService` schema, defaults and partial-update behavior are
+unchanged. A server registering only the current legacy Entity/Rule services
+refuses these new method paths as `Unimplemented`, rather than silently ignoring
+a limit on an older create method. This controlled registration is not proof
+about every historical binary. The new service does not add list, delete,
+in-place finite promotion/demotion, topics, subscriptions, migration or repair.
+
+Verification: all 38 new regular cases passed: five handler units, one literal
+protobuf wire case and 32 paired owner/actual HTTP2/TLS cases on Memory and Fjall.
+They cover complete presence, prepared responses without postcommit reads,
+exact config/limit/no-op batches, stale identities before the command clock,
+retained records and usage, shared admission, private-CA/name refusals, SAS/JWT
+denials and controlled legacy-only registration. Original counted-backend
+discharge precedes physical Fjall reopen; Memory reopens a handle to its shared
+keyspace, not a physical directory. Listener abort/join observations do not prove
+termination of every Tonic connection task, and synchronous broker cleanup has
+no public deadline or exposed join result.
+
+The closed full workspace passed 5,844 tests with no failures and seventeen
+unchanged ignored SDK gates. Every prior test name, status and ignore reason was
+retained. The focused targets passed all 312 cases. Both strict workspace lint
+configurations, both builds and formatting passed against the same frozen
+source, using the shared cache and CPUs 14,15. The official SDK gates were not
+rerun for this native-only increment. The schema extension is additive;
+dependencies, CLI commands, value formats and durable layout 17 are unchanged.
 
 ### Configuration Updates
 

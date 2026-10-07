@@ -54,8 +54,11 @@ Non-finite queues cannot be promoted in place, and finite queues cannot be
 demoted. Delete and recreate is explicit, with a new entity generation; there is
 no ledger backfill or migration API.
 
-These methods are trusted library APIs, not authorization boundaries. Native
-gRPC capacity fields remain unexposed. The separate opt-in authenticated
+These methods are trusted library APIs, not authorization boundaries. The native
+gRPC `FiniteQueueService` separately exposes authenticated create, get and
+generation-fenced full-definition replacement, including logical usage; see
+[Native Finite Queue Administration](compatibility.md#native-finite-queue-administration).
+Legacy `EntityService` capacity fields remain unexposed. The separate opt-in authenticated
 HTTPS endpoint exposes finite ordinary queue creation and full-definition
 updates through Atom `MaxSizeInMegabytes` and `MaxMessageSizeInKilobytes` fields;
 it does not expose usage metrics. Its SAS authorization, limits, defaults and
@@ -155,7 +158,8 @@ the existing entry or fingerprint.
 
 Tests exercise both memory and Fjall stores, physical Fjall reopen, ordered
 atomic credit reuse, ledger corruption, opaque fenced deletion, actual AMQP
-socket rejection/recovery, and the separate library/CLI HTTPS queue path. These
+socket rejection/recovery, native finite administration, and the separate
+library/CLI HTTPS queue path. These
 socket checks use in-tree Rust clients. Separate pinned .NET gates cover
 administration, capacity updates and the ordinary ingress profile below. Injected
 pre-apply backend failures establish no
