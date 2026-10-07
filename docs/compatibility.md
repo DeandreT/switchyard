@@ -1590,6 +1590,34 @@ each build and client process has a 180-second deadline and bounded output captu
 owned-process cleanup and isolated certificate trust. This does not add process
 lifetime guarantees to the older ordinary-message or WebSocket gate runners.
 
+### HTTPS Administration Tokens
+
+`SharedAccessPolicy::authenticate_atom_sas` adds a separate library profile for
+HTTPS administration SAS tokens. Its 8 KiB token cap precedes parsing and applies
+only to this profile. Audiences require HTTPS with effective default port 443;
+an actual listener's request port is not part of the authorization scope. Literal
+resource segments are decoded once and validated before URL normalization can
+erase dot segments or reinterpret backslashes. Control names and ordinary case
+remain literal, without AMQP control-alias conversion.
+
+Signature verification retains the original encoded resource bytes and the
+existing UTF-8 key-text, rotation, expiry, and static-error behavior. Authentication
+alone does not authorize an operation: callers must check the returned grant's
+`Manage` permission against a trusted fixed-host namespace or entity scope using
+their supplied epoch. This method supplies neither TLS proof nor a trusted clock.
+
+The native and CBS entry points retain their existing profiles and token limits.
+This increment starts no HTTP listener, enables no CLI option, and makes no new
+official SDK administration claim. Store formats, dependency versions, and
+existing native/AMQP authentication configuration are unchanged.
+
+Verification: the closed full workspace passed 5,663 tests with no failures and
+the same thirteen ignored SDK cases, adding twelve authentication cases without
+losing any prior case, status, or ignore reason. The focused auth target passed
+all 64 cases. Both strict lint configurations, both builds, and formatting passed
+against the same frozen source, serially using the shared cache and CPUs 14,15.
+No SDK gates were rerun.
+
 ### Finite Queue Capacity
 
 The opt-in trusted owner API reserves logical bytes across an ordinary primary
