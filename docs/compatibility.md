@@ -39,10 +39,10 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Dead-letter receive and resubmit | Pre-1.0 | Receive: state machine, AMQP mapping. Resubmit: not implemented |
 | Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Duplicate detection | Pre-1.0 | State machine, AMQP send/scheduling mappings, Rust and current .NET clients end to end |
-| Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API |
-| Finite queue capacity | Pre-1.0 | Opt-in trusted owner API for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage and Rust AMQP socket tests. Administration fields and official SDK capacity gates are not implemented; see [Finite Queue Capacity](finite-queue-capacity.md) |
+| Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API; library HTTPS full-definition replacement for finite ordinary queues |
+| Finite queue capacity | Pre-1.0 | Opt-in trusted owner API and library HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage and Rust AMQP socket tests. Official SDK administration/capacity gates and HTTP CLI startup are not implemented; see [Finite Queue Capacity](finite-queue-capacity.md) |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
-| Atom/XML entity and rule administration | Pre-1.0 | Not implemented |
+| Atom/XML entity and rule administration | Pre-1.0 | Library-only authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list; rules, topics, subscriptions, HTTP CLI startup and official SDK administration gates are not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; offline JWT Manage via library opt-in or the CLI policy-file option; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
 | Quorum replication | Pre-1.0 | An isolated [fixed-three-node in-process runtime](experimental-replica-runtime.md) exists for bounded Create/Send, but is not integrated with server listeners or the production proposer; production startup remains refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup. The runtime exposes no snapshots or production deployment activation. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
@@ -1622,7 +1622,8 @@ No SDK gates were rerun.
 
 The opt-in trusted owner API reserves logical bytes across an ordinary primary
 queue and its dead-letter shadow. It excludes required sessions and duplicate
-detection; native gRPC/CLI and Atom/XML capacity fields are not exposed. The
+detection; native gRPC capacity fields remain unexposed. The separate library
+HTTPS endpoint below exposes bounded Atom fields, without HTTP CLI startup. The
 reservation model, lifecycle refunds, bounded planner, and corruption boundaries
 are defined in [Finite Queue Capacity](finite-queue-capacity.md).
 
@@ -1701,6 +1702,94 @@ cases preserve every prior case, status and failure reason in those targets.
 Both strict workspace lint configurations, both builds and formatting passed
 against the same frozen source, serially on CPUs 14,15 with the shared cache.
 The full workspace and official SDK gates were not rerun for this increment.
+
+### Library HTTPS Queue Administration
+
+`AtomAdminListener` serves finite ordinary queues over mandatory TLS and HTTP/1.
+Callers supply a broker handle, business namespace, independent
+SAS policy and fixed namespace-only audience scope. Request `Host`, port, SNI,
+forwarded headers and XML do not choose that scope. The listener changes ALPN
+only on its supplied owned TLS configuration; native/CBS authentication and AMQP TLS
+configuration are unchanged. This is a library opt-in, not server CLI activation
+or official .NET administration compatibility.
+
+Each request authenticates the separate bounded HTTPS SAS profile and requires
+`Manage` before polling its body or submitting owner work. The retained grant is
+checked again for expiry and permission immediately before starting asynchronous
+owner admission. That check does not run again at eventual queue insertion or
+execution, and does not revoke owner work already admitted or started. Epoch
+conversion failures refuse rather than using zero.
+
+PUT without a condition creates a finite queue (201); exact `If-Match: *` replaces
+its full definition (200), not a patch. GET returns 200 or 404, DELETE returns an
+empty 200, and the exact `/$Resources/queues` path returns a complete Atom feed.
+That literal collection name is reserved; differently cased and percent-literal
+ordinary names remain distinct. API versions `2024-05` and `2021-05` are accepted;
+`enrich` must be absent or `False`. Listing supports `$top` 1..100 and `$skip`
+0..1000, defaulting to 100/0. A page is filled or genuinely exhausted, or fails
+without a partial feed. Offsets count validated visible ordinary queues, not
+their DLQ shadows. Pages are separate owner turns, not a multi-page snapshot.
+
+Atom defaults are 1024 MiB capacity, 60-second lock, unlimited omitted TTL,
+256 KiB maximum message, ten deliveries and one-minute inactive duplicate
+history. Supported lock durations are 5..300 seconds, present TTL is at least
+one second, and message limits are integral KiB in 1..256. Durations use ordered
+day/time components and exact integral milliseconds; extra fractional digits
+must be zero, with no calendar months, signs, rounding or truncation. Sessions,
+duplicate detection, partitioning, express/ordering, forwarding, nonempty
+metadata/rules, auto-delete and runtime metrics are refused rather than emulated.
+Active status and enabled batching are the only accepted values. Responses expose
+the actual static definition, not invented usage counts or timestamps. SDKs that
+omit inactive duplicate history on PUT may reset it to the one-minute default;
+this is not a lossless GET/PUT promise for every stored configuration.
+
+The complete definition and limit update share the existing fenced atomic owner
+operation. Immutable settings, invalid configuration and below-retained-usage
+limits refuse without partial mutation. Unchanged definitions validate/stamp
+time but commit no batch. Existing records, reservations and deadlines are not
+rewritten; a smaller message limit affects future admission. Deletion binds and
+purges in one owner turn while retaining the existing opaque Usage/Charge path.
+No retry, rollback or known-commit guarantee follows from losing an HTTP reply.
+
+Bounds include 128 accepted connections (including handshakes), ten-second TLS,
+header and body deadlines, a 20-second owner observation deadline and 60-second
+total connection lifetime. Requests are single-use, with keepalive disabled.
+Target/head/token limits are 4096 bytes, 32 headers/16 KiB logical header bytes
+and 8 KiB respectively. Bodies are at most 64 KiB and 1024 frames, including empty
+frames and trailers; trailers are refused. XML independently limits depth 16,
+2048 events including EOF, 32 attributes per element, 64 active namespace bindings
+plus the built-ins, and 128 properties. Replies are capped at 1 MiB and 100 feed
+entries. Owner pages additionally bound backend operations and returned logical
+key/value bytes; these are work/output bounds, not an allocator or RSS guarantee.
+
+Path segments are strictly decoded once before scope and owner use; malformed
+escapes, invalid UTF-8, empty/dot segments, controls and decoded slashes or
+backslashes refuse. The adapter sees the pinned HTTP parser's representation:
+that parser drops a raw URI fragment and can normalize framing headers. The
+endpoint does not claim rejection of every raw-wire spelling erased upstream;
+encoded `%23` remains a literal name. Query validation precedes permissive form
+decoding. XML uses a pinned parser with explicit namespace/entity/declaration
+checks; exactly one optional leading UTF-8 BOM is permitted.
+
+Connection futures remain directly owned by the serve future, without detached
+per-connection tasks. Stopping/dropping that future drops its original TLS and
+HTTP futures; it is not graceful draining or cancellation of queued owner work.
+Public errors are static and redacted. Neither keys, request XML, entity names
+nor arbitrary storage diagnostics are included in error bodies.
+
+Verification: the closed full workspace passed 5,757 tests with no failures and
+the same thirteen ignored SDK cases. Compared with the previous full run of
+5,663 tests, all prior case identities, statuses and ignore reasons were retained;
+the 94 additions comprise twelve already-published deletion-binding cases and
+82 new XML, owner and HTTPS cases. Doctest line locations alone were normalized,
+with multiplicity preserved. All 308 focused server cases passed, including ten
+actual private-CA/name-verified TLS cases and paired Memory/Fjall CRUD, refusal,
+complete-image oracle and physical reopen checks. Both strict lint configurations,
+both builds and formatting passed against the same frozen source, serially on
+CPUs 14,15 with two build jobs and the shared cache. No official SDK gates were
+rerun, and CLI activation remains absent. The only newly resolved package is the
+pinned XML parser; existing package versions/checksums and durable layout 17 are
+unchanged.
 
 ### Message Content
 

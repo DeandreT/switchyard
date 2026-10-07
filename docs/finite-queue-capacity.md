@@ -54,9 +54,14 @@ Non-finite queues cannot be promoted in place, and finite queues cannot be
 demoted. Delete and recreate is explicit, with a new entity generation; there is
 no ledger backfill or migration API.
 
-These methods are trusted library APIs, not authorization boundaries. Neither
-native gRPC/CLI nor Atom/XML administration currently exposes capacity creation,
-updates, or usage.
+These methods are trusted library APIs, not authorization boundaries. Native
+gRPC capacity fields remain unexposed. The separate library-only authenticated
+HTTPS endpoint exposes finite ordinary queue creation and full-definition
+updates through Atom `MaxSizeInMegabytes` and `MaxMessageSizeInKilobytes` fields;
+it does not expose usage metrics. Its SAS authorization, limits, defaults and
+unsupported definitions are documented in
+[Library HTTPS Queue Administration](compatibility.md#library-https-queue-administration).
+There is no HTTP CLI startup or official SDK administration/capacity gate yet.
 
 ## Reservation Model
 
@@ -143,8 +148,9 @@ finite replication needs a new payload contract, not a changed interpretation of
 the existing entry or fingerprint.
 
 Tests exercise both memory and Fjall stores, physical Fjall reopen, ordered
-atomic credit reuse, ledger corruption, opaque fenced deletion, and actual AMQP
-socket rejection/recovery. The socket checks use the in-tree Rust client, not an
+atomic credit reuse, ledger corruption, opaque fenced deletion, actual AMQP
+socket rejection/recovery, and the separate library HTTPS queue path. These
+socket checks use in-tree Rust clients, not an
 official SDK capacity gate. Injected pre-apply backend failures establish no
 partial batch in those fixtures; they do not establish the outcome of an
 indeterminate physical commit.
