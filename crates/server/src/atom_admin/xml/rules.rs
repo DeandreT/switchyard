@@ -5,8 +5,10 @@ use domain::{RuleFilter, RuleName};
 use super::{AtomXmlError, lexical};
 use crate::AtomRuleDefinition;
 
+mod correlation;
 mod decode;
 mod encode;
+mod ordinal;
 
 pub(crate) use decode::decode_definition;
 pub(crate) use encode::{encode_entry, encode_error, encode_feed};
@@ -85,6 +87,6 @@ pub(crate) fn validate_definition(definition: &AtomRuleDefinition) -> Result<(),
                 .map(|_| ())
                 .map_err(|_| RuleXmlError::InvalidDefinition)
         }
-        RuleFilter::Correlation(_) => Err(RuleXmlError::UnsupportedDefinition),
+        RuleFilter::Correlation(filter) => correlation::validate(filter),
     }
 }

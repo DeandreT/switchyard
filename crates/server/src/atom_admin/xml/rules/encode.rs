@@ -6,7 +6,7 @@ use quick_xml::{
 };
 
 use super::super::{ATOM_NS, MAX_FEED_ENTRIES, MAX_REPLY_BYTES, SERVICE_BUS_NS, XSI_NS, lexical};
-use super::{RuleXmlError, validate_definition};
+use super::{RuleXmlError, correlation, validate_definition};
 use crate::AtomRuleDefinition;
 
 #[derive(Default)]
@@ -70,19 +70,22 @@ fn definition_budget(
     definition: &AtomRuleDefinition,
 ) -> Result<(), RuleXmlError> {
     validate_definition(definition)?;
+    let (filter_bytes, markup_bytes) = match &definition.filter {
+        domain::RuleFilter::Sql(filter) => (filter.expression().len(), 0),
+        domain::RuleFilter::Correlation(filter) => correlation::budget(filter)?,
+        _ => (0, 0),
+    };
     let text_bytes = definition
         .name
         .as_str()
         .len()
         .checked_mul(2)
-        .and_then(|bytes| {
-            bytes.checked_add(match &definition.filter {
-                domain::RuleFilter::Sql(filter) => filter.expression().len(),
-                _ => 0,
-            })
-        })
+        .and_then(|bytes| bytes.checked_add(filter_bytes))
         .ok_or(RuleXmlError::ReplyLimitExceeded)?;
-    preflight(total, text_bytes, 1_024)
+    let static_bytes = 1_024_usize
+        .checked_add(markup_bytes)
+        .ok_or(RuleXmlError::ReplyLimitExceeded)?;
+    preflight(total, text_bytes, static_bytes)
 }
 
 fn entry(writer: &mut Writer<Reply>, definition: &AtomRuleDefinition) -> Result<(), RuleXmlError> {
@@ -97,18 +100,46 @@ fn entry(writer: &mut Writer<Reply>, definition: &AtomRuleDefinition) -> Result<
     description.push_attribute(("xmlns", SERVICE_BUS_NS));
     event(writer, Event::Start(description))?;
     let (kind, expression) = match &definition.filter {
-        domain::RuleFilter::True => ("TrueFilter", "1=1"),
-        domain::RuleFilter::False => ("FalseFilter", "1=0"),
-        domain::RuleFilter::Sql(filter) => ("SqlFilter", filter.expression()),
-        _ => return Err(RuleXmlError::UnsupportedDefinition),
+        domain::RuleFilter::True => ("TrueFilter", Some("1=1")),
+        domain::RuleFilter::False => ("FalseFilter", Some("1=0")),
+        domain::RuleFilter::Sql(filter) => ("SqlFilter", Some(filter.expression())),
+        domain::RuleFilter::Correlation(_) => ("CorrelationFilter", None),
     };
     let mut filter = BytesStart::new("Filter");
     filter.push_attribute(("xmlns:i", XSI_NS));
     filter.push_attribute(("i:type", kind));
     event(writer, Event::Start(filter))?;
-    scalar(writer, "SqlExpression", expression)?;
-    open(writer, "Parameters")?;
-    close(writer, "Parameters")?;
+    if let domain::RuleFilter::Correlation(filter) = &definition.filter {
+        for (name, value) in correlation::fields(filter) {
+            if let Some(value) = value {
+                scalar(writer, name, value)?;
+            }
+        }
+        open(writer, "Properties")?;
+        for (key, value) in &filter.properties {
+            open(writer, "KeyValueOfstringanyType")?;
+            scalar(writer, "Key", key)?;
+            let kind = correlation::kind(value)?;
+            let text = correlation::text(value)?;
+            let mut start = BytesStart::new("Value");
+            let value_type = format!("l28:{}", kind.name());
+            start.push_attribute(("xmlns:l28", correlation::XSD_NS));
+            start.push_attribute(("i:type", value_type.as_str()));
+            event(writer, Event::Start(start))?;
+            event(writer, Event::Text(BytesText::new(&text)))?;
+            close(writer, "Value")?;
+            close(writer, "KeyValueOfstringanyType")?;
+        }
+        close(writer, "Properties")?;
+    } else {
+        scalar(
+            writer,
+            "SqlExpression",
+            expression.ok_or(RuleXmlError::InvalidDefinition)?,
+        )?;
+        open(writer, "Parameters")?;
+        close(writer, "Parameters")?;
+    }
     close(writer, "Filter")?;
     scalar(writer, "Name", definition.name.as_str())?;
     close(writer, "RuleDescription")?;

@@ -1,4 +1,6 @@
-use domain::{CorrelationFilter, RuleFilter, RuleName};
+use std::collections::BTreeMap;
+
+use domain::{CorrelationFilter, MessageValue, RuleFilter, RuleName};
 
 use super::super::super::{
     AtomXmlError, Budget, MAX_ATTRIBUTES, MAX_BODY_BYTES, MAX_DEPTH, MAX_EVENTS,
@@ -782,8 +784,10 @@ fn feed_counts_empty_tags_and_all_projection_preflight_are_bounded() {
         Err(RuleXmlError::ReplyLimitExceeded)
     );
     let mut incompatible = values;
-    incompatible[MAX_FEED_ENTRIES - 1].filter =
-        RuleFilter::Correlation(CorrelationFilter::default());
+    incompatible[MAX_FEED_ENTRIES - 1].filter = RuleFilter::Correlation(CorrelationFilter {
+        properties: BTreeMap::from([("opaque".into(), MessageValue::Null)]),
+        ..CorrelationFilter::default()
+    });
     assert_eq!(
         encode_feed(&incompatible),
         Err(RuleXmlError::UnsupportedDefinition)
@@ -880,4 +884,771 @@ fn bare_filter_type_qname_requires_the_service_bus_default_namespace() {
             Err(RuleXmlError::Malformed)
         );
     }
+}
+
+fn correlation_definition(body: &str) -> String {
+    format!(
+        "<Filter xmlns:i=\"{XSI_NS}\" i:type=\"CorrelationFilter\">{body}</Filter><Name>Correlation</Name>"
+    )
+}
+
+fn correlation_property(key: &str, kind: &str, text: &str) -> String {
+    format!(
+        "<KeyValueOfstringanyType><Key>{key}</Key><Value xmlns:l28=\"{}\" i:type=\"l28:{kind}\">{text}</Value></KeyValueOfstringanyType>",
+        super::super::correlation::XSD_NS
+    )
+}
+
+fn correlation_decode(body: &str) -> Result<AtomRuleDefinition, RuleXmlError> {
+    decode(&correlation_definition(body))
+}
+
+fn correlation_roundtrip(filter: CorrelationFilter) -> String {
+    let expected = definition("Correlation", RuleFilter::Correlation(filter));
+    let bytes = encode_entry(&expected).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    let request = text.replace("<title>Correlation</title>", "");
+    assert_eq!(decode_definition(request.as_bytes()), Ok(expected));
+    text
+}
+
+#[test]
+fn correlation_empty_and_all_system_fields_preserve_typed_conditions() {
+    for body in [
+        "",
+        "<Properties/>",
+        "<Properties></Properties>",
+        "<Properties> \t\n </Properties>",
+    ] {
+        assert_eq!(
+            correlation_decode(body),
+            Ok(definition(
+                "Correlation",
+                RuleFilter::Correlation(CorrelationFilter::default())
+            ))
+        );
+    }
+    let filter = CorrelationFilter {
+        correlation_id: Some("".into()),
+        message_id: Some(" Message & <id> ".into()),
+        to: Some(" TO ".into()),
+        reply_to: Some("ReplyTo".into()),
+        subject: Some("\u{e9}\u{3bb}".into()),
+        session_id: Some("Session".into()),
+        reply_to_session_id: Some("ReplySession".into()),
+        content_type: Some(" \r\n ".into()),
+        ..CorrelationFilter::default()
+    };
+    let body = super::super::correlation::fields(&filter)
+        .into_iter()
+        .map(|(name, value)| {
+            format!(
+                "<{name}>{}</{name}>",
+                quick_xml::escape::escape(value.unwrap())
+            )
+        })
+        .collect::<String>();
+    assert_eq!(
+        correlation_decode(&body),
+        Ok(definition(
+            "Correlation",
+            RuleFilter::Correlation(filter.clone())
+        ))
+    );
+    let text = correlation_roundtrip(filter);
+    assert!(text.contains("i:type=\"CorrelationFilter\""));
+    assert!(text.contains("<CorrelationId></CorrelationId>"));
+    assert!(text.contains("<Label>"));
+    assert!(text.contains("&#13;\n"));
+    assert!(text.contains("<Properties></Properties>"));
+    for absent in [
+        "SqlExpression",
+        "Parameters",
+        "Action",
+        "CreatedAt",
+        "MessageCount",
+    ] {
+        assert!(!text.contains(absent), "{absent}");
+    }
+    let empty = correlation_roundtrip(CorrelationFilter::default());
+    assert!(!empty.contains("TrueFilter"));
+    let text = correlation_roundtrip(CorrelationFilter {
+        properties: BTreeMap::from([(
+            "\r Key \r".into(),
+            MessageValue::String("\r\r&\r\n".into()),
+        )]),
+        ..CorrelationFilter::default()
+    });
+    assert!(text.contains("<Key>&#13; Key &#13;</Key>"));
+    assert!(text.contains(">&#13;&#13;&amp;&#13;\n</Value>"));
+}
+
+#[test]
+fn correlation_scalar_types_preserve_constructor_bits_and_dates() {
+    for (kind, text, expected) in [
+        ("string", "", MessageValue::String(String::new())),
+        (
+            "string",
+            "  &amp;lt;\u{e9}&#13;&#10;  ",
+            MessageValue::String("  &lt;\u{e9}\r\n  ".into()),
+        ),
+        ("int", "-2147483648", MessageValue::Int(i32::MIN)),
+        ("int", "+2147483647", MessageValue::Int(i32::MAX)),
+        ("long", "-9223372036854775808", MessageValue::Long(i64::MIN)),
+        ("long", "9223372036854775807", MessageValue::Long(i64::MAX)),
+        ("boolean", "true", MessageValue::Bool(true)),
+        ("boolean", "0", MessageValue::Bool(false)),
+        ("double", "-0", MessageValue::Double((-0.0_f64).to_bits())),
+        ("double", "0e0", MessageValue::Double(0.0_f64.to_bits())),
+        (
+            "double",
+            "1.7976931348623157E308",
+            MessageValue::Double(f64::MAX.to_bits()),
+        ),
+        ("double", "5e-324", MessageValue::Double(1)),
+        (
+            "double",
+            "INF",
+            MessageValue::Double(f64::INFINITY.to_bits()),
+        ),
+        (
+            "double",
+            "-INF",
+            MessageValue::Double(f64::NEG_INFINITY.to_bits()),
+        ),
+        (
+            "dateTime",
+            "1970-01-01T00:00:00.000Z",
+            MessageValue::Timestamp(0),
+        ),
+        (
+            "dateTime",
+            "1969-12-31T23:59:59.999Z",
+            MessageValue::Timestamp(-1),
+        ),
+        (
+            "dateTime",
+            "1970-01-01T01:00:00+01:00",
+            MessageValue::Timestamp(0),
+        ),
+        (
+            "dateTime",
+            "1969-12-31T10:00:00-14:00",
+            MessageValue::Timestamp(0),
+        ),
+        (
+            "dateTime",
+            "0001-01-01T00:00:00Z",
+            MessageValue::Timestamp(-62_135_596_800_000),
+        ),
+        (
+            "dateTime",
+            "9999-12-31T23:59:59.9990000000Z",
+            MessageValue::Timestamp(253_402_300_799_999),
+        ),
+    ] {
+        let filter = CorrelationFilter {
+            properties: BTreeMap::from([(" Key ".into(), expected)]),
+            ..CorrelationFilter::default()
+        };
+        let body = format!(
+            "<Properties>{}</Properties>",
+            correlation_property(" Key ", kind, text)
+        );
+        assert_eq!(
+            correlation_decode(&body),
+            Ok(definition(
+                "Correlation",
+                RuleFilter::Correlation(filter.clone())
+            )),
+            "{kind}: {text}"
+        );
+        let encoded = correlation_roundtrip(filter);
+        assert!(encoded.contains(&format!("i:type=\"l28:{kind}\"")));
+        assert!(encoded.contains("<Key> Key </Key>"));
+    }
+    let filter = CorrelationFilter {
+        properties: BTreeMap::from([
+            ("same".into(), MessageValue::Int(1)),
+            ("Other".into(), MessageValue::Long(1)),
+        ]),
+        ..CorrelationFilter::default()
+    };
+    let text = correlation_roundtrip(filter);
+    assert!(text.contains("<Key>same</Key>"));
+    assert!(text.contains("<Key>Other</Key>"));
+}
+
+#[test]
+fn correlation_value_qnames_are_resolved_and_types_do_not_fall_back() {
+    let property = correlation_property("key", "string", "text");
+    let body = format!("<Properties>{property}</Properties>");
+    let aliased = body
+        .replace("xmlns:l28=", "xmlns:x=")
+        .replace("l28:string", "x:string");
+    assert_eq!(correlation_decode(&body), correlation_decode(&aliased));
+    let bare = body
+        .replace(
+            &format!(
+                "<Value xmlns:l28=\"{}\" i:type=\"l28:string\">",
+                super::super::correlation::XSD_NS
+            ),
+            &format!(
+                "<s:Value xmlns:s=\"{SERVICE_BUS_NS}\" xmlns=\"{}\" i:type=\"string\">",
+                super::super::correlation::XSD_NS
+            ),
+        )
+        .replace("</Value>", "</s:Value>");
+    assert_eq!(correlation_decode(&bare), correlation_decode(&body));
+    for invalid in [
+        body.replace("l28:string", "string"),
+        body.replace("l28:string", "missing:string"),
+        body.replace("l28:string", "i:string"),
+        body.replace("i:type=\"l28:string\"", "type=\"l28:string\""),
+        body.replace("i:type=\"l28:string\"", "i:type=\" l28:string\""),
+        body.replace(super::super::correlation::XSD_NS, "urn:foreign"),
+        body.replace(
+            "<Value ",
+            "<Value xmlns=\"http://www.w3.org/2001/XMLSchema\" ",
+        ),
+        body.replace(">text</Value>", "><Key>text</Key></Value>"),
+    ] {
+        assert_eq!(
+            correlation_decode(&invalid),
+            Err(RuleXmlError::Malformed),
+            "{invalid}"
+        );
+    }
+    for kind in [
+        "String",
+        "unsignedInt",
+        "unsignedLong",
+        "short",
+        "byte",
+        "float",
+        "decimal",
+        "base64Binary",
+        "duration",
+        "guid",
+        "unknown",
+    ] {
+        assert_eq!(
+            correlation_decode(&format!(
+                "<Properties>{}</Properties>",
+                correlation_property("key", kind, "1")
+            )),
+            Err(RuleXmlError::UnsupportedDefinition),
+            "{kind}"
+        );
+    }
+    for forbidden in [
+        "<SqlExpression>1=1</SqlExpression>",
+        "<Parameters/>",
+        "<Subject>x</Subject>",
+        "<Unknown/>",
+    ] {
+        assert_eq!(
+            correlation_decode(forbidden),
+            Err(RuleXmlError::UnsupportedDefinition)
+        );
+    }
+}
+
+#[test]
+fn correlation_duplicate_fields_keys_and_missing_parts_refuse() {
+    let property = correlation_property("key", "int", "1");
+    for invalid in [
+        "<CorrelationId/><CorrelationId/>".into(),
+        "<Properties/><Properties/>".into(),
+        format!("<Properties>{property}{property}</Properties>"),
+        format!("<Properties>{}</Properties>", property.replace("<Key>key</Key>", "<Key>key</Key><Key>key</Key>")),
+        format!("<Properties>{}</Properties>", property.replace("</Value>", "</Value><Value xmlns:x=\"http://www.w3.org/2001/XMLSchema\" i:type=\"x:int\">1</Value>")),
+    ] {
+        assert_eq!(correlation_decode(&invalid), Err(RuleXmlError::Malformed));
+    }
+    for invalid in [
+        "<Properties><KeyValueOfstringanyType/></Properties>".into(),
+        format!("<Properties>{}</Properties>", property.replace("<Key>key</Key>", "")),
+        "<Properties><KeyValueOfstringanyType><Key>key</Key></KeyValueOfstringanyType></Properties>".into(),
+        format!("<Properties>{}</Properties>", property.replace(" i:type=\"l28:int\"", "")),
+    ] {
+        assert_eq!(correlation_decode(&invalid), Err(RuleXmlError::InvalidDefinition));
+    }
+    assert_eq!(
+        correlation_decode("<Properties>text</Properties>"),
+        Err(RuleXmlError::Malformed)
+    );
+    assert_eq!(
+        correlation_decode("<Properties>&#32;</Properties>"),
+        Err(RuleXmlError::Malformed)
+    );
+    assert_eq!(
+        correlation_decode("<Properties><Unknown/></Properties>"),
+        Err(RuleXmlError::UnsupportedDefinition)
+    );
+    let reordered = property
+        .replace("<Key>key</Key>", "")
+        .replace("</Value>", "</Value><Key>key</Key>");
+    assert_eq!(
+        correlation_decode(&format!("<Properties>{reordered}</Properties>")),
+        correlation_decode(&format!("<Properties>{property}</Properties>"))
+    );
+    assert!(
+        correlation_decode(&format!(
+            "<Properties>{}</Properties>",
+            correlation_property("", "string", "")
+        ))
+        .is_ok()
+    );
+}
+
+#[test]
+fn correlation_total_condition_limits_count_system_and_properties() {
+    let properties = |count| {
+        (0..count)
+            .map(|n| correlation_property(&format!("p{n}"), "int", "1"))
+            .collect::<String>()
+    };
+    let exact = format!("<Properties>{}</Properties>", properties(32));
+    assert!(correlation_decode(&exact).is_ok());
+    assert_eq!(
+        correlation_decode(&format!("<Properties>{}</Properties>", properties(33))),
+        Err(RuleXmlError::InvalidDefinition)
+    );
+    let fields = [
+        "CorrelationId",
+        "MessageId",
+        "To",
+        "ReplyTo",
+        "Label",
+        "SessionId",
+        "ReplyToSessionId",
+        "ContentType",
+    ]
+    .into_iter()
+    .map(|name| format!("<{name}/>"))
+    .collect::<String>();
+    assert!(
+        correlation_decode(&format!(
+            "{fields}<Properties>{}</Properties>",
+            properties(24)
+        ))
+        .is_ok()
+    );
+    assert_eq!(
+        correlation_decode(&format!(
+            "{fields}<Properties>{}</Properties>",
+            properties(25)
+        )),
+        Err(RuleXmlError::InvalidDefinition)
+    );
+    let mut filter = CorrelationFilter {
+        properties: (0..32)
+            .map(|n| (format!("p{n}"), MessageValue::Int(1)))
+            .collect(),
+        ..CorrelationFilter::default()
+    };
+    assert_eq!(
+        validate_definition(&definition(
+            "Correlation",
+            RuleFilter::Correlation(filter.clone())
+        )),
+        Ok(())
+    );
+    filter.correlation_id = Some(String::new());
+    assert_eq!(
+        validate_definition(&definition("Correlation", RuleFilter::Correlation(filter))),
+        Err(RuleXmlError::InvalidDefinition)
+    );
+}
+
+#[test]
+fn correlation_scalar_refusals_and_xml_legality_are_exhaustive() {
+    for value in [
+        MessageValue::Null,
+        MessageValue::Ubyte(1),
+        MessageValue::Ushort(1),
+        MessageValue::Uint(1),
+        MessageValue::Ulong(1),
+        MessageValue::Byte(1),
+        MessageValue::Short(1),
+        MessageValue::Float(1),
+        MessageValue::Decimal32([0; 4]),
+        MessageValue::Decimal64([0; 8]),
+        MessageValue::Decimal128([0; 16]),
+        MessageValue::Char('a'),
+        MessageValue::Uuid([0; 16]),
+        MessageValue::Binary(vec![]),
+        MessageValue::Symbol("ascii".into()),
+        MessageValue::Double(0x7ff8_0000_0000_0000),
+        MessageValue::Double(0xfff8_0000_0000_0000),
+        MessageValue::Double(0x7ff8_0000_0000_0001),
+        MessageValue::Timestamp(-62_135_596_800_001),
+        MessageValue::Timestamp(253_402_300_800_000),
+        MessageValue::String("\u{FFFE}".into()),
+    ] {
+        let value = definition(
+            "Correlation",
+            RuleFilter::Correlation(CorrelationFilter {
+                properties: BTreeMap::from([("key".into(), value)]),
+                ..CorrelationFilter::default()
+            }),
+        );
+        assert_eq!(
+            validate_definition(&value),
+            Err(RuleXmlError::UnsupportedDefinition)
+        );
+        assert_eq!(
+            encode_entry(&value),
+            Err(RuleXmlError::UnsupportedDefinition)
+        );
+    }
+    for value in [
+        MessageValue::List(vec![]),
+        MessageValue::Map(vec![]),
+        MessageValue::Array(vec![]),
+        MessageValue::Described {
+            descriptor: domain::MessageDescriptor::Code(1),
+            value: Box::new(MessageValue::Null),
+        },
+    ] {
+        let value = definition(
+            "Correlation",
+            RuleFilter::Correlation(CorrelationFilter {
+                properties: BTreeMap::from([("key".into(), value)]),
+                ..CorrelationFilter::default()
+            }),
+        );
+        assert_eq!(
+            validate_definition(&value),
+            Err(RuleXmlError::InvalidDefinition)
+        );
+    }
+    for name in [
+        "CorrelationId",
+        "MessageId",
+        "To",
+        "ReplyTo",
+        "Label",
+        "SessionId",
+        "ReplyToSessionId",
+        "ContentType",
+    ] {
+        let mut filter = CorrelationFilter::default();
+        super::super::correlation::Field::named(name)
+            .unwrap()
+            .set(&mut filter, "\u{FFFE}".into());
+        assert_eq!(
+            validate_definition(&definition("Correlation", RuleFilter::Correlation(filter))),
+            Err(RuleXmlError::UnsupportedDefinition)
+        );
+        assert_eq!(
+            correlation_decode(&format!("<{name}>&#xFFFE;</{name}>")),
+            Err(RuleXmlError::Malformed)
+        );
+    }
+    let filter = CorrelationFilter {
+        properties: BTreeMap::from([("\u{FFFE}".into(), MessageValue::Int(1))]),
+        ..CorrelationFilter::default()
+    };
+    assert_eq!(
+        validate_definition(&definition("Correlation", RuleFilter::Correlation(filter))),
+        Err(RuleXmlError::UnsupportedDefinition)
+    );
+}
+
+#[test]
+fn correlation_numeric_and_datetime_lexicals_refuse_lossy_inputs() {
+    for (kind, text) in [
+        ("int", "2147483648"),
+        ("int", "1.0"),
+        ("long", "9223372036854775808"),
+        ("boolean", "True"),
+        ("boolean", "2"),
+        ("double", "NaN"),
+        ("double", "nan"),
+        ("double", "Infinity"),
+        ("double", "0x1p0"),
+        ("double", "1e"),
+        ("dateTime", "2000-01-01T00:00:00.000"),
+        ("dateTime", "2000-01-01T00:00:00.0001Z"),
+        ("dateTime", "2000-01-01T00:00:00.0000000001Z"),
+        ("dateTime", "2000-01-01T00:00:60Z"),
+        ("dateTime", "2000-01-01T00:00:00+14:01"),
+        ("dateTime", "2000-01-01T00:00:00+01"),
+        ("dateTime", "2000-02-30T00:00:00Z"),
+        ("dateTime", "2000-01-01T24:00:00Z"),
+        ("dateTime", "0000-01-01T00:00:00Z"),
+        ("dateTime", "0000-12-31T23:59:59.999-00:01"),
+        ("dateTime", "0001-01-01T00:00:00+01:00"),
+        ("dateTime", "9999-12-31T23:59:59.999-01:00"),
+        ("dateTime", "2000-01-01t00:00:00Z"),
+    ] {
+        assert!(
+            correlation_decode(&format!(
+                "<Properties>{}</Properties>",
+                correlation_property("key", kind, text)
+            ))
+            .is_err(),
+            "{kind}: {text}"
+        );
+    }
+}
+
+#[test]
+fn correlation_projection_preflight_counts_all_text_and_property_markup() {
+    let mut filter = CorrelationFilter {
+        correlation_id: Some(" &\r\n ".into()),
+        message_id: Some("Message".into()),
+        to: Some("To".into()),
+        reply_to: Some("Reply".into()),
+        subject: Some("Subject".into()),
+        session_id: Some("Session".into()),
+        reply_to_session_id: Some("ReplySession".into()),
+        content_type: Some("Content".into()),
+        ..CorrelationFilter::default()
+    };
+    for n in 0..24 {
+        filter.properties.insert(
+            format!("key{n}"),
+            match n % 6 {
+                0 => MessageValue::String("&".repeat(100)),
+                1 => MessageValue::Bool(false),
+                2 => MessageValue::Int(i32::MIN),
+                3 => MessageValue::Long(i64::MIN),
+                4 => MessageValue::Double((-f64::MAX).to_bits()),
+                _ => MessageValue::Timestamp(253_402_300_799_999),
+            },
+        );
+    }
+    let (filter_bytes, markup_bytes) = super::super::correlation::budget(&filter).unwrap();
+    assert_eq!(
+        markup_bytes,
+        24 * super::super::correlation::PROPERTY_MARKUP_BYTES
+    );
+    let fields_bytes = super::super::correlation::fields(&filter)
+        .into_iter()
+        .filter_map(|(_, value)| value)
+        .map(str::len)
+        .sum::<usize>();
+    let keys_bytes = filter.properties.keys().map(String::len).sum::<usize>();
+    assert_eq!(
+        filter_bytes,
+        fields_bytes + keys_bytes + 4 * (100 + 5 + 11 + 20 + 24 + 24)
+    );
+    for value in filter.properties.values() {
+        let text = super::super::correlation::text(value).unwrap();
+        if !matches!(value, MessageValue::String(_)) {
+            assert!(text.len() <= 24);
+        }
+    }
+    let value = definition("Correlation", RuleFilter::Correlation(filter.clone()));
+    let reserved = (2 * value.name.as_str().len() + filter_bytes) * 6 + 1_024 + markup_bytes;
+    let mut total = MAX_REPLY_BYTES - reserved;
+    assert_eq!(definition_budget(&mut total, &value), Ok(()));
+    assert_eq!(total, MAX_REPLY_BYTES);
+    let mut one_short = MAX_REPLY_BYTES - reserved + 1;
+    let original = one_short;
+    assert_eq!(
+        definition_budget(&mut one_short, &value),
+        Err(RuleXmlError::ReplyLimitExceeded)
+    );
+    assert_eq!(one_short, original);
+    let text = correlation_roundtrip(filter);
+    assert!(text.len() <= reserved);
+    let small = definition(
+        "Correlation",
+        RuleFilter::Correlation(CorrelationFilter {
+            properties: BTreeMap::from([("key0".into(), MessageValue::Int(1))]),
+            ..CorrelationFilter::default()
+        }),
+    );
+    let mut feed = vec![small; MAX_FEED_ENTRIES];
+    assert!(encode_feed(&feed).is_ok());
+    if let RuleFilter::Correlation(filter) = &mut feed[MAX_FEED_ENTRIES - 1].filter {
+        filter.properties.insert("key0".into(), MessageValue::Null);
+    }
+    assert_eq!(encode_feed(&feed), Err(RuleXmlError::UnsupportedDefinition));
+    let large = definition(
+        "Correlation",
+        RuleFilter::Correlation(CorrelationFilter {
+            subject: Some("&".repeat(60_000)),
+            ..CorrelationFilter::default()
+        }),
+    );
+    assert!(validate_definition(&large).is_ok());
+    assert_eq!(
+        encode_feed(&[large.clone(), large.clone(), large]),
+        Err(RuleXmlError::ReplyLimitExceeded)
+    );
+    let oversized_source = definition(
+        "Correlation",
+        RuleFilter::Correlation(CorrelationFilter {
+            subject: Some("&".repeat(MAX_REPLY_BYTES / 6)),
+            ..CorrelationFilter::default()
+        }),
+    );
+    // Native stored-byte admission remains in the stamped planner, not this profile.
+    assert_eq!(validate_definition(&oversized_source), Ok(()));
+    assert_eq!(
+        encode_entry(&oversized_source),
+        Err(RuleXmlError::ReplyLimitExceeded)
+    );
+}
+
+#[test]
+fn correlation_number_grammar_and_double_finite_bits_roundtrip() {
+    for (literal, expected) in [
+        ("1", 1.0_f64),
+        ("+1.25", 1.25),
+        (".5", 0.5),
+        ("1.", 1.0),
+        ("-1e-2", -0.01),
+    ] {
+        let body = format!(
+            "<Properties>{}</Properties>",
+            correlation_property("key", "double", literal)
+        );
+        let expected = CorrelationFilter {
+            properties: BTreeMap::from([("key".into(), MessageValue::Double(expected.to_bits()))]),
+            ..CorrelationFilter::default()
+        };
+        assert_eq!(
+            correlation_decode(&body),
+            Ok(definition("Correlation", RuleFilter::Correlation(expected)))
+        );
+    }
+    for bits in [
+        0,
+        1,
+        0x8000_0000_0000_0000,
+        0x8000_0000_0000_0001,
+        0x0010_0000_0000_0000,
+        0x7fef_ffff_ffff_ffff,
+        0xffef_ffff_ffff_ffff,
+        0x3ff0_0000_0000_0001,
+        0x3fef_ffff_ffff_ffff,
+        0x8010_0000_0000_0000,
+    ] {
+        correlation_roundtrip(CorrelationFilter {
+            properties: BTreeMap::from([("key".into(), MessageValue::Double(bits))]),
+            ..CorrelationFilter::default()
+        });
+    }
+}
+
+#[test]
+fn correlation_ordinal_key_collisions_refuse_without_normalizing() {
+    let casing = super::super::ordinal::KeyCasing::default();
+    for (left, right) in [
+        ("a", "A"),
+        ("\u{e9}", "\u{c9}"),
+        ("\u{b5}", "\u{39c}"),
+        ("\u{250}", "\u{2c6f}"),
+        ("\u{3c2}", "\u{3a3}"),
+        ("\u{1c8a}", "\u{1c89}"),
+        ("\u{10428}", "\u{10400}"),
+        ("\u{16e60}", "\u{16e40}"),
+        (" Key \u{e9}", " KEY \u{c9}"),
+    ] {
+        assert_eq!(casing.key(left), casing.key(right), "{left:?}, {right:?}");
+        let filter = CorrelationFilter {
+            properties: BTreeMap::from([
+                (left.into(), MessageValue::Int(1)),
+                (right.into(), MessageValue::Long(2)),
+            ]),
+            ..CorrelationFilter::default()
+        };
+        assert_eq!(filter.validate(), Ok(()));
+        let value = definition("Correlation", RuleFilter::Correlation(filter));
+        assert_eq!(
+            validate_definition(&value),
+            Err(RuleXmlError::UnsupportedDefinition)
+        );
+        assert_eq!(
+            encode_entry(&value),
+            Err(RuleXmlError::UnsupportedDefinition)
+        );
+        assert_eq!(
+            encode_feed(&[value]),
+            Err(RuleXmlError::UnsupportedDefinition)
+        );
+        let body = format!(
+            "<Properties>{}{}</Properties>",
+            correlation_property(&quick_xml::escape::escape(left), "int", "1"),
+            correlation_property(&quick_xml::escape::escape(right), "long", "2")
+        );
+        assert_eq!(
+            correlation_decode(&body),
+            Err(RuleXmlError::UnsupportedDefinition)
+        );
+    }
+    for (left, right) in [
+        ("\u{131}", "I"),
+        ("\u{17f}", "S"),
+        ("\u{130}", "i"),
+        ("\u{212a}", "K"),
+        ("\u{df}", "\u{1e9e}"),
+        ("\u{df}", "SS"),
+        ("\u{fb00}", "ff"),
+        ("\u{e9}", "e\u{301}"),
+        ("\u{10d70}", "\u{10d50}"),
+        ("\u{16ebb}", "\u{16ea0}"),
+        (" Key ", "Key"),
+        ("", " "),
+    ] {
+        assert_ne!(casing.key(left), casing.key(right), "{left:?}, {right:?}");
+        let filter = CorrelationFilter {
+            properties: BTreeMap::from([
+                (left.into(), MessageValue::Int(1)),
+                (right.into(), MessageValue::Long(2)),
+            ]),
+            ..CorrelationFilter::default()
+        };
+        let text = correlation_roundtrip(filter);
+        for key in [left, right] {
+            assert!(text.contains(&format!("<Key>{}</Key>", quick_xml::escape::escape(key))));
+        }
+    }
+}
+
+#[test]
+fn correlation_ordinal_model_keeps_static_latin1_and_scalar_width() {
+    let casing = super::super::ordinal::KeyCasing::default();
+    for (first, last, output_first) in [(0x61, 0x7a, 0x41), (0xe0, 0xf6, 0xc0), (0xf8, 0xfe, 0xd8)]
+    {
+        for (scalar, uppercase) in (first..=last).zip(output_first..) {
+            let scalar = char::from_u32(scalar).unwrap();
+            let uppercase = char::from_u32(uppercase).unwrap();
+            assert_eq!(casing.uppercase(scalar), uppercase);
+        }
+    }
+    for scalar in 0..=0xff {
+        if (0x61..=0x7a).contains(&scalar)
+            || (0xe0..=0xf6).contains(&scalar)
+            || (0xf8..=0xfe).contains(&scalar)
+            || scalar == 0xb5
+            || scalar == 0xff
+        {
+            continue;
+        }
+        let scalar = char::from_u32(scalar).unwrap();
+        assert_eq!(casing.uppercase(scalar), scalar);
+    }
+    assert_eq!(casing.uppercase('\u{b5}'), '\u{39c}');
+    assert_eq!(casing.uppercase('\u{ff}'), '\u{178}');
+    assert_eq!(casing.uppercase('\u{131}'), '\u{131}');
+    assert_eq!(casing.uppercase('\u{17f}'), '\u{17f}');
+    assert_eq!(casing.uppercase('\u{1161}'), '\u{1161}');
+    assert_eq!(casing.uppercase('\u{1c8a}'), '\u{1c89}');
+    assert_eq!(casing.uppercase('\u{10428}'), '\u{10400}');
+    assert_eq!(casing.uppercase('\u{10d70}'), '\u{10d70}');
+    assert_eq!(casing.uppercase('\u{16ebb}'), '\u{16ebb}');
+    let original = "\u{250}";
+    let mapped = casing.key(original);
+    assert_ne!(original.len(), mapped.len());
+    assert_eq!(
+        original.encode_utf16().count(),
+        mapped.encode_utf16().count()
+    );
 }

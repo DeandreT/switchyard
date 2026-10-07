@@ -194,10 +194,15 @@ internal static class AtomRuleAdministrationCases
         parameterized.Parameters.Add("unsupported", 1);
         var parameterizedSql = new SqlRuleFilter("1=1");
         parameterizedSql.Parameters.Add("unsupported", 1);
+        var excessiveCorrelation = new CorrelationRuleFilter();
+        for (int condition = 0; condition < 33; condition++)
+        {
+            excessiveCorrelation.ApplicationProperties.Add($"condition-{condition}", condition);
+        }
         foreach ((string label, CreateRuleOptions options) in new (string, CreateRuleOptions)[]
         {
             ("sql", new CreateRuleOptions($"Refused-{suffix}-sql", parameterizedSql)),
-            ("correlation", new CreateRuleOptions($"Refused-{suffix}-correlation", new CorrelationRuleFilter())),
+            ("correlation", new CreateRuleOptions($"Refused-{suffix}-correlation", excessiveCorrelation)),
             ("parameters", new CreateRuleOptions($"Refused-{suffix}-parameters", parameterized)),
             ("action", new CreateRuleOptions($"Refused-{suffix}-action", new TrueRuleFilter())
             {
