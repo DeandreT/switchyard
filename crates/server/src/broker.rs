@@ -34,6 +34,7 @@ use tracing::debug;
 use crate::{AdminTarget, Clock, LocalProposer, ProposeError};
 
 mod admin_reads;
+mod atom_finite_queues;
 mod atomic_messaging;
 mod atomic_work;
 mod bindings;
@@ -46,6 +47,7 @@ mod protocol;
 mod queue_capacity;
 mod request_queue;
 
+pub use atom_finite_queues::AtomQueueOwnerError;
 pub use guarded_atomic_messaging::GuardedAtomicSubmitError;
 pub use native_atomic_messaging::{NativeAtomicMessagingCompletion, NativeAtomicSubmitError};
 
@@ -57,6 +59,29 @@ pub use native_atomic_messaging::{NativeAtomicMessagingCompletion, NativeAtomicS
 const COMMAND_QUEUE_DEPTH: usize = 1_024;
 
 enum Request {
+    GetAtomFiniteQueue {
+        namespace: NamespaceName,
+        entity: EntityPath,
+        reply: flume::Sender<Result<Option<domain::QueueCapacityView>, AtomQueueOwnerError>>,
+    },
+    UpdateAtomFiniteQueue {
+        namespace: NamespaceName,
+        entity: EntityPath,
+        config: QueueConfig,
+        limit: domain::FiniteQueueCapacity,
+        reply: flume::Sender<Result<domain::QueueCapacityView, AtomQueueOwnerError>>,
+    },
+    DeleteAtomFiniteQueue {
+        namespace: NamespaceName,
+        entity: EntityPath,
+        reply: flume::Sender<Result<CommandOutcome, AtomQueueOwnerError>>,
+    },
+    AtomFiniteQueuesPage {
+        namespace: NamespaceName,
+        skip: usize,
+        top: usize,
+        reply: flume::Sender<Result<Vec<domain::QueueCapacityView>, AtomQueueOwnerError>>,
+    },
     CreateFiniteQueue {
         namespace: NamespaceName,
         entity: EntityPath,
@@ -588,6 +613,50 @@ impl Broker {
             .spawn(move || {
                 while let Ok(request) = incoming.recv() {
                     match request {
+                        Request::GetAtomFiniteQueue {
+                            namespace,
+                            entity,
+                            reply,
+                        } => {
+                            let _ = reply.send(proposer.get_atom_finite_queue(&namespace, &entity));
+                        }
+                        Request::UpdateAtomFiniteQueue {
+                            namespace,
+                            entity,
+                            config,
+                            limit,
+                            reply,
+                        } => {
+                            let _ = reply.send(
+                                proposer
+                                    .update_atom_finite_queue(&namespace, &entity, config, limit),
+                            );
+                        }
+                        Request::DeleteAtomFiniteQueue {
+                            namespace,
+                            entity,
+                            reply,
+                        } => {
+                            let application =
+                                proposer.delete_atom_finite_queue_with_effects(&namespace, &entity);
+                            if let Ok(applied) = &application
+                                && let Some(targets) = &applied.entity_deletions
+                            {
+                                for target in targets {
+                                    watching.notify(&namespace, target);
+                                }
+                            }
+                            let _ = reply.send(application.map(|applied| applied.outcome));
+                        }
+                        Request::AtomFiniteQueuesPage {
+                            namespace,
+                            skip,
+                            top,
+                            reply,
+                        } => {
+                            let _ =
+                                reply.send(proposer.atom_finite_queues_page(&namespace, skip, top));
+                        }
                         Request::CreateFiniteQueue {
                             namespace,
                             entity,

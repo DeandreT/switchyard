@@ -79,7 +79,8 @@ impl std::fmt::Display for QueueImmutableProperty {
 }
 
 impl QueueConfigUpdate {
-    pub(crate) fn apply_to(self, current: QueueConfig) -> Result<QueueConfig, BrokerError> {
+    /// Validates and prepares an in-memory configuration; it does not mutate stored queue state.
+    pub fn apply_to(self, current: QueueConfig) -> Result<QueueConfig, BrokerError> {
         if self
             .requires_session
             .is_some_and(|value| value != current.requires_session)

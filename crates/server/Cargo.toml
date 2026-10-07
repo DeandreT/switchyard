@@ -18,23 +18,31 @@ clap.workspace = true
 cluster.workspace = true
 domain.workspace = true
 flume.workspace = true
+futures-util.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+percent-encoding.workspace = true
 protocol-amqp.workspace = true
 prost.workspace = true
+quick-xml.workspace = true
 rustls.workspace = true
 rustix.workspace = true
 storage.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-log.workspace = true
 tracing-subscriber.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 amqp = { workspace = true, features = ["test-client"] }
-futures-util.workspace = true
 hmac.workspace = true
+hyper = { workspace = true, features = ["client"] }
 log.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
@@ -44,6 +52,4 @@ sha2.workspace = true
 tempfile.workspace = true
 testkit.workspace = true
 tokio = { workspace = true, features = ["process"] }
-tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
-url.workspace = true

@@ -465,3 +465,6 @@ for_each_backend! {
 
 #[path = "queue_capacity/definition.rs"]
 mod definition;
+
+#[path = "queue_capacity/atom_owner.rs"]
+mod atom_owner;

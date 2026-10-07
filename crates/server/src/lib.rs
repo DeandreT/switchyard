@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod atom_admin;
 mod broker;
 mod clock;
 mod maintenance;
@@ -23,9 +24,10 @@ use storage::{FjallStore, MemoryStore, StorageError};
 use thiserror::Error;
 
 pub use crate::{
+    atom_admin::{AtomAdminError, AtomAdminListener},
     broker::{
-        Broker, BrokerHandle, GuardedAtomicSubmitError, NativeAtomicMessagingCompletion,
-        NativeAtomicSubmitError, SubmitError,
+        AtomQueueOwnerError, Broker, BrokerHandle, GuardedAtomicSubmitError,
+        NativeAtomicMessagingCompletion, NativeAtomicSubmitError, SubmitError,
     },
     clock::{Clock, ManualClock, SystemClock},
     maintenance::MaintenanceClockAssessment,
