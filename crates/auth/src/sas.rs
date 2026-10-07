@@ -10,6 +10,14 @@ use crate::{
 };
 
 const TOKEN_PREFIX: &str = "SharedAccessSignature ";
+const MAX_ATOM_SAS_TOKEN_BYTES: usize = 8 * 1024;
+
+#[derive(Clone, Copy)]
+enum SasAudienceProfile<'a> {
+    Native,
+    Cbs(&'a str),
+    AtomHttps,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccessGrant {
@@ -124,6 +132,20 @@ impl SharedAccessPolicy {
         self.validate_sas_inner(token, None, now_epoch_seconds)
     }
 
+    /// Authenticates a bounded HTTPS Atom administration token without authorizing
+    /// an operation. Callers must check the literal grant with `AccessGrant::allows`.
+    /// The 8 KiB cap includes the prefix and applies only to this HTTPS profile.
+    pub fn authenticate_atom_sas(
+        &self,
+        token: &str,
+        now_epoch_seconds: u64,
+    ) -> Result<AccessGrant, SasError> {
+        if token.len() > MAX_ATOM_SAS_TOKEN_BYTES {
+            return Err(SasError::Malformed);
+        }
+        self.validate_sas_profile(token, SasAudienceProfile::AtomHttps, now_epoch_seconds)
+    }
+
     /// Validates one Service Bus shared-access token for the CBS audience.
     ///
     /// Positional transport control aliases apply only to CBS scope comparisons
@@ -146,18 +168,40 @@ impl SharedAccessPolicy {
         requested_audience: Option<&str>,
         now_epoch_seconds: u64,
     ) -> Result<AccessGrant, SasError> {
+        let profile = match requested_audience {
+            None => SasAudienceProfile::Native,
+            Some(audience) => SasAudienceProfile::Cbs(audience),
+        };
+        self.validate_sas_profile(token, profile, now_epoch_seconds)
+    }
+
+    fn validate_sas_profile(
+        &self,
+        token: &str,
+        profile: SasAudienceProfile<'_>,
+        now_epoch_seconds: u64,
+    ) -> Result<AccessGrant, SasError> {
         let token = ParsedToken::parse(token)?;
         if token.expiry <= now_epoch_seconds {
             return Err(SasError::Expired);
         }
 
+        let requested_audience = match profile {
+            SasAudienceProfile::Cbs(audience) => Some(audience),
+            SasAudienceProfile::Native | SasAudienceProfile::AtomHttps => None,
+        };
         let requested = requested_audience
             .map(ResourceScope::parse)
             .transpose()
             .map_err(|_| SasError::InvalidAudience)?
             .map(ResourceScope::into_amqp_scope);
-        let mut token_scope =
-            ResourceScope::parse(&token.resource).map_err(|_| SasError::InvalidAudience)?;
+        let mut token_scope = match profile {
+            SasAudienceProfile::Native | SasAudienceProfile::Cbs(_) => {
+                ResourceScope::parse(&token.resource)
+            }
+            SasAudienceProfile::AtomHttps => ResourceScope::parse_atom_https(&token.resource),
+        }
+        .map_err(|_| SasError::InvalidAudience)?;
         if requested_audience.is_some() {
             token_scope = token_scope.into_amqp_scope();
         }
@@ -803,3 +847,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod atom_tests;

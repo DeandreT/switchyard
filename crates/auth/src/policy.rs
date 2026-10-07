@@ -12,6 +12,8 @@ use url::Url;
 
 use crate::Permission;
 
+mod atom_https;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PermissionSet(u8);
