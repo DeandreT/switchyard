@@ -42,7 +42,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API; native generation-fenced and HTTPS full-definition replacement for finite ordinary queues; closed ordinary subscription HTTPS full-definition replacement |
 | Finite queue capacity | Pre-1.0 | Trusted owner API, separate native create/get/full-definition service, and HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage, Rust AMQP socket tests, both pinned .NET administration/limit-update and WSS ingress/credit-recovery gates, explicit CLI activation; see [Finite Queue Capacity](finite-queue-capacity.md) |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
-| Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; closed ordinary subscription create/get/full-update/delete under native-created topics is library gated with both pinned .NET clients on both backends; closed True/False no-action rule create/get/list/delete is available with rule lifecycle SDK verification pending; rule updates, broader Atom filters/actions, topic creation and subscription list/runtime are not implemented |
+| Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; closed ordinary subscription create/get/full-update/delete under native-created topics is library gated with both pinned .NET clients on both backends; closed True/False no-action rule create/get/list/delete is separately gated with both pinned .NET clients on both backends; rule updates, broader Atom filters/actions, topic creation and subscription list/runtime are not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete, separate finite queue create/get/full-definition replacement, and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; offline JWT Manage via library opt-in or the CLI policy-file option; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
 | Quorum replication | Pre-1.0 | An isolated [fixed-three-node in-process runtime](experimental-replica-runtime.md) exists for bounded Create/Send, but is not integrated with server listeners or the production proposer; production startup remains refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup. The runtime exposes no snapshots or production deployment activation. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
@@ -1878,7 +1878,7 @@ after-stamp planner priority. HTTP authentication still reads the epoch and
 rechecks the original grant immediately before starting the async owner operation.
 It does not revoke already-admitted work on timeout or cancellation.
 
-Verification: the complete focused run passed 493 cases with 19 existing
+Preceding library verification: the complete focused run passed 493 cases with 19 existing
 opt-ins ignored across four server targets, preserving all preceding 428P/19I
 identities/statuses/reasons. The 65 additions are nineteen rule codec cases, nine
 request cases, twenty-six paired owner cases, ten paired actual-TLS cases and
@@ -1899,11 +1899,61 @@ both constructors: forty-eight completed children and ninety-six loaded assembly
 observations matching the preceding four versions/file fingerprints. The
 existing verifier checked owned output files during execution, not ongoing DLL
 or package-cache custody. The narrow default-rule Get/refused Update regression
-is not Rule Create/Get/List/Delete lifecycle or SDK message-selection coverage;
-that SDK verification remains pending. Other seventeen opt-ins were not rerun,
-and all nineteen remain ignored in the workspace total. Preapply failure,
+did not certify Rule Create/Get/List/Delete lifecycle or SDK message selection.
+Separate rule lifecycle verification is described below; SDK message selection
+remains outside it. Other seventeen opt-ins were not rerun in that preceding
+library increment, and all nineteen were ignored in its workspace total. Preapply failure,
 same-domain replay and named-store reopen retain their earlier limitations;
 no ambiguous-commit rollback or universal shutdown guarantee follows.
+
+### Official .NET Rule Administration
+
+Both Service Bus .NET SDK versions 7.21.0 and 7.20.2 separately passed the closed
+True/False no-action rule lifecycle gate on Memory and Fjall, using named-key
+and connection-string clients. Twelve awaited children per backend total
+forty-eight completed children and ninety-six loaded assembly observations.
+The exact sequence is empty, wrong-CA, wrong-name, denied, empty, create, inspect,
+refusals, inspect, opaque, delete and recreate. Healthy same-fixture controls
+prove strict private-CA/name checks and configured Send-only Manage refusal
+without owner effects. Static returned/cross-client definitions preserve ordinal
+Name, exact typed filter/expression, empty parameters and null Action; each SDK
+List is one complete page with cardinality zero, one or two, not multipage coverage.
+
+Native fixtures retain ready/locked messages, expiry/lock indexes, DLQ records,
+configuration triples, counters, identities, native siblings and opaque native
+SQL/action rules. Successful batches are exactly the owned RULE Put/Delete plus
+Clock; their actual mutation projection must reproduce the full after-image.
+Read/refused stages preserve complete images. Compatible single-rule Get and
+transient Create/Delete preserve opaque rules; selected SQL/action Get and whole
+List refuse them rather than silently stripping Action or omitting rows. This
+is administration evidence, not SDK message-selection/settlement or date coverage.
+
+Loaded versions and all four file fingerprints match the preceding subscription
+SDK table; the existing verifier checked owned build outputs during execution,
+not ongoing DLL custody, package-cache or memory-image equivalence. Raw full-state
+and named-store reopen checks retain the earlier same-domain replay, preapply
+failure, Memory-not-disk and original cleanup/shutdown qualifications. See
+[Official Rule Client Verification](atom-rules.md#official-client-verification).
+
+The complete focused run passed 494P/0F/21I across four targets, retaining all
+preceding 493P/19I identities, statuses, reasons and multiplicities. Only one
+regular replay-isolation case and two opt-ins were added; those two gates passed
+separately, and the other nineteen SDK opt-ins were not rerun. All twenty-one
+remain ignored in the regular focused run. Eight test-source images and the
+unchanged twenty-four library/profile images add no layouts, dependencies or
+CLI flags. All nine final gates closed successfully against those same frozen
+images: focused tests, both separate rule SDK gates, strict workspace lint and
+all-target builds with default and all features, formatting and the full
+workspace suite. The full run passed 5,987P/0F/21I across 162 groups, retaining
+all 6,005 preceding result rows with statuses, ignored reasons and multiplicities.
+Only the one regular replay-isolation case and two ignored rule gates were added.
+All 119 CLI test results across eight owners and eight executables were unchanged;
+that is Rust regression coverage, not a CLI-launched SDK gate. Domain/store
+layouts remain 17/11. The other nineteen opt-ins were not rerun; all twenty-one
+remain ignored in the regular workspace suite. This current receipt does not
+replace the historical library result above or certify SDK message flow, rule
+dates, multipage rule listing, production readiness, CLI activation or general Azure
+administration.
 
 ### Official .NET Subscription Administration
 

@@ -249,7 +249,8 @@ Subscription listing and runtime properties are excluded; see
 [Atom Subscription Administration](docs/atom-subscriptions.md) for scope and
 the verified library profile and separate SDK verification status. A closed
 [Atom Rule Administration](docs/atom-rules.md) profile adds True/False no-action
-rule create/get/list/delete; broader filters/actions remain native/AMQP.
+rule create/get/list/delete, separately gated with both pinned .NET clients on
+Memory and Fjall; broader filters/actions remain native/AMQP.
 
 The CLI also supports `queue list` and `queue update`, and emits JSON. Topics
 and subscriptions have separate create/get/list/update commands:
