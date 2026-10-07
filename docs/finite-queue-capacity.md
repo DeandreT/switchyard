@@ -71,6 +71,9 @@ The server can explicitly enable this endpoint with dedicated TLS/audience/key
 options; see [HTTPS Administration CLI](compatibility.md#https-administration-cli).
 Both pinned .NET clients also exercise ordinary message ingress and reservation
 recovery over private-CA WSS; see [Official .NET Ingress Gates](#official-net-ingress-gates).
+`switchyardctl finite-queue` exposes native create, get and full-definition
+replacement with an explicit caller generation; see
+[Native Finite Queue CLI](compatibility.md#native-finite-queue-cli).
 
 ## Reservation Model
 

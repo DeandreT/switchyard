@@ -2239,6 +2239,53 @@ source, using the shared cache and CPUs 14,15. The official SDK gates were not
 rerun for this native-only increment. The schema extension is additive;
 dependencies, CLI commands, value formats and durable layout 17 are unchanged.
 
+### Native Finite Queue CLI
+
+`switchyardctl finite-queue` exposes `create`, `get` and `set-definition` through
+the separate native service. Create and set require every queue configuration
+setting, an explicit TTL and positive `--reservation-limit-bytes`. Set also
+requires positive `--expected-generation` from a prior finite response. Missing
+shape or identity fields are refused before credential-file reads or connection;
+explicit numeric zero and false configuration values are forwarded for owner
+validation. These are full definitions, not legacy `queue update` patches.
+
+Each prepared operation invokes one finite client RPC. There is no implicit Get, generation
+refresh, retry, default merging or fallback to legacy methods. A successful
+response must match the requested namespace/path, include complete configuration
+and positive generation/limit, and retain the caller generation for set. JSON
+reports `namespace`, `path`, `generation`, `config`, `reservation_limit_bytes`,
+`reserved_logical_bytes` and `retained_message_count`; unsigned values retain
+their full 64-bit range. Unlimited TTL uses the existing null output convention
+only after required TTL presence is checked. These aggregates remain owner
+observations, not whole-ledger health or physical/Azure capacity certificates.
+
+The commands reuse existing CA/name-checked TLS, sensitive token-file metadata,
+request/response limits, timeouts and static status-only errors. Development
+plaintext still requires explicit loopback opt-in and cannot carry credentials.
+Legacy queue commands and output are unchanged. The `compatibility` JSON adds
+only `finite_queue_operations`; all prior operation arrays retain their values.
+No finite list/delete, in-place promotion/demotion or limit-only command is added.
+
+Verification: all 119 client-package tests passed, retaining all 105 preceding
+case names, outcomes and details. The fourteen additions are six units, six new
+Linux binary scenarios and two unchanged process-helper cases under the new
+target. The built client exercised private-CA TLS, JWT Manage/SAS success,
+credential and name/root denials, full replacement, unsigned JSON, exact no-ops,
+retained usage and below-usage refusal, stale incarnation before a backward
+command clock, and controlled legacy-only `Unimplemented` without fallback.
+The separately replayed seed uses the same domain implementation, not an
+independent charge oracle. This client fixture uses Memory only, with no Fjall
+reopen, server-CLI startup, historical-binary or official SDK claim.
+
+Original-child group/wait/pipe observations and listener abort/join observations
+do not prove every descendant or HTTP2 task terminated. The reused reader
+post-abort join and synchronous broker cleanup have no complete public deadline.
+Both strict workspace lint configurations, both builds and formatting passed
+against the final source with the shared cache and two-CPU policy. The full
+workspace and SDK gates were not rerun for this client-only increment; the
+preceding 5,844-test native run is separate evidence. Server/domain sources,
+dependencies, protobuf, value formats and durable layout 17 are unchanged.
+
 ### Configuration Updates
 
 Updates use independent presence-aware patch fields: queue remains protobuf

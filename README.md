@@ -219,6 +219,30 @@ An optional [development maintenance clock assessment](docs/development-maintena
 uses `--development-maintenance-readiness` on that same admin listener and the
 `maintenance-clock` CLI command. It is not whole-node readiness or write authority.
 
+Finite ordinary queues use the separate `finite-queue` commands. Creation and
+replacement require a complete definition, including explicit false settings and TTL:
+
+```sh
+cargo run -p switchyardctl -- \
+  --endpoint http://127.0.0.1:9080 --allow-insecure \
+  finite-queue create finite-orders --reservation-limit-bytes 1048576 \
+  --lock-duration-millis 30000 --max-delivery-count 5 --ttl-unlimited \
+  --max-message-bytes 16384 --requires-session=false \
+  --requires-duplicate-detection=false \
+  --duplicate-detection-history-time-window-millis 60000 \
+  --dead-lettering-on-message-expiration=true
+cargo run -p switchyardctl -- \
+  --endpoint http://127.0.0.1:9080 --allow-insecure \
+  finite-queue get finite-orders
+```
+
+`finite-queue set-definition` requires the same complete configuration and limit,
+plus `--expected-generation` from the finite response. This fences delete/recreate,
+not concurrent definition edits. Usage is logical reservation accounting across
+the primary and its dead-letter shadow, not disk usage or Azure quota parity.
+Authenticated commands use the existing TLS/token-file options; see
+[Native Finite Queue CLI](docs/compatibility.md#native-finite-queue-cli).
+
 The CLI also supports `queue list` and `queue update`, and emits JSON. Topics
 and subscriptions have separate create/get/list/update commands:
 
