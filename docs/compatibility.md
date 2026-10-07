@@ -1590,6 +1590,41 @@ each build and client process has a 180-second deadline and bounded output captu
 owned-process cleanup and isolated certificate trust. This does not add process
 lifetime guarantees to the older ordinary-message or WebSocket gate runners.
 
+### Current AMQP Literal SET Revalidation
+
+Both existing AMQP `rule_actions` opt-ins passed a fresh current-source
+revalidation, each reporting one passed, zero failed or ignored, and 77 filtered
+tests. All 54 frozen source paths remained unchanged across both serial gates.
+The [current revalidation scope](sql-actions.md#current-amqp-literal-set-revalidation)
+retains both the historical REMOVE-only receipt above and the earlier Version-2
+Verification receipt without changing their results. No source or test case is
+added. Only these two opt-ins were rerun; the other 19 SDK opt-ins and preceding
+6,042-pass workspace result remain historical, not new executions.
+
+Each selected gate configures `Azure.Messaging.ServiceBus` 7.21.0 or 7.20.2 and
+uses named-key credentials over TLS-protected AMQP TCP with isolated private-CA
+trust against memory and Fjall sequentially. Its source requires a successful child exit and an exact completed
+success-marker line, successful fixture cleanup, exact final retained-state
+checks, and snapshot equality plus repeated checks after provider reopen. The
+marker and backend completion are source-bound assertions, not separate
+successful finish lines printed in the Rust output. This runner has no loaded
+DLL fingerprint or loaded-file custody evidence; the pins describe configured
+package versions, not independently measured loaded assembly identities.
+
+The fixed literal workflow checks exact filter/action source enumeration, String,
+Boolean and signed-Int64 assignments, original-filter independence, three copies
+received before independent out-of-order settlement, untouched sibling/error
+copies, conversion-error dead-lettering with failed-action rollback, final
+RuleName handling, body and selected system metadata, content encoding and one
+fixed string footer. The
+complete REMOVE-plus-literal workflow checked 13 parent sequences, 17 physical
+copies, next sequence 14, restored no-action `$Default` definitions and ten
+empty runtime key families before and after reopen. Cleanup does not form a
+transient RulePut, action-version, timestamp or append-batch oracle. It does not
+prove both credential constructors, an HTTPS administration to AMQP action
+bridge, arbitrary action grammar, cloud conversion parity,
+power-loss survival or replicated-quorum durability.
+
 ### HTTPS Administration Tokens
 
 `SharedAccessPolicy::authenticate_atom_sas` adds a separate library profile for

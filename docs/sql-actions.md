@@ -294,3 +294,46 @@ Verification reused the existing build cache with two low-priority CPU cores.
 Its admission assertions do not bound RSS or every native allocation, and the
 durable checks do not establish power-loss survival, replicated quorum behavior,
 rollback after a physical commit error or permission to reopen earlier layouts.
+
+## Current AMQP Literal SET Revalidation
+
+Both existing current-stable and previous-stable `rule_actions` opt-ins passed
+this fresh current-source revalidation: each selected run reported one passed,
+zero failed or ignored, and 77 filtered tests. The 54 frozen source paths were
+unchanged before and after both serial gates. This does not replace the
+historical REMOVE-only or Version-2 Verification receipts above or introduce
+new test cases. Only these two opt-ins were rerun; the other 19 SDK opt-ins and
+the preceding 6,042-pass workspace run remain historical, not new executions.
+
+Each gate configures its build for `Azure.Messaging.ServiceBus` 7.21.0 or 7.20.2
+and uses one `ServiceBusClient` with named-key credentials over TLS-protected
+AMQP TCP with isolated private-CA trust. Its Rust runner visits memory and Fjall
+sequentially. Each passing gate
+required successful child exit, an exact completed success-marker line, fixture
+cleanup, retained-state checks, and snapshot equality plus repeated checks after
+provider reopen. These are source-bound assertions: the successful Rust output
+does not print separate backend finish lines or the captured child marker. This
+runner does not record loaded DLL fingerprints or loaded-file custody, so the
+release names identify configured package pins, not independently measured
+loaded assembly identities.
+
+The literal workflow enumerates the exact action/filter source, sets String,
+Boolean and signed-Int64 application values, and keeps the filters evaluated
+against the original publication. It receives all three successful alpha copies
+before settling them independently out of order, while checking the untouched
+beta sibling and any error copy after each settlement. An incompatible Boolean
+assignment produces `SwitchyardSqlActionError` / `TypeMismatch` in the alpha
+dead-letter queue; an earlier REMOVE in that failed action is rolled back, and
+healthy siblings remain independently available. The checks include final
+RuleName collision handling, exact application keys/values, body and selected
+system metadata, content encoding and one fixed string footer.
+
+The complete REMOVE-plus-literal workflow checked 13 allocated parent sequences,
+17 physical copies and next sequence 14. Final retained-state checks preserved
+both subscriptions, only their restored no-action `$Default` rules, counters
+and ten empty runtime key families before and after provider reopen; they do
+not retain the deleted literal action definitions or form a transient RulePut,
+action-version, timestamp or append-batch oracle. This is a local fixed-workflow
+AMQP check, not both client credential constructors, an HTTPS-created-action-to-
+AMQP bridge, arbitrary action grammar or cloud conversion parity. Memory reopen is not disk recovery;
+Fjall reopen is not a power-loss or replicated-quorum claim.
