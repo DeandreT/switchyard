@@ -31,7 +31,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; closed ordinary subscription HTTPS create/get/full-update/delete under native-created topics (gated with both pinned .NET clients on both backends), plus a closed True/False, bounded native SQL and typed correlation parameter-free Atom rule create/get/list/delete profile with optional native semantic-v2 SQL actions (preceding no-action True/False, dedicated exact-source SQL and fixed-fixture typed correlation SDK lifecycles verified with both pins, backends and constructors; action projection passed codec/owner/actual-TLS checks, no positive SQL-action SDK lifecycle); Azure topic administration remains unimplemented |
+| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; closed ordinary subscription HTTPS create/get/full-update/delete under native-created topics (gated with both pinned .NET clients on both backends), plus a closed True/False, bounded native SQL and typed correlation parameter-free Atom rule create/get/list/delete profile with optional native semantic-v2 SQL actions (preceding no-action True/False, dedicated exact-source SQL and fixed-fixture typed correlation SDK lifecycles verified with both pins, backends and constructors; action projection passed codec/owner/actual-TLS checks; dedicated fixed-source SQL-action SDK CRUD verified with both pins, backends and constructors, not message transformation); Azure topic administration remains unimplemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD/CLI; typed correlation and optional parameter-free native semantic-v2 SQL-action projection through the closed HTTPS rule profile; bounded REMOVE and String/Boolean/Int64-literal SET actions with independent copies and finite local conversion-error dead letters, not full Azure/CLR actions |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -42,7 +42,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API; native generation-fenced and HTTPS full-definition replacement for finite ordinary queues; closed ordinary subscription HTTPS full-definition replacement |
 | Finite queue capacity | Pre-1.0 | Trusted owner API, separate native create/get/full-definition service, and HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage, Rust AMQP socket tests, both pinned .NET administration/limit-update and WSS ingress/credit-recovery gates, explicit CLI activation; see [Finite Queue Capacity](finite-queue-capacity.md) |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
-| Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; closed ordinary subscription create/get/full-update/delete under native-created topics is library gated with both pinned .NET clients on both backends; closed True/False, bounded native SQL and fixed-fixture typed correlation no-action/no-parameter rule Create/Get/List/Delete are separately gated with both pinned .NET clients on both backends and constructors; optional native semantic-v2 SQL-action projection passed codec/owner/actual-TLS checks without a positive SDK action lifecycle claim; rule updates, topic creation and subscription list/runtime are not implemented |
+| Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; closed ordinary subscription create/get/full-update/delete under native-created topics is library gated with both pinned .NET clients on both backends; closed True/False, bounded native SQL and fixed-fixture typed correlation no-action/no-parameter rule Create/Get/List/Delete are separately gated with both pinned .NET clients on both backends and constructors; optional native semantic-v2 SQL-action projection passed codec/owner/actual-TLS checks; dedicated fixed-source SDK action CRUD passed both pins, backends and constructors, not SDK message transformation; rule updates, topic creation and subscription list/runtime are not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete, separate finite queue create/get/full-definition replacement, and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; offline JWT Manage via library opt-in or the CLI policy-file option; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
 | Quorum replication | Pre-1.0 | An isolated [fixed-three-node in-process runtime](experimental-replica-runtime.md) exists for bounded Create/Send, but is not integrated with server listeners or the production proposer; production startup remains refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup. The runtime exposes no snapshots or production deployment activation. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
@@ -2302,6 +2302,58 @@ limitations remain unchanged. No outgoing AMQP conversion, SDK original CR/blank
 fidelity, dates, multipage, CLI-launched broker, general Azure grammar or
 production-readiness claim follows.
 See [Bounded SQL Action Profile](atom-rules.md#bounded-sql-action-profile).
+
+### Official .NET SQL Action Rule Lifecycle
+
+The fixed-source positive HTTPS SQL-action CRUD stage passed SDK pins 7.21.0
+and 7.20.2 on Memory/Fjall with both named-key and connection-string constructors.
+Each selected ignored gate passed one test with 77 filtered tests. Four chains
+completed 15 ordered positions: 60 children, 120 loaded observations, four
+successful stage/cleanup finishes and four unchanged assembly fingerprints.
+The added rules-action stage follows correlation and precedes recreate; removing
+it preserves all 14 old positions and complete ordered loaded observations
+exactly. No opt-in ID changed; other 19 opt-ins were not rerun and all 21 remain
+ignored ordinarily.
+
+Each constructor checks Create 201, cross-client Get 200, one complete single-row
+List page 200, Delete 200, typed missing Get and one real empty page 200. Concrete
+SqlRuleFilter/SqlRuleAction types, ordinal name and both exact source strings,
+and empty independent Parameters are asserted rather than SDK equality. The
+fixed seven-statement action covers plain/user-qualified REMOVE, quoted
+mixed-case target, Unicode/XML-special/LF/apostrophe String, Boolean literals
+and signed Int64 extrema/unary plus: 208 UTF-8 bytes/206 UTF-16 units within
+native action-v2; the filter remains v1. This proves only that administration
+fixture, not general Azure/CLR grammar, cloud parity or message transformation.
+
+The measured action stage asserts four aggregate applies/four stamps across
+both constructors, not four per constructor: two create/delete pairs of exact
+Rule-plus-Clock batches at 1000, exact native filter-v1/action-v2 metadata and
+complete non-Clock raw retained state. The new ordinary guard checks a fixed
+C# declaration and native compilation/type/codec/batch projection, not dynamic
+C# decoding. Replay is same-domain, not an independent oracle or printed
+mutation journal. Eleven old C# methods, the refusal/opaque tail and the complete
+old Rust pure-guard module remain exact.
+
+Focused verification passed 549 tests with zero failures and 21 ignored tests
+(570 rows/four targets), retaining all 569 prior tuples plus one passing pure
+guard. Workspace passed 6,042 tests with zero failures and 21 ignored tests
+(6,063 rows/162 groups/156 owners/146 executables), retaining all 6,062 prior
+tuples plus the same guard. All 119 CLI rows/eight owners/eight executables are
+unchanged. Nine serial gates closed zero against 45 frozen sources (six test-only
+changes/39 unchanged); all 220 durable chunks reconstruct complete output with
+source custody before/after every gate. Strict default/all-feature Clippy and
+workspace/all-target builds, formatting and focused/full/selected SDK tests ran
+on two CPU cores/two jobs with a shared cache and no incremental compilation.
+
+Production, domain/store layouts 17/11, dependencies, routes and CLI are unchanged.
+Loaded-file custody is not package provenance, memory-image measurement or
+TOCTOU defense. Preapply versus ambiguous commit, Memory reopen versus disk
+recovery and inherited blocking-drop/secondary-cleanup limits remain. Complete
+preceding Phase140 action projection and earlier SQL/correlation/model/framework/
+failed-evidence receipts retain their historical counts and qualifications. No
+new action execution/outgoing AMQP conversion, SDK original CR/blank fidelity,
+dates, multipage, CLI-launched broker, general grammar/conversions, cloud parity
+or production readiness follows. See [SQL Action SDK Lifecycle Verification](atom-rules.md#sql-action-sdk-lifecycle-verification).
 
 ### Official .NET Subscription Administration
 

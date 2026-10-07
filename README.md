@@ -260,8 +260,10 @@ ambiguous key collisions. Its fixed-fixture [SDK lifecycle](docs/atom-rules.md#c
 also passed both pins, backends and constructors, checking all eight nonblank
 system fields and eleven typed properties through Create/Get/List/Delete.
 The action projection reuses existing native REMOVE and typed literal SET, and
-passed [codec, owner and actual-TLS verification](docs/atom-rules.md#sql-action-verification);
-positive official SDK SQL-action lifecycle remains unverified.
+passed [codec, owner and actual-TLS verification](docs/atom-rules.md#sql-action-verification).
+The dedicated [SQL-action SDK lifecycle](docs/atom-rules.md#sql-action-sdk-lifecycle-verification)
+passed both pins, backends and constructors, checking exact source through
+Create/Get/List/Delete. This is administration evidence, not SDK message transformation.
 
 The CLI also supports `queue list` and `queue update`, and emits JSON. Topics
 and subscriptions have separate create/get/list/update commands:
