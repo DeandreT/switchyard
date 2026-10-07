@@ -55,7 +55,7 @@ demoted. Delete and recreate is explicit, with a new entity generation; there is
 no ledger backfill or migration API.
 
 These methods are trusted library APIs, not authorization boundaries. Native
-gRPC capacity fields remain unexposed. The separate library-only authenticated
+gRPC capacity fields remain unexposed. The separate opt-in authenticated
 HTTPS endpoint exposes finite ordinary queue creation and full-definition
 updates through Atom `MaxSizeInMegabytes` and `MaxMessageSizeInKilobytes` fields;
 it does not expose usage metrics. Its SAS authorization, limits, defaults and
@@ -64,7 +64,9 @@ unsupported definitions are documented in
 Both pinned .NET administration gates cover this profile on Memory and Fjall,
 including below-retained-usage limit-update refusal with real trusted-owner seeds;
 see [Official .NET Queue Administration](compatibility.md#official-net-queue-administration).
-HTTP CLI startup and SDK send-capacity gates remain absent.
+The server can explicitly enable this endpoint with dedicated TLS/audience/key
+options; see [HTTPS Administration CLI](compatibility.md#https-administration-cli).
+SDK send-capacity gates remain absent.
 
 ## Reservation Model
 
@@ -152,7 +154,7 @@ the existing entry or fingerprint.
 
 Tests exercise both memory and Fjall stores, physical Fjall reopen, ordered
 atomic credit reuse, ledger corruption, opaque fenced deletion, actual AMQP
-socket rejection/recovery, and the separate library HTTPS queue path. These
+socket rejection/recovery, and the separate library/CLI HTTPS queue path. These
 socket checks use in-tree Rust clients. The separate pinned .NET gates cover
 administration and capacity updates, not SDK message-ingress quotas. Injected
 pre-apply backend failures establish no

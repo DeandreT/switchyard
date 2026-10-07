@@ -8,8 +8,8 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Queue and topic send, both batch-send APIs, ordinary/session subscription workflows, queue/topic scheduling/cancellation, duplicate detection and message properties; queue session renew/state/scheduling; isolated offline JWT Send/Listen denial over TLS | Planned | Experimental gate on 7.21.0 |
-| Official .NET SDK, previous stable | Same SAS-gated workflows as current; isolated offline JWT Send/Listen denial over TLS | Planned | Experimental gate on 7.20.2 |
+| Official .NET SDK, current stable | Queue and topic send, both batch-send APIs, ordinary/session subscription workflows, queue/topic scheduling/cancellation, duplicate detection and message properties; queue session renew/state/scheduling; isolated offline JWT Send/Listen denial over TLS | Finite ordinary queue profile; other administration planned | Experimental gate on 7.21.0 |
+| Official .NET SDK, previous stable | Same SAS-gated workflows as current; isolated offline JWT Send/Listen denial over TLS | Finite ordinary queue profile; other administration planned | Experimental gate on 7.20.2 |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
 ## Capability Matrix
@@ -40,9 +40,9 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Duplicate detection | Pre-1.0 | State machine, AMQP send/scheduling mappings, Rust and current .NET clients end to end |
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API; library HTTPS full-definition replacement for finite ordinary queues |
-| Finite queue capacity | Pre-1.0 | Opt-in trusted owner API and library HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage, Rust AMQP socket tests and both pinned .NET administration/limit-update gates. SDK send-capacity gates and HTTP CLI startup are not implemented; see [Finite Queue Capacity](finite-queue-capacity.md) |
+| Finite queue capacity | Pre-1.0 | Opt-in trusted owner API and HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage, Rust AMQP socket tests, both pinned .NET administration/limit-update gates and explicit CLI activation. SDK send-capacity gates are not implemented; see [Finite Queue Capacity](finite-queue-capacity.md) |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
-| Atom/XML entity and rule administration | Pre-1.0 | Library-only authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list, gated with both pinned .NET clients on both backends; rules, topics, subscriptions and HTTP CLI startup are not implemented |
+| Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; rules, topics and subscriptions are not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; offline JWT Manage via library opt-in or the CLI policy-file option; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
 | Quorum replication | Pre-1.0 | An isolated [fixed-three-node in-process runtime](experimental-replica-runtime.md) exists for bounded Create/Send, but is not integrated with server listeners or the production proposer; production startup remains refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup. The runtime exposes no snapshots or production deployment activation. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
@@ -1622,8 +1622,8 @@ No SDK gates were rerun.
 
 The opt-in trusted owner API reserves logical bytes across an ordinary primary
 queue and its dead-letter shadow. It excludes required sessions and duplicate
-detection; native gRPC capacity fields remain unexposed. The separate library
-HTTPS endpoint below exposes bounded Atom fields, without HTTP CLI startup. The
+detection; native gRPC capacity fields remain unexposed. The separate opt-in
+HTTPS endpoint below exposes bounded Atom fields, including explicit CLI startup. The
 reservation model, lifecycle refunds, bounded planner, and corruption boundaries
 are defined in [Finite Queue Capacity](finite-queue-capacity.md).
 
@@ -1710,7 +1710,8 @@ Callers supply a broker handle, business namespace, independent
 SAS policy and fixed namespace-only audience scope. Request `Host`, port, SNI,
 forwarded headers and XML do not choose that scope. The listener changes ALPN
 only on its supplied owned TLS configuration; native/CBS authentication and AMQP TLS
-configuration are unchanged. This is a library opt-in, not server CLI activation.
+configuration are unchanged. The library opt-in and separate CLI activation below
+share this profile.
 The pinned .NET administration gates below cover this finite queue profile.
 
 Each request authenticates the separate bounded HTTPS SAS profile and requires
@@ -1787,7 +1788,7 @@ actual private-CA/name-verified TLS cases and paired Memory/Fjall CRUD, refusal,
 complete-image oracle and physical reopen checks. Both strict lint configurations,
 both builds and formatting passed against the same frozen source, serially on
 CPUs 14,15 with two build jobs and the shared cache. No official SDK gates were
-rerun, and CLI activation remains absent. The only newly resolved package is the
+rerun, and CLI activation was absent in that library increment. The only newly resolved package is the
 pinned XML parser; existing package versions/checksums and durable layout 17 are
 unchanged.
 
@@ -1837,6 +1838,85 @@ both all-target builds and formatting passed on the same twelve-path test-only
 source, serially on CPUs 14,15 with two build jobs and the shared cache. The full
 workspace and thirteen older SDK gates were not rerun for this increment.
 No Rust dependency, production protocol, storage layout or CLI change is included.
+
+### HTTPS Administration CLI
+
+The server enables this endpoint only when `--atom-admin-listen` is supplied
+together with `--atom-admin-audience-host`, `--atom-admin-key-name` and
+`--atom-admin-key-file`. Configured TLS credentials are mandatory. There is no
+default HTTPS listener, inline key, credential reread, legacy SAS/JWT fallback,
+rotation or multiple-rule configuration. The dedicated policy contains exactly
+one namespace-wide Manage rule. All other listener defaults and production
+startup refusals remain unchanged.
+
+The audience host is explicit and independent of the business namespace, bound
+address, request Host and TLS SNI. HTTPS SAS uses effective port 443 even when
+the listener uses another port. A dotless `--namespace` still has the existing
+legacy AMQP/native SAS hostname mapping; enabling Atom does not change it.
+
+For example, with an existing certificate valid for `localhost`:
+
+```sh
+switchyard --namespace development --storage fjall --data-dir ./data \
+  --tls-certificate ./localhost.pem --tls-private-key ./localhost-key.pem \
+  --atom-admin-listen 127.0.0.1:8443 --atom-admin-audience-host localhost \
+  --atom-admin-key-name AtomManage --atom-admin-key-file ./atom-key.txt
+```
+
+This example enables only Atom authentication; configure the existing
+shared-access options separately to protect AMQP/native listeners. The Atom key
+file contains the literal UTF-8 HMAC key, not decoded Base64. Its raw contents,
+including trailing newlines, are bounded to 8 KiB; only terminal CR/LF characters
+are removed. Spaces are significant. Unix opens nonblocking, validates the
+original descriptor as a regular file, then reads at most the cap plus one byte.
+Ordinary regular-file symlinks are accepted; FIFOs, devices and directories are
+refused. Non-Unix prechecking is not a universal special-file race guarantee.
+New Atom configuration errors are static and omit paths, keys and arbitrary
+I/O details; existing TLS/legacy credential diagnostics are unchanged.
+
+Existing startup validation runs first, followed by Atom option completeness,
+TLS, audience/name and key-file validation. `--check-config` reads configured
+credentials but opens no storage or listeners. Disabled Atom performs no Atom
+key-file I/O. Runtime uses the prepared policy and a cloned existing TLS
+configuration, preserving AMQP ALPN. All configured sockets bind before accepting
+connections; the Atom serve future stays in the existing top-level selection.
+This adds no signal handler or graceful shutdown guarantee.
+
+Four Linux actual-binary cases check disabled/valid preflight, occupied listener
+addresses without binding, nonexistent storage parents without creation,
+bounded FIFO/symlink refusal and one durable healthy server child. That child
+establishes a successful strict private-CA/name-verified HTTPS control before
+wrong-CA/name tests, creates a queue, refuses invalid or unconfigured credentials
+without mutation, and preserves the definition across physical Fjall reopen.
+The whole reopened logical image matches an independently constructed native
+Memory oracle at the observed persisted command time. These CLI 401 probes use
+unknown rules, not a configured SEND-only rule; that permission proof belongs to
+the separate library/SDK administration fixtures.
+
+The binary harness retains original child/process-group/pipe handles, bounds
+normal probes and cleanup, and verifies successful kill, reap and output EOF.
+Fallback Drop and panic cleanup do not independently prove all those outcomes;
+the post-abort reader join has no separate deadline. A long explicit timer
+interval prevents an initial sweep in this short fixture because the unchanged
+timer waits before its first sweep. This does not certify production readiness,
+corrupt-store health, Azure quota accounting or indeterminate commit rollback.
+
+Verification: the closed full workspace passed 5,790 tests with no failures and
+fifteen ignored SDK cases. All case identities, statuses and ignore reasons from
+the preceding 5,757-test full run were preserved across the same 154 source
+owners and 160 result groups. The 33 regular additions comprise eight already
+published SDK support cases and 25 CLI cases: twenty configuration cases, four
+actual-binary cases and one inherited diagnostic-redaction identity. The two
+additional ignored administration gates were published and separately executed
+in the preceding SDK increment. Doctest line locations alone were normalized,
+with multiplicity preserved.
+
+All 375 focused library, binary and SDK-harness regular cases passed, with the
+same fifteen ignored cases. Both strict workspace lint configurations, both
+all-target builds and formatting passed against the same nine-path CLI source,
+serially on CPUs 14,15 with two build jobs and the shared cache. No official SDK
+gate was rerun for this CLI increment. Cargo dependencies, the .NET project,
+messaging protocol and durable layout 17 are unchanged.
 
 ### Message Content
 
