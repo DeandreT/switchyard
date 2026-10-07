@@ -54,6 +54,8 @@ const REPLACE: &[u8] = br#"<entry xmlns="http://www.w3.org/2005/Atom"><content t
 mod cases;
 #[path = "atom_admin_transport/fixture.rs"]
 mod fixture;
+#[path = "atom_admin_transport/subscriptions.rs"]
+mod subscriptions;
 
 use fixture::*;
 

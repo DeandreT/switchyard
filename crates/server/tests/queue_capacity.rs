@@ -468,3 +468,5 @@ mod definition;
 
 #[path = "queue_capacity/atom_owner.rs"]
 mod atom_owner;
+#[path = "queue_capacity/atom_subscriptions.rs"]
+mod atom_subscriptions;

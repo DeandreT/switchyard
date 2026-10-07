@@ -26,8 +26,9 @@ use thiserror::Error;
 pub use crate::{
     atom_admin::{AtomAdminError, AtomAdminListener},
     broker::{
-        AtomQueueOwnerError, Broker, BrokerHandle, GuardedAtomicSubmitError,
-        NativeAtomicMessagingCompletion, NativeAtomicSubmitError, SubmitError,
+        AtomQueueOwnerError, AtomSubscriptionOwnerError, Broker, BrokerHandle,
+        GuardedAtomicSubmitError, NativeAtomicMessagingCompletion, NativeAtomicSubmitError,
+        SubmitError,
     },
     clock::{Clock, ManualClock, SystemClock},
     maintenance::MaintenanceClockAssessment,

@@ -18,6 +18,7 @@ use crate::Clock;
 
 mod admin_metadata;
 mod atom_finite_queues;
+mod atom_subscriptions;
 mod atomic_messaging;
 mod bindings;
 mod entity_metadata;

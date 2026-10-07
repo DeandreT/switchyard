@@ -35,6 +35,7 @@ use crate::{AdminTarget, Clock, LocalProposer, ProposeError};
 
 mod admin_reads;
 mod atom_finite_queues;
+mod atom_subscriptions;
 mod atomic_messaging;
 mod atomic_work;
 mod bindings;
@@ -48,6 +49,7 @@ mod queue_capacity;
 mod request_queue;
 
 pub use atom_finite_queues::AtomQueueOwnerError;
+pub use atom_subscriptions::AtomSubscriptionOwnerError;
 pub use guarded_atomic_messaging::GuardedAtomicSubmitError;
 pub use native_atomic_messaging::{NativeAtomicMessagingCompletion, NativeAtomicSubmitError};
 
@@ -59,6 +61,26 @@ pub use native_atomic_messaging::{NativeAtomicMessagingCompletion, NativeAtomicS
 const COMMAND_QUEUE_DEPTH: usize = 1_024;
 
 enum Request {
+    CreateAtomSubscription {
+        namespace: NamespaceName,
+        topic: EntityPath,
+        name: domain::SubscriptionName,
+        config: domain::SubscriptionConfig,
+        reply: flume::Sender<Result<domain::SubscriptionConfig, AtomSubscriptionOwnerError>>,
+    },
+    GetAtomSubscription {
+        namespace: NamespaceName,
+        topic: EntityPath,
+        name: domain::SubscriptionName,
+        reply:
+            flume::Sender<Result<Option<domain::SubscriptionConfig>, AtomSubscriptionOwnerError>>,
+    },
+    DeleteAtomSubscription {
+        namespace: NamespaceName,
+        topic: EntityPath,
+        name: domain::SubscriptionName,
+        reply: flume::Sender<Result<CommandOutcome, AtomSubscriptionOwnerError>>,
+    },
     GetAtomFiniteQueue {
         namespace: NamespaceName,
         entity: EntityPath,
@@ -613,6 +635,44 @@ impl Broker {
             .spawn(move || {
                 while let Ok(request) = incoming.recv() {
                     match request {
+                        Request::CreateAtomSubscription {
+                            namespace,
+                            topic,
+                            name,
+                            config,
+                            reply,
+                        } => {
+                            let _ = reply.send(
+                                proposer
+                                    .create_atom_subscription(&namespace, &topic, &name, config),
+                            );
+                        }
+                        Request::GetAtomSubscription {
+                            namespace,
+                            topic,
+                            name,
+                            reply,
+                        } => {
+                            let _ = reply
+                                .send(proposer.get_atom_subscription(&namespace, &topic, &name));
+                        }
+                        Request::DeleteAtomSubscription {
+                            namespace,
+                            topic,
+                            name,
+                            reply,
+                        } => {
+                            let application = proposer
+                                .delete_atom_subscription_with_effects(&namespace, &topic, &name);
+                            if let Ok(applied) = &application
+                                && let Some(targets) = &applied.entity_deletions
+                            {
+                                for target in targets {
+                                    watching.notify(&namespace, target);
+                                }
+                            }
+                            let _ = reply.send(application.map(|applied| applied.outcome));
+                        }
                         Request::GetAtomFiniteQueue {
                             namespace,
                             entity,

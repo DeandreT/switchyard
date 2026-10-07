@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use auth::ResourceScope;
-use domain::EntityPath;
+use domain::{EntityPath, SubscriptionName};
 use hyper::{
     HeaderMap, Method, Uri, Version,
     header::{CONTENT_LENGTH, CONTENT_TYPE, HOST, IF_MATCH, TRAILER, TRANSFER_ENCODING, UPGRADE},
@@ -16,16 +16,40 @@ use super::{
 pub(super) enum Target {
     Collection,
     Entity(String),
+    Subscription {
+        topic: String,
+        name: String,
+        canonical: String,
+    },
 }
 
 impl Target {
     pub(super) fn scope(&self, audience: &ResourceScope) -> Result<ResourceScope, RequestFailure> {
         match self {
             Self::Collection => Ok(audience.clone()),
-            Self::Entity(path) => {
+            Self::Entity(path)
+            | Self::Subscription {
+                canonical: path, ..
+            } => {
                 ResourceScope::entity(audience.host(), path).map_err(|_| RequestFailure::BadRequest)
             }
         }
+    }
+
+    pub(super) fn subscription(&self) -> Result<(EntityPath, SubscriptionName), RequestFailure> {
+        let Self::Subscription { topic, name, .. } = self else {
+            return Err(RequestFailure::BadRequest);
+        };
+        let topic = EntityPath::new(topic).map_err(|_| RequestFailure::BadRequest)?;
+        if topic.is_dead_letter_queue() || topic.is_subscription_path() {
+            return Err(RequestFailure::BadRequest);
+        }
+        let name = SubscriptionName::new(name).map_err(|_| RequestFailure::BadRequest)?;
+        topic
+            .subscription(&name)
+            .and_then(|entity| entity.dead_letter_queue())
+            .map_err(|_| RequestFailure::BadRequest)?;
+        Ok((topic, name))
     }
 
     pub(super) fn entity(&self) -> Result<EntityPath, RequestFailure> {
@@ -91,6 +115,22 @@ pub(super) fn target(uri: &Uri, headers: &HeaderMap) -> Result<Target, RequestFa
             return Err(RequestFailure::BadRequest);
         }
         segments.push(segment.into_owned());
+    }
+    if segments.len() >= 3
+        && matches!(
+            segments[segments.len() - 2].as_str(),
+            "Subscriptions" | "subscriptions"
+        )
+    {
+        let name = segments.pop().ok_or(RequestFailure::BadRequest)?;
+        segments.pop();
+        let topic = segments.join("/");
+        let canonical = format!("{topic}/subscriptions/{name}");
+        return Ok(Target::Subscription {
+            topic,
+            name,
+            canonical,
+        });
     }
     let path = segments.join("/");
     Ok(if path == QUEUE_COLLECTION_PATH {
@@ -171,13 +211,13 @@ pub(super) fn operation(
             }
             Ok(Operation::List { skip, top })
         }
-        (&Method::GET, Target::Entity(_)) => {
+        (&Method::GET, Target::Entity(_) | Target::Subscription { .. }) => {
             if headers.contains_key(IF_MATCH) {
                 return Err(RequestFailure::BadRequest);
             }
             Ok(Operation::Get)
         }
-        (&Method::PUT, Target::Entity(_)) => {
+        (&Method::PUT, Target::Entity(_) | Target::Subscription { .. }) => {
             if !singleton(headers, CONTENT_TYPE)?
                 .is_some_and(|value| value.eq_ignore_ascii_case("application/atom+xml"))
             {
@@ -185,11 +225,14 @@ pub(super) fn operation(
             }
             match singleton(headers, IF_MATCH)? {
                 None => Ok(Operation::Create),
+                Some("*") if matches!(target, Target::Subscription { .. }) => {
+                    Err(RequestFailure::BadRequest)
+                }
                 Some("*") => Ok(Operation::Update),
                 _ => Err(RequestFailure::BadRequest),
             }
         }
-        (&Method::DELETE, Target::Entity(_)) => {
+        (&Method::DELETE, Target::Entity(_) | Target::Subscription { .. }) => {
             if headers.contains_key(IF_MATCH) {
                 return Err(RequestFailure::BadRequest);
             }

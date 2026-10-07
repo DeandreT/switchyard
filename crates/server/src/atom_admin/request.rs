@@ -123,9 +123,13 @@ where
         &parts.headers,
         &target,
     )?;
+    if matches!(target, Target::Subscription { .. }) {
+        return process_subscription(target, operation, body, context, authorization, &epoch).await;
+    }
     let entity = match target {
         Target::Entity(_) => Some(target.entity()?),
         Target::Collection => None,
+        Target::Subscription { .. } => return Err(RequestFailure::Internal),
     };
     let body = timeout(BODY_TIMEOUT, collect_body(body))
         .await
@@ -246,6 +250,83 @@ where
             .map_err(|_| RequestFailure::Unavailable)??;
             Ok(response(StatusCode::OK, Vec::new(), "application/atom+xml"))
         }
+    }
+}
+
+async fn process_subscription<B>(
+    target: Target,
+    operation: Operation,
+    body: B,
+    context: &RequestContext,
+    authorization: Authorization,
+    epoch: &impl Fn() -> Result<u64, RequestFailure>,
+) -> Result<Response<Full<Bytes>>, RequestFailure>
+where
+    B: Body<Data = Bytes> + Unpin,
+{
+    use super::xml::subscriptions;
+    let (topic, name) = target.subscription()?;
+    let body = timeout(BODY_TIMEOUT, collect_body(body))
+        .await
+        .map_err(|_| RequestFailure::Unavailable)??;
+    let definition = if operation == Operation::Create {
+        Some(subscriptions::decode_definition(&body)?)
+    } else {
+        if !body.is_empty() {
+            return Err(RequestFailure::BadRequest);
+        }
+        None
+    };
+    authorization.recheck(epoch)?;
+    match operation {
+        Operation::Create => {
+            let config = timeout(
+                OWNER_TIMEOUT,
+                context.broker.create_atom_subscription(
+                    context.namespace.clone(),
+                    topic,
+                    name.clone(),
+                    definition.ok_or(RequestFailure::Internal)?,
+                ),
+            )
+            .await
+            .map_err(|_| RequestFailure::Unavailable)??;
+            Ok(response(
+                StatusCode::CREATED,
+                subscriptions::encode_entry(&name, &config)?,
+                "application/atom+xml",
+            ))
+        }
+        Operation::Get => {
+            let config = timeout(
+                OWNER_TIMEOUT,
+                context.broker.get_atom_subscription(
+                    context.namespace.clone(),
+                    topic,
+                    name.clone(),
+                ),
+            )
+            .await
+            .map_err(|_| RequestFailure::Unavailable)??
+            .ok_or(RequestFailure::SubscriptionNotFound)?;
+            Ok(response(
+                StatusCode::OK,
+                subscriptions::encode_entry(&name, &config)?,
+                "application/atom+xml",
+            ))
+        }
+        Operation::Delete => {
+            timeout(
+                OWNER_TIMEOUT,
+                context
+                    .broker
+                    .delete_atom_subscription(context.namespace.clone(), topic, name),
+            )
+            .await
+            .map_err(|_| RequestFailure::Unavailable)??;
+            Ok(response(StatusCode::OK, Vec::new(), "application/atom+xml"))
+        }
+        Operation::List { .. } | Operation::Update => Err(RequestFailure::MethodNotAllowed),
     }
 }
 
