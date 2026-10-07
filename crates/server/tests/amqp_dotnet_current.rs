@@ -44,6 +44,10 @@ mod retained_ingress;
 #[path = "amqp_dotnet_current/offline_jwt_cli.rs"]
 mod offline_jwt_cli;
 
+#[cfg(target_os = "linux")]
+#[path = "amqp_dotnet_current/atom_administration.rs"]
+mod atom_administration;
+
 struct TestTimer {
     shutdown: Arc<Shutdown>,
     thread: Option<JoinHandle<()>>,

@@ -1,6 +1,11 @@
 using Azure;
 using Azure.Messaging.ServiceBus;
 
+if (args.Length > 0 && args[0] == "atom-administration")
+{
+    return await AtomAdministrationCases.RunAsync(args);
+}
+
 if (args.Length > 0 && args[0] == "atomic-evidence-selftest")
 {
     return await AtomicMessagingEvidenceTests.RunAsync(args);

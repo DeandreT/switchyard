@@ -15,6 +15,10 @@ use tokio::{
 
 use super::*;
 
+#[path = "process/atom_administration.rs"]
+mod atom_administration;
+pub(crate) use atom_administration::{AtomScenario, build_atom_client, run_atom_client};
+
 const BUILD_DEADLINE: Duration = Duration::from_secs(180);
 const RUN_DEADLINE: Duration = Duration::from_secs(180);
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
