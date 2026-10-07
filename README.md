@@ -256,7 +256,9 @@ Memory and Fjall also passed the dedicated [SQL rule lifecycle](docs/atom-rules.
 with both constructors, checking exact typed source through Create/Get/List/Delete
 and unchanged retained state. The [correlation profile](docs/atom-rules.md#bounded-correlation-profile)
 passed codec, owner and actual-TLS checks, preserving typed values and refusing
-ambiguous key collisions; its positive official SDK lifecycle remains unverified.
+ambiguous key collisions. Its fixed-fixture [SDK lifecycle](docs/atom-rules.md#correlation-sdk-lifecycle-verification)
+also passed both pins, backends and constructors, checking all eight nonblank
+system fields and eleven typed properties through Create/Get/List/Delete.
 Actions remain native/AMQP.
 
 The CLI also supports `queue list` and `queue update`, and emits JSON. Topics
