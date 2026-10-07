@@ -8,8 +8,8 @@ coverage with the relevant client.
 
 | Client | Data plane | Administration | Status |
 | --- | --- | --- | --- |
-| Official .NET SDK, current stable | Queue and topic send, both batch-send APIs, ordinary/session subscription workflows, queue/topic scheduling/cancellation, duplicate detection and message properties; queue session renew/state/scheduling; finite queue quota/credit recovery and message-size refusal over WSS; isolated offline JWT Send/Listen denial over TLS | Finite ordinary queue profile; other administration planned | Experimental gate on 7.21.0 |
-| Official .NET SDK, previous stable | Same SAS-gated workflows as current, including finite ingress; isolated offline JWT Send/Listen denial over TLS | Finite ordinary queue profile; other administration planned | Experimental gate on 7.20.2 |
+| Official .NET SDK, current stable | Queue and topic send, both batch-send APIs, ordinary/session subscription workflows, queue/topic scheduling/cancellation, duplicate detection and message properties; queue session renew/state/scheduling; finite queue quota/credit recovery and message-size refusal over WSS; isolated offline JWT Send/Listen denial over TLS | Finite ordinary queue profile; new ordinary subscription library profile has SDK gates pending | Experimental gate on 7.21.0 |
+| Official .NET SDK, previous stable | Same SAS-gated workflows as current, including finite ingress; isolated offline JWT Send/Listen denial over TLS | Finite ordinary queue profile; new ordinary subscription library profile has SDK gates pending | Experimental gate on 7.20.2 |
 | Sift pinned revision | Planned | Planned | Not implemented |
 
 ## Capability Matrix
@@ -31,7 +31,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; Azure administration not implemented |
+| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; closed ordinary subscription HTTPS create/get/delete under native-created topics (library tested; official SDK gates pending); Azure topic administration remains unimplemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD/CLI; bounded REMOVE and String/Boolean/Int64-literal SET actions with independent copies and finite local conversion-error dead letters, not full Azure/CLR actions |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -42,7 +42,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API; native generation-fenced and HTTPS full-definition replacement for finite ordinary queues |
 | Finite queue capacity | Pre-1.0 | Trusted owner API, separate native create/get/full-definition service, and HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage, Rust AMQP socket tests, both pinned .NET administration/limit-update and WSS ingress/credit-recovery gates, explicit CLI activation; see [Finite Queue Capacity](finite-queue-capacity.md) |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
-| Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; rules, topics and subscriptions are not implemented |
+| Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; closed ordinary subscription create/get/delete under native-created topics is library tested with official SDK gates pending; rules, topic creation and subscription update/list/runtime are not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete, separate finite queue create/get/full-definition replacement, and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; offline JWT Manage via library opt-in or the CLI policy-file option; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
 | Quorum replication | Pre-1.0 | An isolated [fixed-three-node in-process runtime](experimental-replica-runtime.md) exists for bounded Create/Send, but is not integrated with server listeners or the production proposer; production startup remains refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup. The runtime exposes no snapshots or production deployment activation. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
@@ -1792,6 +1792,49 @@ CPUs 14,15 with two build jobs and the shared cache. No official SDK gates were
 rerun, and CLI activation was absent in that library increment. The only newly resolved package is the
 pinned XML parser; existing package versions/checksums and durable layout 17 are
 unchanged.
+
+### Library HTTPS Subscription Administration
+
+The same opt-in HTTPS listener adds a closed ordinary non-session subscription
+create/get/delete profile under already native-created topics. No new quota,
+MiB field, runtime metric, listener, credential or store format is introduced.
+The bounded static configuration/default-rule grammar, literal canonical scope,
+same-turn live-parent/child proofs and deletion boundaries are documented in
+[Atom Subscription Administration](atom-subscriptions.md).
+
+The deliberate Atom lock restriction is 5..300 seconds; native/core and SDK
+setters permit some smaller positive values. The native per-copy message limit
+must remain 262,144 bytes for this profile. TTL omission means Unlimited, and
+filter-evaluation dead-lettering defaults true. Create accepts only the optional
+exact SDK $Default True/no-action rule; response title is the subscription leaf
+only and Get emits no default-rule description. Compatible native custom rules
+can coexist with config Get but are not exposed or certified by it.
+
+Only the reserved member marker Subscriptions/subscriptions maps to core
+lowercase before BOTH literal scope and owner selection. Other topic/name bytes
+remain unchanged and alias-only scoped SAS credentials do not gain access.
+Memberless primary paths ending in Subscriptions keep ordinary queue behavior.
+
+Create returns its admitted configuration after the existing atomic topology
+batch without a postcommit read. Get does no proposer command-clock work and proves the live parent identity
+after complete child topology/identity checks; HTTP authentication still checks
+the epoch. Live Delete binds and
+fences the current child in that same owner turn, retaining original bounded
+purge/retirement and committed-only wakeups. Absent Delete uses the original
+ordinary planner and honestly stamps once to preserve orphan/runtime/rule
+refusals. This is not corrupt-metadata repair, whole-ledger proof or cancellation
+rollback. Update/list/runtime/rule administration and topic creation remain
+unsupported; replacement is 400 and the local 32-child limit is static 503.
+
+Verification: the full Rust workspace passed 5,898 tests, with 17 existing opt-in
+cases ignored, across 162 result groups. All 5,844 cases from the preceding full
+run were retained, including their statuses and ignore reasons. The 54 additions
+are 14 already-published finite-queue CLI cases and 40 subscription library cases.
+The complete focused run passed 353 cases across three targets: all 313 prior
+cases plus 16 codec, 16 paired owner and eight paired TLS additions. Both strict
+workspace lint/build configurations and formatting passed on the same 17-source
+revision, using two CPU cores and two build jobs. New official SDK subscription
+gates have NOT run; existing finite-queue SDK receipts below remain separate.
 
 ### Official .NET Queue Administration
 

@@ -243,6 +243,12 @@ the primary and its dead-letter shadow, not disk usage or Azure quota parity.
 Authenticated commands use the existing TLS/token-file options; see
 [Native Finite Queue CLI](docs/compatibility.md#native-finite-queue-cli).
 
+The same opt-in HTTPS administration listener also has a closed ordinary
+subscription create/get/delete profile under native-created topics. Updates,
+listing and runtime/rule administration are excluded; see
+[Atom Subscription Administration](docs/atom-subscriptions.md) for scope and
+the verified library profile and separate SDK verification status.
+
 The CLI also supports `queue list` and `queue update`, and emits JSON. Topics
 and subscriptions have separate create/get/list/update commands:
 
