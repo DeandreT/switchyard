@@ -258,6 +258,21 @@ fn verify_loaded_assemblies(dll: &Path, stdout: &str) -> TestResult<LoadedAssemb
     Ok(evidence)
 }
 
+pub(super) fn verify_capacity_loaded_assemblies(dll: &Path, stdout: &str) -> TestResult {
+    let evidence = verify_loaded_assemblies(dll, stdout)?;
+    for (name, loaded) in [
+        ("Azure.Messaging.ServiceBus", evidence.service_bus),
+        ("Azure.Core", evidence.core),
+    ] {
+        let [major, minor, build, revision] = loaded.version;
+        eprintln!(
+            "capacity-sdk loaded assembly={name} version={major}.{minor}.{build}.{revision} sha256={}",
+            hash_text(&loaded.sha256)
+        );
+    }
+    Ok(())
+}
+
 fn hash_text(hash: &[u8; 32]) -> String {
     hash.iter().map(|byte| format!("{byte:02X}")).collect()
 }

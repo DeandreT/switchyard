@@ -19,6 +19,12 @@ use super::*;
 mod atom_administration;
 pub(crate) use atom_administration::{AtomScenario, build_atom_client, run_atom_client};
 
+#[path = "process/capacity_ingress.rs"]
+mod capacity_ingress;
+pub(crate) use capacity_ingress::{
+    CapacityConstructor, CapacityStage, build_capacity_client, run_capacity_client,
+};
+
 #[path = "process/atom_admin_cli.rs"]
 mod atom_admin_cli;
 pub(crate) use atom_admin_cli::{atom_cli_at, with_atom_cli_child};

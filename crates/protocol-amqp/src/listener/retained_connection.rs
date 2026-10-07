@@ -167,6 +167,21 @@ impl<A> RetainedConnectionOwner<A> {
         self.engine.stop();
     }
 
+    /// Joins the original Wrapper without requesting engine stop.
+    ///
+    /// Seals only unused wrapper launch. Already claimed negotiation and engine
+    /// launch remain enabled. A pending borrowed cancellation restores the same
+    /// original token; cached join results and raw outcomes remain retained for
+    /// the unchanged `finish` barrier and its later Actor/Reader joins.
+    ///
+    /// This does not return a success disposition or bound completion. Apply a
+    /// caller-owned deadline and drive the original `finish` for containment on
+    /// timeout. No peer-close, transport-health or descendant proof is implied.
+    pub async fn join_wrapper(&mut self) {
+        self.wrapper.seal();
+        self.wrapper.join().await;
+    }
+
     #[cfg(test)]
     pub(super) fn controls(&self) -> Arc<Controls> {
         self.controls.clone()
@@ -262,6 +277,15 @@ impl<A> RetainedConnectionJoinReport<A> {
 
     pub fn outcomes(&self) -> &RetainedConnectionOutcomes {
         &self.outcomes
+    }
+
+    /// Observes an exact original WebSocket close write/exchange/flush IO failure.
+    ///
+    /// Missing, successful, opaque and non-IO results return None. This neither
+    /// changes the raw result nor certifies a close handshake or failure cause.
+    pub fn websocket_close_io_error_kind(&self) -> Option<io::ErrorKind> {
+        let error = self.outcomes.websocket_close.as_ref()?.as_ref().err()?;
+        super::websocket::original_close_io_kind(error.as_ref())
     }
 
     pub fn anchor(&self) -> &A {

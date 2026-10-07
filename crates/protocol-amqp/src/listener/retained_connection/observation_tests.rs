@@ -234,3 +234,134 @@ fn resume<T>(observed: Result<T, Box<dyn Any + Send>>) -> T {
         Err(payload) => std::panic::resume_unwind(payload),
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrapper_join_cancellation_restores_token_without_sealing_engine_launch() -> TestResult {
+    let anchor = std::rc::Rc::new(());
+    let (mut owner, mut peer, started) = socket(anchor.clone()).await?;
+    let controls = owner.controls();
+    let original_id = owner.wrapper.abort_handle().expect("original Wrapper").id();
+    let business = caught(async {
+        {
+            let mut waiting = pin!(owner.join_wrapper());
+            poll_fn(|context| match waiting.as_mut().poll(context) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(()) => panic!("original negotiation must still be pending"),
+            })
+            .await;
+        }
+        assert_eq!(
+            owner.wrapper.abort_handle().expect("restored Wrapper").id(),
+            original_id,
+        );
+        assert!(!controls.snapshot().opened);
+        assert_eq!(owner.published(), (false, false));
+        peer_close(&owner, &mut peer, started).await?;
+        timeout(DEADLINE, owner.join_wrapper()).await?;
+        assert!(controls.snapshot().opened);
+        assert_eq!(owner.published(), (true, false));
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await;
+    drop(peer);
+    let report = timeout(DEADLINE, owner.finish())
+        .await?
+        .expect("original retained report");
+    resume(business)?;
+    assert!(report.wrapper().is_some_and(Result::is_ok));
+    assert!(report.actor().is_some_and(Result::is_ok));
+    let native = report.native_observations();
+    assert!(native.actor().is_some() && native.reader().is_some());
+    assert!(!native.actor().expect("original Actor").abort_requested());
+    let close = native
+        .peer_close()
+        .expect("engine accepted the original peer Close");
+    assert!(close.close().error.is_none() && !close.locally_closing());
+    assert_eq!(close.reply_state(), ServerPeerCloseReplyState::Ready);
+    assert!(close.reply_result().is_some_and(Result::is_ok));
+    assert!(matches!(
+        &report.outcomes().primary,
+        Some(RetainedConnectionOutcome::Finished(Ok(())))
+    ));
+    assert!(std::rc::Rc::ptr_eq(report.anchor(), &anchor));
+    assert!(timeout(DEADLINE, owner.finish()).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrapper_join_keeps_original_negotiation_error_until_finish() -> TestResult {
+    let (mut owner, peer, started) = socket(()).await?;
+    drop(peer);
+    let business = caught(async {
+        started.map_err(|error| {
+            Box::new(SetupFailure(error)) as Box<dyn std::error::Error + Send + Sync>
+        })?;
+        timeout(DEADLINE, owner.join_wrapper()).await?;
+        assert_eq!(owner.published(), (true, false));
+        timeout(DEADLINE, owner.join_wrapper()).await?;
+        assert_eq!(owner.published(), (true, false));
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await;
+    let report = timeout(DEADLINE, owner.finish())
+        .await?
+        .expect("original retained report");
+    resume(business)?;
+    assert!(report.wrapper().is_some_and(Result::is_ok));
+    assert!(report.actor().is_none() && report.reader().is_none());
+    let Some(RetainedConnectionOutcome::Finished(Err(error))) = &report.outcomes().primary else {
+        panic!("original negotiation error must remain raw");
+    };
+    assert!(error.downcast_ref::<amqp::EngineError>().is_some());
+    assert!(report.outcomes().websocket_close.is_none());
+    assert!(timeout(DEADLINE, owner.finish()).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrapper_join_keeps_original_task_panic_and_payload_until_finish() -> TestResult {
+    use super::controls::Site;
+
+    struct OriginalPanic(u64);
+    let payload = Box::new(OriginalPanic(0x5177_7261_7070_6572));
+    let address = &*payload as *const OriginalPanic;
+    let (mut owner, mut peer, started) = socket(()).await?;
+    let original_id = owner.wrapper.abort_handle().expect("original Wrapper").id();
+    owner.controls().panic_at(Site::PrimaryReady, payload);
+    let business = caught(async {
+        peer_close(&owner, &mut peer, started).await?;
+        timeout(DEADLINE, owner.join_wrapper()).await?;
+        assert_eq!(owner.published(), (true, false));
+        timeout(DEADLINE, owner.join_wrapper()).await?;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await;
+    drop(peer);
+    let report = timeout(DEADLINE, owner.finish())
+        .await?
+        .expect("original retained report");
+    resume(business)?;
+    assert!(matches!(
+        &report.outcomes().primary,
+        Some(RetainedConnectionOutcome::Finished(Ok(())))
+    ));
+    let (parts, outcomes, ()) = report.into_parts();
+    let error = parts
+        .wrapper
+        .expect("original Wrapper result")
+        .expect_err("original Wrapper panic");
+    assert_eq!(error.id(), original_id);
+    assert!(error.is_panic());
+    let payload = error.into_panic();
+    let payload = payload
+        .downcast::<Box<dyn Any + Send>>()
+        .expect("original boxed dynamic panic payload");
+    let payload = payload
+        .downcast::<OriginalPanic>()
+        .expect("original panic payload");
+    assert_eq!(&*payload as *const OriginalPanic, address);
+    assert_eq!(payload.0, 0x5177_7261_7070_6572);
+    assert!(outcomes.primary.is_some());
+    assert!(timeout(DEADLINE, owner.finish()).await?.is_none());
+    Ok(())
+}

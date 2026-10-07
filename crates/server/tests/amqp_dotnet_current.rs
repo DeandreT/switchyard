@@ -52,6 +52,10 @@ mod atom_administration;
 #[path = "amqp_dotnet_current/atom_admin_cli.rs"]
 mod atom_admin_cli;
 
+#[cfg(target_os = "linux")]
+#[path = "amqp_dotnet_current/capacity_ingress.rs"]
+mod capacity_ingress;
+
 struct TestTimer {
     shutdown: Arc<Shutdown>,
     thread: Option<JoinHandle<()>>,

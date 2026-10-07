@@ -59,7 +59,7 @@ internal static class AtomAdministrationCases
         }
     }
 
-    private static void EmitLoadedAssemblyEvidence()
+    internal static void EmitLoadedAssemblyEvidence()
     {
         Emit(typeof(ServiceBusAdministrationClient).Assembly, "Azure.Messaging.ServiceBus");
         Emit(typeof(Azure.Core.Pipeline.HttpClientTransport).Assembly, "Azure.Core");

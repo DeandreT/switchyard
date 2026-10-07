@@ -1,9 +1,9 @@
-use std::{error::Error, time::Duration};
+use std::{error::Error, fmt, time::Duration};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 use tokio_tungstenite::accept_hdr_async_with_config;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::{Error as WebSocketError, protocol::WebSocketConfig};
 
 mod adapter;
 mod handshake;
@@ -20,6 +20,52 @@ const WRITE_BUFFER_BYTES: usize = 64 * 1024;
 const MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 type TransportError = Box<dyn Error + Send + Sync>;
+
+struct WebSocketCloseFailure {
+    boundary: &'static str,
+    original: WebSocketError,
+}
+
+impl fmt::Debug for WebSocketCloseFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WebSocketCloseFailure")
+            .field("boundary", &self.boundary)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for WebSocketCloseFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.boundary)
+    }
+}
+
+impl Error for WebSocketCloseFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.original)
+    }
+}
+
+fn close_failure(boundary: &'static str, original: WebSocketError) -> TransportError {
+    std::io::Error::other(WebSocketCloseFailure { boundary, original }).into()
+}
+
+pub(in crate::listener) fn original_close_io_kind(
+    error: &(dyn Error + Send + Sync + 'static),
+) -> Option<std::io::ErrorKind> {
+    let envelope = error.downcast_ref::<std::io::Error>()?;
+    if envelope.kind() != std::io::ErrorKind::Other {
+        return None;
+    }
+    let failure = envelope
+        .get_ref()?
+        .downcast_ref::<WebSocketCloseFailure>()?;
+    match &failure.original {
+        WebSocketError::Io(original) => Some(original.kind()),
+        _ => None,
+    }
+}
 
 pub(super) async fn upgrade<Io>(
     stream: Io,
@@ -85,7 +131,7 @@ where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     use futures_util::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
+    use tokio_tungstenite::tungstenite::Message;
 
     let close = state.websocket.close(state.close_frame).await;
     match close {
@@ -95,18 +141,18 @@ where
                     Ok(Message::Close(_)) => break,
                     Ok(_) => {}
                     Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => break,
-                    Err(_) => {
-                        return Err(std::io::Error::other("WebSocket close exchange failed").into());
+                    Err(error) => {
+                        return Err(close_failure("WebSocket close exchange failed", error));
                     }
                 }
             }
             match state.websocket.flush().await {
                 Ok(()) | Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => {}
-                Err(_) => return Err(std::io::Error::other("WebSocket close flush failed").into()),
+                Err(error) => return Err(close_failure("WebSocket close flush failed", error)),
             }
         }
         Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => {}
-        Err(_) => return Err(std::io::Error::other("WebSocket close write failed").into()),
+        Err(error) => return Err(close_failure("WebSocket close write failed", error)),
     }
     state.websocket.get_mut().shutdown().await?;
     Ok(())

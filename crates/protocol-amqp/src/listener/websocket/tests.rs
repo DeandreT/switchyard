@@ -314,3 +314,123 @@ async fn cancelling_close_without_a_peer_reply_drops_the_socket() {
     let mut byte = [0; 1];
     assert_eq!(bounded(raw.read(&mut byte)).await.unwrap(), 0);
 }
+
+fn close_cause(error: &super::TransportError) -> &super::WebSocketCloseFailure {
+    let io = error
+        .downcast_ref::<std::io::Error>()
+        .expect("original close IO envelope");
+    assert_eq!(io.kind(), std::io::ErrorKind::Other);
+    io.get_ref()
+        .expect("retained close failure")
+        .downcast_ref::<super::WebSocketCloseFailure>()
+        .expect("closed private failure type")
+}
+
+#[test]
+fn close_failure_preserves_typed_original_without_disclosing_its_text() {
+    for boundary in [
+        "WebSocket close write failed",
+        "WebSocket close exchange failed",
+        "WebSocket close flush failed",
+    ] {
+        let error = super::close_failure(
+            boundary,
+            super::WebSocketError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "private original close sentinel",
+            )),
+        );
+        assert_eq!(error.to_string(), boundary);
+        assert!(!format!("{error:?}").contains("private"));
+        let failure = close_cause(&error);
+        assert_eq!(failure.boundary, boundary);
+        let source = std::error::Error::source(failure).expect("exact original source");
+        let source = source
+            .downcast_ref::<super::WebSocketError>()
+            .expect("typed original source");
+        assert!(std::ptr::eq(source, &failure.original));
+        let super::WebSocketError::Io(original) = source else {
+            panic!("original IO variant")
+        };
+        assert_eq!(original.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(original.to_string(), "private original close sentinel");
+        assert_eq!(
+            super::original_close_io_kind(error.as_ref()),
+            Some(std::io::ErrorKind::UnexpectedEof)
+        );
+    }
+}
+
+#[test]
+fn close_io_observation_refuses_opaque_nested_and_lookalike_errors() {
+    use super::WebSocketError;
+    use std::{error::Error, fmt, io};
+
+    #[derive(Debug)]
+    struct Lookalike(WebSocketError);
+    impl fmt::Display for Lookalike {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("WebSocket close write failed")
+        }
+    }
+    impl Error for Lookalike {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+    let eof = || io::Error::new(io::ErrorKind::UnexpectedEof, "controlled EOF");
+    let opaque: super::TransportError = eof().into();
+    let direct: super::TransportError = WebSocketError::Io(eof()).into();
+    let lookalike: super::TransportError =
+        io::Error::other(Lookalike(WebSocketError::Io(eof()))).into();
+    let nested: super::TransportError = io::Error::other(super::close_failure(
+        "WebSocket close write failed",
+        WebSocketError::Io(eof()),
+    ))
+    .into();
+    let non_io = super::close_failure(
+        "WebSocket close exchange failed",
+        WebSocketError::Protocol(
+            tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        ),
+    );
+    for error in [opaque, direct, lookalike, nested, non_io] {
+        assert_eq!(super::original_close_io_kind(error.as_ref()), None);
+    }
+}
+
+#[tokio::test]
+async fn close_write_retains_original_broken_pipe_after_peer_transport_drop() {
+    let (server, close, client) = pair().await;
+    drop(client);
+    drop(server);
+    let error = bounded(close.finish())
+        .await
+        .expect_err("peer transport is gone");
+    let failure = close_cause(&error);
+    assert_eq!(failure.boundary, "WebSocket close write failed");
+    assert!(matches!(&failure.original, super::WebSocketError::Io(error)
+        if error.kind() == std::io::ErrorKind::BrokenPipe));
+}
+
+#[tokio::test]
+async fn close_exchange_retains_missing_handshake_after_unflushed_peer_reply() {
+    let (server, close, mut client) = pair().await;
+    drop(server);
+    let (closed, ()) = bounded(async {
+        tokio::join!(close.finish(), async {
+            assert!(matches!(next(&mut client).await, Message::Close(_)));
+            drop(client);
+        })
+    })
+    .await;
+    let error = closed.expect_err("peer did not flush its close reply");
+    let failure = close_cause(&error);
+    assert_eq!(failure.boundary, "WebSocket close exchange failed");
+    assert!(matches!(
+        &failure.original,
+        super::WebSocketError::Protocol(
+            tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake
+        )
+    ));
+}
