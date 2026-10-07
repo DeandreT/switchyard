@@ -61,7 +61,10 @@ updates through Atom `MaxSizeInMegabytes` and `MaxMessageSizeInKilobytes` fields
 it does not expose usage metrics. Its SAS authorization, limits, defaults and
 unsupported definitions are documented in
 [Library HTTPS Queue Administration](compatibility.md#library-https-queue-administration).
-There is no HTTP CLI startup or official SDK administration/capacity gate yet.
+Both pinned .NET administration gates cover this profile on Memory and Fjall,
+including below-retained-usage limit-update refusal with real trusted-owner seeds;
+see [Official .NET Queue Administration](compatibility.md#official-net-queue-administration).
+HTTP CLI startup and SDK send-capacity gates remain absent.
 
 ## Reservation Model
 
@@ -150,7 +153,8 @@ the existing entry or fingerprint.
 Tests exercise both memory and Fjall stores, physical Fjall reopen, ordered
 atomic credit reuse, ledger corruption, opaque fenced deletion, actual AMQP
 socket rejection/recovery, and the separate library HTTPS queue path. These
-socket checks use in-tree Rust clients, not an
-official SDK capacity gate. Injected pre-apply backend failures establish no
+socket checks use in-tree Rust clients. The separate pinned .NET gates cover
+administration and capacity updates, not SDK message-ingress quotas. Injected
+pre-apply backend failures establish no
 partial batch in those fixtures; they do not establish the outcome of an
 indeterminate physical commit.

@@ -40,9 +40,9 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Duplicate detection | Pre-1.0 | State machine, AMQP send/scheduling mappings, Rust and current .NET clients end to end |
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API; library HTTPS full-definition replacement for finite ordinary queues |
-| Finite queue capacity | Pre-1.0 | Opt-in trusted owner API and library HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage and Rust AMQP socket tests. Official SDK administration/capacity gates and HTTP CLI startup are not implemented; see [Finite Queue Capacity](finite-queue-capacity.md) |
+| Finite queue capacity | Pre-1.0 | Opt-in trusted owner API and library HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage, Rust AMQP socket tests and both pinned .NET administration/limit-update gates. SDK send-capacity gates and HTTP CLI startup are not implemented; see [Finite Queue Capacity](finite-queue-capacity.md) |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
-| Atom/XML entity and rule administration | Pre-1.0 | Library-only authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list; rules, topics, subscriptions, HTTP CLI startup and official SDK administration gates are not implemented |
+| Atom/XML entity and rule administration | Pre-1.0 | Library-only authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list, gated with both pinned .NET clients on both backends; rules, topics, subscriptions and HTTP CLI startup are not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; offline JWT Manage via library opt-in or the CLI policy-file option; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
 | Quorum replication | Pre-1.0 | An isolated [fixed-three-node in-process runtime](experimental-replica-runtime.md) exists for bounded Create/Send, but is not integrated with server listeners or the production proposer; production startup remains refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup. The runtime exposes no snapshots or production deployment activation. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
@@ -1710,8 +1710,8 @@ Callers supply a broker handle, business namespace, independent
 SAS policy and fixed namespace-only audience scope. Request `Host`, port, SNI,
 forwarded headers and XML do not choose that scope. The listener changes ALPN
 only on its supplied owned TLS configuration; native/CBS authentication and AMQP TLS
-configuration are unchanged. This is a library opt-in, not server CLI activation
-or official .NET administration compatibility.
+configuration are unchanged. This is a library opt-in, not server CLI activation.
+The pinned .NET administration gates below cover this finite queue profile.
 
 Each request authenticates the separate bounded HTTPS SAS profile and requires
 `Manage` before polling its body or submitting owner work. The retained grant is
@@ -1790,6 +1790,53 @@ CPUs 14,15 with two build jobs and the shared cache. No official SDK gates were
 rerun, and CLI activation remains absent. The only newly resolved package is the
 pinned XML parser; existing package versions/checksums and durable layout 17 are
 unchanged.
+
+### Official .NET Queue Administration
+
+The independently executed administration gates passed with Service Bus packages
+`7.21.0` and `7.20.2`, each on Memory and Fjall, using both named-key and
+connection-string constructors. They retain each package's default API version
+(`2024-05` and `2021-05`) and original request serialization/authentication. The
+fixture's owned per-message transport enforces HTTP/1.1 with a dedicated private
+CA, normal hostname checks, no validation callback, no proxy/redirect fallback
+and no global trust changes.
+
+Each backend establishes a successful same-listener healthy control before
+interpreting wrong-CA and wrong-name refusals. Configured SEND-only authorization
+is refused without owner effects. Successful queue operations require exact
+create/update/delete statuses, ordinal names and all supported static fields;
+no SDK equality shortcut masks case or inactive-history differences. Full PUT
+omission resets TTL to unlimited and disabled duplicate history to one minute.
+Duplicate creation and unsupported definitions refuse without partial mutation.
+
+Trusted owner seeds provide five real 256-KiB messages for below-retained-usage
+limit refusals and real retained messages for lowering the future message limit
+and clearing TTL. Their records, reservations and original deadlines survive.
+These are SDK administration/limit-update gates, not SDK send-capacity gates.
+The complete committed image matches an independent native Memory oracle, and
+Fjall is reopened only after original listener/broker/store ownership is released.
+A separate initially empty namespace exercises SDK-parsed pages for 101 queues
+and preserves the unrelated CRUD namespace. Losing a reply or an indeterminate
+physical commit still provides no new retry or rollback guarantee.
+
+Actual owned restore/dependency manifests resolve Azure.Core `1.62.0` with
+Service Bus `7.21.0`, and Azure.Core `1.60.0` with Service Bus `7.20.2`. The two
+loaded assembly Location-file SHA256 observations match the corresponding owned
+output DLLs; assembly versions alone are not NuGet package identities, and file
+hashes are not executable-memory-image proofs. Build and child execution reuse
+the bounded original-process-group/pipe cleanup harness. Fixture failure, cleanup
+failure and original panic remain failures, not success markers.
+
+Verification: both new opt-in SDK gates closed successfully, each covering both
+backends and constructors. The frozen SDK Rust target passed 38 regular cases
+with no failures and fifteen ignored cases. All original thirty regular cases
+and thirteen SDK case identities, statuses and ignore reasons were preserved;
+the additions are eight regular support cases and two opt-in administration
+gates, executed separately above. Both strict workspace lint configurations,
+both all-target builds and formatting passed on the same twelve-path test-only
+source, serially on CPUs 14,15 with two build jobs and the shared cache. The full
+workspace and thirteen older SDK gates were not rerun for this increment.
+No Rust dependency, production protocol, storage layout or CLI change is included.
 
 ### Message Content
 
