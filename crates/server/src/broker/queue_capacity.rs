@@ -91,6 +91,50 @@ impl BrokerHandle {
             .map_err(SubmitError::Propose)
     }
 
+    pub async fn set_finite_queue_definition_fenced(
+        &self,
+        binding: EntityBinding,
+        config: QueueConfig,
+        limit: FiniteQueueCapacity,
+    ) -> Result<QueueCapacityView, SubmitError> {
+        let (reply, result) = flume::bounded(1);
+        self.requests
+            .send_async(Request::SetFiniteQueueDefinition {
+                binding,
+                config,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        result
+            .recv_async()
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
+
+    pub fn set_finite_queue_definition_fenced_blocking(
+        &self,
+        binding: EntityBinding,
+        config: QueueConfig,
+        limit: FiniteQueueCapacity,
+    ) -> Result<QueueCapacityView, SubmitError> {
+        let (reply, result) = flume::bounded(1);
+        self.requests
+            .send(Request::SetFiniteQueueDefinition {
+                binding,
+                config,
+                limit,
+                reply,
+            })
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        result
+            .recv()
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
+
     pub async fn describe_queue_capacity(
         &self,
         namespace: NamespaceName,

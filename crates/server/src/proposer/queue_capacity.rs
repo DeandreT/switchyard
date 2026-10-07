@@ -40,6 +40,25 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
             })?)
     }
 
+    /// Fences identity before host stamping and applies both settings together.
+    pub fn set_finite_queue_definition_fenced(
+        &self,
+        binding: &EntityBinding,
+        config: QueueConfig,
+        limit: FiniteQueueCapacity,
+    ) -> Result<QueueCapacityView, ProposeError> {
+        self.machine.validate_queue_capacity_limit_intent(binding)?;
+        let issued_at = self.stamp()?;
+        Ok(self
+            .machine
+            .apply_queue_capacity(&QueueCapacityCommandV1::SetDefinitionFenced {
+                binding: binding.clone(),
+                issued_at,
+                config,
+                limit,
+            })?)
+    }
+
     pub fn describe_queue_capacity(
         &self,
         namespace: &NamespaceName,

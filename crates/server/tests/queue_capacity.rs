@@ -462,3 +462,6 @@ for_each_backend! {
     shared_admin_and_amqp_metadata_refuse_missing_capacity_without_a_clock_read,
     amqp_full_rejection_preserves_state_and_completion_restores_send_capacity,
 }
+
+#[path = "queue_capacity/definition.rs"]
+mod definition;

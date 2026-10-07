@@ -40,6 +40,12 @@ pub enum QueueCapacityCommandV1 {
         issued_at: Timestamp,
         limit: FiniteQueueCapacity,
     },
+    SetDefinitionFenced {
+        binding: EntityBinding,
+        issued_at: Timestamp,
+        config: QueueConfig,
+        limit: FiniteQueueCapacity,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -52,7 +58,8 @@ pub enum QueueCapacityStatus {
     },
 }
 
-/// A clock-free view from one owner turn; it does not certify the entire ledger.
+/// An owner-profile view from a describe or prepared mutation.
+/// It does not certify the entire ledger.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueueCapacityView {
     pub binding: EntityBinding,
@@ -83,5 +90,99 @@ mod tests {
             crate::codec::decode::<FiniteQueueCapacity>(&crate::codec::encode(&0_u64).unwrap())
                 .is_err()
         );
+    }
+
+    fn golden_config() -> QueueConfig {
+        QueueConfig {
+            lock_duration_millis: 1,
+            max_delivery_count: 2,
+            default_time_to_live_millis: None,
+            max_message_bytes: 4,
+            requires_session: false,
+            requires_duplicate_detection: false,
+            duplicate_detection_history_time_window_millis: 20_000,
+            dead_lettering_on_message_expiration: true,
+        }
+    }
+
+    fn golden_binding() -> Result<EntityBinding, BrokerError> {
+        let entity = EntityPath::new("q")?;
+        EntityBinding::new(
+            NamespaceName::new("a")?,
+            entity.clone(),
+            entity,
+            crate::EntityIncarnationKind::Queue,
+            1,
+        )
+    }
+
+    #[test]
+    fn original_capacity_instruction_variants_keep_literal_bytes() -> Result<(), BrokerError> {
+        let create = QueueCapacityCommandV1::CreateFinite {
+            namespace: NamespaceName::new("a")?,
+            entity: EntityPath::new("q")?,
+            issued_at: Timestamp::from_millis(3),
+            config: golden_config(),
+            limit: FiniteQueueCapacity::new(5)?,
+        };
+        let limit = QueueCapacityCommandV1::SetLimitFenced {
+            binding: golden_binding()?,
+            issued_at: Timestamp::from_millis(3),
+            limit: FiniteQueueCapacity::new(5)?,
+        };
+        for (instruction, bytes) in [
+            (
+                create,
+                vec![11, 0, 1, 97, 1, 113, 3, 1, 2, 0, 4, 0, 0, 160, 156, 1, 1, 5],
+            ),
+            (limit, vec![11, 1, 1, 97, 1, 113, 1, 113, 0, 1, 3, 5]),
+        ] {
+            assert_eq!(crate::codec::encode(&instruction)?, bytes);
+            assert_eq!(
+                crate::codec::decode::<QueueCapacityCommandV1>(&bytes)?,
+                instruction
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn full_definition_is_additive_and_preserves_unlimited_ttl() -> Result<(), BrokerError> {
+        let instruction = QueueCapacityCommandV1::SetDefinitionFenced {
+            binding: golden_binding()?,
+            issued_at: Timestamp::from_millis(3),
+            config: golden_config(),
+            limit: FiniteQueueCapacity::new(5)?,
+        };
+        let bytes = vec![
+            11, 2, 1, 97, 1, 113, 1, 113, 0, 1, 3, 1, 2, 0, 4, 0, 0, 160, 156, 1, 1, 5,
+        ];
+        assert_eq!(crate::codec::encode(&instruction)?, bytes);
+        assert_eq!(
+            crate::codec::decode::<QueueCapacityCommandV1>(&bytes)?,
+            instruction
+        );
+        let finite_ttl = QueueCapacityCommandV1::SetDefinitionFenced {
+            config: QueueConfig {
+                default_time_to_live_millis: Some(7),
+                ..golden_config()
+            },
+            binding: golden_binding()?,
+            issued_at: Timestamp::from_millis(3),
+            limit: FiniteQueueCapacity::new(5)?,
+        };
+        assert_eq!(
+            crate::codec::decode::<QueueCapacityCommandV1>(&crate::codec::encode(&finite_ttl)?)?,
+            finite_ttl
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_definition_rejects_a_decoded_zero_capacity() {
+        let bytes = [
+            11, 2, 1, 97, 1, 113, 1, 113, 0, 1, 3, 1, 2, 0, 4, 0, 0, 160, 156, 1, 1, 0,
+        ];
+        assert!(crate::codec::decode::<QueueCapacityCommandV1>(&bytes).is_err());
     }
 }

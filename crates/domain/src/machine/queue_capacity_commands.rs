@@ -1,7 +1,7 @@
 use crate::queue_capacity::QueueCapacityMode;
 use crate::{
     EntityBinding, EntityIncarnationKind, FiniteQueueCapacity, QueueCapacityCommandV1,
-    QueueCapacityStatus, QueueCapacityView,
+    QueueCapacityStatus, QueueCapacityView, QueueConfigUpdate, QueueTimeToLiveUpdate,
 };
 
 use super::*;
@@ -96,6 +96,9 @@ impl<S: StateStore> StateMachine<S> {
             QueueCapacityCommandV1::CreateFinite { issued_at, .. } => *issued_at,
             QueueCapacityCommandV1::SetLimitFenced {
                 binding, issued_at, ..
+            }
+            | QueueCapacityCommandV1::SetDefinitionFenced {
+                binding, issued_at, ..
             } => {
                 self.validate_queue_capacity_limit_intent(binding)?;
                 *issued_at
@@ -177,6 +180,77 @@ impl<S: StateStore> StateMachine<S> {
                     );
                 }
                 let mut result = view(&profile)?;
+                result.capacity = QueueCapacityStatus::FiniteV1 {
+                    limit: *limit,
+                    reserved_bytes: usage.reserved_bytes(),
+                    message_count: usage.message_count(),
+                };
+                result
+            }
+            QueueCapacityCommandV1::SetDefinitionFenced {
+                binding,
+                config,
+                limit,
+                ..
+            } => {
+                self.validate_queue_capacity_limit_intent(binding)?;
+                let profile = queue_capacity::validate_owner_profile(
+                    self,
+                    binding.namespace(),
+                    binding.owner(),
+                )?;
+                let current = profile
+                    .mode()
+                    .limit_bytes()
+                    .ok_or(BrokerError::QueueCapacityNotSupported)?;
+                let usage = profile.usage().ok_or(BrokerError::QueueCapacityCorrupt)?;
+                let proposed_config = QueueConfigUpdate {
+                    lock_duration_millis: Some(config.lock_duration_millis),
+                    max_delivery_count: Some(config.max_delivery_count),
+                    default_time_to_live_millis: Some(match config.default_time_to_live_millis {
+                        None => QueueTimeToLiveUpdate::Unlimited,
+                        Some(millis) => QueueTimeToLiveUpdate::Finite { millis },
+                    }),
+                    max_message_bytes: Some(config.max_message_bytes),
+                    requires_session: Some(config.requires_session),
+                    requires_duplicate_detection: Some(config.requires_duplicate_detection),
+                    duplicate_detection_history_time_window_millis: Some(
+                        config.duplicate_detection_history_time_window_millis,
+                    ),
+                    dead_lettering_on_message_expiration: Some(
+                        config.dead_lettering_on_message_expiration,
+                    ),
+                }
+                .apply_to(profile.config())?;
+                if usage.reserved_bytes() > limit.bytes() {
+                    return Err(BrokerError::QueueCapacityFull);
+                }
+                if proposed_config != profile.config() {
+                    batch.push_put(
+                        keys::queue_config(binding.namespace(), binding.owner()),
+                        codec::encode(&proposed_config)?,
+                    );
+                    batch.push_put(
+                        keys::queue_config(
+                            binding.namespace(),
+                            &binding.owner().dead_letter_queue()?,
+                        ),
+                        codec::encode(&proposed_config.dead_letter_shadow())?,
+                    );
+                }
+                if current.get() != limit.bytes() {
+                    let proposed =
+                        QueueCapacityMode::finite_v1(profile.generation(), limit.nonzero())
+                            .map_err(|_| BrokerError::InvalidQueueCapacity)?;
+                    batch.push_put(
+                        keys::queue_capacity_mode(binding.namespace(), binding.owner()),
+                        proposed
+                            .encode()
+                            .map_err(|_| BrokerError::QueueCapacityCorrupt)?,
+                    );
+                }
+                let mut result = view(&profile)?;
+                result.config = proposed_config;
                 result.capacity = QueueCapacityStatus::FiniteV1 {
                     limit: *limit,
                     reserved_bytes: usage.reserved_bytes(),

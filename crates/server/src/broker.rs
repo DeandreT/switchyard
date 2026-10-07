@@ -69,6 +69,12 @@ enum Request {
         limit: domain::FiniteQueueCapacity,
         reply: flume::Sender<Result<domain::QueueCapacityView, ProposeError>>,
     },
+    SetFiniteQueueDefinition {
+        binding: EntityBinding,
+        config: QueueConfig,
+        limit: domain::FiniteQueueCapacity,
+        reply: flume::Sender<Result<domain::QueueCapacityView, ProposeError>>,
+    },
     DescribeQueueCapacity {
         namespace: NamespaceName,
         entity: EntityPath,
@@ -600,6 +606,17 @@ impl Broker {
                         } => {
                             let _ = reply
                                 .send(proposer.set_queue_capacity_limit_fenced(&binding, limit));
+                        }
+                        Request::SetFiniteQueueDefinition {
+                            binding,
+                            config,
+                            limit,
+                            reply,
+                        } => {
+                            let _ = reply.send(
+                                proposer
+                                    .set_finite_queue_definition_fenced(&binding, config, limit),
+                            );
                         }
                         Request::DescribeQueueCapacity {
                             namespace,

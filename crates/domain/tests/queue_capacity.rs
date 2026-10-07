@@ -1,5 +1,8 @@
 //! Logical reservations share one owner across the primary queue and its DLQ.
 
+#[path = "queue_capacity/definition.rs"]
+mod definition;
+
 use std::{
     collections::BTreeMap,
     error::Error,
