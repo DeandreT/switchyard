@@ -35,7 +35,7 @@ On create, `DefaultRuleDescription` may be absent or describe only the supported
 
 Domain creation atomically installs its existing single `$Default` true/no-action rule. Get does not expose the rule set and does not fabricate `DefaultRuleDescription`. Compatible native custom rules can coexist with configuration Get; their contents are neither observed nor certified by the HTTP response. Rule management remains on the existing native/AMQP interfaces.
 
-The two pinned SDK source contracts are described by [SubscriptionPropertiesExtensions](https://raw.githubusercontent.com/Azure/azure-sdk-for-net/4e4c19469fe598b9f28a73d065514106985e7560/sdk/servicebus/Azure.Messaging.ServiceBus/src/Administration/SubscriptionPropertiesExtensions.cs), [CreateRuleOptions](https://raw.githubusercontent.com/Azure/azure-sdk-for-net/4e4c19469fe598b9f28a73d065514106985e7560/sdk/servicebus/Azure.Messaging.ServiceBus/src/Administration/Rules/CreateRuleOptions.cs), and [RuleDescriptionExtensions](https://raw.githubusercontent.com/Azure/azure-sdk-for-net/4e4c19469fe598b9f28a73d065514106985e7560/sdk/servicebus/Azure.Messaging.ServiceBus/src/Administration/Rules/RuleDescriptionExtensions.cs). These source observations are not new restored/loaded-binary or SDK conformance evidence.
+The two pinned SDK source contracts are described by [SubscriptionPropertiesExtensions](https://raw.githubusercontent.com/Azure/azure-sdk-for-net/4e4c19469fe598b9f28a73d065514106985e7560/sdk/servicebus/Azure.Messaging.ServiceBus/src/Administration/SubscriptionPropertiesExtensions.cs), [CreateRuleOptions](https://raw.githubusercontent.com/Azure/azure-sdk-for-net/4e4c19469fe598b9f28a73d065514106985e7560/sdk/servicebus/Azure.Messaging.ServiceBus/src/Administration/Rules/CreateRuleOptions.cs), and [RuleDescriptionExtensions](https://raw.githubusercontent.com/Azure/azure-sdk-for-net/4e4c19469fe598b9f28a73d065514106985e7560/sdk/servicebus/Azure.Messaging.ServiceBus/src/Administration/Rules/RuleDescriptionExtensions.cs). These source observations are separate from the actual loaded-binary and SDK gate evidence below.
 
 ## Literal Authorization
 
@@ -61,7 +61,7 @@ The existing listener bounds remain: 128 connections including handshakes; 10-se
 
 Missing topic/subscription maps 404, duplicate subscription 409, unsupported definition/replacement 400, known 32-subscription topology limit 503 and stored corruption 500. The topology bound is a local work/admission limit, not an Azure subscription quota. All public errors are static and omit keys, XML, entity names and arbitrary backend diagnostics. Already admitted owner work may finish after the HTTP observation deadline.
 
-## Verification
+## Library Verification
 
 The full Rust workspace passed 5,898 tests, with 17 existing opt-in cases ignored, across 162 result groups. All 5,844 cases in the preceding full run were retained, including statuses and ignore reasons. The 54 additions comprise 14 already-published finite-queue CLI cases and 40 subscription library cases. All 119 current CLI cases were retained.
 
@@ -69,4 +69,21 @@ The complete focused library/transport run passed 353 cases across three targets
 
 Injected storage refusals occur before apply; they do not establish rollback after an ambiguous physical commit or lost reply. Same-domain replay comparisons are not an independent implementation oracle. Reopen checks cover the named fixture-owned stores, not universal process shutdown or cleanup.
 
-New official SDK subscription gates have NOT run. Existing finite-queue SDK receipts remain separate and are not subscription compatibility claims.
+## Official Client Verification
+
+The pinned .NET clients 7.21.0 and 7.20.2 each passed a separate opt-in subscription gate on Memory and Fjall, using both named-key and connection-string administration clients. Each pin ran 11 awaited child processes per backend with exact completed markers. Wrong CA, wrong hostname and Send-only credentials were refused before owner work, bracketed by healthy controls. The requested SDK versions were built separately; each child's loaded Service Bus and Azure.Core file records were compared with its owned build output by the Rust verifier. Those output directories were temporary; this records runtime checks, not ongoing custody or an independent NuGet cache inventory.
+
+The successful scenarios cover complete default/custom scalar creation, Get/Exists, duplicate and unsupported-profile/rule refusals, deletion and generation-two recreation. Trusted native fixtures add ready/expiring messages, dead letters and non-default rules before configuration Get and Delete. Raw-state checks verify unchanged Get results, bounded owned-state purge, restored default rules, retained counter fences, and unaffected parent/native-sibling state. Reopen checks cover the fixture-owned Memory/Fjall stores. Topics and subscriptions naturally have no CapacityMode/Usage/Charge rows; their absence is checked, not presented as nonvacuous quota coverage.
+
+| SDK pin | Assembly | Loaded version | SHA-256 |
+| --- | --- | --- | --- |
+| 7.21.0 | Azure.Messaging.ServiceBus | 7.21.0.0 | `8B43506EEA82C852639E81754D1553DCD29816E8EE9A1F208E0CAD1F82F0A8B7` |
+| 7.21.0 | Azure.Core | 1.62.0.0 | `176236AFE4BB4D07773806D3473654E57B3A42C3D9A6D639EF03290669AB7AAE` |
+| 7.20.2 | Azure.Messaging.ServiceBus | 7.20.2.0 | `FAB2ACB2D56FC9AFB8CA7ADFE373ABD5E4E645355A03E7461D4384298D1BA891` |
+| 7.20.2 | Azure.Core | 1.60.0.0 | `D7DFB9CC346B225A661C71F93D2996667B8E2F56B6E4FAB8F825AB6B205C0939` |
+
+The complete Rust SDK-target run passed 53 regular cases, with 19 opt-in cases ignored: all preceding 52 regular and 17 ignored cases retained, plus one regular replay-isolation test and the two new opt-in gates. The two gates passed separately, rather than being counted as regular workspace cases. Existing finite-queue and other SDK gates were not rerun.
+
+This increment's full Rust workspace run passed 5,899 tests, with 19 opt-in cases ignored, across 162 result groups. All 5,898 previously passing cases and all 17 prior ignored cases were retained with their statuses and ignore reasons; only the one regular test and two opt-in gates were added. All 119 current CLI cases were retained. Formatting, both strict workspace lint/build configurations, the complete focused target, both SDK gates and the full workspace run passed on the same eight test-source images and unchanged 17 library-source images. Builds/tests used the shared cache, two CPU cores and two build jobs; the SDK gates ran serially.
+
+The HTTP adapter remains a closed library profile, not general Azure administration. These gates do not certify production readiness, subscription updates/list/runtime/rule administration, topic HTTP administration or a broker launched with CLI options. Same-domain replay is not an independent implementation oracle. The inherited TLS fixture still lacks a universal shutdown deadline; synchronous broker drop can block, and a primary panic can mask secondary cleanup diagnostics. Successful stage/cleanup records do not strengthen those lifecycle guarantees.
