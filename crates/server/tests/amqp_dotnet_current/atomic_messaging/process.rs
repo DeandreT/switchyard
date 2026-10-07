@@ -19,6 +19,10 @@ use super::*;
 mod atom_administration;
 pub(crate) use atom_administration::{AtomScenario, build_atom_client, run_atom_client};
 
+#[path = "process/atom_admin_cli.rs"]
+mod atom_admin_cli;
+pub(crate) use atom_admin_cli::{atom_cli_at, with_atom_cli_child};
+
 const BUILD_DEADLINE: Duration = Duration::from_secs(180);
 const RUN_DEADLINE: Duration = Duration::from_secs(180);
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(5);

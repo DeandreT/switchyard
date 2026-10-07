@@ -48,6 +48,10 @@ mod offline_jwt_cli;
 #[path = "amqp_dotnet_current/atom_administration.rs"]
 mod atom_administration;
 
+#[cfg(target_os = "linux")]
+#[path = "amqp_dotnet_current/atom_admin_cli.rs"]
+mod atom_admin_cli;
+
 struct TestTimer {
     shutdown: Arc<Shutdown>,
     thread: Option<JoinHandle<()>>,

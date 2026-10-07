@@ -2,6 +2,13 @@
 
 mod logging;
 
+#[path = "main/atom_admin_configuration.rs"]
+mod atom_admin_configuration;
+
+#[cfg(test)]
+#[path = "main/atom_admin_configuration_tests.rs"]
+mod atom_admin_configuration_tests;
+
 #[cfg(test)]
 #[path = "main/maintenance_tests.rs"]
 mod maintenance_tests;
@@ -41,6 +48,8 @@ use server::{
 };
 use tracing::info;
 
+use atom_admin_configuration::{PreparedAtomAdmin, load_atom_admin_configuration};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "switchyard",
@@ -78,6 +87,24 @@ struct Arguments {
     /// identity and configured SAS/offline JWT policies as AMQP.
     #[arg(long)]
     admin_listen: Option<SocketAddr>,
+
+    /// Enable HTTPS Atom queue administration at this independent address.
+    /// Requires TLS and all three dedicated Atom audience/key options.
+    #[arg(long)]
+    atom_admin_listen: Option<SocketAddr>,
+
+    /// Fixed HTTPS SAS namespace host, independent of --namespace and legacy SAS.
+    /// A dotless --namespace still keeps its existing legacy hostname mapping.
+    #[arg(long, value_name = "HOST")]
+    atom_admin_audience_host: Option<String>,
+
+    /// Name of the dedicated namespace-wide Atom Manage rule.
+    #[arg(long)]
+    atom_admin_key_name: Option<String>,
+
+    /// UTF-8 Atom SAS key file, limited to 8 KiB. No inline key is accepted.
+    #[arg(long, value_name = "PATH")]
+    atom_admin_key_file: Option<PathBuf>,
 
     /// Enable the descriptive development clock probe on --admin-listen.
     #[arg(long)]
@@ -403,6 +430,7 @@ struct PreparedConfiguration {
     shared_access_authentication: Option<SharedAccessAuthentication>,
     listen: SocketAddr,
     interval: Duration,
+    atom_admin: Option<PreparedAtomAdmin>,
 }
 
 fn prepare_configuration(arguments: &Arguments) -> Result<PreparedConfiguration, StartupError> {
@@ -445,6 +473,7 @@ fn prepare_configuration(arguments: &Arguments) -> Result<PreparedConfiguration,
     let storage = storage_choice(arguments)?;
     server::validate_storage_configuration(cluster, &storage)?;
     let namespace = namespace_from_hostname(&arguments.namespace)?;
+    let atom_admin = load_atom_admin_configuration(arguments, tls.is_some())?;
     Ok(PreparedConfiguration {
         cluster,
         storage,
@@ -453,6 +482,7 @@ fn prepare_configuration(arguments: &Arguments) -> Result<PreparedConfiguration,
         shared_access_authentication,
         listen,
         interval: Duration::from_millis(arguments.sweep_interval_millis),
+        atom_admin,
     })
 }
 
@@ -469,6 +499,7 @@ fn run_with_arguments(arguments: Arguments) -> Result<(), StartupError> {
         shared_access_authentication,
         listen,
         interval,
+        atom_admin,
     } = prepared;
     let mode = cluster.mode;
     let state = server::open(cluster, storage)?;
@@ -565,6 +596,23 @@ fn run_with_arguments(arguments: Arguments) -> Result<(), StartupError> {
         } else {
             None
         };
+        let atom = if let Some(configuration) = atom_admin {
+            let socket = tokio::net::TcpListener::bind(configuration.address)
+                .await
+                .map_err(|error| StartupError::Listen {
+                    address: configuration.address.to_string(),
+                    detail: error.to_string(),
+                })?;
+            let admin = configuration.listener(
+                broker.handle(),
+                namespace.clone(),
+                tls.as_ref().ok_or(StartupError::AtomAdminRequiresTls)?,
+            )?;
+            info!(address = %socket.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, namespace = %namespace, "accepting HTTPS Atom administration connections");
+            Some((admin, socket))
+        } else {
+            None
+        };
         info!(address = %listener.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, namespace = %namespace, tls = tls.is_some(), "accepting AMQP connections");
         if let Some((_, socket)) = &websocket {
             info!(address = %socket.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, namespace = %namespace, tls = tls.is_some(), "accepting AMQP WebSocket connections");
@@ -599,6 +647,12 @@ fn run_with_arguments(arguments: Arguments) -> Result<(), StartupError> {
                 None => std::future::pending().await,
             }
         };
+        let serve_atom = async {
+            match atom {
+                Some((admin, socket)) => admin.serve(socket).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             result = amqp.serve(listener) => {
                 result.map_err(|error| StartupError::Runtime(error.to_string()))
@@ -610,6 +664,9 @@ fn run_with_arguments(arguments: Arguments) -> Result<(), StartupError> {
                 result.map_err(|error| StartupError::Runtime(error.to_string()))
             }
             result = serve_experimental => {
+                result.map_err(|error| StartupError::Runtime(error.to_string()))
+            }
+            result = serve_atom => {
                 result.map_err(|error| StartupError::Runtime(error.to_string()))
             }
         }

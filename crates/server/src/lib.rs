@@ -151,6 +151,28 @@ pub enum StartupError {
     OfflineJwtPolicyNotUtf8,
     #[error(transparent)]
     OfflineJwtPolicyConfiguration(#[from] auth::JwtError),
+    #[error("Atom administration options require --atom-admin-listen")]
+    AtomAdminRequiresListener,
+    #[error("Atom administration requires an audience host, key name and key file")]
+    IncompleteAtomAdminConfiguration,
+    #[error("Atom administration requires TLS")]
+    AtomAdminRequiresTls,
+    #[error("the Atom administration audience must be a namespace host")]
+    AtomAdminInvalidAudience,
+    #[error("the Atom administration key name cannot be empty")]
+    AtomAdminInvalidKeyName,
+    #[error("could not read the Atom administration key file")]
+    ReadAtomAdminKey,
+    #[error("the Atom administration key must be a regular file")]
+    AtomAdminKeyNotRegularFile,
+    #[error("the Atom administration key file exceeds 8 KiB")]
+    AtomAdminKeyTooLarge,
+    #[error("the Atom administration key file must contain UTF-8")]
+    AtomAdminKeyNotUtf8,
+    #[error("the Atom administration key cannot be empty")]
+    AtomAdminInvalidKey,
+    #[error("the Atom administration configuration is invalid")]
+    AtomAdminConfiguration,
     #[error(transparent)]
     AuthPolicy(#[from] auth::PolicyError),
     #[error(transparent)]
