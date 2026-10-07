@@ -244,8 +244,8 @@ Authenticated commands use the existing TLS/token-file options; see
 [Native Finite Queue CLI](docs/compatibility.md#native-finite-queue-cli).
 
 The same opt-in HTTPS administration listener also has a closed ordinary
-subscription create/get/delete profile under native-created topics. Updates,
-listing and runtime/rule administration are excluded; see
+subscription create/get/full-update/delete profile under native-created topics.
+Listing and runtime/rule administration are excluded; see
 [Atom Subscription Administration](docs/atom-subscriptions.md) for scope and
 the verified library profile and separate SDK verification status.
 

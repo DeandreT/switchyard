@@ -31,7 +31,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; closed ordinary subscription HTTPS create/get/delete under native-created topics (gated with both pinned .NET clients on both backends); Azure topic administration remains unimplemented |
+| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; closed ordinary subscription HTTPS create/get/full-update/delete under native-created topics (gated with both pinned .NET clients on both backends); Azure topic administration remains unimplemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD/CLI; bounded REMOVE and String/Boolean/Int64-literal SET actions with independent copies and finite local conversion-error dead letters, not full Azure/CLR actions |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -39,10 +39,10 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Dead-letter receive and resubmit | Pre-1.0 | Receive: state machine, AMQP mapping. Resubmit: not implemented |
 | Sessions and session state | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Duplicate detection | Pre-1.0 | State machine, AMQP send/scheduling mappings, Rust and current .NET clients end to end |
-| Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API; native generation-fenced and HTTPS full-definition replacement for finite ordinary queues |
+| Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API; native generation-fenced and HTTPS full-definition replacement for finite ordinary queues; closed ordinary subscription HTTPS full-definition replacement |
 | Finite queue capacity | Pre-1.0 | Trusted owner API, separate native create/get/full-definition service, and HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage, Rust AMQP socket tests, both pinned .NET administration/limit-update and WSS ingress/credit-recovery gates, explicit CLI activation; see [Finite Queue Capacity](finite-queue-capacity.md) |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
-| Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; closed ordinary subscription create/get/delete under native-created topics is library gated with both pinned .NET clients on both backends; rules, topic creation and subscription update/list/runtime are not implemented |
+| Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; closed ordinary subscription create/get/full-update/delete under native-created topics is library gated with both pinned .NET clients on both backends; rules, topic creation and subscription list/runtime are not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete, separate finite queue create/get/full-definition replacement, and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; offline JWT Manage via library opt-in or the CLI policy-file option; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
 | Quorum replication | Pre-1.0 | An isolated [fixed-three-node in-process runtime](experimental-replica-runtime.md) exists for bounded Create/Send, but is not integrated with server listeners or the production proposer; production startup remains refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup. The runtime exposes no snapshots or production deployment activation. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
@@ -1796,7 +1796,7 @@ unchanged.
 ### Library HTTPS Subscription Administration
 
 The same opt-in HTTPS listener adds a closed ordinary non-session subscription
-create/get/delete profile under already native-created topics. No new quota,
+create/get/full-update/delete profile under already native-created topics. No new quota,
 MiB field, runtime metric, listener, credential or store format is introduced.
 The bounded static configuration/default-rule grammar, literal canonical scope,
 same-turn live-parent/child proofs and deletion boundaries are documented in
@@ -1823,8 +1823,15 @@ fences the current child in that same owner turn, retaining original bounded
 purge/retirement and committed-only wakeups. Absent Delete uses the original
 ordinary planner and honestly stamps once to preserve orphan/runtime/rule
 refusals. This is not corrupt-metadata repair, whole-ledger proof or cancellation
-rollback. Update/list/runtime/rule administration and topic creation remain
-unsupported; replacement is 400 and the local 32-child limit is static 503.
+rollback. Full Update admits only the supported current and desired definitions,
+uses the current child identity fence and changes only three configuration
+projections plus Clock. Omitted fields reset to defaults/Unlimited; every nested
+default-rule description is refused. Existing messages/deadlines/rules/identities
+and counters remain untouched, with no wakeups. Exact no-ops still stamp/check
+the command clock, but do not apply a batch or advance durable Clock. Absent
+Update preserves the original stamped Update planner, which does not prove orphan
+runtime/rule health. List/runtime/rule administration and topic creation remain
+unsupported; the local 32-child limit is static 503.
 
 Verification of the preceding library publication: the full Rust workspace passed
 5,898 tests, with 17 existing opt-in
@@ -1839,7 +1846,7 @@ gates are recorded separately below; finite-queue SDK receipts remain separate.
 
 ### Official .NET Subscription Administration
 
-The closed library create/get/delete profile is now gated separately with .NET
+The preceding closed library create/get/delete profile was gated separately with .NET
 SDK 7.21.0 and 7.20.2. Each opt-in passed on Memory and Fjall with both named-key
 and connection-string administration clients. Each backend completed eleven
 awaited child processes, including strict wrong-CA/name and Send-only denial
@@ -1862,8 +1869,34 @@ Other SDK gates were not rerun. Trusted native retention seeds and same-domain
 replay are not independent implementations or subscription quota coverage.
 Successful cleanup/reopen checks cover named fixture-owned resources; inherited
 unbounded broker drop and possible masked secondary cleanup errors remain.
-This does not certify a CLI-launched broker, subscription update/list/runtime/
-rule administration, topic HTTP administration or production readiness.
+That preceding gate did not certify subscription updates. The current profile
+still does not certify a CLI-launched broker, subscription list/runtime/rule
+administration, topic HTTP administration or production readiness.
+
+### Full HTTPS Subscription Updates
+
+The closed full-update profile is now verified with both pinned .NET clients on
+Memory and Fjall, using both administration constructors. Each backend runs
+twelve awaited children, including the new update stage between retained-state
+inspection and deletion. Four changed configuration-triple-plus-Clock batches
+and eight stamps cover complete changes, default/Unlimited resets and exact
+no-op repeats. All original messages/expiry deadlines/rules/identities/counters
+and parent/native sibling rows remain exact; loaded versions/hashes are unchanged.
+
+The focused four-target run passed 428 regular cases with 19 opt-ins ignored.
+All preceding 406 passing and 19 ignored cases were retained, and exactly four
+codec, twelve paired owner and six paired TLS cases were added. Both opt-ins
+passed separately; the SDK support target remains 53P/19I with no new identities.
+Detailed actual receipts and unchanged lifecycle/temporary-file limits are in
+[Atom Subscription Administration](atom-subscriptions.md#full-update-verification).
+
+The full workspace passed 5,921P/0F/19I across 162 result groups, retaining
+all preceding 5,899 passing and 19 ignored cases with statuses/reasons and all
+119 CLI cases. The same 22 update cases are the only additions. Formatting,
+both strict lint/build configurations, focused targets, both SDK opt-ins and
+full workspace passed on the same frozen 18-source revision, serially with
+two cores/jobs and the shared cache. Domain/store layouts remain 17/11, and
+no dependencies or CLI flags were added.
 
 ### Official .NET Queue Administration
 
