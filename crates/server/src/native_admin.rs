@@ -23,6 +23,7 @@ use tonic::{Request, Response, Status};
 use crate::{AdminTarget, BrokerHandle, ProposeError, SubmitError};
 
 mod deletion;
+mod finite_queues;
 mod maintenance;
 mod offline_jwt;
 mod paging;

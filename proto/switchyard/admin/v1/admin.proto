@@ -386,3 +386,53 @@ message GetClockReadinessRequest {
 message ClockReadinessResponse {
   MaintenanceClockState state = 1;
 }
+
+// Separate methods keep older servers from ignoring finite reservation settings.
+service FiniteQueueService {
+  rpc CreateFiniteQueue(CreateFiniteQueueRequest) returns (FiniteQueue);
+  rpc GetFiniteQueue(GetFiniteQueueRequest) returns (FiniteQueue);
+  rpc SetFiniteQueueDefinition(SetFiniteQueueDefinitionRequest) returns (FiniteQueue);
+}
+
+message CreateFiniteQueueRequest {
+  string namespace = 1;
+  string path = 2;
+  // Required full definition: all eight logical fields, including explicit TTL.
+  // Present false and zero are retained for authoritative owner validation.
+  QueueConfiguration config = 3;
+  // Required positive logical reservation limit, independent of message size.
+  optional uint64 reservation_limit_bytes = 4;
+}
+
+message GetFiniteQueueRequest {
+  string namespace = 1;
+  string path = 2;
+}
+
+message SetFiniteQueueDefinitionRequest {
+  string namespace = 1;
+  string path = 2;
+  // Required positive owner incarnation; not a definition revision or CAS token.
+  optional uint64 expected_generation = 3;
+  // Required full definition, not the legacy partial-patch interpretation.
+  // Every logical field and the TTL oneof must be explicitly present.
+  QueueConfiguration config = 4;
+  // Required positive logical reservation limit.
+  optional uint64 reservation_limit_bytes = 5;
+}
+
+// Finite owner-profile point view, not a certificate of every record and ledger.
+message FiniteQueue {
+  string namespace = 1;
+  string path = 2;
+  uint64 generation = 3;
+  // All logical configuration fields and the TTL choice are explicit.
+  QueueConfiguration config = 4;
+  uint64 reservation_limit_bytes = 5;
+  // Aggregate logical reservations across the primary queue and its DLQ.
+  // Not physical storage, process memory, wire size or a namespace quota.
+  uint64 reserved_logical_bytes = 6;
+  // Aggregate retained messages, including locked/deferred/scheduled and DLQ.
+  // Not a ready/active message count or SDK RuntimeInfo projection.
+  uint64 retained_message_count = 7;
+}

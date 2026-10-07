@@ -8,7 +8,8 @@ use std::{
 };
 
 use admin_api::v1::{
-    entity_service_server::EntityServiceServer, rule_service_server::RuleServiceServer,
+    entity_service_server::EntityServiceServer,
+    finite_queue_service_server::FiniteQueueServiceServer, rule_service_server::RuleServiceServer,
 };
 use thiserror::Error;
 use tokio::{
@@ -102,6 +103,11 @@ impl NativeAdminListener {
         server
             .add_service(
                 EntityServiceServer::new(self.service.clone())
+                    .max_decoding_message_size(NATIVE_ADMIN_REQUEST_LIMIT)
+                    .max_encoding_message_size(NATIVE_ADMIN_RESPONSE_LIMIT),
+            )
+            .add_service(
+                FiniteQueueServiceServer::new(self.service.clone())
                     .max_decoding_message_size(NATIVE_ADMIN_REQUEST_LIMIT)
                     .max_encoding_message_size(NATIVE_ADMIN_RESPONSE_LIMIT),
             )

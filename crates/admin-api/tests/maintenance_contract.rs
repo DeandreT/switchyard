@@ -274,6 +274,37 @@ V|EntityKind|ENTITY_KIND_QUEUE|1
 V|EntityKind|ENTITY_KIND_SUBSCRIPTION|3
 V|EntityKind|ENTITY_KIND_TOPIC|2
 V|EntityKind|ENTITY_KIND_UNSPECIFIED|0";
+// Exact additive finite service; the historical ORIGINAL profile stays unchanged.
+const FINITE_QUEUE_PROFILE: &str = r"F|CreateFiniteQueueRequest|config|3|1|11|.switchyard.admin.v1.QueueConfiguration|false|-
+F|CreateFiniteQueueRequest|namespace|1|1|9|-|false|-
+F|CreateFiniteQueueRequest|path|2|1|9|-|false|-
+F|CreateFiniteQueueRequest|reservation_limit_bytes|4|1|4|-|true|_reservation_limit_bytes
+F|FiniteQueue|config|4|1|11|.switchyard.admin.v1.QueueConfiguration|false|-
+F|FiniteQueue|generation|3|1|4|-|false|-
+F|FiniteQueue|namespace|1|1|9|-|false|-
+F|FiniteQueue|path|2|1|9|-|false|-
+F|FiniteQueue|reservation_limit_bytes|5|1|4|-|false|-
+F|FiniteQueue|reserved_logical_bytes|6|1|4|-|false|-
+F|FiniteQueue|retained_message_count|7|1|4|-|false|-
+F|GetFiniteQueueRequest|namespace|1|1|9|-|false|-
+F|GetFiniteQueueRequest|path|2|1|9|-|false|-
+F|SetFiniteQueueDefinitionRequest|config|4|1|11|.switchyard.admin.v1.QueueConfiguration|false|-
+F|SetFiniteQueueDefinitionRequest|expected_generation|3|1|4|-|true|_expected_generation
+F|SetFiniteQueueDefinitionRequest|namespace|1|1|9|-|false|-
+F|SetFiniteQueueDefinitionRequest|path|2|1|9|-|false|-
+F|SetFiniteQueueDefinitionRequest|reservation_limit_bytes|5|1|4|-|true|_reservation_limit_bytes
+M|CreateFiniteQueueRequest
+M|FiniteQueue
+M|GetFiniteQueueRequest
+M|SetFiniteQueueDefinitionRequest
+O|CreateFiniteQueueRequest|_reservation_limit_bytes
+O|SetFiniteQueueDefinitionRequest|_expected_generation
+O|SetFiniteQueueDefinitionRequest|_reservation_limit_bytes
+R|FiniteQueueService|CreateFiniteQueue|.switchyard.admin.v1.CreateFiniteQueueRequest|.switchyard.admin.v1.FiniteQueue|false|false
+R|FiniteQueueService|GetFiniteQueue|.switchyard.admin.v1.GetFiniteQueueRequest|.switchyard.admin.v1.FiniteQueue|false|false
+R|FiniteQueueService|SetFiniteQueueDefinition|.switchyard.admin.v1.SetFiniteQueueDefinitionRequest|.switchyard.admin.v1.FiniteQueue|false|false
+S|FiniteQueueService";
+
 fn descriptor() -> FileDescriptorProto {
     FileDescriptorSet::decode(FILE_DESCRIPTOR_SET)
         .expect("generated descriptor")
@@ -368,6 +399,7 @@ fn additive_descriptor_preserves_old_admin_contracts() {
         "V|MaintenanceClockState|MAINTENANCE_CLOCK_STATE_UNAVAILABLE|3",
         "V|MaintenanceClockState|MAINTENANCE_CLOCK_STATE_STOPPED|4",
     ].into_iter().map(str::to_owned));
+    expected.extend(FINITE_QUEUE_PROFILE.lines().map(str::to_owned));
     expected.sort();
     assert_eq!(records(&file), expected);
 }
@@ -409,5 +441,80 @@ fn default_and_five_states_have_exact_wire_encodings() {
     assert_eq!(
         request.encode_to_vec(),
         [10, 6, b't', b'e', b'n', b'a', b'n', b't']
+    );
+}
+
+#[test]
+fn finite_requests_have_exact_presence_wire_encodings() {
+    let get = v1::GetFiniteQueueRequest {
+        namespace: "n".into(),
+        path: "q".into(),
+    };
+    let get_bytes = [10, 1, b'n', 18, 1, b'q'];
+    assert_eq!(get.encode_to_vec(), get_bytes);
+    assert_eq!(
+        v1::GetFiniteQueueRequest::decode(get_bytes.as_slice()).unwrap(),
+        get
+    );
+
+    for (limit, suffix) in [
+        (None, vec![]),
+        (Some(0), vec![32, 0]),
+        (Some(1), vec![32, 1]),
+    ] {
+        let request = v1::CreateFiniteQueueRequest {
+            namespace: "n".into(),
+            path: "q".into(),
+            config: Some(v1::QueueConfiguration::default()),
+            reservation_limit_bytes: limit,
+        };
+        let expected = [get_bytes.as_slice(), &[26, 0], suffix.as_slice()].concat();
+        assert_eq!(request.encode_to_vec(), expected);
+        assert_eq!(
+            v1::CreateFiniteQueueRequest::decode(expected.as_slice()).unwrap(),
+            request
+        );
+    }
+    for (generation, limit, expected) in [
+        (None, None, vec![34, 0]),
+        (Some(0), Some(0), vec![24, 0, 34, 0, 40, 0]),
+        (Some(1), Some(2), vec![24, 1, 34, 0, 40, 2]),
+    ] {
+        let request = v1::SetFiniteQueueDefinitionRequest {
+            config: Some(v1::QueueConfiguration::default()),
+            expected_generation: generation,
+            reservation_limit_bytes: limit,
+            ..Default::default()
+        };
+        assert_eq!(request.encode_to_vec(), expected);
+        assert_eq!(
+            v1::SetFiniteQueueDefinitionRequest::decode(expected.as_slice()).unwrap(),
+            request
+        );
+    }
+    let response = v1::FiniteQueue {
+        namespace: "n".into(),
+        path: "q".into(),
+        generation: 3,
+        config: Some(v1::QueueConfiguration::default()),
+        reservation_limit_bytes: 4,
+        reserved_logical_bytes: 2,
+        retained_message_count: 1,
+    };
+    let response_bytes = [10, 1, b'n', 18, 1, b'q', 24, 3, 34, 0, 40, 4, 48, 2, 56, 1];
+    assert_eq!(response.encode_to_vec(), response_bytes);
+    assert_eq!(
+        v1::FiniteQueue::decode(response_bytes.as_slice()).unwrap(),
+        response
+    );
+    let max = v1::CreateFiniteQueueRequest {
+        reservation_limit_bytes: Some(u64::MAX),
+        ..Default::default()
+    };
+    let max_bytes = [32, 255, 255, 255, 255, 255, 255, 255, 255, 255, 1];
+    assert_eq!(max.encode_to_vec(), max_bytes);
+    assert_eq!(
+        v1::CreateFiniteQueueRequest::decode(max_bytes.as_slice()).unwrap(),
+        max
     );
 }
