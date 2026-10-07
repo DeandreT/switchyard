@@ -54,6 +54,26 @@ fn connection(
 }
 
 #[test]
+fn borrowed_offline_jwt_policy_is_optional_and_retains_loaded_grants() {
+    let default = configuration(false);
+    assert!(default.offline_jwt_policy().is_none());
+    let configured = configuration(true);
+    let grant = configured
+        .offline_jwt_policy()
+        .expect("configured policy is borrowed")
+        .validate(TOKEN, &ResourceScope::parse(AUDIENCE).expect("scope"), 100)
+        .expect("same loaded JWT grants");
+    assert_eq!(grant.permissions(), PermissionSet::SEND);
+    assert_eq!(configured.audience_host(), HOST);
+    assert!(
+        configured
+            .policy()
+            .authenticate_plain("producer", "secret")
+            .is_ok()
+    );
+}
+
+#[test]
 fn optional_jwt_configuration_preserves_sas_defaults_and_plain_credentials() {
     let default = configuration(false);
     assert!(!default.requires_tls());

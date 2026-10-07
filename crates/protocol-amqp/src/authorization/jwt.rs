@@ -42,7 +42,7 @@ impl SharedAccessAuthentication {
     ///
     /// The existing shared-access policy and PLAIN behavior remain unchanged.
     /// Keys and rights are local, immutable policy inputs. This adds no discovery,
-    /// cloud identity integration, JWT-only constructor or CLI startup flag.
+    /// cloud identity integration or a JWT-only constructor.
     /// The existing policy may be empty; JWT then supplies the configured grants.
     pub fn with_offline_jwt_policy(mut self, policy: JwtPolicy) -> Self {
         self.offline_jwt_policy = Some(policy);

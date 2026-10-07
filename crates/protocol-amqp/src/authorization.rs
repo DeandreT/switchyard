@@ -54,6 +54,10 @@ impl SharedAccessAuthentication {
         &self.policy
     }
 
+    pub fn offline_jwt_policy(&self) -> Option<&auth::JwtPolicy> {
+        self.offline_jwt_policy.as_ref()
+    }
+
     pub fn audience_host(&self) -> &str {
         &self.audience_host
     }

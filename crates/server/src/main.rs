@@ -14,6 +14,10 @@ mod config_check_tests;
 #[path = "main/offline_jwt_policy_tests.rs"]
 mod offline_jwt_policy_tests;
 
+#[cfg(test)]
+#[path = "main/native_admin_authentication_tests.rs"]
+mod native_admin_authentication_tests;
+
 use std::{
     fs,
     io::Read,
@@ -71,7 +75,7 @@ struct Arguments {
     listen: Option<SocketAddr>,
 
     /// Enable native HTTP/2 administration at this address. Uses the same TLS
-    /// identity and shared-access policy as AMQP when configured.
+    /// identity and configured SAS/offline JWT policies as AMQP.
     #[arg(long)]
     admin_listen: Option<SocketAddr>,
 
@@ -106,8 +110,8 @@ struct Arguments {
     #[arg(long, value_name = "PATH")]
     shared_access_key_file: Option<PathBuf>,
 
-    /// Load a pinned offline JWT policy for TLS/shared-access AMQP listeners.
-    /// The policy file is also read by --check-config. Native administration stays SAS-only.
+    /// Load a pinned offline JWT policy for the configured TLS listeners.
+    /// The policy file is also read by --check-config.
     #[arg(long, value_name = "PATH")]
     offline_jwt_policy_file: Option<PathBuf>,
 
@@ -236,6 +240,29 @@ fn amqp_listener(
         listener = listener.with_shared_access_authentication(authentication.clone());
     }
     listener
+}
+
+fn native_admin_service(
+    broker: server::BrokerHandle,
+    namespace: domain::NamespaceName,
+    authentication: Option<&SharedAccessAuthentication>,
+    development_maintenance_readiness: bool,
+) -> Result<NativeAdminService, auth::ResourceScopeError> {
+    let mut service = NativeAdminService::new(broker, namespace);
+    if development_maintenance_readiness {
+        service = service.with_development_maintenance_readiness();
+    }
+    if let Some(authentication) = authentication {
+        service = service.with_shared_access_policy(
+            authentication.policy().clone(),
+            authentication.audience_host(),
+        )?;
+        if let Some(policy) = authentication.offline_jwt_policy() {
+            service =
+                service.with_offline_jwt_policy(policy.clone(), authentication.audience_host())?;
+        }
+    }
+    Ok(service)
 }
 
 fn load_shared_access_authentication(
@@ -523,16 +550,12 @@ fn run_with_arguments(arguments: Arguments) -> Result<(), StartupError> {
                     address: address.to_string(),
                     detail: error.to_string(),
                 })?;
-            let mut service = NativeAdminService::new(broker.handle(), namespace.clone());
-            if arguments.development_maintenance_readiness {
-                service = service.with_development_maintenance_readiness();
-            }
-            if let Some(authentication) = &shared_access_authentication {
-                service = service.with_shared_access_policy(
-                    authentication.policy().clone(),
-                    authentication.audience_host(),
-                )?;
-            }
+            let service = native_admin_service(
+                broker.handle(),
+                namespace.clone(),
+                shared_access_authentication.as_ref(),
+                arguments.development_maintenance_readiness,
+            )?;
             let mut admin = NativeAdminListener::new(service);
             if let Some(tls) = &tls {
                 admin = admin.with_tls(&tls.certificate_chain, &tls.private_key)?;
