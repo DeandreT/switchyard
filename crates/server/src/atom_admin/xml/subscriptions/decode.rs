@@ -113,7 +113,14 @@ struct DefaultRule {
     parameters: bool,
 }
 
+#[derive(Clone, Copy)]
+enum DefinitionKind {
+    Create,
+    Update,
+}
+
 struct Parser {
+    kind: DefinitionKind,
     resolver: NamespaceResolver,
     budget: Budget,
     frames: Vec<Frame>,
@@ -125,10 +132,11 @@ struct Parser {
 }
 
 impl Parser {
-    fn new() -> Self {
+    fn new(kind: DefinitionKind) -> Self {
         let mut resolver = NamespaceResolver::default();
         resolver.set_max_namespace_bindings(MAX_NAMESPACE_BINDINGS);
         Self {
+            kind,
             resolver,
             budget: Budget::default(),
             frames: Vec::new(),
@@ -234,6 +242,10 @@ impl Parser {
             {
                 self.budget.property()?;
                 let property = Property::parse(local)?;
+                if property == Property::DefaultRule && matches!(self.kind, DefinitionKind::Update)
+                {
+                    return Err(SubscriptionXmlError::UnsupportedDefinition);
+                }
                 if !self.properties.insert(property) {
                     return Err(SubscriptionXmlError::Malformed);
                 }
@@ -512,6 +524,16 @@ fn declaration(raw: &str, budget: &mut Budget) -> Result<(), SubscriptionXmlErro
 }
 
 pub(crate) fn decode_definition(body: &[u8]) -> Result<SubscriptionConfig, SubscriptionXmlError> {
+    decode(body, DefinitionKind::Create)
+}
+
+pub(crate) fn decode_update_definition(
+    body: &[u8],
+) -> Result<SubscriptionConfig, SubscriptionXmlError> {
+    decode(body, DefinitionKind::Update)
+}
+
+fn decode(body: &[u8], kind: DefinitionKind) -> Result<SubscriptionConfig, SubscriptionXmlError> {
     if body.len() > MAX_BODY_BYTES {
         return Err(SubscriptionXmlError::WorkLimitExceeded);
     }
@@ -529,7 +551,7 @@ pub(crate) fn decode_definition(body: &[u8]) -> Result<SubscriptionConfig, Subsc
     config.expand_empty_elements = false;
     config.trim_markup_names_in_closing_tags = true;
     config.trim_text(false);
-    let mut parser = Parser::new();
+    let mut parser = Parser::new(kind);
     loop {
         parser.budget.event()?;
         match reader

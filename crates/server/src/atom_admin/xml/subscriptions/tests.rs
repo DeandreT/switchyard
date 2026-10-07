@@ -523,3 +523,137 @@ fn output_sink_and_pre_escape_boundaries_preserve_prior_bytes_on_refusal() {
         Err(SubscriptionXmlError::ReplyLimitExceeded)
     );
 }
+
+use super::super::decode_update_definition;
+
+fn decode_update(properties: &str) -> Result<SubscriptionConfig, SubscriptionXmlError> {
+    decode_update_definition(document(properties).as_bytes())
+}
+
+#[test]
+fn full_update_definition_preserves_all_exposed_scalars() {
+    assert_eq!(
+        decode_update(
+            "<LockDuration>PT15S</LockDuration><RequiresSession>false</RequiresSession><DefaultMessageTimeToLive>PT45S</DefaultMessageTimeToLive><DeadLetteringOnMessageExpiration>true</DeadLetteringOnMessageExpiration><DeadLetteringOnFilterEvaluationExceptions>false</DeadLetteringOnFilterEvaluationExceptions><MaxDeliveryCount>3</MaxDeliveryCount><EnableBatchedOperations>true</EnableBatchedOperations><Status>Active</Status>"
+        ),
+        Ok(SubscriptionConfig {
+            lock_duration_millis: 15_000,
+            max_delivery_count: 3,
+            default_time_to_live_millis: Some(45_000),
+            max_message_bytes: MAX_MESSAGE_BYTES,
+            requires_session: false,
+            dead_lettering_on_message_expiration: true,
+            dead_lettering_on_filter_evaluation_exceptions: false,
+        })
+    );
+}
+
+#[test]
+fn full_update_omissions_reset_defaults_and_unlimited_ttl() {
+    let changed = "<LockDuration>PT5S</LockDuration><MaxDeliveryCount>1</MaxDeliveryCount><DefaultMessageTimeToLive>PT1S</DefaultMessageTimeToLive><DeadLetteringOnMessageExpiration>true</DeadLetteringOnMessageExpiration><DeadLetteringOnFilterEvaluationExceptions>false</DeadLetteringOnFilterEvaluationExceptions>";
+    assert_ne!(
+        decode_update(changed).unwrap(),
+        SubscriptionConfig::default()
+    );
+    assert_eq!(decode_update(""), Ok(SubscriptionConfig::default()));
+    assert_eq!(
+        decode_update(
+            "<LockDuration>PT10S</LockDuration><RequiresSession>0</RequiresSession><DeadLetteringOnMessageExpiration>0</DeadLetteringOnMessageExpiration><DeadLetteringOnFilterEvaluationExceptions>1</DeadLetteringOnFilterEvaluationExceptions>"
+        ),
+        Ok(SubscriptionConfig {
+            lock_duration_millis: 10_000,
+            ..SubscriptionConfig::default()
+        })
+    );
+    assert_eq!(
+        decode_update("<DefaultMessageTimeToLive>PT922337203685.477S</DefaultMessageTimeToLive>")
+            .unwrap()
+            .default_time_to_live_millis,
+        Some(922_337_203_685_477)
+    );
+    assert_eq!(decode_update("").unwrap().default_time_to_live_millis, None);
+}
+
+#[test]
+fn full_update_refuses_every_default_rule_description() {
+    for properties in [
+        String::from("<DefaultRuleDescription/>"),
+        rule(""),
+        rule("<Parameters/>"),
+        rule("").replace("$Default", "custom"),
+        rule("").replace("TrueFilter", "FalseFilter"),
+        format!("{}{}", rule(""), rule("")),
+        format!("<s:DefaultRuleDescription xmlns:s=\"{SERVICE_BUS_NS}\"/>"),
+    ] {
+        assert_eq!(
+            decode_update(&properties),
+            Err(SubscriptionXmlError::UnsupportedDefinition),
+            "{properties}"
+        );
+    }
+    for parameters in ["", "<Parameters/>", "<Parameters> \n\t </Parameters>"] {
+        assert_eq!(decode(&rule(parameters)), Ok(SubscriptionConfig::default()));
+    }
+}
+
+#[test]
+fn full_update_reuses_closed_grammar_and_existing_bounds() {
+    for (properties, error) in [
+        (
+            "<MaxDeliveryCount>1</MaxDeliveryCount><MaxDeliveryCount>2</MaxDeliveryCount>",
+            SubscriptionXmlError::Malformed,
+        ),
+        (
+            "<RequiresSession>true</RequiresSession>",
+            SubscriptionXmlError::UnsupportedDefinition,
+        ),
+        ("<ForwardTo/>", SubscriptionXmlError::UnsupportedDefinition),
+        (
+            "<LockDuration>PT4.999S</LockDuration>",
+            SubscriptionXmlError::InvalidDefinition,
+        ),
+        (
+            "<DefaultMessageTimeToLive>PT0S</DefaultMessageTimeToLive>",
+            SubscriptionXmlError::InvalidDefinition,
+        ),
+        (
+            "<MaxDeliveryCount>2147483648</MaxDeliveryCount>",
+            SubscriptionXmlError::InvalidDefinition,
+        ),
+    ] {
+        assert_eq!(decode_update(properties), Err(error), "{properties}");
+    }
+    let valid = document("");
+    for invalid in [
+        format!("<?xml standalone=\"yes\"?>{valid}"),
+        format!("<?xml version=\"1.1\"?>{valid}"),
+        format!("<!DOCTYPE entry>{valid}"),
+        format!("{valid}{valid}"),
+        valid.replace(SERVICE_BUS_NS, "urn:foreign"),
+    ] {
+        assert_eq!(
+            decode_update_definition(invalid.as_bytes()),
+            Err(SubscriptionXmlError::Malformed)
+        );
+    }
+    let mut at_limit = valid.clone();
+    at_limit.push_str(&" ".repeat(MAX_BODY_BYTES - valid.len()));
+    assert_eq!(
+        decode_update_definition(at_limit.as_bytes()),
+        Ok(SubscriptionConfig::default())
+    );
+    at_limit.push(' ');
+    assert_eq!(
+        decode_update_definition(at_limit.as_bytes()),
+        Err(SubscriptionXmlError::WorkLimitExceeded)
+    );
+    let events = document(&format!(
+        "<LockDuration>{}</LockDuration>",
+        "&#32;".repeat(MAX_EVENTS)
+    ));
+    assert!(events.len() < MAX_BODY_BYTES);
+    assert_eq!(
+        decode_update_definition(events.as_bytes()),
+        Err(SubscriptionXmlError::WorkLimitExceeded)
+    );
+}

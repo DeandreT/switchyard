@@ -12,7 +12,7 @@ internal static class AtomAdministrationCases
     {
         "empty", "create", "update", "noop", "refusals", "quota", "retention",
         "delete", "paging", "denied", "tls-refused",
-        "subscriptions-empty", "subscriptions-create", "subscriptions-inspect",
+        "subscriptions-empty", "subscriptions-create", "subscriptions-inspect", "subscriptions-update",
         "subscriptions-refusals", "subscriptions-delete", "subscriptions-recreate",
         "subscriptions-denied", "subscriptions-tls-refused",
     };
@@ -110,6 +110,7 @@ internal static class AtomAdministrationCases
             case "subscriptions-empty":
             case "subscriptions-create":
             case "subscriptions-inspect":
+            case "subscriptions-update":
             case "subscriptions-refusals":
             case "subscriptions-delete":
             case "subscriptions-recreate":

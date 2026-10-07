@@ -827,3 +827,6 @@ for_each_subscription_backend! {
     subscription_count_limit_is_a_refusal_without_a_partial_batch,
     child_recreation_rejects_old_fences_before_clock_and_by_name_deletes_current,
 }
+
+#[path = "atom_subscriptions/updates.rs"]
+mod updates;

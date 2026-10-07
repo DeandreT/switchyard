@@ -58,6 +58,52 @@ impl BrokerHandle {
         result.recv().map_err(|_| SubmitError::BrokerStopped)?
     }
 
+    /// Replaces the supported scalar definition under the current child fence.
+    pub async fn update_atom_subscription(
+        &self,
+        namespace: NamespaceName,
+        topic: EntityPath,
+        name: SubscriptionName,
+        config: SubscriptionConfig,
+    ) -> Result<SubscriptionConfig, AtomSubscriptionOwnerError> {
+        let (reply, result) = flume::bounded(1);
+        self.requests
+            .send_async(Request::UpdateAtomSubscription {
+                namespace,
+                topic,
+                name,
+                config,
+                reply,
+            })
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        result
+            .recv_async()
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?
+    }
+
+    /// Blocking equivalent of the same single owner request.
+    pub fn update_atom_subscription_blocking(
+        &self,
+        namespace: NamespaceName,
+        topic: EntityPath,
+        name: SubscriptionName,
+        config: SubscriptionConfig,
+    ) -> Result<SubscriptionConfig, AtomSubscriptionOwnerError> {
+        let (reply, result) = flume::bounded(1);
+        self.requests
+            .send(Request::UpdateAtomSubscription {
+                namespace,
+                topic,
+                name,
+                config,
+                reply,
+            })
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        result.recv().map_err(|_| SubmitError::BrokerStopped)?
+    }
+
     /// Reads a supported subscription without a command timestamp or mutation.
     pub async fn get_atom_subscription(
         &self,

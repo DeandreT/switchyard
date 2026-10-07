@@ -7,7 +7,7 @@ use domain::{
     SubscriptionName, Timestamp, TopicConfig, codec, keys,
 };
 use server::{AtomSubscriptionOwnerError, BrokerHandle, ProposeError, SubmitError};
-use storage::{StateStore, StoreSnapshot};
+use storage::{Mutation, StateStore, StoreSnapshot, WriteBatch};
 
 use super::{
     super::{postconditions::SUFFIXES, process::AtomScenario},
@@ -113,6 +113,26 @@ pub(super) fn advance(
                         BrokerError::SubscriptionAlreadyExists
                     )))
                 ));
+            }
+        }
+        AtomScenario::SubscriptionsUpdate => {
+            for suffix in SUFFIXES {
+                for (kind, config) in [
+                    ("Default", updated_default()),
+                    ("Definition", SubscriptionConfig::default()),
+                ] {
+                    for _ in 0..2 {
+                        assert_eq!(
+                            handle.update_atom_subscription_blocking(
+                                namespace.clone(),
+                                topic(),
+                                name(kind, suffix),
+                                config,
+                            )?,
+                            config
+                        );
+                    }
+                }
             }
         }
         AtomScenario::SubscriptionsDelete => {
@@ -777,4 +797,124 @@ pub(super) fn check_final<S: StateStore>(store: &S, namespace: &NamespaceName) -
         only_fences(store, namespace, &entity, &shadow)?;
     }
     membership(store, namespace, &expected)
+}
+
+fn updated_default() -> SubscriptionConfig {
+    SubscriptionConfig {
+        lock_duration_millis: 30_000,
+        max_delivery_count: 4,
+        default_time_to_live_millis: Some(60_000),
+        dead_lettering_on_message_expiration: true,
+        dead_lettering_on_filter_evaluation_exceptions: false,
+        ..SubscriptionConfig::default()
+    }
+}
+
+pub(super) fn check_updated<S: StateStore>(
+    store: &S,
+    namespace: &NamespaceName,
+    before: &StoreSnapshot,
+    batches: &[WriteBatch],
+) -> TestResult {
+    check_parent(store, namespace, true)?;
+    let mut expected = vec![SubscriptionName::new(SIBLING)?];
+    let mut allowed = BTreeSet::from([keys::clock()]);
+    let mut expected_batches = BTreeSet::new();
+    for suffix in SUFFIXES {
+        for (kind, config, rule_name, filter) in [
+            ("Default", updated_default(), FALSE_RULE, RuleFilter::False),
+            (
+                "Definition",
+                SubscriptionConfig::default(),
+                "$Default",
+                RuleFilter::True,
+            ),
+        ] {
+            let subscription = name(kind, suffix);
+            live(
+                store,
+                namespace,
+                &subscription,
+                config,
+                1,
+                rule_name,
+                filter,
+            )?;
+            let entity = topic().subscription(&subscription)?;
+            let shadow = entity.dead_letter_queue()?;
+            let config_keys = BTreeSet::from([
+                keys::subscription(namespace, &topic(), &subscription),
+                keys::queue_config(namespace, &entity),
+                keys::queue_config(namespace, &shadow),
+            ]);
+            for key in &config_keys {
+                let original = before
+                    .entries()
+                    .iter()
+                    .find(|(candidate, _)| candidate == key)
+                    .expect("original retained subscription config");
+                assert_ne!(
+                    store.get(key)?.expect("updated subscription config"),
+                    original.1,
+                    "changed subscription config retained its original bytes"
+                );
+            }
+            let mut batch_keys = config_keys.clone();
+            batch_keys.insert(keys::clock());
+            expected_batches.insert(batch_keys);
+            allowed.extend(config_keys);
+            if kind == "Default" {
+                // The new finite default TTL does not rewrite pre-existing Unlimited records.
+                messages(store, namespace, &entity, &[2], None, false)?;
+                messages(store, namespace, &shadow, &[1], None, true)?;
+            } else {
+                // Unlimited configuration reset preserves the original finite expiry and index.
+                messages(store, namespace, &entity, &[1, 2], Some(45_000), false)?;
+                messages(store, namespace, &shadow, &[], None, false)?;
+            }
+            expected.push(subscription);
+        }
+    }
+    membership(store, namespace, &expected)?;
+    let unchanged = |snapshot: &StoreSnapshot| {
+        snapshot
+            .entries()
+            .iter()
+            .filter(|(key, _)| !allowed.contains(key))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        unchanged(before),
+        unchanged(&store.snapshot()?),
+        "subscription update changed retained rows, rules, identities, counters, parent or sibling"
+    );
+    assert_eq!(
+        batches.len(),
+        4,
+        "changed/no-op SDK updates committed wrong batch count"
+    );
+    let mut actual_batches = BTreeSet::new();
+    for batch in batches {
+        assert_eq!(batch.mutations().len(), 4);
+        let mut changed = BTreeSet::new();
+        for mutation in batch.mutations() {
+            let Mutation::Put { key, .. } = mutation else {
+                panic!("subscription update deleted a retained row");
+            };
+            assert!(
+                changed.insert(key.clone()),
+                "duplicate subscription update mutation"
+            );
+        }
+        assert!(
+            actual_batches.insert(changed),
+            "duplicate changed subscription batch"
+        );
+    }
+    assert_eq!(
+        actual_batches, expected_batches,
+        "subscription updates did not commit exactly their config triple and clock"
+    );
+    Ok(())
 }

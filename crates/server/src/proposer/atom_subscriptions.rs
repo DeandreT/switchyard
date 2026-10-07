@@ -1,5 +1,6 @@
 use domain::{
-    DeleteEntityTarget, EntityBinding, EntityIncarnationKind, SubscriptionConfig, SubscriptionName,
+    DeleteEntityTarget, EntityBinding, EntityIncarnationKind, QueueTimeToLiveUpdate,
+    SubscriptionConfig, SubscriptionConfigUpdate, SubscriptionName,
 };
 
 use super::*;
@@ -33,6 +34,48 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
             },
         )?;
         if outcome != CommandOutcome::SubscriptionCreated {
+            return Err(ProposeError::UnexpectedOutcome {
+                outcome: format!("{outcome:?}"),
+            }
+            .into());
+        }
+        Ok(config)
+    }
+
+    /// Replaces the complete supported definition without rewriting retained
+    /// state or reading the store after the original atomic config update.
+    pub fn update_atom_subscription(
+        &self,
+        namespace: &NamespaceName,
+        topic: &EntityPath,
+        name: &SubscriptionName,
+        config: SubscriptionConfig,
+    ) -> Result<SubscriptionConfig, AtomSubscriptionOwnerError> {
+        let admission = self.atom_subscription_admission(namespace, topic, name)?;
+        validate_names(topic, name)?;
+        if let Some((_, current)) = &admission {
+            subscriptions::validate_config(current)
+                .map_err(|_| AtomSubscriptionOwnerError::UnsupportedDefinition)?;
+        }
+        subscriptions::validate_config(&config)
+            .map_err(|_| AtomSubscriptionOwnerError::UnsupportedDefinition)?;
+        let kind = CommandKind::UpdateSubscription {
+            name: name.clone(),
+            update: complete_update(config),
+        };
+        let outcome = if let Some((binding, _)) = admission {
+            self.propose_fenced_with_effects(&binding, topic, kind)?
+                .outcome
+        } else {
+            // Preserve the original missing-topology and command-clock refusal
+            // path. This planner does not prove orphan runtime or rule health.
+            let outcome = self.propose(namespace, topic, kind)?;
+            return Err(ProposeError::UnexpectedOutcome {
+                outcome: format!("{outcome:?}"),
+            }
+            .into());
+        };
+        if outcome != CommandOutcome::SubscriptionUpdated {
             return Err(ProposeError::UnexpectedOutcome {
                 outcome: format!("{outcome:?}"),
             }
@@ -121,6 +164,24 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
             .bind_entity(namespace, topic, topic, EntityIncarnationKind::Topic)?
             .ok_or(BrokerError::DanglingEntityMetadata)?;
         Ok(Some((admission.binding, config)))
+    }
+}
+
+fn complete_update(config: SubscriptionConfig) -> SubscriptionConfigUpdate {
+    SubscriptionConfigUpdate {
+        lock_duration_millis: Some(config.lock_duration_millis),
+        max_delivery_count: Some(config.max_delivery_count),
+        default_time_to_live_millis: Some(match config.default_time_to_live_millis {
+            Some(millis) => QueueTimeToLiveUpdate::Finite { millis },
+            None => QueueTimeToLiveUpdate::Unlimited,
+        }),
+        // The closed profile proves the existing hidden limit, never mutates it.
+        max_message_bytes: None,
+        requires_session: Some(false),
+        dead_lettering_on_message_expiration: Some(config.dead_lettering_on_message_expiration),
+        dead_lettering_on_filter_evaluation_exceptions: Some(
+            config.dead_lettering_on_filter_evaluation_exceptions,
+        ),
     }
 }
 

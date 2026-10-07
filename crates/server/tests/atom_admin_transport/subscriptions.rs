@@ -463,3 +463,6 @@ subscription_transport_backends! {
     subscription_auth_xml_and_unsupported_operations_have_no_mutations,
     subscription_tls_profile_and_topology_limits_keep_healthy_controls,
 }
+
+#[path = "subscriptions/updates.rs"]
+mod updates;

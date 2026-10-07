@@ -271,6 +271,8 @@ where
         .map_err(|_| RequestFailure::Unavailable)??;
     let definition = if operation == Operation::Create {
         Some(subscriptions::decode_definition(&body)?)
+    } else if operation == Operation::Update {
+        Some(subscriptions::decode_update_definition(&body)?)
     } else {
         if !body.is_empty() {
             return Err(RequestFailure::BadRequest);
@@ -279,6 +281,24 @@ where
     };
     authorization.recheck(epoch)?;
     match operation {
+        Operation::Update => {
+            let config = timeout(
+                OWNER_TIMEOUT,
+                context.broker.update_atom_subscription(
+                    context.namespace.clone(),
+                    topic,
+                    name.clone(),
+                    definition.ok_or(RequestFailure::Internal)?,
+                ),
+            )
+            .await
+            .map_err(|_| RequestFailure::Unavailable)??;
+            Ok(response(
+                StatusCode::OK,
+                subscriptions::encode_entry(&name, &config)?,
+                "application/atom+xml",
+            ))
+        }
         Operation::Create => {
             let config = timeout(
                 OWNER_TIMEOUT,
@@ -326,7 +346,7 @@ where
             .map_err(|_| RequestFailure::Unavailable)??;
             Ok(response(StatusCode::OK, Vec::new(), "application/atom+xml"))
         }
-        Operation::List { .. } | Operation::Update => Err(RequestFailure::MethodNotAllowed),
+        Operation::List { .. } => Err(RequestFailure::MethodNotAllowed),
     }
 }
 

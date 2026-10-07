@@ -225,9 +225,6 @@ pub(super) fn operation(
             }
             match singleton(headers, IF_MATCH)? {
                 None => Ok(Operation::Create),
-                Some("*") if matches!(target, Target::Subscription { .. }) => {
-                    Err(RequestFailure::BadRequest)
-                }
                 Some("*") => Ok(Operation::Update),
                 _ => Err(RequestFailure::BadRequest),
             }

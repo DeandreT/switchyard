@@ -41,6 +41,9 @@ internal static class AtomSubscriptionAdministrationCases
                 RequireDefault(await GetAsync(client, DefaultName(suffix), token), DefaultName(suffix));
                 RequireDefinition(await GetAsync(client, DefinitionName(suffix), token), DefinitionName(suffix));
                 break;
+            case "subscriptions-update":
+                await UpdateAsync(client, other, suffix, token);
+                break;
             case "subscriptions-refusals":
                 await RefusalsAsync(client, other, suffix, token);
                 break;
@@ -126,6 +129,42 @@ internal static class AtomSubscriptionAdministrationCases
             && string.IsNullOrEmpty(subscription.UserMetadata), "Closed subscription profile.");
     }
 
+    private static async Task UpdateAsync(
+        ServiceBusAdministrationClient client, ServiceBusAdministrationClient other,
+        string suffix, CancellationToken token)
+    {
+        foreach (bool reset in new[] { false, true })
+        {
+            string name = reset ? DefinitionName(suffix) : DefaultName(suffix);
+            SubscriptionProperties desired = await GetAsync(client, name, token);
+            if (reset)
+            {
+                RequireDefinition(desired, name);
+            }
+            else
+            {
+                RequireDefault(desired, name);
+            }
+            desired.LockDuration = TimeSpan.FromSeconds(reset ? 60 : 30);
+            desired.MaxDeliveryCount = reset ? 10 : 4;
+            desired.DefaultMessageTimeToLive = reset ? TimeSpan.MaxValue : TimeSpan.FromSeconds(60);
+            desired.RequiresSession = false;
+            desired.DeadLetteringOnMessageExpiration = !reset;
+            desired.EnableDeadLetteringOnFilterEvaluationExceptions = reset;
+            for (int repeat = 0; repeat < 2; repeat++)
+            {
+                Response<SubscriptionProperties> updated =
+                    await client.UpdateSubscriptionAsync(desired, token);
+                RequireStatus(updated.GetRawResponse(), 200);
+                RequireProfile(updated.Value, name, reset ? 60 : 30, reset ? 10 : 4,
+                    reset ? TimeSpan.MaxValue : TimeSpan.FromSeconds(60), !reset, reset);
+                RequireProfile(await GetAsync(other, name, token), name, reset ? 60 : 30, reset ? 10 : 4,
+                    reset ? TimeSpan.MaxValue : TimeSpan.FromSeconds(60), !reset, reset);
+                desired = updated.Value;
+            }
+        }
+    }
+
     private static async Task RefusalsAsync(
         ServiceBusAdministrationClient client, ServiceBusAdministrationClient other,
         string suffix, CancellationToken token)
@@ -169,9 +208,6 @@ internal static class AtomSubscriptionAdministrationCases
             Require(!(await other.SubscriptionExistsAsync(Topic, name, token)).Value,
                 "Refused default rule created a subscription.");
         }
-        SubscriptionProperties current = await GetAsync(client, DefaultName(suffix), token);
-        current.LockDuration = TimeSpan.FromSeconds(30);
-        await ExpectArgumentAsync(() => client.UpdateSubscriptionAsync(current, token));
         await ExpectArgumentAsync(async () =>
         {
             await foreach (SubscriptionProperties _ in client.GetSubscriptionsAsync(Topic, token)) { }

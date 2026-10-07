@@ -167,6 +167,23 @@ pub(super) async fn run<P: StoreProvider>(
     )
     .await?;
     state::check_retained(fixture.machine().store(), &fixture.namespace)?;
+    let before_update = fixture.snapshot()?;
+    let update_effects = fixture.effects();
+    stage(
+        fixture,
+        oracle,
+        dll,
+        AtomScenario::SubscriptionsUpdate,
+        4,
+        8,
+    )
+    .await?;
+    state::check_updated(
+        fixture.machine().store(),
+        &fixture.namespace,
+        &before_update,
+        &fixture.batches_since(update_effects),
+    )?;
     let retained = fixture.snapshot()?;
     stage(
         fixture,

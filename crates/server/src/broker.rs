@@ -68,6 +68,13 @@ enum Request {
         config: domain::SubscriptionConfig,
         reply: flume::Sender<Result<domain::SubscriptionConfig, AtomSubscriptionOwnerError>>,
     },
+    UpdateAtomSubscription {
+        namespace: NamespaceName,
+        topic: EntityPath,
+        name: domain::SubscriptionName,
+        config: domain::SubscriptionConfig,
+        reply: flume::Sender<Result<domain::SubscriptionConfig, AtomSubscriptionOwnerError>>,
+    },
     GetAtomSubscription {
         namespace: NamespaceName,
         topic: EntityPath,
@@ -655,6 +662,18 @@ impl Broker {
                         } => {
                             let _ = reply
                                 .send(proposer.get_atom_subscription(&namespace, &topic, &name));
+                        }
+                        Request::UpdateAtomSubscription {
+                            namespace,
+                            topic,
+                            name,
+                            config,
+                            reply,
+                        } => {
+                            let _ = reply.send(
+                                proposer
+                                    .update_atom_subscription(&namespace, &topic, &name, config),
+                            );
                         }
                         Request::DeleteAtomSubscription {
                             namespace,

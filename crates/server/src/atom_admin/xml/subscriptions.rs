@@ -9,7 +9,7 @@ mod encode;
 
 const MAX_MESSAGE_BYTES: usize = 262_144;
 
-pub(crate) use decode::decode_definition;
+pub(crate) use decode::{decode_definition, decode_update_definition};
 pub(crate) use encode::{encode_entry, encode_error};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

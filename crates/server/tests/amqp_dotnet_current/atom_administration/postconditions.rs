@@ -170,6 +170,7 @@ impl Oracle {
             AtomScenario::SubscriptionsEmpty
             | AtomScenario::SubscriptionsCreate
             | AtomScenario::SubscriptionsInspect
+            | AtomScenario::SubscriptionsUpdate
             | AtomScenario::SubscriptionsRefusals
             | AtomScenario::SubscriptionsDelete
             | AtomScenario::SubscriptionsRecreate
@@ -541,6 +542,7 @@ mod tests {
             AtomScenario::SubscriptionsEmpty,
             AtomScenario::SubscriptionsCreate,
             AtomScenario::SubscriptionsInspect,
+            AtomScenario::SubscriptionsUpdate,
             AtomScenario::SubscriptionsRefusals,
             AtomScenario::SubscriptionsDelete,
             AtomScenario::SubscriptionsRecreate,
