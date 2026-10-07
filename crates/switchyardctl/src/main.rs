@@ -26,6 +26,7 @@ use tonic::{
 };
 use url::{Host, Position, Url};
 
+mod finite_queues;
 mod maintenance;
 mod rules;
 mod topology;
@@ -33,6 +34,7 @@ mod topology;
 #[cfg(test)]
 mod authorization_tests;
 
+use finite_queues::FiniteQueueCommand;
 use rules::RuleCommand;
 use topology::{
     SubscriptionCommand, SubscriptionConfigurationOutput, TopicCommand, TopicConfigurationOutput,
@@ -74,6 +76,10 @@ enum Command {
     Compatibility,
     /// Assess this development owner's command clock without mutating state.
     MaintenanceClock,
+    FiniteQueue {
+        #[command(subcommand)]
+        command: FiniteQueueCommand,
+    },
     Queue {
         #[command(subcommand)]
         command: QueueCommand,
@@ -531,6 +537,7 @@ struct CompatibilityOutput {
     package: &'static str,
     transport: &'static str,
     version: &'static str,
+    finite_queue_operations: [&'static str; 3],
     queue_operations: [&'static str; 5],
     topic_operations: [&'static str; 5],
     subscription_operations: [&'static str; 5],
@@ -550,6 +557,7 @@ async fn execute(arguments: Arguments) -> Result<(), CliError> {
                 package: PROTOBUF_PACKAGE,
                 transport: "grpc",
                 version: env!("CARGO_PKG_VERSION"),
+                finite_queue_operations: finite_queues::OPERATIONS,
                 queue_operations: ["create", "get", "list", "update", "delete"],
                 topic_operations: ["create", "get", "list", "update", "delete"],
                 subscription_operations: ["create", "get", "list", "update", "delete"],
@@ -557,6 +565,9 @@ async fn execute(arguments: Arguments) -> Result<(), CliError> {
             });
         }
         Command::MaintenanceClock => return maintenance::execute(&arguments).await,
+        Command::FiniteQueue { command } => {
+            return finite_queues::execute(&arguments, command).await;
+        }
         Command::Topic { command } => return topology::execute_topic(&arguments, command).await,
         Command::Subscription { command } => {
             return topology::execute_subscription(&arguments, command).await;
