@@ -31,7 +31,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; closed ordinary subscription HTTPS create/get/full-update/delete under native-created topics (gated with both pinned .NET clients on both backends), plus a closed True/False no-action Atom rule create/get/list/delete profile; Azure topic administration remains unimplemented |
+| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; closed ordinary subscription HTTPS create/get/full-update/delete under native-created topics (gated with both pinned .NET clients on both backends), plus a closed True/False and bounded native SQL no-action/no-parameter Atom rule create/get/list/delete profile (library codec/owner/actual-TLS and narrow native-SQL-Get/parameter-refusal SDK regressions verified; dedicated SDK SQL lifecycle remains separate); Azure topic administration remains unimplemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD/CLI; bounded REMOVE and String/Boolean/Int64-literal SET actions with independent copies and finite local conversion-error dead letters, not full Azure/CLR actions |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -42,7 +42,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Entity configuration updates | Pre-1.0 | Atomic state-machine patches; native queue, topic, and subscription API; native generation-fenced and HTTPS full-definition replacement for finite ordinary queues; closed ordinary subscription HTTPS full-definition replacement |
 | Finite queue capacity | Pre-1.0 | Trusted owner API, separate native create/get/full-definition service, and HTTPS Atom fields for ordinary non-session, non-deduplicating queues; primary and DLQ logical reservations, paired storage, Rust AMQP socket tests, both pinned .NET administration/limit-update and WSS ingress/credit-recovery gates, explicit CLI activation; see [Finite Queue Capacity](finite-queue-capacity.md) |
 | Same-placement-group transactions | Pre-1.0 | Trusted same-queue foundation and explicit posting/messaging listeners; [same-queue .NET scopes](dotnet-transaction-scopes.md) gate warmed/cold-first immediate send and held PeekLock Complete over experimental TLS on both backends and both pinned clients. General placement-group work is not implemented; default Service Bus listeners still refuse transaction traffic |
-| Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; closed ordinary subscription create/get/full-update/delete under native-created topics is library gated with both pinned .NET clients on both backends; closed True/False no-action rule create/get/list/delete is separately gated with both pinned .NET clients on both backends; rule updates, broader Atom filters/actions, topic creation and subscription list/runtime are not implemented |
+| Atom/XML entity and rule administration | Pre-1.0 | Authenticated TLS HTTP/1 finite ordinary queue create/get/full-update/delete/list through library opt-in or dedicated CLI options, gated with both pinned .NET clients on both backends; closed ordinary subscription create/get/full-update/delete under native-created topics is library gated with both pinned .NET clients on both backends; the preceding True/False no-action rule lifecycle is separately gated with both pinned .NET clients on both backends, while bounded native SQL no-action/no-parameter library support and native-seeded SQL Get/parameter-refusal regressions are verified (dedicated SDK SQL lifecycle remains separate); rule updates, correlation filters/actions, topic creation and subscription list/runtime are not implemented |
 | Native gRPC administration | Pre-1.0 | Queue/topic/subscription create/get/list/update/delete, separate finite queue create/get/full-definition replacement, and typed rule CRUD with bounded REMOVE/literal SET actions over HTTP/2 and authenticated TLS; offline JWT Manage via library opt-in or the CLI policy-file option; optional development [maintenance clock query](development-maintenance-clock.md), not production readiness; other services not implemented |
 | Quorum replication | Pre-1.0 | An isolated [fixed-three-node in-process runtime](experimental-replica-runtime.md) exists for bounded Create/Send, but is not integrated with server listeners or the production proposer; production startup remains refused. Separate committed-queue apply, vote/log storage, and state-machine adapters retain local progress and membership in isolated replica directories. Owned storage-pair preflight validates fingerprints, membership, votes, and cleanup. The runtime exposes no snapshots or production deployment activation. Development Fjall persistence remains local only |
 | Partitioned entities | Later | Out of initial scope |
@@ -1847,9 +1847,9 @@ gates are recorded separately below; finite-queue SDK receipts remain separate.
 
 ### Library HTTPS Rule Administration
 
-The existing HTTPS listener adds closed True/False no-action rule
-create/get/list/delete under compatible ordinary subscriptions and live
-native-created topics. No listener, credential, dependency or durable format
+The existing HTTPS listener adds closed True/False and bounded native SQL
+no-action/no-parameter rule create/get/list/delete under compatible ordinary
+subscriptions and live native-created topics. No listener, credential, dependency or durable format
 changes. The exact XML, literal names, bounded list and owner semantics are in
 [Atom Rule Administration](atom-rules.md).
 
@@ -1862,7 +1862,7 @@ CreatedAt or runtime counts. Update/If-Match conditions remain unsupported.
 
 Get uses the complete bounded native rule getter before selecting a supported
 rule. List proves the whole set representable before skip/take; skipped or
-out-of-page SQL/action rules cannot be hidden by a short successful feed.
+out-of-page correlation/action rules cannot be hidden by a short successful feed.
 Create/Delete preserve healthy opaque siblings through the existing child-fenced
 planners and return without postcommit reads. Only the owned rule and Clock
 change; retained records/configurations/deadlines/identities and other rule
@@ -1877,6 +1877,9 @@ but apply nothing; malformed stored rule values in mutations retain original
 after-stamp planner priority. HTTP authentication still reads the epoch and
 rechecks the original grant immediately before starting the async owner operation.
 It does not revoke already-admitted work on timeout or cancellation.
+
+The following library and SDK receipts describe the preceding True/False-only
+wire profile, including its SQL refusals; they do not verify the SQL extension.
 
 Preceding library verification: the complete focused run passed 493 cases with 19 existing
 opt-ins ignored across four server targets, preserving all preceding 428P/19I
@@ -1907,6 +1910,10 @@ same-domain replay and named-store reopen retain their earlier limitations;
 no ambiguous-commit rollback or universal shutdown guarantee follows.
 
 ### Official .NET Rule Administration
+
+This preceding receipt describes the True/False wire profile before bounded SQL
+projection. Its selected native SQL refusals are historical, not current SQL
+compatibility or SQL Create/List/Delete lifecycle evidence.
 
 Both Service Bus .NET SDK versions 7.21.0 and 7.20.2 separately passed the closed
 True/False no-action rule lifecycle gate on Memory and Fjall, using named-key
@@ -1950,10 +1957,73 @@ Only the one regular replay-isolation case and two ignored rule gates were added
 All 119 CLI test results across eight owners and eight executables were unchanged;
 that is Rust regression coverage, not a CLI-launched SDK gate. Domain/store
 layouts remain 17/11. The other nineteen opt-ins were not rerun; all twenty-one
-remain ignored in the regular workspace suite. This current receipt does not
+remain ignored in the regular workspace suite. That preceding receipt does not
 replace the historical library result above or certify SDK message flow, rule
 dates, multipage rule listing, production readiness, CLI activation or general Azure
 administration.
+
+### Bounded SQL Rule Administration
+
+The closed rule profile also accepts an exact bare Service Bus SqlFilter with
+an explicit matching Name, XML-legal source and absent/empty Parameters. It uses
+native semantic version 1 and the existing compiler, not a new SQL grammar or
+wire action/parameter model. Original once-decoded source is retained without
+trim/case folding or relabeling SQL `1=1`/`1=0` as Boolean types. Existing limits are
+1,024 UTF-16 units, 4,096 UTF-8 bytes, 128 physical tokens/nodes, depth 32 and 32 IN
+items; complete-set compilation/evaluation budgets remain native. Correlation
+filters, nonempty Parameters, every Action and Rule Update remain unsupported.
+
+Raw XML 1.0 CR/CRLF normalizes once to LF; numeric `&#13;` survives as CR. Replies
+escape retained CR numerically, count source bytes in their sixfold preflight
+and preserve the exact source with empty Parameters. This describes codec/raw HTTP
+fidelity only, not original SDK-constructor CR preservation through its writer.
+No normalization of an expected SDK source is allowed to hide that boundary.
+
+Get completes stored-set health/compilation before selected projection. List
+proves every stored rule representable before skip/take, including rows outside
+the requested page. Action is rejected before constructing an action-free DTO.
+Create/Delete preserve healthy opaque correlation/action siblings and the
+original rule-plus-Clock mutation/retained-state semantics. Invalid desired SQL
+syntax/unsupported grammar/compile-limit failures map 400: HTTP decoding rejects
+before BrokerHandle, while direct DTO validation runs inside the owner turn
+before child/profile admission and stamping. Current stored compilation faults
+map 500; mutators retain original after-stamp planner priority. Native rule-count,
+stored-byte and XML-work 503, header 431, HTTP admission 400 and reply-limit 500
+remain unchanged, with static redacted diagnostics.
+
+Verification passed on the same seven changed source images and twenty-five
+unchanged library/test images throughout nine serial gates: the complete focused
+run, both separately executed Rule SDK gates, strict workspace lint and all-target
+builds with default and all features, formatting and the full workspace suite.
+Source images were checked before and after each gate. All nine closed
+successfully using two CPU cores and two build jobs in the shared cache. The
+focused run passed 510P/0F/21I across four targets, retaining all 515
+preceding result rows with statuses, ignored reasons and multiplicities. The only
+additions are six codec, six Memory/Fjall owner and four actual-TLS
+SQL cases. The full workspace passed 6,003P/0F/21I across 162 groups, retaining all
+6,008 preceding rows with statuses, reasons and multiplicities; only the same
+sixteen regular cases were added. All 119 CLI results across eight owners and
+eight executables are unchanged. Domain/store layouts remain 17/11, with no
+dependency or CLI-flag change.
+
+The admitted counts use the durable revalidated nine-gate run after a runtime
+observation interruption. The interrupted earlier workspace execution is not a pass,
+and retained earlier focused/SDK logs are not double-counted.
+
+Both existing Rule SDK gates separately passed with pins 7.21.0 and 7.20.2 on
+Memory and Fjall with both constructors. Their twelve-stage sequence is unchanged:
+forty-eight completed children, ninety-six loaded assembly observations and
+successful stage/cleanup outcomes overall. The narrow amendment reads native
+SQL `1=0` as an exact concrete SqlRuleFilter with empty Parameters and null Action,
+and refuses nonempty SQL Parameters without owner effects. It does not certify
+an SDK SQL Create/List/Delete lifecycle. Versions and all four owned-file
+fingerprints match the preceding subscription SDK table; replay, custody,
+memory-image and cleanup qualifications remain unchanged. The other nineteen SDK
+opt-ins were not rerun, and all twenty-one remain ignored in the regular workspace
+suite. The preceding 493/19, 5,986/19, 494/21 and 5,987/21 receipts remain historical.
+No dates, multipage paging, SDK message-selection/settlement, CLI activation,
+production readiness or general Azure SQL claim is added. See
+[Bounded SQL Profile](atom-rules.md#bounded-sql-profile).
 
 ### Official .NET Subscription Administration
 

@@ -11,7 +11,7 @@ The opt-in HTTPS administration listener provides a closed create/get/full-updat
 | Get, including existence checks | GET /{topic}/Subscriptions/{name} | 200 with static configuration, or 404 |
 | Delete | DELETE /{topic}/Subscriptions/{name}, empty body | Empty 200 after the existing deletion commits |
 
-Every request requires `api-version=2024-05` or `2021-05`. Get accepts absent `enrich` or `enrich=False` only. Only a singleton `If-Match: *` selects full update; other or duplicate conditions are refused. Subscription list/paging, runtime properties and topic creation are unsupported. The separate [Atom Rule Administration](atom-rules.md) profile supports True/False no-action rule create/get/list/delete, not rule updates or broader native filters/actions. A primary queue literally named `topic/Subscriptions` or `topic/subscriptions` keeps its existing ordinary queue lookup contract; omission of subscription listing does not reserve that path or guarantee a particular collection-route status.
+Every request requires `api-version=2024-05` or `2021-05`. Get accepts absent `enrich` or `enrich=False` only. Only a singleton `If-Match: *` selects full update; other or duplicate conditions are refused. Subscription list/paging, runtime properties and topic creation are unsupported. The separate [Atom Rule Administration](atom-rules.md) profile supports True/False and bounded native SQL no-action/no-parameter rule create/get/list/delete, not rule updates, correlation filters or actions. A primary queue literally named `topic/Subscriptions` or `topic/subscriptions` keeps its existing ordinary queue lookup contract; omission of subscription listing does not reserve that path or guarantee a particular collection-route status.
 
 ## Definition Profile
 

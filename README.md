@@ -248,9 +248,12 @@ subscription create/get/full-update/delete profile under native-created topics.
 Subscription listing and runtime properties are excluded; see
 [Atom Subscription Administration](docs/atom-subscriptions.md) for scope and
 the verified library profile and separate SDK verification status. A closed
-[Atom Rule Administration](docs/atom-rules.md) profile adds True/False no-action
-rule create/get/list/delete, separately gated with both pinned .NET clients on
-Memory and Fjall; broader filters/actions remain native/AMQP.
+[Atom Rule Administration](docs/atom-rules.md) profile adds True/False and bounded
+native SQL no-action/no-parameter rule create/get/list/delete. The SQL library
+profile passed codec, owner and actual-TLS checks; both pinned .NET clients on
+Memory and Fjall verified native-seeded SQL Get and parameter refusal. Dedicated
+SDK SQL Create/List/Delete lifecycle remains separate. Correlation filters and
+actions remain native/AMQP.
 
 The CLI also supports `queue list` and `queue update`, and emits JSON. Topics
 and subscriptions have separate create/get/list/update commands:
