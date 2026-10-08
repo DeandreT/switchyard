@@ -1270,6 +1270,7 @@ async fn healthy_named_and_next_available_handoffs_echo_and_register_the_exact_g
                         ReceivingLinkProtocol {
                             authorization: None,
                             management: Arc::clone(&management),
+                            session_registration: None,
                         },
                     ),
                 )

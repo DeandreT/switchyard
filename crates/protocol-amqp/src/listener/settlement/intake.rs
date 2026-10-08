@@ -20,6 +20,7 @@ pub(super) type RawReceiveResult = Result<CommandOutcome, BrokerRejection>;
 pub(super) struct ReceivePacket {
     pub(super) reservation: CreditReservation,
     pub(super) result: Option<RawReceiveResult>,
+    pub(super) panicked: bool,
 }
 
 pub(super) struct ReceiveIntake<'a> {
@@ -27,6 +28,7 @@ pub(super) struct ReceiveIntake<'a> {
     actual: Option<Pin<Box<dyn Future<Output = RawReceiveResult> + Send + 'a>>>,
     started: bool,
     retired: bool,
+    panicked: bool,
     result: Option<RawReceiveResult>,
 }
 
@@ -40,6 +42,7 @@ impl<'a> ReceiveIntake<'a> {
             actual: Some(Box::pin(actual)),
             started: false,
             retired: false,
+            panicked: false,
             result: None,
         }
     }
@@ -49,30 +52,36 @@ impl<'a> ReceiveIntake<'a> {
     }
 
     /// A dropped observer leaves the original future, credit, and any completed
-    /// result in this owner. None means retirement before the first poll only.
+    /// result in this owner. A panicked original is terminal, never re-polled.
     pub(super) async fn observe(&mut self) -> Option<&RawReceiveResult> {
         assert!(
             self.reservation.is_some(),
             "cannot observe a consumed receive intake"
         );
-        if self.retired && !self.started {
+        if self.panicked || (self.retired && !self.started) {
             return None;
         }
         if self.result.is_none() {
             poll_fn(|context| {
                 self.started = true;
-                match self
-                    .actual
-                    .as_mut()
-                    .expect("receive intake must retain its original future")
-                    .as_mut()
-                    .poll(context)
-                {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(result) => {
+                let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.actual
+                        .as_mut()
+                        .expect("receive intake must retain its original future")
+                        .as_mut()
+                        .poll(context)
+                }));
+                match polled {
+                    Ok(Poll::Pending) => Poll::Pending,
+                    Ok(Poll::Ready(result)) => {
                         self.result = Some(result);
                         self.actual = None;
                         Poll::Ready(())
+                    }
+                    Err(payload) => {
+                        self.panicked = true;
+                        self.actual = None;
+                        std::panic::resume_unwind(payload)
                     }
                 }
             })
@@ -100,6 +109,7 @@ impl<'a> ReceiveIntake<'a> {
         Some(ReceivePacket {
             reservation: self.reservation.take()?,
             result: self.result.take(),
+            panicked: self.panicked,
         })
     }
 }

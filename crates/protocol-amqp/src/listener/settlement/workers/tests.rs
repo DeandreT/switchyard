@@ -638,6 +638,7 @@ async fn natural_pump_joins_commit_before_releasing_its_held_session() {
             let protocol = ReceivingLinkProtocol {
                 authorization: None,
                 management: Arc::clone(&management),
+                session_registration: None,
             };
             let mut pump = tokio::spawn(serve_receiving_client(
                 sender,

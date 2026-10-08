@@ -25,6 +25,7 @@ pub(super) struct TransferPacket {
     pub(super) result: Option<RawTransferResult>,
     pub(super) started: bool,
     pub(super) retired: bool,
+    pub(super) panicked: bool,
 }
 
 pub(super) struct PendingTransfer<'a> {
@@ -32,6 +33,7 @@ pub(super) struct PendingTransfer<'a> {
     actual: Option<Pin<Box<dyn Future<Output = RawTransferResult> + Send + 'a>>>,
     started: bool,
     retired: bool,
+    panicked: bool,
     result: Option<RawTransferResult>,
 }
 
@@ -45,6 +47,7 @@ impl<'a> PendingTransfer<'a> {
             actual: Some(Box::pin(actual)),
             started: false,
             retired: false,
+            panicked: false,
             result: None,
         }
     }
@@ -54,30 +57,37 @@ impl<'a> PendingTransfer<'a> {
     }
 
     /// Cancellation drops only this borrower, not the original native start.
-    /// None means retirement before its first poll, not a failed transfer.
+    /// None means unpolled retirement or a poisoned original; the packet's
+    /// panicked flag distinguishes them. Neither is a fabricated transfer error.
     pub(super) async fn observe(&mut self) -> Option<&RawTransferResult> {
         assert!(
             self.delivery.is_some(),
             "cannot observe a consumed pending transfer"
         );
-        if self.retired && !self.started {
+        if self.panicked || (self.retired && !self.started) {
             return None;
         }
         if self.result.is_none() {
             poll_fn(|context| {
                 self.started = true;
-                match self
-                    .actual
-                    .as_mut()
-                    .expect("pending transfer must retain its original native future")
-                    .as_mut()
-                    .poll(context)
-                {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(result) => {
+                let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.actual
+                        .as_mut()
+                        .expect("pending transfer must retain its original native future")
+                        .as_mut()
+                        .poll(context)
+                }));
+                match polled {
+                    Ok(Poll::Pending) => Poll::Pending,
+                    Ok(Poll::Ready(result)) => {
                         self.result = Some(result);
                         self.actual = None;
                         Poll::Ready(())
+                    }
+                    Err(payload) => {
+                        self.panicked = true;
+                        self.actual = None;
+                        std::panic::resume_unwind(payload)
                     }
                 }
             })
@@ -113,6 +123,7 @@ impl<'a> PendingTransfer<'a> {
             result: self.result.take(),
             started: self.started,
             retired: self.retired,
+            panicked: self.panicked,
         })
     }
 }

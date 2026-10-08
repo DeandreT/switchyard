@@ -185,7 +185,12 @@ The pump also retains one original Receive and its reserved credit through
 natural teardown. Never-polled work is discarded; a polled attempt is drained
 and cached before residual route/session cleanup. Late results cause no Transfer
 or implicit settlement: PeekLock waits for expiry; ReceiveAndDelete can be lost.
-Cancelled borrowed observers retain custody, not an aborted parent task.
+An outer receiving-pump panic also retains originals and completed packets.
+Cleanup drains intake/native/workers, conditionally removes captured registrations,
+then observes one lazy original session release before resuming the primary panic.
+Cancelled borrowed cleanup retains each phase and raw result. A panicked original
+is terminal-marked without repoll, retry or fabricated success; its accepted work
+is not recovered. This does not protect an aborted ancestor or bound cleanup time.
 
 Once native transfer starts, teardown retains its original future, Delivery and
 reservation. Intake, transfer and workers retire before drains; a late Pending
@@ -225,8 +230,8 @@ native stop. CBS retains the original begun token validation/store and native
 operations, without rolling back installed grants or retrying a selected reply
 route. Retirement starts no new acknowledgement or second confirmation; every
 returned reply exit closes and identity-unregisters its captured channel.
-CBS bootstrap does not wait for an existing authorization grant. Panic-safe
-settlement custody (#111), task trees (#75) and
+CBS bootstrap does not wait for an existing authorization grant. Send/CBS/management
+panic custody (#127-#129), task trees (#75) and
 process shutdown remain [roadmap work](roadmap.md#next-main-increments); stalled
 broker/I/O can delay cleanup. These guarantees do not cover an aborted ancestor.
 

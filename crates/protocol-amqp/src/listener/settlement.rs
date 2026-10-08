@@ -10,6 +10,7 @@ use domain::{
     CommandKind, CommandOutcome, Delivery, EntityPath, LockToken, NamespaceName, ReceiveMode,
     SessionHold,
 };
+use futures_util::FutureExt;
 use serde_amqp::{Value, primitives::Symbol};
 use tokio::sync::watch;
 use tracing::{debug, warn};
@@ -25,6 +26,7 @@ use super::{
 
 #[cfg(test)]
 mod attachment_handoff_tests;
+mod custody;
 #[cfg(test)]
 mod delivery_owner_tests;
 #[cfg(test)]
@@ -32,10 +34,14 @@ mod ingress_tests;
 mod intake;
 mod pending_transfer;
 #[cfg(test)]
+mod receiving_custody_tests;
+#[cfg(test)]
 mod test_support;
 mod workers;
+use custody::{OriginalCleanup, ReceivingCustody};
 use intake::ReceiveIntake;
 use pending_transfer::PendingTransfer;
+#[cfg(test)]
 use workers::SettlementWorkers;
 
 /// How long a receiving link waits on a wakeup before asking the broker anyway.
@@ -95,6 +101,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
     let ReceivingLinkProtocol {
         authorization,
         management,
+        session_registration,
     } = protocol;
     let link_name = sender.name().to_owned();
     let settlement_context = SettlementContext {
@@ -104,15 +111,19 @@ pub(super) async fn serve_receiving_client<B: Broker>(
         authorization: authorization.clone(),
         management: management.clone(),
     };
-    let mut in_flight = SettlementWorkers::new();
-    let mut intake = None;
-    let mut transfer = None;
-    let mut transfer_registration = None;
-    let mut registered_deliveries = Vec::new();
+    let mut custody =
+        ReceivingCustody::new(&settlement_context, session.clone(), session_registration);
     let detached = sender.on_detach_owned();
     tokio::pin!(detached);
 
-    let exit = 'pump: loop {
+    // The pump borrows custody: unwinding it cannot drop admitted originals.
+    let pumped = std::panic::AssertUnwindSafe(observe_pump(async {
+    let ReceivingCustody {
+        workers: in_flight, intake, received, transfer, transferred,
+        transfer_registration, registrations: registered_deliveries,
+        credit_release, ..
+    } = &mut custody;
+    'pump: loop {
         if in_flight.len() == MAX_IN_FLIGHT_DELIVERIES {
             tokio::select! {
                 biased;
@@ -130,7 +141,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                 completion = in_flight.next() => {
                     let completion = completion
                         .expect("a full in-flight set cannot end before yielding a completion");
-                    if let Some(exit) = handle_completion(completion, &mut registered_deliveries) {
+                    if let Some(exit) = handle_completion(completion, registered_deliveries) {
                         break 'pump exit;
                     }
                 }
@@ -153,7 +164,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                     completion = in_flight.next(), if !in_flight.is_empty() => {
                         let completion = completion
                             .expect("a non-empty in-flight set must yield a completion");
-                        if let Some(exit) = handle_completion(completion, &mut registered_deliveries) {
+                        if let Some(exit) = handle_completion(completion, registered_deliveries) {
                             break 'pump exit;
                         }
                     }
@@ -178,7 +189,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
         }
         let wakeup = broker.deliverable(&namespace, &entity);
         tokio::pin!(wakeup);
-        intake = Some(ReceiveIntake::new(reservation, async {
+        *intake = Some(ReceiveIntake::new(reservation, async {
             broker
                 .submit(
                     namespace.clone(),
@@ -203,7 +214,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                     completion = in_flight.next(), if !in_flight.is_empty() => {
                         let completion = completion
                             .expect("a non-empty in-flight set must yield a completion");
-                        if let Some(exit) = handle_completion(completion, &mut registered_deliveries) {
+                        if let Some(exit) = handle_completion(completion, registered_deliveries) {
                             break 'pump exit;
                         }
                     }
@@ -211,19 +222,27 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                 }
             }
         }
-        let packet = intake
-            .take()
+        *received = intake
+            .as_mut()
             .expect("one reserved Receive attempt")
-            .take_packet()
-            .expect("the observed Receive owns a packet");
-        let reservation = packet.reservation;
-        let fetched = packet.result.expect("active Receive was not retired");
+            .take_packet();
+        #[cfg(test)]
+        custody::pump_checkpoint(custody::PanicFrontier::ReceivePacket);
+        let packet = received.as_ref().expect("the observed Receive owns a packet");
+        let fetched = packet.result.as_ref().expect("active Receive was not retired").clone();
         let delivery = match received_delivery(fetched) {
             Ok(Some(delivery)) => delivery,
             Ok(None) => {
-                if let Err(error) = reservation.release().await {
+                let packet = received.take().expect("retained empty Receive packet");
+                *credit_release = Some(OriginalCleanup::new(packet.reservation.release()));
+                *intake = None;
+                let original = credit_release.as_mut().expect("retained original credit release");
+                original.finish().await;
+                if let Some(payload) = original.take_panic() { std::panic::resume_unwind(payload); }
+                if let Some(Err(error)) = original.take_result() {
                     break 'pump PumpExit::Engine(error);
                 }
+                *credit_release = None;
                 let fallback = tokio::time::sleep(EMPTY_QUEUE_FALLBACK);
                 tokio::pin!(fallback);
                 loop {
@@ -235,7 +254,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                         completion = in_flight.next(), if !in_flight.is_empty() => {
                             let completion = completion
                                 .expect("a non-empty in-flight set must yield a completion");
-                            if let Some(exit) = handle_completion(completion, &mut registered_deliveries) {
+                            if let Some(exit) = handle_completion(completion, registered_deliveries) {
                                 break 'pump exit;
                             }
                         }
@@ -266,7 +285,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
             Err(error) => break 'pump PumpExit::Protocol(error),
         };
         let lock_token = delivery.lock.map(|lock| lock.token);
-        transfer_registration = if let Some(lock) = delivery.lock {
+        *transfer_registration = if let Some(lock) = delivery.lock {
             let registration = management
                 .register_delivery(&link_name, entity.clone(), delivery.sequence, lock.token)
                 .await;
@@ -283,10 +302,12 @@ pub(super) async fn serve_receiving_client<B: Broker>(
         // `send_pending` resolves only after this transfer consumed remote
         // credit and was written. Existing remote outcomes remain live while
         // it waits, so slow credit cannot serialize unrelated settlements.
-        transfer = Some(PendingTransfer::new(
+        let packet = received.take().expect("retained Receive packet before native handoff");
+        *transfer = Some(PendingTransfer::new(
             delivery,
-            sender.send_pending_with_credit(reservation, message, delivery_tag),
+            sender.send_pending_with_credit(packet.reservation, message, delivery_tag),
         ));
+        *intake = None;
         {
             let original = transfer.as_mut().expect("one retained native start");
             loop {
@@ -299,7 +320,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                     completion = in_flight.next(), if !in_flight.is_empty() => {
                         let completion = completion
                             .expect("a non-empty in-flight set must yield a completion");
-                        if let Some(exit) = handle_completion(completion, &mut registered_deliveries) {
+                        if let Some(exit) = handle_completion(completion, registered_deliveries) {
                             break 'pump exit;
                         }
                     }
@@ -307,19 +328,24 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                 }
             }
         }
-        let packet = transfer
-            .take()
+        *transferred = transfer
+            .as_mut()
             .expect("one retained native start")
-            .take_packet()
-            .expect("the observed native start owns a packet");
+            .take_packet();
+        #[cfg(test)]
+        custody::pump_checkpoint(custody::PanicFrontier::TransferPacket);
+        let packet = transferred.as_ref().expect("the observed native start owns a packet");
         debug_assert!(packet.started && !packet.retired);
-        let pending = match packet.result.expect("active native start was not retired") {
-            Ok(pending) => pending,
-            Err(error) => {
+        if let Some(Err(error)) = packet.result.as_ref() {
                 debug!(sequence = %packet.delivery.sequence, %error, "native start failed after broker delivery");
+                let packet = transferred.take().expect("retained failed native packet");
+                let Err(error) = packet.result.expect("failed native result") else { unreachable!() };
+                *transfer = None;
                 break 'pump PumpExit::Engine(error);
-            }
-        };
+        }
+        let packet = transferred.take().expect("retained successful native packet");
+        *transfer = None;
+        let Ok(pending) = packet.result.expect("active native start was not retired") else { unreachable!() };
         let delivery = packet.delivery;
         let registration = transfer_registration.take();
         let retirement = in_flight.subscribe();
@@ -333,113 +359,22 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                 retirement,
             ),
         );
+    }
+    })).catch_unwind().await;
+    let exit = match pumped {
+        Ok(exit) => Some(exit),
+        Err(payload) => {
+            custody.record_primary(payload);
+            None
+        }
     };
 
-    // Retire transport-only waits, but drain every original worker before
-    // releasing routes or the session. A submitted broker operation must not
-    // lose its result merely because the remote link has gone away.
-    if let Some(original) = intake.as_mut() {
-        original.retire();
+    custody.finish(&settlement_context).await;
+    if let Some(payload) = custody.take_panic() {
+        std::panic::resume_unwind(payload);
     }
-    if let Some(original) = transfer.as_mut() {
-        original.retire();
-    }
-    in_flight.retire();
-    if let Some(original) = intake.as_mut() {
-        debug!(
-            started = original.started(),
-            "draining retired Receive intake"
-        );
-        if let Some(result) = original.finish().await {
-            match result {
-                Ok(CommandOutcome::Received(delivery)) => {
-                    debug!(sequence = ?delivery.as_ref().map(|delivery| delivery.sequence), "retired Receive result observed without transfer");
-                }
-                Ok(other) => warn!(?other, "retired Receive produced an unexpected outcome"),
-                Err(rejection) => debug!(%rejection, "retired Receive was rejected"),
-            }
-        }
-    }
-    if let Some(original) = transfer.as_mut() {
-        debug!(
-            started = original.started(),
-            "draining retired native transfer"
-        );
-        let _ = original.finish().await;
-        let packet = original
-            .take_packet()
-            .expect("finished native start owns one terminal packet");
-        debug!(
-            started = packet.started,
-            retired = packet.retired,
-            "retired native start result observed"
-        );
-        match packet.result {
-            Some(Ok(pending)) => {
-                let registration = transfer_registration.take();
-                let retirement = in_flight.subscribe();
-                in_flight.adopt_retired(
-                    registration.clone(),
-                    settle_started_delivery(
-                        pending,
-                        packet.delivery,
-                        registration,
-                        settlement_context.clone(),
-                        retirement,
-                    ),
-                );
-            }
-            Some(Err(error)) => {
-                debug!(sequence = %packet.delivery.sequence, %error, "retired native start failed");
-            }
-            None => {
-                debug!(sequence = %packet.delivery.sequence, "retired native start was never polled");
-            }
-        }
-    }
-    in_flight.finish().await;
-    if let Some(original) = intake.as_mut() {
-        // Retired transport cannot consume this credit. Drop uses the original
-        // identity on the engine's unbounded cleanup path, not a new wait.
-        drop(original.take_packet());
-    }
-    for joined in in_flight.finished() {
-        match &joined.result {
-            Ok(completion) => {
-                if let Some(registration) = completion.registration.as_ref() {
-                    registered_deliveries.retain(|retained| retained != registration);
-                }
-                match &completion.result {
-                    Ok(()) => {}
-                    Err(SettlementFailure::Unauthorized) => {
-                        debug!(task = %joined.id, "retired settlement lost authorization");
-                    }
-                    Err(SettlementFailure::Engine(error)) => {
-                        debug!(task = %joined.id, %error, "retired settlement transport failed");
-                    }
-                    Err(SettlementFailure::Protocol(error)) => {
-                        warn!(task = %joined.id, %error, "retired settlement conversion failed");
-                    }
-                }
-            }
-            Err(error) => {
-                warn!(task = %joined.id, token = ?joined.lock_token, %error, "settlement worker failed while draining");
-            }
-        }
-    }
-    for failed in in_flight.failures() {
-        debug_assert_eq!(
-            failed.lock_token,
-            failed
-                .registration
-                .as_ref()
-                .map(DeliveryRegistration::lock_token)
-        );
-        warn!(task = %failed.id, token = ?failed.lock_token, error = %failed.error, "settlement worker failed during intake");
-    }
-    unregister_deliveries(&management, &mut registered_deliveries).await;
-    release_session(&broker, &namespace, &entity, session.as_ref()).await;
-    let join_error = in_flight.into_join_error();
+    let join_error = custody.workers.into_join_error();
+    let exit = exit.expect("a panicked pump is reported after original cleanup");
 
     match exit {
         // The engine already answered a remote Detach before surfacing the
@@ -480,6 +415,22 @@ pub(super) async fn serve_receiving_client<B: Broker>(
             let _ = sender.close().await;
             Err(error.into())
         }
+    }
+}
+
+async fn observe_pump<F: std::future::Future>(pump: F) -> F::Output {
+    #[cfg(test)]
+    {
+        tokio::pin!(pump);
+        std::future::poll_fn(|context| {
+            custody::pump_poll(context);
+            pump.as_mut().poll(context)
+        })
+        .await
+    }
+    #[cfg(not(test))]
+    {
+        pump.await
     }
 }
 

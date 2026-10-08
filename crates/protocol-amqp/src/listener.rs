@@ -26,8 +26,8 @@ use crate::{
     authorization::{ConnectionAuthorization, SharedAccessSaslAcceptor},
     cbs::{serve_cbs_replies, serve_cbs_requests},
     management::{
-        ConnectionManagement, ManagementAuthorization, serve_management_replies,
-        serve_management_requests,
+        ConnectionManagement, ManagementAuthorization, SessionRegistration,
+        serve_management_replies, serve_management_requests,
     },
     parse_attachment, read_incoming_messages,
     websocket::accept_amqp_websocket,
@@ -569,12 +569,10 @@ async fn serve_session<B: Broker>(
                         ReceivingLinkProtocol {
                             authorization: link_authorization,
                             management: Arc::clone(&connection_management),
+                            session_registration: registration,
                         },
                     )
                     .await;
-                    if let Some(registration) = registration.as_ref() {
-                        connection_management.unregister_session(registration).await;
-                    }
                     if let Err(error) = result {
                         warn!(%error, "receiving link ended");
                     }
@@ -595,6 +593,7 @@ struct LinkAuthorization {
 struct ReceivingLinkProtocol {
     authorization: Option<LinkAuthorization>,
     management: Arc<ConnectionManagement>,
+    session_registration: Option<SessionRegistration>,
 }
 
 fn session_attach_properties(accepted: &AcceptedSession) -> Fields {

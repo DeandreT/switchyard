@@ -30,6 +30,7 @@ own live assignments, acceptance and full dependencies.
 - [x] Original CBS token/native custody and captured reply cleanup (#86); pump coordinator #74 complete
 - [x] Owned original End observation retires attachment/receiving preparation (#110)
 - [x] Captured delivery identities fence registry cleanup and renewal (#117)
+- [x] Outer receiving-pump panic retains original work, packets and cleanup phases (#111); ancestor abortion remains pending
 - [x] Pure offline JWT policy and issuer-qualified grants (#8); [consumers/activation pending](offline-jwt.md)
 - [x] Pure bounded SQL predicates, IN/LIKE and scalar arithmetic (#11/#95/#96/#97); [rule integration pending](sql-predicates.md)
 - [x] Bounded Linux SDK child runs and loaded-file custody (#99)
@@ -47,11 +48,12 @@ or administration certification. See [SDK gates](sdk-gates.md) and [compatibilit
 
 ## Next Main Increments
 
-1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7): #111 receiving panic custody,
-   with independent CBS #128 and management #129. [#75](https://github.com/DeandreT/switchyard/issues/75)
-   owns ordered #127-#133 leaf/ancestor children and completes #63.
+1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7): independent CBS #128
+   and management #129. [#75](https://github.com/DeandreT/switchyard/issues/75)
+   owns ordered #127-#133 leaf/ancestor children, with early-fault notice #139 before
+   link-family #132, and completes #63.
    [#64](https://github.com/DeandreT/switchyard/issues/64) owns #134 listener -> #135 limits
-   -> #136 aggregate deadline, then #65 signals. #117 is merged; child issues own dependencies.
+   -> #136 aggregate deadline, then #65 signals. #111/#117 are merged; child issues own dependencies.
 2. After #7, complete [#12](https://github.com/DeandreT/switchyard/issues/12):
    retained sender #57 -> receiver/settlement #58 -> sessions #59 -> management
    #60. Merged #56 alone is not retained wire authority.
@@ -72,13 +74,13 @@ Integration paths, not every prerequisite. Nodes beyond merged foundations are p
 
 ```mermaid
 flowchart TD
-    Main["Merged foundations/custody; #74/#110/#117 complete"] --> Panic["#111 Panic-safe settlement custody"]
+    Main["Merged foundations/custody; #74/#110/#111/#117 complete"] --> Send["#127 Send panic custody"]
     Main --> Leaves["#128 CBS / #129 Management panic custody"]
-    Panic --> Send["#127 Send panic custody"]
-    Panic --> Native["#130 Native -> #131 Attachments"]
-    Leaves --> Trees["#132 Links -> #133 Sessions / finish #75/#63"]
-    Send --> Trees
-    Native --> Trees
+    Main --> Native["#130 Native -> #131 Attachments"]
+    Leaves --> Fault["#139 Early leaf-fault notification"]
+    Send --> Fault
+    Native --> Fault
+    Fault --> Trees["#132 Links -> #133 Sessions / finish #75/#63"]
     Trees --> Admission["#134 Listener -> #135 Limits -> #136 Deadline / finish #64"]
     Admission --> Signals["#65 Signal shutdown / finish #7"]
     Signals --> Authority["#57 -> #58 -> #59 -> #60 / finish #12"]
@@ -116,7 +118,7 @@ chain. Split multi-PR work into child issues before implementation.
 
 | Lane | Entry And Boundary |
 | --- | --- |
-| Receiving/ancestors | [#111](https://github.com/DeandreT/switchyard/issues/111), then ordered #127/#130-#133; serialize listener/native/registry edits |
+| Receiving/ancestors | #111 receiving panic custody complete; ordered #127/#130-#133/#139 remain. Serialize listener/native/registry edits |
 | Leaf panic custody | [#128](https://github.com/DeandreT/switchyard/issues/128) CBS and [#129](https://github.com/DeandreT/switchyard/issues/129) management are ready on distinct paths; coordinate authorization.rs |
 | SQL | #11 pure kernel complete; [#20](https://github.com/DeandreT/switchyard/issues/20) filters waits for #16 typed content, then #21 actions. Serialize compiler/rule paths; no retained integration yet |
 | Auth activation | #8 policy merged; #71 -> #17 waits for #7. Serialize shared authorization/CBS files, not a current parallel pickup |
