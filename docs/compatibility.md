@@ -124,7 +124,12 @@ changes no storage/value/wire format. See
 Fjall fsyncs before returning applied state and preserves messages, locks,
 delivery counts, sessions, and sequence numbers across restart. It does not
 preserve them after loss of the only node; replication is absent. Memory is
-volatile. A missing format marker is stamped only when known `meta` and `records`
+volatile. Production durable startup refuses with a static replication-unavailable
+error before opening storage or listening. Development remains single-node;
+production memory keeps its existing refusal. CLI TLS/auth/storage-argument and
+cluster-validation error precedence is unchanged.
+
+A missing format marker is stamped only when known `meta` and `records`
 keyspaces are empty. Existing rows, even empty-valued ones, refuse opening
 without a marker write. Valid V1 markers retain their prior behavior. Store and
 value formats remain V1: no migration, foreign-keyspace proof, or filesystem-byte

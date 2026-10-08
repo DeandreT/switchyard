@@ -13,6 +13,7 @@ and assignment source. Milestones group work; independent lanes can run in paral
 - [x] Single-node memory/Fjall parity and fsynced durable apply
 - [x] Complete bounded listed-topic topology proof ([PR #1](https://github.com/DeandreT/switchyard/pull/1))
 - [x] Refusal of populated unversioned stores ([PR #4](https://github.com/DeandreT/switchyard/pull/4))
+- [x] Production startup refuses before storage/listeners until quorum exists ([#5](https://github.com/DeandreT/switchyard/issues/5))
 - [ ] Remaining client semantics, administration and conserved capacity
 - [ ] Real quorum, multi-tenant security, recovery and measured release gates
 
@@ -23,10 +24,9 @@ or administration certification. See [compatibility](compatibility.md).
 
 ## Next Main Increments
 
-1. Merge [#5](https://github.com/DeandreT/switchyard/issues/5): refuse production startup without quorum, before storage/listeners.
-2. Port [#6](https://github.com/DeandreT/switchyard/issues/6): private live owner metadata with an explicit durable format fence.
-3. Port [#12](https://github.com/DeandreT/switchyard/issues/12), then [#15](https://github.com/DeandreT/switchyard/issues/15): real retained authority before live deletion/recreation.
-4. Port safe configuration and typed-content increments separately, then their dependent features.
+1. Port [#6](https://github.com/DeandreT/switchyard/issues/6): private live owner metadata with an explicit durable format fence.
+2. Port [#12](https://github.com/DeandreT/switchyard/issues/12), then [#15](https://github.com/DeandreT/switchyard/issues/15): real retained authority before live deletion/recreation.
+3. Port safe configuration and typed-content increments separately, then their dependent features.
 
 `feat/amqp-message-sections` and `feat/topic-mode-metadata` remain reference
 material, not merge units. Reimplement each issue on fresh `main`, preserve its
@@ -67,8 +67,8 @@ flowchart TD
 
 ## Parallel Pickup
 
-Seven issues were ready at publication. [#5](https://github.com/DeandreT/switchyard/issues/5) is assigned for
-the next increment; the other starting lanes are available:
+The backlog began with seven ready issues. The remaining starting lanes are
+below; check live assignments before pickup. [#6](https://github.com/DeandreT/switchyard/issues/6) is claimed for the next port.
 
 | Lane | Start | Boundary |
 | --- | --- | --- |

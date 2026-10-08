@@ -51,13 +51,16 @@ pub enum NodeState {
 
 /// Validates a configuration and opens the state it names.
 ///
-/// Production is refused an in-memory store here rather than at the point a
-/// message is lost.
+/// Production refuses memory storage and unavailable quorum replication before
+/// opening a durable directory. Cluster validation keeps precedence.
 pub fn open(cluster: ClusterConfig, storage: StorageChoice) -> Result<NodeState, StartupError> {
     cluster.validate()?;
     match (cluster.mode, storage) {
         (DeploymentMode::Production, StorageChoice::Memory) => {
             Err(StartupError::MemoryStorageInProduction)
+        }
+        (DeploymentMode::Production, StorageChoice::Durable { .. }) => {
+            Err(StartupError::ReplicationUnavailableInProduction)
         }
         (_, StorageChoice::Memory) => {
             Ok(NodeState::Memory(StateMachine::new(MemoryStore::default())))
@@ -72,6 +75,8 @@ pub fn open(cluster: ClusterConfig, storage: StorageChoice) -> Result<NodeState,
 pub enum StartupError {
     #[error("production mode cannot run on in-memory storage")]
     MemoryStorageInProduction,
+    #[error("production mode requires quorum replication, which is not implemented")]
+    ReplicationUnavailableInProduction,
     #[error("the durable backend needs a data directory")]
     MissingDataDirectory,
     #[error("could not listen on {address}: {detail}")]
@@ -112,6 +117,7 @@ pub enum StartupError {
 
 #[cfg(test)]
 mod tests {
+    use storage::{StateStore, WriteBatch};
     use tempfile::TempDir;
 
     use super::*;
@@ -182,6 +188,134 @@ mod tests {
             open(development(), StorageChoice::Memory)?,
             NodeState::Memory(_)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn production_durable_is_refused_before_creating_a_directory() {
+        let parent = TempDir::new().expect("a temporary parent");
+        for voters in [3, 5] {
+            let directory = parent.path().join(format!("not-created-{voters}"));
+            assert_eq!(
+                open(
+                    ClusterConfig {
+                        mode: DeploymentMode::Production,
+                        voters,
+                    },
+                    StorageChoice::Durable {
+                        directory: directory.clone(),
+                    },
+                )
+                .err(),
+                Some(StartupError::ReplicationUnavailableInProduction),
+            );
+            assert!(!directory.exists(), "production created a data directory");
+        }
+        assert_eq!(
+            std::fs::read_dir(parent.path())
+                .expect("the parent is readable")
+                .count(),
+            0,
+        );
+    }
+
+    #[test]
+    fn production_replication_refusal_preserves_a_file_target() {
+        let parent = TempDir::new().expect("a temporary parent");
+        let directory = parent.path().join("existing-file");
+        let original = b"not a database directory";
+        std::fs::write(&directory, original).expect("an existing file target");
+        for voters in [3, 5] {
+            assert_eq!(
+                open(
+                    ClusterConfig {
+                        mode: DeploymentMode::Production,
+                        voters,
+                    },
+                    StorageChoice::Durable {
+                        directory: directory.clone(),
+                    },
+                )
+                .err(),
+                Some(StartupError::ReplicationUnavailableInProduction),
+                "replication policy must precede backend open errors",
+            );
+            assert!(directory.is_file());
+            let retained = std::fs::read(&directory).expect("the retained file");
+            assert_eq!(retained.as_slice(), original.as_slice());
+        }
+    }
+
+    #[test]
+    fn invalid_production_cluster_precedes_both_backend_refusals() {
+        let parent = TempDir::new().expect("a temporary parent");
+        let directory = parent.path().join("not-created");
+        for storage in [
+            StorageChoice::Memory,
+            StorageChoice::Durable {
+                directory: directory.clone(),
+            },
+        ] {
+            assert_eq!(
+                open(
+                    ClusterConfig {
+                        mode: DeploymentMode::Production,
+                        voters: 2,
+                    },
+                    storage,
+                )
+                .err(),
+                Some(StartupError::Cluster(
+                    cluster::ClusterConfigError::ProductionRequiresOddQuorum,
+                )),
+            );
+            assert!(!directory.exists());
+        }
+    }
+
+    #[test]
+    fn production_replication_refusal_preserves_a_populated_store() -> Result<(), StartupError> {
+        let parent = TempDir::new().expect("a temporary parent");
+        let directory = parent.path().join("populated");
+        let key = b"startup-control-record".to_vec();
+        let value = b"retained-content".to_vec();
+        let before = {
+            let state = open(
+                development(),
+                StorageChoice::Durable {
+                    directory: directory.clone(),
+                },
+            )?;
+            let NodeState::Durable(machine) = state else {
+                panic!("development must open the durable backend");
+            };
+            machine
+                .store()
+                .apply(WriteBatch::default().put(key.clone(), value.clone()))?;
+            let snapshot = machine.store().snapshot()?;
+            assert_eq!(snapshot.entries(), &[(key, value)]);
+            snapshot
+        };
+        for voters in [3, 5] {
+            assert_eq!(
+                open(
+                    ClusterConfig {
+                        mode: DeploymentMode::Production,
+                        voters,
+                    },
+                    StorageChoice::Durable {
+                        directory: directory.clone(),
+                    },
+                )
+                .err(),
+                Some(StartupError::ReplicationUnavailableInProduction),
+            );
+        }
+        let state = open(development(), StorageChoice::Durable { directory })?;
+        let NodeState::Durable(machine) = state else {
+            panic!("development must reopen the durable backend");
+        };
+        assert_eq!(machine.store().snapshot()?, before);
         Ok(())
     }
 }
