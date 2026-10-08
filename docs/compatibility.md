@@ -66,6 +66,10 @@ time consumers still await [#71](https://github.com/DeandreT/switchyard/issues/7
 JWT CBS activation remains [#17](https://github.com/DeandreT/switchyard/issues/17).
 Existing SAS/PLAIN authentication and resource-scope behavior are unchanged.
 
+The [SQL predicate kernel](sql-predicates.md) is a bounded, ephemeral typed domain
+API only. Its local grammar/error profile does not enable persisted SQL rules,
+subscription fanout or actions; #96/#97 extend it before #20 integration.
+
 ## Known Differences And Bounds
 
 | Behavior | Current contract |

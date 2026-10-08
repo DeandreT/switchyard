@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 postcard.workspace = true
 serde.workspace = true
+sqlparser.workspace = true
 storage.workspace = true
 thiserror.workspace = true
 

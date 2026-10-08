@@ -25,6 +25,7 @@ and assignment source. Milestones group work; independent lanes can run in paral
 - [x] Original inbound Send/Batch custody through data-link retirement ([#89](https://github.com/DeandreT/switchyard/issues/89)); outbound #90 remains
 - [x] Acquisition broker invocation starts inside the retained first poll ([#91](https://github.com/DeandreT/switchyard/issues/91))
 - [x] Pure offline JWT policy and issuer-qualified grants ([#8](https://github.com/DeandreT/switchyard/issues/8)); [consumers and activation remain pending](offline-jwt.md)
+- [x] Pure bounded typed SQL predicate kernel ([#95](https://github.com/DeandreT/switchyard/issues/95)); [patterns/scalars and integration remain pending](sql-predicates.md)
 - [ ] Remaining client semantics, administration and conserved capacity
 - [ ] Real quorum, multi-tenant security, recovery and measured release gates
 
@@ -115,7 +116,7 @@ pickup. Retained wire authority follows the merged core and connection-lifecycle
 | Identity policy | [#8](https://github.com/DeandreT/switchyard/issues/8) | Pure `auth` policy; no listener/CBS activation |
 | Client evidence | [#9](https://github.com/DeandreT/switchyard/issues/9) | Test harness and pin/custody records; no runtime changes |
 | Administration contract | [#10](https://github.com/DeandreT/switchyard/issues/10) | Scrubbed fixtures/closed profiles; no serving endpoint |
-| Rule compiler | [#11](https://github.com/DeandreT/switchyard/issues/11) | Isolated parser/evaluator; no command/codec/fan-out integration |
+| Rule compiler | [#11](https://github.com/DeandreT/switchyard/issues/11) | Kernel #95 -> patterns #96 -> scalars #97; no command/codec/fan-out integration |
 
 Before starting, assign the issue to yourself and check that its dependencies
 are merged. `status:ready` is a pickup hint, not permission to edit shared files.
@@ -191,7 +192,10 @@ single PR for the whole row. Update pickup labels when prerequisites merge.
 | Bounded authenticated Atom HTTPS | [#30](https://github.com/DeandreT/switchyard/issues/30) | [#10](https://github.com/DeandreT/switchyard/issues/10), [#8](https://github.com/DeandreT/switchyard/issues/8), [#7](https://github.com/DeandreT/switchyard/issues/7) |
 | Atom subscription Get | [#31](https://github.com/DeandreT/switchyard/issues/31) | [#10](https://github.com/DeandreT/switchyard/issues/10), [#6](https://github.com/DeandreT/switchyard/issues/6), [#30](https://github.com/DeandreT/switchyard/issues/30) |
 | Atom entity CRUD | [#32](https://github.com/DeandreT/switchyard/issues/32) | [#31](https://github.com/DeandreT/switchyard/issues/31), [#19](https://github.com/DeandreT/switchyard/issues/19), [#13](https://github.com/DeandreT/switchyard/issues/13), [#14](https://github.com/DeandreT/switchyard/issues/14), [#15](https://github.com/DeandreT/switchyard/issues/15) |
-| Pure bounded SQL parser/evaluator | [#11](https://github.com/DeandreT/switchyard/issues/11) | Independent |
+| Pure bounded SQL parser/evaluator | [#11](https://github.com/DeandreT/switchyard/issues/11) | Ordered children below; parent remains open until all are verified |
+| Typed predicate kernel | [#95](https://github.com/DeandreT/switchyard/issues/95) | Independent; implemented ([local profile](sql-predicates.md)) |
+| Bounded IN/LIKE predicates | [#96](https://github.com/DeandreT/switchyard/issues/96) | [#95](https://github.com/DeandreT/switchyard/issues/95); pending |
+| Scalar arithmetic/static lookup | [#97](https://github.com/DeandreT/switchyard/issues/97) | [#96](https://github.com/DeandreT/switchyard/issues/96); pending |
 | SQL filter integration | [#20](https://github.com/DeandreT/switchyard/issues/20) | [#11](https://github.com/DeandreT/switchyard/issues/11), [#16](https://github.com/DeandreT/switchyard/issues/16) |
 | SQL actions and wire projection | [#21](https://github.com/DeandreT/switchyard/issues/21) | [#20](https://github.com/DeandreT/switchyard/issues/20) |
 | Held-session settlement/renewal | [#24](https://github.com/DeandreT/switchyard/issues/24) | [#12](https://github.com/DeandreT/switchyard/issues/12) |

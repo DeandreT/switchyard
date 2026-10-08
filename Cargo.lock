@@ -358,6 +358,7 @@ version = "0.1.0"
 dependencies = [
  "postcard",
  "serde",
+ "sqlparser",
  "storage",
  "testkit",
  "thiserror",
@@ -1398,6 +1399,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.63.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3679862809bd1f92e563cf6fd820e28f39135303668001c10331d5027183e8b4"
+dependencies = [
+ "log",
 ]
 
 [[package]]
