@@ -298,14 +298,15 @@ pub(super) async fn accept_entity_link<B: Broker>(
             SessionRequest::Named(session_id) => Some(Some(session_id.clone())),
         };
         if let Some(session_id) = session_id {
-            handoff.begin_grant(broker.submit(
-                namespace.clone(),
-                prepared.entity.clone(),
-                CommandKind::AcceptSession {
-                    session_id,
-                    lock_duration_millis: None,
-                },
-            ));
+            let grant_namespace = namespace.clone();
+            let grant_entity = prepared.entity.clone();
+            let command = CommandKind::AcceptSession {
+                session_id,
+                lock_duration_millis: None,
+            };
+            handoff.begin_grant(async move {
+                broker.submit(grant_namespace, grant_entity, command).await
+            });
             let _ = handoff.observe().await;
             let grant = match handoff.take_step() {
                 Some(HandoffStep::Grant(grant)) => grant,

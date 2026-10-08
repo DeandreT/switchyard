@@ -633,3 +633,209 @@ async fn natural_terminal_drains_receive_before_releasing_an_already_held_sessio
         }
     }).await.expect("original test observer task joined");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eager_actual_receive_returns_before_exact_session_cleanup_and_reopen() {
+    use crate::listener::settlement::test_support::{
+        EagerAcquisitionBroker, EagerEvent, EagerTarget, acquisition_counters, assert_eager_release,
+    };
+    use std::sync::Arc;
+
+    for durable in [false, true] {
+        for mode in [ReceiveMode::PeekLock, ReceiveMode::ReceiveAndDelete] {
+            let actor = Actor::new(durable, true);
+            let session_id = SessionId::new("eager-receive").unwrap();
+            let sequence = actor.send("eager-receive", Some(session_id.clone()));
+            let CommandOutcome::SessionAccepted(Some(accepted)) =
+                actor.intent(CommandKind::AcceptSession {
+                    session_id: Some(session_id),
+                    lock_duration_millis: None,
+                })
+            else {
+                panic!("actual fixture session grant");
+            };
+            let hold = accepted.hold();
+            let before_counters = acquisition_counters(&actor);
+            actor.clock.set(2_000);
+            arm_receive(&actor, mode, sequence);
+            let actor = Arc::new(actor);
+            let broker = EagerAcquisitionBroker::new(Arc::clone(&actor), EagerTarget::Receive);
+            let guard = broker.guard();
+            let mut wire = Wire::new_with_credit(ReceiverSettleMode::First, 1).await;
+            let sender = wire.sender.take().unwrap();
+            let (borrowed_done, borrowed) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let mut original = {
+                let actor = Arc::clone(&actor);
+                let broker = broker.clone();
+                let hold = hold.clone();
+                tokio::spawn(async move {
+                    let mut helper = Box::pin(serve_receiving_client(
+                        sender,
+                        actor.namespace.clone(),
+                        actor.entity.clone(),
+                        broker.clone(),
+                        mode,
+                        Some(hold),
+                        ReceivingLinkProtocol {
+                            authorization: None,
+                            management: ConnectionManagement::new(),
+                        },
+                    ));
+                    tokio::select! {
+                        () = broker.first_poll() => {}
+                        _ = helper.as_mut() => panic!("helper cleaned up before observing its raw Receive"),
+                    }
+                    let _ = borrowed_done.send(());
+                    let _ = resumed.await;
+                    helper.await
+                })
+            };
+            actor.gate.reached(false).await;
+            actor.gate.release(false);
+            actor.gate.reached(true).await;
+            assert_eq!(
+                StateMachine::new(actor.store().clone())
+                    .last_applied_time()
+                    .unwrap()
+                    .as_millis(),
+                2_000
+            );
+            wire.detach().await;
+            actor.gate.release_all();
+            let raw = broker.captured().await;
+            let CommandOutcome::Received(Some(delivery)) = &raw else {
+                panic!("actual eager Receive");
+            };
+            assert_eq!(delivery.sequence, sequence);
+            broker.release_invocation();
+            tokio::select! {
+                () = broker.first_poll() => {}
+                result = &mut original => panic!(
+                    "helper finished before the returned-future poll: failed={}, events={:?}",
+                    result.is_err(), broker.events()
+                ),
+            }
+            timeout(WAIT, borrowed).await.unwrap().unwrap();
+            assert_eq!(broker.events().len(), 3);
+            broker.release_result();
+            resume.send(()).unwrap();
+            timeout(WAIT, original).await.unwrap().unwrap().unwrap();
+            assert!(matches!(
+                assert_eager_release(&broker.events(), &raw, &hold),
+                CommandKind::Receive { mode: actual, session: Some(session), .. }
+                    if actual == mode && session == hold
+            ));
+            let machine = StateMachine::new(actor.store().clone());
+            match mode {
+                ReceiveMode::PeekLock => {
+                    let record = machine
+                        .message(&actor.namespace, &actor.entity, sequence)
+                        .unwrap()
+                        .unwrap();
+                    assert!(matches!(record.state, MessageState::Locked { token, .. }
+                        if Some(token) == delivery.lock.map(|lock| lock.token)));
+                }
+                ReceiveMode::ReceiveAndDelete => assert!(
+                    machine
+                        .message(&actor.namespace, &actor.entity, sequence)
+                        .unwrap()
+                        .is_none()
+                ),
+            }
+            assert!(
+                machine
+                    .session(&actor.namespace, &actor.entity, &hold.session_id)
+                    .unwrap()
+                    .unwrap()
+                    .lock
+                    .is_none()
+            );
+            let after_counters = acquisition_counters(&actor);
+            assert_eq!(after_counters.next_sequence, before_counters.next_sequence);
+            assert_eq!(
+                after_counters.next_lock_token,
+                before_counters.next_lock_token + u64::from(mode == ReceiveMode::PeekLock)
+            );
+            // The replacement Attach response on this session rejects any earlier late Transfer.
+            let replacement = wire.reattach(1).await;
+            drop(replacement);
+            wire.stop().await;
+            let committed = actor.store().snapshot().unwrap();
+            drop(machine);
+            drop(guard);
+            drop(broker);
+            let mut actor = Arc::try_unwrap(actor)
+                .unwrap_or_else(|_| panic!("all eager observer references released"));
+            actor.reopen();
+            assert_eq!(actor.store().snapshot().unwrap(), committed);
+            assert_eq!(
+                StateMachine::new(actor.store().clone())
+                    .last_applied_time()
+                    .unwrap()
+                    .as_millis(),
+                2_000
+            );
+        }
+    }
+
+    // Original-link retirement before helper polling invokes no eager Receive method/future.
+    let actor = Actor::new(false, true);
+    let session_id = SessionId::new("unpolled-receive").unwrap();
+    let sequence = actor.send("unpolled-receive", Some(session_id.clone()));
+    let CommandOutcome::SessionAccepted(Some(accepted)) =
+        actor.intent(CommandKind::AcceptSession {
+            session_id: Some(session_id),
+            lock_duration_millis: None,
+        })
+    else {
+        panic!("actual fixture session grant");
+    };
+    let hold = accepted.hold();
+    let before_counters = acquisition_counters(&actor);
+    let actor = Arc::new(actor);
+    let broker = EagerAcquisitionBroker::new(Arc::clone(&actor), EagerTarget::Receive);
+    let _guard = broker.guard();
+    let mut wire = Wire::new_with_credit(ReceiverSettleMode::First, 1).await;
+    let sender = wire.sender.take().unwrap();
+    wire.detach().await;
+    let original = tokio::spawn(serve_receiving_client(
+        sender,
+        actor.namespace.clone(),
+        actor.entity.clone(),
+        broker.clone(),
+        ReceiveMode::PeekLock,
+        Some(hold.clone()),
+        ReceivingLinkProtocol {
+            authorization: None,
+            management: ConnectionManagement::new(),
+        },
+    ));
+    timeout(WAIT, original).await.unwrap().unwrap().unwrap();
+    let events = broker.events();
+    let [
+        EagerEvent::Invoked(invoked),
+        EagerEvent::Completed(completed, result),
+    ] = events.as_slice()
+    else {
+        panic!("only held-session cleanup is allowed: {events:?}");
+    };
+    assert_eq!(
+        invoked,
+        &CommandKind::ReleaseSession {
+            session: hold.clone()
+        }
+    );
+    assert_eq!(completed.as_ref(), invoked);
+    assert_eq!(result, &Ok(CommandOutcome::SessionReleased));
+    assert_eq!(acquisition_counters(&actor), before_counters);
+    assert_eq!(
+        StateMachine::new(actor.store().clone())
+            .message(&actor.namespace, &actor.entity, sequence)
+            .unwrap()
+            .unwrap()
+            .state,
+        MessageState::Ready
+    );
+    wire.stop().await;
+}

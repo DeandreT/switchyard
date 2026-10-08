@@ -1164,3 +1164,172 @@ async fn actual_helper_native_result_retirement() {
     .await
     .expect("original test observer joined");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eager_actual_grant_is_drained_after_end_before_exact_release_and_reopen() {
+    use super::test_support::{EagerAcquisitionBroker, EagerTarget, assert_eager_release};
+
+    for durable in [false, true] {
+        for after in [false, true] {
+            let actor = Actor::new(durable, true);
+            let sequence = actor.send("eager-grant", Some(session_id()));
+            let before_counters = counters(&actor);
+            actor.clock.set(2_000);
+            actor.gate.arm_put(domain::keys::session(
+                &actor.namespace,
+                &actor.entity,
+                &session_id(),
+            ));
+            let actor = Arc::new(actor);
+            let broker = EagerAcquisitionBroker::new(Arc::clone(&actor), EagerTarget::Grant);
+            let guard = broker.guard();
+            let (mut wire, mut session) = PendingWire::new().await;
+            let attach = wire.offer(&mut session, Some(filter(false))).await;
+            let session = Arc::new(session);
+            let management = ConnectionManagement::new();
+            let (borrowed_done, borrowed) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let mut original = {
+                let actor = Arc::clone(&actor);
+                let broker = broker.clone();
+                let session = Arc::clone(&session);
+                let management = Arc::clone(&management);
+                tokio::spawn(async move {
+                    let mut helper = Box::pin(accept_entity_link(
+                        &session,
+                        &broker,
+                        &actor.namespace,
+                        "orders",
+                        attach,
+                        None,
+                        &management,
+                    ));
+                    tokio::select! {
+                        () = broker.first_poll() => {}
+                        _ = helper.as_mut() => panic!("helper ended before its raw result was observed"),
+                    }
+                    let _ = borrowed_done.send(());
+                    let _ = resumed.await;
+                    helper.await
+                })
+            };
+            actor.gate.reached(false).await;
+            if after {
+                actor.gate.release(false);
+                actor.gate.reached(true).await;
+            }
+            assert_eq!(
+                StateMachine::new(actor.store().clone())
+                    .last_applied_time()
+                    .unwrap()
+                    .as_millis(),
+                if after { 2_000 } else { 1_000 }
+            );
+            wire.end().await;
+            assert!(session.is_ended());
+            actor.gate.release_all();
+            let raw = broker.captured().await;
+            let CommandOutcome::SessionAccepted(Some(accepted)) = &raw else {
+                panic!("actual eager grant");
+            };
+            let hold = accepted.hold();
+            assert_eq!(accepted.session_id, session_id());
+            assert_eq!(
+                StateMachine::new(actor.store().clone())
+                    .session(&actor.namespace, &actor.entity, &hold.session_id)
+                    .unwrap()
+                    .unwrap()
+                    .lock,
+                Some(accepted.lock)
+            );
+            broker.release_invocation();
+            tokio::select! {
+                () = broker.first_poll() => {}
+                result = &mut original => panic!(
+                    "helper finished before the returned-future poll: failed={}, events={:?}",
+                    result.is_err(), broker.events()
+                ),
+            }
+            timeout(WAIT, borrowed).await.unwrap().unwrap();
+            assert_eq!(broker.events().len(), 3);
+            broker.release_result();
+            resume.send(()).unwrap();
+            assert!(
+                timeout(WAIT, original)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                assert_eager_release(&broker.events(), &raw, &hold),
+                CommandKind::AcceptSession {
+                    session_id: Some(session_id()),
+                    lock_duration_millis: None,
+                }
+            );
+            assert!(management.registered_session(LINK).await.is_none());
+            assert_eq!(
+                counters(&actor).next_sequence,
+                before_counters.next_sequence
+            );
+            assert_eq!(
+                counters(&actor).next_lock_token,
+                before_counters.next_lock_token + 1
+            );
+            assert_eq!(
+                StateMachine::new(actor.store().clone())
+                    .message(&actor.namespace, &actor.entity, sequence)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                domain::MessageState::Ready
+            );
+            let independent = wire.native_fifo_after_accept(false).await;
+            assert!(!independent.is_ended());
+            wire.stop().await;
+            drop(independent);
+            drop(session);
+            drop(guard);
+            drop(broker);
+            let mut actor = Arc::try_unwrap(actor)
+                .unwrap_or_else(|_| panic!("all eager observer references released"));
+            assert_reopened_release(&mut actor, &hold);
+            assert_eq!(
+                StateMachine::new(actor.store().clone())
+                    .last_applied_time()
+                    .unwrap()
+                    .as_millis(),
+                2_000
+            );
+        }
+    }
+
+    // A positively ended session before the real helper's first poll invokes no adapter method.
+    let actor = Arc::new(Actor::new(false, true));
+    let before = actor.store().snapshot().unwrap();
+    let broker = EagerAcquisitionBroker::new(Arc::clone(&actor), EagerTarget::Grant);
+    let _guard = broker.guard();
+    let (mut wire, mut session) = PendingWire::new().await;
+    let attach = wire.offer(&mut session, Some(filter(false))).await;
+    wire.end().await;
+    assert!(session.is_ended());
+    assert!(
+        accept_entity_link(
+            &session,
+            &broker,
+            &actor.namespace,
+            "orders",
+            attach,
+            None,
+            &ConnectionManagement::new(),
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(broker.events().is_empty());
+    assert_eq!(actor.store().snapshot().unwrap(), before);
+    wire.stop().await;
+}

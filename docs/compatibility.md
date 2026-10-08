@@ -180,7 +180,8 @@ and natural Detach/auth retirement. Never-polled retired work submits nothing;
 begun work drains without a replacement or new late acknowledgement. A committed
 send is not rolled back, and cancellation of a queued wire acknowledgement is
 not proof it was unsent. Whole-task abortion remains #75.
-Acquisition callers still rely on lazy broker method invocation (#91).
+Receive and session-grant callers defer broker method invocation to the retained
+original's first poll, including eager adapters. This is not an enqueue receipt.
 
 Outbound starts (#90), management/CBS retirement (#85/#86) and process shutdown
 remain [roadmap work](roadmap.md#next-main-increments). Stalled broker/native I/O
