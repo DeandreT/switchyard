@@ -47,9 +47,11 @@ or administration certification. See [SDK gates](sdk-gates.md) and [compatibilit
 
 ## Next Main Increments
 
-1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7): #111 panic-safe settlements
-   -> #75 task trees -> #64 admission/deadlines -> #65 signal shutdown. #74 is
-   complete; #75 completes #63. #73/#84/#87/#85/#86/#110/#117 are merged.
+1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7): #111 receiving panic custody,
+   with independent CBS #128 and management #129. [#75](https://github.com/DeandreT/switchyard/issues/75)
+   owns ordered #127-#133 leaf/ancestor children and completes #63.
+   [#64](https://github.com/DeandreT/switchyard/issues/64) owns #134 listener -> #135 limits
+   -> #136 aggregate deadline, then #65 signals. #117 is merged; child issues own dependencies.
 2. After #7, complete [#12](https://github.com/DeandreT/switchyard/issues/12):
    retained sender #57 -> receiver/settlement #58 -> sessions #59 -> management
    #60. Merged #56 alone is not retained wire authority.
@@ -71,8 +73,13 @@ Integration paths, not every prerequisite. Nodes beyond merged foundations are p
 ```mermaid
 flowchart TD
     Main["Merged foundations/custody; #74/#110/#117 complete"] --> Panic["#111 Panic-safe settlement custody"]
-    Panic --> Trees["#75 Task trees / finish #63"]
-    Trees --> Admission["#64 Admission/deadlines"]
+    Main --> Leaves["#128 CBS / #129 Management panic custody"]
+    Panic --> Send["#127 Send panic custody"]
+    Panic --> Native["#130 Native -> #131 Attachments"]
+    Leaves --> Trees["#132 Links -> #133 Sessions / finish #75/#63"]
+    Send --> Trees
+    Native --> Trees
+    Trees --> Admission["#134 Listener -> #135 Limits -> #136 Deadline / finish #64"]
     Admission --> Signals["#65 Signal shutdown / finish #7"]
     Signals --> Authority["#57 -> #58 -> #59 -> #60 / finish #12"]
     Authority --> Delete["#15 Retirement/recreation"]
@@ -109,7 +116,8 @@ chain. Split multi-PR work into child issues before implementation.
 
 | Lane | Entry And Boundary |
 | --- | --- |
-| Protocol | #111 panic-safe settlement custody, then the ordered chain above; one listener/native/registry owner |
+| Receiving/ancestors | [#111](https://github.com/DeandreT/switchyard/issues/111), then ordered #127/#130-#133; serialize listener/native/registry edits |
+| Leaf panic custody | [#128](https://github.com/DeandreT/switchyard/issues/128) CBS and [#129](https://github.com/DeandreT/switchyard/issues/129) management are ready on distinct paths; coordinate authorization.rs |
 | SQL | #11 pure kernel complete; [#20](https://github.com/DeandreT/switchyard/issues/20) filters waits for #16 typed content, then #21 actions. Serialize compiler/rule paths; no retained integration yet |
 | Auth activation | #8 policy merged; #71 -> #17 waits for #7. Serialize shared authorization/CBS files, not a current parallel pickup |
 | Replication | [#36](https://github.com/DeandreT/switchyard/issues/36): cluster/storage/proposer replay; retain startup refusal, no quorum claim |
