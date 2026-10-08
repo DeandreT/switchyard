@@ -19,7 +19,7 @@ and assignment source. Milestones group work; independent lanes can run in paral
 - [ ] Real quorum, multi-tenant security, recovery and measured release gates
 
 The owner-metadata increment passed 615 ordinary tests with two opt-in SDK selectors
-ignored. Those selectors were not rerun for this schema-only change. Current
+ignored. Those selectors were not rerun for this owner-metadata increment. Current
 .NET coverage is pinned 7.20.2 and experimental Memory-only TCP/WSS, not durable
 or administration certification. See [compatibility](compatibility.md).
 
