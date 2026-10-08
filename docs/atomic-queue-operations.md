@@ -45,11 +45,14 @@ endpoint and do not replace ordinary per-link authorization.
 
 ## Preparation And Commit
 
-Each operation prepares its ordinary mutations against a private point-read
-overlay. Later operations see earlier prepared counters, duplicate history,
-message states, locks, and indexes. Preparation cannot scan, snapshot, or
-commit to the backing store. Only the final normalized batch reaches the real
-store, once; each key occurs once, including the global clock and counters.
+Each operation prepares its ordinary mutations against a private read-your-writes
+point overlay. Later operations see earlier prepared counters, duplicate history,
+message states, locks, and indexes. The only permitted metadata scan is the bound
+primary queue owner's canonical subscription-TopicMode prefix, with start equal to
+that prefix and limit exactly one. This health probe must be empty; staged edits
+under its prefix are refused. Every other scan, snapshot and backing-store commit
+remains forbidden during preparation. Only the final normalized batch reaches
+the real store, once; each key occurs once, including the global clock and counters.
 
 Duplicate sends retain ordinary semantics: they consume acknowledged sequence
 numbers even when no message survives. Duplicate history is shared across the
@@ -86,9 +89,9 @@ All caps apply to the whole group, not separately to each member:
 | Logical sent messages, including duplicate drops | 100 |
 | Borrowed command-content tally | 4 MiB |
 | Shared command-input value nodes | 65,536 |
-| Point reads, including repeated overlay hits | 4,096 |
-| Cumulative point-read key bytes | 1 MiB |
-| Cumulative point-read value bytes | 16 MiB |
+| Read/query requests, including repeated overlay hits and allowed probes | 4,096 |
+| Cumulative read/query key bytes | 1 MiB |
+| Cumulative read/query value bytes | 16 MiB |
 | Unique mutation keys, including deleted keys | 4,096 |
 | Unique mutation-key bytes | 1 MiB |
 | Cumulative generated Put value bytes | 16 MiB |
@@ -101,13 +104,16 @@ compound values. Empty body sections consume conservative section overhead,
 so they cannot evade the work bound. Existing per-message depth, property,
 header, and queue limits still apply.
 
-Read limits cover each domain validation/application pass. Proposer admission
-is a separate bounded pass, and stamping has its existing applied-clock read.
-Generated Put bytes count every prepared value, even if a later operation
-replaces the same key. These are deterministic discovery/work limits, not a
-total memory or process-RSS guarantee. A backend point read materializes one
-value before its length can be rejected; the existing record decoder is not
-replaced here.
+Read limits cover each domain validation/application pass. Every allowed probe
+consumes one read request, charges both requested prefix and start bytes, then
+charges any returned key/value bytes; a returned row is not a second read request.
+Point reads still include repeated overlay hits. Proposer admission is a separate
+bounded pass, and stamping has its existing applied-clock read. Generated Put
+bytes count every prepared value, even if a later operation replaces the same
+key. These are deterministic discovery/work limits, not a total memory or
+process-RSS guarantee. A backend point read or one-row probe materializes its
+value before the returned-byte limit can reject it; the existing record decoder
+is not replaced here.
 
 The payload-free `AtomicMessagingInputUsage` exposes this same borrowed input
 accounting incrementally. Optional [owned work reservations](atomic-work-reservations.md)

@@ -31,7 +31,7 @@ of it: nothing below is reachable by a client until the protocol edge exists.
 | Lock expiry and redelivery | Pre-1.0 | State machine |
 | Message lock renewal | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
 | Time-to-live expiry | Pre-1.0 | State machine and timer; default drop and optional dead-lettering, official .NET deferred-expiry gate |
-| Topics and subscriptions | Pre-1.0 | Atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; closed ordinary subscription HTTPS create/get/full-update/delete under native-created topics (gated with both pinned .NET clients on both backends), plus a closed True/False, bounded native SQL and typed correlation parameter-free Atom rule create/get/list/delete profile with optional native semantic-v2 SQL actions (preceding no-action True/False, dedicated exact-source SQL and fixed-fixture typed correlation SDK lifecycles verified with both pins, backends and constructors; action projection passed codec/owner/actual-TLS checks; dedicated fixed-source SQL-action SDK CRUD verified with both pins, backends and constructors; fixed HTTPS-created SQL-v1/action-v2-to-AMQP transformed-copy bridge verified with both pins/backends, both administration constructors and named-key AMQP); Azure topic administration remains unimplemented |
+| Topics and subscriptions | Pre-1.0 | Mandatory generation-bound NonFinite topic modes, atomic rule-selected fanout, parent-retained scheduling/cancellation, ordinary/session subscription and dead-letter routing, native create/get/list/update/delete, Rust clients on both backends and both pinned .NET clients; closed ordinary subscription HTTPS create/get/full-update/delete under native-created topics (gated with both pinned .NET clients on both backends), plus a closed True/False, bounded native SQL and typed correlation parameter-free Atom rule create/get/list/delete profile with optional native semantic-v2 SQL actions (preceding no-action True/False, dedicated exact-source SQL and fixed-fixture typed correlation SDK lifecycles verified with both pins, backends and constructors; action projection passed codec/owner/actual-TLS checks; dedicated fixed-source SQL-action SDK CRUD verified with both pins, backends and constructors; fixed HTTPS-created SQL-v1/action-v2-to-AMQP transformed-copy bridge verified with both pins/backends, both administration constructors and named-key AMQP); Azure topic administration remains unimplemented |
 | Correlation and SQL filters/actions | Pre-1.0 | Persisted Boolean, scalar correlation, and bounded SQL rules through AMQP and native rule CRUD/CLI; typed correlation and optional parameter-free native semantic-v2 SQL-action projection through the closed HTTPS rule profile; bounded REMOVE and String/Boolean/Int64-literal SET actions with independent copies and finite local conversion-error dead letters, not full Azure/CLR actions |
 | Scheduling and cancellation | Pre-1.0 | State machine, AMQP management and send-annotation mappings, Rust and current .NET clients end to end |
 | Deferral and deferred receive | Pre-1.0 | State machine, AMQP management mapping, Rust and current .NET clients end to end |
@@ -417,7 +417,9 @@ is a Switchyard policy, not a verified Azure queue-update property.
 
 The state machine can create and read distinct topic definitions and bounded,
 sorted subscription membership. Queue and topic names cannot occupy the same
-namespace path. Subscription creation names its parent topic and atomically
+namespace path. Topic creation atomically stores its configuration, live identity
+and mandatory generation-bound NonFinite topic mode. Subscription creation names
+its parent topic and atomically
 stores the member, its receive-only backing queue, its dead-letter shadow, and
 an explicit `$Default` true rule;
 invalid settings, path collisions, composed path limits, or storage failure
@@ -1796,8 +1798,14 @@ and 8 KiB respectively. Bodies are at most 64 KiB and 1024 frames, including emp
 frames and trailers; trailers are refused. XML independently limits depth 16,
 2048 events including EOF, 32 attributes per element, 64 active namespace bindings
 plus the built-ins, and 128 properties. Replies are capped at 1 MiB and 100 feed
-entries. Owner pages additionally bound backend operations and returned logical
-key/value bytes; these are work/output bounds, not an allocator or RSS guarantee.
+entries. Queue owner pages separately allow at most 64 ordinary discovery scans
+and 1,100 exact current-owner metadata probes (canonical subscription-TopicMode
+prefix, start equal to prefix, limit one). These probes validate consumed primary
+queue candidates, including skipped rows; the separate lookahead is not consumed.
+All page work shares caps of 4,096 returned rows, 16,384 point reads, 4 MiB key/query
+bytes and 16 MiB returned values. Query bytes include both prefix and start, then
+returned keys. No snapshot fallback or silent scan clamping supplies an exhaustion
+proof. These are work/output bounds, not an allocator or RSS guarantee.
 
 Path segments are strictly decoded once before scope and owner use; malformed
 escapes, invalid UTF-8, empty/dot segments, controls and decoded slashes or
@@ -3054,16 +3062,108 @@ and store layout remain unchanged by configuration updates.
 patches, scoped credentials, typed JSON responses, and nonzero refusal behavior
 as `queue update`.
 
+### Mandatory Non-finite Topic Mode
+
+Every live primary topic requires one private canonical NonFinite topic-mode
+record at its exact owner key. The bounded value-format-11 envelope carries
+`TMOD`, schema 1, the current nonzero topic generation and only the NonFinite
+variant, in at most 64 bytes; its separate key family is tag `0x19`. Topic creation
+stages configuration, identity and mode together. Prepared creation validates
+that generation-bound staged mode without reading uncommitted storage. Topic
+delete removes its mode atomically with the existing owned topology and runtime
+purge. The public TopicConfig and ordinary command/message encodings are unchanged.
+
+Mode is never owned by an ordinary queue, its shadow, a subscription or its DLQ.
+Common live queue/topic health also makes a bounded one-row absence probe under
+the owner's subscription-TopicMode prefix, including nonexistent descendants.
+Missing, malformed, stale-generation or misplaced mode metadata is
+TopicCapacityCorrupt, not an unlimited fallback or implicit adoption. Existing
+identity/kind/topology priority remains: only a complete live subscription proves
+its parent mode, while an absent child need not validate an unrelated parent.
+Fenced owner admission refuses parent corruption before host/stored-clock work;
+authentication and desired-definition validation keep their earlier priorities.
+Native topic pages prove health only for consumed returned topics, not a full-set
+health pass before pagination.
+
+This is a mandatory metadata/health boundary, not finite topic capacity. It adds
+no topic usage/charge ledger, finite topic quota, HTTPS Topic CRUD, new SDK source
+or directory migration. Active layout 18 fences the new contract; historical
+layout-17 image API names and their explicit queue-only profiles remain unchanged.
+
+#### Reference-branch Verification
+
+This receipt belongs to the verified legacy-base reference branch
+`feat/topic-mode-metadata`, source commit
+`239370d6b0e3d009bb1ccbc5372fd8e83dbde475`, not a main merge or a legacy-base PR.
+A focused port onto main remains separate work; neither retained topic accounting
+nor finite Topic API/transport is implemented by this metadata increment.
+
+The final workspace passed 6,086 cases with zero failures and 23 opt-ins ignored,
+across 6,109 rows and 162 result groups. All 6,068 preceding tuples retain their
+status, reason and multiplicity after the two authorized atomic-test renames;
+exactly 41 passing regular cases were added and no ignored registration was
+added. All 156 owners/146 executables remain, including unchanged 119 CLI cases
+across eight owners/eight executables. The final source guard binds 141 paths:
+54 changed and 87 unchanged. Repeated gate rows are not summed as unique coverage.
+
+Verification deliberately combines fourteen retained successful V9 checks
+(239 durable raw chunks, guard 137/53) with eight fresh final-source V10 checks
+(200 chunks, guard 141/54). Final production and SDK inputs are byte-identical
+between those guards; the two later fixture-only corrections are covered by
+the fresh 60-case corrected-target run, formatting, both strict lint variants,
+both all-target builds, full workspace and protobuf check. The retained focused
+core run passed 2,629 cases and server run 563 with 23 ignored; those are V9
+executions, not falsely relabeled final-guard reruns. Sources were checked before
+and after each recorded check. Execution used the shared target, two CPU cores,
+two build jobs and disabled incremental compilation.
+
+Paired Memory/Fjall cases cover atomic topic creation, generation-bound mode
+health, absent/retired and wrong-kind priority, full-length topic paths, ordinary
+lifecycle and opaque owned-topic deletion. Paired serialized-owner cases verify
+corrupt live-parent refusals before both clocks with no apply or wakeup, retained
+state, restoration and reopen. Native ListEntities status assertions are trusted
+unauthenticated direct service calls, not native authentication or gRPC transport
+proof. Separate real private-CA HTTPS cases check subscription/rule leaves and
+rule listing, 500 on corrupt live-parent mode, unchanged state/Clock and retained
+401-before-owner and missing-child semantics. Scoped atomic and queue-page
+metadata-query tests preserve runtime discovery/early-refusal bounds while
+charging their exact allowed probes; derived layout-18 tests refuse previous
+standalone, replica, catalog, protected and paired profiles without logical
+record rewriting. Historical layout-17 image APIs are not relabeled.
+
+Six existing SDK opt-ins passed one selected case/82 filtered each on V9 and
+are reused only under the byte-identical production/SDK-input qualification.
+The current/previous baseline workflows use Memory only with permissive
+experimental TLS and do not measure loaded-DLL custody. The strict private-CA
+bridge and fifteen-position CRUD chains use both Memory/Fjall and both configured
+pins. Their four bridge children/eight loaded-file observations and sixty CRUD
+children/120 observations retain every ordered preceding observation and the
+same four ServiceBus/Core fingerprints. These are regression checks, not new
+SDK source or new Topic administration proof. Loaded output-file custody is not
+package provenance, memory-image measurement or transitive assembly custody.
+The other seventeen opt-ins, including the separate literal-SET selections, were
+not rerun; all 23 remain ignored in ordinary workspace execution.
+
+All eight failed build/test/lint attempts and the unused formatter diagnostic
+remain retained and excluded. In particular the V9 workspace
+(6,080 passed/six failed/23 ignored, 203 raw chunks) is not a passing result;
+protobuf did not run in that attempt. Its first fourteen successful checks are
+separately qualified above. Final layout/value versions are 18/11, with no
+dependency, CLI, protocol route or schema expansion. Memory reopen is not disk
+recovery, and Fjall reopen is not power-loss or replication proof. No migration,
+cloud parity, universal SDK compatibility or production-readiness claim follows;
+all preceding receipts keep their exact historical counts and scope.
+
 ## Durable Format
 
 The current value envelope remains version 11; the active durable base layout
-is version 17. Isolated replicas derive `0x80000011`, catalog replicas derive
-`0xc0000011`, and protected publication derives `0xd0000011` from that same
-`ACTIVE_STORE_FORMAT`. Their exact profile-v1 tags are unchanged. Existing v16
+is version 18. Isolated replicas derive `0x80000012`, catalog replicas derive
+`0xc0000012`, and protected publication derives `0xd0000012` from that same
+`ACTIVE_STORE_FORMAT`. Their exact profile-v1 tags are unchanged. Existing v17
 and older directories in every derived namespace are refused; older builds
-likewise refuse new v17 directories. A nonempty unversioned ordinary directory
-is refused before a marker is written. Mandatory capacity-mode metadata and
-finite reservation sidecars are protected by this layout; see
+likewise refuse new v18 directories. A nonempty unversioned ordinary directory
+is refused before a marker is written. Mandatory queue/topic-mode metadata and
+finite queue reservation sidecars are protected by this layout; see
 [Finite Queue Capacity](finite-queue-capacity.md).
 No automatic relabeling, repair, migration or rollback conversion is provided.
 

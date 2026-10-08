@@ -125,11 +125,14 @@ entire ledger. A raw queue-config lookup is not an owner-health proof.
 
 One capacity plan bounds 1,024 distinct source or admission message identities,
 2,048 events, 2,048 ledger
-keys, 4,096 added point reads, 4 MiB of added read-key bytes, and 256 KiB of
-materialized read values. Ordinary finite send/receive checks add point reads,
-not prefix scans. These are logical planner bounds, not total command processing,
-RSS, allocation, or elapsed-time guarantees. `StateStore::get` materializes one
-value before the planner can account for its size. Existing handler validation
+keys, 4,096 added read/query requests, 4 MiB of added read-key bytes, and 256 KiB
+of materialized read values. Ordinary finite owner-health checks include an exact
+one-row probe of the owner's subscription-TopicMode prefix, which must be empty.
+The native capacity read budget charges that requested prefix once, plus any
+returned key/value bytes; it does not charge an implicit start a second time.
+These are logical planner bounds, not total command processing, RSS, allocation,
+or elapsed-time guarantees. Point reads and the one-row probe materialize their
+values before the planner can account for their size. Existing handler validation
 and input-preprocessing policies remain separate. Non-finite queues retain their
 existing large trusted-vector behavior.
 
@@ -142,8 +145,8 @@ sidecars.
 
 ## Durable And Image Boundaries
 
-Active durable layout 17 protects the mandatory mode and finite sidecars. Older
-directories are refused, and an ordinary unversioned directory with nonempty
+Active durable layout 18 protects mandatory queue/topic modes and finite queue
+sidecars. Layout 17 and older directories are refused, and an ordinary unversioned directory with nonempty
 metadata or message records is refused before a new marker is written. There is
 no automatic relabeling, migration, or rollback conversion.
 

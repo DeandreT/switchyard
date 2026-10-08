@@ -2,7 +2,9 @@
 
 ## Current Boundary (2026-10-06)
 
-The active business layout is 17. Ordinary committed queue creation stages its
+The active business layout is 18. The mandatory NonFinite topic mode is a separate
+current owner-health boundary; this closed queue replay/image profile does not
+create topics or implement finite topic accounting. Ordinary committed queue creation stages its
 mandatory NonFinite Mode in the same batch; old committed work schemas and
 fingerprints are unchanged. This closed Create/Send replay path does not apply
 finite-capacity instructions: a touched finite owner is a fatal
@@ -33,13 +35,13 @@ service: custom implementations and privileged raw batch writers must preserve
 the single-writer contract. Expected-previous checks are not storage CAS.
 
 Replica directories use `0x80000000 | ACTIVE_STORE_FORMAT`, currently
-`0x80000011`, and exact `committed-state-v1` metadata. Fresh creation stamps the
+`0x80000012`, and exact `committed-state-v1` metadata. Fresh creation stamps the
 format, profile, and initialized-zero flag in one fsynced metadata batch.
 Every privileged commit sets initialized-one in the same atomic batch as its
-record mutations. The current standalone format is 17; every ACTIVE-derived
+record mutations. The current standalone format is 18; every ACTIVE-derived
 profile advances at the same global interpretation boundary, even without
 session-message locks. Standalone open refuses replica metadata and replica
-layouts, and an older format-16 binary refuses the new layout. Replica open rejects earlier
+layouts, and older format-17 and format-16 binaries refuse the new layout. Replica open rejects earlier
 replica layouts, standalone directories, partial or malformed headers and
 populated unversioned data. There is no implicit adoption, rollback conversion
 or migration; see [Durable Format](compatibility.md#durable-format).

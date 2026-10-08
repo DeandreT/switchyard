@@ -269,6 +269,12 @@ SQL-v1/action-v2 definition, while named-key AMQP checks transformed and untouch
 sibling copies with independent settlement. This is a fixed bridge, not general
 Azure action or CLR conversion compatibility.
 
+Every live primary topic now requires a private, canonical NonFinite topic mode
+bound to its current generation. [Active layout 18](docs/compatibility.md#mandatory-non-finite-topic-mode)
+protects that metadata and refuses older directories without migration. This
+health boundary does not implement finite topic quotas, topic reservation
+accounting or HTTPS topic administration.
+
 The CLI also supports `queue list` and `queue update`, and emits JSON. Topics
 and subscriptions have separate create/get/list/update commands:
 

@@ -2,12 +2,12 @@
 
 ## Current Boundary (2026-10-06)
 
-The global business layout is 17; profile tags and opaque catalog framing are
+The global business layout is 18; profile tags and opaque catalog framing are
 unchanged. Current domain/native catalog consumers require role-2
 `CreateSendLayout17V1` images, while this storage layer still neither validates
 nor rewrites artifact roles. A legacy catalog does not gain current restore
 authority merely because its bytes can be stored. The verification receipts
-below describe the original increment, not new layout-17 execution.
+below describe the original increment, not new layout-18 execution.
 
 `MemoryCatalogReplicaStore` and `FjallCatalogReplicaStore` add one opaque catalog
 slot beside isolated committed business records. Both remain unique writers;
@@ -27,8 +27,8 @@ The durable layout uses
 `ACTIVE_CATALOG_REPLICA_STORE_FORMAT = 0xc000_0000 | ACTIVE_STORE_FORMAT` and the
 exact profile `committed-state-catalog-v1`. Its record-layout version advances
 with existing formats; a catalog-header change also needs an explicit profile
-version change. The current global base is 17, so this profile uses
-`0xc0000011`; standalone and ordinary replica layouts are 17 and `0x80000011`.
+version change. The current global base is 18, so this profile uses
+`0xc0000012`; standalone and ordinary replica layouts are 18 and `0x80000012`.
 The catalog profile tag remains version 1. This profile does not bypass the
 shared base-format guard or convert an earlier directory.
 
