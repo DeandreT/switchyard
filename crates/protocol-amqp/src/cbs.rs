@@ -1,9 +1,15 @@
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    pin::Pin,
+    sync::Arc,
+};
 
 use amqp::{
     ApplicationProperties, Body, DeliveryState, EngineError, Message, MessageId, Outcome,
     Properties, Receiver, Sender,
 };
+use futures_util::FutureExt;
 use serde_amqp::{Value, primitives::Binary};
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -12,7 +18,12 @@ use crate::authorization::ConnectionAuthorization;
 
 mod custody;
 
-use custody::{OperationControl, PendingOperation, TokenValidation};
+use custody::{
+    OperationControl, PanicPayload, PendingOperation, PumpPoint, ReplyCustody, RequestCustody,
+    TokenValidation,
+};
+
+type CbsError = Box<dyn std::error::Error + Send + Sync>;
 
 pub(crate) const PUT_TOKEN_OPERATION: &str = "put-token";
 pub(crate) const SAS_TOKEN_TYPE: &str = "servicebus.windows.net:sastoken";
@@ -93,71 +104,126 @@ pub(crate) async fn serve_cbs_requests(
             Err(error) => return Err(error.into()),
         };
 
-        let correlation = delivery
-            .message()
-            .properties
-            .as_ref()
-            .and_then(|properties| {
-                Some((properties.message_id.clone()?, properties.reply_to.clone()?))
-            });
-        let Some((message_id, reply_to)) = correlation else {
-            let mut rejected = native_operation(receiver.reject(&delivery, None));
-            if observe_or_retire(&mut rejected, detached.as_mut()).await {
-                let _ = rejected.finish().await;
-                consume_native_result(&mut rejected)?;
-                return Ok(());
-            }
-            consume_native_result(&mut rejected)?;
-            continue;
+        // The owner outlives the borrowed pump, but not the next mutable recv.
+        let mut custody = RequestCustody::default();
+        let result = AssertUnwindSafe(cbs_request_pump(
+            &receiver,
+            &delivery,
+            &authorization,
+            &mut custody,
+            detached.as_mut(),
+        ))
+        .catch_unwind()
+        .await;
+        let cleanup = AssertUnwindSafe(custody.finish()).catch_unwind().await;
+        let diagnostics = if cleanup.is_ok() {
+            catch_unwind(AssertUnwindSafe(|| custody.report())).err()
+        } else {
+            None
         };
-
-        let control = OperationControl::new();
-        let mut original = PendingOperation::new(
-            process_request(
-                delivery.message(),
-                message_id,
-                &authorization,
-                control.clone(),
-            ),
-            control,
-        );
-        if observe_or_retire(&mut original, detached.as_mut()).await {
-            let _ = original.finish().await;
-            let packet = original
-                .take_packet()
-                .expect("retired CBS request is consumed once");
-            debug!(
-                started = packet.started,
-                retired = packet.retired,
-                response = packet.result.flatten().is_some(),
-                "retired CBS token result observed without acknowledgement"
-            );
+        let cleanup_panic = cleanup
+            .err()
+            .or_else(|| custody.take_cleanup_panic())
+            .or(diagnostics);
+        let retired = finish_pump(result, cleanup_panic, custody.take_native_error())?;
+        if retired {
             return Ok(());
-        }
-        let response = original
-            .take_packet()
-            .expect("observed CBS request is consumed once")
-            .result
-            .flatten()
-            .expect("active CBS request has a response");
-        // CBS requests are usually pre-settled, so accepting those is a no-op,
-        // while unsettled diagnostic clients still get their outcome.
-        let mut accepted = native_operation(receiver.accept(&delivery));
-        if observe_or_retire(&mut accepted, detached.as_mut()).await {
-            let _ = accepted.finish().await;
-            consume_native_result(&mut accepted)?;
-            return Ok(());
-        }
-        consume_native_result(&mut accepted)?;
-        let routed = tokio::select! {
-            biased;
-            () = &mut detached => return Ok(()),
-            routed = authorization.route_response(&reply_to, response) => routed,
-        };
-        if routed.is_err() {
-            debug!(%reply_to, "CBS reply route disappeared");
         }
     }
+}
+
+async fn cbs_request_pump<'a>(
+    receiver: &'a Receiver,
+    delivery: &'a amqp::Delivery,
+    authorization: &'a ConnectionAuthorization,
+    custody: &mut RequestCustody<'a>,
+    mut detached: Pin<&mut (impl Future<Output = ()> + Send)>,
+) -> Result<bool, CbsError> {
+    let correlation = delivery
+        .message()
+        .properties
+        .as_ref()
+        .and_then(|properties| {
+            Some((properties.message_id.clone()?, properties.reply_to.clone()?))
+        });
+    let Some((message_id, reply_to)) = correlation else {
+        custody.native = Some(native_operation(receiver.reject(delivery, None)));
+        if observe_or_retire(
+            custody.native.as_mut().unwrap(),
+            detached.as_mut(),
+            PumpPoint::RequestNative,
+        )
+        .await
+        {
+            return Ok(true);
+        }
+        custody.capture_native();
+        if let Some(error) = custody.take_native_error() {
+            return Err(error.into());
+        }
+        return Ok(false);
+    };
+
+    let control = OperationControl::new();
+    custody.token = Some(PendingOperation::new(
+        process_request(
+            delivery.message(),
+            message_id,
+            authorization,
+            control.clone(),
+        ),
+        control,
+    ));
+    #[cfg(test)]
+    custody::pump_checkpoint(PumpPoint::RequestPrepared).await;
+    if observe_or_retire(
+        custody.token.as_mut().unwrap(),
+        detached.as_mut(),
+        PumpPoint::RequestToken,
+    )
+    .await
+    {
+        return Ok(true);
+    }
+    custody.capture_token();
+    custody.response = Some(
+        custody
+            .token_packet
+            .as_mut()
+            .unwrap()
+            .result
+            .take()
+            .flatten()
+            .expect("active CBS request has a response"),
+    );
+    #[cfg(test)]
+    custody::pump_checkpoint(PumpPoint::RequestResponse).await;
+    // CBS requests are usually pre-settled, so accepting those is a no-op,
+    // while unsettled diagnostic clients still get their outcome.
+    custody.native = Some(native_operation(receiver.accept(delivery)));
+    if observe_or_retire(
+        custody.native.as_mut().unwrap(),
+        detached.as_mut(),
+        PumpPoint::RequestNative,
+    )
+    .await
+    {
+        return Ok(true);
+    }
+    custody.capture_native();
+    if let Some(error) = custody.take_native_error() {
+        return Err(error.into());
+    }
+    let routed = tokio::select! {
+        biased;
+        () = detached.as_mut() => return Ok(true),
+        () = custody::pump_fault(PumpPoint::RequestRouting) => unreachable!("CBS fault checkpoint panics"),
+        routed = authorization.route_response(&reply_to, custody.response.as_ref().unwrap().clone()) => routed,
+    };
+    if routed.is_err() {
+        debug!(%reply_to, "CBS reply route disappeared");
+    }
+    Ok(false)
 }
 
 async fn process_request(
@@ -212,42 +278,66 @@ pub(crate) async fn serve_cbs_replies(
     sender: Sender,
     address: String,
     route: mpsc::Sender<CbsResponse>,
-    mut responses: mpsc::Receiver<CbsResponse>,
+    responses: mpsc::Receiver<CbsResponse>,
     authorization: Arc<ConnectionAuthorization>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let result = cbs_reply_loop(&sender, &mut responses).await;
-    responses.close();
-    authorization.unregister_reply_route(&address, &route).await;
-    result
+    let mut custody = ReplyCustody::new(responses, address, route, &authorization);
+    let result = AssertUnwindSafe(cbs_reply_loop(&sender, &mut custody))
+        .catch_unwind()
+        .await;
+    let cleanup = AssertUnwindSafe(custody.finish()).catch_unwind().await;
+    let diagnostics = if cleanup.is_ok() {
+        catch_unwind(AssertUnwindSafe(|| custody.report())).err()
+    } else {
+        None
+    };
+    let cleanup_panic = cleanup
+        .err()
+        .or_else(|| custody.take_cleanup_panic())
+        .or(diagnostics);
+    finish_pump(result, cleanup_panic, custody.take_native_error())
 }
 
-async fn cbs_reply_loop(
-    sender: &Sender,
-    responses: &mut mpsc::Receiver<CbsResponse>,
+async fn cbs_reply_loop<'a>(
+    sender: &'a Sender,
+    custody: &mut ReplyCustody<'a>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let detached = sender.on_detach_owned();
     tokio::pin!(detached);
     loop {
+        #[cfg(test)]
+        custody::pump_checkpoint(PumpPoint::ReplyIdle).await;
         let response = tokio::select! {
             biased;
             () = &mut detached => return Ok(()),
-            response = responses.recv() => response,
+            response = custody.responses.recv() => response,
         };
         let Some(response) = response else {
             return Ok(());
         };
         let control = OperationControl::new();
-        let mut original = PendingOperation::new(
+        custody.original = Some(PendingOperation::new(
             send_cbs_response(sender, response, control.clone()),
             control,
-        );
-        if observe_or_retire(&mut original, detached.as_mut()).await {
-            responses.close();
-            let _ = original.finish().await;
-            consume_native_result(&mut original)?;
+        ));
+        #[cfg(test)]
+        custody::pump_checkpoint(PumpPoint::ReplyPrepared).await;
+        if observe_or_retire(
+            custody.original.as_mut().unwrap(),
+            detached.as_mut(),
+            PumpPoint::ReplyNative,
+        )
+        .await
+        {
             return Ok(());
         }
-        consume_native_result(&mut original)?;
+        custody.capture_packet();
+        #[cfg(test)]
+        custody::pump_checkpoint(PumpPoint::ReplyResult).await;
+        if let Some(error) = custody.take_native_error() {
+            return Err(error.into());
+        }
+        custody.packet = None;
     }
 }
 
@@ -280,10 +370,12 @@ async fn send_cbs_response(
 async fn observe_or_retire<T: Send>(
     original: &mut PendingOperation<'_, T>,
     detached: Pin<&mut (impl Future<Output = ()> + Send)>,
+    point: PumpPoint,
 ) -> bool {
     tokio::select! {
         biased;
         () = detached => { original.retire(); true }
+        () = custody::pump_fault(point) => unreachable!("CBS fault checkpoint panics"),
         _ = original.observe() => false,
     }
 }
@@ -304,20 +396,23 @@ fn native_operation<'a, T: Send + 'a>(
     )
 }
 
-fn consume_native_result<T: Send>(
-    original: &mut PendingOperation<'_, Result<T, EngineError>>,
-) -> Result<(), EngineError> {
-    let packet = original
-        .take_packet()
-        .expect("finished CBS native result is consumed once");
-    debug!(
-        started = packet.started,
-        retired = packet.retired,
-        "original CBS native result observed"
-    );
-    match packet.result {
-        None | Some(Ok(_)) => Ok(()),
-        Some(Err(error)) => Err(error),
+fn finish_pump<T>(
+    primary: std::thread::Result<Result<T, CbsError>>,
+    cleanup_panic: Option<PanicPayload>,
+    native_error: Option<EngineError>,
+) -> Result<T, CbsError> {
+    match primary {
+        Err(payload) => resume_unwind(payload),
+        Ok(Err(error)) => Err(error),
+        Ok(Ok(value)) => {
+            if let Some(error) = native_error {
+                return Err(error.into());
+            }
+            if let Some(payload) = cleanup_panic {
+                resume_unwind(payload);
+            }
+            Ok(value)
+        }
     }
 }
 

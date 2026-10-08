@@ -21,7 +21,8 @@ use tokio::{
     time::timeout,
 };
 
-use super::request_retirement_tests::authorization;
+use super::custody::{PUMP_FAULT, PumpFault};
+use super::request_retirement_tests::{assert_outer_panic, authorization};
 use super::*;
 
 pub(super) const WAIT: Duration = Duration::from_secs(8);
@@ -421,6 +422,392 @@ async fn assert_unregistered(authorization: &ConnectionAuthorization) {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn outer_reply_panic_before_native_start_closes_only_its_captured_route() {
+    for settle in [ReceiverSettleMode::First, ReceiverSettleMode::Second] {
+        for replace in [false, true] {
+            for point in [PumpPoint::ReplyPrepared, PumpPoint::ReplyIdle] {
+                let (mut wire, endpoint) = Wire::new(Role::Receiver, 1, settle.clone()).await;
+                let LinkEndpoint::Sender(sender) = endpoint else {
+                    panic!("CBS reply sender")
+                };
+                let authorization = authorization();
+                let (route, responses) =
+                    authorization.register_reply_route(ADDRESS.to_owned()).await;
+                if point == PumpPoint::ReplyPrepared {
+                    route
+                        .send(CbsResponse::accepted(MessageId::Ulong(42)))
+                        .await
+                        .unwrap();
+                }
+                let fault = PumpFault::new(point);
+                let mut serving = Box::pin(
+                    PUMP_FAULT.scope(
+                        Arc::clone(&fault),
+                        AssertUnwindSafe(serve_cbs_replies(
+                            sender,
+                            ADDRESS.to_owned(),
+                            route.clone(),
+                            responses,
+                            Arc::clone(&authorization),
+                        ))
+                        .catch_unwind(),
+                    ),
+                );
+                pending_once(serving.as_mut()).await;
+                timeout(WAIT, fault.reached.notified()).await.unwrap();
+                let replacement = if replace {
+                    Some(authorization.register_reply_route(ADDRESS.to_owned()).await)
+                } else {
+                    None
+                };
+                fault.trigger.notify_one();
+                assert_outer_panic(timeout(WAIT, serving.as_mut()).await.unwrap());
+                assert!(route.is_closed());
+                if let Some((_new_route, mut responses)) = replacement {
+                    assert!(matches!(
+                        responses.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                    authorization
+                        .route_response(ADDRESS, CbsResponse::accepted(MessageId::Ulong(999)))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        responses.recv().await.unwrap().correlation_id,
+                        MessageId::Ulong(999)
+                    );
+                } else {
+                    assert_unregistered(&authorization).await;
+                }
+                wire.barrier().await;
+                wire.no_frame_yet().await;
+                wire.stop().await;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn outer_reply_panic_retains_begun_write_or_confirmation_and_preserves_primary_panic() {
+    for (settle, confirmation) in [
+        (ReceiverSettleMode::First, false),
+        (ReceiverSettleMode::Second, false),
+        (ReceiverSettleMode::Second, true),
+    ] {
+        for fail in [false, true] {
+            let (mut wire, endpoint) = Wire::new(Role::Receiver, 1, settle.clone()).await;
+            let LinkEndpoint::Sender(sender) = endpoint else {
+                panic!("CBS reply sender")
+            };
+            let authorization = authorization();
+            let (route, responses) = authorization.register_reply_route(ADDRESS.to_owned()).await;
+            route
+                .send(CbsResponse::accepted(MessageId::Ulong(42)))
+                .await
+                .unwrap();
+            if !confirmation {
+                wire.writes.arm(false);
+            }
+            let fault = PumpFault::new(PumpPoint::ReplyNative);
+            let mut serving = Box::pin(
+                PUMP_FAULT.scope(
+                    Arc::clone(&fault),
+                    AssertUnwindSafe(serve_cbs_replies(
+                        sender,
+                        ADDRESS.to_owned(),
+                        route.clone(),
+                        responses,
+                        Arc::clone(&authorization),
+                    ))
+                    .catch_unwind(),
+                ),
+            );
+            pending_once(serving.as_mut()).await;
+            timeout(WAIT, fault.reached.notified()).await.unwrap();
+            if confirmation {
+                let (transfer, _) = wire.response_transfer().await;
+                wire.accept_response(transfer.delivery_id.unwrap()).await;
+                wire.barrier().await;
+                wire.writes.arm(false);
+                pending_once(serving.as_mut()).await;
+            }
+            timeout(WAIT, wire.writes.reached()).await.unwrap();
+            let (_replacement, mut replacement_responses) =
+                authorization.register_reply_route(ADDRESS.to_owned()).await;
+            fault.trigger.notify_one();
+            for _ in 0..2 {
+                pending_once(serving.as_mut()).await;
+                assert!(
+                    route.is_closed(),
+                    "the original channel closes before the held native operation completes"
+                );
+                assert!(wire.writes.state.lock().unwrap().held);
+            }
+            wire.no_frame_yet().await;
+            if fail {
+                wire.writes.fail_held_write();
+            } else {
+                wire.stop().await;
+                assert!(
+                    wire.writes.state.lock().unwrap().held,
+                    "native Stop, not dropping an observer, interrupted the write"
+                );
+            }
+            assert_outer_panic(timeout(WAIT, serving.as_mut()).await.unwrap());
+            assert!(matches!(
+                replacement_responses.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            authorization
+                .route_response(ADDRESS, CbsResponse::accepted(MessageId::Ulong(999)))
+                .await
+                .unwrap();
+            assert_eq!(
+                replacement_responses.recv().await.unwrap().correlation_id,
+                MessageId::Ulong(999)
+            );
+            wire.stop().await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn outer_reply_panic_keeps_ready_or_cached_outcome_and_starts_no_new_confirmation() {
+    let (mut wire, endpoint) = Wire::new(Role::Receiver, 1, ReceiverSettleMode::Second).await;
+    let LinkEndpoint::Sender(sender) = endpoint else {
+        panic!("CBS reply sender")
+    };
+    let authorization = authorization();
+    let (route, responses) = authorization.register_reply_route(ADDRESS.to_owned()).await;
+    route
+        .send(CbsResponse::accepted(MessageId::Ulong(42)))
+        .await
+        .unwrap();
+    let fault = PumpFault::new(PumpPoint::ReplyNative);
+    let mut serving = Box::pin(
+        PUMP_FAULT.scope(
+            Arc::clone(&fault),
+            AssertUnwindSafe(serve_cbs_replies(
+                sender,
+                ADDRESS.to_owned(),
+                route.clone(),
+                responses,
+                Arc::clone(&authorization),
+            ))
+            .catch_unwind(),
+        ),
+    );
+    pending_once(serving.as_mut()).await;
+    timeout(WAIT, fault.reached.notified()).await.unwrap();
+    let (transfer, _) = wire.response_transfer().await;
+    wire.accept_response(transfer.delivery_id.unwrap()).await;
+    wire.barrier().await;
+    // The outer fault wins before the same retained future observes its ready outcome.
+    fault.trigger.notify_one();
+    assert_outer_panic(timeout(WAIT, serving.as_mut()).await.unwrap());
+    assert!(route.is_closed());
+    assert_unregistered(&authorization).await;
+    wire.barrier().await;
+    wire.no_frame_yet().await;
+    wire.stop().await;
+    for (settle, second) in [
+        (ReceiverSettleMode::First, false),
+        (ReceiverSettleMode::Second, true),
+    ] {
+        let (mut wire, endpoint) = Wire::new(Role::Receiver, 1, settle).await;
+        let LinkEndpoint::Sender(sender) = endpoint else {
+            panic!("CBS reply sender")
+        };
+        let authorization = super::request_retirement_tests::authorization();
+        let (route, responses) = authorization.register_reply_route(ADDRESS.to_owned()).await;
+        route
+            .send(CbsResponse::accepted(MessageId::Ulong(42)))
+            .await
+            .unwrap();
+        let fault = PumpFault::new(PumpPoint::ReplyResult);
+        let mut serving = Box::pin(
+            PUMP_FAULT.scope(
+                Arc::clone(&fault),
+                AssertUnwindSafe(serve_cbs_replies(
+                    sender,
+                    ADDRESS.to_owned(),
+                    route.clone(),
+                    responses,
+                    Arc::clone(&authorization),
+                ))
+                .catch_unwind(),
+            ),
+        );
+        pending_once(serving.as_mut()).await;
+        let (transfer, _) = wire.response_transfer().await;
+        wire.accept_response(transfer.delivery_id.unwrap()).await;
+        wire.barrier().await;
+        pending_once(serving.as_mut()).await;
+        if second {
+            let Performative::Disposition(confirmation) = wire.control(CHANNEL).await else {
+                panic!("original second confirmation")
+            };
+            assert_eq!(confirmation.first, transfer.delivery_id.unwrap());
+            assert_eq!(confirmation.state, Some(DeliveryState::Accepted(Accepted)));
+            assert!(confirmation.settled);
+            pending_once(serving.as_mut()).await;
+        }
+        timeout(WAIT, fault.reached.notified()).await.unwrap();
+        let (_replacement, mut replacement_responses) =
+            authorization.register_reply_route(ADDRESS.to_owned()).await;
+        let held = authorization.reply_route_lock().await;
+        fault.trigger.notify_one();
+        for _ in 0..2 {
+            pending_once(serving.as_mut()).await;
+            assert!(
+                route.is_closed(),
+                "cached native completion precedes the held conditional cleanup"
+            );
+        }
+        drop(held);
+        assert_outer_panic(timeout(WAIT, serving.as_mut()).await.unwrap());
+        assert!(matches!(
+            replacement_responses.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        authorization
+            .route_response(ADDRESS, CbsResponse::accepted(MessageId::Ulong(999)))
+            .await
+            .unwrap();
+        assert_eq!(
+            replacement_responses.recv().await.unwrap().correlation_id,
+            MessageId::Ulong(999)
+        );
+        wire.barrier().await;
+        wire.no_frame_yet().await;
+        wire.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reply_owner_retains_cached_native_packet_and_route_across_cancelled_unregister() {
+    let (mut wire, endpoint) = Wire::new(Role::Receiver, 1, ReceiverSettleMode::First).await;
+    let LinkEndpoint::Sender(sender) = endpoint else {
+        panic!("CBS reply sender")
+    };
+    let authorization = authorization();
+    let (route, responses) = authorization.register_reply_route(ADDRESS.to_owned()).await;
+    let mut custody =
+        ReplyCustody::new(responses, ADDRESS.to_owned(), route.clone(), &authorization);
+    let control = OperationControl::new();
+    custody.original = Some(PendingOperation::new(
+        send_cbs_response(
+            &sender,
+            CbsResponse::accepted(MessageId::Ulong(42)),
+            control.clone(),
+        ),
+        control.clone(),
+    ));
+    pending_once(Box::pin(custody.original.as_mut().unwrap().observe()).as_mut()).await;
+    let (transfer, _) = wire.response_transfer().await;
+    wire.accept_response(transfer.delivery_id.unwrap()).await;
+    wire.barrier().await;
+    assert!(matches!(
+        timeout(WAIT, custody.original.as_mut().unwrap().observe())
+            .await
+            .unwrap(),
+        Some(Ok(Outcome::Accepted(_)))
+    ));
+    custody.capture_packet();
+    let (_replacement, mut replacement_responses) =
+        authorization.register_reply_route(ADDRESS.to_owned()).await;
+    let held = authorization.reply_route_lock().await;
+    for _ in 0..2 {
+        pending_once(Box::pin(custody.finish()).as_mut()).await;
+        assert!(custody.original.is_none() && route.is_closed());
+        let packet = custody.packet.as_ref().unwrap();
+        assert!(packet.started && !packet.panicked);
+        assert!(matches!(
+            packet.result.as_ref(),
+            Some(Ok(Outcome::Accepted(_)))
+        ));
+    }
+    drop(held);
+    timeout(WAIT, custody.finish()).await.unwrap();
+    timeout(WAIT, custody.finish()).await.unwrap();
+    assert!(matches!(
+        custody.packet.as_ref().unwrap().result.as_ref(),
+        Some(Ok(Outcome::Accepted(_)))
+    ));
+    assert!(matches!(
+        replacement_responses.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    authorization
+        .route_response(ADDRESS, CbsResponse::accepted(MessageId::Ulong(999)))
+        .await
+        .unwrap();
+    assert_eq!(
+        replacement_responses.recv().await.unwrap().correlation_id,
+        MessageId::Ulong(999)
+    );
+    wire.barrier().await;
+    wire.no_frame_yet().await;
+    wire.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn outer_request_panic_retains_begun_accept_or_reject_until_native_stop_or_error() {
+    for reject in [false, true] {
+        for fail in [false, true] {
+            let (mut wire, endpoint) = Wire::new(Role::Sender, 0, ReceiverSettleMode::First).await;
+            let LinkEndpoint::Receiver(receiver) = endpoint else {
+                panic!("CBS request receiver")
+            };
+            let authorization = authorization();
+            let (_route, mut responses) =
+                authorization.register_reply_route(ADDRESS.to_owned()).await;
+            let message = if reject {
+                Message::default()
+            } else {
+                super::request_retirement_tests::request("invalid-token", 42)
+            };
+            wire.request_message(&message, false).await;
+            wire.barrier().await;
+            wire.writes.arm(false);
+            let fault = PumpFault::new(PumpPoint::RequestNative);
+            let mut serving = Box::pin(
+                PUMP_FAULT.scope(
+                    Arc::clone(&fault),
+                    AssertUnwindSafe(serve_cbs_requests(receiver, Arc::clone(&authorization)))
+                        .catch_unwind(),
+                ),
+            );
+            pending_once(serving.as_mut()).await;
+            timeout(WAIT, fault.reached.notified()).await.unwrap();
+            timeout(WAIT, wire.writes.reached()).await.unwrap();
+            fault.trigger.notify_one();
+            for _ in 0..2 {
+                pending_once(serving.as_mut()).await;
+                assert!(wire.writes.state.lock().unwrap().held);
+                assert!(matches!(
+                    responses.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+            }
+            wire.no_frame_yet().await;
+            if fail {
+                wire.writes.fail_held_write();
+            } else {
+                wire.stop().await;
+            }
+            assert_outer_panic(timeout(WAIT, serving.as_mut()).await.unwrap());
+            assert!(matches!(
+                responses.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert!(authorization.grant_snapshot().await.is_empty());
+            wire.stop().await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn actual_no_credit_reply_retires_queued_original_without_replacement_retry() {
     for stop in [false, true] {
         let (mut wire, endpoint) = Wire::new(Role::Receiver, 0, ReceiverSettleMode::First).await;
@@ -468,6 +855,107 @@ async fn actual_no_credit_reply_retires_queued_original_without_replacement_retr
             MessageId::Ulong(999)
         );
         wire.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_no_credit_native_error_precedes_secondary_diagnostic_panic_after_retirement() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PanicDiagnostics(Arc<AtomicUsize>);
+
+    impl tracing::Subscriber for PanicDiagnostics {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target().ends_with("::cbs::custody")
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            std::panic::panic_any("controlled secondary CBS diagnostic panic");
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    for settle in [ReceiverSettleMode::First, ReceiverSettleMode::Second] {
+        for stop in [false, true] {
+            let (mut wire, endpoint) = Wire::new(Role::Receiver, 0, settle.clone()).await;
+            let LinkEndpoint::Sender(sender) = endpoint else {
+                panic!("actual CBS reply sender")
+            };
+            let authorization = authorization();
+            let (route, responses) = authorization.register_reply_route(ADDRESS.to_owned()).await;
+            route
+                .send(CbsResponse::accepted(MessageId::Ulong(42)))
+                .await
+                .unwrap();
+            let diagnostics = Arc::new(AtomicUsize::new(0));
+            let dispatch = tracing::Dispatch::new(PanicDiagnostics(Arc::clone(&diagnostics)));
+            let mut serving = Box::pin(
+                AssertUnwindSafe(serve_cbs_replies(
+                    sender,
+                    ADDRESS.to_owned(),
+                    route.clone(),
+                    responses,
+                    Arc::clone(&authorization),
+                ))
+                .catch_unwind(),
+            );
+            // Scope the subscriber to polls of this same original wrapper only.
+            let mut observed = Box::pin(poll_fn(|context| {
+                tracing::dispatcher::with_default(&dispatch, || serving.as_mut().poll(context))
+            }));
+            pending_once(observed.as_mut()).await;
+            wire.barrier().await;
+            let (_replacement, mut replacement_responses) =
+                authorization.register_reply_route(ADDRESS.to_owned()).await;
+            if stop {
+                wire.stop().await;
+            } else {
+                wire.detach().await;
+            }
+            let error = timeout(WAIT, observed.as_mut())
+                .await
+                .unwrap()
+                .expect("secondary diagnostic panic must not mask the original native error")
+                .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<EngineError>(),
+                Some(EngineError::RemoteDetached)
+            ));
+            assert_eq!(
+                diagnostics.load(Ordering::SeqCst),
+                1,
+                "caught diagnostic event was actually reached"
+            );
+            assert!(
+                route.is_closed(),
+                "captured route cleanup precedes diagnostics"
+            );
+            assert!(matches!(
+                replacement_responses.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            authorization
+                .route_response(ADDRESS, CbsResponse::accepted(MessageId::Ulong(999)))
+                .await
+                .unwrap();
+            assert_eq!(
+                replacement_responses.recv().await.unwrap().correlation_id,
+                MessageId::Ulong(999)
+            );
+            wire.stop().await;
+        }
     }
 }
 

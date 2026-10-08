@@ -280,6 +280,11 @@ impl ConnectionAuthorization {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn reply_route_lock(&self) -> impl Send + '_ {
+        self.routes.lock().await
+    }
+
     pub(crate) async fn route_response(
         &self,
         address: &str,

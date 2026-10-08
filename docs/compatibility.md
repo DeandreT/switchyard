@@ -230,8 +230,12 @@ native stop. CBS retains the original begun token validation/store and native
 operations, without rolling back installed grants or retrying a selected reply
 route. Retirement starts no new acknowledgement or second confirmation; every
 returned reply exit closes and identity-unregisters its captured channel.
-CBS bootstrap does not wait for an existing authorization grant. Send/CBS/management
-panic custody (#127-#129), task trees (#75) and
+Outer CBS pump panics retain original token/native work and cached packets until
+captured-route cleanup finishes. Cancelled borrowed finish resumes that custody;
+primary faults and original native errors precede secondary diagnostic failures.
+A panicked original is terminal, not retried or treated as successful.
+CBS bootstrap does not wait for an existing authorization grant. Send/management
+panic custody (#127/#129), task trees (#75) and
 process shutdown remain [roadmap work](roadmap.md#next-main-increments); stalled
 broker/I/O can delay cleanup. These guarantees do not cover an aborted ancestor.
 
