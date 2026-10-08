@@ -1,379 +1,184 @@
 # Switchyard Architecture
 
-## Status
+## Current Runtime
 
-This document is the implementation contract for Switchyard. The repository is
-currently pre-alpha. A deterministic state machine covers queue send and
-receive, both settlement modes, lock expiry, time-to-live expiry,
-dead-lettering and dead-letter receive, deferral and deferred retrieval,
-read-only message browsing, scheduled delivery and cancellation, duplicate
-detection, immediate and scheduled rule-filtered topic fanout, and the session
-ownership and session state described under [Message Semantics](#message-semantics).
-It runs over either the Fjall backend or the memory backend, so a single node
-survives a restart.
+Switchyard is pre-alpha and single-node. One namespace reaches the deterministic
+state machine through the repository-owned AMQP engine and local proposer. Fjall
+survives restart; memory does not. Neither survives loss of its only node.
+Configured voters validate startup policy but do not start Raft or establish quorum.
 
-The `switchyard` binary accepts AMQP connections over development plaintext or
-TLS, authenticates a configured shared-access policy through SASL PLAIN or CBS
-SAS, carries queue messages, immediate and scheduled topic publications,
-subscription copies, and sessions across that edge, and sweeps lock,
-time-to-live, session-lock, and duplicate-history expiry while activating
-scheduled messages.
-JWT/OIDC, mTLS, policy administration,
-Raft, and compliance implementations remain to be built. Within the semantics
-below, general SQL subscription filters and actions, session-aware
-subscriptions, topic duplicate detection, and configurable discard versus
-dead-letter behavior on TTL expiry are not implemented. The storage keyspace
-layout under [Storage](#storage) is still a single record keyspace rather than
-the split listed there.
-
-Compatibility means observable protocol and SDK behavior backed by automated
-tests. It does not mean byte-for-byte implementation similarity, Microsoft
-certification, or support for undocumented Azure internals.
-
-## Goals
-
-- Provide the Azure Service Bus Standard queue and publish/subscribe model.
-- Run production workloads on a minimum three-node Linux cluster.
-- Preserve acknowledged messages through any single-node failure.
-- Scale to multi-terabyte retained datasets and 100,000 aggregate durable
-  1 KiB messages per second on the published reference hardware.
-- Isolate mutually untrusted namespaces through authentication, authorization,
-  quotas, fair scheduling, encryption keys, and audit scopes.
-- Supply controls and evidence hooks for SOC 2 and HIPAA-oriented deployments.
-- Keep the server runtime in Rust without RocksDB, OpenSSL, or system TLS
-  dependencies.
-
-## Initial Non-Goals
-
-- Azure Service Bus Premium-specific behavior
-- Partitioning one queue or topic across multiple Raft groups
-- Transactions spanning Raft groups
-- Active-active or standby cross-region replication
-- A browser administration dashboard
-- A Kubernetes operator
-- Windows or macOS production servers
-- Regulatory certification supplied by the software itself
-
-## Node Architecture
-
-Every production node runs the same `switchyard` binary:
-
-```text
- AMQP/TLS 5671       WSS + HTTPS 443       Admin gRPC 9443
-        |                    |                     |
-        +---------------- protocol edge ----------+
-                             |
-                  authentication + admission
-                             |
-                       request router
-                             |
-              +--------------+--------------+
-              |                             |
-       metadata Raft group          data Raft groups
-              |                             |
-              +------- replicated log ------+
-                             |
-                 deterministic state machine
-                             |
-                      Fjall keyspaces
-                             |
-              backup, audit, metrics, tracing
+```mermaid
+flowchart TD
+    Client[AMQP client] --> Edge[TCP/TLS or WSS edge]
+    Edge --> Auth[SAS policy when configured]
+    Auth --> Broker[Broker command queue]
+    Timers[Activation and expiry worker] --> Broker
+    Broker --> Proposer[Local proposer: stamp command time]
+    Proposer --> Machine[Deterministic state machine]
+    Machine --> Batch[One atomic storage batch]
+    Batch --> Memory[Memory backend: volatile]
+    Batch --> Fjall[Fjall backend: journal and SyncAll]
+    Memory --> Outcome[Committed outcome returned to edge]
+    Fjall --> Outcome
 ```
 
-Client connections terminate on any node. That edge node authenticates the
-connection, enforces connection-level limits, resolves the entity placement,
-and forwards typed broker commands to the current Raft leader. AMQP connection
-and link state remain local, while message ownership, locks, sessions,
-transactions, and settlements are replicated.
+The edge accepts only after apply succeeds; durable acknowledgement requires
+Fjall. Commands carry timestamps; rejection writes nothing. See
+[server](crates/server/src/lib.rs),
+[proposer](crates/server/src/proposer.rs), and
+[state machine](crates/domain/src/machine.rs).
 
-## Protocol Edge
+### Protocol And Identity
 
-The repository-owned AMQP engine handles framing, sessions, links, flow
-control, settlement, and SASL. The protocol listener establishes TLS before
-that engine starts. Switchyard implements the Service Bus-specific layer:
+The edge owns framing, links, credit/drain, settlement, SASL, and Service Bus
+entity/annotation/`$management` mappings. SASL PLAIN or ANONYMOUS/`MSSBCBS` then
+CBS SAS provides Send/Listen/Manage authorization. Expired grants close links;
+initial authorization has a deadline. TLS precedes AMQP; WSS carries binary
+AMQP at `/$servicebus/websocket`.
 
-- SASL PLAIN for shared access policies
-- SASL ANONYMOUS followed by CBS `$cbs` SAS or JWT authorization
-- Queue, topic, subscription, and dead-letter entity paths
-- `$management` request/reply operations
-- Peek-lock and receive-delete settlement mappings
-- Scheduled, deferred, dead-letter, session, and sequence annotations
-- Subscription rule add, remove, and enumeration through AMQP management
-- AMQP transaction coordinator links and transactional dispositions
-- Compatible errors, status codes, link detach conditions, and retry hints
+Namespace, queue, topic, and subscription names are ASCII case-insensitive in
+typed identifiers, storage, AMQP addresses, and entity-scoped SAS audiences.
+Session and placement identifiers remain case-preserving. The native gRPC API
+and CLI are scaffolds; no entity administration listener exists. JWT/OIDC,
+mTLS, transactions, and Atom/XML administration are not implemented.
 
-The HTTPS compatibility endpoint implements the Atom/XML entity and rule
-operations required by Sift and `ServiceBusAdministrationClient`. The native
-control plane is gRPC only.
+### Message State
 
-Production listeners require TLS. Plaintext AMQP and HTTP are available only
-when the explicit development profile is active.
+| Implemented area | Contract |
+| --- | --- |
+| Peek-lock | Lock commits before delivery; completion commits deletion. At-least-once delivery. |
+| Receive-delete | Deletion commits before transfer. At-most-once delivery. |
+| Atomic batches | Every child validates before one commit; failure consumes no sequence or history. |
+| Sessions | Exclusive session lock and durable opaque state; FIFO only within a session. |
+| Scheduling | Topic/queue placeholder is browseable but not receivable; activation assigns an active sequence and starts TTL. |
+| Deferral and peek | Deferred records require explicit retrieval; peek is read-only and sequence-ordered. |
+| Duplicate detection | Queue-scoped exact non-empty message IDs suppress copies for a deterministic history window. |
+| Topics | Publication and matching subscription copies commit atomically; subscriptions use the queue lifecycle. |
+| DLQ | A reserved queue drained by ordinary receive/settlement; no cascading dead-lettering. |
 
-## Control Plane
+Immediate topic publication evaluates subscriptions and rules at command apply.
+Scheduled publication stores only a topic-owned placeholder: subscriptions and
+rules are evaluated at later activation, not send time. Each subscription starts
+with `$Default`; actionless true/false/correlation rules use OR across rules and
+typed AND within a correlation filter. Multiple matches produce one copy. A
+publication with no matches succeeds without retaining an active copy. Payloads
+are copied per subscription; shared payload storage is not implemented.
 
-One metadata Raft group owns:
+Routing proves the complete listed subscription set, including exact canonical
+membership bytes, parent-derived backing configuration, and the real DLQ
+profile, before exposing a page or committing copies. A 2,001-entry lookahead
+enforces the 2,000-subscription cap. This is not a global orphan scan or an
+incarnation fence; ordinary retained-message and rule-management paths are not
+newly covered. See [topic routing](crates/domain/src/machine/topic.rs) and the
+[compatibility differences](docs/compatibility.md#known-differences-and-bounds).
 
-- Cluster membership and node availability-zone labels
-- Namespace definitions, quotas, RBAC bindings, and KMS references
-- Entity definitions, immutable placement groups, and replica assignments
-- Storage, snapshot, protocol, and Raft command compatibility requirements
-- Backup manifests, feature gates, and cluster-wide audit configuration
-- Namespace storage quota leases allocated to data groups
+### Time And Storage
 
-Metadata operations are low volume and never carry message bodies. Placement
-changes add a learner, install a snapshot, catch it up, promote it through
-joint consensus, and only then remove the previous replica.
+The timer proposes bounded activation and lock, TTL, session-lock, and duplicate
+sweeps. Independent cursors isolate entity failures; saturated scans continue
+immediately. The proposer holds time still for small host-clock regressions and
+refuses larger ones, logged/retried but not wired to readiness. The state machine
+rejects regressing command time.
 
-## Data Plane And Sharding
+Fjall uses one `records` keyspace for domain keys and `meta` for a big-endian V1
+layout marker. Atomic batches are journalled and fsynced before apply returns;
+snapshots cannot observe a partial batch. A directory has one live owner.
+Missing markers are initialized only if both known keyspaces are empty; any
+existing row, including an empty value, refuses opening without adding a marker.
+A valid V1 marker keeps its existing behavior. This is neither a migration nor
+validation of foreign keyspaces or filesystem-byte invariance.
 
-A placement group maps to one Raft group with three voters. A queue receives a
-new placement group by default. A topic and every subscription and rule below
-it always share one group so filter evaluation and fanout commit atomically.
+The domain uses big-endian keys and V1 value envelopes. Memory and Fjall share
+the storage contract and paired tests. Split production keyspaces, replicated
+logs, quota accounting, encryption, and snapshot installation remain planned. See
+[storage](crates/storage/src/lib.rs) and
+[Fjall opening/apply](crates/storage/src/durable.rs).
 
-An entity can be created with an explicit `placement_group_id`. This permits
-same-group transactions between queues and topics. The setting is immutable
-after creation; moving an entity requires a controlled drain and recreation.
+## Production Target: Not Implemented
 
-The first production release does not split a hot entity. Its 100,000
-messages-per-second target is aggregate across independently placed entities.
-Session ordering is local to the owning entity group.
+The intended release is a Rust-native Linux broker with quorum durability,
+multi-tenant isolation, and Standard-compatible queues/topics. The design below
+is a requirement for future work, not an available deployment configuration.
+The server runtime, storage, and TLS must avoid RocksDB, OpenSSL, and system TLS.
 
-## Durable Write Path
+```mermaid
+flowchart TD
+    Client[Client] --> Edge[Authenticated protocol edge]
+    Edge --> Router[Placement router]
+    Metadata[Metadata Raft group] --> Router
+    Router --> Leader[Data-group leader]
+    Leader --> Log[Raft proposal]
+    Log --> Voters[Three voters: fsync replayable entry]
+    Voters --> Quorum{Quorum durable?}
+    Quorum -->|Yes| Apply[Deterministic atomic apply]
+    Apply --> Ack[Leader returns outcome]
+    Quorum -->|No| Refuse[Unavailable: refuse mutation]
+```
 
-1. The edge validates size, authorization, namespace quota, and protocol
-   fields.
-2. It resolves and forwards the typed command to the data-group leader.
-3. The leader encrypts protected fields, allocates deterministic identifiers,
-   and proposes the command.
-4. Every voter writes the Raft entry and hard state to its Fjall journal and
-   performs `SyncAll` before acknowledging replication.
-5. After quorum commit, each replica applies the command through one atomic
-   Fjall batch.
-6. The leader returns the protocol outcome only after its local apply
-   completes.
+### Placement And Durability
 
-Acknowledgement therefore means that a quorum holds a durable replayable
-record. Applied indexes and snapshots are persisted before older log segments
-can be compacted.
+- At least three odd-numbered cluster voters; three replicas per placement group.
+- A queue has one group by default. A topic, its subscriptions, and rules share
+  one group so fanout is atomic.
+- Immutable explicit placement permits same-group transactions. Partitioned
+  entities and cross-group transactions are outside the first release.
+- Metadata owns membership, namespace policy/quotas, placement, compatibility,
+  and backup/audit configuration, never message bodies.
+- Edge connections and AMQP link state remain local; messages, locks, sessions,
+  and settlements become replicated state.
+- Acknowledgement requires a quorum-fsynced replayable entry plus leader apply.
+  Without quorum, mutations, lock-acquiring receives, and consistent management
+  reads refuse with retryable availability errors.
+- Moves require learner snapshot/catch-up, joint-consensus promotion, then
+  removal. Applied indexes/snapshots fence log compaction.
 
-If quorum is unavailable, sends, receives that acquire locks, settlements,
-transactions, and consistent management reads fail with retryable availability
-errors. Switchyard does not acknowledge through a minority partition.
+Transactions stage invisible operations and commit in one same-group batch;
+disconnect/lease expiry aborts them. Cross-group forwarding instead needs a
+durable source outbox, idempotent destination command, and completion marker:
+at-least-once forwarding, not distributed atomicity.
 
-## Storage
+### Isolation, Security, And Recovery
 
-The production backend is Fjall. One database per node contains isolated
-keyspaces for:
+Namespaces will be mutually untrusted. Bounded storage leases, rate allocations,
+and weighted scheduling must enforce quotas/fairness; limits refuse sends,
+never evict live messages.
 
-- Raft hard state, entries, membership, applied indexes, and snapshots
-- Namespace and entity metadata cached from the metadata group
-- Encrypted message records and topic payload reference counts
-- Ready, scheduled, expiry, deferred, and dead-letter indexes
-- Peek locks, delivery counts, session ownership, and session state
-- Duplicate-detection windows and keyed identifier indexes
-- Staged transactions and durable forwarding outboxes
-- Logical quota accounting and audit-chain records
-- Backup checkpoints and exporter cursors
+OIDC and mTLS/SPIFFE mappings will supplement SAS. Per-namespace AES-256-GCM keys
+will protect bodies, properties, session state, credentials, and sensitive IDs;
+keyed digests protect equality indexes. Routing/sequencing may remain plaintext.
+External KMS must retain wrapped versions for reads, rotation, backup, and restore.
 
-The state machine uses explicit big-endian keys and V1 value envelopes. Until
-the production compatibility boundary is established, schema changes update
-that format directly.
+Audit will exclude sensitive content, form per-group hash chains, and export
+signed batches to configured WORM storage/telemetry. Compliance mode will require
+TLS, external KMS, complete auditing, encrypted backups, and fail-closed bounded
+audit backlog. Every authentication decision, admin change, message operation,
+backup, restore, and export must be audited. These are planned controls, not certification. See
+[threat model](docs/threat-model.md).
 
-What exists today is one `records` keyspace holding every state-machine key, and
-a `meta` keyspace holding the V1 on-disk layout marker. An open refuses any
-other marker rather than guessing at the meaning of stored bytes. A command's
-batch is journalled and fsynced before the store
-reports it applied, and a store directory has a single owner — a second open of a
-live directory is refused rather than shared.
+Encrypted snapshots and immutable committed-log archives will support
+point-in-time restore into an empty cluster. Signed manifests must pin metadata,
+membership, applied indexes, checksums, and key versions, verified before
+installation. Quorum, disk, clock, KMS, audit backlog, and backup freshness will
+feed readiness/alerts. Exporters remain operator-configured.
 
-The memory backend implements the same atomic batch and snapshot contract, and
-one conformance suite runs against both backends so they cannot drift. It is
-reserved for unit tests, deterministic simulations, Sift demos, and local
-development and never satisfies production readiness.
+## Completion Gates
 
-## Message Semantics
+The [roadmap](docs/roadmap.md) owns issue status and dependencies. The release
+contract remains unfulfilled until these independent gates pass:
 
-Peek-lock provides at-least-once delivery. Lock acquisition is committed before
-delivery, and completion removes the message only after settlement commits. A
-failed transfer or receiver leaves the durable lock to expire and permits
-redelivery.
+- [ ] Current/previous pinned .NET and pinned Sift data/administration gates;
+  differential checks for supported behavior, not blanket compatibility claims
+- [ ] Crash/fsync/snapshot recovery and partition/leader-change replay tests
+- [ ] Authorization, hard quotas/fairness, KMS outage/rotation, and audit integrity
+- [ ] Corrupt-backup refusal, empty-cluster restore, and rolling-upgrade checks
+- [ ] Parser fuzzing, model/property tests, and protocol/configuration golden vectors
+- [ ] Signed Linux x86_64/arm64 binaries/images, SBOMs, and deployment guidance
+- [ ] Published reference-hardware evidence: 5 TiB retained-data compaction,
+  failover, backup, and restore soak; 100,000 aggregate durable 1 KiB messages/s,
+  three replicas, encryption/audit,
+  NVMe/10 GbE, and send acknowledgement below 20 ms p99
 
-Receive-delete provides at-most-once delivery. Deletion commits before the
-transfer, so a client failure can lose that delivery by design.
-
-FIFO is guaranteed only within a session. Session ownership, its lock deadline,
-and opaque session state are replicated. A new owner cannot acquire a session
-until the previous lock expires or is released.
-
-Leader-only timer workers scan scheduled, lock-expiry, TTL, duplicate, and
-auto-delete indexes. They propose explicit state-machine commands; local wall
-clock never mutates state directly. An injected hybrid logical clock prevents
-time from moving backward. Clock jumps beyond the configured safety threshold
-pause timers and fail readiness until an operator resolves the condition.
-
-The worker that exists today activates queue and topic scheduled indexes and
-sweeps the queue lock-expiry, TTL, session-lock, and duplicate-history indexes.
-One sweep command processes a bounded number of entries, so the worker
-re-proposes until an index reports less than a full batch; queue and topic
-catalogs have independent cursors, topic activation runs before queue
-maintenance, and one entity's failure does not stop unrelated entities. A
-saturated bounded sweep schedules its continuation immediately instead of
-adding another timer interval of latency.
-Time reaches the state machine only through the proposer, which stamps each
-command: a host clock that steps back a little holds the applied timestamp still
-rather than regressing it, and one that steps back further has the command
-refused. Refusal is not yet wired to a readiness signal — the sweep is logged and
-retried on the next tick.
-
-Duplicate detection is configured per queue and keyed by the exact, non-empty
-message identifier. The first accepted send owns that identifier until its
-history deadline; another send in that window is acknowledged without storing
-another message. Scheduled and immediately available sends share the same
-history, and settlement, cancellation, expiry, or dead-lettering does not erase
-it. The history begins at the replicated command timestamp and a duplicate hit
-does not extend it. Those last two boundary choices make replay deterministic;
-Azure documents the window behavior but not either detail.
-
-An immediate topic command validates the whole singular or batch publication,
-allocates topic-owned sequence numbers, then materializes one envelope copy in
-every matching subscription present at that command's position in the
-replicated order. A scheduled topic command persists one topic-owned placeholder
-instead; topic-targeted peek can browse it, and cancellation can remove it,
-without exposing a subscription copy early. When it becomes due, one replicated
-activation command retires the placeholder, allocates a new active topic
-sequence, evaluates the subscriptions and rules present at that command's log
-position, and atomically materializes every matching copy. A topic with no
-matches still accepts the immediate or activated publication. Every
-subscription is created atomically with the implicit `$Default` true rule and
-otherwise uses the ordinary queue lifecycle, including independent lock,
-settlement, expiry, deferral, browsing, and DLQ state. Actionless true, false,
-and correlation rules are durable and
-combined with OR semantics; every populated field inside one correlation
-filter is an exact, typed AND predicate. Several matching actionless rules
-still produce one subscription copy. Rule creation, deletion, and paginated
-enumeration use the Service Bus AMQP management contract. Management scheduling
-and cancellation plus annotated scheduled transfers work for queues and topics.
-General SQL filters and SQL actions remain unimplemented; actions require
-deterministic per-copy
-property overlays before exposure. The current backend stores a full payload
-copy per subscription; shared encrypted payload records and reference counting
-remain an optimization for the production storage layout.
-
-## Transactions And Forwarding
-
-AMQP transactions are represented by replicated begin, stage, commit, and
-abort commands. Staged operations remain invisible until one atomic commit
-batch applies. Connection loss causes an explicit or lease-expiry abort.
-
-Transactions can include sends, settlements, and forwarding only when every
-entity belongs to the same placement group. Cross-group attempts fail before
-performing any member operation.
-
-Non-transactional forwarding across groups uses a durable source-side outbox,
-an idempotent destination command, and a replicated completion marker. This
-provides at-least-once forwarding without pretending to provide distributed
-atomicity.
-
-## Quotas And Isolation
-
-Namespaces are security and resource-isolation boundaries. Each namespace has
-limits for stored logical bytes, entities, subscriptions, connections,
-in-flight requests, message rate, bandwidth, and audit backlog.
-
-The metadata group grants bounded storage leases to data groups. A group cannot
-accept bytes beyond its lease, and the sum of leases cannot exceed the
-namespace quota. Rate limits use bounded per-node token allocations. The
-request scheduler applies namespace-weighted fairness so one tenant cannot
-consume every worker or connection slot.
-
-Reaching a storage quota rejects new sends. Switchyard never deletes live
-messages to make room.
-
-## Identity, Encryption, And Audit
-
-Authorization supports Azure-style SAS rights (`Send`, `Listen`, `Manage`),
-OIDC issuer/audience validation with claim-to-role bindings, and mTLS
-certificate or SPIFFE mappings. Native roles are scoped to cluster, namespace,
-or entity. Namespace, queue, topic, and subscription identities are normalized
-with ASCII case folding at every construction and deserialization boundary;
-AMQP links and entity-scoped SAS audiences use that same canonical identity.
-Session identifiers and placement-group identifiers remain case-preserving.
-
-Bodies, user properties, session state, credentials, and sensitive identifiers
-are encrypted with per-namespace AES-256-GCM data keys. Required sequence,
-timestamp, delivery, and routing fields remain plaintext. Equality lookup
-indexes use keyed digests instead of raw message or session identifiers.
-
-Data keys are wrapped by AWS KMS, Azure Key Vault, Google Cloud KMS, or Vault
-Transit. A local provider exists only for development. New writes use the
-active key version; old wrapped versions remain available for reads, backups,
-and background rotation.
-
-Every authentication decision, administration change, send, receive,
-settlement, backup, restore, and export emits a replicated audit record. Audit
-records contain actor and operation metadata but no message body or sensitive
-property value. Records form a per-group hash chain and are exported as signed
-batches to S3-compatible object storage with object lock and live OTLP.
-
-Compliance mode requires TLS, external KMS, complete audit scope, declared WORM
-retention, and encrypted backups. If its durable audit backlog reaches the
-reserved limit, audited operations fail closed instead of silently dropping
-evidence.
-
-## Backup And Recovery
-
-Each Raft group periodically emits an encrypted logical snapshot and
-continuously archives immutable committed-log chunks. A signed cluster backup
-manifest records the metadata revision, group membership, applied index,
-checksums, and required namespace key versions for every included group.
-
-Restore operates only into an empty cluster. It verifies manifests, signatures,
-checksums, and KMS key availability before installing snapshots and replaying
-logs to their pinned indexes. Continuous cross-region replication is deferred;
-v1 disaster recovery is encrypted snapshot and point-in-time log restore.
-
-## Observability
-
-Nodes expose Prometheus metrics, OpenTelemetry traces and logs, structured
-correlation identifiers, and separate liveness and readiness endpoints.
-Production alerts cover quorum, leader churn, replication lag, fsync latency,
-disk pressure, quota exhaustion, clock skew, KMS failures, audit backlog, and
-backup freshness.
-
-No telemetry leaves a cluster unless an operator configures an exporter.
-
-## Distribution
-
-Supported production targets are Linux x86_64 and arm64. Releases contain
-signed standalone binaries, OCI images, SBOMs, checksums, license reports,
-systemd examples, and a Helm chart with StatefulSets and replica anti-affinity.
-
-A production deployment requires at least three odd-numbered voters on durable
-NVMe storage. The reference performance environment uses three nodes connected
-by 10 GbE. A single node is supported only as an explicit development mode.
-
-## Verification And Release Gates
-
-Switchyard will publish a compatibility matrix rather than make a blanket
-compatibility claim. The initial gate runs the current and previous stable
-official .NET SDKs and a pinned Sift revision against Switchyard. Differential
-tests compare supported behavior with Azure Service Bus; external emulators are
-test oracles only and are not runtime dependencies.
-
-The test program includes:
-
-- State-machine model and property tests
-- AMQP, XML, filter, and configuration golden vectors
-- Parser and protocol fuzzing
-- Crash injection around each fsync and snapshot boundary
-- Network partitions, leader changes, and deterministic Raft simulation
-- KMS outage, key rotation, authorization, and audit-chain tests
-- Backup corruption, empty-cluster restore, and rolling-upgrade tests
-- Namespace fairness and hard-quota tests
-- A 5 TiB retained-data compaction, failover, backup, and restore soak
-- A 100,000 messages/second benchmark using persistent 1 KiB messages,
-  replication factor three, batching, encryption, full auditing, NVMe, and
-  10 GbE, with send acknowledgement below 20 ms p99
-
-Version `1.0` is reserved until the compatibility, durability, security,
-recovery, and performance gates pass.
+Version 1.0 is reserved for passing compatibility, durability, security, recovery,
+and performance gates. Premium features, cross-region replication, a browser
+dashboard, a Kubernetes operator, and non-Linux production servers are not
+initial release commitments.
