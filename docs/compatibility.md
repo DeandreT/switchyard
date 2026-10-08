@@ -174,7 +174,15 @@ originals are observed and cached. An unused hold gets one release attempt using
 its captured entity/full hold, after hold-only matching unregister if registered;
 refusal leaves ordinary expiry. This is not an atomic link-live, live-hold or
 registry fence ([#87](https://github.com/DeandreT/switchyard/issues/87)), or ancestor-task shielding ([#75](https://github.com/DeandreT/switchyard/issues/75)).
-Data/management/CBS transport retirement (#84-#86) and ordered process shutdown
+
+Inbound links retain one original Send/Batch result through borrowed observers
+and natural Detach/auth retirement. Never-polled retired work submits nothing;
+begun work drains without a replacement or new late acknowledgement. A committed
+send is not rolled back, and cancellation of a queued wire acknowledgement is
+not proof it was unsent. Whole-task abortion remains #75.
+Acquisition callers still rely on lazy broker method invocation (#91).
+
+Outbound starts (#90), management/CBS retirement (#85/#86) and process shutdown
 remain [roadmap work](roadmap.md#next-main-increments). Stalled broker/native I/O
 can still delay cleanup.
 

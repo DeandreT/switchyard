@@ -22,6 +22,8 @@ use super::{
 
 #[cfg(test)]
 mod attachment_handoff_tests;
+#[cfg(test)]
+mod ingress_tests;
 mod intake;
 #[cfg(test)]
 mod test_support;

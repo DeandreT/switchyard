@@ -34,9 +34,11 @@ use crate::{
 };
 
 mod attachments;
+mod ingress;
 mod settlement;
 
 use attachments::{EntityLink, accept_entity_link};
+use ingress::SendIntake;
 use settlement::serve_receiving_client;
 
 const LOCKED_UNTIL_UTC_PROPERTY: &str = "com.microsoft:locked-until-utc";
@@ -697,39 +699,42 @@ async fn serve_sending_client<B: Broker>(
     broker: B,
     authorization: Option<LinkAuthorization>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    loop {
-        let received = async {
-            match authorization.as_ref() {
-                Some(authorization) => {
-                    tokio::select! {
-                        result = receiver.recv() => Some(result),
-                        () = authorization.wait_until_unauthorized() => None,
-                    }
-                }
-                None => Some(receiver.recv().await),
-            }
+    let detached = receiver.on_detach_owned();
+    tokio::pin!(detached);
+    let unauthorized = async {
+        match authorization.as_ref() {
+            Some(authorization) => authorization.wait_until_unauthorized().await,
+            None => std::future::pending().await,
         }
-        .await;
-        let Some(received) = received else {
-            receiver
-                .close_with_error(unauthorized_error("the link's authorization has expired"))
-                .await?;
-            return Ok(());
+    };
+    tokio::pin!(unauthorized);
+
+    let retirement = loop {
+        let received = tokio::select! {
+            biased;
+            () = &mut detached => break SendRetirement::Detached,
+            () = &mut unauthorized => break SendRetirement::Unauthorized,
+            received = receiver.recv() => received,
         };
         let delivery = match received {
             Ok(delivery) => delivery,
             // The engine already answered a remote Detach. A late local close
             // could detach a replacement link that reused this handle.
             Err(EngineError::RemoteClosed | EngineError::RemoteDetached | EngineError::Stopped) => {
-                return Ok(());
+                break SendRetirement::Detached;
             }
             Err(error) => return Err(error.into()),
         };
-        if let Some(authorization) = authorization.as_ref()
-            && let Err(error) = authorization.ensure().await
-        {
-            receiver.close_with_error(error).await?;
-            return Ok(());
+        if let Some(authorization) = authorization.as_ref() {
+            let prepared = tokio::select! {
+                biased;
+                () = &mut detached => break SendRetirement::Detached,
+                () = &mut unauthorized => break SendRetirement::Unauthorized,
+                prepared = authorization.ensure() => prepared,
+            };
+            if prepared.is_err() {
+                break SendRetirement::Unauthorized;
+            }
         }
         let incoming = match read_incoming_messages(
             delivery.message_format(),
@@ -740,12 +745,15 @@ async fn serve_sending_client<B: Broker>(
             Err(error) => {
                 // The client's message, the client's fault: reject this transfer
                 // and keep the link.
-                receiver
-                    .reject(
+                tokio::select! {
+                    biased;
+                    () = &mut detached => break SendRetirement::Detached,
+                    () = &mut unauthorized => break SendRetirement::Unauthorized,
+                    rejected = receiver.reject(
                         &delivery,
                         Some(error_for(AmqpError::InvalidField, error.to_string())),
-                    )
-                    .await?;
+                    ) => rejected?,
+                }
                 continue;
             }
         };
@@ -772,32 +780,90 @@ async fn serve_sending_client<B: Broker>(
                 )
             }
         };
-        let outcome = broker
-            .submit(namespace.clone(), entity.clone(), command)
-            .await;
+        let mut original = SendIntake::new(async {
+            broker
+                .submit(namespace.clone(), entity.clone(), command)
+                .await
+        });
+        let retired = tokio::select! {
+            biased;
+            () = &mut detached => Some(SendRetirement::Detached),
+            () = &mut unauthorized => Some(SendRetirement::Unauthorized),
+            _ = original.observe() => None,
+        };
+        if let Some(retirement) = retired {
+            debug!(started = original.started(), "draining retired Send intake");
+            let _ = original.finish().await;
+            let packet = original
+                .take_packet()
+                .expect("finished Send owns one terminal packet");
+            debug!(
+                started = packet.started,
+                retired = packet.retired,
+                "retired Send result observed without new acknowledgement"
+            );
+            match packet.result {
+                Some(Ok(other)) if !expected.matches(&other) => {
+                    warn!(?other, "retired Send produced an unexpected outcome");
+                }
+                Some(Err(rejection)) => debug!(%rejection, "retired Send was rejected"),
+                _ => {}
+            }
+            break retirement;
+        }
+        let packet = original
+            .take_packet()
+            .expect("observed Send owns one terminal packet");
+        debug_assert!(packet.started && !packet.retired);
+        let outcome = packet.result.expect("active Send was not retired");
 
         // Accepting only after the command committed is what makes the
         // acknowledgement mean the message is durable.
-        match outcome {
-            Ok(outcome) if expected.matches(&outcome) => receiver.accept(&delivery).await?,
-            Ok(other) => {
-                receiver
-                    .reject(
-                        &delivery,
-                        Some(error_for(
-                            AmqpError::InternalError,
-                            format!("send produced an unexpected outcome: {other:?}"),
-                        )),
-                    )
-                    .await?
+        let acknowledgement = async {
+            match outcome {
+                Ok(outcome) if expected.matches(&outcome) => receiver.accept(&delivery).await,
+                Ok(other) => {
+                    receiver
+                        .reject(
+                            &delivery,
+                            Some(error_for(
+                                AmqpError::InternalError,
+                                format!("send produced an unexpected outcome: {other:?}"),
+                            )),
+                        )
+                        .await
+                }
+                Err(rejection) => {
+                    receiver
+                        .reject(&delivery, Some(rejection_error(&rejection)))
+                        .await
+                }
             }
-            Err(rejection) => {
-                receiver
-                    .reject(&delivery, Some(rejection_error(&rejection)))
-                    .await?
-            }
+        };
+        tokio::select! {
+            biased;
+            () = &mut detached => break SendRetirement::Detached,
+            () = &mut unauthorized => break SendRetirement::Unauthorized,
+            acknowledged = acknowledgement => acknowledged?,
+        }
+    };
+
+    if matches!(retirement, SendRetirement::Unauthorized) {
+        // Prefer observed original-link retirement to a new local auth Close.
+        tokio::select! {
+            biased;
+            () = &mut detached => {}
+            closed = receiver.close_with_error(unauthorized_error(
+                "the link's authorization has expired",
+            )) => closed?,
         }
     }
+    Ok(())
+}
+
+enum SendRetirement {
+    Detached,
+    Unauthorized,
 }
 
 #[derive(Clone, Copy)]

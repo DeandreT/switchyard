@@ -22,6 +22,7 @@ and assignment source. Milestones group work; independent lanes can run in paral
 - [x] Original Receive/result/credit custody through natural teardown ([#79](https://github.com/DeandreT/switchyard/issues/79))
 - [x] Native queued-credit replies own cleanup before observation ([#81](https://github.com/DeandreT/switchyard/issues/81))
 - [x] Exact original session-grant/native-attach handoff ([#80](https://github.com/DeandreT/switchyard/issues/80)); acquisition coordinator #73 complete
+- [x] Original inbound Send/Batch custody through data-link retirement ([#89](https://github.com/DeandreT/switchyard/issues/89)); outbound #90 remains
 - [ ] Remaining client semantics, administration and conserved capacity
 - [ ] Real quorum, multi-tenant security, recovery and measured release gates
 
@@ -32,7 +33,7 @@ See [compatibility](compatibility.md).
 
 ## Next Main Increments
 
-1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7): data links #84, registry fencing #87, management #85, then CBS #86 under #74; task trees (#75/#63), admission/deadlines (#64), then signal shutdown (#65). Joins are not graceful Close acknowledgements.
+1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7): acquisition caller frontier #91, then outbound #90 completes data links #84, followed by registry #87, management #85 and CBS #86 under #74; task trees (#75/#63), admission/deadlines (#64), then signal shutdown (#65). Joins are not graceful Close acknowledgements.
 2. Complete [#12](https://github.com/DeandreT/switchyard/issues/12) through sender, receiver/settlement, sessions, then management ([#57](https://github.com/DeandreT/switchyard/issues/57) through [#60](https://github.com/DeandreT/switchyard/issues/60)) using the bound broker API. Wire adapters wait for #7.
 3. Enable [#15](https://github.com/DeandreT/switchyard/issues/15) only after retained authority is complete; no live deletion/recreation claim yet.
 4. Port safe configuration and typed-content increments independently, then their dependent features.
@@ -61,8 +62,10 @@ flowchart TD
     Settlement --> Receive["#79 Receive/credit custody"]
     Receive --> Acquisition["#80 Session handoff / #73"]
     Permits --> CreditReply["#81 Queued credit replies"]
-    CreditReply --> DataTransport
-    Acquisition --> DataTransport["#84 Data-link transport / #74"]
+    CreditReply --> IngressTransport
+    Acquisition --> IngressTransport["#89 Inbound Send/Batch"]
+    IngressTransport --> Invocation["#91 Acquisition call frontier"]
+    Invocation --> DataTransport["#90 Outbound starts / #84"]
     DataTransport --> Registry["#87 Session registry handoff"]
     Registry --> ManagementTransport["#85 Management transport"]
     ManagementTransport --> CbsTransport["#86 CBS transport"]
@@ -106,7 +109,7 @@ pickup. Retained wire authority follows the merged core and connection-lifecycle
 | Lane | Start | Boundary |
 | --- | --- | --- |
 | Retained sender | [#57](https://github.com/DeandreT/switchyard/issues/57) | Wait for #7; sender/listener ownership only |
-| Connection lifecycle | [#63](https://github.com/DeandreT/switchyard/issues/63) | After #80; #84 -> #87 -> #85 -> #86 -> #75, then #64/#65 |
+| Connection lifecycle | [#63](https://github.com/DeandreT/switchyard/issues/63) | After #89; #91 -> #90 -> #87 -> #85 -> #86 -> #75, then #64/#65 |
 | Identity policy | [#8](https://github.com/DeandreT/switchyard/issues/8) | Pure `auth` policy; no listener/CBS activation |
 | Client evidence | [#9](https://github.com/DeandreT/switchyard/issues/9) | Test harness and pin/custody records; no runtime changes |
 | Administration contract | [#10](https://github.com/DeandreT/switchyard/issues/10) | Scrubbed fixtures/closed profiles; no serving endpoint |
@@ -151,7 +154,10 @@ single PR for the whole row. Update pickup labels when prerequisites merge.
 | Exact session-grant/native-attach handoff | [#80](https://github.com/DeandreT/switchyard/issues/80) | [#79](https://github.com/DeandreT/switchyard/issues/79); implemented |
 | Native queued-credit cleanup custody | [#81](https://github.com/DeandreT/switchyard/issues/81) | [#67](https://github.com/DeandreT/switchyard/issues/67); implemented |
 | Cooperative transport/route cleanup | [#74](https://github.com/DeandreT/switchyard/issues/74) | [#80](https://github.com/DeandreT/switchyard/issues/80), [#81](https://github.com/DeandreT/switchyard/issues/81); ordered children below |
-| Original data-link transport retirement | [#84](https://github.com/DeandreT/switchyard/issues/84) | [#80](https://github.com/DeandreT/switchyard/issues/80), [#81](https://github.com/DeandreT/switchyard/issues/81) |
+| Original data-link transport retirement | [#84](https://github.com/DeandreT/switchyard/issues/84) | [#89](https://github.com/DeandreT/switchyard/issues/89), [#90](https://github.com/DeandreT/switchyard/issues/90) |
+| Inbound Send/Batch custody | [#89](https://github.com/DeandreT/switchyard/issues/89) | [#80](https://github.com/DeandreT/switchyard/issues/80), [#81](https://github.com/DeandreT/switchyard/issues/81); implemented |
+| Deferred acquisition method invocation | [#91](https://github.com/DeandreT/switchyard/issues/91) | [#89](https://github.com/DeandreT/switchyard/issues/89) |
+| Outbound native-start custody/late adoption | [#90](https://github.com/DeandreT/switchyard/issues/90) | [#91](https://github.com/DeandreT/switchyard/issues/91) |
 | Fenced session registry handoff/cleanup | [#87](https://github.com/DeandreT/switchyard/issues/87) | [#84](https://github.com/DeandreT/switchyard/issues/84) |
 | Management transport/route retirement | [#85](https://github.com/DeandreT/switchyard/issues/85) | [#87](https://github.com/DeandreT/switchyard/issues/87) |
 | CBS transport/route retirement | [#86](https://github.com/DeandreT/switchyard/issues/86) | [#85](https://github.com/DeandreT/switchyard/issues/85) |
