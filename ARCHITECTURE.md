@@ -36,6 +36,15 @@ CBS SAS provides Send/Listen/Manage authorization. Expired grants close links;
 initial authorization has a deadline. TLS precedes AMQP; WSS carries binary
 AMQP at `/$servicebus/websocket`.
 
+Accepted native connections retain their original driver and reader handles.
+Sticky stop bypasses bounded commands and interrupts driver IO/channel waits
+before normal link cleanup. `shutdown` joins both and caches results across
+canceled waiters; Drop requests stop without joining. Joined shutdown is not a
+peer Close acknowledgement. Sender-capacity waits, protocol task ownership,
+connection admission/pre-open deadlines, and process signals remain planned.
+See [native custody](crates/amqp/src/server/tasks.rs) and the
+[shutdown sequence](docs/roadmap.md#next-main-increments).
+
 Namespace, queue, topic, and subscription names are ASCII case-insensitive in
 typed identifiers, storage, AMQP addresses, and entity-scoped SAS audiences.
 Session and placement identifiers remain case-preserving. The native gRPC API

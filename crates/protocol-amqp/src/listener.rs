@@ -197,7 +197,7 @@ where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     B: Broker,
 {
-    let (connection, authorization) = match shared_access_authentication {
+    let (mut connection, authorization) = match shared_access_authentication {
         Some(config) => {
             let sasl_acceptor = SharedAccessSaslAcceptor::new(&config);
             let connection = ServerConnection::accept(
@@ -214,11 +214,24 @@ where
             None,
         ),
     };
-    serve_open_connection(connection, namespace, broker, authorization).await
+    let result = serve_open_connection(&mut connection, namespace, broker, authorization).await;
+    let shutdown = connection.shutdown().await;
+    match (result, shutdown) {
+        (Err(error), shutdown) => {
+            if let Err(shutdown) = shutdown {
+                warn!(%shutdown, "native tasks failed during error cleanup");
+            }
+            Err(error)
+        }
+        (Ok(()), shutdown) => {
+            shutdown?;
+            Ok(())
+        }
+    }
 }
 
 async fn serve_open_connection<B: Broker>(
-    mut connection: ServerConnection,
+    connection: &mut ServerConnection,
     namespace: NamespaceName,
     broker: B,
     authorization: Option<Arc<ConnectionAuthorization>>,

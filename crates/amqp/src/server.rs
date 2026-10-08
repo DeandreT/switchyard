@@ -65,6 +65,7 @@ pub struct ServerConnection {
     commands: mpsc::Sender<Command>,
     cleanup: mpsc::UnboundedSender<CleanupCommand>,
     incoming_sessions: mpsc::Receiver<IncomingSession>,
+    tasks: ConnectionTasks,
 }
 
 pub struct IncomingSession {
@@ -405,22 +406,35 @@ impl ServerConnection {
         let (commands, command_rx) = mpsc::channel(256);
         let (cleanup, cleanup_rx) = mpsc::unbounded_channel();
         let (incoming_session_tx, incoming_sessions) = mpsc::channel(32);
-        tokio::spawn(run_connection(
+        let tasks = ConnectionTasks::spawn(
             stream,
             remote_open.max_frame_size,
             command_rx,
             cleanup_rx,
             incoming_session_tx,
-        ));
+        );
         Ok(Self {
             commands,
             cleanup,
             incoming_sessions,
+            tasks,
         })
     }
 
     pub async fn next_incoming_session(&mut self) -> Option<IncomingSession> {
         self.incoming_sessions.recv().await
+    }
+
+    /// Requests task termination without using the bounded command channel.
+    /// This does not perform a graceful AMQP Close or certify completed joins.
+    pub fn stop(&self) {
+        self.tasks.stop();
+    }
+
+    /// Stops and joins the original driver and reader. A cancelled borrowed
+    /// waiter may retry; completed results remain retained for repeated calls.
+    pub async fn shutdown(&mut self) -> Result<(), ConnectionShutdownError> {
+        self.tasks.shutdown().await
     }
 
     pub async fn accept_session(
@@ -924,6 +938,10 @@ async fn request<T>(
 
 mod engine;
 use engine::*;
+
+mod tasks;
+pub use tasks::ConnectionShutdownError;
+use tasks::{ConnectionTasks, wait_for_stop};
 
 #[cfg(feature = "test-client")]
 mod client;

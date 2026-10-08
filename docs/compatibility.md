@@ -35,6 +35,7 @@ loaded-DLL provenance, or durable SDK custody. See
 | Area | Coverage and limit |
 | --- | --- |
 | Transport | AMQP 1.0 TCP/TLS and WSS binary tunnel at `/$servicebus/websocket` (`AMQPWSB10` or `amqp`); plaintext only in development |
+| Native lifecycle | Accepted connection owns its original driver/reader tasks; sticky stop bypasses command capacity; joined shutdown retains both results |
 | Authentication | TLS before AMQP; SASL PLAIN or ANONYMOUS/`MSSBCBS` then CBS SAS; namespace/entity Send, Listen, Manage grants |
 | Queue delivery | Singular/atomic batch send, peek-lock, receive-delete, independent out-of-order settlement, bounded prefetch/credit drain |
 | Envelope | Durable encoded AMQP body/forms, identifiers, properties, annotations, application properties, footer; broker-authoritative delivery overlays |
@@ -146,6 +147,17 @@ is stale. Wrapper scope mismatch precedes these reads. This is not a whole-store
 or parent-membership proof, live deletion, or a global mixed-corruption priority.
 Wire links, legacy name calls, timers and raw catalog/diagnostic reads remain
 outside retained-authority protection; #57-#60 will adopt it at the edge.
+
+Native `stop` interrupts driver IO/channel work; `shutdown` joins the original
+driver and reader, retaining results for cancellation-safe retry. Drop requests
+stop only. Join success does not acknowledge AMQP Close: `close` and
+`close_with_error` still require the peer reply. Detach-aware sender-capacity
+waits, protocol task ownership, bounded connection admission/pre-open deadlines,
+and ordered process shutdown remain [#7 work](roadmap.md#next-main-increments).
+
+Sustained inbound traffic beyond initial credit is not certified. Session
+transfer-window accounting and receiving-credit refill remain
+[#68](https://github.com/DeandreT/switchyard/issues/68)/[#69](https://github.com/DeandreT/switchyard/issues/69).
 
 Timer commands, not local wall-clock mutation, drive activation/expiry. Small
 host-clock regressions hold command time still; large ones refuse and retry,

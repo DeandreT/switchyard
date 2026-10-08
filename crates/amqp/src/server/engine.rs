@@ -1,4 +1,5 @@
 use super::*;
+use tokio::io::AsyncWriteExt;
 
 mod link_flow;
 
@@ -169,80 +170,77 @@ pub(super) struct PartialDelivery {
     bytes: Vec<u8>,
 }
 
-pub(super) async fn run_connection<Io>(
-    stream: Io,
+pub(super) async fn run_connection<W>(
+    mut writer: W,
     remote_max_frame_size: u32,
     mut commands: mpsc::Receiver<Command>,
     mut cleanup: mpsc::UnboundedReceiver<CleanupCommand>,
     incoming_sessions: mpsc::Sender<IncomingSession>,
+    mut frames: mpsc::Receiver<Result<Frame, EngineError>>,
+    mut stop: watch::Receiver<bool>,
 ) where
-    Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
 {
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let (frames_tx, mut frames) = mpsc::channel(256);
-    tokio::spawn(async move {
-        loop {
-            let frame = read_frame(&mut reader).await;
-            let done = frame.is_err();
-            if frames_tx.send(frame).await.is_err() || done {
-                break;
-            }
-        }
-    });
-
     let mut sessions = HashMap::<u16, SessionState>::new();
     let mut pending_sessions = HashMap::<u16, u64>::new();
     let mut closing_reply: Option<oneshot::Sender<Result<(), EngineError>>> = None;
     let mut cleanup_open = true;
-    loop {
-        tokio::select! {
-            biased;
-            cleanup_command = cleanup.recv(), if cleanup_open => {
-                match cleanup_command {
-                    Some(cleanup_command) => {
-                        if handle_cleanup(cleanup_command, &mut writer, &mut sessions).await.is_err() {
-                            break;
+    // Cancellation must reach nested writes and channel sends before link cleanup.
+    tokio::select! {
+        biased;
+        _ = super::wait_for_stop(&mut stop) => {}
+        _ = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    cleanup_command = cleanup.recv(), if cleanup_open => {
+                        match cleanup_command {
+                            Some(cleanup_command) => {
+                                if handle_cleanup(cleanup_command, &mut writer, &mut sessions).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => cleanup_open = false,
                         }
                     }
-                    None => cleanup_open = false,
-                }
-            }
-            frame = frames.recv() => {
-                let Some(frame) = frame else { break };
-                let Ok(frame) = frame else { break };
-                match handle_frame(
-                    frame,
-                    &mut writer,
-                    &incoming_sessions,
-                    &mut pending_sessions,
-                    &mut sessions,
-                    remote_max_frame_size,
-                ).await {
-                    Ok(FrameAction::Continue) => {}
-                    Ok(FrameAction::Closed) => {
-                        if let Some(reply) = closing_reply.take() {
-                            let _ = reply.send(Ok(()));
+                    frame = frames.recv() => {
+                        let Some(frame) = frame else { break };
+                        let Ok(frame) = frame else { break };
+                        match handle_frame(
+                            frame,
+                            &mut writer,
+                            &incoming_sessions,
+                            &mut pending_sessions,
+                            &mut sessions,
+                            remote_max_frame_size,
+                        ).await {
+                            Ok(FrameAction::Continue) => {}
+                            Ok(FrameAction::Closed) => {
+                                if let Some(reply) = closing_reply.take() {
+                                    let _ = reply.send(Ok(()));
+                                }
+                                break;
+                            }
+                            Err(_) => break,
                         }
-                        break;
                     }
-                    Err(_) => break,
+                    command = commands.recv() => {
+                        let Some(command) = command else { break };
+                        match handle_command(
+                            command,
+                            &mut writer,
+                            &mut pending_sessions,
+                            &mut sessions,
+                            remote_max_frame_size,
+                        ).await {
+                            Ok(CommandAction::Continue) => {}
+                            Ok(CommandAction::Closing(reply)) => closing_reply = Some(reply),
+                            Err(_) => break,
+                        }
+                    }
                 }
             }
-            command = commands.recv() => {
-                let Some(command) = command else { break };
-                match handle_command(
-                    command,
-                    &mut writer,
-                    &mut pending_sessions,
-                    &mut sessions,
-                    remote_max_frame_size,
-                ).await {
-                    Ok(CommandAction::Continue) => {}
-                    Ok(CommandAction::Closing(reply)) => closing_reply = Some(reply),
-                    Err(_) => break,
-                }
-            }
-        }
+        } => {}
     }
 
     for session in sessions.values_mut() {
@@ -387,6 +385,8 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
         }
         Performative::Close(_) => {
             write_amqp(writer, 0, Performative::Close(Close::default()), Vec::new()).await?;
+            // The reader may stop next, so it cannot flush a buffered transport for us.
+            writer.flush().await?;
             return Ok(FrameAction::Closed);
         }
         Performative::Open(_) => return Err(invalid_state("duplicate AMQP open")),
@@ -711,14 +711,11 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             error,
             reply,
         } => {
-            let link = sessions.get_mut(&channel).and_then(|session| {
-                let is_current = session
-                    .links
-                    .get(&handle)
-                    .is_some_and(|link| link.incarnation() == incarnation);
-                is_current.then(|| session.links.remove(&handle)).flatten()
-            });
-            if let Some(mut link) = link {
+            let is_current = sessions
+                .get(&channel)
+                .and_then(|session| session.links.get(&handle))
+                .is_some_and(|link| link.incarnation() == incarnation);
+            if is_current {
                 write_amqp(
                     writer,
                     channel,
@@ -730,12 +727,18 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                     Vec::new(),
                 )
                 .await?;
-                stop_link(&mut link);
+                if let Some(mut link) = sessions
+                    .get_mut(&channel)
+                    .and_then(|session| session.links.remove(&handle))
+                {
+                    stop_link(&mut link);
+                }
             }
             let _ = reply.send(Ok(()));
         }
         Command::Close { error, reply } => {
             write_amqp(writer, 0, Performative::Close(Close { error }), Vec::new()).await?;
+            writer.flush().await?;
             return Ok(CommandAction::Closing(reply));
         }
     }
