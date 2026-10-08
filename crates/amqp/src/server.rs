@@ -626,10 +626,7 @@ impl Sender {
         message: Message,
         delivery_tag: DeliveryTag,
     ) -> Result<PendingDelivery, EngineError> {
-        let permit = Arc::clone(&self.send_capacity)
-            .acquire_owned()
-            .await
-            .map_err(|_| EngineError::Stopped)?;
+        let permit = self.acquire_send_capacity().await?;
         let (started, start) = oneshot::channel();
         let (reply, response) = oneshot::channel();
         self.commands
@@ -656,6 +653,35 @@ impl Sender {
             response,
             commands: self.commands.clone(),
         })
+    }
+
+    async fn acquire_send_capacity(&self) -> Result<OwnedSemaphorePermit, EngineError> {
+        let mut detached = self.detached.clone();
+        let acquire = Arc::clone(&self.send_capacity).acquire_owned();
+        tokio::pin!(acquire);
+        loop {
+            if *detached.borrow_and_update() {
+                return Err(EngineError::RemoteDetached);
+            }
+            if self.commands.is_closed() || detached.has_changed().is_err() {
+                return Err(EngineError::Stopped);
+            }
+            // Keep the same semaphore waiter across notifications to retain FIFO order.
+            tokio::select! {
+                biased;
+                _ = detached.changed() => {}
+                _ = self.commands.closed() => {}
+                acquired = &mut acquire => {
+                    if *detached.borrow() {
+                        return Err(EngineError::RemoteDetached);
+                    }
+                    if self.commands.is_closed() || detached.has_changed().is_err() {
+                        return Err(EngineError::Stopped);
+                    }
+                    return acquired.map_err(|_| EngineError::Stopped);
+                }
+            }
+        }
     }
 
     /// Sends a delivery and returns the receiver's outcome before confirming

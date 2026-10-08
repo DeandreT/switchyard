@@ -151,9 +151,10 @@ outside retained-authority protection; #57-#60 will adopt it at the edge.
 Native `stop` interrupts driver IO/channel work; `shutdown` joins the original
 driver and reader, retaining results for cancellation-safe retry. Drop requests
 stop only. Join success does not acknowledge AMQP Close: `close` and
-`close_with_error` still require the peer reply. Detach-aware sender-capacity
-waits, protocol task ownership, bounded connection admission/pre-open deadlines,
-and ordered process shutdown remain [#7 work](roadmap.md#next-main-increments).
+`close_with_error` still require the peer reply. Sender capacity waits observe
+detach and command closure, even when callers retain all 256 confirmation permits.
+Protocol task ownership, bounded admission/pre-open deadlines and ordered process
+shutdown remain [#7 work](roadmap.md#next-main-increments).
 
 Sustained inbound traffic beyond initial credit is not certified. Session
 transfer-window accounting and receiving-credit refill remain

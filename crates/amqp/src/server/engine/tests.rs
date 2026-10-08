@@ -3,6 +3,7 @@ use serde_amqp::primitives::Binary;
 use super::*;
 use crate::{AmqpError, ErrorCondition, Rejected, Source, Target, Value};
 
+mod capacity;
 mod credit;
 mod incarnation;
 mod session_incarnation;

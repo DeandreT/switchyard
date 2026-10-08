@@ -17,6 +17,7 @@ and assignment source. Milestones group work; independent lanes can run in paral
 - [x] Private live owner heads with an active format-2 store fence ([#6](https://github.com/DeandreT/switchyard/issues/6))
 - [x] Consumed bound broker API with pre-clock authority checks ([#56](https://github.com/DeandreT/switchyard/issues/56)); wire adoption remains pending
 - [x] Original native driver/reader stop and joined shutdown ([#62](https://github.com/DeandreT/switchyard/issues/62)); wider lifecycle remains pending
+- [x] Detach-aware sender admission with unchanged bounded capacity ([#67](https://github.com/DeandreT/switchyard/issues/67))
 - [ ] Remaining client semantics, administration and conserved capacity
 - [ ] Real quorum, multi-tenant security, recovery and measured release gates
 
@@ -27,7 +28,7 @@ See [compatibility](compatibility.md).
 
 ## Next Main Increments
 
-1. Finish parent [#7](https://github.com/DeandreT/switchyard/issues/7) in order: native custody [#62](https://github.com/DeandreT/switchyard/issues/62), detach-aware sender capacity [#67](https://github.com/DeandreT/switchyard/issues/67), protocol task ownership [#63](https://github.com/DeandreT/switchyard/issues/63), connection admission/deadlines [#64](https://github.com/DeandreT/switchyard/issues/64), then ordered signal shutdown [#65](https://github.com/DeandreT/switchyard/issues/65). Only native custody is implemented; joined tasks do not establish graceful Close acknowledgement or the wider shutdown chain.
+1. Finish parent [#7](https://github.com/DeandreT/switchyard/issues/7): protocol task ownership [#63](https://github.com/DeandreT/switchyard/issues/63), admission/deadlines [#64](https://github.com/DeandreT/switchyard/issues/64), then signal shutdown [#65](https://github.com/DeandreT/switchyard/issues/65). Native custody and sender admission are implemented; task joins are not graceful Close acknowledgements.
 2. Complete [#12](https://github.com/DeandreT/switchyard/issues/12) through sender, receiver/settlement, sessions, then management ([#57](https://github.com/DeandreT/switchyard/issues/57) through [#60](https://github.com/DeandreT/switchyard/issues/60)) using the bound broker API. Wire adapters wait for #7.
 3. Enable [#15](https://github.com/DeandreT/switchyard/issues/15) only after retained authority is complete; no live deletion/recreation claim yet.
 4. Port safe configuration and typed-content increments independently, then their dependent features.
@@ -92,7 +93,7 @@ pickup. Retained wire authority follows the merged core and connection-lifecycle
 | Lane | Start | Boundary |
 | --- | --- | --- |
 | Retained sender | [#57](https://github.com/DeandreT/switchyard/issues/57) | Wait for #7; sender/listener ownership only |
-| Connection lifecycle | [#67](https://github.com/DeandreT/switchyard/issues/67) | After #62; native detach-aware sender-capacity waits only, then #63-#65 |
+| Connection lifecycle | [#63](https://github.com/DeandreT/switchyard/issues/63) | After #62/#67; protocol task ownership only, then #64/#65 |
 | Identity policy | [#8](https://github.com/DeandreT/switchyard/issues/8) | Pure `auth` policy; no listener/CBS activation |
 | Client evidence | [#9](https://github.com/DeandreT/switchyard/issues/9) | Test harness and pin/custody records; no runtime changes |
 | Administration contract | [#10](https://github.com/DeandreT/switchyard/issues/10) | Scrubbed fixtures/closed profiles; no serving endpoint |
@@ -129,7 +130,7 @@ single PR for the whole row. Update pickup labels when prerequisites merge.
 | Management authority | [#60](https://github.com/DeandreT/switchyard/issues/60) | [#59](https://github.com/DeandreT/switchyard/issues/59) |
 | Bounded AMQP task shutdown | [#7](https://github.com/DeandreT/switchyard/issues/7) | All five ordered children below |
 | Native driver/reader custody | [#62](https://github.com/DeandreT/switchyard/issues/62) | Independent; implemented |
-| Detach-aware sender-capacity waits | [#67](https://github.com/DeandreT/switchyard/issues/67) | [#62](https://github.com/DeandreT/switchyard/issues/62) |
+| Detach-aware sender-capacity waits | [#67](https://github.com/DeandreT/switchyard/issues/67) | [#62](https://github.com/DeandreT/switchyard/issues/62); implemented |
 | Protocol session/link/settlement task ownership | [#63](https://github.com/DeandreT/switchyard/issues/63) | [#62](https://github.com/DeandreT/switchyard/issues/62), [#67](https://github.com/DeandreT/switchyard/issues/67) |
 | Bounded TCP/WSS admission and aggregate TLS/HTTP/SASL/Open deadline | [#64](https://github.com/DeandreT/switchyard/issues/64) | [#63](https://github.com/DeandreT/switchyard/issues/63) |
 | Signal shutdown: listener cleanup, timer join, broker/runtime | [#65](https://github.com/DeandreT/switchyard/issues/65) | [#64](https://github.com/DeandreT/switchyard/issues/64) |
@@ -145,7 +146,8 @@ single PR for the whole row. Update pickup labels when prerequisites merge.
 | Work | Issue | Requires |
 | --- | --- | --- |
 | Offline JWT policy | [#8](https://github.com/DeandreT/switchyard/issues/8) | Independent |
-| JWT CBS integration | [#17](https://github.com/DeandreT/switchyard/issues/17) | [#8](https://github.com/DeandreT/switchyard/issues/8), [#7](https://github.com/DeandreT/switchyard/issues/7) |
+| Verified grant consumers | [#71](https://github.com/DeandreT/switchyard/issues/71) | [#8](https://github.com/DeandreT/switchyard/issues/8), [#7](https://github.com/DeandreT/switchyard/issues/7) |
+| JWT CBS integration | [#17](https://github.com/DeandreT/switchyard/issues/17) | [#8](https://github.com/DeandreT/switchyard/issues/8), [#7](https://github.com/DeandreT/switchyard/issues/7), [#71](https://github.com/DeandreT/switchyard/issues/71) |
 | Two SDK pins and launched-client identity | [#9](https://github.com/DeandreT/switchyard/issues/9) | Independent |
 | Native session transfer windows | [#68](https://github.com/DeandreT/switchyard/issues/68) | [#7](https://github.com/DeandreT/switchyard/issues/7) |
 | Bounded receiving-credit refill | [#69](https://github.com/DeandreT/switchyard/issues/69) | [#68](https://github.com/DeandreT/switchyard/issues/68), [#9](https://github.com/DeandreT/switchyard/issues/9) |
