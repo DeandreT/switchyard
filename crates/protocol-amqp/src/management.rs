@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex as StdMutex, Weak},
+    time::Duration,
+};
 
 use amqp::{
     AmqpError, ApplicationProperties, Body, Error as AmqpProtocolError, Message, MessageId,
@@ -110,11 +114,49 @@ fn definitive_message_lock_loss(rejection: &BrokerRejection) -> bool {
     )
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ManagedSession {
+#[derive(Debug)]
+pub(crate) struct SessionClaim {
+    management: Weak<ConnectionManagement>,
+    link_name: String,
+    entity: EntityPath,
+    identity: Arc<()>,
+}
+
+impl Drop for SessionClaim {
+    fn drop(&mut self) {
+        if let Some(management) = self.management.upgrade() {
+            let mut claims = management
+                .session_claims
+                .lock()
+                .expect("the pending session claim lock is not poisoned");
+            if claims
+                .get(&self.link_name)
+                .is_some_and(|identity| Arc::ptr_eq(identity, &self.identity))
+            {
+                claims.remove(&self.link_name);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SessionRegistration {
+    link_name: String,
     entity: EntityPath,
     hold: SessionHold,
+    identity: Arc<()>,
 }
+
+impl PartialEq for SessionRegistration {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity)
+            && self.link_name == other.link_name
+            && self.entity == other.entity
+            && self.hold == other.hold
+    }
+}
+
+impl Eq for SessionRegistration {}
 
 #[derive(Debug, Default)]
 struct ReplyRoutes {
@@ -130,7 +172,8 @@ pub(crate) struct ConnectionManagement {
     deliveries: RwLock<HashMap<DeliveryKey, ManagedDelivery>>,
     request_response_deliveries:
         RwLock<HashMap<RequestResponseDeliveryKey, RequestResponseDelivery>>,
-    sessions: RwLock<HashMap<String, ManagedSession>>,
+    session_claims: StdMutex<HashMap<String, Arc<()>>>,
+    sessions: RwLock<HashMap<String, SessionRegistration>>,
     routes: Mutex<ReplyRoutes>,
     route_changed: Notify,
 }
@@ -331,30 +374,83 @@ impl ConnectionManagement {
         self.request_response_delivery(entity, lock_token).await
     }
 
-    pub(crate) async fn register_session(
-        &self,
+    pub(crate) fn claim_session(
+        self: &Arc<Self>,
         link_name: &str,
         entity: EntityPath,
-        hold: SessionHold,
-    ) {
-        self.sessions
-            .write()
-            .await
-            .insert(link_name.to_owned(), ManagedSession { entity, hold });
-    }
-
-    pub(crate) async fn unregister_session(&self, link_name: &str, hold: &SessionHold) {
-        let mut sessions = self.sessions.write().await;
-        if sessions
-            .get(link_name)
-            .is_some_and(|session| &session.hold == hold)
-        {
-            sessions.remove(link_name);
+    ) -> SessionClaim {
+        let identity = Arc::new(());
+        self.session_claims
+            .lock()
+            .expect("the pending session claim lock is not poisoned")
+            .insert(link_name.to_owned(), Arc::clone(&identity));
+        SessionClaim {
+            management: Arc::downgrade(self),
+            link_name: link_name.to_owned(),
+            entity,
+            identity,
         }
     }
 
-    async fn session(&self, link_name: &str) -> Option<ManagedSession> {
+    pub(crate) async fn install_session(
+        &self,
+        claim: &SessionClaim,
+        hold: SessionHold,
+        is_live: impl FnOnce() -> bool,
+    ) -> Option<SessionRegistration> {
+        let mut sessions = self.sessions.write().await;
+        // Claiming does not await this row lock. Hold the synchronous claim
+        // lock through insertion so another runtime thread cannot supersede
+        // the owner between the check and the write.
+        let mut claims = self
+            .session_claims
+            .lock()
+            .expect("the pending session claim lock is not poisoned");
+        if !claims
+            .get(&claim.link_name)
+            .is_some_and(|identity| Arc::ptr_eq(identity, &claim.identity))
+            || !is_live()
+        {
+            return None;
+        }
+        let registration = SessionRegistration {
+            link_name: claim.link_name.clone(),
+            entity: claim.entity.clone(),
+            hold,
+            identity: Arc::clone(&claim.identity),
+        };
+        sessions.insert(claim.link_name.clone(), registration.clone());
+        claims.remove(&claim.link_name);
+        Some(registration)
+    }
+
+    pub(crate) async fn unregister_session(&self, registration: &SessionRegistration) {
+        let mut sessions = self.sessions.write().await;
+        if sessions
+            .get(&registration.link_name)
+            .is_some_and(|session| session == registration)
+        {
+            sessions.remove(&registration.link_name);
+        }
+    }
+
+    async fn session(&self, link_name: &str) -> Option<SessionRegistration> {
         self.sessions.read().await.get(link_name).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn session_write_lock(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, SessionRegistration>> {
+        self.sessions.write().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn registered_session_owner(
+        &self,
+        link_name: &str,
+    ) -> Option<SessionRegistration> {
+        self.session(link_name).await
     }
 
     #[cfg(test)]
@@ -788,7 +884,7 @@ async fn requested_session(
     message: &Message,
     entity: &EntityPath,
     management: &ConnectionManagement,
-) -> Result<ManagedSession, SessionLookupError> {
+) -> Result<SessionRegistration, SessionLookupError> {
     let properties =
         message
             .application_properties
@@ -1069,6 +1165,9 @@ fn unauthorized_error(description: impl Into<String>) -> AmqpProtocolError {
 
 #[derive(Clone, Copy, Debug)]
 struct RouteError;
+
+#[cfg(test)]
+mod session_registry_tests;
 
 #[cfg(test)]
 mod tests {

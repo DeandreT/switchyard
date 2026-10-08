@@ -25,6 +25,7 @@ use tokio::{
 
 use super::test_support::{Actor, ActualBroker, WAIT, pending_once};
 use crate::authorization::ConnectionAuthorization;
+use crate::listener::ReceivingLinkProtocol;
 use crate::listener::attachments::{
     AttachmentHandoff, HandoffPhase, HandoffStep, accept_entity_link,
 };
@@ -474,6 +475,54 @@ async fn ended_before_first_helper_poll_never_submits_a_grant() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn ended_unpolled_helper_preserves_a_newer_pending_registration_claim() {
+    tokio::spawn(async move {
+        for durable in [false, true] {
+            let mut actor = Actor::new(durable, true);
+            let expected = accepted(&actor.intent(CommandKind::AcceptSession {
+                session_id: Some(session_id()),
+                lock_duration_millis: None,
+            }))
+            .clone();
+            let before = actor.store().snapshot().unwrap();
+            let (mut wire, mut session) = PendingWire::new().await;
+            let attach = wire.offer(&mut session, Some(filter(false))).await;
+            let management = ConnectionManagement::new();
+            let original = accept_entity_link(
+                &session,
+                actor.broker.as_ref().unwrap(),
+                &actor.namespace,
+                "orders",
+                attach,
+                None,
+                &management,
+            );
+            wire.end().await;
+            assert!(session.is_ended());
+            let newer_claim = management.claim_session(LINK, actor.entity.clone());
+            assert!(timeout(WAIT, original).await.unwrap().unwrap().is_none());
+            let newer_owner = management
+                .install_session(&newer_claim, expected.hold(), || true)
+                .await
+                .expect("already-retired original work cannot supersede a live pending claim");
+            assert_eq!(
+                management.registered_session_owner(LINK).await,
+                Some(newer_owner)
+            );
+            assert_eq!(grant_count(&actor), 0);
+            assert!(release_holds(&actor).is_empty());
+            assert_eq!(stored_grant(&actor), expected);
+            actor.reopen();
+            assert_eq!(actor.store().snapshot().unwrap(), before);
+            assert_eq!(stored_grant(&actor), expected);
+            wire.stop().await;
+        }
+    })
+    .await
+    .expect("unpolled retired attachment observer joined");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn actual_helper_drains_one_hidden_grant_then_releases_its_exact_hold() {
     tokio::spawn(async move {
         for durable in [false, true] {
@@ -764,11 +813,20 @@ async fn late_helper_release_refusal_preserves_same_entity_replacement_and_regis
             // An actual queued command on the same broker is a positive apply/
             // reply barrier while the original protocol observer stays unpolled.
             actor.intent(CommandKind::GetSessionState { session: old.hold() });
+            let old_claim = management.claim_session(LINK, actor.entity.clone());
+            let old_registration = management
+                .install_session(&old_claim, old.hold(), || true)
+                .await
+                .unwrap();
             wire.end().await;
             actor.clock.set(old.lock.locked_until.as_millis());
             let replacement = accepted(&actor.intent(CommandKind::AcceptSession { session_id: Some(session_id()), lock_duration_millis: None })).clone();
             assert_ne!(old.hold().token, replacement.hold().token);
-            management.register_session(LINK, actor.entity.clone(), replacement.hold()).await;
+            let replacement_claim = management.claim_session(LINK, actor.entity.clone());
+            let replacement_registration = management
+                .install_session(&replacement_claim, replacement.hold(), || true)
+                .await
+                .unwrap();
             assert!(timeout(WAIT, original.as_mut()).await.unwrap().unwrap().is_none());
             drop(original);
             assert_eq!(release_holds(&actor), vec![old.hold()]);
@@ -780,10 +838,9 @@ async fn late_helper_release_refusal_preserves_same_entity_replacement_and_regis
             }
             let registered = Some((actor.entity.clone(), replacement.hold()));
             assert_eq!(management.registered_session(LINK).await, registered);
-            // Exercise the existing same-entity full-hold comparison explicitly;
-            // this is not a late-register or cross-entity aliasing guarantee.
-            management.unregister_session(LINK, &old.hold()).await;
+            management.unregister_session(&old_registration).await;
             assert_eq!(management.registered_session(LINK).await, registered);
+            assert_eq!(management.registered_session_owner(LINK).await, Some(replacement_registration));
             assert_eq!(stored_grant(&actor), replacement);
             drop(broker);
             let before_reopen = actor.store().snapshot().unwrap();
@@ -794,6 +851,186 @@ async fn late_helper_release_refusal_preserves_same_entity_replacement_and_regis
             wire.stop().await;
         }
     }).await.expect("original test observer joined");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_handoff_waiting_on_registry_write_lock_cannot_replace_a_newer_claim() {
+    tokio::spawn(async move {
+        for durable in [false, true] {
+            for ended in [false, true] {
+                let mut actor = Actor::new(durable, true);
+                actor.gate.arm_put(domain::keys::session(
+                    &actor.namespace,
+                    &actor.entity,
+                    &session_id(),
+                ));
+                let (mut wire, mut session) = PendingWire::new().await;
+                let attach = wire.offer(&mut session, Some(filter(false))).await;
+                let management = ConnectionManagement::new();
+                let write_lock = management.session_write_lock().await;
+                let broker = ReleaseWitness::new(&actor);
+                let mut original = Box::pin(accept_entity_link(
+                    &session,
+                    &broker,
+                    &actor.namespace,
+                    "orders",
+                    attach,
+                    None,
+                    &management,
+                ));
+                pending_once(original.as_mut()).await;
+                actor.gate.reached(false).await;
+                actor.gate.release(false);
+                actor.gate.reached(true).await;
+                let old = stored_grant(&actor);
+                actor.gate.release(true);
+                actor.intent(CommandKind::GetSessionState { session: old.hold() });
+                pending_once(original.as_mut()).await;
+                let _independent = wire.native_fifo_after_accept(true).await;
+                // The broker and native FIFO barriers above completed the two
+                // original replies. This poll can only wait at registry install.
+                pending_once(original.as_mut()).await;
+                if ended {
+                    wire.end().await;
+                    assert!(session.is_ended());
+                }
+                actor.clock.set(old.lock.locked_until.as_millis());
+                let replacement = accepted(&actor.intent(CommandKind::AcceptSession {
+                    session_id: Some(session_id()),
+                    lock_duration_millis: None,
+                }))
+                .clone();
+                assert_ne!(old.hold().token, replacement.hold().token);
+                let replacement_claim = management.claim_session(LINK, actor.entity.clone());
+                let mut replacement_install = Box::pin(management.install_session(
+                    &replacement_claim,
+                    replacement.hold(),
+                    || true,
+                ));
+                pending_once(replacement_install.as_mut()).await;
+                drop(write_lock);
+                let (old_result, replacement_registration, detach) = timeout(WAIT, async {
+                    tokio::join!(
+                        biased;
+                        original.as_mut(),
+                        replacement_install.as_mut(),
+                        async {
+                            if ended { None } else { Some(control(&mut wire.peer, CHANNEL).await) }
+                        }
+                    )
+                }).await.unwrap();
+                let replacement_registration = replacement_registration.unwrap();
+                if let Some(detach) = detach {
+                    let Performative::Detach(detach) = detach else {
+                        panic!("superseded original link receives an actual Detach");
+                    };
+                    assert_eq!(
+                        detach.error.unwrap().condition.as_symbol(),
+                        Symbol::from("amqp:illegal-state")
+                    );
+                    assert!(!session.is_ended());
+                }
+                assert!(old_result.unwrap().is_none());
+                drop(original);
+                assert_eq!(release_holds(&actor), vec![old.hold()]);
+                {
+                    let results = broker.results.lock().unwrap();
+                    assert_eq!(results.len(), 1);
+                    assert_eq!(results[0].0, old.hold());
+                    assert!(matches!(
+                        &results[0].1,
+                        Err(BrokerRejection::Refused(BrokerError::SessionLockNotHeld { session_id: actual }))
+                            if actual == &session_id()
+                    ));
+                }
+                assert_eq!(
+                    management.registered_session_owner(LINK).await,
+                    Some(replacement_registration.clone())
+                );
+                assert_eq!(stored_grant(&actor), replacement);
+                drop(broker);
+                let before_reopen = actor.store().snapshot().unwrap();
+                actor.reopen();
+                assert_eq!(actor.store().snapshot().unwrap(), before_reopen);
+                assert_eq!(stored_grant(&actor), replacement);
+                assert_eq!(
+                    management.registered_session_owner(LINK).await,
+                    Some(replacement_registration)
+                );
+                wire.stop().await;
+            }
+        }
+    })
+    .await
+    .expect("original registration observer joined");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_native_retirement_while_registry_install_waits_releases_without_installing() {
+    tokio::spawn(async move {
+        for durable in [false, true] {
+            for ended in [false, true] {
+                let mut actor = Actor::new(durable, true);
+                actor.gate.arm_put(domain::keys::session(
+                    &actor.namespace,
+                    &actor.entity,
+                    &session_id(),
+                ));
+                let (mut wire, mut session) = PendingWire::new().await;
+                let attach = wire.offer(&mut session, Some(filter(false))).await;
+                let management = ConnectionManagement::new();
+                let write_lock = management.session_write_lock().await;
+                let broker = ReleaseWitness::new(&actor);
+                let mut original = Box::pin(accept_entity_link(
+                    &session,
+                    &broker,
+                    &actor.namespace,
+                    "orders",
+                    attach,
+                    None,
+                    &management,
+                ));
+                pending_once(original.as_mut()).await;
+                actor.gate.reached(false).await;
+                actor.gate.release(false);
+                actor.gate.reached(true).await;
+                let expected = stored_grant(&actor);
+                actor.gate.release(true);
+                actor.intent(CommandKind::GetSessionState {
+                    session: expected.hold(),
+                });
+                pending_once(original.as_mut()).await;
+                let _independent = wire.native_fifo_after_accept(true).await;
+                pending_once(original.as_mut()).await;
+                if ended {
+                    wire.end().await;
+                } else {
+                    wire.detach().await;
+                    assert!(!session.is_ended());
+                }
+                drop(write_lock);
+                assert!(
+                    timeout(WAIT, original.as_mut())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .is_none()
+                );
+                drop(original);
+                assert!(management.registered_session_owner(LINK).await.is_none());
+                assert_eq!(release_holds(&actor), vec![expected.hold()]);
+                {
+                    let results = broker.results.lock().unwrap();
+                    assert_eq!(&*results, &[(expected.hold(), Ok(()))]);
+                }
+                drop(broker);
+                assert_reopened_release(&mut actor, &expected.hold());
+                wire.stop().await;
+            }
+        }
+    })
+    .await
+    .expect("original native-retirement observer joined");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -823,6 +1060,7 @@ async fn healthy_named_and_next_available_handoffs_echo_and_register_the_exact_g
                 .unwrap()
                 .unwrap();
                 let expected = link.accepted.as_ref().unwrap().clone();
+                let registration = link.registration.as_ref().unwrap().clone();
                 assert_eq!(expected.session_id, session_id());
                 assert_eq!(link.entity, actor.entity);
                 assert!(link.authorization.is_none());
@@ -850,18 +1088,29 @@ async fn healthy_named_and_next_available_handoffs_echo_and_register_the_exact_g
                 );
                 grant_started_and_returned(&actor);
                 wire.end().await;
-                let LinkEndpoint::Sender(mut sender) = link.endpoint else {
+                let LinkEndpoint::Sender(sender) = link.endpoint else {
                     panic!("actual receiving-client sender");
                 };
-                timeout(WAIT, sender.on_detach()).await.unwrap();
-                management.unregister_session(LINK, &expected.hold()).await;
-                super::release_session(
-                    actor.broker.as_ref().unwrap(),
-                    &actor.namespace,
-                    &actor.entity,
-                    Some(&expected.hold()),
+                timeout(
+                    WAIT,
+                    super::serve_receiving_client(
+                        sender,
+                        actor.namespace.clone(),
+                        actor.entity.clone(),
+                        actor.broker.as_ref().unwrap().clone(),
+                        link.mode,
+                        Some(expected.hold()),
+                        ReceivingLinkProtocol {
+                            authorization: None,
+                            management: Arc::clone(&management),
+                        },
+                    ),
                 )
-                .await;
+                .await
+                .unwrap()
+                .unwrap();
+                management.unregister_session(&registration).await;
+                assert!(management.registered_session(LINK).await.is_none());
                 assert_reopened_release(&mut actor, &expected.hold());
                 wire.stop().await;
             }

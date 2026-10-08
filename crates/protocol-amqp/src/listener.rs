@@ -508,6 +508,7 @@ async fn serve_session<B: Broker>(
             endpoint,
             entity,
             accepted,
+            registration,
             authorization: link_authorization,
             mode,
         }) = accept_entity_link(
@@ -547,7 +548,6 @@ async fn serve_session<B: Broker>(
             // The client receives; this end sends.
             LinkEndpoint::Sender(sender) => {
                 let hold = accepted.map(|accepted| accepted.hold());
-                let link_name = sender.name().to_owned();
                 let connection_management = Arc::clone(&management);
                 tokio::spawn(async move {
                     let result = serve_receiving_client(
@@ -563,10 +563,8 @@ async fn serve_session<B: Broker>(
                         },
                     )
                     .await;
-                    if let Some(hold) = hold.as_ref() {
-                        connection_management
-                            .unregister_session(&link_name, hold)
-                            .await;
+                    if let Some(registration) = registration.as_ref() {
+                        connection_management.unregister_session(registration).await;
                     }
                     if let Err(error) = result {
                         warn!(%error, "receiving link ended");

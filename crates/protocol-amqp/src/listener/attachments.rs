@@ -15,12 +15,15 @@ use auth::Permission;
 use domain::{
     AcceptedSession, CommandKind, CommandOutcome, EntityPath, NamespaceName, ReceiveMode,
 };
+use futures_util::FutureExt;
 use serde_amqp::primitives::Symbol;
 use tracing::{debug, warn};
 
 use crate::{
-    Broker, BrokerRejection, SessionRequest, authorization::ConnectionAuthorization,
-    management::ConnectionManagement, read_session_filter, stamp_session_filter,
+    Broker, BrokerRejection, SessionRequest,
+    authorization::ConnectionAuthorization,
+    management::{ConnectionManagement, SessionRegistration},
+    read_session_filter, stamp_session_filter,
 };
 
 use super::{
@@ -221,6 +224,7 @@ pub(super) struct EntityLink {
     pub(super) endpoint: LinkEndpoint,
     pub(super) entity: EntityPath,
     pub(super) accepted: Option<AcceptedSession>,
+    pub(super) registration: Option<SessionRegistration>,
     pub(super) authorization: Option<LinkAuthorization>,
     pub(super) mode: ReceiveMode,
 }
@@ -232,12 +236,10 @@ struct PreparedLink {
 }
 
 async fn prepare_link(
-    address: &str,
+    entity: EntityPath,
     attach: &Attach,
     authorization: Option<&Arc<ConnectionAuthorization>>,
 ) -> Result<PreparedLink, AmqpProtocolError> {
-    let entity = resolve_entity(address, attach.role.clone())
-        .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?;
     let authorization = match authorization {
         Some(authorization) => {
             let permission = match attach.role {
@@ -280,12 +282,27 @@ pub(super) async fn accept_entity_link<B: Broker>(
     authorization: Option<&Arc<ConnectionAuthorization>>,
     management: &Arc<ConnectionManagement>,
 ) -> Result<Option<EntityLink>, EngineError> {
+    let resolved = resolve_entity(address, attach.role.clone())
+        .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()));
+    // Capture attachment ordering before authorization, grant, or native work
+    // can await. Filling in a hold later must not mint a newer ownership claim.
+    let claim = if attach.role == Role::Receiver && !session.is_ended() {
+        resolved
+            .as_ref()
+            .ok()
+            .map(|entity| management.claim_session(&attach.name, entity.clone()))
+    } else {
+        None
+    };
     let mode = match attach.snd_settle_mode {
         SenderSettleMode::Settled => ReceiveMode::ReceiveAndDelete,
         SenderSettleMode::Unsettled | SenderSettleMode::Mixed => ReceiveMode::PeekLock,
     };
     let mut handoff = AttachmentHandoff::new(session);
-    let mut plan = prepare_link(address, &attach, authorization).await;
+    let mut plan = match resolved {
+        Ok(entity) => prepare_link(entity, &attach, authorization).await,
+        Err(error) => Err(error),
+    };
     if session.is_ended() {
         retire_handoff(&mut handoff, broker, namespace, None, management, None).await;
         return Ok(None);
@@ -400,13 +417,47 @@ pub(super) async fn accept_entity_link<B: Broker>(
             return Ok(None);
         }
     };
-    let registered_link = match (&endpoint, handoff.accepted()) {
+    let registration = match (&endpoint, handoff.accepted()) {
         (LinkEndpoint::Sender(sender), Some(accepted)) => {
-            let link_name = sender.name().to_owned();
-            management
-                .register_session(&link_name, prepared.entity.clone(), accepted.hold())
+            let mut detached = std::pin::pin!(sender.on_detach_owned());
+            let mut retired = false;
+            let registration = management
+                .install_session(
+                    claim
+                        .as_ref()
+                        .expect("a receiving attachment captured its claim"),
+                    accepted.hold(),
+                    || {
+                        retired = session.is_ended() || detached.as_mut().now_or_never().is_some();
+                        !retired
+                    },
+                )
                 .await;
-            Some(link_name)
+            if registration.is_none() {
+                if retired || session.is_ended() || detached.as_mut().now_or_never().is_some() {
+                    drop(endpoint);
+                } else {
+                    detach_with(
+                        endpoint,
+                        error_for(
+                            AmqpError::IllegalState,
+                            "session attachment was superseded".to_owned(),
+                        ),
+                    )
+                    .await;
+                }
+                retire_handoff(
+                    &mut handoff,
+                    broker,
+                    namespace,
+                    Some(&prepared.entity),
+                    management,
+                    None,
+                )
+                .await;
+                return Ok(None);
+            }
+            registration
         }
         _ => None,
     };
@@ -418,7 +469,7 @@ pub(super) async fn accept_entity_link<B: Broker>(
             namespace,
             Some(&prepared.entity),
             management,
-            registered_link.as_deref(),
+            registration.as_ref(),
         )
         .await;
         return Ok(None);
@@ -430,6 +481,7 @@ pub(super) async fn accept_entity_link<B: Broker>(
         endpoint,
         entity: prepared.entity,
         accepted: packet.accepted,
+        registration,
         authorization: prepared.authorization,
         mode,
     }))
@@ -441,7 +493,7 @@ async fn retire_handoff<B: Broker>(
     namespace: &NamespaceName,
     entity: Option<&EntityPath>,
     management: &Arc<ConnectionManagement>,
-    registered_link: Option<&str>,
+    registration: Option<&SessionRegistration>,
 ) {
     let _ = handoff.finish().await;
     let packet = handoff
@@ -453,8 +505,8 @@ async fn retire_handoff<B: Broker>(
     }
     if let Some(accepted) = packet.accepted {
         let hold = accepted.hold();
-        if let Some(link_name) = registered_link {
-            management.unregister_session(link_name, &hold).await;
+        if let Some(registration) = registration {
+            management.unregister_session(registration).await;
         }
         settlement::release_session(
             broker,

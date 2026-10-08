@@ -351,9 +351,11 @@ mod tests {
             SessionId::new("cart-1").expect("a valid session"),
             LockToken::new(9),
         );
+        let claim = management.claim_session("receiver-1", entity.clone());
         management
-            .register_session("receiver-1", entity.clone(), hold.clone())
-            .await;
+            .install_session(&claim, hold.clone(), || true)
+            .await
+            .expect("the associated receive link owns its registration");
         let mut request = request(0, 1);
         request.body = body([
             (FROM_SEQUENCE_NUMBER, Value::Long(0)),
@@ -404,16 +406,18 @@ mod tests {
         let broker = RecordingBroker::returning(Vec::new());
         let management = ConnectionManagement::new();
         let entity = entity();
+        let claim = management.claim_session("receiver-1", entity.clone());
         management
-            .register_session(
-                "receiver-1",
-                entity.clone(),
+            .install_session(
+                &claim,
                 SessionHold::new(
                     SessionId::new("cart-1").expect("a valid session"),
                     LockToken::new(9),
                 ),
+                || true,
             )
-            .await;
+            .await
+            .expect("the associated receive link owns its registration");
         let mut request = request(0, 1);
         request.body = body([
             (FROM_SEQUENCE_NUMBER, Value::Long(0)),

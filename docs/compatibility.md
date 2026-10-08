@@ -190,9 +190,12 @@ behind blocked native I/O.
 Entity attaches retain original native acceptance and any session grant through
 borrowed observers. Observed End discards only never-polled phases; polled
 originals are observed and cached. An unused hold gets one release attempt using
-its captured entity/full hold, after hold-only matching unregister if registered;
-refusal leaves ordinary expiry. This is not an atomic link-live, live-hold or
-registry fence ([#87](https://github.com/DeandreT/switchyard/issues/87)), or ancestor-task shielding ([#75](https://github.com/DeandreT/switchyard/issues/75)).
+its captured entity/full hold; refusal leaves ordinary expiry. Receiving entity
+attaches claim registry ownership before their first helper await. Installation
+checks the latest claim and observed original End/Detach after write-lock
+admission; stale cleanup matches the captured owner, entity and full hold.
+Failed newest claims preserve installed rows without reviving older pending work.
+This is not atomic link/hold liveness or ancestor-task shielding (#75).
 
 Inbound links retain one original Send/Batch result through borrowed observers
 and natural Detach/auth retirement. Never-polled retired work submits nothing;
@@ -202,7 +205,7 @@ not proof it was unsent. Whole-task abortion remains #75.
 Receive and session-grant callers defer broker method invocation to the retained
 original's first poll, including eager adapters. This is not an enqueue receipt.
 
-Registry fencing (#87), management/CBS retirement (#85/#86) and process shutdown
+Management/CBS retirement (#85/#86) and process shutdown
 remain [roadmap work](roadmap.md#next-main-increments). Stalled broker/native I/O
 can still delay cleanup.
 
