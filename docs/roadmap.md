@@ -28,7 +28,7 @@ own live assignments, acceptance and full dependencies.
 - [x] Fenced session registration and captured-owner cleanup (#87)
 - [x] Original management command/reply custody and exact route cleanup (#85, [PR #112](https://github.com/DeandreT/switchyard/pull/112))
 - [x] Pure offline JWT policy and issuer-qualified grants (#8); [consumers/activation pending](offline-jwt.md)
-- [x] Pure bounded typed SQL predicate kernel (#95); [patterns/scalars/integration pending](sql-predicates.md)
+- [x] Pure bounded typed SQL predicates and IN/LIKE (#95/#96); [scalars/integration pending](sql-predicates.md)
 - [x] Bounded Linux SDK child runs and loaded-file custody (#99)
 - [x] Two exact SDK selectors and approved runtime assets (#100); [durable matrix pending](sdk-gates.md)
 - [ ] Remaining client semantics, administration and conserved capacity
@@ -80,7 +80,7 @@ flowchart TD
     Signals --> Windows["#68 Windows -> #69 Refill; #77 Echo"]
     Main --> Profiles["#13/#14 Profiles -> #22 Modes"]
     Main --> Content["#16 Typed content"]
-    Kernel["Merged #95 SQL kernel"] --> SQL["#96 -> #97 / finish #11"]
+    Kernel["Merged #95/#96 SQL predicates"] --> SQL["#97 Scalars / finish #11"]
     SQL --> Rules["#20 Filters -> #21 Actions"]
     Content --> Rules
     Profiles --> Queue["#27 Finite queues"]
@@ -110,7 +110,7 @@ chain. Split multi-PR work into child issues before implementation.
 | Lane | Entry And Boundary |
 | --- | --- |
 | Protocol | #86 CBS/routes, then the ordered chain above; one listener/native/registry owner |
-| SQL | [#96](https://github.com/DeandreT/switchyard/issues/96): pure compiler/evaluator/tests after merged #95. Unmerged source is not completion; #97 blocked |
+| SQL | [#97](https://github.com/DeandreT/switchyard/issues/97): arithmetic/static lookup after merged #96; pure compiler/evaluator/tests, no retained-rule integration |
 | Auth activation | #8 policy merged; #71 -> #17 waits for #7. Serialize shared authorization/CBS files, not a current parallel pickup |
 | Replication | [#36](https://github.com/DeandreT/switchyard/issues/36): cluster/storage/proposer replay; retain startup refusal, no quorum claim |
 | Administration | [#10](https://github.com/DeandreT/switchyard/issues/10): Atom fixtures/profiles; [#18](https://github.com/DeandreT/switchyard/issues/18): native Create/Get/List service/protobuf. No listener activation |

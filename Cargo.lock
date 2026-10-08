@@ -357,6 +357,7 @@ name = "domain"
 version = "0.1.0"
 dependencies = [
  "postcard",
+ "regex-automata",
  "serde",
  "sqlparser",
  "storage",

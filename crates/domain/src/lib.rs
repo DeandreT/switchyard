@@ -57,8 +57,9 @@ pub use sql_filter::{
     MAX_SQL_COMPARISON_BYTES, MAX_SQL_COMPILE_NODES, MAX_SQL_COMPILE_SOURCE_BYTES,
     MAX_SQL_COMPILE_TOKENS, MAX_SQL_EVALUATION_WORK, MAX_SQL_EXPRESSION_BYTES,
     MAX_SQL_EXPRESSION_DEPTH, MAX_SQL_EXPRESSION_NODES, MAX_SQL_EXPRESSION_TOKENS,
-    MAX_SQL_EXPRESSION_UTF16_UNITS, MAX_SQL_PARSER_DEPTH, SqlCompileBudget, SqlCompileError,
-    SqlCompileLimit, SqlCompileUsage, SqlEvaluationBudget, SqlEvaluationError, SqlEvaluationLimit,
+    MAX_SQL_EXPRESSION_UTF16_UNITS, MAX_SQL_IN_OPERANDS, MAX_SQL_LIKE_PATTERN_BYTES,
+    MAX_SQL_PARSER_DEPTH, MAX_SQL_REGEX_BYTES, SqlCompileBudget, SqlCompileError, SqlCompileLimit,
+    SqlCompileUsage, SqlEvaluationBudget, SqlEvaluationError, SqlEvaluationLimit,
     SqlEvaluationUsage, SqlMessageContext, SqlProgram, SqlProgramMetrics, SqlProperty,
     SqlSystemProperty, SqlSystemValue, SqlTruth, SqlValue,
 };

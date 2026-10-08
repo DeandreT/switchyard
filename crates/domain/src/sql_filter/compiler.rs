@@ -195,6 +195,68 @@ impl Builder<'_> {
                     negated: matches!(expr, Expr::IsNotNull(_)),
                 }
             }
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                if list.is_empty() {
+                    return Err(SqlCompileError::Syntax);
+                }
+                limit(list.len(), MAX_SQL_IN_OPERANDS, SqlCompileLimit::InOperands)?;
+                let input = self.scalar(expr, depth + 1)?;
+                let mut operands = [0; MAX_SQL_IN_OPERANDS];
+                for (index, operand) in list.iter().enumerate() {
+                    operands[index] = self.scalar(operand, depth + 1)?;
+                }
+                Node::InList {
+                    input,
+                    operands,
+                    len: list.len() as u8,
+                    negated: *negated,
+                }
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                escape_char,
+                negated,
+                any,
+            } => {
+                if *any {
+                    return Err(unsupported("LIKE ANY"));
+                }
+                let input = self.scalar(expr, depth + 1)?;
+                let pattern = self.scalar(pattern, depth + 1)?;
+                let escape = escape_char
+                    .as_ref()
+                    .map(|expr| self.scalar(expr, depth + 1))
+                    .transpose()?;
+                let known_escape = match escape.map(|index| &self.nodes[usize::from(index)]) {
+                    None => Some(None),
+                    Some(Node::Literal(Literal::String(text))) => Some(Some(
+                        super::pattern::escape(text).ok_or(SqlCompileError::InvalidLikeEscape)?,
+                    )),
+                    _ => None,
+                };
+                if let Node::Literal(Literal::String(text)) = &self.nodes[usize::from(pattern)] {
+                    limit(
+                        text.len(),
+                        MAX_SQL_LIKE_PATTERN_BYTES,
+                        SqlCompileLimit::LikePatternBytes,
+                    )?;
+                    if let Some(escape) = known_escape {
+                        super::pattern::validate(text, escape)
+                            .map_err(|_| SqlCompileError::InvalidLikePattern)?;
+                    }
+                }
+                Node::Like {
+                    input,
+                    pattern,
+                    escape,
+                    negated: *negated,
+                }
+            }
             Expr::Function(function) => {
                 use sqlparser::ast::{
                     FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart,
@@ -230,6 +292,20 @@ impl Builder<'_> {
             _ => return Err(unsupported("expression")),
         };
         self.push(node, depth)
+    }
+
+    fn scalar(&mut self, expr: &Expr, depth: usize) -> Result<u16, SqlCompileError> {
+        match expr {
+            Expr::Nested(inner) => self.scalar(inner, depth),
+            Expr::Identifier(_)
+            | Expr::CompoundIdentifier(_)
+            | Expr::Value(_)
+            | Expr::UnaryOp {
+                op: UnaryOperator::Minus | UnaryOperator::Plus,
+                ..
+            } => self.lower(expr, depth),
+            _ => Err(unsupported("scalar operand")),
+        }
     }
 }
 

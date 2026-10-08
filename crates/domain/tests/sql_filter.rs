@@ -3,9 +3,10 @@
 use domain::{
     MAX_SQL_COMPARISON_BYTES, MAX_SQL_COMPILE_SOURCE_BYTES, MAX_SQL_EVALUATION_WORK,
     MAX_SQL_EXPRESSION_BYTES, MAX_SQL_EXPRESSION_TOKENS, MAX_SQL_EXPRESSION_UTF16_UNITS,
-    SqlCompileBudget, SqlCompileError, SqlCompileLimit, SqlEvaluationBudget, SqlEvaluationError,
-    SqlEvaluationLimit, SqlMessageContext, SqlProgram, SqlProperty, SqlSystemProperty,
-    SqlSystemValue, SqlTruth, SqlValue,
+    MAX_SQL_IN_OPERANDS, MAX_SQL_LIKE_PATTERN_BYTES, MAX_SQL_REGEX_BYTES, SqlCompileBudget,
+    SqlCompileError, SqlCompileLimit, SqlEvaluationBudget, SqlEvaluationError, SqlEvaluationLimit,
+    SqlMessageContext, SqlProgram, SqlProperty, SqlSystemProperty, SqlSystemValue, SqlTruth,
+    SqlValue,
 };
 
 fn evaluate(
@@ -348,10 +349,546 @@ fn incompatible_and_unsupported_inputs_are_errors_not_false_matches() {
 }
 
 #[test]
+fn in_and_not_in_preserve_three_valued_equality_and_all_numeric_widths() {
+    for (expression, expected) in [
+        ("1 IN (1)", SqlTruth::True),
+        ("1 IN (2,3)", SqlTruth::False),
+        ("1 NOT IN (2,3)", SqlTruth::True),
+        ("1 NOT IN (1,2)", SqlTruth::False),
+        ("1 IN (NULL,1)", SqlTruth::True),
+        ("1 IN (1,NULL)", SqlTruth::True),
+        ("1 IN (2,NULL)", SqlTruth::Unknown),
+        ("1 NOT IN (2,NULL)", SqlTruth::Unknown),
+        ("NULL IN (1,NULL)", SqlTruth::Unknown),
+        ("missing NOT IN (1,2)", SqlTruth::Unknown),
+        ("TRUE IN (FALSE,TRUE)", SqlTruth::True),
+        ("'A' IN ('a','A')", SqlTruth::True),
+        ("'A' NOT IN ('a')", SqlTruth::True),
+        ("(-1) IN (+1,-1)", SqlTruth::True),
+    ] {
+        assert_eq!(evaluate(expression, &[]).unwrap(), expected, "{expression}");
+    }
+    for value in [
+        SqlValue::Byte(1),
+        SqlValue::Ubyte(1),
+        SqlValue::Short(1),
+        SqlValue::Ushort(1),
+        SqlValue::Int(1),
+        SqlValue::Uint(1),
+        SqlValue::Long(1),
+        SqlValue::Ulong(1),
+        SqlValue::Float(1.0),
+        SqlValue::Double(1.0),
+    ] {
+        assert_eq!(
+            evaluate("x IN (0,1,2)", &[property("x", value)]).unwrap(),
+            SqlTruth::True
+        );
+    }
+    assert_eq!(
+        evaluate("x IN (x,1.0)", &[property("x", SqlValue::Double(f64::NAN))]).unwrap(),
+        SqlTruth::False
+    );
+    assert_eq!(
+        evaluate(
+            "x IN (x,NULL)",
+            &[property("x", SqlValue::Double(f64::NAN))]
+        )
+        .unwrap(),
+        SqlTruth::Unknown
+    );
+}
+
+#[test]
+fn in_exact_operand_ceiling_and_scalar_only_grammar_are_fixed() {
+    let operands = (0..MAX_SQL_IN_OPERANDS)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let exact = format!("31 IN ({operands})");
+    assert_eq!(evaluate(&exact, &[]).unwrap(), SqlTruth::True);
+    assert_eq!(
+        SqlProgram::compile(&exact).unwrap().metrics().nodes,
+        MAX_SQL_IN_OPERANDS + 2
+    );
+    let over = format!("31 IN ({operands},32)");
+    assert_eq!(
+        SqlProgram::compile(&over).unwrap_err(),
+        SqlCompileError::Limit {
+            kind: SqlCompileLimit::InOperands,
+            maximum: MAX_SQL_IN_OPERANDS,
+        }
+    );
+    assert!(SqlProgram::compile("1 IN ()").is_err());
+    for expression in [
+        "1 IN (1+1)",
+        "1 IN (EXISTS(x))",
+        "1 IN (1=1)",
+        "(1=1) IN (TRUE)",
+    ] {
+        assert!(
+            matches!(
+                SqlProgram::compile(expression),
+                Err(SqlCompileError::Unsupported { .. })
+            ),
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn in_never_hides_later_type_unsupported_ambiguous_or_system_errors() {
+    for expression in [
+        "1 IN (1,'1')",
+        "1 NOT IN (1,TRUE)",
+        "FALSE AND 1 IN (1,'1')",
+        "TRUE OR 1 IN (1,'1')",
+    ] {
+        assert_eq!(
+            evaluate(expression, &[]),
+            Err(SqlEvaluationError::TypeMismatch),
+            "{expression}"
+        );
+    }
+    let values = [property("x", SqlValue::Unsupported)];
+    for expression in ["1 IN (1,x)", "NULL IN (x)", "FALSE AND 1 IN (1,x)"] {
+        assert_eq!(
+            evaluate(expression, &values),
+            Err(SqlEvaluationError::UnsupportedValue)
+        );
+    }
+    let duplicates = [
+        property("x", SqlValue::Int(1)),
+        property("X", SqlValue::Int(2)),
+    ];
+    assert_eq!(
+        evaluate("1 IN (1,x)", &duplicates),
+        Err(SqlEvaluationError::AmbiguousProperty)
+    );
+    assert_eq!(
+        evaluate("1 IN (1,sys.MessageId)", &[]),
+        Err(SqlEvaluationError::MissingSystemProperty)
+    );
+    let numeric = [
+        property("signed", SqlValue::Long(1)),
+        property("unsigned", SqlValue::Ulong(1)),
+    ];
+    assert_eq!(
+        evaluate("unsigned IN (1,signed)", &numeric),
+        Err(SqlEvaluationError::TypeMismatch)
+    );
+    assert_eq!(
+        evaluate("unsigned IN (-1)", &numeric),
+        Err(SqlEvaluationError::TypeMismatch)
+    );
+}
+
+#[test]
+fn like_is_ordinal_whole_input_unicode_scalar_and_newline_aware() {
+    for (expression, expected) in [
+        ("'' LIKE ''", SqlTruth::True),
+        ("'' LIKE '%'", SqlTruth::True),
+        ("'' LIKE '_'", SqlTruth::False),
+        ("'abc' LIKE 'a%c'", SqlTruth::True),
+        ("'abc' LIKE 'a_c'", SqlTruth::True),
+        ("'abc' NOT LIKE 'a_d'", SqlTruth::True),
+        ("'abc' LIKE 'b'", SqlTruth::False),
+        ("'ABC' LIKE 'a%'", SqlTruth::False),
+        ("'\u{1f600}' LIKE '_'", SqlTruth::True),
+        ("'\u{1f600}' LIKE '__'", SqlTruth::False),
+        ("'e\u{301}' LIKE '_'", SqlTruth::False),
+        ("'e\u{301}' LIKE '__'", SqlTruth::True),
+        ("'\n' LIKE '_'", SqlTruth::True),
+        ("'a\nb' LIKE 'a%b'", SqlTruth::True),
+        ("'[a].*+$^(){}?|\\' LIKE '[a].*+$^(){}?|\\'", SqlTruth::True),
+        ("'a' LIKE 'a ' ", SqlTruth::False),
+    ] {
+        assert_eq!(
+            evaluate(expression, &[]).unwrap(),
+            expected,
+            "{expression:?}"
+        );
+    }
+    let values = [
+        property("value", SqlValue::String("a\u{1f600}b")),
+        property("pattern", SqlValue::String("a_b")),
+    ];
+    assert_eq!(
+        evaluate("value LIKE pattern", &values).unwrap(),
+        SqlTruth::True
+    );
+}
+
+#[test]
+fn like_escape_quotes_wildcards_escape_itself_and_other_scalars() {
+    for expression in [
+        "'ABC%' LIKE 'ABC\\%' ESCAPE '\\'",
+        "'a_b' LIKE 'a!_b' ESCAPE '!'",
+        "'!' LIKE '!!' ESCAPE '!'",
+        "'a' LIKE '!a' ESCAPE '!'",
+        "'%' LIKE '\u{1f600}%' ESCAPE '\u{1f600}'",
+        "'_' LIKE '%_' ESCAPE '%'",
+        "'%' LIKE '_%' ESCAPE '_'",
+        "'O''Brien' LIKE 'O''Br%'",
+    ] {
+        assert_eq!(
+            evaluate(expression, &[]).unwrap(),
+            SqlTruth::True,
+            "{expression}"
+        );
+    }
+    let values = [
+        property("text", SqlValue::String("%")),
+        property("pattern", SqlValue::String("!%")),
+        property("escape", SqlValue::String("!")),
+    ];
+    assert_eq!(
+        evaluate("text LIKE pattern ESCAPE [escape]", &values).unwrap(),
+        SqlTruth::True
+    );
+    assert_eq!(evaluate("'\\a' LIKE '\\a'", &[]).unwrap(), SqlTruth::True);
+}
+
+#[test]
+fn like_null_type_and_referenced_input_errors_are_explicit() {
+    for expression in [
+        "NULL LIKE '%'",
+        "missing NOT LIKE '%'",
+        "'x' LIKE NULL",
+        "'x' LIKE '%' ESCAPE NULL",
+    ] {
+        assert_eq!(
+            evaluate(expression, &[]).unwrap(),
+            SqlTruth::Unknown,
+            "{expression}"
+        );
+    }
+    for expression in [
+        "1 LIKE '%'",
+        "'x' LIKE TRUE",
+        "'x' LIKE '%' ESCAPE 1",
+        "NULL LIKE TRUE",
+    ] {
+        assert_eq!(
+            evaluate(expression, &[]),
+            Err(SqlEvaluationError::TypeMismatch),
+            "{expression}"
+        );
+    }
+    for expression in [
+        "FALSE AND x LIKE '%'",
+        "TRUE OR 'x' LIKE x",
+        "NULL LIKE '%' ESCAPE x",
+    ] {
+        assert_eq!(
+            evaluate(expression, &[property("x", SqlValue::Unsupported)]),
+            Err(SqlEvaluationError::UnsupportedValue)
+        );
+    }
+    assert_eq!(
+        evaluate("sys.MessageId LIKE '%'", &[]),
+        Err(SqlEvaluationError::MissingSystemProperty)
+    );
+    let duplicates = [
+        property("pattern", SqlValue::String("a")),
+        property("PATTERN", SqlValue::String("%")),
+    ];
+    assert_eq!(
+        evaluate("'a' LIKE pattern", &duplicates),
+        Err(SqlEvaluationError::AmbiguousProperty)
+    );
+}
+
+#[test]
+fn like_literal_and_dynamic_malformed_controls_are_deterministic() {
+    for expression in [
+        "'x' LIKE '!' ESCAPE '!'",
+        "FALSE AND 'x' LIKE 'abc!' ESCAPE '!'",
+    ] {
+        assert_eq!(
+            SqlProgram::compile(expression).unwrap_err(),
+            SqlCompileError::InvalidLikePattern
+        );
+    }
+    for expression in [
+        "'x' LIKE '%' ESCAPE ''",
+        "'x' LIKE '%' ESCAPE 'ab'",
+        "'x' LIKE '%' ESCAPE 'e\u{301}'",
+    ] {
+        assert_eq!(
+            SqlProgram::compile(expression).unwrap_err(),
+            SqlCompileError::InvalidLikeEscape
+        );
+    }
+    for expression in [
+        "'x' LIKE pattern ESCAPE '!'",
+        "FALSE AND NULL LIKE pattern ESCAPE '!'",
+    ] {
+        for _ in 0..2 {
+            assert_eq!(
+                evaluate(expression, &[property("pattern", SqlValue::String("abc!"))]),
+                Err(SqlEvaluationError::InvalidLikePattern)
+            );
+        }
+    }
+    for escape in ["", "ab", "e\u{301}"] {
+        let values = [property("escape", SqlValue::String(escape))];
+        assert_eq!(
+            evaluate("'x' LIKE '%' ESCAPE [escape]", &values),
+            Err(SqlEvaluationError::InvalidLikeEscape)
+        );
+    }
+    let mut compile = SqlCompileBudget::default();
+    let expression = "FALSE AND 'x' LIKE '!' ESCAPE '!'";
+    assert_eq!(
+        SqlProgram::compile_with_budget(expression, &mut compile).unwrap_err(),
+        SqlCompileError::InvalidLikePattern
+    );
+    assert_eq!(compile.used().source_bytes, expression.len());
+    assert!(compile.used().tokens > 0);
+    assert!(compile.used().nodes > 0);
+}
+
+#[test]
+fn like_property_pattern_exact_byte_and_regex_limits_are_independent() {
+    let exact = "a".repeat(MAX_SQL_LIKE_PATTERN_BYTES);
+    assert_eq!(
+        evaluate(
+            "'' LIKE pattern",
+            &[property("pattern", SqlValue::String(&exact))]
+        )
+        .unwrap(),
+        SqlTruth::False
+    );
+    let unicode = "\u{1f600}".repeat(MAX_SQL_LIKE_PATTERN_BYTES / 4);
+    assert_eq!(
+        evaluate(
+            "'' LIKE pattern",
+            &[property("pattern", SqlValue::String(&unicode))]
+        )
+        .unwrap(),
+        SqlTruth::False
+    );
+    let over = format!("{exact}a");
+    for expression in ["'' LIKE pattern", "TRUE OR NULL LIKE pattern"] {
+        assert_eq!(
+            evaluate(expression, &[property("pattern", SqlValue::String(&over))]),
+            Err(SqlEvaluationError::Limit {
+                kind: SqlEvaluationLimit::LikePatternBytes,
+                maximum: MAX_SQL_LIKE_PATTERN_BYTES,
+            })
+        );
+    }
+    let regex_over = "_".repeat(MAX_SQL_LIKE_PATTERN_BYTES);
+    for expression in [
+        "'' LIKE pattern",
+        "FALSE AND NULL LIKE pattern",
+        "TRUE OR 1 LIKE pattern",
+    ] {
+        assert_eq!(
+            evaluate(
+                expression,
+                &[property("pattern", SqlValue::String(&regex_over))]
+            ),
+            Err(SqlEvaluationError::Limit {
+                kind: SqlEvaluationLimit::RegexBytes,
+                maximum: MAX_SQL_REGEX_BYTES,
+            })
+        );
+    }
+}
+
+#[test]
+fn in_preflight_charges_all_operands_even_after_matches_and_under_booleans() {
+    let program = SqlProgram::compile("'a' IN ('a','long')").unwrap();
+    let mut exact = SqlEvaluationBudget::with_limits(6, 7);
+    assert_eq!(
+        program
+            .evaluate(SqlMessageContext::default(), &mut exact)
+            .unwrap(),
+        SqlTruth::True
+    );
+    assert_eq!(exact.used().work, 6);
+    assert_eq!(exact.used().comparison_bytes, 7);
+    for expression in [
+        "'a' IN ('a','long')",
+        "TRUE OR 'a' IN ('a','long')",
+        "FALSE AND 'a' IN ('a','long')",
+    ] {
+        assert_eq!(
+            SqlProgram::compile(expression).unwrap().evaluate(
+                SqlMessageContext::default(),
+                &mut SqlEvaluationBudget::with_limits(100, 6)
+            ),
+            Err(SqlEvaluationError::Limit {
+                kind: SqlEvaluationLimit::ComparisonBytes,
+                maximum: 6,
+            })
+        );
+    }
+    assert_eq!(
+        program.evaluate(SqlMessageContext::default(), &mut exact),
+        Err(SqlEvaluationError::Limit {
+            kind: SqlEvaluationLimit::WorkUnits,
+            maximum: 6,
+        })
+    );
+}
+
+#[test]
+fn multiple_small_like_clauses_fit_the_default_shared_budget() {
+    for expression in [
+        "'a' LIKE 'a' AND 'b' LIKE 'b' AND 'c' LIKE 'c' AND 'd' LIKE 'd'",
+        "'a' LIKE 'z' OR 'b' LIKE 'z' OR 'c' LIKE 'z' OR 'd' LIKE 'd'",
+    ] {
+        assert_eq!(evaluate(expression, &[]).unwrap(), SqlTruth::True);
+    }
+}
+
+#[test]
+fn like_full_preflight_and_matching_budgets_cannot_be_hidden_or_refunded() {
+    for expression in [
+        "'x' LIKE '%'",
+        "TRUE OR 'x' LIKE '%'",
+        "FALSE AND NULL LIKE '%'",
+    ] {
+        let program = SqlProgram::compile(expression).unwrap();
+        let mut bytes = SqlEvaluationBudget::with_limits(MAX_SQL_EVALUATION_WORK, 1);
+        assert_eq!(
+            program.evaluate(SqlMessageContext::default(), &mut bytes),
+            Err(SqlEvaluationError::Limit {
+                kind: SqlEvaluationLimit::ComparisonBytes,
+                maximum: 1,
+            })
+        );
+        let mut work = SqlEvaluationBudget::with_limits(100, MAX_SQL_COMPARISON_BYTES);
+        assert_eq!(
+            program.evaluate(SqlMessageContext::default(), &mut work),
+            Err(SqlEvaluationError::Limit {
+                kind: SqlEvaluationLimit::WorkUnits,
+                maximum: 100,
+            })
+        );
+        assert!(work.used().comparison_bytes >= MAX_SQL_REGEX_BYTES);
+        assert!(work.used().work > 0);
+    }
+    let program = SqlProgram::compile("'x' LIKE '%'").unwrap();
+    let mut measured = SqlEvaluationBudget::default();
+    assert_eq!(
+        program
+            .evaluate(SqlMessageContext::default(), &mut measured)
+            .unwrap(),
+        SqlTruth::True
+    );
+    let used = measured.used();
+    let mut exact = SqlEvaluationBudget::with_limits(used.work, used.comparison_bytes);
+    assert_eq!(
+        program
+            .evaluate(SqlMessageContext::default(), &mut exact)
+            .unwrap(),
+        SqlTruth::True
+    );
+    let mut work = SqlEvaluationBudget::with_limits(used.work - 1, used.comparison_bytes);
+    assert_eq!(
+        program.evaluate(SqlMessageContext::default(), &mut work),
+        Err(SqlEvaluationError::Limit {
+            kind: SqlEvaluationLimit::WorkUnits,
+            maximum: used.work - 1,
+        })
+    );
+    let mut bytes = SqlEvaluationBudget::with_limits(used.work, used.comparison_bytes - 1);
+    assert_eq!(
+        program.evaluate(SqlMessageContext::default(), &mut bytes),
+        Err(SqlEvaluationError::Limit {
+            kind: SqlEvaluationLimit::ComparisonBytes,
+            maximum: used.comparison_bytes - 1,
+        })
+    );
+    assert_eq!(
+        program.evaluate(SqlMessageContext::default(), &mut exact),
+        Err(SqlEvaluationError::Limit {
+            kind: SqlEvaluationLimit::WorkUnits,
+            maximum: used.work,
+        })
+    );
+    let large_input = "x".repeat(4_096);
+    let expensive_pattern = "_".repeat(128);
+    for expression in ["input LIKE pattern", "TRUE OR input LIKE pattern"] {
+        assert_eq!(
+            evaluate(
+                expression,
+                &[
+                    property("input", SqlValue::String(&large_input)),
+                    property("pattern", SqlValue::String(&expensive_pattern))
+                ]
+            ),
+            Err(SqlEvaluationError::Limit {
+                kind: SqlEvaluationLimit::WorkUnits,
+                maximum: MAX_SQL_EVALUATION_WORK,
+            })
+        );
+    }
+}
+
+#[test]
+fn set_pattern_shared_compiler_budgets_keep_the_existing_contract() {
+    for expression in ["1 IN (1,2)", "'a' LIKE 'a%'"] {
+        let metrics = SqlProgram::compile(expression).unwrap().metrics();
+        let mut exact =
+            SqlCompileBudget::with_limits(metrics.source_bytes, metrics.tokens, metrics.nodes);
+        SqlProgram::compile_with_budget(expression, &mut exact).unwrap();
+        assert_eq!(exact.used().source_bytes, metrics.source_bytes);
+        assert_eq!(exact.used().tokens, metrics.tokens);
+        assert_eq!(exact.used().nodes, metrics.nodes);
+        assert_eq!(
+            SqlProgram::compile_with_budget(expression, &mut exact).unwrap_err(),
+            SqlCompileError::Limit {
+                kind: SqlCompileLimit::AggregateSourceBytes,
+                maximum: metrics.source_bytes,
+            }
+        );
+        let mut nodes =
+            SqlCompileBudget::with_limits(metrics.source_bytes, metrics.tokens, metrics.nodes - 1);
+        assert_eq!(
+            SqlProgram::compile_with_budget(expression, &mut nodes).unwrap_err(),
+            SqlCompileError::Limit {
+                kind: SqlCompileLimit::AggregateNodes,
+                maximum: metrics.nodes - 1,
+            }
+        );
+        assert_eq!(nodes.used().nodes, metrics.nodes - 1);
+    }
+}
+
+#[test]
+fn deterministic_dynamic_pattern_corpus_has_no_panics_or_unstable_results() {
+    let program = SqlProgram::compile("'a\n\u{1f600}' LIKE pattern ESCAPE '!'").unwrap();
+    let alphabet = ['a', '%', '_', '!', '\u{1f600}', '[', '\\', '\n'];
+    let mut state = 0x96_u64;
+    for length in 0..64 {
+        let mut pattern = String::new();
+        for _ in 0..length {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            pattern.push(alphabet[(state as usize) % alphabet.len()]);
+        }
+        let values = [property("pattern", SqlValue::String(&pattern))];
+        let context = SqlMessageContext {
+            application_properties: &values,
+            system_properties: &[],
+        };
+        assert_eq!(
+            program.evaluate(context, &mut SqlEvaluationBudget::default()),
+            program.evaluate(context, &mut SqlEvaluationBudget::default()),
+            "{pattern:?}"
+        );
+    }
+}
+
+#[test]
 fn later_language_children_and_statement_extensions_are_refused() {
     for expression in [
-        "x IN (1,2)",
-        "x LIKE 'a%'",
         "x+1=2",
         "-x=1",
         "p('x')=1",
@@ -360,6 +897,12 @@ fn later_language_children_and_statement_extensions_are_refused() {
         "CAST(x AS INT)=1",
         "x BETWEEN 1 AND 2",
         "x IN (SELECT y FROM t)",
+        "x IN (TRUE AND FALSE)",
+        "(x=1) IN (TRUE)",
+        "x LIKE (TRUE AND FALSE)",
+        "x ILIKE 'a%'",
+        "x SIMILAR TO 'a%'",
+        "x LIKE ANY ('a%')",
         "CASE WHEN TRUE THEN TRUE ELSE FALSE END",
         "EXISTS(1)",
         "EXISTS(DISTINCT x)",

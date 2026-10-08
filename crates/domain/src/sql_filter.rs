@@ -9,6 +9,7 @@ mod budget;
 mod compiler;
 mod evaluator;
 mod numeric;
+mod pattern;
 
 pub use budget::{SqlCompileBudget, SqlCompileUsage, SqlEvaluationBudget, SqlEvaluationUsage};
 
@@ -23,6 +24,9 @@ pub const MAX_SQL_COMPILE_TOKENS: usize = 32_768;
 pub const MAX_SQL_COMPILE_NODES: usize = 32_768;
 pub const MAX_SQL_EVALUATION_WORK: usize = 1_048_576;
 pub const MAX_SQL_COMPARISON_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_SQL_IN_OPERANDS: usize = 32;
+pub const MAX_SQL_LIKE_PATTERN_BYTES: usize = 16 * 1024;
+pub const MAX_SQL_REGEX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlTruth {
@@ -139,6 +143,8 @@ pub enum SqlCompileLimit {
     AggregateSourceBytes,
     AggregateTokens,
     AggregateNodes,
+    InOperands,
+    LikePatternBytes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -147,6 +153,10 @@ pub enum SqlCompileError {
     Syntax,
     #[error("unsupported SQL predicate: {feature}")]
     Unsupported { feature: &'static str },
+    #[error("SQL LIKE escape must contain exactly one Unicode scalar")]
+    InvalidLikeEscape,
+    #[error("SQL LIKE pattern ends with an unpaired escape")]
+    InvalidLikePattern,
     #[error("SQL compilation exceeds {kind:?} limit {maximum}")]
     Limit {
         kind: SqlCompileLimit,
@@ -158,6 +168,8 @@ pub enum SqlCompileError {
 pub enum SqlEvaluationLimit {
     WorkUnits,
     ComparisonBytes,
+    LikePatternBytes,
+    RegexBytes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -174,6 +186,10 @@ pub enum SqlEvaluationError {
     StringOrderingUnsupported,
     #[error("SQL result is not a Boolean predicate")]
     NonPredicate,
+    #[error("SQL LIKE escape must contain exactly one Unicode scalar")]
+    InvalidLikeEscape,
+    #[error("SQL LIKE pattern is malformed")]
+    InvalidLikePattern,
     #[error("SQL evaluation exceeds {kind:?} limit {maximum}")]
     Limit {
         kind: SqlEvaluationLimit,
@@ -213,7 +229,26 @@ enum Node {
     Literal(Literal),
     Property(Property),
     Not(u16),
-    Binary { op: Binary, left: u16, right: u16 },
-    IsNull { input: u16, negated: bool },
+    Binary {
+        op: Binary,
+        left: u16,
+        right: u16,
+    },
+    IsNull {
+        input: u16,
+        negated: bool,
+    },
     Exists(Property),
+    InList {
+        input: u16,
+        operands: [u16; MAX_SQL_IN_OPERANDS],
+        len: u8,
+        negated: bool,
+    },
+    Like {
+        input: u16,
+        pattern: u16,
+        escape: Option<u16>,
+        negated: bool,
+    },
 }

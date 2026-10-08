@@ -41,6 +41,7 @@ hmac = "0.12"
 percent-encoding = "2.3"
 postcard = { version = "1.1", features = ["use-std"] }
 rcgen = "0.13"
+regex-automata = { version = "=0.4.16", default-features = false, features = ["std", "syntax", "nfa-pikevm"] }
 ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2.2"

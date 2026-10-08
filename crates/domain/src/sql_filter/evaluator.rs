@@ -97,6 +97,79 @@ pub(super) fn evaluate<'a>(
             }
         }
     }
+    // The bound pass repeats scalar lookups; charge every scan before any runs.
+    for node in &program.nodes {
+        match node {
+            Node::InList {
+                input,
+                operands,
+                len,
+                ..
+            } => {
+                charge_scalar_lookup(program, message, *input, key_bytes, budget)?;
+                for operand in &operands[..usize::from(*len)] {
+                    charge_scalar_lookup(program, message, *operand, key_bytes, budget)?;
+                }
+            }
+            Node::Like {
+                input,
+                pattern,
+                escape,
+                ..
+            } => {
+                charge_scalar_lookup(program, message, *input, key_bytes, budget)?;
+                charge_scalar_lookup(program, message, *pattern, key_bytes, budget)?;
+                if let Some(escape) = escape {
+                    charge_scalar_lookup(program, message, *escape, key_bytes, budget)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    // New scalar predicates reserve every operand and regex translation before
+    // allocating slots, including failed or Boolean-hidden branches.
+    for node in &program.nodes {
+        match node {
+            Node::InList {
+                input,
+                operands,
+                len,
+                ..
+            } => {
+                let input = scalar_bound(program, message, *input);
+                let mut bytes = input.saturating_mul(usize::from(*len));
+                for operand in &operands[..usize::from(*len)] {
+                    bytes = bytes.saturating_add(scalar_bound(program, message, *operand));
+                }
+                budget.work(usize::from(*len))?;
+                budget.bytes(bytes)?;
+            }
+            Node::Like {
+                input,
+                pattern,
+                escape,
+                ..
+            } => {
+                let input = scalar_bound(program, message, *input);
+                let pattern = scalar_bound(program, message, *pattern);
+                let escape = escape.map_or(0, |index| scalar_bound(program, message, index));
+                let bytes = input.saturating_add(pattern).saturating_add(escape);
+                budget.work(bytes.saturating_add(1))?;
+                budget.bytes(bytes)?;
+                if pattern > MAX_SQL_LIKE_PATTERN_BYTES {
+                    return Err(SqlEvaluationError::Limit {
+                        kind: SqlEvaluationLimit::LikePatternBytes,
+                        maximum: MAX_SQL_LIKE_PATTERN_BYTES,
+                    });
+                }
+                budget.bytes(
+                    super::pattern::allocation_bound(pattern).saturating_add(MAX_SQL_REGEX_BYTES),
+                )?;
+                budget.work(super::pattern::build_work_bound(pattern))?;
+            }
+            _ => {}
+        }
+    }
     let mut slots: Vec<Slot<'a>> = Vec::with_capacity(program.nodes.len());
     let mut first_error = None;
     for node in &program.nodes {
@@ -155,6 +228,52 @@ pub(super) fn evaluate<'a>(
                     left.string_bound.max(right.string_bound),
                 )
             }
+            Node::InList {
+                input,
+                operands,
+                len,
+                negated,
+            } => {
+                let input = slots[usize::from(*input)];
+                let mut truth = SqlTruth::False;
+                let mut error = None;
+                let mut bound = input.string_bound;
+                for operand in &operands[..usize::from(*len)] {
+                    let operand = slots[usize::from(*operand)];
+                    bound = bound.max(operand.string_bound);
+                    match compare(Binary::Eq, input, operand).and_then(operand_truth) {
+                        Ok(SqlTruth::True) => truth = SqlTruth::True,
+                        Ok(SqlTruth::Unknown) if truth == SqlTruth::False => {
+                            truth = SqlTruth::Unknown
+                        }
+                        Ok(_) => {}
+                        Err(found) => {
+                            error.get_or_insert(found);
+                        }
+                    }
+                }
+                Slot::new(
+                    match error {
+                        Some(error) => Err(error),
+                        None => Ok(Value::from_truth(negate(truth, *negated))),
+                    },
+                    bound,
+                )
+            }
+            Node::Like {
+                input,
+                pattern,
+                escape,
+                negated,
+            } => {
+                let input = slots[usize::from(*input)];
+                let pattern = slots[usize::from(*pattern)];
+                let escape = escape.map(|index| slots[usize::from(index)]);
+                Slot::new(
+                    like(input, pattern, escape, *negated, budget),
+                    input.string_bound.max(pattern.string_bound),
+                )
+            }
         };
         if let Err(error) = slot.value {
             if matches!(error, SqlEvaluationError::Limit { .. }) {
@@ -168,6 +287,90 @@ pub(super) fn evaluate<'a>(
         Some(error) => Err(error),
         None => slots[usize::from(program.root)].value?.truth(),
     }
+}
+
+fn scalar_bound(program: &SqlProgram, message: SqlMessageContext<'_>, index: u16) -> usize {
+    match &program.nodes[usize::from(index)] {
+        Node::Literal(Literal::String(value)) => value.len(),
+        Node::Property(property) => lookup(message, property).1.string_bound,
+        _ => 0,
+    }
+}
+
+fn charge_scalar_lookup(
+    program: &SqlProgram,
+    message: SqlMessageContext<'_>,
+    index: u16,
+    key_bytes: usize,
+    budget: &mut SqlEvaluationBudget,
+) -> Result<(), SqlEvaluationError> {
+    match &program.nodes[usize::from(index)] {
+        Node::Property(Property::User(name)) => {
+            let bytes = name
+                .len()
+                .saturating_mul(message.application_properties.len())
+                .saturating_add(key_bytes);
+            budget.work(message.application_properties.len().saturating_add(bytes))?;
+            budget.bytes(bytes)
+        }
+        Node::Property(Property::System(_)) => budget.work(message.system_properties.len()),
+        _ => Ok(()),
+    }
+}
+
+fn negate(truth: SqlTruth, negated: bool) -> SqlTruth {
+    match (negated, truth) {
+        (true, SqlTruth::True) => SqlTruth::False,
+        (true, SqlTruth::False) => SqlTruth::True,
+        _ => truth,
+    }
+}
+
+fn like<'a>(
+    input: Slot<'a>,
+    pattern: Slot<'a>,
+    escape: Option<Slot<'a>>,
+    negated: bool,
+    budget: &mut SqlEvaluationBudget,
+) -> Result<Value<'a>, SqlEvaluationError> {
+    let escape = match escape.map(|slot| slot.value).transpose()? {
+        None => None,
+        Some(Value::String(text)) => {
+            Some(super::pattern::escape(text).ok_or(SqlEvaluationError::InvalidLikeEscape)?)
+        }
+        Some(value) if value.unknown() => return Ok(Value::Unknown),
+        Some(_) => return Err(SqlEvaluationError::TypeMismatch),
+    };
+    let pattern = match pattern.value? {
+        Value::String(text) => text,
+        value if value.unknown() => return input.value.map(|_| Value::Unknown),
+        _ => return Err(SqlEvaluationError::TypeMismatch),
+    };
+    // Build even with null, incompatible or unsupported input: those values
+    // cannot conceal a regex limit. Matching work is charged before its cache.
+    let regex = super::pattern::compile(pattern, escape)?;
+    budget.work(
+        input
+            .string_bound
+            .saturating_add(1)
+            .saturating_mul(regex.get_nfa().states().len()),
+    )?;
+    let input = match input.value? {
+        Value::String(text) => text,
+        value if value.unknown() => return Ok(Value::Unknown),
+        _ => return Err(SqlEvaluationError::TypeMismatch),
+    };
+    // Capture-free PikeVM sparse sets and epsilon stack are linear in states.
+    budget.bytes(
+        regex
+            .get_nfa()
+            .states()
+            .len()
+            .saturating_mul(64)
+            .saturating_add(32),
+    )?;
+    let mut cache = regex.create_cache();
+    Ok(Value::Bool(regex.is_match(&mut cache, input) != negated))
 }
 
 fn lookup<'a>(message: SqlMessageContext<'a>, property: &Property) -> (bool, Slot<'a>) {
@@ -263,6 +466,14 @@ fn binary<'a>(
     }
     budget.work(1)?;
     budget.bytes(left.string_bound.saturating_add(right.string_bound))?;
+    compare(op, left, right)
+}
+
+fn compare<'a>(
+    op: Binary,
+    left: Slot<'a>,
+    right: Slot<'a>,
+) -> Result<Value<'a>, SqlEvaluationError> {
     let left = left.value?;
     let right = right.value?;
     if left.unknown() || right.unknown() {
