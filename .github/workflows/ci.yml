@@ -13,6 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Verification helper unit tests
+        working-directory: tools/tests
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python3 --version
+          python3 -m unittest -v test_cargo_handoff
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: clippy, rustfmt
