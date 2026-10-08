@@ -8,8 +8,8 @@ protocol/client gates establish the surface. Neither is certification.
 
 | Client | Available gate | Qualification |
 | --- | --- | --- |
-| Official .NET, declared 7.20.2 | Opt-in TCP and WSS data-plane workflows | Experimental Memory coverage with loaded-file custody; not exact pins, durable or administration certification |
-| Previous pinned .NET | Planned | No gate implemented |
+| Official .NET, declared-current 7.21.0 / Core 1.62.0 | Opt-in TCP and WSS data-plane workflows | Exact locked graph and approved runtime bytes; experimental Memory coverage |
+| Official .NET, previous 7.20.2 / Core 1.60.0 | Same workflows, isolated package/build roots | Exact fixed selector; not durable or administration certification |
 | Pinned Sift | Planned | No gate implemented |
 | Rust AMQP client | Protocol end-to-end suites | Broader protocol checks; not a substitute for official SDK gates |
 
@@ -19,7 +19,9 @@ queue sessions/state, duplicate detection, queue/topic scheduling and
 cancellation, filtered topic/subscription delivery, rule management, and
 case-insensitive addressing. Selected gates require Linux, .NET 10 and NuGet
 restore; missing prerequisites fail. Ordinary workspace tests ignore them.
-Declared 7.20.2 is not exact NuGet graph or latest-release certification.
+Both selectors use exact ranges and checked-in lockfiles; declared-current is
+a fixed choice, not a latest-release claim. Selected ServiceBus/Core package,
+output and nonce-bound loaded-file hashes must match checked-in approvals.
 
 TCP uses a permissive certificate callback for a generated test identity. WSS
 uses the platform trust path with a generated root scoped to the child process

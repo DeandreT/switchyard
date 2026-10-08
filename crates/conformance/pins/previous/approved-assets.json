@@ -1,0 +1,21 @@
+{
+  "framework": "net10.0",
+  "packages": [
+    {
+      "id": "Azure.Messaging.ServiceBus",
+      "role": "service_bus",
+      "runtime_asset": "lib/net10.0/Azure.Messaging.ServiceBus.dll",
+      "sha256": "f07a2a15b7a1276970e512e9486de8a2ea8b551833669b40f9c0117544191e5b",
+      "version": "7.20.2"
+    },
+    {
+      "id": "Azure.Core",
+      "role": "core",
+      "runtime_asset": "lib/net10.0/Azure.Core.dll",
+      "sha256": "d0773e2ebfc5dd9f478f82aff0f77f18f446268f22b95dc8201525dcd959d743",
+      "version": "1.60.0"
+    }
+  ],
+  "schema": 1,
+  "selector": "previous"
+}

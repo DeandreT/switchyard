@@ -29,6 +29,7 @@ amqp = { workspace = true, features = ["test-client"] }
 base64.workspace = true
 hmac.workspace = true
 rcgen.workspace = true
+roxmltree = "=0.21.1"
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true

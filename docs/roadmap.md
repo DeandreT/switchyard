@@ -28,12 +28,13 @@ and assignment source. Milestones group work; independent lanes can run in paral
 - [x] Fenced session registration and captured-owner cleanup ([#87](https://github.com/DeandreT/switchyard/issues/87))
 - [x] Pure offline JWT policy and issuer-qualified grants ([#8](https://github.com/DeandreT/switchyard/issues/8)); [consumers and activation remain pending](offline-jwt.md)
 - [x] Pure bounded typed SQL predicate kernel ([#95](https://github.com/DeandreT/switchyard/issues/95)); [patterns/scalars and integration remain pending](sql-predicates.md)
-- [x] Bounded Linux SDK child runs and loaded-file custody ([#99](https://github.com/DeandreT/switchyard/issues/99)); [exact pins and durable matrix remain pending](sdk-gates.md)
+- [x] Bounded Linux SDK child runs and loaded-file custody ([#99](https://github.com/DeandreT/switchyard/issues/99))
+- [x] Two exact SDK selectors and approved runtime assets ([#100](https://github.com/DeandreT/switchyard/issues/100)); [durable matrix remains pending](sdk-gates.md)
 - [ ] Remaining client semantics, administration and conserved capacity
 - [ ] Real quorum, multi-tenant security, recovery and measured release gates
 
-The ordinary workspace gate excludes two opt-in SDK selectors; foundation-only
-increments do not rerun them. Current .NET projects declare 7.20.2 and coverage is
+The ordinary workspace gate excludes four SDK workflows and one restored-pin
+control; foundation-only increments do not rerun them. Coverage is
 experimental Memory-only TCP/WSS, not durable or administration certification.
 See [compatibility](compatibility.md).
 
@@ -186,7 +187,7 @@ single PR for the whole row. Update pickup labels when prerequisites merge.
 | JWT CBS integration | [#17](https://github.com/DeandreT/switchyard/issues/17) | [#8](https://github.com/DeandreT/switchyard/issues/8), [#7](https://github.com/DeandreT/switchyard/issues/7), [#71](https://github.com/DeandreT/switchyard/issues/71) |
 | Two SDK pins and launched-client identity | [#9](https://github.com/DeandreT/switchyard/issues/9) | Ordered children below; coordinator remains open |
 | Bounded SDK child and loaded-file custody | [#99](https://github.com/DeandreT/switchyard/issues/99) | Independent; implemented ([gate limits](sdk-gates.md)) |
-| Exact current/previous package pins | [#100](https://github.com/DeandreT/switchyard/issues/100) | [#99](https://github.com/DeandreT/switchyard/issues/99) |
+| Exact current/previous package pins | [#100](https://github.com/DeandreT/switchyard/issues/100) | Implemented after #99; [gate limits](sdk-gates.md) |
 | Pinned Memory/Fjall TCP/WSS matrix | [#101](https://github.com/DeandreT/switchyard/issues/101) | [#100](https://github.com/DeandreT/switchyard/issues/100), [#7](https://github.com/DeandreT/switchyard/issues/7) |
 | Native session transfer windows | [#68](https://github.com/DeandreT/switchyard/issues/68) | [#7](https://github.com/DeandreT/switchyard/issues/7) |
 | Bounded receiving-credit refill | [#69](https://github.com/DeandreT/switchyard/issues/69) | [#68](https://github.com/DeandreT/switchyard/issues/68), [#9](https://github.com/DeandreT/switchyard/issues/9) |

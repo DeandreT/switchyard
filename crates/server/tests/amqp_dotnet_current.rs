@@ -1,9 +1,11 @@
-//! Opt-in gate for the current stable official .NET Service Bus client.
+//! Opt-in Memory TCP workflows for two fixed official .NET package selections.
 
 use std::{error::Error, path::PathBuf, sync::Arc, time::Duration};
 
 #[allow(dead_code)]
 mod sdk_child;
+
+use sdk_child::pins::SdkPin;
 
 use auth::{PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule};
 use domain::{
@@ -26,8 +28,19 @@ const FILTER_SUBSCRIPTION: &str = "Filtered-Subscription";
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires dotnet and a NuGet restore"]
-async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows()
+async fn declared_current_dotnet_client_exercises_settlement_and_session_workflows()
 -> Result<(), Box<dyn Error>> {
+    run_tcp_workflows(SdkPin::DeclaredCurrent).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires dotnet and a NuGet restore"]
+async fn previous_dotnet_client_exercises_settlement_and_session_workflows()
+-> Result<(), Box<dyn Error>> {
+    run_tcp_workflows(SdkPin::Previous).await
+}
+
+async fn run_tcp_workflows(pin: SdkPin) -> Result<(), Box<dyn Error>> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -152,8 +165,11 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../conformance/dotnet-current");
     let output = async {
-        let mut run =
-            sdk_child::SdkRun::prepare(&source, "Switchyard.Conformance.DotNetCurrent.csproj")?;
+        let mut run = sdk_child::SdkRun::prepare(
+            &source,
+            "Switchyard.Conformance.DotNetCurrent.csproj",
+            pin,
+        )?;
         run.build().await?;
         let args = [
             HOST.into(),
@@ -176,6 +192,11 @@ async fn current_stable_dotnet_client_exercises_settlement_and_session_workflows
             KEY.into(),
         ];
         let verified = run.run(&args, &[]).await?;
+        println!(
+            "SDK_PIN_VERIFIED {} {}",
+            pin.selector(),
+            serde_json::to_string(&verified.packages).map_err(std::io::Error::other)?
+        );
         println!(
             "SDK_CUSTODY_VERIFIED {}",
             serde_json::to_string(&verified.records).map_err(std::io::Error::other)?

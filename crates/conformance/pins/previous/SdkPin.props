@@ -1,0 +1,8 @@
+<Project>
+  <PropertyGroup>
+    <SwitchyardSdkSelector>previous</SwitchyardSdkSelector>
+    <SwitchyardServiceBusVersion>[7.20.2]</SwitchyardServiceBusVersion>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RestoreLockedMode>true</RestoreLockedMode>
+  </PropertyGroup>
+</Project>
