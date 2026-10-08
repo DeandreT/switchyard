@@ -790,3 +790,249 @@ pub(super) async fn pending_once<F: Future + ?Sized>(mut future: Pin<&mut F>) {
         "positive gate must still hold original work"
     );
 }
+
+#[derive(Clone, Copy)]
+pub(super) enum EagerTarget {
+    Grant,
+    Receive,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum EagerEvent {
+    Invoked(CommandKind),
+    Captured(CommandOutcome),
+    FuturePolled,
+    RawReturned(CommandOutcome),
+    Completed(Box<CommandKind>, Result<CommandOutcome, BrokerRejection>),
+}
+
+#[derive(Default)]
+struct EagerState {
+    events: Vec<EagerEvent>,
+    allow_invocation: bool,
+    allow_result: bool,
+}
+
+#[derive(Default)]
+struct EagerGates {
+    state: Mutex<EagerState>,
+    changed: Notify,
+    invocation: Condvar,
+}
+
+impl EagerGates {
+    async fn reached(&self, first_poll: bool) {
+        timeout(WAIT, async {
+            loop {
+                let notified = self.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let reached = self.state.lock().unwrap().events.iter().any(|event| {
+                    if first_poll {
+                        matches!(event, EagerEvent::FuturePolled)
+                    } else {
+                        matches!(event, EagerEvent::Captured(_))
+                    }
+                });
+                if reached {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("positive eager acquisition frontier");
+    }
+
+    fn release_invocation(&self) {
+        self.state.lock().unwrap().allow_invocation = true;
+        self.invocation.notify_all();
+    }
+
+    fn release_result(&self) {
+        self.state.lock().unwrap().allow_result = true;
+        self.changed.notify_waiters();
+    }
+
+    async fn result_ready(&self) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.events.push(EagerEvent::FuturePolled);
+        }
+        self.changed.notify_waiters();
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.state.lock().unwrap().allow_result {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct EagerAcquisitionBroker {
+    actor: Arc<Actor>,
+    target: EagerTarget,
+    gates: Arc<EagerGates>,
+}
+
+impl EagerAcquisitionBroker {
+    pub(super) fn new(actor: Arc<Actor>, target: EagerTarget) -> Self {
+        Self {
+            actor,
+            target,
+            gates: Arc::new(EagerGates::default()),
+        }
+    }
+
+    pub(super) fn guard(&self) -> EagerReleaseGuard {
+        EagerReleaseGuard {
+            actor: Arc::clone(&self.actor),
+            gates: Arc::clone(&self.gates),
+        }
+    }
+
+    pub(super) async fn captured(&self) -> CommandOutcome {
+        self.gates.reached(false).await;
+        self.events()
+            .into_iter()
+            .find_map(|event| match event {
+                EagerEvent::Captured(outcome) => Some(outcome),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    pub(super) async fn first_poll(&self) {
+        self.gates.reached(true).await;
+    }
+
+    pub(super) fn release_invocation(&self) {
+        self.gates.release_invocation();
+    }
+
+    pub(super) fn release_result(&self) {
+        self.gates.release_result();
+    }
+
+    pub(super) fn events(&self) -> Vec<EagerEvent> {
+        self.gates.state.lock().unwrap().events.clone()
+    }
+}
+
+impl Broker for EagerAcquisitionBroker {
+    fn submit(
+        &self,
+        namespace: NamespaceName,
+        entity: EntityPath,
+        kind: CommandKind,
+    ) -> impl Future<Output = Result<CommandOutcome, BrokerRejection>> + Send {
+        assert_eq!(namespace, self.actor.namespace);
+        assert_eq!(entity, self.actor.entity);
+        self.gates
+            .state
+            .lock()
+            .unwrap()
+            .events
+            .push(EagerEvent::Invoked(kind.clone()));
+        let eager = matches!(
+            (self.target, &kind),
+            (EagerTarget::Grant, CommandKind::AcceptSession { .. })
+                | (EagerTarget::Receive, CommandKind::Receive { .. })
+        );
+        // Actor.intent applies on the real owner thread during method invocation,
+        // before a future exists. It intentionally bypasses ActualBroker's log.
+        let captured = eager.then(|| {
+            let outcome = self.actor.intent(kind.clone());
+            let mut state = self.gates.state.lock().unwrap();
+            state.events.push(EagerEvent::Captured(outcome.clone()));
+            self.gates.changed.notify_waiters();
+            while !state.allow_invocation {
+                state = self.gates.invocation.wait(state).unwrap();
+            }
+            outcome
+        });
+        let actual = self.actor.broker.as_ref().unwrap().clone();
+        let gates = Arc::clone(&self.gates);
+        async move {
+            if let Some(outcome) = captured {
+                gates.result_ready().await;
+                gates
+                    .state
+                    .lock()
+                    .unwrap()
+                    .events
+                    .push(EagerEvent::RawReturned(outcome.clone()));
+                Ok(outcome)
+            } else {
+                let result = actual.submit(namespace, entity, kind.clone()).await;
+                gates
+                    .state
+                    .lock()
+                    .unwrap()
+                    .events
+                    .push(EagerEvent::Completed(Box::new(kind), result.clone()));
+                result
+            }
+        }
+    }
+
+    fn deliverable(&self, _: &NamespaceName, _: &EntityPath) -> impl Future<Output = ()> + Send {
+        std::future::pending()
+    }
+}
+
+pub(super) struct EagerReleaseGuard {
+    actor: Arc<Actor>,
+    gates: Arc<EagerGates>,
+}
+
+impl Drop for EagerReleaseGuard {
+    fn drop(&mut self) {
+        self.actor.gate.release_all();
+        self.gates.release_invocation();
+        self.gates.release_result();
+    }
+}
+
+pub(super) fn assert_eager_release(
+    events: &[EagerEvent],
+    expected: &CommandOutcome,
+    hold: &domain::SessionHold,
+) -> CommandKind {
+    let [
+        EagerEvent::Invoked(kind),
+        EagerEvent::Captured(captured),
+        EagerEvent::FuturePolled,
+        EagerEvent::RawReturned(returned),
+        EagerEvent::Invoked(release),
+        EagerEvent::Completed(completed, result),
+    ] = events
+    else {
+        panic!("one eager result must return before exact cleanup: {events:?}");
+    };
+    assert_eq!(captured, expected);
+    assert_eq!(returned, expected);
+    let release_kind = CommandKind::ReleaseSession {
+        session: hold.clone(),
+    };
+    assert_eq!(release, &release_kind);
+    assert_eq!(completed.as_ref(), &release_kind);
+    assert_eq!(result, &Ok(CommandOutcome::SessionReleased));
+    kind.clone()
+}
+
+pub(super) fn acquisition_counters(actor: &Actor) -> domain::QueueCounters {
+    actor
+        .store()
+        .get(&domain::keys::queue_counters(
+            &actor.namespace,
+            &actor.entity,
+        ))
+        .unwrap()
+        .map(|bytes| domain::codec::decode(&bytes).unwrap())
+        .unwrap_or_default()
+}

@@ -164,18 +164,19 @@ pub(super) async fn serve_receiving_client<B: Broker>(
         }
         let wakeup = broker.deliverable(&namespace, &entity);
         tokio::pin!(wakeup);
-        intake = Some(ReceiveIntake::new(
-            reservation,
-            broker.submit(
-                namespace.clone(),
-                entity.clone(),
-                CommandKind::Receive {
-                    mode,
-                    lock_duration_millis: None,
-                    session: session.clone(),
-                },
-            ),
-        ));
+        intake = Some(ReceiveIntake::new(reservation, async {
+            broker
+                .submit(
+                    namespace.clone(),
+                    entity.clone(),
+                    CommandKind::Receive {
+                        mode,
+                        lock_duration_millis: None,
+                        session: session.clone(),
+                    },
+                )
+                .await
+        }));
         {
             let original = intake.as_mut().expect("one reserved Receive attempt");
             loop {
