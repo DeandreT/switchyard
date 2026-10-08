@@ -51,9 +51,18 @@ impl FjallStore {
             .map_err(|error| StorageError::backend("read the store format version", &error))?
         {
             Some(recorded) => require_readable_format(&recorded)?,
-            // No version record means nothing has ever been written here, so
-            // stamp the directory durably before it can hold a single record.
             None => {
+                // A missing marker does not prove this is a fresh store.
+                let metadata_entry = meta.iter().next().map(read_entry).transpose()?;
+                let record_entry = records.iter().next().map(read_entry).transpose()?;
+                if metadata_entry.is_some() || record_entry.is_some() {
+                    return Err(StorageError::CorruptMetadata {
+                        detail: String::from(
+                            "unversioned store contains existing records or metadata",
+                        ),
+                    });
+                }
+
                 let mut batch = database.batch().durability(Some(PersistMode::SyncAll));
                 batch.insert(
                     &meta,
@@ -279,6 +288,183 @@ mod tests {
         // rather than come back as a missing key.
         assert_eq!(reopened.get(b"ready:1")?, Some(Vec::new()));
         assert_eq!(reopened.scan_prefix(b"ready:", 16)?.len(), 1);
+        Ok(())
+    }
+
+    #[derive(Debug, Default, Eq, PartialEq)]
+    struct KnownRows {
+        meta: Vec<(Key, Value)>,
+        records: Vec<(Key, Value)>,
+    }
+
+    fn seed_known_rows(directory: &Path, rows: &KnownRows) -> Result<(), StorageError> {
+        let database = Database::builder(directory)
+            .open()
+            .map_err(|error| StorageError::backend("open raw known keyspaces", &error))?;
+        let meta = database
+            .keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)
+            .map_err(|error| StorageError::backend("open raw metadata", &error))?;
+        let records = database
+            .keyspace(RECORDS_KEYSPACE, KeyspaceCreateOptions::default)
+            .map_err(|error| StorageError::backend("open raw records", &error))?;
+        let mut batch = database.batch().durability(Some(PersistMode::SyncAll));
+        for (key, value) in &rows.meta {
+            batch.insert(&meta, key.as_slice(), value.as_slice());
+        }
+        for (key, value) in &rows.records {
+            batch.insert(&records, key.as_slice(), value.as_slice());
+        }
+        batch
+            .commit()
+            .map_err(|error| StorageError::backend("seed raw known rows", &error))
+    }
+
+    fn read_known_rows(directory: &Path) -> Result<KnownRows, StorageError> {
+        let database = Database::builder(directory)
+            .open()
+            .map_err(|error| StorageError::backend("open raw known keyspaces", &error))?;
+        let meta = database
+            .keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)
+            .map_err(|error| StorageError::backend("open raw metadata", &error))?;
+        let records = database
+            .keyspace(RECORDS_KEYSPACE, KeyspaceCreateOptions::default)
+            .map_err(|error| StorageError::backend("open raw records", &error))?;
+        let snapshot = database.snapshot();
+        Ok(KnownRows {
+            meta: snapshot
+                .iter(&meta)
+                .map(read_entry)
+                .collect::<Result<_, _>>()?,
+            records: snapshot
+                .iter(&records)
+                .map(read_entry)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    fn assert_unversioned_refusal(
+        directory: &Path,
+        expected: &KnownRows,
+    ) -> Result<(), StorageError> {
+        assert_eq!(&read_known_rows(directory)?, expected);
+        assert!(
+            expected
+                .meta
+                .iter()
+                .all(|(key, _)| key.as_slice() != FORMAT_VERSION_KEY)
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                FjallStore::open(directory).err(),
+                Some(StorageError::CorruptMetadata {
+                    detail: String::from("unversioned store contains existing records or metadata"),
+                }),
+            );
+            assert_eq!(
+                &read_known_rows(directory)?,
+                expected,
+                "known raw rows and missing marker stay exact"
+            );
+        }
+        Ok(())
+    }
+
+    fn unversioned_meta_rows() -> Vec<(Key, Value)> {
+        vec![
+            (b"a-unknown".to_vec(), Vec::new()),
+            (b"z-unknown".to_vec(), b"retained metadata".to_vec()),
+        ]
+    }
+
+    fn unversioned_record_rows() -> Vec<(Key, Value)> {
+        vec![
+            (b"a-record".to_vec(), Vec::new()),
+            (b"z-record".to_vec(), b"retained record".to_vec()),
+        ]
+    }
+
+    #[test]
+    fn initializes_existing_empty_unversioned_known_keyspaces() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        seed_known_rows(directory.path(), &KnownRows::default())?;
+        assert_eq!(read_known_rows(directory.path())?, KnownRows::default());
+        let store = FjallStore::open(directory.path())?;
+        assert!(store.snapshot()?.entries().is_empty());
+        assert_eq!(store.get(FORMAT_VERSION_KEY)?, None);
+        drop(store);
+
+        let expected = KnownRows {
+            meta: vec![(
+                FORMAT_VERSION_KEY.to_vec(),
+                STORE_FORMAT_V1.to_be_bytes().to_vec(),
+            )],
+            records: Vec::new(),
+        };
+        assert_eq!(read_known_rows(directory.path())?, expected);
+        let reopened = FjallStore::open(directory.path())?;
+        assert!(reopened.snapshot()?.entries().is_empty());
+        drop(reopened);
+        assert_eq!(read_known_rows(directory.path())?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_unversioned_metadata_without_changing_known_rows() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        let rows = KnownRows {
+            meta: unversioned_meta_rows(),
+            records: Vec::new(),
+        };
+        seed_known_rows(directory.path(), &rows)?;
+        assert_unversioned_refusal(directory.path(), &rows)
+    }
+
+    #[test]
+    fn refuses_unversioned_records_without_changing_known_rows() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        let rows = KnownRows {
+            meta: Vec::new(),
+            records: unversioned_record_rows(),
+        };
+        seed_known_rows(directory.path(), &rows)?;
+        assert_unversioned_refusal(directory.path(), &rows)
+    }
+
+    #[test]
+    fn refuses_unversioned_metadata_and_records_without_changing_known_rows()
+    -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        let rows = KnownRows {
+            meta: unversioned_meta_rows(),
+            records: unversioned_record_rows(),
+        };
+        seed_known_rows(directory.path(), &rows)?;
+        assert_unversioned_refusal(directory.path(), &rows)
+    }
+
+    #[test]
+    fn marked_version_one_accepts_populated_known_keyspaces() -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        let mut metadata = unversioned_meta_rows();
+        metadata.insert(
+            1,
+            (
+                FORMAT_VERSION_KEY.to_vec(),
+                STORE_FORMAT_V1.to_be_bytes().to_vec(),
+            ),
+        );
+        let rows = KnownRows {
+            meta: metadata,
+            records: unversioned_record_rows(),
+        };
+        seed_known_rows(directory.path(), &rows)?;
+        let store = FjallStore::open(directory.path())?;
+        assert_eq!(store.snapshot()?.entries(), rows.records.as_slice());
+        for (key, value) in &rows.records {
+            assert_eq!(store.get(key)?, Some(value.clone()));
+        }
+        drop(store);
+        assert_eq!(read_known_rows(directory.path())?, rows);
         Ok(())
     }
 }

@@ -257,6 +257,13 @@ backends, so a single node keeps its messages, locks, delivery counts, and
 sequence numbers across a restart. Preserving them across the loss of a node
 still needs replication.
 
+A Fjall directory without a format marker is initialized only when both its
+known `meta` and `records` keyspaces are empty. Existing rows, including
+empty-valued entries, refuse opening as corrupt metadata without adding a
+marker. An existing valid V1 marker retains the prior open behavior. This
+changes neither store format V1 nor domain/wire bytes; it is not a migration
+or a proof about foreign keyspaces or filesystem-byte invariance.
+
 Switchyard enforces the Standard limit of 2,000 subscriptions per topic, the
 separate documented name bounds for topics and subscriptions, and the Standard
 256 KiB wire-message limit. It does not yet reproduce Azure namespace capacity
