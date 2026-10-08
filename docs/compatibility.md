@@ -167,8 +167,16 @@ natural teardown. Never-polled work is discarded; a polled attempt is drained
 and cached before residual route/session cleanup. Late results cause no Transfer
 or implicit settlement: PeekLock waits for expiry; ReceiveAndDelete can be lost.
 Cancelled borrowed observers retain custody, not an aborted parent task.
-Session handoff, wider transport/task cleanup and ordered process shutdown remain
-[roadmap work](roadmap.md#next-main-increments). A stalled broker can still stall joins.
+
+Entity attaches retain original native acceptance and any session grant through
+borrowed observers. Observed End discards only never-polled phases; polled
+originals are observed and cached. An unused hold gets one release attempt using
+its captured entity/full hold, after hold-only matching unregister if registered;
+refusal leaves ordinary expiry. This is not an atomic link-live, live-hold or
+registry fence ([#87](https://github.com/DeandreT/switchyard/issues/87)), or ancestor-task shielding ([#75](https://github.com/DeandreT/switchyard/issues/75)).
+Data/management/CBS transport retirement (#84-#86) and ordered process shutdown
+remain [roadmap work](roadmap.md#next-main-increments). Stalled broker/native I/O
+can still delay cleanup.
 
 Sustained inbound traffic beyond initial credit is not certified. Session
 transfer-window accounting and receiving-credit refill remain

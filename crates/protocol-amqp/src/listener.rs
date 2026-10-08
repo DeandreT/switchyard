@@ -8,13 +8,11 @@
 use std::sync::Arc;
 
 use amqp::{
-    AmqpError, Attach, EngineError, Error as AmqpProtocolError, ErrorCondition, Fields,
-    LinkEndpoint, Receiver, Role, SenderSettleMode, ServerConnection, ServerSession,
+    AmqpError, EngineError, Error as AmqpProtocolError, ErrorCondition, Fields, LinkEndpoint,
+    Receiver, Role, ServerConnection, ServerSession,
 };
 use auth::{Permission, ResourceScope};
-use domain::{
-    AcceptedSession, CommandKind, CommandOutcome, EntityPath, NamespaceName, ReceiveMode,
-};
+use domain::{AcceptedSession, CommandKind, CommandOutcome, EntityPath, NamespaceName};
 use rustls::ServerConfig;
 use serde_amqp::{Value, primitives::Symbol};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -23,7 +21,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::{
-    Attachment, Broker, BrokerRejection, IncomingMessages, ProtocolError, SessionRequest,
+    Attachment, Broker, BrokerRejection, IncomingMessages, ProtocolError,
     SharedAccessAuthentication,
     authorization::{ConnectionAuthorization, SharedAccessSaslAcceptor},
     cbs::{serve_cbs_replies, serve_cbs_requests},
@@ -31,12 +29,14 @@ use crate::{
         ConnectionManagement, ManagementAuthorization, serve_management_replies,
         serve_management_requests,
     },
-    parse_attachment, read_incoming_messages, read_session_filter, stamp_session_filter,
+    parse_attachment, read_incoming_messages,
     websocket::accept_amqp_websocket,
 };
 
+mod attachments;
 mod settlement;
 
+use attachments::{EntityLink, accept_entity_link};
 use settlement::serve_receiving_client;
 
 const LOCKED_UNTIL_UTC_PROPERTY: &str = "com.microsoft:locked-until-utc";
@@ -502,70 +502,24 @@ async fn serve_session<B: Broker>(
         // source. The other terminus may carry a generated link address.
         debug!(%address, ?attach, "accepting entity link");
 
-        // A receiver that asks for pre-settled transfers is asking for
-        // at-most-once: the broker deletes before sending and a lost transfer
-        // stays lost. Anything else gets peek-lock.
-        let mode = match attach.snd_settle_mode {
-            SenderSettleMode::Settled => ReceiveMode::ReceiveAndDelete,
-            SenderSettleMode::Unsettled | SenderSettleMode::Mixed => ReceiveMode::PeekLock,
-        };
-
-        // Everything that can refuse the link is decided before the attach is
-        // accepted, so a granted session can be stamped into the source the
-        // acceptor echoes — the echo is how a next-available receiver learns
-        // which session it got.
-        let plan = plan_link(
+        let Some(EntityLink {
+            endpoint,
+            entity,
+            accepted,
+            authorization: link_authorization,
+            mode,
+        }) = accept_entity_link(
+            &session,
             &broker,
             &namespace,
             address,
-            &attach,
+            attach,
             authorization.as_ref(),
+            &management,
         )
-        .await;
-        if let Ok((_, Some(accepted), _)) = &plan
-            && let Some(source) = attach.source.as_mut()
-        {
-            stamp_session_filter(source, &accepted.session_id);
-        }
-
-        let response_properties = plan
-            .as_ref()
-            .ok()
-            .and_then(|(_, accepted, _)| accepted.as_ref())
-            .map(session_attach_properties);
-        let endpoint = match session
-            .accept_attach_with_properties(
-                attach,
-                crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64,
-                response_properties,
-            )
-            .await
-        {
-            Ok(endpoint) => endpoint,
-            Err(error) => {
-                // Planning a session receiver acquires its broker hold before
-                // the attach can be accepted. If the peer detached meanwhile,
-                // that hold belongs to no link and must not block its
-                // replacement until lock expiry.
-                if let Ok((entity, Some(accepted), _)) = &plan {
-                    let hold = accepted.hold();
-                    settlement::release_session(&broker, &namespace, entity, Some(&hold)).await;
-                }
-                match error {
-                    EngineError::RemoteDetached => continue,
-                    error => return Err(error.into()),
-                }
-            }
-        };
-        let (entity, accepted, link_authorization) = match plan {
-            Ok(plan) => plan,
-            Err(error) => {
-                // Refusing the link rather than the connection: another link on
-                // the same session may be perfectly valid.
-                warn!(%address, condition = ?error.condition, "refusing link");
-                detach_with(endpoint, error).await;
-                continue;
-            }
+        .await?
+        else {
+            continue;
         };
 
         info!(%address, entity = %entity, session = accepted.as_ref().map(|accepted| accepted.session_id.as_str()), "link attached");
@@ -592,11 +546,6 @@ async fn serve_session<B: Broker>(
             LinkEndpoint::Sender(sender) => {
                 let hold = accepted.map(|accepted| accepted.hold());
                 let link_name = sender.name().to_owned();
-                if let Some(hold) = hold.as_ref() {
-                    management
-                        .register_session(&link_name, entity.clone(), hold.clone())
-                        .await;
-                }
                 let connection_management = Arc::clone(&management);
                 tokio::spawn(async move {
                     let result = serve_receiving_client(
@@ -663,87 +612,6 @@ impl LinkAuthorization {
         self.connection
             .wait_until_unauthorized(&self.resource, self.permission)
             .await;
-    }
-}
-
-/// Everything an attach needs decided before it is answered: the entity it
-/// reaches, and the session lock it holds if its source asked for one.
-async fn plan_link<B: Broker>(
-    broker: &B,
-    namespace: &NamespaceName,
-    address: &str,
-    attach: &Attach,
-    authorization: Option<&Arc<ConnectionAuthorization>>,
-) -> Result<
-    (
-        EntityPath,
-        Option<AcceptedSession>,
-        Option<LinkAuthorization>,
-    ),
-    AmqpProtocolError,
-> {
-    let entity = resolve_entity(address, attach.role.clone())
-        .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?;
-    let link_authorization = match authorization {
-        Some(authorization) => {
-            let permission = match attach.role {
-                Role::Sender => Permission::Send,
-                Role::Receiver => Permission::Listen,
-            };
-            let resource = authorization
-                .authorize_entity(entity.as_str(), permission)
-                .await
-                .map_err(|_| {
-                    unauthorized_error(format!("{permission:?} is not authorized for {entity}"))
-                })?;
-            Some(LinkAuthorization {
-                connection: Arc::clone(authorization),
-                resource,
-                permission,
-            })
-        }
-        None => None,
-    };
-
-    // Only a receiving link takes a session lock; a sender names a session per
-    // message instead.
-    if attach.role != Role::Receiver {
-        return Ok((entity, None, link_authorization));
-    }
-    let session_id = match read_session_filter(attach.source.as_ref())
-        .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()))?
-    {
-        SessionRequest::None => return Ok((entity, None, link_authorization)),
-        SessionRequest::NextAvailable => None,
-        SessionRequest::Named(session_id) => Some(session_id),
-    };
-
-    match broker
-        .submit(
-            namespace.clone(),
-            entity.clone(),
-            CommandKind::AcceptSession {
-                session_id,
-                lock_duration_millis: None,
-            },
-        )
-        .await
-    {
-        Ok(CommandOutcome::SessionAccepted(Some(accepted))) => {
-            Ok((entity, Some(accepted), link_authorization))
-        }
-        // Nothing to grant is what Service Bus reports as a timeout: the client
-        // did nothing wrong and simply asks again.
-        Ok(CommandOutcome::SessionAccepted(None)) => Err(AmqpProtocolError::new(
-            ErrorCondition::Custom(Symbol::from(crate::TIMEOUT)),
-            String::from("no session is available to accept"),
-            None,
-        )),
-        Ok(other) => Err(error_for(
-            AmqpError::InternalError,
-            format!("accepting a session produced an unexpected outcome: {other:?}"),
-        )),
-        Err(rejection) => Err(rejection_error(&rejection)),
     }
 }
 

@@ -20,6 +20,8 @@ use super::{
     LinkAuthorization, ReceivingLinkProtocol, error_for, rejection_error, unauthorized_error,
 };
 
+#[cfg(test)]
+mod attachment_handoff_tests;
 mod intake;
 #[cfg(test)]
 mod test_support;

@@ -473,6 +473,12 @@ impl ServerConnection {
 }
 
 impl ServerSession {
+    /// Reports observed session or driver termination, even while old attach
+    /// offers remain buffered. This does not wait for or predict remote End.
+    pub fn is_ended(&self) -> bool {
+        self.incoming_attaches.is_closed() || self.commands.is_closed()
+    }
+
     pub async fn next_incoming_attach(&mut self) -> Option<Attach> {
         let incoming = self.incoming_attaches.recv().await?;
         self.pending_attach_identities

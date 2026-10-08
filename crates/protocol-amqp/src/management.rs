@@ -357,6 +357,16 @@ impl ConnectionManagement {
         self.sessions.read().await.get(link_name).cloned()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn registered_session(
+        &self,
+        link_name: &str,
+    ) -> Option<(EntityPath, SessionHold)> {
+        self.session(link_name)
+            .await
+            .map(|session| (session.entity, session.hold))
+    }
+
     pub(crate) async fn register_reply_route(
         &self,
         address: String,
