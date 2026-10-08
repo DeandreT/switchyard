@@ -231,7 +231,10 @@ ServiceBusReceiver batchReceiver = client.CreateReceiver(
     batchQueue,
     new ServiceBusReceiverOptions { PrefetchCount = 8 });
 IReadOnlyList<ServiceBusReceivedMessage> batched =
-    await batchReceiver.ReceiveMessagesAsync(6, TimeSpan.FromSeconds(10));
+    await BatchReceive.AccumulateAsync<ServiceBusReceivedMessage>(
+        6, TimeSpan.FromSeconds(10),
+        (remaining, wait, cancellation) =>
+            batchReceiver.ReceiveMessagesAsync(remaining, wait, cancellation));
 if (batched.Count != 6)
 {
     Console.Error.WriteLine($"expected six batched messages, received {batched.Count}");
@@ -277,7 +280,10 @@ await using (ServiceBusReceiver receiveAndDelete = client.CreateReceiver(
     }))
 {
     IReadOnlyList<ServiceBusReceivedMessage> deleted =
-        await receiveAndDelete.ReceiveMessagesAsync(3, TimeSpan.FromSeconds(10));
+        await BatchReceive.AccumulateAsync<ServiceBusReceivedMessage>(
+            3, TimeSpan.FromSeconds(10),
+            (remaining, wait, cancellation) =>
+                receiveAndDelete.ReceiveMessagesAsync(remaining, wait, cancellation));
     if (deleted.Count != 3 ||
         deleted.Select(message => message.Body.ToString()).ToArray() is not
         ["receive-delete-batch-0", "receive-delete-batch-1", "receive-delete-batch-2"])
@@ -888,7 +894,10 @@ await dedupeSender.SendMessagesAsync(new[]
 });
 
 IReadOnlyList<ServiceBusReceivedMessage> deduplicated =
-    await dedupeReceiver.ReceiveMessagesAsync(3, TimeSpan.FromSeconds(10));
+    await BatchReceive.AccumulateAsync<ServiceBusReceivedMessage>(
+        3, TimeSpan.FromSeconds(10),
+        (remaining, wait, cancellation) =>
+            dedupeReceiver.ReceiveMessagesAsync(remaining, wait, cancellation));
 if (deduplicated.Count != 3 ||
     deduplicated.Select(message => message.Body.ToString()).ToArray() is not
     ["dedupe-singular-first", "dedupe-batch-a-first", "dedupe-batch-b-first"])

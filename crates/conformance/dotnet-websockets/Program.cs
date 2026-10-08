@@ -166,7 +166,10 @@ await using ServiceBusReceiver batchReceiver = client.CreateReceiver(
     batchQueue,
     new ServiceBusReceiverOptions { PrefetchCount = 3 });
 IReadOnlyList<ServiceBusReceivedMessage> batchReceived =
-    await batchReceiver.ReceiveMessagesAsync(3, TimeSpan.FromSeconds(10));
+    await BatchReceive.AccumulateAsync<ServiceBusReceivedMessage>(
+        3, TimeSpan.FromSeconds(10),
+        (remaining, wait, cancellation) =>
+            batchReceiver.ReceiveMessagesAsync(remaining, wait, cancellation));
 if (batchReceived.Count != 3)
 {
     Console.Error.WriteLine(

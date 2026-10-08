@@ -9,11 +9,30 @@ Ordinary workspace tests ignore four workflows and one restored-pin control.
 Selecting one requires
 Linux, .NET 10 and NuGet restore; missing prerequisites fail rather than skip.
 
+The four exact batch checks accumulate arrival-order short batches: the
+[SDK receive contract](https://learn.microsoft.com/en-us/dotnet/api/azure.messaging.servicebus.servicebusreceiver.receivemessagesasync)
+does not promise `maxMessages` results, even when available. Each check requests
+only its remainder under one monotonic 10s budget and linked cancellation.
+Empty returns pause up to 100ms; 100 total empty returns or budget exhaustion
+diagnose a partial result, which still fails the unchanged exact assertions.
+Over-return and late full completion fail; caller/unrelated cancellation
+propagates. Nothing is filtered, reordered, reread or settled by the helper.
+Original fetch tasks are directly awaited: cancellation cooperation is required,
+not a finite-progress promise for uncooperative delegates. Pins, custody and
+parent deadlines are unchanged.
+
 ```sh
 cargo test --locked -p server --test sdk_child_custody -j2
 cargo test --locked -p server --test sdk_pin_controls -j2 -- --include-ignored --nocapture
 cargo test --locked -p server --test amqp_dotnet_current -j2 -- --ignored --nocapture
 cargo test --locked -p server --test amqp_dotnet_websockets -j2 -- --ignored --nocapture
+```
+
+Standalone fake-receiver controls use .NET 10 without NuGet packages; they are
+separate from ordinary Rust CI and do not certify SDK/broker behavior:
+
+```sh
+DOTNET_PROCESSOR_COUNT=2 dotnet run --project crates/conformance/batch-receive-controls/Switchyard.Conformance.BatchReceiveControls.csproj --configuration Release
 ```
 
 ## Custody Contract

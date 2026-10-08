@@ -81,6 +81,7 @@ impl SdkRun {
             .ok_or_else(|| io::Error::other("missing shared parent"))?
             .join("shared");
         for name in [
+            "BatchReceive.cs",
             "CaseInsensitiveIdentityConformance.cs",
             "RuleConformance.cs",
             "ScheduledTopicConformance.cs",

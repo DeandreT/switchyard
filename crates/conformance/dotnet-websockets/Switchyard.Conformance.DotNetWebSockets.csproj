@@ -10,6 +10,7 @@
   <ItemGroup>
     <PackageReference Include="Azure.Messaging.ServiceBus" Version="$(SwitchyardServiceBusVersion)" />
     <Compile Include="../shared/SdkCustody.cs" Link="SdkCustody.cs" />
+    <Compile Include="../shared/BatchReceive.cs" Link="BatchReceive.cs" />
     <Compile Include="../shared/CaseInsensitiveIdentityConformance.cs"
              Link="CaseInsensitiveIdentityConformance.cs" />
     <Compile Include="../shared/RuleConformance.cs"
