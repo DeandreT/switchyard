@@ -38,6 +38,47 @@ Run focused tests first and broaden verification with the change's risk.
 Protocol/broker changes need relevant client or end-to-end coverage and a
 compatibility update; report skipped gates rather than imply they passed.
 
+### Shared Target Handoffs
+
+Opt-in Linux/Python 3.11+ guard: [cargo_handoff.py](tools/cargo_handoff.py).
+Initialize only a new, empty external parent with an absent `target` child,
+never an existing target/cache. All writers must use the guard and freeze inputs.
+
+```sh
+mkdir /mnt/scratch/owned
+python3 tools/cargo_handoff.py init --target /mnt/scratch/owned/target
+taskset -c 14,15 nice -n 10 python3 tools/cargo_handoff.py run \
+  --target /mnt/scratch/owned/target --receipt /mnt/scratch/check-01 \
+  -- cargo test --workspace --locked
+python3 -m unittest discover -s tools/tests
+```
+
+The pinned 1.97.1 helper records worktree/content/configuration/toolchain fingerprints,
+disk headroom, package-scoped invalidation, exact commands and original output.
+Changed local packages and owned dependents are cleaned; third-party caches and
+retained receipts are not. Interrupted/failed runs force conservative invalidation.
+Cargo clean ignores path qualifiers: each owned name must have exactly one
+source-less version-4 lock entry matching its explicit or workspace-inherited
+manifest version. Same-name registry/git/other-version entries refuse cleanup.
+Unmapped inputs (including docs), configuration or Cargo command-graph changes
+conservatively clean all approved local packages, trading build time for refusal
+to guess which package consumes a shared input.
+Ownership or observed active-lock uncertainty refuses, not silently adopts.
+The sentinel/guard live in that parent; Cargo alone creates the target and cache
+tag on the first run. Preexisting targets and foreign parent entries refuse.
+An interrupted initial run requires Cargo-tagged cleanup or refuses; the helper
+never creates a cache tag or adopts an older sentinel layout.
+Cargo lock probes are advisory and released before Cargo; they cannot exclude
+non-cooperating writers. Exit zero is not corpus/coverage certification.
+External include/build-script inputs and unrelated environment variables must
+remain frozen; the helper does not fingerprint them.
+
+Run [the tiny fixture](tools/tests/cargo_handoff_fixture.py) on two CPUs with a new
+external directory. It compares exact known test IDs/executables against a fresh
+dependency-free reference; only fixture timestamps change. A non-reproduction
+does not prove universal Cargo cache correctness. Review source-bound expected
+test identities/statuses separately for real workspace gates.
+
 ## Durable Compatibility
 
 Changes to stored keys/values, replicated commands, snapshots, or wire encoding

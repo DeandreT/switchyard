@@ -33,6 +33,7 @@ own live assignments, acceptance and full dependencies.
 - [x] Pure bounded SQL predicates, IN/LIKE and scalar arithmetic (#11/#95/#96/#97); [rule integration pending](sql-predicates.md)
 - [x] Bounded Linux SDK child runs and loaded-file custody (#99)
 - [x] Two exact SDK selectors and approved runtime assets (#100); [durable matrix pending](sdk-gates.md)
+- [x] Content-aware owned Cargo handoffs (#105); Linux frozen-input profile only
 - [ ] Remaining client semantics, administration and conserved capacity
 - [ ] Real quorum, multi-tenant security, recovery and measured release gates
 
@@ -115,7 +116,7 @@ chain. Split multi-PR work into child issues before implementation.
 | Replication | [#36](https://github.com/DeandreT/switchyard/issues/36): cluster/storage/proposer replay; retain startup refusal, no quorum claim |
 | Administration | [#10](https://github.com/DeandreT/switchyard/issues/10): Atom fixtures/profiles; [#18](https://github.com/DeandreT/switchyard/issues/18): native Create/Get/List service/protobuf. No listener activation |
 | Domain ports | #13 profiles, #16 content, #23 duplicate history; serialize shared command/codec/key-tag/store-fence edits |
-| Client/release evidence | [#101](https://github.com/DeandreT/switchyard/issues/101): test matrix after #7. [#105](https://github.com/DeandreT/switchyard/issues/105): independent shared-target verification helper. Neither owns runtime fixes |
+| Client/release evidence | [#101](https://github.com/DeandreT/switchyard/issues/101): test matrix after #7. [#123](https://github.com/DeandreT/switchyard/issues/123): helper unit CI after #105. Neither owns runtime fixes |
 
 Assign before pickup; merge prerequisites first. `status:ready` is only a hint.
 Serialize shared contracts and each C# program; freeze inputs during verification.
