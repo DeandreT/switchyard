@@ -115,6 +115,18 @@ impl ConnectionAuthorization {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn grant_write_lock(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, Vec<AccessGrant>> {
+        self.grants.write().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn grant_snapshot(&self) -> Vec<AccessGrant> {
+        self.grants.read().await.clone()
+    }
+
     pub(crate) async fn authorize_entity(
         &self,
         entity_path: &str,

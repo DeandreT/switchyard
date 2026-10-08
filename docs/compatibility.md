@@ -212,8 +212,14 @@ begun commands and their post-result registry work. Original native acknowledgem
 replies and begun confirmations remain owned; no new late reply/confirmation starts.
 Every returned reply exit closes its captured channel and unregisters by identity.
 Original native errors precede cleanup errors; blocked writers still need joined
-native stop. CBS (#86), task trees (#75) and process shutdown remain
-[roadmap work](roadmap.md#next-main-increments); stalled broker/I/O can delay cleanup.
+native stop. CBS retains the original begun token validation/store and native
+operations, without rolling back installed grants or retrying a selected reply
+route. Retirement starts no new acknowledgement or second confirmation; every
+returned reply exit closes and identity-unregisters its captured channel.
+CBS bootstrap does not wait for an existing authorization grant. End-observed
+preparation (#110), panic-safe settlement custody (#111), task trees (#75) and
+process shutdown remain [roadmap work](roadmap.md#next-main-increments); stalled
+broker/I/O can delay cleanup. These guarantees do not cover an aborted ancestor.
 
 Sustained inbound traffic beyond initial credit is not certified. Session
 transfer-window accounting and receiving-credit refill remain

@@ -27,6 +27,7 @@ own live assignments, acceptance and full dependencies.
 - [x] Original outbound starts and late Pending adoption (#90); data-link coordinator #84 complete
 - [x] Fenced session registration and captured-owner cleanup (#87)
 - [x] Original management command/reply custody and exact route cleanup (#85, [PR #112](https://github.com/DeandreT/switchyard/pull/112))
+- [x] Original CBS token/native custody and captured reply cleanup (#86); pump coordinator #74 complete
 - [x] Pure offline JWT policy and issuer-qualified grants (#8); [consumers/activation pending](offline-jwt.md)
 - [x] Pure bounded typed SQL predicates and IN/LIKE (#95/#96); [scalars/integration pending](sql-predicates.md)
 - [x] Bounded Linux SDK child runs and loaded-file custody (#99)
@@ -43,10 +44,10 @@ or administration certification. See [SDK gates](sdk-gates.md) and [compatibilit
 
 ## Next Main Increments
 
-1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7): #86 CBS -> #110
-   End-observed preparation -> #111 panic-safe settlements -> #75 task trees ->
-   #64 admission/deadlines -> #65 signal shutdown. #86 completes #74; #75
-   completes #63. #73/#84/#87/#85 are merged; #86 is ready.
+1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7): #110 End-observed
+   preparation -> #117 captured delivery owners -> #111 panic-safe settlements
+   -> #75 task trees -> #64 admission/deadlines -> #65 signal shutdown. #74 is
+   complete; #75 completes #63. #73/#84/#87/#85/#86 are merged; #110 is ready.
 2. After #7, complete [#12](https://github.com/DeandreT/switchyard/issues/12):
    retained sender #57 -> receiver/settlement #58 -> sessions #59 -> management
    #60. Merged #56 alone is not retained wire authority.
@@ -67,9 +68,9 @@ Integration paths, not every prerequisite. Nodes beyond merged foundations are p
 
 ```mermaid
 flowchart TD
-    Main["Merged foundations/custody"] --> CBS["#86 CBS / finish #74"]
-    CBS --> Prep["#110 End-observed preparation"]
-    Prep --> Panic["#111 Panic-safe settlement custody"]
+    Main["Merged foundations/custody; #74 complete"] --> Prep["#110 End-observed preparation"]
+    Prep --> Delivery["#117 Captured delivery owners"]
+    Delivery --> Panic["#111 Panic-safe settlement custody"]
     Panic --> Trees["#75 Task trees / finish #63"]
     Trees --> Admission["#64 Admission/deadlines"]
     Admission --> Signals["#65 Signal shutdown / finish #7"]
@@ -109,7 +110,7 @@ chain. Split multi-PR work into child issues before implementation.
 
 | Lane | Entry And Boundary |
 | --- | --- |
-| Protocol | #86 CBS/routes, then the ordered chain above; one listener/native/registry owner |
+| Protocol | #110 End-observed preparation, then the ordered chain above; one listener/native/registry owner |
 | SQL | [#97](https://github.com/DeandreT/switchyard/issues/97): arithmetic/static lookup after merged #96; pure compiler/evaluator/tests, no retained-rule integration |
 | Auth activation | #8 policy merged; #71 -> #17 waits for #7. Serialize shared authorization/CBS files, not a current parallel pickup |
 | Replication | [#36](https://github.com/DeandreT/switchyard/issues/36): cluster/storage/proposer replay; retain startup refusal, no quorum claim |
