@@ -24,6 +24,7 @@ and assignment source. Milestones group work; independent lanes can run in paral
 - [x] Exact original session-grant/native-attach handoff ([#80](https://github.com/DeandreT/switchyard/issues/80)); acquisition coordinator #73 complete
 - [x] Original inbound Send/Batch custody through data-link retirement ([#89](https://github.com/DeandreT/switchyard/issues/89)); outbound #90 remains
 - [x] Acquisition broker invocation starts inside the retained first poll ([#91](https://github.com/DeandreT/switchyard/issues/91))
+- [x] Pure offline JWT policy and issuer-qualified grants ([#8](https://github.com/DeandreT/switchyard/issues/8)); [consumers and activation remain pending](offline-jwt.md)
 - [ ] Remaining client semantics, administration and conserved capacity
 - [ ] Real quorum, multi-tenant security, recovery and measured release gates
 
@@ -176,7 +177,7 @@ single PR for the whole row. Update pickup labels when prerequisites merge.
 
 | Work | Issue | Requires |
 | --- | --- | --- |
-| Offline JWT policy | [#8](https://github.com/DeandreT/switchyard/issues/8) | Independent |
+| Offline JWT policy | [#8](https://github.com/DeandreT/switchyard/issues/8) | Independent; implemented |
 | Verified grant consumers | [#71](https://github.com/DeandreT/switchyard/issues/71) | [#8](https://github.com/DeandreT/switchyard/issues/8), [#7](https://github.com/DeandreT/switchyard/issues/7) |
 | JWT CBS integration | [#17](https://github.com/DeandreT/switchyard/issues/17) | [#8](https://github.com/DeandreT/switchyard/issues/8), [#7](https://github.com/DeandreT/switchyard/issues/7), [#71](https://github.com/DeandreT/switchyard/issues/71) |
 | Two SDK pins and launched-client identity | [#9](https://github.com/DeandreT/switchyard/issues/9) | Independent |

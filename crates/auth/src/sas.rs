@@ -14,12 +14,52 @@ const TOKEN_PREFIX: &str = "SharedAccessSignature ";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccessGrant {
     subject: String,
+    issuer: GrantIssuer,
     scope: ResourceScope,
+    valid_from_epoch_seconds: u64,
     expires_at_epoch_seconds: u64,
     permissions: PermissionSet,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+enum GrantIssuer {
+    SharedAccess(String),
+    Jwt(String),
+}
+
+impl std::fmt::Debug for GrantIssuer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::SharedAccess(_) => "SharedAccess(<redacted>)",
+            Self::Jwt(_) => "Jwt(<redacted>)",
+        })
+    }
+}
+
 impl AccessGrant {
+    /// Compares the verified issuer namespace and principal, not the resource scope.
+    pub fn same_principal(&self, other: &Self) -> bool {
+        self.issuer == other.issuer && self.subject == other.subject
+    }
+
+    pub(crate) fn verified_jwt(
+        subject: String,
+        issuer: String,
+        scope: ResourceScope,
+        valid_from_epoch_seconds: u64,
+        expires_at_epoch_seconds: u64,
+        permissions: PermissionSet,
+    ) -> Self {
+        Self {
+            subject,
+            issuer: GrantIssuer::Jwt(issuer),
+            scope,
+            valid_from_epoch_seconds,
+            expires_at_epoch_seconds,
+            permissions,
+        }
+    }
+
     pub fn subject(&self) -> &str {
         &self.subject
     }
@@ -32,6 +72,15 @@ impl AccessGrant {
         self.expires_at_epoch_seconds
     }
 
+    pub fn valid_from_epoch_seconds(&self) -> u64 {
+        self.valid_from_epoch_seconds
+    }
+
+    pub fn is_valid_at(&self, now_epoch_seconds: u64) -> bool {
+        self.valid_from_epoch_seconds <= now_epoch_seconds
+            && now_epoch_seconds < self.expires_at_epoch_seconds
+    }
+
     pub fn permissions(&self) -> PermissionSet {
         self.permissions
     }
@@ -42,7 +91,7 @@ impl AccessGrant {
         permission: Permission,
         now_epoch_seconds: u64,
     ) -> bool {
-        now_epoch_seconds < self.expires_at_epoch_seconds
+        self.is_valid_at(now_epoch_seconds)
             && self.scope.contains(requested)
             && self.permissions.allows(permission)
     }
@@ -64,7 +113,9 @@ impl SharedAccessPolicy {
         }
         Ok(AccessGrant {
             subject: key_name.to_owned(),
+            issuer: GrantIssuer::SharedAccess(rule.scope().host().to_owned()),
             scope: rule.scope().clone(),
+            valid_from_epoch_seconds: 0,
             expires_at_epoch_seconds: u64::MAX,
             permissions: rule.permissions(),
         })
@@ -113,7 +164,9 @@ impl SharedAccessPolicy {
 
         Ok(AccessGrant {
             subject: token.key_name,
+            issuer: GrantIssuer::SharedAccess(token_scope.host().to_owned()),
             scope: token_scope,
+            valid_from_epoch_seconds: 0,
             expires_at_epoch_seconds: token.expiry,
             permissions: rule.permissions(),
         })

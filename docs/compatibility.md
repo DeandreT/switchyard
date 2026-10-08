@@ -46,6 +46,7 @@ loaded-DLL provenance, or durable SDK custody. See
 | Rules | Durable `$Default`, actionless true/false/correlation, typed equality; create/delete/paginated AMQP rule management |
 | Time | Bounded runtime activation plus lock, TTL, session-lock, and duplicate-history expiry |
 | Identity | ASCII-folded namespace/entity/subscription addressing and SAS scope; session/placement IDs retain case |
+| Offline identity policy | Pure local RS256 JWT verification with pinned public keys, injected time and local rights; no JWT transport activation |
 | Persistence | Paired memory/Fjall semantics; Fjall journal fsync before applied outcome and single-directory ownership |
 
 Manage includes Send and Listen. Scheduling/cancellation require Send;
@@ -58,6 +59,12 @@ renewal. Protocol rejections carry compatible conditions/retry hints rather
 than silently falling back to unsupported behavior.
 Outbound receive reserves remote credit before broker mutation; an empty result
 releases it. Drain completes after reservations are consumed or released.
+
+The [offline JWT API](offline-jwt.md) produces issuer-qualified grants; SAS/PLAIN
+principals are qualified by their verified namespace host. Protocol refresh and
+time consumers still await [#71](https://github.com/DeandreT/switchyard/issues/71);
+JWT CBS activation remains [#17](https://github.com/DeandreT/switchyard/issues/17).
+Existing SAS/PLAIN authentication and resource-scope behavior are unchanged.
 
 ## Known Differences And Bounds
 
@@ -204,7 +211,7 @@ not implemented.
 | --- | --- |
 | Service Bus semantics | General SQL filters/actions, session subscriptions/session-ID predicates, topic duplicates, configurable TTL policy, DLQ resubmit/forwarding, same-group transactions |
 | Administration | Atom/XML entity/rule administration and working native gRPC/CLI transport (contract only) |
-| Identity/security | JWT/OIDC, mTLS, policy administration, full RBAC, per-namespace encryption/KMS, tamper-evident audit |
+| Identity/security | JWT grant-consumer integration and wire activation, network OIDC discovery, mTLS, policy administration, full RBAC, per-namespace encryption/KMS, tamper-evident audit |
 | Production runtime | Raft/placement, hard quotas/fairness, encrypted backup/restore, readiness/observability, release/performance evidence |
 
 Partitioned entities and cross-placement-group transactions are later scope;

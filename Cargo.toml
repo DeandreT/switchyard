@@ -41,10 +41,12 @@ hmac = "0.12"
 percent-encoding = "2.3"
 postcard = { version = "1.1", features = ["use-std"] }
 rcgen = "0.13"
+ring = { version = "=0.17.14", default-features = false, features = ["alloc"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_amqp = "0.14.1"
+serde_json = "1.0"
 sha2 = "0.10"
 tempfile = "3.27"
 thiserror = "2.0"
