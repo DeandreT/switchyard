@@ -793,6 +793,8 @@ async fn serve_sending_client<B: Broker>(
         };
         if let Some(retirement) = retired {
             debug!(started = original.started(), "draining retired Send intake");
+            #[cfg(test)]
+            let _ = SEND_INTAKE_RETIREMENT.try_with(|witness| witness.notify_one());
             let _ = original.finish().await;
             let packet = original
                 .take_packet()
@@ -864,6 +866,11 @@ async fn serve_sending_client<B: Broker>(
 enum SendRetirement {
     Detached,
     Unauthorized,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static SEND_INTAKE_RETIREMENT: Arc<tokio::sync::Notify>;
 }
 
 #[derive(Clone, Copy)]

@@ -28,12 +28,15 @@ use sha2::Sha256;
 use storage::StateStore;
 use tokio::{
     io::{DuplexStream, duplex},
+    sync::Notify,
     time::timeout,
 };
 
 use super::test_support::{Actor, ActualBroker, WAIT, pending_once};
 use crate::authorization::ConnectionAuthorization;
-use crate::listener::{LinkAuthorization, ingress::SendIntake, serve_sending_client};
+use crate::listener::{
+    LinkAuthorization, SEND_INTAKE_RETIREMENT, ingress::SendIntake, serve_sending_client,
+};
 use crate::{
     Broker, BrokerRejection, SERVICE_BUS_BATCH_MESSAGE_FORMAT, SharedAccessAuthentication,
 };
@@ -404,12 +407,16 @@ async fn actual_send_and_batch_retirement_drains_one_hidden_result_and_reopens()
                         let authorization = auth.then(authorization);
                         let mut wire = IngressWire::new().await;
                         let receiver = wire.receiver.take().unwrap();
-                        let mut pump = tokio::spawn(serve_sending_client(
-                            receiver,
-                            actor.namespace.clone(),
-                            actor.entity.clone(),
-                            actor.broker.as_ref().unwrap().clone(),
-                            authorization.clone(),
+                        let retirement = Arc::new(Notify::new());
+                        let mut pump = tokio::spawn(SEND_INTAKE_RETIREMENT.scope(
+                            Arc::clone(&retirement),
+                            serve_sending_client(
+                                receiver,
+                                actor.namespace.clone(),
+                                actor.entity.clone(),
+                                actor.broker.as_ref().unwrap().clone(),
+                                authorization.clone(),
+                            ),
                         ));
                         let (message, format) = messages(batch);
                         wire.send(0, message, format).await;
@@ -432,6 +439,12 @@ async fn actual_send_and_batch_retirement_drains_one_hidden_result_and_reopens()
                         } else {
                             assert!(wire.detach().await.error.is_none());
                         }
+                        timeout(WAIT, retirement.notified())
+                            .await
+                            .expect("actual pump selected retirement before result release");
+                        if let Some(authorization) = authorization.as_ref() {
+                            assert!(authorization.ensure().await.is_err());
+                        }
                         pending_once(std::pin::Pin::new(&mut pump)).await;
                         {
                             let log = actor.log.lock().unwrap();
@@ -450,10 +463,11 @@ async fn actual_send_and_batch_retirement_drains_one_hidden_result_and_reopens()
                             2_000
                         );
                         if auth {
-                            let Performative::Detach(detach) =
-                                control(&mut wire.peer, CHANNEL).await
-                            else {
-                                panic!("auth retirement without late acknowledgement");
+                            let detach = match control(&mut wire.peer, CHANNEL).await {
+                                Performative::Detach(detach) => detach,
+                                other => panic!(
+                                    "auth retirement without late acknowledgement: {other:?}"
+                                ),
                             };
                             assert_eq!(
                                 detach.error.unwrap().condition,
