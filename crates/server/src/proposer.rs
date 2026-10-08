@@ -7,8 +7,8 @@
 //! replication rather than after it.
 
 use domain::{
-    BrokerError, Command, CommandKind, CommandOutcome, EntityPath, NamespaceName, StateMachine,
-    Timestamp,
+    BoundCommand, BrokerError, Command, CommandKind, CommandOutcome, EntityBinding, EntityPath,
+    NamespaceName, StateMachine, Timestamp,
 };
 use storage::StateStore;
 use thiserror::Error;
@@ -56,6 +56,34 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
         let issued_at = self.stamp()?;
         let command = Command::new(namespace.clone(), entity.clone(), issued_at, kind);
         Ok(self.machine.apply(&command)?)
+    }
+
+    pub fn bind_entity(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+    ) -> Result<EntityBinding, ProposeError> {
+        Ok(self.machine.bind_entity(namespace, entity)?)
+    }
+
+    /// Checks the retained owner before observing the host clock, then rechecks
+    /// in the deterministic machine before its ordinary applied-clock path.
+    pub fn propose_bound(
+        &self,
+        binding: &EntityBinding,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, ProposeError> {
+        self.machine.validate_binding(binding)?;
+        let issued_at = self.stamp()?;
+        let command = Command::new(
+            binding.namespace().clone(),
+            binding.target().clone(),
+            issued_at,
+            kind,
+        );
+        Ok(self
+            .machine
+            .apply_bound(&BoundCommand::new(binding.clone(), command))?)
     }
 
     /// The timestamp to put on the next command.

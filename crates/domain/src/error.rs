@@ -12,6 +12,12 @@ use crate::{
 /// command rejects it exactly where the leader did.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum BrokerError {
+    #[error("entity does not exist")]
+    EntityNotFound,
+    #[error("retained entity authority no longer names the live owner")]
+    StaleEntityBinding,
+    #[error("command scope does not match its retained entity authority")]
+    InvalidEntityBinding,
     #[error("queue does not exist")]
     QueueNotFound,
     #[error("queue already exists")]

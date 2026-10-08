@@ -1,10 +1,11 @@
-//! Creation-time owner identity; retained endpoint authority is a separate layer.
+//! Creation-time owner identity and retained endpoint authority.
 
 use serde::{Deserialize, Serialize};
 use storage::{StateStore, WriteBatch};
 
 use crate::{
-    BrokerError, DEAD_LETTER_QUEUE_SUFFIX, EntityPath, NamespaceName, SubscriptionName, codec,
+    BoundCommand, BrokerError, CommandOutcome, DEAD_LETTER_QUEUE_SUFFIX, EntityBinding,
+    EntityBindingKind, EntityPath, NamespaceName, SubscriptionName, codec,
     identifier::SUBSCRIPTION_PATH_SEGMENT, keys,
 };
 
@@ -17,6 +18,26 @@ pub(super) enum Kind {
     Queue,
     Topic,
     Subscription,
+}
+
+impl From<Kind> for EntityBindingKind {
+    fn from(kind: Kind) -> Self {
+        match kind {
+            Kind::Queue => Self::Queue,
+            Kind::Topic => Self::Topic,
+            Kind::Subscription => Self::Subscription,
+        }
+    }
+}
+
+impl From<EntityBindingKind> for Kind {
+    fn from(kind: EntityBindingKind) -> Self {
+        match kind {
+            EntityBindingKind::Queue => Self::Queue,
+            EntityBindingKind::Topic => Self::Topic,
+            EntityBindingKind::Subscription => Self::Subscription,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -108,11 +129,21 @@ impl<S: StateStore> StateMachine<S> {
         owner: &EntityPath,
         kind: Kind,
     ) -> Result<(), BrokerError> {
+        self.live_owner_generation(namespace, owner, kind)
+            .map(|_| ())
+    }
+
+    fn live_owner_generation(
+        &self,
+        namespace: &NamespaceName,
+        owner: &EntityPath,
+        kind: Kind,
+    ) -> Result<u64, BrokerError> {
         let raw = self
             .store()
             .get(&keys::entity_metadata(namespace, owner))?
             .ok_or(BrokerError::EntityMetadataCorrupt)?;
-        decode_live(&raw, kind)?;
+        let record = decode_live(&raw, kind)?;
         if self
             .store()
             .get(&keys::entity_metadata(
@@ -123,7 +154,7 @@ impl<S: StateStore> StateMachine<S> {
         {
             return Err(BrokerError::EntityMetadataCorrupt);
         }
-        Ok(())
+        Ok(record.generation)
     }
 
     pub(super) fn require_queue_owner(
@@ -146,6 +177,69 @@ impl<S: StateStore> StateMachine<S> {
             return Err(BrokerError::EntityMetadataCorrupt);
         }
         self.require_live_owner(namespace, &owner, kind)
+    }
+
+    /// Captures a live target without observing or advancing the applied clock.
+    /// Profile health follows the existing catalog getters, not a global scan.
+    pub fn bind_entity(
+        &self,
+        namespace: &NamespaceName,
+        target: &EntityPath,
+    ) -> Result<EntityBinding, BrokerError> {
+        let (owner, kind) = if primary_path(target.as_str()).is_some()
+            && self.topic_config(namespace, target)?.is_some()
+        {
+            (target.clone(), Kind::Topic)
+        } else {
+            let (owner, kind, _) = queue_owner(target)?;
+            if self.queue_config(namespace, target)?.is_none() {
+                return Err(BrokerError::EntityNotFound);
+            }
+            (owner, kind)
+        };
+        let generation = self.live_owner_generation(namespace, &owner, kind)?;
+        Ok(EntityBinding::new(
+            namespace.clone(),
+            target.clone(),
+            owner,
+            kind.into(),
+            generation,
+        ))
+    }
+
+    /// Rechecks retained authority before an ordinary command can read Clock.
+    pub fn validate_binding(&self, binding: &EntityBinding) -> Result<(), BrokerError> {
+        let generation = self.live_owner_generation(
+            binding.namespace(),
+            binding.owner(),
+            binding.kind().into(),
+        )?;
+        if generation != binding.generation() {
+            return Err(BrokerError::StaleEntityBinding);
+        }
+        let present = match binding.kind() {
+            EntityBindingKind::Topic => self
+                .topic_config(binding.namespace(), binding.target())?
+                .is_some(),
+            EntityBindingKind::Queue | EntityBindingKind::Subscription => self
+                .queue_config(binding.namespace(), binding.target())?
+                .is_some(),
+        };
+        if !present {
+            return Err(BrokerError::StaleEntityBinding);
+        }
+        Ok(())
+    }
+
+    /// Applies only to the exact namespace and physical target originally bound.
+    pub fn apply_bound(&self, envelope: &BoundCommand) -> Result<CommandOutcome, BrokerError> {
+        let binding = envelope.binding();
+        let command = envelope.command();
+        if &command.namespace != binding.namespace() || &command.entity != binding.target() {
+            return Err(BrokerError::InvalidEntityBinding);
+        }
+        self.validate_binding(binding)?;
+        self.apply(command)
     }
 }
 

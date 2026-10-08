@@ -137,9 +137,15 @@ is no migration, foreign-keyspace proof, or filesystem-byte invariance claim.
 See [opener](../crates/storage/src/durable.rs).
 
 Present configurations and listed topic profiles require canonical live owner
-heads; DLQs share their owner's head. This is not retained-link authority or a
-whole-store orphan proof. Complete, session-state/release and configuration-free
-session-expiry paths, raw catalogs and diagnostic reads remain unfenced.
+heads; DLQs share their owner's head. Bound broker calls capture immutable
+namespace/target/owner/kind/generation through the owner queue. They recheck the
+live head, forbidden shadow head, generation and existing target profile before
+host or stored Clock, including Complete and session-state/release commands.
+Malformed heads are corruption; same-kind generation drift or a vanished target
+is stale. Wrapper scope mismatch precedes these reads. This is not a whole-store
+or parent-membership proof, live deletion, or a global mixed-corruption priority.
+Wire links, legacy name calls, timers and raw catalog/diagnostic reads remain
+outside retained-authority protection; #57-#60 will adopt it at the edge.
 
 Timer commands, not local wall-clock mutation, drive activation/expiry. Small
 host-clock regressions hold command time still; large ones refuse and retry,

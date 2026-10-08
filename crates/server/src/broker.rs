@@ -21,7 +21,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use domain::{CommandKind, CommandOutcome, EntityPath, NamespaceName, Timestamp};
+use domain::{CommandKind, CommandOutcome, EntityBinding, EntityPath, NamespaceName, Timestamp};
 use storage::StateStore;
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -37,6 +37,16 @@ use crate::{Clock, LocalProposer, ProposeError};
 const COMMAND_QUEUE_DEPTH: usize = 1_024;
 
 enum Request {
+    Bind {
+        namespace: NamespaceName,
+        entity: EntityPath,
+        reply: flume::Sender<Result<EntityBinding, ProposeError>>,
+    },
+    ApplyBound {
+        binding: EntityBinding,
+        kind: Box<CommandKind>,
+        reply: flume::Sender<Result<CommandOutcome, ProposeError>>,
+    },
     Apply {
         namespace: NamespaceName,
         entity: EntityPath,
@@ -215,6 +225,90 @@ impl BrokerHandle {
             .map_err(SubmitError::Propose)
     }
 
+    /// Resolves a live entity binding on the owner without stamping a command.
+    pub fn bind_entity_blocking(
+        &self,
+        namespace: NamespaceName,
+        entity: EntityPath,
+    ) -> Result<EntityBinding, SubmitError> {
+        let (reply, binding) = flume::bounded(1);
+        self.requests
+            .send(Request::Bind {
+                namespace,
+                entity,
+                reply,
+            })
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        binding
+            .recv()
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
+
+    /// Resolves a live entity binding without blocking the caller's executor.
+    pub async fn bind_entity(
+        &self,
+        namespace: NamespaceName,
+        entity: EntityPath,
+    ) -> Result<EntityBinding, SubmitError> {
+        let (reply, binding) = flume::bounded(1);
+        self.requests
+            .send_async(Request::Bind {
+                namespace,
+                entity,
+                reply,
+            })
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        binding
+            .recv_async()
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
+
+    /// Applies a command through its retained entity binding on the owner.
+    pub fn submit_bound_blocking(
+        &self,
+        binding: EntityBinding,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, SubmitError> {
+        let (reply, outcome) = flume::bounded(1);
+        self.requests
+            .send(Request::ApplyBound {
+                binding,
+                kind: Box::new(kind),
+                reply,
+            })
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        outcome
+            .recv()
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
+
+    /// Applies a bound command without blocking the caller's executor.
+    pub async fn submit_bound(
+        &self,
+        binding: EntityBinding,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, SubmitError> {
+        let (reply, outcome) = flume::bounded(1);
+        self.requests
+            .send_async(Request::ApplyBound {
+                binding,
+                kind: Box::new(kind),
+                reply,
+            })
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?;
+        outcome
+            .recv_async()
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)?
+            .map_err(SubmitError::Propose)
+    }
+
     /// The highest timestamp the machine has applied.
     pub fn last_applied_blocking(&self) -> Result<Timestamp, SubmitError> {
         let (reply, applied) = flume::bounded(1);
@@ -294,6 +388,28 @@ impl Broker {
             .spawn(move || {
                 while let Ok(request) = incoming.recv() {
                     match request {
+                        Request::Bind {
+                            namespace,
+                            entity,
+                            reply,
+                        } => {
+                            let _ = reply.send(proposer.bind_entity(&namespace, &entity));
+                        }
+                        Request::ApplyBound {
+                            binding,
+                            kind,
+                            reply,
+                        } => {
+                            let outcome = proposer.propose_bound(&binding, *kind);
+                            if let Ok(outcome) = outcome.as_ref() {
+                                watching.notify_outcome(
+                                    binding.namespace(),
+                                    binding.target(),
+                                    outcome,
+                                );
+                            }
+                            let _ = reply.send(outcome);
+                        }
                         Request::Apply {
                             namespace,
                             entity,

@@ -27,7 +27,9 @@ pub const TIMEOUT: &str = "com.microsoft:timeout";
 /// The condition symbol to report `error` as.
 pub fn condition_for(error: &BrokerError) -> &'static str {
     match error {
-        BrokerError::QueueNotFound
+        BrokerError::EntityNotFound
+        | BrokerError::StaleEntityBinding
+        | BrokerError::QueueNotFound
         | BrokerError::TopicNotFound
         | BrokerError::SubscriptionNotFound
         | BrokerError::RuleNotFound { .. }
@@ -78,6 +80,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
 
         BrokerError::MessageTooLarge { .. } => MESSAGE_SIZE_EXCEEDED,
         BrokerError::MessageIdTooLong { .. }
+        | BrokerError::InvalidEntityBinding
         | BrokerError::EmptyRulePage
         | BrokerError::RulePageTooLarge { .. }
         | BrokerError::RuleConfig(_) => INVALID_FIELD,
@@ -122,6 +125,18 @@ mod tests {
 
     fn session() -> SessionId {
         SessionId::new("cart-1").expect("a valid session id")
+    }
+
+    #[test]
+    fn retained_authority_refusals_are_specific_and_nonretryable() {
+        for (error, condition) in [
+            (BrokerError::EntityNotFound, NOT_FOUND),
+            (BrokerError::StaleEntityBinding, NOT_FOUND),
+            (BrokerError::InvalidEntityBinding, INVALID_FIELD),
+        ] {
+            assert_eq!(condition_for(&error), condition);
+            assert!(!is_retryable(&error));
+        }
     }
 
     #[test]

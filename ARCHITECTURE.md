@@ -68,9 +68,10 @@ Routing proves the complete listed subscription set, including exact canonical
 membership bytes, parent-derived backing configuration, and the real DLQ
 profile, before exposing a page or committing copies. A 2,001-entry lookahead
 enforces the 2,000-subscription cap. Present configurations and listed profiles
-require private live owner heads; DLQs share their owner's head. This is not a
-global orphan scan or retained-endpoint authority. Configuration-free completion,
-session state/release/expiry and raw catalog/diagnostic paths remain unfenced.
+require private live owner heads; DLQs share their owner's head. Bound broker
+calls retain an opaque owner/target identity and recheck it before host or stored
+Clock, including configuration-free commands. Legacy name/wire calls, timers
+and raw catalog/diagnostic reads remain unfenced; no global orphan scan is added.
 See [topic routing](crates/domain/src/machine/topic.rs) and the
 [compatibility differences](docs/compatibility.md#known-differences-and-bounds).
 

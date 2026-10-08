@@ -11,6 +11,7 @@ pub mod codec;
 pub mod keys;
 
 mod command;
+mod entity_binding;
 mod error;
 mod identifier;
 mod machine;
@@ -23,6 +24,7 @@ mod topic;
 
 pub use codec::CodecError;
 pub use command::{Command, CommandKind, CommandOutcome, MessageInput};
+pub use entity_binding::{BoundCommand, EntityBinding, EntityBindingKind};
 pub use error::BrokerError;
 pub use identifier::{
     DEAD_LETTER_QUEUE_SUFFIX, EntityPath, IdentifierError, MAX_ENTITY_PATH_BYTES,

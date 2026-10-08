@@ -15,17 +15,18 @@ and assignment source. Milestones group work; independent lanes can run in paral
 - [x] Refusal of populated unversioned stores ([PR #4](https://github.com/DeandreT/switchyard/pull/4))
 - [x] Production startup refuses before storage/listeners until quorum exists ([#5](https://github.com/DeandreT/switchyard/issues/5))
 - [x] Private live owner heads with an active format-2 store fence ([#6](https://github.com/DeandreT/switchyard/issues/6))
+- [x] Consumed bound broker API with pre-clock authority checks ([#56](https://github.com/DeandreT/switchyard/issues/56)); wire adoption remains pending
 - [ ] Remaining client semantics, administration and conserved capacity
 - [ ] Real quorum, multi-tenant security, recovery and measured release gates
 
-The owner-metadata increment passed 615 ordinary tests with two opt-in SDK selectors
-ignored. Those selectors were not rerun for this owner-metadata increment. Current
-.NET coverage is pinned 7.20.2 and experimental Memory-only TCP/WSS, not durable
-or administration certification. See [compatibility](compatibility.md).
+The ordinary workspace gate excludes two opt-in SDK selectors; foundation-only
+increments do not rerun them. Current .NET coverage is pinned 7.20.2 and
+experimental Memory-only TCP/WSS, not durable or administration certification.
+See [compatibility](compatibility.md).
 
 ## Next Main Increments
 
-1. Complete [#12](https://github.com/DeandreT/switchyard/issues/12) through five focused children: bound broker API, sender, receiver/settlement, sessions, then management ([#56](https://github.com/DeandreT/switchyard/issues/56) through [#60](https://github.com/DeandreT/switchyard/issues/60)). Wire adapters wait for [#7](https://github.com/DeandreT/switchyard/issues/7).
+1. Complete [#12](https://github.com/DeandreT/switchyard/issues/12) through sender, receiver/settlement, sessions, then management ([#57](https://github.com/DeandreT/switchyard/issues/57) through [#60](https://github.com/DeandreT/switchyard/issues/60)) using the bound broker API. Wire adapters wait for [#7](https://github.com/DeandreT/switchyard/issues/7).
 2. Enable [#15](https://github.com/DeandreT/switchyard/issues/15) only after retained authority is complete; no live deletion/recreation claim yet.
 3. Port safe configuration and typed-content increments independently, then their dependent features.
 
@@ -75,11 +76,11 @@ flowchart TD
 ## Parallel Pickup
 
 These starting lanes have distinct boundaries; check live assignments before
-pickup. [#56](https://github.com/DeandreT/switchyard/issues/56) is claimed for the next foundation increment.
+pickup. Retained wire authority follows the merged core and connection-lifecycle prerequisite.
 
 | Lane | Start | Boundary |
 | --- | --- | --- |
-| Retained authority core | [#56](https://github.com/DeandreT/switchyard/issues/56) | Domain/proposer/broker; no listener edits |
+| Retained sender | [#57](https://github.com/DeandreT/switchyard/issues/57) | Wait for #7; sender/listener ownership only |
 | Connection lifecycle | [#7](https://github.com/DeandreT/switchyard/issues/7) | AMQP task ownership; no auth/schema edits |
 | Identity policy | [#8](https://github.com/DeandreT/switchyard/issues/8) | Pure `auth` policy; no listener/CBS activation |
 | Client evidence | [#9](https://github.com/DeandreT/switchyard/issues/9) | Test harness and pin/custody records; no runtime changes |
