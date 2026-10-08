@@ -8,6 +8,7 @@
 
   <ItemGroup>
     <PackageReference Include="Azure.Messaging.ServiceBus" Version="7.20.2" />
+    <Compile Include="../shared/SdkCustody.cs" Link="SdkCustody.cs" />
     <Compile Include="../shared/CaseInsensitiveIdentityConformance.cs"
              Link="CaseInsensitiveIdentityConformance.cs" />
     <Compile Include="../shared/RuleConformance.cs"

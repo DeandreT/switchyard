@@ -8,27 +8,28 @@ protocol/client gates establish the surface. Neither is certification.
 
 | Client | Available gate | Qualification |
 | --- | --- | --- |
-| Official .NET, pinned 7.20.2 | Opt-in TCP and WSS data-plane workflows | Experimental; memory backend, not durable or administration coverage |
+| Official .NET, declared 7.20.2 | Opt-in TCP and WSS data-plane workflows | Experimental Memory coverage with loaded-file custody; not exact pins, durable or administration certification |
 | Previous pinned .NET | Planned | No gate implemented |
 | Pinned Sift | Planned | No gate implemented |
 | Rust AMQP client | Protocol end-to-end suites | Broader protocol checks; not a substitute for official SDK gates |
 
-The pinned .NET workflows cover queue/batch send, prefetch and independent
+The .NET workflows cover queue/batch send, prefetch and independent
 settlement, receive-delete, envelope fidelity, renew/abandon/defer/peek, DLQ,
 queue sessions/state, duplicate detection, queue/topic scheduling and
 cancellation, filtered topic/subscription delivery, rule management, and
-case-insensitive addressing. They require `dotnet` and NuGet restore and are
-ignored by the ordinary workspace test command. Their version is a test pin,
-not a latest-release claim.
+case-insensitive addressing. Selected gates require Linux, .NET 10 and NuGet
+restore; missing prerequisites fail. Ordinary workspace tests ignore them.
+Declared 7.20.2 is not exact NuGet graph or latest-release certification.
 
 TCP uses a permissive certificate callback for a generated test identity. WSS
 uses the platform trust path with a generated root scoped to the child process
 through `SSL_CERT_FILE`, not the TCP callback or a machine-wide trust change.
-These are distinct fixtures; neither establishes production trust deployment,
-loaded-DLL provenance, or durable SDK custody. See
+Nonce-bound loaded-assembly records match launched file hashes; completion
+follows async disposal. Neither fixture certifies production trust, durable
+SDK or whole-test task-tree shutdown. See [gate commands and limits](sdk-gates.md),
 [TCP gate](../crates/server/tests/amqp_dotnet_current.rs),
 [WSS gate](../crates/server/tests/amqp_dotnet_websockets.rs), and
-[pinned project](../crates/conformance/dotnet-current/Switchyard.Conformance.DotNetCurrent.csproj).
+[declared project](../crates/conformance/dotnet-current/Switchyard.Conformance.DotNetCurrent.csproj).
 
 ## Implemented Surface
 

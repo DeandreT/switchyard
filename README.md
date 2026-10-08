@@ -14,7 +14,7 @@ messaging model and official clients, without an Azure subscription.
 - [x] Atomic queue send/batch, receive, settlement, expiry, DLQ, deferral, and peek
 - [x] Queue sessions, scheduling/cancellation, and duplicate detection
 - [x] Immediate/scheduled topics, subscriptions, and actionless correlation rules
-- [x] SASL PLAIN/CBS SAS and experimental pinned .NET 7.20.2 TCP/WSS gates
+- [x] SASL PLAIN/CBS SAS and experimental .NET TCP/WSS loaded-file custody gates
 - [x] Fsynced single-node storage and bounded topic routing integrity checks
 - [ ] Administration, remaining Service Bus semantics, and broader client gates
 - [ ] Quorum durability, tenant isolation, encryption/audit, and recovery

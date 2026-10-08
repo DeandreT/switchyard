@@ -1,6 +1,10 @@
 using Azure;
 using Azure.Messaging.ServiceBus;
 
+return await SdkCustody.RunAsync(args, WorkflowAsync);
+
+static async Task<int> WorkflowAsync(string[] args)
+{
 if (args.Length != 17)
 {
     Console.Error.WriteLine(
@@ -252,3 +256,4 @@ Console.WriteLine(
     "durable correlation rule management and filtered fan-out, " +
     "and session attach passed");
 return 0;
+}

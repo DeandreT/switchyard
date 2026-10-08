@@ -1,6 +1,9 @@
 //! Opt-in AMQP-over-WebSockets gate for the current official .NET client.
 
-use std::{error::Error, path::PathBuf, process::Command, sync::Arc, time::Duration};
+use std::{error::Error, path::PathBuf, sync::Arc, time::Duration};
+
+#[allow(dead_code)]
+mod sdk_child;
 
 use auth::{PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule};
 use domain::{
@@ -151,54 +154,46 @@ async fn current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn
         TimerWorker::new(&timer_broker).run(Duration::from_millis(25), &timer_stop);
     });
 
-    let project = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../conformance/dotnet-websockets/Switchyard.Conformance.DotNetWebSockets.csproj");
-    let output = tokio::task::spawn_blocking(move || {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../conformance/dotnet-websockets");
+    let output = async {
         let _trust = trust;
-        let build = Command::new("dotnet")
-            .arg("build")
-            .arg(&project)
-            .arg("--configuration")
-            .arg("Release")
-            .arg("--maxcpucount:2")
-            .output()?;
-        if !build.status.success() {
-            return Ok::<_, std::io::Error>(build);
-        }
-        Command::new("dotnet")
-            .arg("run")
-            .arg("--project")
-            .arg(&project)
-            .arg("--configuration")
-            .arg("Release")
-            .arg("--no-build")
-            .arg("--")
-            .env("SSL_CERT_FILE", &certificate_path)
-            .arg(HOST)
-            .arg(format!("sb://localhost:{}", address.port()))
-            .arg("websocket-orders")
-            .arg("websocket-batch")
-            .arg("websocket-schedule")
-            .arg("websocket-dedupe")
-            .arg("websocket-sessions")
-            .arg("websocket-events")
-            .arg("first")
-            .arg("second")
-            .arg(CASE_QUEUE)
-            .arg(CASE_TOPIC)
-            .arg(CASE_SUBSCRIPTION)
-            .arg(FILTER_TOPIC)
-            .arg(FILTER_SUBSCRIPTION)
-            .arg(RULE)
-            .arg(KEY)
-            .output()
-    })
+        let mut run =
+            sdk_child::SdkRun::prepare(&source, "Switchyard.Conformance.DotNetWebSockets.csproj")?;
+        run.build().await?;
+        let args = [
+            HOST.into(),
+            format!("sb://localhost:{}", address.port()).into(),
+            "websocket-orders".into(),
+            "websocket-batch".into(),
+            "websocket-schedule".into(),
+            "websocket-dedupe".into(),
+            "websocket-sessions".into(),
+            "websocket-events".into(),
+            "first".into(),
+            "second".into(),
+            CASE_QUEUE.into(),
+            CASE_TOPIC.into(),
+            CASE_SUBSCRIPTION.into(),
+            FILTER_TOPIC.into(),
+            FILTER_SUBSCRIPTION.into(),
+            RULE.into(),
+            KEY.into(),
+        ];
+        let verified = run
+            .run(&args, &[("SSL_CERT_FILE", certificate_path.as_os_str())])
+            .await?;
+        println!(
+            "SDK_CUSTODY_VERIFIED {}",
+            serde_json::to_string(&verified.records).map_err(std::io::Error::other)?
+        );
+        Ok::<_, std::io::Error>(verified.output)
+    }
     .await;
     timer_shutdown.signal();
     timer
         .join()
         .map_err(|_| std::io::Error::other("the test timer worker panicked"))?;
-    let output = output??;
+    let output = output?;
 
     assert!(
         output.status.success(),
