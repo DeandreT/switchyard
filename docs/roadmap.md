@@ -26,6 +26,7 @@ and assignment source. Milestones group work; independent lanes can run in paral
 - [x] Acquisition broker invocation starts inside the retained first poll ([#91](https://github.com/DeandreT/switchyard/issues/91))
 - [x] Original outbound starts and late Pending adoption ([#90](https://github.com/DeandreT/switchyard/issues/90)); data-link coordinator #84 complete
 - [x] Fenced session registration and captured-owner cleanup ([#87](https://github.com/DeandreT/switchyard/issues/87))
+- [x] Original management command/reply custody and exact route cleanup ([#85](https://github.com/DeandreT/switchyard/issues/85))
 - [x] Pure offline JWT policy and issuer-qualified grants ([#8](https://github.com/DeandreT/switchyard/issues/8)); [consumers and activation remain pending](offline-jwt.md)
 - [x] Pure bounded typed SQL predicate kernel ([#95](https://github.com/DeandreT/switchyard/issues/95)); [patterns/scalars and integration remain pending](sql-predicates.md)
 - [x] Bounded Linux SDK child runs and loaded-file custody ([#99](https://github.com/DeandreT/switchyard/issues/99))
@@ -40,7 +41,7 @@ See [compatibility](compatibility.md).
 
 ## Next Main Increments
 
-1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7): after completed data links #84 and registry #87, management #85 and CBS #86 finish #74; task trees (#75/#63), admission/deadlines (#64), then signal shutdown (#65). Joins are not graceful Close acknowledgements.
+1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7): CBS #86 finishes #74 after completed data links #84, management #85 and registry #87; task trees (#75/#63), admission/deadlines (#64), then signal shutdown (#65). Joins are not graceful Close acknowledgements.
 2. Complete [#12](https://github.com/DeandreT/switchyard/issues/12) through sender, receiver/settlement, sessions, then management ([#57](https://github.com/DeandreT/switchyard/issues/57) through [#60](https://github.com/DeandreT/switchyard/issues/60)) using the bound broker API. Wire adapters wait for #7.
 3. Enable [#15](https://github.com/DeandreT/switchyard/issues/15) only after retained authority is complete; no live deletion/recreation claim yet.
 4. Port safe configuration and typed-content increments independently, then their dependent features.
@@ -116,7 +117,7 @@ pickup. Retained wire authority follows the merged core and connection-lifecycle
 | Lane | Start | Boundary |
 | --- | --- | --- |
 | Retained sender | [#57](https://github.com/DeandreT/switchyard/issues/57) | Wait for #7; sender/listener ownership only |
-| Connection lifecycle | [#63](https://github.com/DeandreT/switchyard/issues/63) | After #84/#87; #85 -> #86 -> #75, then #64/#65 |
+| Connection lifecycle | [#63](https://github.com/DeandreT/switchyard/issues/63) | After #84/#85/#87; #86 -> #75, then #64/#65 |
 | Identity policy | [#8](https://github.com/DeandreT/switchyard/issues/8) | Pure `auth` policy; no listener/CBS activation |
 | Client evidence | [#9](https://github.com/DeandreT/switchyard/issues/9) | Test harness and pin/custody records; no runtime changes |
 | Administration contract | [#10](https://github.com/DeandreT/switchyard/issues/10) | Scrubbed fixtures/closed profiles; no serving endpoint |
@@ -166,7 +167,7 @@ single PR for the whole row. Update pickup labels when prerequisites merge.
 | Deferred acquisition method invocation | [#91](https://github.com/DeandreT/switchyard/issues/91) | [#89](https://github.com/DeandreT/switchyard/issues/89); implemented |
 | Outbound native-start custody/late adoption | [#90](https://github.com/DeandreT/switchyard/issues/90) | [#91](https://github.com/DeandreT/switchyard/issues/91); implemented |
 | Fenced session registry handoff/cleanup | [#87](https://github.com/DeandreT/switchyard/issues/87) | [#84](https://github.com/DeandreT/switchyard/issues/84); implemented |
-| Management transport/route retirement | [#85](https://github.com/DeandreT/switchyard/issues/85) | [#87](https://github.com/DeandreT/switchyard/issues/87) |
+| Management transport/route retirement | [#85](https://github.com/DeandreT/switchyard/issues/85) | Implemented after #84/#87 |
 | CBS transport/route retirement | [#86](https://github.com/DeandreT/switchyard/issues/86) | [#85](https://github.com/DeandreT/switchyard/issues/85) |
 | Original session/link task trees | [#75](https://github.com/DeandreT/switchyard/issues/75) | [#74](https://github.com/DeandreT/switchyard/issues/74) |
 | Bounded TCP/WSS admission and aggregate TLS/HTTP/SASL/Open deadline | [#64](https://github.com/DeandreT/switchyard/issues/64) | [#63](https://github.com/DeandreT/switchyard/issues/63) |

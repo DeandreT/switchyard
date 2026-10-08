@@ -207,9 +207,13 @@ not proof it was unsent. Whole-task abortion remains #75.
 Receive and session-grant callers defer broker method invocation to the retained
 original's first poll, including eager adapters. This is not an enqueue receipt.
 
-Management/CBS retirement (#85/#86) and process shutdown
-remain [roadmap work](roadmap.md#next-main-increments). Stalled broker/native I/O
-can still delay cleanup.
+Management retirement discards preparation before broker invocation, but drains
+begun commands and their post-result registry work. Original native acknowledgements,
+replies and begun confirmations remain owned; no new late reply/confirmation starts.
+Every returned reply exit closes its captured channel and unregisters by identity.
+Original native errors precede cleanup errors; blocked writers still need joined
+native stop. CBS (#86), task trees (#75) and process shutdown remain
+[roadmap work](roadmap.md#next-main-increments); stalled broker/I/O can delay cleanup.
 
 Sustained inbound traffic beyond initial credit is not certified. Session
 transfer-window accounting and receiving-credit refill remain

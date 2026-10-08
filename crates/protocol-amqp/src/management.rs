@@ -1,12 +1,14 @@
 use std::{
     collections::HashMap,
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex as StdMutex, Weak},
     time::Duration,
 };
 
 use amqp::{
-    AmqpError, ApplicationProperties, Body, Error as AmqpProtocolError, Message, MessageId,
-    Receiver, Sender,
+    AmqpError, ApplicationProperties, Body, DeliveryState, EngineError, Error as AmqpProtocolError,
+    Message, MessageId, Outcome, Receiver, Sender,
 };
 use auth::{Permission, ResourceScope};
 use domain::{
@@ -25,12 +27,14 @@ use tracing::debug;
 
 use crate::{Broker, BrokerRejection, authorization::ConnectionAuthorization};
 
+mod custody;
 mod deferred;
 mod peek;
 mod response;
 mod rules;
 mod scheduled;
 
+use self::custody::{OperationControl, PendingOperation, RequestBroker};
 use self::response::ManagementResponse;
 
 pub use deferred::{RECEIVE_BY_SEQUENCE_NUMBER_OPERATION, UPDATE_DISPOSITION_OPERATION};
@@ -557,23 +561,20 @@ pub(crate) async fn serve_management_requests<B: Broker>(
     management: Arc<ConnectionManagement>,
     authorization: Option<ManagementAuthorization>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    loop {
-        let received = match authorization.as_ref() {
-            Some(authorization) => {
-                tokio::select! {
-                    result = receiver.recv() => Some(result),
-                    () = authorization.wait_until_unauthorized() => None,
-                }
-            }
-            None => Some(receiver.recv().await),
-        };
-        let Some(received) = received else {
-            receiver
-                .close_with_error(unauthorized_error(
-                    "the management link's authorization has expired",
-                ))
-                .await?;
-            return Ok(());
+    let detached = receiver.on_detach_owned();
+    let retirement = async {
+        tokio::select! {
+            biased;
+            () = detached => ManagementRetirement::Detached,
+            () = wait_until_unauthorized(authorization.as_ref()) => ManagementRetirement::Unauthorized,
+        }
+    };
+    tokio::pin!(retirement);
+    let exit = loop {
+        let received = tokio::select! {
+            biased;
+            exit = &mut retirement => break exit,
+            received = receiver.recv() => received,
         };
         let delivery = match received {
             Ok(delivery) => delivery,
@@ -581,49 +582,176 @@ pub(crate) async fn serve_management_requests<B: Broker>(
                 amqp::EngineError::RemoteClosed
                 | amqp::EngineError::RemoteDetached
                 | amqp::EngineError::Stopped,
-            ) => return Ok(()),
+            ) => break ManagementRetirement::Detached,
             Err(error) => return Err(error.into()),
         };
-        if let Some(authorization) = authorization.as_ref()
-            && let Err(error) = authorization.ensure_any().await
-        {
-            receiver.close_with_error(error).await?;
-            return Ok(());
+        if let Some(authorization) = authorization.as_ref() {
+            let prepared = tokio::select! {
+                biased;
+                exit = &mut retirement => break exit,
+                prepared = authorization.ensure_any() => prepared,
+            };
+            if prepared.is_err() {
+                break ManagementRetirement::Unauthorized;
+            }
         }
 
-        let Some(properties) = delivery.message().properties.as_ref() else {
-            receiver.reject(&delivery, None).await?;
-            continue;
-        };
-        let (Some(message_id), Some(reply_to)) =
-            (properties.message_id.clone(), properties.reply_to.clone())
-        else {
-            receiver.reject(&delivery, None).await?;
+        let correlation = delivery
+            .message()
+            .properties
+            .as_ref()
+            .and_then(|properties| {
+                Some((properties.message_id.clone()?, properties.reply_to.clone()?))
+            });
+        let Some((message_id, reply_to)) = correlation else {
+            let mut rejected = native_operation(receiver.reject(&delivery, None));
+            if let Some(exit) = observe_or_retire(&mut rejected, retirement.as_mut()).await {
+                let _ = rejected.finish().await;
+                consume_native_result(&mut rejected, Ok(()))?;
+                break exit;
+            }
+            rejected
+                .take_packet()
+                .expect("observed rejection is consumed once")
+                .result
+                .expect("active rejection has a result")?;
             continue;
         };
 
-        let response = process_request(
-            delivery.message(),
-            message_id,
-            &namespace,
-            &entity,
-            &broker,
-            &management,
-            authorization.as_ref(),
-        )
-        .await;
+        let request_broker = RequestBroker::new(broker.clone());
+        let mut original = PendingOperation::new(
+            process_request(
+                delivery.message(),
+                message_id,
+                &namespace,
+                &entity,
+                &request_broker,
+                &management,
+                authorization.as_ref(),
+            ),
+            request_broker.control(),
+        );
+        if let Some(exit) = observe_or_retire(&mut original, retirement.as_mut()).await {
+            let _ = original.finish().await;
+            let packet = original
+                .take_packet()
+                .expect("retired request is consumed once");
+            debug!(
+                started = packet.started,
+                retired = packet.retired,
+                response = packet.result.is_some(),
+                "retired management request observed without acknowledgement"
+            );
+            break exit;
+        }
+        let response = original
+            .take_packet()
+            .expect("observed request is consumed once")
+            .result
+            .expect("active management request has a response");
         debug!(correlation_id = ?response.correlation_id, %reply_to, status_code = response.status_code, "management request processed");
-        receiver.accept(&delivery).await?;
-        if management
-            .route_response(&reply_to, response)
-            .await
-            .is_err()
-        {
+        let mut accepted = native_operation(receiver.accept(&delivery));
+        if let Some(exit) = observe_or_retire(&mut accepted, retirement.as_mut()).await {
+            let _ = accepted.finish().await;
+            consume_native_result(&mut accepted, Ok(()))?;
+            break exit;
+        }
+        accepted
+            .take_packet()
+            .expect("observed acknowledgement is consumed once")
+            .result
+            .expect("active acknowledgement has a result")?;
+        let routed = tokio::select! {
+            biased;
+            exit = &mut retirement => break exit,
+            routed = management.route_response(&reply_to, response) => routed,
+        };
+        if routed.is_err() {
             debug!(%reply_to, "management reply route disappeared");
         } else {
             debug!(%reply_to, "management response routed");
         }
+    };
+    if matches!(exit, ManagementRetirement::Unauthorized) {
+        guarded_close(
+            receiver.close_with_error(unauthorized_error(
+                "the management link's authorization has expired",
+            )),
+            receiver.on_detach_owned(),
+        )
+        .await?;
     }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ManagementRetirement {
+    Detached,
+    Unauthorized,
+}
+
+async fn observe_or_retire<T: Send>(
+    original: &mut PendingOperation<'_, T>,
+    retirement: Pin<&mut (impl Future<Output = ManagementRetirement> + Send)>,
+) -> Option<ManagementRetirement> {
+    tokio::select! {
+        biased;
+        exit = retirement => { original.retire(); Some(exit) }
+        _ = original.observe() => None,
+    }
+}
+
+fn native_operation<'a, T: Send + 'a>(
+    actual: impl Future<Output = Result<T, EngineError>> + Send + 'a,
+) -> PendingOperation<'a, Result<T, EngineError>> {
+    let control = OperationControl::new();
+    let frontier = control.clone();
+    PendingOperation::new(
+        async move {
+            if !frontier.begin() {
+                return Err(EngineError::Stopped);
+            }
+            actual.await
+        },
+        control,
+    )
+}
+
+fn consume_native_result<T: Send>(
+    original: &mut PendingOperation<'_, Result<T, EngineError>>,
+    cleanup: Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    let packet = original
+        .take_packet()
+        .expect("finished native result is consumed once");
+    debug!(
+        started = packet.started,
+        retired = packet.retired,
+        "original management native result observed"
+    );
+    match packet.result {
+        None | Some(Ok(_)) => cleanup,
+        Some(Err(error)) => {
+            if let Err(cleanup_error) = cleanup {
+                debug!(%cleanup_error, "secondary management native cleanup failed");
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn guarded_close(
+    actual: impl Future<Output = Result<(), EngineError>> + Send,
+    detached: impl Future<Output = ()> + Send,
+) -> Result<(), EngineError> {
+    let mut original = native_operation(actual);
+    tokio::pin!(detached);
+    tokio::select! {
+        biased;
+        () = &mut detached => { let _ = original.finish().await; }
+        _ = original.observe() => {}
+    }
+    consume_native_result(&mut original, Ok(()))
 }
 
 async fn process_request<B: Broker>(
@@ -1117,35 +1245,113 @@ fn lock_token(uuid: &Uuid) -> Option<LockToken> {
 }
 
 pub(crate) async fn serve_management_replies(
-    mut sender: Sender,
+    sender: Sender,
     address: String,
     route: mpsc::Sender<ManagementResponse>,
     mut responses: mpsc::Receiver<ManagementResponse>,
     management: Arc<ConnectionManagement>,
     authorization: Option<ManagementAuthorization>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    loop {
+    let result = management_reply_loop(&sender, &mut responses, authorization.as_ref()).await;
+    responses.close();
+    management.unregister_reply_route(&address, &route).await;
+    result
+}
+
+async fn management_reply_loop(
+    sender: &Sender,
+    responses: &mut mpsc::Receiver<ManagementResponse>,
+    authorization: Option<&ManagementAuthorization>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let detached = sender.on_detach_owned();
+    let retirement = async {
         tokio::select! {
-            _ = sender.on_detach() => {
-                management.unregister_reply_route(&address, &route).await;
-                return Ok(());
-            }
-            () = wait_until_unauthorized(authorization.as_ref()), if authorization.is_some() => {
-                management.unregister_reply_route(&address, &route).await;
-                sender.close_with_error(unauthorized_error(
-                    "the management link's authorization has expired",
-                )).await?;
-                return Ok(());
-            }
-            response = responses.recv() => {
-                let Some(response) = response else { return Ok(()) };
-                let tag = response_delivery_tag(&response.correlation_id);
-                debug!(?response.correlation_id, status_code = response.status_code, "sending management response");
-                sender.send(response.into_message(), tag).await?;
-                debug!("management response sent");
-            }
+            biased;
+            () = detached => ManagementRetirement::Detached,
+            () = wait_until_unauthorized(authorization) => ManagementRetirement::Unauthorized,
         }
+    };
+    tokio::pin!(retirement);
+    loop {
+        let response = tokio::select! {
+            biased;
+            exit = &mut retirement => {
+                if matches!(exit, ManagementRetirement::Unauthorized) {
+                    responses.close();
+                    guarded_close(
+                        sender.close_with_error(unauthorized_error("the management link's authorization has expired")),
+                        sender.on_detach_owned(),
+                    ).await?;
+                }
+                return Ok(());
+            }
+            response = responses.recv() => response,
+        };
+        let Some(response) = response else {
+            return Ok(());
+        };
+        debug!(?response.correlation_id, status_code = response.status_code, "sending management response");
+        let control = OperationControl::new();
+        let mut original = PendingOperation::new(
+            send_management_response(sender, response, control.clone()),
+            control,
+        );
+        if let Some(exit) = observe_or_retire(&mut original, retirement.as_mut()).await {
+            responses.close();
+            let close_result = if matches!(exit, ManagementRetirement::Unauthorized) {
+                // A queued no-credit start needs local native retirement to
+                // wake it. Keep both originals; stop/join, not dropping an
+                // observer, is what can interrupt a blocked native writer.
+                let (_, closed) = tokio::join!(
+                    original.finish(),
+                    guarded_close(
+                        sender.close_with_error(unauthorized_error(
+                            "the management link's authorization has expired"
+                        )),
+                        sender.on_detach_owned(),
+                    ),
+                );
+                closed
+            } else {
+                let _ = original.finish().await;
+                Ok(())
+            };
+            consume_native_result(&mut original, close_result)?;
+            return Ok(());
+        }
+        original
+            .take_packet()
+            .expect("original management reply is consumed once")
+            .result
+            .expect("active management reply has a result")?;
+        debug!("management response sent");
     }
+}
+
+async fn send_management_response(
+    sender: &Sender,
+    response: ManagementResponse,
+    control: OperationControl,
+) -> Result<Outcome, EngineError> {
+    if !control.begin() {
+        return Err(EngineError::Stopped);
+    }
+    let tag = response_delivery_tag(&response.correlation_id);
+    let pending = sender.send_pending(response.into_message(), tag).await?;
+    let observed = pending.await?;
+    let (_, outcome, confirmation) = observed.into_parts();
+    if let Some(confirmation) = confirmation
+        && control.begin()
+    {
+        let state = match &outcome {
+            Outcome::Accepted(value) => DeliveryState::Accepted(value.clone()),
+            Outcome::Rejected(value) => DeliveryState::Rejected(value.clone()),
+            Outcome::Released(value) => DeliveryState::Released(value.clone()),
+            Outcome::Modified(value) => DeliveryState::Modified(value.clone()),
+        };
+        confirmation.confirm(state).await?;
+    }
+    Ok(outcome)
 }
 
 async fn wait_until_unauthorized(authorization: Option<&ManagementAuthorization>) {
@@ -1168,6 +1374,12 @@ struct RouteError;
 
 #[cfg(test)]
 mod session_registry_tests;
+
+#[cfg(test)]
+mod request_retirement_tests;
+
+#[cfg(test)]
+mod reply_retirement_tests;
 
 #[cfg(test)]
 mod tests {
