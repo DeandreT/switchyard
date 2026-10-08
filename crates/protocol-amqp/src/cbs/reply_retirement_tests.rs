@@ -887,6 +887,9 @@ async fn actual_no_credit_native_error_precedes_secondary_diagnostic_panic_after
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
+    // Keep tracing's single-dispatcher fast path from using another test
+    // thread's empty default when it first registers or rebuilds a callsite.
+    let _other_dispatch = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     for settle in [ReceiverSettleMode::First, ReceiverSettleMode::Second] {
         for stop in [false, true] {
             let (mut wire, endpoint) = Wire::new(Role::Receiver, 0, settle.clone()).await;
@@ -901,6 +904,10 @@ async fn actual_no_credit_native_error_precedes_secondary_diagnostic_panic_after
                 .unwrap();
             let diagnostics = Arc::new(AtomicUsize::new(0));
             let dispatch = tracing::Dispatch::new(PanicDiagnostics(Arc::clone(&diagnostics)));
+            std::thread::spawn(tracing::callsite::rebuild_interest_cache)
+                .join()
+                .unwrap();
+            assert_eq!(diagnostics.load(Ordering::SeqCst), 0);
             let mut serving = Box::pin(
                 AssertUnwindSafe(serve_cbs_replies(
                     sender,
