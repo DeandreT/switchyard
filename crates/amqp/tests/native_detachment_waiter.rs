@@ -309,3 +309,197 @@ async fn owned_receiver_waiter_outlives_endpoint_without_treating_drop_as_detach
     timeout(WAIT, detached.as_mut()).await.unwrap();
     wire.stop().await;
 }
+
+use amqp::{Accepted, DeliveryState, Disposition, Flow, Sender, Source};
+
+impl Wire {
+    async fn attach_sender(&mut self) -> Sender {
+        write_frame(
+            &mut self.peer,
+            &frame(
+                CHANNEL,
+                Performative::Attach(Box::new(Attach {
+                    name: "sender-watch".to_owned(),
+                    handle: HANDLE,
+                    role: Role::Receiver,
+                    snd_settle_mode: SenderSettleMode::Unsettled,
+                    rcv_settle_mode: ReceiverSettleMode::First,
+                    source: Some(Source::new("orders")),
+                    target: None,
+                    unsettled: None,
+                    incomplete_unsettled: false,
+                    initial_delivery_count: None,
+                    max_message_size: None,
+                    offered_capabilities: None,
+                    desired_capabilities: None,
+                    properties: None,
+                })),
+                Vec::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        let incoming = timeout(WAIT, self.session.next_incoming_attach())
+            .await
+            .unwrap()
+            .unwrap();
+        let LinkEndpoint::Sender(sender) =
+            self.session.accept_attach(incoming, 1024).await.unwrap()
+        else {
+            panic!("actual native Sender");
+        };
+        assert!(matches!(
+            control(&mut self.peer, CHANNEL).await,
+            Performative::Attach(_)
+        ));
+        write_frame(
+            &mut self.peer,
+            &frame(
+                CHANNEL,
+                Performative::Flow(Flow {
+                    handle: Some(HANDLE),
+                    delivery_count: Some(0),
+                    link_credit: Some(1),
+                    incoming_window: 2048,
+                    outgoing_window: 2048,
+                    ..Flow::default()
+                }),
+                Vec::new(),
+            ),
+        )
+        .await
+        .unwrap();
+        sender
+    }
+
+    async fn sender_wire() -> (Self, Sender) {
+        let mut wire = Self::new().await;
+        wire.detach().await;
+        drop(wire.receiver.take());
+        let sender = wire.attach_sender().await;
+        (wire, sender)
+    }
+
+    async fn outbound_transfer(&mut self) -> u32 {
+        let Frame::Amqp {
+            channel,
+            performative: Some(Performative::Transfer(transfer)),
+            payload,
+        } = timeout(WAIT, read_frame(&mut self.peer))
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("actual native Transfer");
+        };
+        assert_eq!(channel, CHANNEL);
+        assert!(!payload.is_empty());
+        transfer.delivery_id.unwrap()
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn owned_sender_waiter_survives_cancelled_observer_beside_original_native_start() {
+    for terminal in 0..3 {
+        let (mut wire, sender) = Wire::sender_wire().await;
+        let mut watch = Box::pin(sender.on_detach_owned());
+        let mut watched = Box::pin(async { watch.as_mut().await });
+        pending_once(watched.as_mut()).await;
+        drop(watched);
+        let reservation = timeout(WAIT, sender.on_credit()).await.unwrap().unwrap();
+        let mut original = Box::pin(sender.send_pending_with_credit(
+            reservation,
+            Message::data(b"original".to_vec()),
+            b"original".to_vec().into(),
+        ));
+        let mut observer = Box::pin(async { original.as_mut().await });
+        pending_once(observer.as_mut()).await;
+        drop(observer);
+        let id = wire.outbound_transfer().await;
+        wire.fifo().await;
+        // The later native Begin response proves the original start command
+        // completed before this terminal; its success reply is still unobserved.
+        pending_once(watch.as_mut()).await;
+        match terminal {
+            0 => wire.detach().await,
+            1 => wire.end().await,
+            _ => wire.stop().await,
+        }
+        timeout(WAIT, watch.as_mut()).await.unwrap();
+        let pending = timeout(WAIT, original.as_mut()).await.unwrap().unwrap();
+        assert_eq!(pending.identity().delivery_id(), id);
+        assert_eq!(pending.identity().channel(), CHANNEL);
+        assert_eq!(pending.identity().handle(), HANDLE);
+        assert!(matches!(
+            timeout(WAIT, pending).await.unwrap(),
+            Err(EngineError::RemoteDetached | EngineError::Stopped)
+        ));
+        drop(original);
+        drop(watch);
+        drop(sender);
+        wire.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn owned_sender_waiter_and_stale_close_cannot_retire_same_handle_replacement() {
+    let (mut wire, old) = Wire::sender_wire().await;
+    let mut old_watch = Box::pin(old.on_detach_owned());
+    pending_once(old_watch.as_mut()).await;
+    wire.detach().await;
+    timeout(WAIT, old_watch.as_mut()).await.unwrap();
+    let replacement = wire.attach_sender().await;
+    let mut replacement_watch = Box::pin(replacement.on_detach_owned());
+    old.close().await.unwrap();
+    drop(old);
+    wire.fifo().await;
+    pending_once(replacement_watch.as_mut()).await;
+    let reservation = replacement.on_credit().await.unwrap();
+    let mut original = Box::pin(replacement.send_pending_with_credit(
+        reservation,
+        Message::data(b"replacement".to_vec()),
+        b"replacement".to_vec().into(),
+    ));
+    pending_once(original.as_mut()).await;
+    let id = wire.outbound_transfer().await;
+    let pending = timeout(WAIT, original.as_mut()).await.unwrap().unwrap();
+    write_frame(
+        &mut wire.peer,
+        &frame(
+            CHANNEL,
+            Performative::Disposition(Disposition {
+                role: Role::Receiver,
+                first: id,
+                last: None,
+                settled: true,
+                state: Some(DeliveryState::Accepted(Accepted)),
+                batchable: false,
+            }),
+            Vec::new(),
+        ),
+    )
+    .await
+    .unwrap();
+    let outcome = timeout(WAIT, pending).await.unwrap().unwrap();
+    assert!(matches!(outcome.outcome(), amqp::Outcome::Accepted(_)));
+    pending_once(replacement_watch.as_mut()).await;
+    wire.detach().await;
+    timeout(WAIT, replacement_watch.as_mut()).await.unwrap();
+    drop(original);
+    drop(replacement_watch);
+    drop(replacement);
+    wire.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn owned_sender_waiter_outlives_endpoint_without_treating_drop_as_detach() {
+    let (mut wire, sender) = Wire::sender_wire().await;
+    let mut watch = Box::pin(sender.on_detach_owned());
+    pending_once(watch.as_mut()).await;
+    drop(sender);
+    wire.fifo().await;
+    pending_once(watch.as_mut()).await;
+    wire.end().await;
+    timeout(WAIT, watch.as_mut()).await.unwrap();
+    wire.stop().await;
+}

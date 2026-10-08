@@ -179,6 +179,13 @@ and cached before residual route/session cleanup. Late results cause no Transfer
 or implicit settlement: PeekLock waits for expiry; ReceiveAndDelete can be lost.
 Cancelled borrowed observers retain custody, not an aborted parent task.
 
+Once native transfer starts, teardown retains its original future, Delivery and
+reservation. Intake, transfer and workers retire before drains; a late Pending
+joins the same retired worker owner before its first finish. Ready outcomes use
+existing authorization/settlement rules before route/session cleanup. Auth
+retirement does not roll back an already-started Transfer or guarantee progress
+behind blocked native I/O.
+
 Entity attaches retain original native acceptance and any session grant through
 borrowed observers. Observed End discards only never-polled phases; polled
 originals are observed and cached. An unused hold gets one release attempt using
@@ -194,7 +201,7 @@ not proof it was unsent. Whole-task abortion remains #75.
 Receive and session-grant callers defer broker method invocation to the retained
 original's first poll, including eager adapters. This is not an enqueue receipt.
 
-Outbound starts (#90), management/CBS retirement (#85/#86) and process shutdown
+Registry fencing (#87), management/CBS retirement (#85/#86) and process shutdown
 remain [roadmap work](roadmap.md#next-main-increments). Stalled broker/native I/O
 can still delay cleanup.
 

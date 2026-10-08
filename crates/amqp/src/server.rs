@@ -824,6 +824,13 @@ impl Sender {
         wait_for_detach(&mut self.detached).await;
     }
 
+    /// Observes this sender's retirement without borrowing the endpoint.
+    /// The watch is captured now, so handle reuse cannot replace its lifetime.
+    pub fn on_detach_owned(&self) -> impl Future<Output = ()> + Send + 'static + use<> {
+        let mut detached = self.detached.clone();
+        async move { wait_for_detach(&mut detached).await }
+    }
+
     pub async fn close(&self) -> Result<(), EngineError> {
         self.close_inner(None).await
     }

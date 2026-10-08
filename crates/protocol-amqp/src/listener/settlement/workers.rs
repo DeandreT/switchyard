@@ -58,6 +58,8 @@ pub(super) struct SettlementWorkers {
     retirement: watch::Sender<bool>,
     finished: Vec<SettlementJoin>,
     failures: Vec<SettlementJoinFailure>,
+    finish_started: bool,
+    late_adopted: bool,
 }
 
 impl SettlementWorkers {
@@ -68,6 +70,8 @@ impl SettlementWorkers {
             retirement,
             finished: Vec::new(),
             failures: Vec::new(),
+            finish_started: false,
+            late_adopted: false,
         }
     }
 
@@ -91,8 +95,41 @@ impl SettlementWorkers {
             !*self.retirement.borrow(),
             "cannot spawn a retired settlement worker"
         );
+        self.push(lock_token, settlement)
+    }
+
+    /// Adopts the pump's one retained native start after retirement, but before
+    /// any finish poll can have joined and cached the original worker set.
+    pub(super) fn adopt_retired<F>(&mut self, lock_token: Option<LockToken>, settlement: F) -> Id
+    where
+        F: Future<Output = Result<(), SettlementFailure>> + Send + 'static,
+    {
         assert!(
-            self.len() < MAX_IN_FLIGHT_DELIVERIES,
+            *self.retirement.borrow(),
+            "late adoption requires settlement retirement"
+        );
+        assert!(
+            !self.finish_started && self.finished.is_empty(),
+            "cannot adopt after settlement finish starts"
+        );
+        assert!(
+            !self.late_adopted,
+            "cannot adopt more than one late delivery"
+        );
+        assert!(
+            self.len() + self.failures.len() < MAX_IN_FLIGHT_DELIVERIES,
+            "too many retained original settlement workers"
+        );
+        self.late_adopted = true;
+        self.push(lock_token, settlement)
+    }
+
+    fn push<F>(&mut self, lock_token: Option<LockToken>, settlement: F) -> Id
+    where
+        F: Future<Output = Result<(), SettlementFailure>> + Send + 'static,
+    {
+        assert!(
+            self.len() + self.failures.len() < MAX_IN_FLIGHT_DELIVERIES,
             "too many outstanding settlement workers"
         );
         let handle = tokio::spawn(async move {
@@ -136,6 +173,7 @@ impl SettlementWorkers {
     /// Retains each original result before the next await, including when this
     /// borrowed finish waiter is dropped and a later waiter retries.
     pub(super) async fn finish(&mut self) -> &[SettlementJoin] {
+        self.finish_started = true;
         self.retire();
         while let Some(joined) = self.pending.next().await {
             self.finished.push(joined);

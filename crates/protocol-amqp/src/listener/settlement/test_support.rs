@@ -8,7 +8,7 @@ use std::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -438,6 +438,7 @@ impl Drop for Actor {
 struct WriteState {
     blocked: bool,
     entered: bool,
+    waker: Option<Waker>,
 }
 
 #[derive(Default)]
@@ -449,6 +450,24 @@ pub(super) struct WriteGate {
 impl WriteGate {
     pub(super) fn block(&self) {
         self.state.lock().unwrap().blocked = true;
+    }
+
+    pub(super) fn release(&self) {
+        let waker = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.blocked = false;
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    pub(super) fn release_on_drop(self: &Arc<Self>) -> WriteReleaseGuard {
+        WriteReleaseGuard(Arc::clone(self))
     }
 
     pub(super) async fn reached(&self) {
@@ -465,6 +484,14 @@ impl WriteGate {
         })
         .await
         .expect("actual confirmation write reached gate");
+    }
+}
+
+pub(super) struct WriteReleaseGuard(Arc<WriteGate>);
+
+impl Drop for WriteReleaseGuard {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 
@@ -492,6 +519,7 @@ impl AsyncWrite for GatedIo {
         let mut state = self.gate.state.lock().unwrap();
         if state.blocked {
             state.entered = true;
+            state.waker = Some(cx.waker().clone());
             self.gate.changed.notify_waiters();
             return Poll::Pending;
         }

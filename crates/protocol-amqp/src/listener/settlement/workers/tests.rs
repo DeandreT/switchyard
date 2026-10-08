@@ -631,3 +631,131 @@ async fn natural_pump_joins_commit_before_releasing_its_held_session() {
         }
     }
 }
+
+// These controls exercise owner limits, not fabricated native settlement outcomes.
+#[tokio::test(flavor = "current_thread")]
+async fn late_adoption_preserves_retained_raw_failure_and_allows_only_one_original() {
+    let mut workers = SettlementWorkers::new();
+    let token = domain::LockToken::new(900);
+    let failed_id = workers.spawn(Some(token), async { panic!("retained-before-adoption") });
+    let completion = timeout(WAIT, workers.next()).await.unwrap().unwrap();
+    assert!(completion.lock_token.is_none());
+    assert_eq!(workers.failures()[0].id, failed_id);
+    assert_eq!(workers.failures()[0].lock_token, Some(token));
+    assert!(workers.failures()[0].error.is_panic());
+    assert!(workers.finished().is_empty());
+    let ordinary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        workers.spawn(None, async { Ok(()) });
+    }));
+    assert!(ordinary.is_err());
+    let adopted_id = workers.adopt_retired(None, async { Ok(()) });
+    let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        workers.adopt_retired(None, async { Ok(()) });
+    }));
+    assert!(duplicate.is_err());
+    timeout(WAIT, workers.finish()).await.unwrap();
+    assert_eq!(workers.finished().len(), 1);
+    assert_eq!(workers.finished()[0].id, adopted_id);
+    assert!(
+        workers.finished()[0]
+            .result
+            .as_ref()
+            .unwrap()
+            .result
+            .is_ok()
+    );
+    assert_eq!(workers.failures()[0].id, failed_id);
+    let failure = workers.into_join_error().unwrap();
+    assert_eq!(failure.id(), failed_id);
+    assert_eq!(
+        failure.into_panic().downcast_ref::<&str>(),
+        Some(&"retained-before-adoption")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn first_finish_poll_permanently_closes_late_adoption_even_without_cached_joins() {
+    let mut empty = SettlementWorkers::new();
+    assert!(empty.finish().await.is_empty());
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        empty.adopt_retired(None, async { Ok(()) });
+    }));
+    assert!(
+        refused.is_err(),
+        "an empty completed drain still closes admission"
+    );
+
+    let mut workers = SettlementWorkers::new();
+    let (release, paused) = tokio::sync::oneshot::channel();
+    let original_id = workers.spawn(None, async {
+        paused.await.unwrap();
+        Ok(())
+    });
+    let mut borrowed = Box::pin(workers.finish());
+    pending_once(borrowed.as_mut()).await;
+    drop(borrowed);
+    assert!(workers.finished().is_empty());
+    assert_eq!(workers.len(), 1);
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        workers.adopt_retired(None, async { Ok(()) });
+    }));
+    assert!(
+        refused.is_err(),
+        "cancelling the observer cannot reopen admission"
+    );
+    release.send(()).unwrap();
+    timeout(WAIT, workers.finish()).await.unwrap();
+    assert_eq!(workers.finished()[0].id, original_id);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn late_adoption_counts_unreaped_originals_and_retained_failures_toward_thirty_two() {
+    let mut workers = SettlementWorkers::new();
+    let ids: Vec<_> = (0..31)
+        .map(|_| workers.spawn(None, async { Ok(()) }))
+        .collect();
+    originals_completed(&workers).await;
+    workers.retire();
+    let last = workers.adopt_retired(None, async { Ok(()) });
+    assert_eq!(workers.len(), 32);
+    timeout(WAIT, workers.finish()).await.unwrap();
+    assert_eq!(workers.finished().len(), 32);
+    assert!(
+        workers
+            .finished()
+            .iter()
+            .all(|joined| joined.id == last || ids.contains(&joined.id))
+    );
+
+    let mut workers = SettlementWorkers::new();
+    let failed = workers.spawn(None, async { panic!("failure-consumes-capacity") });
+    let mut releases = Vec::new();
+    let mut original_ids = Vec::new();
+    for _ in 0..31 {
+        let (release, paused) = tokio::sync::oneshot::channel();
+        releases.push(release);
+        original_ids.push(workers.spawn(None, async {
+            paused.await.unwrap();
+            Ok(())
+        }));
+    }
+    timeout(WAIT, workers.next()).await.unwrap().unwrap();
+    assert_eq!(workers.failures()[0].id, failed);
+    assert_eq!(workers.len() + workers.failures().len(), 32);
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        workers.adopt_retired(None, async { Ok(()) });
+    }));
+    assert!(refused.is_err());
+    for release in releases {
+        release.send(()).unwrap();
+    }
+    timeout(WAIT, workers.finish()).await.unwrap();
+    assert!(
+        workers
+            .finished()
+            .iter()
+            .all(|joined| original_ids.contains(&joined.id))
+    );
+    assert_eq!(workers.failures()[0].id, failed);
+    assert_eq!(workers.into_join_error().unwrap().id(), failed);
+}

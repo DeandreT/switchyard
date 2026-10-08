@@ -25,10 +25,12 @@ mod attachment_handoff_tests;
 #[cfg(test)]
 mod ingress_tests;
 mod intake;
+mod pending_transfer;
 #[cfg(test)]
 mod test_support;
 mod workers;
 use intake::ReceiveIntake;
+use pending_transfer::PendingTransfer;
 use workers::SettlementWorkers;
 
 /// How long a receiving link waits on a wakeup before asking the broker anyway.
@@ -78,7 +80,7 @@ enum PumpExit {
 /// independent: several peek locks may remain outstanding and settle in any
 /// order without stalling new credit.
 pub(super) async fn serve_receiving_client<B: Broker>(
-    mut sender: Sender,
+    sender: Sender,
     namespace: NamespaceName,
     entity: EntityPath,
     broker: B,
@@ -101,7 +103,10 @@ pub(super) async fn serve_receiving_client<B: Broker>(
     };
     let mut in_flight = SettlementWorkers::new();
     let mut intake = None;
+    let mut transfer = None;
     let mut registered_locks = HashSet::new();
+    let detached = sender.on_detach_owned();
+    tokio::pin!(detached);
 
     let exit = 'pump: loop {
         if in_flight.len() == MAX_IN_FLIGHT_DELIVERIES {
@@ -182,7 +187,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
             loop {
                 tokio::select! {
                     biased;
-                    _ = sender.on_detach() => break 'pump PumpExit::Clean,
+                    () = &mut detached => break 'pump PumpExit::Clean,
                     () = wait_until_link_unauthorized(authorization.as_ref()), if authorization.is_some() => {
                         break 'pump PumpExit::Unauthorized;
                     }
@@ -266,12 +271,16 @@ pub(super) async fn serve_receiving_client<B: Broker>(
         // `send_pending` resolves only after this transfer consumed remote
         // credit and was written. Existing remote outcomes remain live while
         // it waits, so slow credit cannot serialize unrelated settlements.
-        let pending = {
-            let started = sender.send_pending_with_credit(reservation, message, delivery_tag);
-            tokio::pin!(started);
+        transfer = Some(PendingTransfer::new(
+            delivery,
+            sender.send_pending_with_credit(reservation, message, delivery_tag),
+        ));
+        {
+            let original = transfer.as_mut().expect("one retained native start");
             loop {
                 tokio::select! {
                     biased;
+                    () = &mut detached => break 'pump PumpExit::Clean,
                     () = wait_until_link_unauthorized(authorization.as_ref()), if authorization.is_some() => {
                         break 'pump PumpExit::Unauthorized;
                     }
@@ -282,13 +291,24 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                             break 'pump exit;
                         }
                     }
-                    started = &mut started => match started {
-                        Ok(pending) => break pending,
-                        Err(error) => break 'pump PumpExit::Engine(error),
-                    },
+                    _ = original.observe() => break,
                 }
             }
+        }
+        let packet = transfer
+            .take()
+            .expect("one retained native start")
+            .take_packet()
+            .expect("the observed native start owns a packet");
+        debug_assert!(packet.started && !packet.retired);
+        let pending = match packet.result.expect("active native start was not retired") {
+            Ok(pending) => pending,
+            Err(error) => {
+                debug!(sequence = %packet.delivery.sequence, %error, "native start failed after broker delivery");
+                break 'pump PumpExit::Engine(error);
+            }
         };
+        let delivery = packet.delivery;
         let retirement = in_flight.subscribe();
         in_flight.spawn(
             lock_token,
@@ -300,6 +320,9 @@ pub(super) async fn serve_receiving_client<B: Broker>(
     // releasing routes or the session. A submitted broker operation must not
     // lose its result merely because the remote link has gone away.
     if let Some(original) = intake.as_mut() {
+        original.retire();
+    }
+    if let Some(original) = transfer.as_mut() {
         original.retire();
     }
     in_flight.retire();
@@ -315,6 +338,42 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                 }
                 Ok(other) => warn!(?other, "retired Receive produced an unexpected outcome"),
                 Err(rejection) => debug!(%rejection, "retired Receive was rejected"),
+            }
+        }
+    }
+    if let Some(original) = transfer.as_mut() {
+        debug!(
+            started = original.started(),
+            "draining retired native transfer"
+        );
+        let _ = original.finish().await;
+        let packet = original
+            .take_packet()
+            .expect("finished native start owns one terminal packet");
+        debug!(
+            started = packet.started,
+            retired = packet.retired,
+            "retired native start result observed"
+        );
+        match packet.result {
+            Some(Ok(pending)) => {
+                let lock_token = packet.delivery.lock.map(|lock| lock.token);
+                let retirement = in_flight.subscribe();
+                in_flight.adopt_retired(
+                    lock_token,
+                    settle_started_delivery(
+                        pending,
+                        packet.delivery,
+                        settlement_context.clone(),
+                        retirement,
+                    ),
+                );
+            }
+            Some(Err(error)) => {
+                debug!(sequence = %packet.delivery.sequence, %error, "retired native start failed");
+            }
+            None => {
+                debug!(sequence = %packet.delivery.sequence, "retired native start was never polled");
             }
         }
     }
@@ -364,9 +423,14 @@ pub(super) async fn serve_receiving_client<B: Broker>(
             None => Ok(()),
         },
         PumpExit::Unauthorized => {
-            sender
-                .close_with_error(unauthorized_error("the link's authorization has expired"))
-                .await?;
+            // A processed original Detach wins over a new late auth Close.
+            tokio::select! {
+                biased;
+                () = &mut detached => {}
+                closed = sender.close_with_error(unauthorized_error(
+                    "the link's authorization has expired",
+                )) => closed?,
+            }
             Ok(())
         }
         PumpExit::Broker(rejection) => {
