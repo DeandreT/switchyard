@@ -45,6 +45,7 @@ const TAG_DUPLICATE_EXPIRY: u8 = 0x0D;
 const TAG_TOPIC_CONFIG: u8 = 0x0E;
 const TAG_TOPIC_SUBSCRIPTION: u8 = 0x0F;
 const TAG_SUBSCRIPTION_RULE: u8 = 0x10;
+const TAG_ENTITY_METADATA: u8 = 0x11;
 
 const SEPARATOR: u8 = 0x00;
 
@@ -84,6 +85,11 @@ pub fn clock() -> Vec<u8> {
 
 pub fn queue_config(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
     entity_scope(TAG_QUEUE_CONFIG, namespace, entity)
+}
+
+/// Private owner metadata. Dead-letter queues use their parent's owner key.
+pub fn entity_metadata(namespace: &NamespaceName, owner: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_ENTITY_METADATA, namespace, owner)
 }
 
 /// Every queue configuration in the store, across every namespace. Walking it is
@@ -378,6 +384,20 @@ pub fn trailing_deadline(key: &[u8]) -> Option<(Timestamp, SequenceNumber)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_metadata_has_a_distinct_canonical_scope_without_retagging_deferred() {
+        let namespace = NamespaceName::new("Tenant").expect("namespace");
+        let owner = EntityPath::new("Orders").expect("owner");
+        let key = entity_metadata(&namespace, &owner);
+        assert_eq!(key, b"\x11tenant\0orders\0");
+        assert_eq!(deferred_prefix(&namespace, &owner)[0], 0x07);
+        assert_eq!(entity_scope_parts(&key), Some(("tenant", "orders")));
+        assert_ne!(
+            key,
+            entity_metadata(&namespace, &owner.dead_letter_queue().expect("shadow"))
+        );
+    }
 
     fn namespace() -> NamespaceName {
         NamespaceName::new("tenant").expect("valid namespace")

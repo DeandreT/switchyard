@@ -14,19 +14,20 @@ and assignment source. Milestones group work; independent lanes can run in paral
 - [x] Complete bounded listed-topic topology proof ([PR #1](https://github.com/DeandreT/switchyard/pull/1))
 - [x] Refusal of populated unversioned stores ([PR #4](https://github.com/DeandreT/switchyard/pull/4))
 - [x] Production startup refuses before storage/listeners until quorum exists ([#5](https://github.com/DeandreT/switchyard/issues/5))
+- [x] Private live owner heads with an active format-2 store fence ([#6](https://github.com/DeandreT/switchyard/issues/6))
 - [ ] Remaining client semantics, administration and conserved capacity
 - [ ] Real quorum, multi-tenant security, recovery and measured release gates
 
-The storage increment passed 590 ordinary tests with two opt-in SDK selectors
-ignored. Those selectors were not rerun for that opener-only change. Current
+The owner-metadata increment passed 615 ordinary tests with two opt-in SDK selectors
+ignored. Those selectors were not rerun for this schema-only change. Current
 .NET coverage is pinned 7.20.2 and experimental Memory-only TCP/WSS, not durable
 or administration certification. See [compatibility](compatibility.md).
 
 ## Next Main Increments
 
-1. Port [#6](https://github.com/DeandreT/switchyard/issues/6): private live owner metadata with an explicit durable format fence.
-2. Port [#12](https://github.com/DeandreT/switchyard/issues/12), then [#15](https://github.com/DeandreT/switchyard/issues/15): real retained authority before live deletion/recreation.
-3. Port safe configuration and typed-content increments separately, then their dependent features.
+1. Complete [#12](https://github.com/DeandreT/switchyard/issues/12) through five focused children: bound broker API, sender, receiver/settlement, sessions, then management ([#56](https://github.com/DeandreT/switchyard/issues/56) through [#60](https://github.com/DeandreT/switchyard/issues/60)). Wire adapters wait for [#7](https://github.com/DeandreT/switchyard/issues/7).
+2. Enable [#15](https://github.com/DeandreT/switchyard/issues/15) only after retained authority is complete; no live deletion/recreation claim yet.
+3. Port safe configuration and typed-content increments independently, then their dependent features.
 
 `feat/amqp-message-sections` and `feat/topic-mode-metadata` remain reference
 material, not merge units. Reimplement each issue on fresh `main`, preserve its
@@ -44,7 +45,13 @@ shows the main integration paths, not every edge.
 flowchart TD
     Main["Main: topology/store safety merged"] --> Guard["#5 Production startup refusal"]
     Main --> Owners["#6 Live owner heads"]
-    Owners --> Bindings["#12 Retained authority"]
+    Owners --> Core["#56 Bound broker API"]
+    Core --> Sender["#57 Sender"]
+    Shutdown["#7 Task shutdown"] --> Sender
+    Sender --> Receiver["#58 Receiver/settlement"]
+    Receiver --> Sessions["#59 Sessions"]
+    Sessions --> Management["#60 Management"]
+    Management --> Bindings["#12 Retained authority complete"]
     Bindings --> Delete["#15 Retirement/recreation"]
     Owners --> Profiles["#13/#14 Safe profile updates"]
     Owners --> Content["#16 Typed retained content"]
@@ -67,12 +74,12 @@ flowchart TD
 
 ## Parallel Pickup
 
-The backlog began with seven ready issues. The remaining starting lanes are
-below; check live assignments before pickup. [#6](https://github.com/DeandreT/switchyard/issues/6) is claimed for the next port.
+These starting lanes have distinct boundaries; check live assignments before
+pickup. [#56](https://github.com/DeandreT/switchyard/issues/56) is claimed for the next foundation increment.
 
 | Lane | Start | Boundary |
 | --- | --- | --- |
-| Owner/schema foundation | [#6](https://github.com/DeandreT/switchyard/issues/6) | Domain keys/codec/create plus the store fence; one schema owner |
+| Retained authority core | [#56](https://github.com/DeandreT/switchyard/issues/56) | Domain/proposer/broker; no listener edits |
 | Connection lifecycle | [#7](https://github.com/DeandreT/switchyard/issues/7) | AMQP task ownership; no auth/schema edits |
 | Identity policy | [#8](https://github.com/DeandreT/switchyard/issues/8) | Pure `auth` policy; no listener/CBS activation |
 | Client evidence | [#9](https://github.com/DeandreT/switchyard/issues/9) | Test harness and pin/custody records; no runtime changes |
@@ -102,7 +109,12 @@ single PR for the whole row. Update pickup labels when prerequisites merge.
 | --- | --- | --- |
 | Fail-closed production startup | [#5](https://github.com/DeandreT/switchyard/issues/5) | Independent |
 | Private live owner metadata | [#6](https://github.com/DeandreT/switchyard/issues/6) | [#2](https://github.com/DeandreT/switchyard/issues/2), merged |
-| Retained incarnation authority | [#12](https://github.com/DeandreT/switchyard/issues/12) | [#6](https://github.com/DeandreT/switchyard/issues/6) |
+| Retained incarnation authority | [#12](https://github.com/DeandreT/switchyard/issues/12) | [#6](https://github.com/DeandreT/switchyard/issues/6), [#7](https://github.com/DeandreT/switchyard/issues/7); five children below |
+| Bound broker API | [#56](https://github.com/DeandreT/switchyard/issues/56) | [#6](https://github.com/DeandreT/switchyard/issues/6) |
+| Retained sender | [#57](https://github.com/DeandreT/switchyard/issues/57) | [#56](https://github.com/DeandreT/switchyard/issues/56), [#7](https://github.com/DeandreT/switchyard/issues/7) |
+| Retained receiver/settlement | [#58](https://github.com/DeandreT/switchyard/issues/58) | [#57](https://github.com/DeandreT/switchyard/issues/57) |
+| Held-session authority | [#59](https://github.com/DeandreT/switchyard/issues/59) | [#58](https://github.com/DeandreT/switchyard/issues/58) |
+| Management authority | [#60](https://github.com/DeandreT/switchyard/issues/60) | [#59](https://github.com/DeandreT/switchyard/issues/59) |
 | Bounded AMQP task shutdown | [#7](https://github.com/DeandreT/switchyard/issues/7) | Independent |
 | Ordinary queue updates | [#13](https://github.com/DeandreT/switchyard/issues/13) | [#6](https://github.com/DeandreT/switchyard/issues/6) |
 | Parent/subscription profile updates | [#14](https://github.com/DeandreT/switchyard/issues/14) | [#13](https://github.com/DeandreT/switchyard/issues/13) |

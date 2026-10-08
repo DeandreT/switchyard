@@ -12,6 +12,18 @@ impl<S: StateStore> StateMachine<S> {
         namespace: &NamespaceName,
         entity: &EntityPath,
     ) -> Result<Option<QueueConfig>, BrokerError> {
+        let Some(config) = self.raw_queue_config(namespace, entity)? else {
+            return Ok(None);
+        };
+        self.require_queue_owner(namespace, entity)?;
+        Ok(Some(config))
+    }
+
+    pub(super) fn raw_queue_config(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+    ) -> Result<Option<QueueConfig>, BrokerError> {
         self.read(&keys::queue_config(namespace, entity))
     }
 

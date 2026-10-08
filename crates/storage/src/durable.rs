@@ -7,7 +7,7 @@
 //!
 //! Two keyspaces are used. `records` holds exactly the keys the caller writes,
 //! so a scan or a snapshot never surfaces anything this module added of its own.
-//! `meta` holds the V1 on-disk format marker, which is checked on every open.
+//! `meta` holds the active on-disk format marker, which is checked on every open.
 
 use std::path::{Path, PathBuf};
 
@@ -15,9 +15,12 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 
 use crate::{Key, Mutation, StateStore, StorageError, StoreSnapshot, Value, WriteBatch};
 
-/// The durable layout: caller keys verbatim in `records`, and a big-endian V1
-/// format marker in `meta`.
+/// Historical layout before domain entities required persisted owner identities.
 pub const STORE_FORMAT_V1: u32 = 1;
+/// Layout requiring live owner identities for domain entity records.
+pub const STORE_FORMAT_V2: u32 = 2;
+/// The only layout this build reads and writes.
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V2;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
@@ -67,7 +70,7 @@ impl FjallStore {
                 batch.insert(
                     &meta,
                     FORMAT_VERSION_KEY,
-                    STORE_FORMAT_V1.to_be_bytes().to_vec(),
+                    ACTIVE_STORE_FORMAT.to_be_bytes().to_vec(),
                 );
                 batch.commit().map_err(|error| {
                     StorageError::backend("stamp the store format version", &error)
@@ -173,10 +176,10 @@ fn require_readable_format(recorded: &[u8]) -> Result<(), StorageError> {
         ),
     })?;
     let found = u32::from_be_bytes(bytes);
-    if found != STORE_FORMAT_V1 {
+    if found != ACTIVE_STORE_FORMAT {
         return Err(StorageError::UnsupportedStoreFormat {
             found,
-            expected: STORE_FORMAT_V1,
+            expected: ACTIVE_STORE_FORMAT,
         });
     }
     Ok(())
@@ -212,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn stamps_version_one_when_it_creates_a_store() -> Result<(), StorageError> {
+    fn stamps_version_two_when_it_creates_a_store() -> Result<(), StorageError> {
         let directory = TempDir::new().expect("a temporary directory");
         let store = FjallStore::open(directory.path())?;
         assert_eq!(store.directory(), directory.path());
@@ -222,19 +225,30 @@ mod tests {
         let reopened = FjallStore::open(directory.path())?;
         assert_eq!(reopened.snapshot()?.entries(), &[]);
         assert_eq!(reopened.get(FORMAT_VERSION_KEY)?, None);
+        drop(reopened);
+        assert_eq!(
+            read_known_rows(directory.path())?,
+            KnownRows {
+                meta: vec![(
+                    FORMAT_VERSION_KEY.to_vec(),
+                    STORE_FORMAT_V2.to_be_bytes().to_vec(),
+                )],
+                records: Vec::new(),
+            }
+        );
         Ok(())
     }
 
     #[test]
     fn refuses_a_store_with_any_other_format() -> Result<(), StorageError> {
         let directory = TempDir::new().expect("a temporary directory");
-        stamp_format(directory.path(), &(STORE_FORMAT_V1 + 1).to_be_bytes())?;
+        stamp_format(directory.path(), &(ACTIVE_STORE_FORMAT + 1).to_be_bytes())?;
 
         assert_eq!(
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
-                found: STORE_FORMAT_V1 + 1,
-                expected: STORE_FORMAT_V1,
+                found: ACTIVE_STORE_FORMAT + 1,
+                expected: ACTIVE_STORE_FORMAT,
             })
         );
         Ok(())
@@ -396,7 +410,7 @@ mod tests {
         let expected = KnownRows {
             meta: vec![(
                 FORMAT_VERSION_KEY.to_vec(),
-                STORE_FORMAT_V1.to_be_bytes().to_vec(),
+                ACTIVE_STORE_FORMAT.to_be_bytes().to_vec(),
             )],
             records: Vec::new(),
         };
@@ -443,14 +457,14 @@ mod tests {
     }
 
     #[test]
-    fn marked_version_one_accepts_populated_known_keyspaces() -> Result<(), StorageError> {
+    fn marked_version_two_accepts_populated_known_keyspaces() -> Result<(), StorageError> {
         let directory = TempDir::new().expect("a temporary directory");
         let mut metadata = unversioned_meta_rows();
         metadata.insert(
             1,
             (
                 FORMAT_VERSION_KEY.to_vec(),
-                STORE_FORMAT_V1.to_be_bytes().to_vec(),
+                STORE_FORMAT_V2.to_be_bytes().to_vec(),
             ),
         );
         let rows = KnownRows {
@@ -465,6 +479,75 @@ mod tests {
         }
         drop(store);
         assert_eq!(read_known_rows(directory.path())?, rows);
+        let reopened = FjallStore::open(directory.path())?;
+        assert_eq!(reopened.snapshot()?.entries(), rows.records.as_slice());
+        drop(reopened);
+        assert_eq!(read_known_rows(directory.path())?, rows);
         Ok(())
+    }
+
+    fn assert_marked_version_one_refusal(
+        directory: &Path,
+        expected: &KnownRows,
+    ) -> Result<(), StorageError> {
+        assert_eq!(&read_known_rows(directory)?, expected);
+        assert_eq!(
+            expected
+                .meta
+                .iter()
+                .find(|(key, _)| key.as_slice() == FORMAT_VERSION_KEY)
+                .map(|(_, value)| value.clone()),
+            Some(STORE_FORMAT_V1.to_be_bytes().to_vec())
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                FjallStore::open(directory).err(),
+                Some(StorageError::UnsupportedStoreFormat {
+                    found: STORE_FORMAT_V1,
+                    expected: ACTIVE_STORE_FORMAT,
+                })
+            );
+            assert_eq!(
+                &read_known_rows(directory)?,
+                expected,
+                "known raw rows and historical marker stay exact"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn marked_version_one_refuses_empty_known_keyspaces_without_changing_rows()
+    -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        let rows = KnownRows {
+            meta: vec![(
+                FORMAT_VERSION_KEY.to_vec(),
+                STORE_FORMAT_V1.to_be_bytes().to_vec(),
+            )],
+            records: Vec::new(),
+        };
+        seed_known_rows(directory.path(), &rows)?;
+        assert_marked_version_one_refusal(directory.path(), &rows)
+    }
+
+    #[test]
+    fn marked_version_one_refuses_populated_known_keyspaces_without_changing_rows()
+    -> Result<(), StorageError> {
+        let directory = TempDir::new().expect("a temporary directory");
+        let mut metadata = unversioned_meta_rows();
+        metadata.insert(
+            1,
+            (
+                FORMAT_VERSION_KEY.to_vec(),
+                STORE_FORMAT_V1.to_be_bytes().to_vec(),
+            ),
+        );
+        let rows = KnownRows {
+            meta: metadata,
+            records: unversioned_record_rows(),
+        };
+        seed_known_rows(directory.path(), &rows)?;
+        assert_marked_version_one_refusal(directory.path(), &rows)
     }
 }

@@ -67,9 +67,11 @@ are copied per subscription; shared payload storage is not implemented.
 Routing proves the complete listed subscription set, including exact canonical
 membership bytes, parent-derived backing configuration, and the real DLQ
 profile, before exposing a page or committing copies. A 2,001-entry lookahead
-enforces the 2,000-subscription cap. This is not a global orphan scan or an
-incarnation fence; ordinary retained-message and rule-management paths are not
-newly covered. See [topic routing](crates/domain/src/machine/topic.rs) and the
+enforces the 2,000-subscription cap. Present configurations and listed profiles
+require private live owner heads; DLQs share their owner's head. This is not a
+global orphan scan or retained-endpoint authority. Configuration-free completion,
+session state/release/expiry and raw catalog/diagnostic paths remain unfenced.
+See [topic routing](crates/domain/src/machine/topic.rs) and the
 [compatibility differences](docs/compatibility.md#known-differences-and-bounds).
 
 ### Time And Storage
@@ -80,13 +82,13 @@ immediately. The proposer holds time still for small host-clock regressions and
 refuses larger ones, logged/retried but not wired to readiness. The state machine
 rejects regressing command time.
 
-Fjall uses one `records` keyspace for domain keys and `meta` for a big-endian V1
+Fjall uses one `records` keyspace for domain keys and `meta` for a big-endian
 layout marker. Atomic batches are journalled and fsynced before apply returns;
 snapshots cannot observe a partial batch. A directory has one live owner.
 Missing markers are initialized only if both known keyspaces are empty; any
 existing row, including an empty value, refuses opening without adding a marker.
-A valid V1 marker keeps its existing behavior. This is neither a migration nor
-validation of foreign keyspaces or filesystem-byte invariance.
+Active format 2 requires owner metadata; format 1 refuses even when empty.
+There is no migration, foreign-keyspace validation or filesystem-byte guarantee.
 
 The domain uses big-endian keys and V1 value envelopes. Memory and Fjall share
 the storage contract and paired tests. Split production keyspaces, replicated

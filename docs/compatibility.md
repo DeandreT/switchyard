@@ -131,9 +131,15 @@ cluster-validation error precedence is unchanged.
 
 A missing format marker is stamped only when known `meta` and `records`
 keyspaces are empty. Existing rows, even empty-valued ones, refuse opening
-without a marker write. Valid V1 markers retain their prior behavior. Store and
-value formats remain V1: no migration, foreign-keyspace proof, or filesystem-byte
-invariance is claimed. See [opener](../crates/storage/src/durable.rs).
+without a marker write. Active store format 2 requires private live owner heads;
+format 1 directories refuse, even when empty. Value envelopes remain V1. There
+is no migration, foreign-keyspace proof, or filesystem-byte invariance claim.
+See [opener](../crates/storage/src/durable.rs).
+
+Present configurations and listed topic profiles require canonical live owner
+heads; DLQs share their owner's head. This is not retained-link authority or a
+whole-store orphan proof. Complete, session-state/release and configuration-free
+session-expiry paths, raw catalogs and diagnostic reads remain unfenced.
 
 Timer commands, not local wall-clock mutation, drive activation/expiry. Small
 host-clock regressions hold command time still; large ones refuse and retry,

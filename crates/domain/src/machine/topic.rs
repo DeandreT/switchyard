@@ -10,6 +10,7 @@ use crate::{
 
 use super::{
     StateMachine,
+    incarnations::Kind,
     send::{SendInput, effective_time_to_live, message_record},
 };
 
@@ -36,6 +37,7 @@ impl<S: StateStore> StateMachine<S> {
         {
             return Err(BrokerError::TopicTopologyCorrupt);
         }
+        self.require_live_owner(namespace, topic, Kind::Topic)?;
         Ok(Some(config))
     }
 
@@ -101,7 +103,7 @@ impl<S: StateStore> StateMachine<S> {
         entity: &EntityPath,
         parent: TopicConfig,
     ) -> Result<QueueConfig, BrokerError> {
-        let backing = self.queue_config(namespace, entity)?.ok_or_else(|| {
+        let backing = self.raw_queue_config(namespace, entity)?.ok_or_else(|| {
             BrokerError::DanglingSubscription {
                 entity: entity.clone(),
             }
@@ -124,7 +126,7 @@ impl<S: StateStore> StateMachine<S> {
             ..expected
         };
         if backing != expected
-            || self.queue_config(namespace, &shadow)? != Some(expected_shadow)
+            || self.raw_queue_config(namespace, &shadow)? != Some(expected_shadow)
             || self
                 .store()
                 .get(&keys::topic_config(namespace, entity))?
@@ -136,6 +138,7 @@ impl<S: StateStore> StateMachine<S> {
         {
             return Err(BrokerError::TopicTopologyCorrupt);
         }
+        self.require_live_owner(namespace, entity, Kind::Subscription)?;
         Ok(backing)
     }
 
@@ -174,6 +177,7 @@ impl<S: StateStore> StateMachine<S> {
         {
             return Err(BrokerError::TopicTopologyCorrupt);
         }
+        self.stage_new_owner(&command.namespace, &command.entity, Kind::Topic, batch)?;
         batch.push_put(key, codec::encode(&config)?);
         Ok(CommandOutcome::TopicCreated)
     }
@@ -237,6 +241,7 @@ impl<S: StateStore> StateMachine<S> {
             return Err(BrokerError::TopicTopologyCorrupt);
         }
 
+        self.stage_new_owner(&command.namespace, &entity, Kind::Subscription, batch)?;
         batch.push_put(index_key, codec::encode(&entity)?);
         batch.push_put(queue_key, codec::encode(&queue)?);
         batch.push_put(

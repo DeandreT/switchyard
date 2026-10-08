@@ -847,6 +847,11 @@ fn full_membership_lookahead_preserves_limit_and_admission_priority<P: StoreProv
     provider: P,
 ) -> Result<(), Box<dyn Error>> {
     let fixture = Fixture::new(provider)?;
+    let first = fixture.subscribe(0, "s0000")?;
+    let head = fixture
+        .raw()
+        .get(&keys::entity_metadata(&fixture.namespace, &first))?
+        .expect("created subscription head");
     let backing = QueueConfig::default();
     let shadow_config = QueueConfig {
         max_delivery_count: u32::MAX,
@@ -869,6 +874,10 @@ fn full_membership_lookahead_preserves_limit_and_admission_priority<P: StoreProv
             keys::queue_config(&fixture.namespace, &child.dead_letter_queue()?),
             codec::encode(&shadow_config)?,
         );
+        batch.push_put(
+            keys::entity_metadata(&fixture.namespace, &child),
+            head.clone(),
+        );
         entities.push(child);
     }
     fixture.raw().apply(batch)?;
@@ -884,6 +893,8 @@ fn full_membership_lookahead_preserves_limit_and_admission_priority<P: StoreProv
     let mut expected_gets = vec![
         keys::topic_config(&fixture.namespace, &fixture.topic),
         keys::queue_config(&fixture.namespace, &fixture.topic),
+        keys::entity_metadata(&fixture.namespace, &fixture.topic),
+        keys::entity_metadata(&fixture.namespace, &fixture.topic.dead_letter_queue()?),
     ];
     for child in &entities {
         let shadow = child.dead_letter_queue()?;
@@ -891,6 +902,8 @@ fn full_membership_lookahead_preserves_limit_and_admission_priority<P: StoreProv
         expected_gets.push(keys::queue_config(&fixture.namespace, &shadow));
         expected_gets.push(keys::topic_config(&fixture.namespace, child));
         expected_gets.push(keys::topic_config(&fixture.namespace, &shadow));
+        expected_gets.push(keys::entity_metadata(&fixture.namespace, child));
+        expected_gets.push(keys::entity_metadata(&fixture.namespace, &shadow));
     }
     assert_eq!(trace.gets, expected_gets);
     let invalid = SubscriptionConfig {
@@ -929,7 +942,9 @@ fn full_membership_lookahead_preserves_limit_and_admission_priority<P: StoreProv
         trace.gets,
         vec![
             keys::topic_config(&fixture.namespace, &fixture.topic),
-            keys::queue_config(&fixture.namespace, &fixture.topic)
+            keys::queue_config(&fixture.namespace, &fixture.topic),
+            keys::entity_metadata(&fixture.namespace, &fixture.topic),
+            keys::entity_metadata(&fixture.namespace, &fixture.topic.dead_letter_queue()?)
         ]
     );
     let trace = fixture.reject(

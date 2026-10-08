@@ -44,6 +44,8 @@ pub enum BrokerError {
     DanglingSubscription { entity: EntityPath },
     #[error("topic ownership metadata is corrupt")]
     TopicTopologyCorrupt,
+    #[error("entity ownership metadata is corrupt")]
+    EntityMetadataCorrupt,
     #[error("messages cannot be sent directly to a topic subscription")]
     SubscriptionSendNotAllowed,
     #[error("messages cannot be received directly from a topic")]

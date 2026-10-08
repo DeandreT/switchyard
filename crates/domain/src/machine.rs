@@ -13,6 +13,7 @@ mod catalog;
 mod deferred;
 mod duplicate;
 mod expiry;
+mod incarnations;
 mod peek;
 mod rules;
 mod scheduling;
@@ -32,6 +33,7 @@ use crate::{
 };
 
 use self::deferred::replace_envelope;
+use self::incarnations::Kind;
 use self::send::SendInput;
 
 pub use self::peek::{MAX_PEEK_BATCH, MAX_PEEK_SCAN};
@@ -491,6 +493,18 @@ impl<S: StateStore> StateMachine<S> {
             requires_duplicate_detection: false,
             ..config
         };
+        if self
+            .store
+            .get(&keys::queue_config(&command.namespace, &dead_letter_queue))?
+            .is_some()
+            || self
+                .store
+                .get(&keys::topic_config(&command.namespace, &dead_letter_queue))?
+                .is_some()
+        {
+            return Err(BrokerError::EntityMetadataCorrupt);
+        }
+        self.stage_new_owner(&command.namespace, &command.entity, Kind::Queue, batch)?;
         batch.push_put(key, codec::encode(&config)?);
         batch.push_put(
             keys::queue_config(&command.namespace, &dead_letter_queue),

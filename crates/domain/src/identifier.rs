@@ -20,7 +20,7 @@ pub const MAX_RULE_NAME_CHARACTERS: usize = 50;
 /// Suffix naming an entity's dead-letter queue, per the Service Bus path model.
 pub const DEAD_LETTER_QUEUE_SUFFIX: &str = "/$deadletterqueue";
 
-const SUBSCRIPTION_PATH_SEGMENT: &str = "/subscriptions/";
+pub(crate) const SUBSCRIPTION_PATH_SEGMENT: &str = "/subscriptions/";
 const SUBSCRIPTION_COLLECTION_SUFFIX: &str = "/subscriptions";
 const MANAGEMENT_SUFFIX: &str = "/$management";
 const MAX_INTERNAL_ENTITY_PATH_BYTES: usize = MAX_ENTITY_PATH_BYTES
