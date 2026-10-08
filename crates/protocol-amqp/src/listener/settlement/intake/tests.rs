@@ -517,6 +517,77 @@ async fn natural_authorization_retirement_drains_the_original_receive_without_tr
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn actual_receive_authorization_preparation_retires_with_grant_row_still_held() {
+    tokio::spawn(async move {
+        for durable in [false, true] {
+            for mode in [ReceiveMode::PeekLock, ReceiveMode::ReceiveAndDelete] {
+                for terminal in [Terminal::End, Terminal::Stop] {
+                  for unpolled in [false, true] {
+                    let actor = std::sync::Arc::new(Actor::new(durable, true));
+                    let session_id = SessionId::new("held-receive-authorization").unwrap();
+                    let sequence = actor.send("held-receive-authorization", Some(session_id.clone()));
+                    let CommandOutcome::SessionAccepted(Some(accepted)) = actor.intent(CommandKind::AcceptSession {
+                        session_id: Some(session_id),
+                        lock_duration_millis: None,
+                    }) else { panic!("original captured session hold"); };
+                    let hold = accepted.hold();
+                    let before = acquisition_counters(&actor);
+                    let broker = EagerAcquisitionBroker::new(std::sync::Arc::clone(&actor), EagerTarget::Receive);
+                    let _release = broker.guard();
+                    broker.release_invocation();
+                    broker.release_result();
+                    let mut wire = Wire::new_with_credit(ReceiverSettleMode::First, 1).await;
+                    let _flow_processed = wire.session_barrier(2).await;
+                    let authorization = authorization();
+                    let grants = authorization.connection.grant_write_lock().await;
+                    let mut original = Box::pin(serve_receiving_client(
+                        wire.sender.take().unwrap(), actor.namespace.clone(), actor.entity.clone(),
+                        broker.clone(), mode, Some(hold.clone()),
+                        ReceivingLinkProtocol {
+                            authorization: Some(authorization.clone()),
+                            management: ConnectionManagement::new(),
+                        },
+                    ));
+                    if !unpolled {
+                        pending_once(original.as_mut()).await;
+                        // The original ReserveCredit reply precedes this native FIFO
+                        // barrier. The next poll must reach the held authorization row.
+                        let _credit_reserved = wire.session_barrier(3).await;
+                        pending_once(original.as_mut()).await;
+                        assert!(broker.events().is_empty());
+                        tokio::select! {
+                            biased;
+                            result = original.as_mut() => panic!("actual grant row must hold Receive preparation: {}", result.is_ok()),
+                            () = std::future::ready(()) => {},
+                        }
+                    }
+                    terminate(&mut wire, terminal).await;
+                    timeout(WAIT, original.as_mut()).await.unwrap().unwrap();
+                    drop(original);
+                    let events = broker.events();
+                    let [EagerEvent::Invoked(release), EagerEvent::Completed(completed, result)] = events.as_slice() else {
+                        panic!("only exact captured-session cleanup is allowed: {events:?}");
+                    };
+                    assert_eq!(release, &CommandKind::ReleaseSession { session: hold.clone() });
+                    assert_eq!(completed.as_ref(), release);
+                    assert_eq!(result, &Ok(CommandOutcome::SessionReleased));
+                    assert_eq!(acquisition_counters(&actor), before);
+                    let machine = StateMachine::new(actor.store().clone());
+                    assert_eq!(machine.message(&actor.namespace, &actor.entity, sequence)
+                        .unwrap().unwrap().state, MessageState::Ready);
+                    assert!(machine.session(&actor.namespace, &actor.entity, &hold.session_id)
+                        .unwrap().unwrap().lock.is_none());
+                    // No row release is needed to finish the original helper.
+                    drop(grants);
+                    wire.stop().await;
+                  }
+                }
+            }
+        }
+    }).await.expect("original receiving preparation observer joined");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn older_original_worker_failure_drains_receive_and_drops_only_its_credit() {
     tokio::spawn(async move {
         for durable in [false, true] {

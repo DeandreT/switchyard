@@ -708,6 +708,7 @@ where
                         sessions.insert(channel, SessionState {
                             incarnation: next_session_incarnation(),
                             attach_tx: Some(unused_attach_tx.clone()),
+                            _ended: watch::channel(false).0,
                             pending_attaches: HashMap::new(),
                             links: HashMap::new(),
                             pending_flows: HashMap::new(),

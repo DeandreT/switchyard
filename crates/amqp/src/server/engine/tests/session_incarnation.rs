@@ -53,6 +53,7 @@ async fn an_ended_pending_session_cannot_accept_across_channel_reuse() {
             channel,
             incarnation: first.incarnation,
             attach_tx,
+            ended_tx: watch::channel(false).0,
             reply,
         },
         &mut wire,
@@ -76,6 +77,7 @@ async fn an_ended_pending_session_cannot_accept_across_channel_reuse() {
             channel,
             incarnation: second.incarnation,
             attach_tx,
+            ended_tx: watch::channel(false).0,
             reply,
         },
         &mut wire,
@@ -104,6 +106,7 @@ async fn a_stale_session_cannot_install_a_link_into_its_replacement() {
         SessionState {
             incarnation: current_session,
             attach_tx: None,
+            _ended: watch::channel(false).0,
             pending_attaches: HashMap::from([(1, 44)]),
             links: HashMap::new(),
             pending_flows: HashMap::new(),
@@ -173,6 +176,7 @@ async fn a_detached_pending_attach_cannot_cross_handle_reuse() {
         SessionState {
             incarnation: session_incarnation,
             attach_tx: Some(attach_tx),
+            _ended: watch::channel(false).0,
             pending_attaches: HashMap::new(),
             links: HashMap::new(),
             pending_flows: HashMap::new(),

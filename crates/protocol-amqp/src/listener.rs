@@ -313,7 +313,15 @@ async fn serve_session<B: Broker>(
     authorization: Option<Arc<ConnectionAuthorization>>,
     management: Arc<ConnectionManagement>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    while let Some(mut attach) = session.next_incoming_attach().await {
+    let ended = session.on_end_owned();
+    tokio::pin!(ended);
+    loop {
+        let attach = tokio::select! {
+            biased;
+            () = &mut ended => break,
+            attach = session.next_incoming_attach() => attach,
+        };
+        let Some(mut attach) = attach else { break };
         let source_address = attach
             .source
             .as_ref()
@@ -390,13 +398,14 @@ async fn serve_session<B: Broker>(
             let plan = match entity {
                 Ok(entity) => {
                     let link_authorization = match authorization.as_ref() {
-                        Some(authorization) => match authorization
-                            .authorize_entity_any(
+                        Some(authorization) => match tokio::select! {
+                            biased;
+                            () = &mut ended => break,
+                            result = authorization.authorize_entity_any(
                                 entity.as_str(),
                                 &[Permission::Send, Permission::Listen],
-                            )
-                            .await
-                        {
+                            ) => result,
+                        } {
                             Ok(resource) => Some(ManagementAuthorization::new(
                                 Arc::clone(authorization),
                                 resource,

@@ -23,7 +23,9 @@ use tokio::{
     time::timeout,
 };
 
-use super::test_support::{Actor, ActualBroker, WAIT, pending_once};
+use super::test_support::{
+    Actor, ActualBroker, EagerAcquisitionBroker, EagerTarget, WAIT, pending_once,
+};
 use crate::authorization::ConnectionAuthorization;
 use crate::listener::ReceivingLinkProtocol;
 use crate::listener::attachments::{
@@ -908,11 +910,23 @@ async fn actual_handoff_waiting_on_registry_write_lock_cannot_replace_a_newer_cl
                     || true,
                 ));
                 pending_once(replacement_install.as_mut()).await;
+                let retired_result = if ended {
+                    // The original releases its captured hold while the registry
+                    // row and the newer pending install are still blocked.
+                    Some(timeout(WAIT, original.as_mut()).await.unwrap())
+                } else {
+                    None
+                };
                 drop(write_lock);
                 let (old_result, replacement_registration, detach) = timeout(WAIT, async {
                     tokio::join!(
                         biased;
-                        original.as_mut(),
+                        async {
+                            match retired_result {
+                                Some(result) => result,
+                                None => original.as_mut().await,
+                            }
+                        },
                         replacement_install.as_mut(),
                         async {
                             if ended { None } else { Some(control(&mut wire.peer, CHANNEL).await) }
@@ -969,7 +983,7 @@ async fn actual_handoff_waiting_on_registry_write_lock_cannot_replace_a_newer_cl
 async fn actual_native_retirement_while_registry_install_waits_releases_without_installing() {
     tokio::spawn(async move {
         for durable in [false, true] {
-            for ended in [false, true] {
+            for (ended, stopped) in [(false, false), (true, false), (true, true)] {
                 let mut actor = Actor::new(durable, true);
                 actor.gate.arm_put(domain::keys::session(
                     &actor.namespace,
@@ -1003,19 +1017,31 @@ async fn actual_native_retirement_while_registry_install_waits_releases_without_
                 let _independent = wire.native_fifo_after_accept(true).await;
                 pending_once(original.as_mut()).await;
                 if ended {
-                    wire.end().await;
+                    if stopped {
+                        wire.connection.stop();
+                    } else {
+                        wire.end().await;
+                    }
+                    assert!(
+                        timeout(WAIT, original.as_mut())
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .is_none()
+                    );
+                    drop(write_lock);
                 } else {
                     wire.detach().await;
                     assert!(!session.is_ended());
+                    drop(write_lock);
+                    assert!(
+                        timeout(WAIT, original.as_mut())
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .is_none()
+                    );
                 }
-                drop(write_lock);
-                assert!(
-                    timeout(WAIT, original.as_mut())
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .is_none()
-                );
                 drop(original);
                 assert!(management.registered_session_owner(LINK).await.is_none());
                 assert_eq!(release_holds(&actor), vec![expected.hold()]);
@@ -1031,6 +1057,147 @@ async fn actual_native_retirement_while_registry_install_waits_releases_without_
     })
     .await
     .expect("original native-retirement observer joined");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_entity_authorization_preparation_retires_with_grant_row_still_held() {
+    for durable in [false, true] {
+        for stopped in [false, true] {
+            for unpolled in [false, true] {
+                let actor = Arc::new(Actor::new(durable, true));
+                let replacement = accepted(&actor.intent(CommandKind::AcceptSession {
+                    session_id: Some(session_id()),
+                    lock_duration_millis: None,
+                }))
+                .clone();
+                let before = actor.store().snapshot().unwrap();
+                let before_counters = counters(&actor);
+                let broker = EagerAcquisitionBroker::new(Arc::clone(&actor), EagerTarget::Grant);
+                let _release = broker.guard();
+                broker.release_invocation();
+                broker.release_result();
+                let (mut wire, mut session) = PendingWire::new().await;
+                let attach = wire.offer(&mut session, Some(filter(false))).await;
+                let authorization = wrong_permission();
+                let grants = authorization.grant_write_lock().await;
+                let management = ConnectionManagement::new();
+                let mut original = Box::pin(accept_entity_link(
+                    &session,
+                    &broker,
+                    &actor.namespace,
+                    "orders",
+                    attach,
+                    Some(&authorization),
+                    &management,
+                ));
+                if !unpolled {
+                    pending_once(original.as_mut()).await;
+                    // Cancel only a waiter, then resume this same pinned preparation.
+                    tokio::select! {
+                        biased;
+                        result = original.as_mut() => panic!("actual grant row must hold preparation: {}", result.is_ok()),
+                        () = std::future::ready(()) => {},
+                    }
+                }
+                let newer_claim = management.claim_session(LINK, actor.entity.clone());
+                let newer = management
+                    .install_session(&newer_claim, replacement.hold(), || true)
+                    .await
+                    .unwrap();
+                if stopped {
+                    wire.connection.stop();
+                } else {
+                    wire.end().await;
+                }
+                assert!(
+                    timeout(WAIT, original.as_mut())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .is_none()
+                );
+                drop(original);
+                assert!(
+                    broker.events().is_empty(),
+                    "retired preparation invoked no eager acquisition"
+                );
+                assert_eq!(counters(&actor), before_counters);
+                assert_eq!(actor.store().snapshot().unwrap(), before);
+                assert_eq!(management.registered_session_owner(LINK).await, Some(newer));
+                // Completion and all assertions precede releasing the actual grant row.
+                drop(grants);
+                wire.stop().await;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_management_authorization_preparation_retires_with_grant_row_still_held() {
+    for stopped in [false, true] {
+        for unpolled in [false, true] {
+            let actor = Arc::new(Actor::new(false, false));
+            let before = actor.store().snapshot().unwrap();
+            let broker = EagerAcquisitionBroker::new(Arc::clone(&actor), EagerTarget::Grant);
+            let _release = broker.guard();
+            broker.release_invocation();
+            broker.release_result();
+            let (mut wire, session) = PendingWire::new().await;
+            let authorization = wrong_permission();
+            let grants = authorization.grant_write_lock().await;
+            write_frame(
+                &mut wire.peer,
+                &frame(
+                    CHANNEL,
+                    Performative::Attach(Box::new(Attach {
+                        name: "held-management".to_owned(),
+                        handle: HANDLE,
+                        role: Role::Sender,
+                        snd_settle_mode: SenderSettleMode::Unsettled,
+                        rcv_settle_mode: ReceiverSettleMode::First,
+                        source: None,
+                        target: Some(Target::new("orders/$management")),
+                        unsettled: None,
+                        incomplete_unsettled: false,
+                        initial_delivery_count: Some(0),
+                        max_message_size: None,
+                        offered_capabilities: None,
+                        desired_capabilities: None,
+                        properties: None,
+                    })),
+                ),
+            )
+            .await
+            .unwrap();
+            // The real second Begin proves the offered management Attach is buffered.
+            let _independent = wire.begin(2).await;
+            let mut original = Box::pin(crate::listener::serve_session(
+                session,
+                actor.namespace.clone(),
+                broker.clone(),
+                Some(Arc::clone(&authorization)),
+                ConnectionManagement::new(),
+            ));
+            if !unpolled {
+                pending_once(original.as_mut()).await;
+                tokio::select! {
+                    biased;
+                    result = original.as_mut() => panic!("actual grant row must hold management preparation: {}", result.is_ok()),
+                    () = std::future::ready(()) => {},
+                }
+            }
+            if stopped {
+                wire.connection.stop();
+            } else {
+                wire.end().await;
+            }
+            timeout(WAIT, original.as_mut()).await.unwrap().unwrap();
+            assert!(broker.events().is_empty());
+            assert_eq!(actor.store().snapshot().unwrap(), before);
+            drop(grants);
+            wire.stop().await;
+        }
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

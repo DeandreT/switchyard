@@ -80,6 +80,7 @@ pub struct ServerSession {
     commands: mpsc::Sender<Command>,
     cleanup: mpsc::UnboundedSender<CleanupCommand>,
     incoming_attaches: mpsc::Receiver<IncomingAttach>,
+    ended: watch::Receiver<bool>,
     pending_attach_identities: Mutex<HashMap<u32, VecDeque<IncomingAttachIdentity>>>,
 }
 
@@ -442,10 +443,12 @@ impl ServerConnection {
         incoming: IncomingSession,
     ) -> Result<ServerSession, EngineError> {
         let (attach_tx, incoming_attaches) = mpsc::channel(32);
+        let (ended_tx, ended) = watch::channel(false);
         request(&self.commands, |reply| Command::AcceptSession {
             channel: incoming.channel,
             incarnation: incoming.incarnation,
             attach_tx,
+            ended_tx,
             reply,
         })
         .await?;
@@ -455,6 +458,7 @@ impl ServerConnection {
             commands: self.commands.clone(),
             cleanup: self.cleanup.clone(),
             incoming_attaches,
+            ended,
             pending_attach_identities: Mutex::new(HashMap::new()),
         })
     }
@@ -477,6 +481,14 @@ impl ServerSession {
     /// offers remain buffered. This does not wait for or predict remote End.
     pub fn is_ended(&self) -> bool {
         self.incoming_attaches.is_closed() || self.commands.is_closed()
+    }
+
+    /// Observes this original session's processed End or driver termination.
+    /// The owned waiter survives caller cancellation and channel reuse; readiness
+    /// does not mean the answering End was written or native tasks were joined.
+    pub fn on_end_owned(&self) -> impl Future<Output = ()> + Send + 'static + use<> {
+        let mut ended = self.ended.clone();
+        async move { wait_for_detach(&mut ended).await }
     }
 
     pub async fn next_incoming_attach(&mut self) -> Option<Attach> {

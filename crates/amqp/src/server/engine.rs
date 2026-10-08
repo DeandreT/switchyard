@@ -13,6 +13,7 @@ pub(super) enum Command {
         channel: u16,
         incarnation: u64,
         attach_tx: mpsc::Sender<IncomingAttach>,
+        ended_tx: watch::Sender<bool>,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
     AcceptLink {
@@ -95,6 +96,8 @@ pub(super) enum CleanupCommand {
 pub(super) struct SessionState {
     pub(super) incarnation: u64,
     pub(super) attach_tx: Option<mpsc::Sender<IncomingAttach>>,
+    // The original state owns the only producer; End/Stop/panic drop is terminal.
+    pub(super) _ended: watch::Sender<bool>,
     pub(super) pending_attaches: HashMap<u32, u64>,
     pub(super) links: HashMap<u32, LinkState>,
     pub(super) pending_flows: HashMap<u32, Flow>,
@@ -413,6 +416,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             channel,
             incarnation,
             attach_tx,
+            ended_tx,
             reply,
         } => {
             if pending_sessions.get(&channel) != Some(&incarnation) {
@@ -435,6 +439,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 SessionState {
                     incarnation,
                     attach_tx: Some(attach_tx),
+                    _ended: ended_tx,
                     pending_attaches: HashMap::new(),
                     links: HashMap::new(),
                     pending_flows: HashMap::new(),

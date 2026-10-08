@@ -162,10 +162,15 @@ pub(super) async fn serve_receiving_client<B: Broker>(
         };
 
         // Authorization preparation is not the broker's first-poll frontier.
-        if let Some(authorization) = authorization.as_ref()
-            && authorization.ensure().await.is_err()
-        {
-            break 'pump PumpExit::Unauthorized;
+        if let Some(authorization) = authorization.as_ref() {
+            let authorized = tokio::select! {
+                biased;
+                () = &mut detached => break 'pump PumpExit::Clean,
+                authorized = authorization.ensure() => authorized,
+            };
+            if authorized.is_err() {
+                break 'pump PumpExit::Unauthorized;
+            }
         }
         let wakeup = broker.deliverable(&namespace, &entity);
         tokio::pin!(wakeup);

@@ -69,6 +69,7 @@ fn sending_session(
     let session = SessionState {
         incarnation: 0,
         attach_tx: None,
+        _ended: watch::channel(false).0,
         pending_attaches: HashMap::new(),
         links: HashMap::from([(handle, LinkState::Sending(link))]),
         pending_flows: HashMap::new(),
@@ -93,6 +94,7 @@ fn receiving_session(
     let session = SessionState {
         incarnation: 0,
         attach_tx: None,
+        _ended: watch::channel(false).0,
         pending_attaches: HashMap::new(),
         links: HashMap::from([(handle, LinkState::Receiving(link))]),
         pending_flows: HashMap::new(),
@@ -179,6 +181,7 @@ fn queued_sending_session(
     let session = SessionState {
         incarnation: 0,
         attach_tx: None,
+        _ended: watch::channel(false).0,
         pending_attaches: HashMap::new(),
         links: HashMap::from([(handle, LinkState::Sending(link))]),
         pending_flows: HashMap::new(),
@@ -496,6 +499,7 @@ async fn link_credit_arriving_during_attach_is_applied_when_the_link_is_accepted
         SessionState {
             incarnation: 0,
             attach_tx: Some(attach_tx),
+            _ended: watch::channel(false).0,
             pending_attaches: HashMap::new(),
             links: HashMap::new(),
             pending_flows: HashMap::new(),
@@ -599,6 +603,7 @@ async fn drain_acknowledgement_is_generation_bound_and_returns_unused_credit() {
     let session = SessionState {
         incarnation: 0,
         attach_tx: None,
+        _ended: watch::channel(false).0,
         pending_attaches: HashMap::new(),
         links: HashMap::from([(handle, LinkState::Sending(link))]),
         pending_flows: HashMap::new(),
@@ -988,6 +993,7 @@ async fn a_range_disposition_completes_only_matching_deliveries() {
     let session = SessionState {
         incarnation: 0,
         attach_tx: None,
+        _ended: watch::channel(false).0,
         pending_attaches: HashMap::new(),
         links: HashMap::from([(handle, LinkState::Sending(link))]),
         pending_flows: HashMap::new(),
@@ -1076,6 +1082,7 @@ async fn a_send_command_crossing_a_detach_gets_a_detach_error() {
         SessionState {
             incarnation: 0,
             attach_tx: None,
+            _ended: watch::channel(false).0,
             pending_attaches: HashMap::new(),
             links: HashMap::new(),
             pending_flows: HashMap::new(),

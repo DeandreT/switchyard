@@ -1,17 +1,21 @@
 //! Session closure remains observable with buffered attach offers.
 
 use std::{
+    future::{Future, poll_fn, ready},
     io,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, Waker},
     time::Duration,
 };
 
 use amqp::{
-    Attach, Begin, End, EngineError, Frame, LinkEndpoint, Open, Performative, ProtocolHeader,
-    ReceiverSettleMode, Role, SenderSettleMode, ServerConnection, ServerSession, Source,
-    read_frame, read_protocol_header, write_frame, write_protocol_header,
+    Attach, Begin, Close, ConnectionShutdownError, End, EngineError, Frame, LinkEndpoint, Open,
+    Performative, ProtocolHeader, ReceiverSettleMode, Role, SenderSettleMode, ServerConnection,
+    ServerSession, Source, read_frame, read_protocol_header, write_frame, write_protocol_header,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, duplex},
@@ -32,6 +36,7 @@ struct WriteState {
 struct WriteGate {
     state: Mutex<WriteState>,
     changed: Notify,
+    panic_next: AtomicBool,
 }
 
 impl WriteGate {
@@ -55,7 +60,7 @@ impl WriteGate {
             }
         })
         .await
-        .expect("original native writer reached the answering-End gate");
+        .expect("original native writer reached the held control-reply gate");
     }
 
     fn release(&self) {
@@ -91,6 +96,9 @@ impl AsyncWrite for GatedIo {
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if self.gate.panic_next.swap(false, Ordering::SeqCst) {
+            panic!("original session observer native driver panic");
+        }
         {
             let mut state = self.gate.state.lock().unwrap();
             if state.blocked {
@@ -309,4 +317,112 @@ async fn joined_original_stop_marks_sessions_ended_with_buffered_offers() {
         "buffered-stop"
     );
     assert!(original.next_incoming_attach().await.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn owned_original_end_waiter_survives_cancel_before_held_reply_and_channel_reuse() {
+    let mut wire = Wire::new().await;
+    let original = wire.begin(1).await;
+    let independent = wire.begin(2).await;
+    let mut ended = Box::pin(original.on_end_owned());
+    tokio::select! {
+        biased;
+        () = &mut ended => panic!("the original session is still active"),
+        () = ready(()) => {},
+    }
+    wire.writes.block();
+    write_frame(&mut wire.peer, &frame(1, Performative::End(End::default())))
+        .await
+        .unwrap();
+    wire.writes.reached().await;
+    timeout(WAIT, &mut ended).await.unwrap();
+    assert!(wire.writes.state.lock().unwrap().blocked);
+    assert!(original.is_ended());
+    assert!(!independent.is_ended());
+    // A retry observes the same closed producer, not the next channel occupant.
+    timeout(WAIT, original.on_end_owned()).await.unwrap();
+    wire.writes.release();
+    assert!(matches!(
+        control(&mut wire.peer, 1).await,
+        Performative::End(_)
+    ));
+    let replacement = wire.begin(1).await;
+    let mut replacement_end = Box::pin(replacement.on_end_owned());
+    poll_fn(|cx| {
+        assert!(replacement_end.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    timeout(WAIT, original.on_end_owned()).await.unwrap();
+    assert!(!replacement.is_ended());
+    wire.connection.stop();
+    timeout(WAIT, replacement_end).await.unwrap();
+    timeout(WAIT, independent.on_end_owned()).await.unwrap();
+    timeout(WAIT, wire.connection.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn owned_original_end_waiter_closes_on_stop_without_releasing_native_write() {
+    let mut wire = Wire::new().await;
+    let original = wire.begin(1).await;
+    let mut ended = Box::pin(original.on_end_owned());
+    poll_fn(|cx| {
+        assert!(ended.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    wire.writes.block();
+    write_frame(
+        &mut wire.peer,
+        &frame(0, Performative::Close(Close::default())),
+    )
+    .await
+    .unwrap();
+    wire.writes.reached().await;
+    assert!(!original.is_ended());
+    wire.connection.stop();
+    timeout(WAIT, ended).await.unwrap();
+    assert!(wire.writes.state.lock().unwrap().blocked);
+    assert!(original.is_ended());
+    // Join is a separate operation after observation; the held write was not released.
+    timeout(WAIT, wire.connection.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    wire.writes.release();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn owned_original_end_waiter_closes_on_actual_driver_panic_before_join() {
+    let mut wire = Wire::new().await;
+    let original = wire.begin(1).await;
+    let mut ended = Box::pin(original.on_end_owned());
+    poll_fn(|cx| {
+        assert!(ended.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    wire.writes.panic_next.store(true, Ordering::SeqCst);
+    write_frame(
+        &mut wire.peer,
+        &frame(0, Performative::Close(Close::default())),
+    )
+    .await
+    .unwrap();
+    timeout(WAIT, ended).await.unwrap();
+    assert!(original.is_ended());
+    timeout(WAIT, original.on_end_owned()).await.unwrap();
+    let failure = timeout(WAIT, wire.connection.shutdown())
+        .await
+        .unwrap()
+        .unwrap_err();
+    let driver = match failure {
+        ConnectionShutdownError::DriverFailed(driver)
+        | ConnectionShutdownError::BothFailed { driver, .. } => driver,
+        other => panic!("the original native driver must report its panic: {other:?}"),
+    };
+    assert!(driver.contains("original session observer native driver panic"));
 }

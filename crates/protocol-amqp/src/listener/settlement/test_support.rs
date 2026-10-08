@@ -695,6 +695,40 @@ impl Wire {
         .await
     }
 
+    pub(super) async fn session_barrier(&mut self, channel: u16) -> ServerSession {
+        let mut begin = frame(Performative::Begin(Begin::default()));
+        let Frame::Amqp {
+            channel: actual, ..
+        } = &mut begin
+        else {
+            unreachable!()
+        };
+        *actual = channel;
+        write_frame(&mut self.peer, &begin).await.unwrap();
+        let incoming = timeout(WAIT, self.connection.next_incoming_session())
+            .await
+            .unwrap()
+            .unwrap();
+        let session = timeout(WAIT, self.connection.accept_session(incoming))
+            .await
+            .unwrap()
+            .unwrap();
+        let Frame::Amqp {
+            channel: actual,
+            performative: Some(Performative::Begin(_)),
+            payload,
+        } = timeout(WAIT, read_frame(&mut self.peer))
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("original native command FIFO Begin barrier");
+        };
+        assert_eq!(actual, channel);
+        assert!(payload.is_empty());
+        session
+    }
+
     pub(super) async fn detach(&mut self) {
         write_frame(
             &mut self.peer,

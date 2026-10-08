@@ -299,9 +299,20 @@ pub(super) async fn accept_entity_link<B: Broker>(
         SenderSettleMode::Unsettled | SenderSettleMode::Mixed => ReceiveMode::PeekLock,
     };
     let mut handoff = AttachmentHandoff::new(session);
-    let mut plan = match resolved {
-        Ok(entity) => prepare_link(entity, &attach, authorization).await,
-        Err(error) => Err(error),
+    let ended = session.on_end_owned();
+    tokio::pin!(ended);
+    let mut plan = tokio::select! {
+        biased;
+        () = &mut ended => {
+            retire_handoff(&mut handoff, broker, namespace, None, management, None).await;
+            return Ok(None);
+        }
+        plan = async {
+            match resolved {
+                Ok(entity) => prepare_link(entity, &attach, authorization).await,
+                Err(error) => Err(error),
+            }
+        } => plan,
     };
     if session.is_ended() {
         retire_handoff(&mut handoff, broker, namespace, None, management, None).await;
@@ -421,8 +432,10 @@ pub(super) async fn accept_entity_link<B: Broker>(
         (LinkEndpoint::Sender(sender), Some(accepted)) => {
             let mut detached = std::pin::pin!(sender.on_detach_owned());
             let mut retired = false;
-            let registration = management
-                .install_session(
+            let registration = tokio::select! {
+                biased;
+                () = &mut ended => None,
+                registration = management.install_session(
                     claim
                         .as_ref()
                         .expect("a receiving attachment captured its claim"),
@@ -431,8 +444,8 @@ pub(super) async fn accept_entity_link<B: Broker>(
                         retired = session.is_ended() || detached.as_mut().now_or_never().is_some();
                         !retired
                     },
-                )
-                .await;
+                ) => registration,
+            };
             if registration.is_none() {
                 if retired || session.is_ended() || detached.as_mut().now_or_never().is_some() {
                     drop(endpoint);

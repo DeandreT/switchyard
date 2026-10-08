@@ -198,6 +198,10 @@ checks the latest claim and observed original End/Detach after write-lock
 admission; stale cleanup matches the captured owner, entity and full hold.
 Failed newest claims preserve installed rows without reviving older pending work.
 This is not atomic link/hold liveness or ancestor-task shielding (#75).
+An owned original-session End observer fences attachment authorization and session
+registry installation. End, Stop or driver panic wakes preparation even while its
+row is held; readiness does not acknowledge the End reply or join native tasks.
+Receiving authorization preparation observes its captured Detach before Receive.
 
 Inbound links retain one original Send/Batch result through borrowed observers
 and natural Detach/auth retirement. Never-polled retired work submits nothing;
@@ -216,8 +220,8 @@ native stop. CBS retains the original begun token validation/store and native
 operations, without rolling back installed grants or retrying a selected reply
 route. Retirement starts no new acknowledgement or second confirmation; every
 returned reply exit closes and identity-unregisters its captured channel.
-CBS bootstrap does not wait for an existing authorization grant. End-observed
-preparation (#110), panic-safe settlement custody (#111), task trees (#75) and
+CBS bootstrap does not wait for an existing authorization grant. Captured delivery
+owners (#117), panic-safe settlement custody (#111), task trees (#75) and
 process shutdown remain [roadmap work](roadmap.md#next-main-increments); stalled
 broker/I/O can delay cleanup. These guarantees do not cover an aborted ancestor.
 
