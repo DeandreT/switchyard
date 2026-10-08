@@ -175,6 +175,11 @@ before residual route cleanup and session release. Retirement stops unanswered
 remote/confirmation waits, not started broker submissions; ready outcomes still
 apply. Second-mode success follows durable settlement. Cancelled finish observers
 retain original handles/results. Drop only requests retirement and detaches.
+Each delivery registration has a private captured identity. Worker/residual
+cleanup and management renewal/disposition writes match that identity under the
+row lock; equal-value or cross-entity replacements survive stale cleanup.
+Cancelled residual cleanup keeps each unfinished handle until removal completes.
+Lookup preference, TTL purge and delayed-install ordering remain unchanged.
 
 The pump also retains one original Receive and its reserved credit through
 natural teardown. Never-polled work is discarded; a polled attempt is drained
@@ -220,8 +225,8 @@ native stop. CBS retains the original begun token validation/store and native
 operations, without rolling back installed grants or retrying a selected reply
 route. Retirement starts no new acknowledgement or second confirmation; every
 returned reply exit closes and identity-unregisters its captured channel.
-CBS bootstrap does not wait for an existing authorization grant. Captured delivery
-owners (#117), panic-safe settlement custody (#111), task trees (#75) and
+CBS bootstrap does not wait for an existing authorization grant. Panic-safe
+settlement custody (#111), task trees (#75) and
 process shutdown remain [roadmap work](roadmap.md#next-main-increments); stalled
 broker/I/O can delay cleanup. These guarantees do not cover an aborted ancestor.
 

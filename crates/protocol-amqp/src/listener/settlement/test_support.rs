@@ -372,7 +372,6 @@ impl Actor {
             broker: self.broker.as_ref().unwrap().clone(),
             authorization: None,
             management,
-            link_name: LINK.to_owned(),
         }
     }
 

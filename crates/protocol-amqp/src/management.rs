@@ -83,9 +83,52 @@ pub(crate) struct ManagedDelivery {
     delivery: Option<Delivery>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DeliveryRegistration {
+    key: DeliveryKey,
+    managed: ManagedDelivery,
+    identity: Arc<()>,
+}
+
+impl DeliveryRegistration {
+    pub(crate) fn lock_token(&self) -> LockToken {
+        self.key.lock_token
+    }
+}
+
+impl PartialEq for DeliveryRegistration {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity) && self.key == other.key
+    }
+}
+
+impl Eq for DeliveryRegistration {}
+
+#[derive(Clone, Debug)]
+struct RequestResponseDeliveryRegistration {
+    key: RequestResponseDeliveryKey,
+    identity: Arc<()>,
+}
+
+impl PartialEq for RequestResponseDeliveryRegistration {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.identity, &other.identity) && self.key == other.key
+    }
+}
+
+impl Eq for RequestResponseDeliveryRegistration {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedDeliverySelection {
+    managed: ManagedDelivery,
+    ordinary: Option<DeliveryRegistration>,
+    request_response: Option<RequestResponseDeliveryRegistration>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RequestResponseDelivery {
     managed: ManagedDelivery,
+    registration: RequestResponseDeliveryRegistration,
     /// A protocol-local deadline. Domain timestamps may come from a replay or
     /// test clock, so they are never compared with this process's wall clock.
     expires_at: Instant,
@@ -173,7 +216,7 @@ struct ReplyRoutes {
 /// replicated broker state, and both disappear when the connection does.
 #[derive(Debug, Default)]
 pub(crate) struct ConnectionManagement {
-    deliveries: RwLock<HashMap<DeliveryKey, ManagedDelivery>>,
+    deliveries: RwLock<HashMap<DeliveryKey, DeliveryRegistration>>,
     request_response_deliveries:
         RwLock<HashMap<RequestResponseDeliveryKey, RequestResponseDelivery>>,
     session_claims: StdMutex<HashMap<String, Arc<()>>>,
@@ -193,27 +236,42 @@ impl ConnectionManagement {
         entity: EntityPath,
         sequence: SequenceNumber,
         lock_token: LockToken,
-    ) {
-        self.deliveries.write().await.insert(
-            DeliveryKey {
+    ) -> DeliveryRegistration {
+        let registration = DeliveryRegistration {
+            key: DeliveryKey {
                 link_name: link_name.to_owned(),
                 lock_token,
             },
-            ManagedDelivery {
+            managed: ManagedDelivery {
                 entity,
                 sequence,
                 delivery: None,
             },
-        );
+            identity: Arc::new(()),
+        };
+        self.deliveries
+            .write()
+            .await
+            .insert(registration.key.clone(), registration.clone());
+        registration
     }
 
-    pub(crate) async fn unregister_delivery(&self, link_name: &str, lock_token: LockToken) {
-        self.deliveries.write().await.remove(&DeliveryKey {
-            link_name: link_name.to_owned(),
-            lock_token,
-        });
+    pub(crate) async fn unregister_delivery(&self, registration: &DeliveryRegistration) {
+        let mut deliveries = self.deliveries.write().await;
+        if deliveries
+            .get(&registration.key)
+            .is_some_and(|current| current == registration)
+        {
+            deliveries.remove(&registration.key);
+        }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn delivery_write_lock(&self) -> impl Send + '_ {
+        self.deliveries.write().await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn delivery(
         &self,
         link_name: &str,
@@ -226,12 +284,16 @@ impl ConnectionManagement {
                 link_name: link_name.to_owned(),
                 lock_token,
             })
-            .cloned()
+            .map(|registered| registered.managed.clone())
     }
 
-    async fn register_request_response_delivery(&self, entity: EntityPath, delivery: Delivery) {
+    async fn register_request_response_delivery(
+        &self,
+        entity: EntityPath,
+        delivery: Delivery,
+    ) -> RequestResponseDeliveryRegistration {
         self.register_request_response_delivery_at(entity, delivery, Instant::now())
-            .await;
+            .await
     }
 
     async fn register_request_response_delivery_at(
@@ -239,29 +301,36 @@ impl ConnectionManagement {
         entity: EntityPath,
         delivery: Delivery,
         now: Instant,
-    ) {
+    ) -> RequestResponseDeliveryRegistration {
         let sequence = delivery.sequence;
         let lock = delivery
             .lock
             .expect("only a locked management delivery is registered");
-        let mut deliveries = self.request_response_deliveries.write().await;
-        purge_request_response_deliveries(&mut deliveries, now);
-        deliveries.insert(
-            RequestResponseDeliveryKey {
+        let registration = RequestResponseDeliveryRegistration {
+            key: RequestResponseDeliveryKey {
                 entity: entity.clone(),
                 lock_token: lock.token,
             },
+            identity: Arc::new(()),
+        };
+        let mut deliveries = self.request_response_deliveries.write().await;
+        purge_request_response_deliveries(&mut deliveries, now);
+        deliveries.insert(
+            registration.key.clone(),
             RequestResponseDelivery {
                 managed: ManagedDelivery {
                     entity,
                     sequence,
                     delivery: Some(delivery),
                 },
+                registration: registration.clone(),
                 expires_at: request_response_deadline(now, lock.lock_duration_millis),
             },
         );
+        registration
     }
 
+    #[cfg(test)]
     async fn request_response_delivery(
         &self,
         entity: &EntityPath,
@@ -271,6 +340,7 @@ impl ConnectionManagement {
             .await
     }
 
+    #[cfg(test)]
     async fn request_response_delivery_at(
         &self,
         entity: &EntityPath,
@@ -289,14 +359,12 @@ impl ConnectionManagement {
 
     async fn refresh_request_response_delivery(
         &self,
-        entity: &EntityPath,
-        lock_token: LockToken,
+        registration: Option<&RequestResponseDeliveryRegistration>,
         locked_until: domain::Timestamp,
         lock_duration_millis: u64,
     ) {
         self.refresh_request_response_delivery_at(
-            entity,
-            lock_token,
+            registration,
             locked_until,
             lock_duration_millis,
             Instant::now(),
@@ -306,22 +374,20 @@ impl ConnectionManagement {
 
     async fn refresh_request_response_delivery_at(
         &self,
-        entity: &EntityPath,
-        lock_token: LockToken,
+        registration: Option<&RequestResponseDeliveryRegistration>,
         locked_until: domain::Timestamp,
         lock_duration_millis: u64,
         now: Instant,
     ) {
-        let key = RequestResponseDeliveryKey {
-            entity: entity.clone(),
-            lock_token,
-        };
         let mut deliveries = self.request_response_deliveries.write().await;
-        if let Some(registered) = deliveries.get_mut(&key) {
+        if let Some(registration) = registration
+            && let Some(registered) = deliveries.get_mut(&registration.key)
+            && registered.registration == *registration
+        {
             registered.expires_at = request_response_deadline(now, lock_duration_millis);
             if let Some(delivery) = registered.managed.delivery.as_mut() {
                 delivery.lock = Some(domain::DeliveryLock {
-                    token: lock_token,
+                    token: registration.key.lock_token,
                     locked_until,
                     lock_duration_millis,
                 });
@@ -334,28 +400,24 @@ impl ConnectionManagement {
 
     async fn unregister_request_response_delivery(
         &self,
-        entity: &EntityPath,
-        lock_token: LockToken,
+        registration: &RequestResponseDeliveryRegistration,
     ) {
-        self.request_response_deliveries
-            .write()
-            .await
-            .remove(&RequestResponseDeliveryKey {
-                entity: entity.clone(),
-                lock_token,
-            });
+        let mut deliveries = self.request_response_deliveries.write().await;
+        if deliveries
+            .get(&registration.key)
+            .is_some_and(|current| current.registration == *registration)
+        {
+            deliveries.remove(&registration.key);
+        }
     }
 
-    async fn unregister_managed_delivery(
-        &self,
-        entity: &EntityPath,
-        link_name: Option<&str>,
-        lock_token: LockToken,
-    ) {
-        self.unregister_request_response_delivery(entity, lock_token)
-            .await;
-        if let Some(link_name) = link_name {
-            self.unregister_delivery(link_name, lock_token).await;
+    async fn unregister_managed_delivery(&self, selection: &ManagedDeliverySelection) {
+        if let Some(registration) = selection.request_response.as_ref() {
+            self.unregister_request_response_delivery(registration)
+                .await;
+        }
+        if let Some(registration) = selection.ordinary.as_ref() {
+            self.unregister_delivery(registration).await;
         }
     }
 
@@ -368,14 +430,40 @@ impl ConnectionManagement {
         entity: &EntityPath,
         link_name: Option<&str>,
         lock_token: LockToken,
-    ) -> Option<ManagedDelivery> {
-        if let Some(link_name) = link_name
-            && let Some(delivery) = self.delivery(link_name, lock_token).await
-            && &delivery.entity == entity
-        {
-            return Some(delivery);
+    ) -> Option<ManagedDeliverySelection> {
+        let ordinary = if let Some(link_name) = link_name {
+            self.deliveries
+                .read()
+                .await
+                .get(&DeliveryKey {
+                    link_name: link_name.to_owned(),
+                    lock_token,
+                })
+                .filter(|registered| &registered.managed.entity == entity)
+                .cloned()
+        } else {
+            None
+        };
+        let key = RequestResponseDeliveryKey {
+            entity: entity.clone(),
+            lock_token,
+        };
+        let mut deliveries = self.request_response_deliveries.write().await;
+        // Ordinary authority can renew an alias whose local deadline expired.
+        // Fallback authority still requires the existing live-row check.
+        if ordinary.is_none() {
+            purge_request_response_deliveries(&mut deliveries, Instant::now());
         }
-        self.request_response_delivery(entity, lock_token).await
+        let request_response = deliveries.get(&key);
+        let managed = ordinary
+            .as_ref()
+            .map(|registered| registered.managed.clone())
+            .or_else(|| request_response.map(|registered| registered.managed.clone()))?;
+        Some(ManagedDeliverySelection {
+            managed,
+            ordinary,
+            request_response: request_response.map(|registered| registered.registration.clone()),
+        })
     }
 
     pub(crate) fn claim_session(
@@ -953,7 +1041,7 @@ async fn renew_message_lock<B: Broker>(
             namespace.clone(),
             entity.clone(),
             CommandKind::RenewLock {
-                sequence: delivery.sequence,
+                sequence: delivery.managed.sequence,
                 lock_token,
                 lock_duration_millis: None,
             },
@@ -966,8 +1054,7 @@ async fn renew_message_lock<B: Broker>(
         }) => {
             management
                 .refresh_request_response_delivery(
-                    entity,
-                    lock_token,
+                    delivery.request_response.as_ref(),
                     locked_until,
                     lock_duration_millis,
                 )
@@ -988,9 +1075,7 @@ async fn renew_message_lock<B: Broker>(
         ),
         Err(rejection) => {
             if definitive_message_lock_loss(&rejection) {
-                management
-                    .unregister_managed_delivery(entity, link_name, lock_token)
-                    .await;
+                management.unregister_managed_delivery(&delivery).await;
                 return ManagementResponse::lock_lost(
                     message_id,
                     tracking_id,

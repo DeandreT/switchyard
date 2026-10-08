@@ -14,6 +14,8 @@ use tokio::{
     task::{Id, JoinError, JoinHandle},
 };
 
+use crate::management::DeliveryRegistration;
+
 use super::{MAX_IN_FLIGHT_DELIVERIES, SettlementCompletion, SettlementFailure};
 
 #[cfg(test)]
@@ -22,18 +24,20 @@ mod tests;
 pub(super) struct SettlementJoin {
     pub(super) id: Id,
     pub(super) lock_token: Option<LockToken>,
+    pub(super) registration: Option<DeliveryRegistration>,
     pub(super) result: Result<SettlementCompletion, JoinError>,
 }
 
 pub(super) struct SettlementJoinFailure {
     pub(super) id: Id,
     pub(super) lock_token: Option<LockToken>,
+    pub(super) registration: Option<DeliveryRegistration>,
     pub(super) error: JoinError,
 }
 
 struct SettlementTask {
     id: Id,
-    lock_token: Option<LockToken>,
+    registration: Option<DeliveryRegistration>,
     handle: JoinHandle<SettlementCompletion>,
 }
 
@@ -47,7 +51,11 @@ impl Future for SettlementTask {
         };
         Poll::Ready(SettlementJoin {
             id: self.id,
-            lock_token: self.lock_token,
+            lock_token: self
+                .registration
+                .as_ref()
+                .map(DeliveryRegistration::lock_token),
+            registration: self.registration.clone(),
             result,
         })
     }
@@ -87,7 +95,11 @@ impl SettlementWorkers {
         self.retirement.subscribe()
     }
 
-    pub(super) fn spawn<F>(&mut self, lock_token: Option<LockToken>, settlement: F) -> Id
+    pub(super) fn spawn<F>(
+        &mut self,
+        registration: Option<DeliveryRegistration>,
+        settlement: F,
+    ) -> Id
     where
         F: Future<Output = Result<(), SettlementFailure>> + Send + 'static,
     {
@@ -95,12 +107,16 @@ impl SettlementWorkers {
             !*self.retirement.borrow(),
             "cannot spawn a retired settlement worker"
         );
-        self.push(lock_token, settlement)
+        self.push(registration, settlement)
     }
 
     /// Adopts the pump's one retained native start after retirement, but before
     /// any finish poll can have joined and cached the original worker set.
-    pub(super) fn adopt_retired<F>(&mut self, lock_token: Option<LockToken>, settlement: F) -> Id
+    pub(super) fn adopt_retired<F>(
+        &mut self,
+        registration: Option<DeliveryRegistration>,
+        settlement: F,
+    ) -> Id
     where
         F: Future<Output = Result<(), SettlementFailure>> + Send + 'static,
     {
@@ -121,10 +137,10 @@ impl SettlementWorkers {
             "too many retained original settlement workers"
         );
         self.late_adopted = true;
-        self.push(lock_token, settlement)
+        self.push(registration, settlement)
     }
 
-    fn push<F>(&mut self, lock_token: Option<LockToken>, settlement: F) -> Id
+    fn push<F>(&mut self, registration: Option<DeliveryRegistration>, settlement: F) -> Id
     where
         F: Future<Output = Result<(), SettlementFailure>> + Send + 'static,
     {
@@ -132,14 +148,18 @@ impl SettlementWorkers {
             self.len() + self.failures.len() < MAX_IN_FLIGHT_DELIVERIES,
             "too many outstanding settlement workers"
         );
+        let completion_registration = registration.clone();
         let handle = tokio::spawn(async move {
             let result = settlement.await;
-            SettlementCompletion { lock_token, result }
+            SettlementCompletion {
+                registration: completion_registration,
+                result,
+            }
         });
         let id = handle.id();
         self.pending.push(SettlementTask {
             id,
-            lock_token,
+            registration,
             handle,
         });
         id
@@ -153,13 +173,14 @@ impl SettlementWorkers {
                 self.failures.push(SettlementJoinFailure {
                     id: joined.id,
                     lock_token: joined.lock_token,
+                    registration: joined.registration,
                     error,
                 });
                 self.retire();
-                // Keep the original token registered until residual cleanup:
+                // Keep the original registration until residual cleanup:
                 // a panicked task may not have unregistered its delivery.
                 Some(SettlementCompletion {
-                    lock_token: None,
+                    registration: None,
                     result: Err(SettlementFailure::Engine(EngineError::Stopped)),
                 })
             }

@@ -185,9 +185,9 @@ pub(super) async fn update_disposition<B: Broker>(
     let (kind, expected) = match disposition_command(
         status,
         message,
-        delivery.sequence,
+        delivery.managed.sequence,
         lock_token,
-        delivery.delivery.as_ref(),
+        delivery.managed.delivery.as_ref(),
         properties.as_ref(),
     ) {
         Ok(disposition) => disposition,
@@ -198,9 +198,7 @@ pub(super) async fn update_disposition<B: Broker>(
 
     match broker.submit(namespace.clone(), entity.clone(), kind).await {
         Ok(outcome) if expected.matches(&outcome) => {
-            management
-                .unregister_managed_delivery(entity, link_name, lock_token)
-                .await;
+            management.unregister_managed_delivery(&delivery).await;
             ManagementResponse::accepted(message_id, tracking_id, Value::Null)
         }
         Ok(other) => ManagementResponse::internal(
@@ -210,9 +208,7 @@ pub(super) async fn update_disposition<B: Broker>(
         ),
         Err(rejection) => {
             if super::definitive_message_lock_loss(&rejection) {
-                management
-                    .unregister_managed_delivery(entity, link_name, lock_token)
-                    .await;
+                management.unregister_managed_delivery(&delivery).await;
                 return ManagementResponse::lock_lost(
                     message_id,
                     tracking_id,
@@ -733,7 +729,7 @@ mod tests {
         let management = ConnectionManagement::new();
         let entity = EntityPath::new("orders").expect("valid entity");
         let started = tokio::time::Instant::now();
-        management
+        let registration = management
             .register_request_response_delivery_at(
                 entity.clone(),
                 locked_delivery(7, 9, 1_000),
@@ -742,8 +738,7 @@ mod tests {
             .await;
         management
             .refresh_request_response_delivery_at(
-                &entity,
-                LockToken::new(9),
+                Some(&registration),
                 domain::Timestamp::from_millis(2_000),
                 2_000,
                 started + std::time::Duration::from_millis(900),
@@ -822,7 +817,7 @@ mod tests {
             management
                 .managed_delivery(&entity, None, LockToken::new(9))
                 .await
-                .map(|delivery| delivery.sequence),
+                .map(|delivery| delivery.managed.sequence),
             Some(SequenceNumber::new(7))
         );
         assert_eq!(

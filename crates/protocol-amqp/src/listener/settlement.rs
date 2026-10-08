@@ -1,6 +1,6 @@
 //! Receiving-link delivery and settlement.
 
-use std::{collections::HashSet, time::Duration};
+use std::time::Duration;
 
 use amqp::{
     AmqpError, DeliveryConfirmation, DeliveryState, DeliveryTag, EngineError, Fields, Outcome,
@@ -14,7 +14,10 @@ use serde_amqp::{Value, primitives::Symbol};
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
-use crate::{Broker, BrokerRejection, management::ConnectionManagement};
+use crate::{
+    Broker, BrokerRejection,
+    management::{ConnectionManagement, DeliveryRegistration},
+};
 
 use super::{
     LinkAuthorization, ReceivingLinkProtocol, error_for, rejection_error, unauthorized_error,
@@ -22,6 +25,8 @@ use super::{
 
 #[cfg(test)]
 mod attachment_handoff_tests;
+#[cfg(test)]
+mod delivery_owner_tests;
 #[cfg(test)]
 mod ingress_tests;
 mod intake;
@@ -45,7 +50,7 @@ const EMPTY_QUEUE_FALLBACK: Duration = Duration::from_secs(3);
 const MAX_IN_FLIGHT_DELIVERIES: usize = 32;
 
 struct SettlementCompletion {
-    lock_token: Option<LockToken>,
+    registration: Option<DeliveryRegistration>,
     result: Result<(), SettlementFailure>,
 }
 
@@ -56,7 +61,6 @@ struct SettlementContext<B> {
     broker: B,
     authorization: Option<LinkAuthorization>,
     management: std::sync::Arc<ConnectionManagement>,
-    link_name: String,
 }
 
 enum SettlementFailure {
@@ -99,12 +103,12 @@ pub(super) async fn serve_receiving_client<B: Broker>(
         broker: broker.clone(),
         authorization: authorization.clone(),
         management: management.clone(),
-        link_name: link_name.clone(),
     };
     let mut in_flight = SettlementWorkers::new();
     let mut intake = None;
     let mut transfer = None;
-    let mut registered_locks = HashSet::new();
+    let mut transfer_registration = None;
+    let mut registered_deliveries = Vec::new();
     let detached = sender.on_detach_owned();
     tokio::pin!(detached);
 
@@ -126,7 +130,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                 completion = in_flight.next() => {
                     let completion = completion
                         .expect("a full in-flight set cannot end before yielding a completion");
-                    if let Some(exit) = handle_completion(completion, &mut registered_locks) {
+                    if let Some(exit) = handle_completion(completion, &mut registered_deliveries) {
                         break 'pump exit;
                     }
                 }
@@ -149,7 +153,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                     completion = in_flight.next(), if !in_flight.is_empty() => {
                         let completion = completion
                             .expect("a non-empty in-flight set must yield a completion");
-                        if let Some(exit) = handle_completion(completion, &mut registered_locks) {
+                        if let Some(exit) = handle_completion(completion, &mut registered_deliveries) {
                             break 'pump exit;
                         }
                     }
@@ -199,7 +203,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                     completion = in_flight.next(), if !in_flight.is_empty() => {
                         let completion = completion
                             .expect("a non-empty in-flight set must yield a completion");
-                        if let Some(exit) = handle_completion(completion, &mut registered_locks) {
+                        if let Some(exit) = handle_completion(completion, &mut registered_deliveries) {
                             break 'pump exit;
                         }
                     }
@@ -231,7 +235,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                         completion = in_flight.next(), if !in_flight.is_empty() => {
                             let completion = completion
                                 .expect("a non-empty in-flight set must yield a completion");
-                            if let Some(exit) = handle_completion(completion, &mut registered_locks) {
+                            if let Some(exit) = handle_completion(completion, &mut registered_deliveries) {
                                 break 'pump exit;
                             }
                         }
@@ -262,12 +266,15 @@ pub(super) async fn serve_receiving_client<B: Broker>(
             Err(error) => break 'pump PumpExit::Protocol(error),
         };
         let lock_token = delivery.lock.map(|lock| lock.token);
-        if let Some(lock) = delivery.lock {
-            management
+        transfer_registration = if let Some(lock) = delivery.lock {
+            let registration = management
                 .register_delivery(&link_name, entity.clone(), delivery.sequence, lock.token)
                 .await;
-            registered_locks.insert(lock.token);
-        }
+            registered_deliveries.push(registration.clone());
+            Some(registration)
+        } else {
+            None
+        };
         let delivery_tag = match lock_token {
             Some(token) => lock_delivery_tag(token),
             None => sequence_delivery_tag(delivery.sequence),
@@ -292,7 +299,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                     completion = in_flight.next(), if !in_flight.is_empty() => {
                         let completion = completion
                             .expect("a non-empty in-flight set must yield a completion");
-                        if let Some(exit) = handle_completion(completion, &mut registered_locks) {
+                        if let Some(exit) = handle_completion(completion, &mut registered_deliveries) {
                             break 'pump exit;
                         }
                     }
@@ -314,10 +321,17 @@ pub(super) async fn serve_receiving_client<B: Broker>(
             }
         };
         let delivery = packet.delivery;
+        let registration = transfer_registration.take();
         let retirement = in_flight.subscribe();
         in_flight.spawn(
-            lock_token,
-            settle_started_delivery(pending, delivery, settlement_context.clone(), retirement),
+            registration.clone(),
+            settle_started_delivery(
+                pending,
+                delivery,
+                registration,
+                settlement_context.clone(),
+                retirement,
+            ),
         );
     };
 
@@ -362,13 +376,14 @@ pub(super) async fn serve_receiving_client<B: Broker>(
         );
         match packet.result {
             Some(Ok(pending)) => {
-                let lock_token = packet.delivery.lock.map(|lock| lock.token);
+                let registration = transfer_registration.take();
                 let retirement = in_flight.subscribe();
                 in_flight.adopt_retired(
-                    lock_token,
+                    registration.clone(),
                     settle_started_delivery(
                         pending,
                         packet.delivery,
+                        registration,
                         settlement_context.clone(),
                         retirement,
                     ),
@@ -391,8 +406,8 @@ pub(super) async fn serve_receiving_client<B: Broker>(
     for joined in in_flight.finished() {
         match &joined.result {
             Ok(completion) => {
-                if let Some(token) = completion.lock_token {
-                    registered_locks.remove(&token);
+                if let Some(registration) = completion.registration.as_ref() {
+                    registered_deliveries.retain(|retained| retained != registration);
                 }
                 match &completion.result {
                     Ok(()) => {}
@@ -413,9 +428,16 @@ pub(super) async fn serve_receiving_client<B: Broker>(
         }
     }
     for failed in in_flight.failures() {
+        debug_assert_eq!(
+            failed.lock_token,
+            failed
+                .registration
+                .as_ref()
+                .map(DeliveryRegistration::lock_token)
+        );
         warn!(task = %failed.id, token = ?failed.lock_token, error = %failed.error, "settlement worker failed during intake");
     }
-    unregister_deliveries(&management, &link_name, &mut registered_locks).await;
+    unregister_deliveries(&management, &mut registered_deliveries).await;
     release_session(&broker, &namespace, &entity, session.as_ref()).await;
     let join_error = in_flight.into_join_error();
 
@@ -463,10 +485,10 @@ pub(super) async fn serve_receiving_client<B: Broker>(
 
 fn handle_completion(
     completion: SettlementCompletion,
-    registered_locks: &mut HashSet<LockToken>,
+    registered_deliveries: &mut Vec<DeliveryRegistration>,
 ) -> Option<PumpExit> {
-    if let Some(lock_token) = completion.lock_token {
-        registered_locks.remove(&lock_token);
+    if let Some(registration) = completion.registration.as_ref() {
+        registered_deliveries.retain(|retained| retained != registration);
     }
     match completion.result {
         Ok(()) => None,
@@ -481,11 +503,11 @@ fn handle_completion(
 
 async fn unregister_deliveries(
     management: &ConnectionManagement,
-    link_name: &str,
-    registered_locks: &mut HashSet<LockToken>,
+    registered_deliveries: &mut Vec<DeliveryRegistration>,
 ) {
-    for lock_token in std::mem::take(registered_locks) {
-        management.unregister_delivery(link_name, lock_token).await;
+    while let Some(registration) = registered_deliveries.last() {
+        management.unregister_delivery(registration).await;
+        registered_deliveries.pop();
     }
 }
 
@@ -542,6 +564,7 @@ fn received_delivery(
 async fn settle_started_delivery<B: Broker>(
     pending: PendingDelivery,
     delivery: Delivery,
+    registration: Option<DeliveryRegistration>,
     context: SettlementContext<B>,
     mut retirement: watch::Receiver<bool>,
 ) -> Result<(), SettlementFailure> {
@@ -551,9 +574,7 @@ async fn settle_started_delivery<B: Broker>(
         broker,
         authorization,
         management,
-        link_name,
     } = context;
-    let lock_token = delivery.lock.map(|lock| lock.token);
     tokio::pin!(pending);
     // Observe an already-ready disposition even when retirement is sticky;
     // only a genuinely unanswered transport wait can be discarded.
@@ -562,8 +583,8 @@ async fn settle_started_delivery<B: Broker>(
         remote = &mut pending => Some(remote),
         () = wait_for_retirement(&mut retirement) => None,
     };
-    if let Some(lock_token) = lock_token {
-        management.unregister_delivery(&link_name, lock_token).await;
+    if let Some(registration) = registration.as_ref() {
+        management.unregister_delivery(registration).await;
     }
     let Some(remote) = remote else { return Ok(()) };
     let remote = remote.map_err(SettlementFailure::Engine)?;

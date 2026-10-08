@@ -20,7 +20,7 @@ use crate::listener::{
         workers::SettlementWorkers,
     },
 };
-use crate::management::ConnectionManagement;
+use crate::management::{ConnectionManagement, DeliveryRegistration};
 
 async fn reserve(wire: &Wire) -> amqp::CreditReservation {
     timeout(WAIT, wire.sender.as_ref().unwrap().on_credit())
@@ -76,9 +76,12 @@ async fn drain_response(wire: &mut Wire, count: u32) {
     assert!(flow.drain);
 }
 
-async fn registered(actor: &Actor, delivery: &Delivery) -> Arc<ConnectionManagement> {
+async fn registered(
+    actor: &Actor,
+    delivery: &Delivery,
+) -> (Arc<ConnectionManagement>, DeliveryRegistration) {
     let management = ConnectionManagement::new();
-    management
+    let registration = management
         .register_delivery(
             LINK,
             actor.entity.clone(),
@@ -86,7 +89,7 @@ async fn registered(actor: &Actor, delivery: &Delivery) -> Arc<ConnectionManagem
             delivery.lock.unwrap().token,
         )
         .await;
-    management
+    (management, registration)
 }
 
 async fn assert_cached(owner: &mut PendingTransfer<'_>, id: amqp::DeliveryIdentity) {
@@ -116,7 +119,7 @@ async fn original_native_start_survives_lowered_credit_write_gate_and_cancelled_
             let delivery = actor.receive();
             let token = delivery.lock.unwrap().token;
             let before = actor.store().snapshot().unwrap();
-            let management = registered(&actor, &delivery).await;
+            let (management, registration) = registered(&actor, &delivery).await;
             let mut wire = Wire::new_with_credit(mode, 1).await;
             let reservation = reserve(&wire).await;
             request_zero_credit(&mut wire, 0).await;
@@ -168,10 +171,11 @@ async fn original_native_start_survives_lowered_credit_write_gate_and_cancelled_
             workers.retire();
             let retirement = workers.subscribe();
             let worker_id = workers.adopt_retired(
-                Some(token),
+                Some(registration.clone()),
                 settle_started_delivery(
                     packet.result.unwrap().unwrap(),
                     packet.delivery,
+                    Some(registration.clone()),
                     actor.context(Arc::clone(&management)),
                     retirement,
                 ),
@@ -179,6 +183,10 @@ async fn original_native_start_survives_lowered_credit_write_gate_and_cancelled_
             timeout(WAIT, workers.finish()).await.unwrap();
             assert_eq!(workers.finished()[0].id, worker_id);
             assert_eq!(workers.finished()[0].lock_token, Some(token));
+            assert_eq!(
+                workers.finished()[0].registration.as_ref(),
+                Some(&registration)
+            );
             assert!(
                 workers.finished()[0]
                     .result
@@ -213,7 +221,7 @@ async fn late_original_pending_is_adopted_before_finish_and_drains_ready_accepte
             let key = actor.key(delivery.sequence);
             let before = actor.store().snapshot().unwrap();
             actor.gate.arm(key.clone());
-            let management = registered(&actor, &delivery).await;
+            let (management, registration) = registered(&actor, &delivery).await;
             let mut wire = Wire::new_with_credit(mode, 1).await;
             let reservation = reserve(&wire).await;
             let sender = wire.sender.take().unwrap();
@@ -246,10 +254,11 @@ async fn late_original_pending_is_adopted_before_finish_and_drains_ready_accepte
             let packet = owner.take_packet().unwrap();
             let retirement = workers.subscribe();
             let worker_id = workers.adopt_retired(
-                Some(token),
+                Some(registration.clone()),
                 settle_started_delivery(
                     packet.result.unwrap().unwrap(),
                     packet.delivery,
+                    Some(registration.clone()),
                     actor.context(Arc::clone(&management)),
                     retirement,
                 ),

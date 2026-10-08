@@ -2,7 +2,7 @@
 
 use amqp::{Detach, Flow, Frame, Performative, ReceiverSettleMode, read_frame, write_frame};
 use domain::{CommandKind, CommandOutcome, Delivery, ReceiveMode, SessionHold, SessionId};
-use std::{collections::HashSet, pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc};
 use storage::StateStore;
 use tokio::{task::Id, time::timeout};
 
@@ -11,7 +11,7 @@ use crate::listener::{
     ReceivingLinkProtocol,
     settlement::{serve_receiving_client, settle_started_delivery, test_support::*},
 };
-use crate::management::ConnectionManagement;
+use crate::management::{ConnectionManagement, DeliveryRegistration};
 
 async fn start_worker(
     workers: &mut SettlementWorkers,
@@ -19,31 +19,42 @@ async fn start_worker(
     actor: &Actor,
     delivery: Delivery,
     management: Arc<ConnectionManagement>,
-) -> (Id, u32) {
+) -> (Id, u32, DeliveryRegistration) {
     let token = delivery.lock.unwrap().token;
-    management
+    let registration = management
         .register_delivery(LINK, actor.entity.clone(), delivery.sequence, token)
         .await;
     let (pending, wire_id) = wire.start(&delivery).await;
     let retired = workers.subscribe();
     let id = workers.spawn(
-        Some(token),
-        settle_started_delivery(pending, delivery, actor.context(management), retired),
+        Some(registration.clone()),
+        settle_started_delivery(
+            pending,
+            delivery,
+            Some(registration.clone()),
+            actor.context(management),
+            retired,
+        ),
     );
-    (id, wire_id)
+    (id, wire_id, registration)
 }
 
-fn assert_original_finished(workers: &SettlementWorkers, id: Id, token: domain::LockToken) {
+fn assert_original_finished(
+    workers: &SettlementWorkers,
+    id: Id,
+    registration: &DeliveryRegistration,
+) {
     assert!(workers.is_empty());
     assert_eq!(workers.finished().len(), 1);
     let joined = &workers.finished()[0];
     assert_eq!(joined.id, id);
-    assert_eq!(joined.lock_token, Some(token));
+    assert_eq!(joined.lock_token, Some(registration.lock_token()));
+    assert_eq!(joined.registration.as_ref(), Some(registration));
     let completion = joined
         .result
         .as_ref()
         .expect("original worker joined normally");
-    assert_eq!(completion.lock_token, Some(token));
+    assert_eq!(completion.registration.as_ref(), Some(registration));
     assert!(completion.result.is_ok());
 }
 
@@ -54,11 +65,10 @@ async fn unanswered_actual_outcomes_retire_without_new_settlement_commands() {
             let mut actor = Actor::new(durable, false);
             actor.send("unanswered", None);
             let delivery = actor.receive();
-            let token = delivery.lock.unwrap().token;
             let before = actor.store().snapshot().unwrap();
             let mut wire = Wire::new(mode).await;
             let mut workers = SettlementWorkers::new();
-            let (id, _) = start_worker(
+            let (id, _, registration) = start_worker(
                 &mut workers,
                 &mut wire,
                 &actor,
@@ -72,11 +82,11 @@ async fn unanswered_actual_outcomes_retire_without_new_settlement_commands() {
             assert_eq!(workers.len(), 1);
             assert_eq!(workers.pending.iter().next().unwrap().id, id);
             timeout(WAIT, workers.finish()).await.unwrap();
-            assert_original_finished(&workers, id, token);
+            assert_original_finished(&workers, id, &registration);
             assert_eq!(actor.complete_count(), 0);
             assert_eq!(actor.store().snapshot().unwrap(), before);
             timeout(WAIT, workers.finish()).await.unwrap();
-            assert_original_finished(&workers, id, token);
+            assert_original_finished(&workers, id, &registration);
             wire.stop().await;
             drop(workers);
             actor.reopen();
@@ -94,7 +104,6 @@ async fn actual_broker_submission_drains_across_cancelled_finish_and_reopen() {
                 actor.send("commit", None);
                 let delivery = actor.receive();
                 let sequence = delivery.sequence;
-                let token = delivery.lock.unwrap().token;
                 let key = actor.key(sequence);
                 let lock_key = domain::keys::lock(
                     &actor.namespace,
@@ -112,7 +121,7 @@ async fn actual_broker_submission_drains_across_cancelled_finish_and_reopen() {
                 actor.gate.arm(key.clone());
                 let mut wire = Wire::new(mode.clone()).await;
                 let mut workers = SettlementWorkers::new();
-                let (id, wire_id) = start_worker(
+                let (id, wire_id, registration) = start_worker(
                     &mut workers,
                     &mut wire,
                     &actor,
@@ -151,7 +160,7 @@ async fn actual_broker_submission_drains_across_cancelled_finish_and_reopen() {
                 }
                 actor.gate.release(true);
                 timeout(WAIT, workers.finish()).await.unwrap();
-                assert_original_finished(&workers, id, token);
+                assert_original_finished(&workers, id, &registration);
                 wire.no_queued_frame().await;
                 assert_eq!(actor.complete_count(), 1);
                 assert_eq!(actor.gate.state.lock().unwrap().commits, 1);
@@ -167,7 +176,7 @@ async fn actual_broker_submission_drains_across_cancelled_finish_and_reopen() {
                 assert_eq!(committed.entries(), expected.as_slice());
                 assert!(actor.store().get(&key).unwrap().is_none());
                 timeout(WAIT, workers.finish()).await.unwrap();
-                assert_original_finished(&workers, id, token);
+                assert_original_finished(&workers, id, &registration);
                 wire.stop().await;
                 drop(workers);
                 actor.reopen();
@@ -184,12 +193,11 @@ async fn actual_second_confirmation_write_retires_without_resubmission() {
         let mut actor = Actor::new(durable, false);
         actor.send("confirmation", None);
         let delivery = actor.receive();
-        let token = delivery.lock.unwrap().token;
         let key = actor.key(delivery.sequence);
         actor.gate.arm(key.clone());
         let mut wire = Wire::new(ReceiverSettleMode::Second).await;
         let mut workers = SettlementWorkers::new();
-        let (id, wire_id) = start_worker(
+        let (id, wire_id, registration) = start_worker(
             &mut workers,
             &mut wire,
             &actor,
@@ -207,7 +215,7 @@ async fn actual_second_confirmation_write_retires_without_resubmission() {
         assert_eq!(actor.complete_count(), 1);
         assert!(actor.store().get(&key).unwrap().is_none());
         timeout(WAIT, workers.finish()).await.unwrap();
-        assert_original_finished(&workers, id, token);
+        assert_original_finished(&workers, id, &registration);
         assert_eq!(actor.complete_count(), 1);
         let committed = actor.store().snapshot().unwrap();
         wire.stop().await;
@@ -228,7 +236,7 @@ async fn actual_ready_remote_outcome_wins_sticky_retirement() {
             let key = actor.key(delivery.sequence);
             let mut wire = Wire::new(mode).await;
             let management = ConnectionManagement::new();
-            management
+            let registration = management
                 .register_delivery(LINK, actor.entity.clone(), delivery.sequence, token)
                 .await;
             // Retain the genuine PendingDelivery without polling its outcome.
@@ -259,12 +267,18 @@ async fn actual_ready_remote_outcome_wins_sticky_retirement() {
             let mut workers = SettlementWorkers::new();
             let retirement = workers.subscribe();
             let id = workers.spawn(
-                Some(token),
-                settle_started_delivery(pending, delivery, actor.context(management), retirement),
+                Some(registration.clone()),
+                settle_started_delivery(
+                    pending,
+                    delivery,
+                    Some(registration.clone()),
+                    actor.context(management),
+                    retirement,
+                ),
             );
             workers.retire();
             timeout(WAIT, workers.finish()).await.unwrap();
-            assert_original_finished(&workers, id, token);
+            assert_original_finished(&workers, id, &registration);
             assert_eq!(actor.complete_count(), 1);
             assert!(actor.store().get(&key).unwrap().is_none());
             let committed = actor.store().snapshot().unwrap();
@@ -297,7 +311,7 @@ async fn later_delivery_settles_while_an_earlier_remote_outcome_is_unanswered() 
                 ConnectionManagement::new(),
             )
             .await;
-            let (_, wire_id) = start_worker(
+            let (_, wire_id, _) = start_worker(
                 &mut workers,
                 &mut wire,
                 &actor,
@@ -327,6 +341,67 @@ async fn later_delivery_settles_while_an_earlier_remote_outcome_is_unanswered() 
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn stale_real_worker_preserves_an_equal_payload_replacement_registration() {
+    for durable in [false, true] {
+        for mode in [ReceiverSettleMode::First, ReceiverSettleMode::Second] {
+            let mut actor = Actor::new(durable, false);
+            actor.send("replacement-registration", None);
+            let delivery = actor.receive();
+            let sequence = delivery.sequence;
+            let token = delivery.lock.unwrap().token;
+            let key = actor.key(sequence);
+            let mut wire = Wire::new(mode).await;
+            let mut workers = SettlementWorkers::new();
+            let management = ConnectionManagement::new();
+            let (_, wire_id, original) = start_worker(
+                &mut workers,
+                &mut wire,
+                &actor,
+                delivery,
+                Arc::clone(&management),
+            )
+            .await;
+            let payload = management.delivery(LINK, token).await.unwrap();
+            let replacement = management
+                .register_delivery(LINK, actor.entity.clone(), sequence, token)
+                .await;
+            assert_ne!(original, replacement);
+            assert_eq!(
+                management.delivery(LINK, token).await,
+                Some(payload.clone())
+            );
+
+            wire.accepted(wire_id).await;
+            let completion = timeout(WAIT, workers.next()).await.unwrap().unwrap();
+            assert_eq!(completion.registration.as_ref(), Some(&original));
+            assert!(completion.result.is_ok());
+            let mut registrations = vec![original.clone(), replacement.clone()];
+            assert!(super::super::handle_completion(completion, &mut registrations).is_none());
+            assert_eq!(registrations, vec![replacement.clone()]);
+            assert_eq!(
+                management.delivery(LINK, token).await,
+                Some(payload.clone())
+            );
+            if wire.mode == ReceiverSettleMode::Second {
+                wire.confirmed(wire_id).await;
+            }
+            management.unregister_delivery(&original).await;
+            assert_eq!(management.delivery(LINK, token).await, Some(payload));
+            management.unregister_delivery(&replacement).await;
+            assert!(management.delivery(LINK, token).await.is_none());
+            assert_eq!(actor.complete_count(), 1);
+            assert!(actor.store().get(&key).unwrap().is_none());
+            let committed = actor.store().snapshot().unwrap();
+            timeout(WAIT, workers.finish()).await.unwrap();
+            wire.stop().await;
+            drop(workers);
+            actor.reopen();
+            assert_eq!(actor.store().snapshot().unwrap(), committed);
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn original_real_worker_panic_retains_token_id_and_payload_through_next() {
     let actor = Actor::new(false, false);
     actor.send("aborted-worker", None);
@@ -336,35 +411,45 @@ async fn original_real_worker_panic_retains_token_id_and_payload_through_next() 
     let mut workers = SettlementWorkers::new();
     let (pending, wire_id) = wire.start(&delivery).await;
     let retirement = workers.subscribe();
-    let context = actor.context(ConnectionManagement::new());
-    let id = workers.spawn(Some(token), async move {
-        settle_started_delivery(pending, delivery, context, retirement).await?;
+    let management = ConnectionManagement::new();
+    let registration = management
+        .register_delivery(LINK, actor.entity.clone(), delivery.sequence, token)
+        .await;
+    let context = actor.context(management);
+    let original = registration.clone();
+    let id = workers.spawn(Some(registration.clone()), async move {
+        settle_started_delivery(pending, delivery, Some(original), context, retirement).await?;
         panic!("original-settlement-panic");
     });
     wire.accepted(wire_id).await;
     wire.confirmed(wire_id).await;
     let completion = timeout(WAIT, workers.next()).await.unwrap().unwrap();
-    assert!(completion.lock_token.is_none());
+    assert!(completion.registration.is_none());
     assert!(matches!(
         &completion.result,
         Err(super::super::SettlementFailure::Engine(
             amqp::EngineError::Stopped
         ))
     ));
-    let mut registered_locks = HashSet::from([token]);
+    let mut registered_locks = vec![registration.clone()];
     assert!(matches!(
         super::super::handle_completion(completion, &mut registered_locks),
         Some(super::super::PumpExit::Clean)
     ));
-    assert!(registered_locks.contains(&token));
+    assert_eq!(registered_locks, vec![registration.clone()]);
     assert_eq!(workers.failures().len(), 1);
     let failure = &workers.failures()[0];
     assert_eq!(failure.id, id);
     assert_eq!(failure.lock_token, Some(token));
+    assert_eq!(failure.registration.as_ref(), Some(&registration));
     assert_eq!(failure.error.id(), id);
     assert!(failure.error.is_panic());
     timeout(WAIT, workers.finish()).await.unwrap();
     assert_eq!(workers.failures()[0].id, id);
+    assert_eq!(
+        workers.failures()[0].registration.as_ref(),
+        Some(&registration)
+    );
     let error = workers.into_join_error().expect("original raw panic");
     assert_eq!(error.id(), id);
     let payload = error.into_panic();
@@ -400,7 +485,7 @@ async fn finish_retains_a_completed_original_before_a_cancelled_pending_join() {
     actor.gate.arm(actor.key(submitted.sequence));
     let mut wire = Wire::new(ReceiverSettleMode::First).await;
     let mut workers = SettlementWorkers::new();
-    let (completed_id, wire_id) = start_worker(
+    let (completed_id, wire_id, completed_registration) = start_worker(
         &mut workers,
         &mut wire,
         &actor,
@@ -410,7 +495,7 @@ async fn finish_retains_a_completed_original_before_a_cancelled_pending_join() {
     .await;
     wire.accepted(wire_id).await;
     originals_completed(&workers).await;
-    let (submitted_id, wire_id) = start_worker(
+    let (submitted_id, wire_id, submitted_registration) = start_worker(
         &mut workers,
         &mut wire,
         &actor,
@@ -425,8 +510,16 @@ async fn finish_retains_a_completed_original_before_a_cancelled_pending_join() {
     drop(observer);
     assert_eq!(workers.len(), 1);
     assert_eq!(workers.pending.iter().next().unwrap().id, submitted_id);
+    assert_eq!(
+        workers.pending.iter().next().unwrap().registration.as_ref(),
+        Some(&submitted_registration)
+    );
     assert_eq!(workers.finished().len(), 1);
     assert_eq!(workers.finished()[0].id, completed_id);
+    assert_eq!(
+        workers.finished()[0].registration.as_ref(),
+        Some(&completed_registration)
+    );
     assert!(
         workers.finished()[0]
             .result
@@ -440,6 +533,14 @@ async fn finish_retains_a_completed_original_before_a_cancelled_pending_join() {
     assert_eq!(workers.finished().len(), 2);
     assert_eq!(workers.finished()[0].id, completed_id);
     assert_eq!(workers.finished()[1].id, submitted_id);
+    assert_eq!(
+        workers.finished()[0].registration.as_ref(),
+        Some(&completed_registration)
+    );
+    assert_eq!(
+        workers.finished()[1].registration.as_ref(),
+        Some(&submitted_registration)
+    );
     assert!(
         workers
             .finished()
@@ -462,7 +563,7 @@ async fn thirty_two_completed_unreaped_real_workers_still_consume_the_bound() {
     let mut workers = SettlementWorkers::new();
     let mut ids = Vec::new();
     for _ in 0..32 {
-        let (id, wire_id) = start_worker(
+        let (id, wire_id, _) = start_worker(
             &mut workers,
             &mut wire,
             &actor,
@@ -480,11 +581,15 @@ async fn thirty_two_completed_unreaped_real_workers_still_consume_the_bound() {
     let (pending, _) = wire.start(&extra).await;
     let token = extra.lock.unwrap().token;
     let retirement = workers.subscribe();
-    let context = actor.context(ConnectionManagement::new());
+    let management = ConnectionManagement::new();
+    let registration = management
+        .register_delivery(LINK, actor.entity.clone(), extra.sequence, token)
+        .await;
+    let context = actor.context(management);
     let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         workers.spawn(
-            Some(token),
-            settle_started_delivery(pending, extra, context, retirement),
+            Some(registration.clone()),
+            settle_started_delivery(pending, extra, Some(registration), context, retirement),
         );
     }));
     assert!(
@@ -637,18 +742,42 @@ async fn natural_pump_joins_commit_before_releasing_its_held_session() {
 async fn late_adoption_preserves_retained_raw_failure_and_allows_only_one_original() {
     let mut workers = SettlementWorkers::new();
     let token = domain::LockToken::new(900);
-    let failed_id = workers.spawn(Some(token), async { panic!("retained-before-adoption") });
+    let management = ConnectionManagement::new();
+    let registration = management
+        .register_delivery(
+            LINK,
+            domain::EntityPath::new("orders").unwrap(),
+            domain::SequenceNumber::new(9),
+            token,
+        )
+        .await;
+    let failed_id = workers.spawn(Some(registration.clone()), async {
+        panic!("retained-before-adoption")
+    });
     let completion = timeout(WAIT, workers.next()).await.unwrap().unwrap();
-    assert!(completion.lock_token.is_none());
+    assert!(completion.registration.is_none());
     assert_eq!(workers.failures()[0].id, failed_id);
     assert_eq!(workers.failures()[0].lock_token, Some(token));
+    assert_eq!(
+        workers.failures()[0].registration.as_ref(),
+        Some(&registration)
+    );
     assert!(workers.failures()[0].error.is_panic());
     assert!(workers.finished().is_empty());
     let ordinary = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         workers.spawn(None, async { Ok(()) });
     }));
     assert!(ordinary.is_err());
-    let adopted_id = workers.adopt_retired(None, async { Ok(()) });
+    let adopted_registration = management
+        .register_delivery(
+            LINK,
+            domain::EntityPath::new("orders").unwrap(),
+            domain::SequenceNumber::new(9),
+            token,
+        )
+        .await;
+    assert_ne!(registration, adopted_registration);
+    let adopted_id = workers.adopt_retired(Some(adopted_registration.clone()), async { Ok(()) });
     let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         workers.adopt_retired(None, async { Ok(()) });
     }));
@@ -656,6 +785,19 @@ async fn late_adoption_preserves_retained_raw_failure_and_allows_only_one_origin
     timeout(WAIT, workers.finish()).await.unwrap();
     assert_eq!(workers.finished().len(), 1);
     assert_eq!(workers.finished()[0].id, adopted_id);
+    assert_eq!(
+        workers.finished()[0].registration.as_ref(),
+        Some(&adopted_registration)
+    );
+    assert_eq!(
+        workers.finished()[0]
+            .result
+            .as_ref()
+            .unwrap()
+            .registration
+            .as_ref(),
+        Some(&adopted_registration)
+    );
     assert!(
         workers.finished()[0]
             .result
@@ -665,6 +807,10 @@ async fn late_adoption_preserves_retained_raw_failure_and_allows_only_one_origin
             .is_ok()
     );
     assert_eq!(workers.failures()[0].id, failed_id);
+    assert_eq!(
+        workers.failures()[0].registration.as_ref(),
+        Some(&registration)
+    );
     let failure = workers.into_join_error().unwrap();
     assert_eq!(failure.id(), failed_id);
     assert_eq!(

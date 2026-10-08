@@ -29,11 +29,12 @@ own live assignments, acceptance and full dependencies.
 - [x] Original management command/reply custody and exact route cleanup (#85, [PR #112](https://github.com/DeandreT/switchyard/pull/112))
 - [x] Original CBS token/native custody and captured reply cleanup (#86); pump coordinator #74 complete
 - [x] Owned original End observation retires attachment/receiving preparation (#110)
+- [x] Captured delivery identities fence registry cleanup and renewal (#117)
 - [x] Pure offline JWT policy and issuer-qualified grants (#8); [consumers/activation pending](offline-jwt.md)
 - [x] Pure bounded SQL predicates, IN/LIKE and scalar arithmetic (#11/#95/#96/#97); [rule integration pending](sql-predicates.md)
 - [x] Bounded Linux SDK child runs and loaded-file custody (#99)
 - [x] Two exact SDK selectors and approved runtime assets (#100); [durable matrix pending](sdk-gates.md)
-- [x] Content-aware owned Cargo handoffs (#105); Linux frozen-input profile only
+- [x] Content-aware owned Cargo handoffs and unit CI (#105/#123); Linux frozen-input profile only
 - [ ] Remaining client semantics, administration and conserved capacity
 - [ ] Real quorum, multi-tenant security, recovery and measured release gates
 
@@ -46,10 +47,9 @@ or administration certification. See [SDK gates](sdk-gates.md) and [compatibilit
 
 ## Next Main Increments
 
-1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7): #117 captured
-   delivery owners -> #111 panic-safe settlements
+1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7): #111 panic-safe settlements
    -> #75 task trees -> #64 admission/deadlines -> #65 signal shutdown. #74 is
-   complete; #75 completes #63. #73/#84/#87/#85/#86/#110 are merged; #117 is ready.
+   complete; #75 completes #63. #73/#84/#87/#85/#86/#110/#117 are merged.
 2. After #7, complete [#12](https://github.com/DeandreT/switchyard/issues/12):
    retained sender #57 -> receiver/settlement #58 -> sessions #59 -> management
    #60. Merged #56 alone is not retained wire authority.
@@ -70,8 +70,7 @@ Integration paths, not every prerequisite. Nodes beyond merged foundations are p
 
 ```mermaid
 flowchart TD
-    Main["Merged foundations/custody; #74/#110 complete"] --> Delivery["#117 Captured delivery owners"]
-    Delivery --> Panic["#111 Panic-safe settlement custody"]
+    Main["Merged foundations/custody; #74/#110/#117 complete"] --> Panic["#111 Panic-safe settlement custody"]
     Panic --> Trees["#75 Task trees / finish #63"]
     Trees --> Admission["#64 Admission/deadlines"]
     Admission --> Signals["#65 Signal shutdown / finish #7"]
@@ -110,13 +109,13 @@ chain. Split multi-PR work into child issues before implementation.
 
 | Lane | Entry And Boundary |
 | --- | --- |
-| Protocol | #117 captured delivery owners, then the ordered chain above; one listener/native/registry owner |
+| Protocol | #111 panic-safe settlement custody, then the ordered chain above; one listener/native/registry owner |
 | SQL | #11 pure kernel complete; [#20](https://github.com/DeandreT/switchyard/issues/20) filters waits for #16 typed content, then #21 actions. Serialize compiler/rule paths; no retained integration yet |
 | Auth activation | #8 policy merged; #71 -> #17 waits for #7. Serialize shared authorization/CBS files, not a current parallel pickup |
 | Replication | [#36](https://github.com/DeandreT/switchyard/issues/36): cluster/storage/proposer replay; retain startup refusal, no quorum claim |
 | Administration | [#10](https://github.com/DeandreT/switchyard/issues/10): Atom fixtures/profiles; [#18](https://github.com/DeandreT/switchyard/issues/18): native Create/Get/List service/protobuf. No listener activation |
 | Domain ports | #13 profiles, #16 content, #23 duplicate history; serialize shared command/codec/key-tag/store-fence edits |
-| Client/release evidence | [#101](https://github.com/DeandreT/switchyard/issues/101): test matrix after #7. [#123](https://github.com/DeandreT/switchyard/issues/123): helper unit CI after #105. Neither owns runtime fixes |
+| Client/release evidence | [#101](https://github.com/DeandreT/switchyard/issues/101): test matrix after #7; no runtime fixes |
 
 Assign before pickup; merge prerequisites first. `status:ready` is only a hint.
 Serialize shared contracts and each C# program; freeze inputs during verification.
