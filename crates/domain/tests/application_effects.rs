@@ -610,6 +610,7 @@ fn storage_failure_cannot_publish_an_effect_and_success_needs_no_shadow_queries<
         keys::topic_config(&fixture.namespace, &shadow),
         keys::queue_capacity_mode(&fixture.namespace, &shadow),
         keys::queue_capacity_usage(&fixture.namespace, &shadow),
+        keys::topic_mode(&fixture.namespace, &shadow),
     ];
     controls.fail_commit.store(true, Ordering::Relaxed);
     controls.refuse_shadow_reads.store(true, Ordering::Relaxed);
@@ -623,7 +624,7 @@ fn storage_failure_cannot_publish_an_effect_and_success_needs_no_shadow_queries<
         }))
     );
     assert_eq!(controls.apply_calls.load(Ordering::Relaxed), attempts + 1);
-    assert_eq!(controls.shadow_metadata_reads.load(Ordering::Relaxed), 4);
+    assert_eq!(controls.shadow_metadata_reads.load(Ordering::Relaxed), 5);
     assert_eq!(fixture.machine.store().snapshot()?, snapshot);
     fixture = fixture.restart()?;
     assert_eq!(fixture.machine.store().snapshot()?, snapshot);
@@ -632,14 +633,14 @@ fn storage_failure_cannot_publish_an_effect_and_success_needs_no_shadow_queries<
     assert_eq!(result.outcome, CommandOutcome::Received(None));
     assert!(result.dead_letters_enqueued);
     assert_eq!(controls.apply_calls.load(Ordering::Relaxed), attempts + 2);
-    assert_eq!(controls.shadow_metadata_reads.load(Ordering::Relaxed), 8);
+    assert_eq!(controls.shadow_metadata_reads.load(Ordering::Relaxed), 10);
     let snapshot = fixture.machine.store().snapshot()?;
     controls.commit_boundary.store(false, Ordering::Relaxed);
     let no_op = apply(&fixture, 21, command)?;
     assert_eq!(no_op.outcome, CommandOutcome::Received(None));
     assert!(!no_op.dead_letters_enqueued);
     assert_eq!(controls.apply_calls.load(Ordering::Relaxed), attempts + 2);
-    assert_eq!(controls.shadow_metadata_reads.load(Ordering::Relaxed), 12);
+    assert_eq!(controls.shadow_metadata_reads.load(Ordering::Relaxed), 15);
     assert_eq!(fixture.machine.store().snapshot()?, snapshot);
     controls.refuse_shadow_reads.store(false, Ordering::Relaxed);
     assert_dead_letters(&fixture, &[sequence])?;

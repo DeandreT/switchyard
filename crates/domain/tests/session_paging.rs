@@ -27,6 +27,7 @@ struct ScanCall {
     prefix: Vec<u8>,
     start: Vec<u8>,
     limit: usize,
+    returned: usize,
 }
 
 #[derive(Clone)]
@@ -58,12 +59,14 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let rows = self.inner.scan_from(prefix, start, limit)?;
         self.scans.lock().expect("scan recorder").push(ScanCall {
             prefix: prefix.to_vec(),
             start: start.to_vec(),
             limit,
+            returned: rows.len(),
         });
-        self.inner.scan_from(prefix, start, limit)
+        Ok(rows)
     }
 }
 
@@ -223,17 +226,31 @@ impl<P: StoreProvider> Node<P> {
     fn assert_page_reads(&self, count: usize) {
         let prefix = keys::entity_session_ready_prefix(&self.namespace, &self.entity);
         let calls = self.scans.lock().expect("scan recorder").clone();
+        let mut mode_prefix = keys::topic_mode(&self.namespace, &self.entity);
+        assert_eq!(mode_prefix.pop(), Some(0));
+        mode_prefix.extend_from_slice(b"/subscriptions/");
+        let metadata: Vec<_> = calls
+            .iter()
+            .filter(|call| call.prefix == mode_prefix)
+            .collect();
+        assert_eq!(metadata.len(), 1, "one completed capacity-profile probe");
+        assert_eq!(metadata[0].start, mode_prefix);
+        assert_eq!(metadata[0].limit, 1);
+        assert_eq!(metadata[0].returned, 0);
+        assert_eq!(calls.last(), Some(metadata[0]));
         let ready: Vec<_> = calls.iter().filter(|call| call.prefix == prefix).collect();
         let probes: Vec<_> = calls
             .iter()
             .filter(|call| call.prefix.first() == Some(&0x14))
             .collect();
         assert_eq!(ready.len(), count);
-        assert_eq!(calls.len(), ready.len() + probes.len());
+        assert_eq!(calls.len(), ready.len() + probes.len() + metadata.len());
         assert!(probes.len() <= count);
         let mut seen = std::collections::BTreeSet::new();
         for call in &probes {
             assert_eq!(call.limit, 1);
+            assert_eq!(call.start, call.prefix);
+            assert_eq!(call.returned, 0);
             assert!(
                 seen.insert(&call.prefix),
                 "one grant probe per eligible session"
@@ -759,7 +776,7 @@ fn page_command_is_appended_with_scoped_cursor_roundtrips_and_unchanged_versions
         assert_eq!(codec::decode::<CommandKind>(&encoded)?, command);
     }
     assert_eq!(codec::ACTIVE_VALUE_FORMAT, 11);
-    assert_eq!(storage::ACTIVE_STORE_FORMAT, 17);
+    assert_eq!(storage::ACTIVE_STORE_FORMAT, 18);
     Ok(())
 }
 

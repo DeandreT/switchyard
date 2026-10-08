@@ -51,6 +51,7 @@ const TAG_SESSION_MESSAGE_LOCK_SUMMARY: u8 = 0x15;
 const TAG_QUEUE_CAPACITY_MODE: u8 = 0x16;
 const TAG_QUEUE_CAPACITY_USAGE: u8 = 0x17;
 const TAG_MESSAGE_CHARGE: u8 = 0x18;
+const TAG_TOPIC_MODE: u8 = 0x19;
 
 const SEPARATOR: u8 = 0x00;
 
@@ -225,6 +226,11 @@ pub(crate) fn subscription_capacity_mode_prefix(
     subscription_descendant_scope(TAG_QUEUE_CAPACITY_MODE, namespace, topic)
 }
 
+/// Descendant scope for detecting misplaced topic-mode metadata.
+pub fn subscription_topic_mode_prefix(namespace: &NamespaceName, topic: &EntityPath) -> Vec<u8> {
+    subscription_descendant_scope(TAG_TOPIC_MODE, namespace, topic)
+}
+
 fn subscription_descendant_scope(
     tag: u8,
     namespace: &NamespaceName,
@@ -311,6 +317,11 @@ pub fn entity_incarnation(namespace: &NamespaceName, owner: &EntityPath) -> Vec<
 /// Mandatory capacity profile for a primary queue, never for its DLQ shadow.
 pub fn queue_capacity_mode(namespace: &NamespaceName, owner: &EntityPath) -> Vec<u8> {
     entity_scope(TAG_QUEUE_CAPACITY_MODE, namespace, owner)
+}
+
+/// Mandatory metadata for a live primary topic, never a child or DLQ.
+pub fn topic_mode(namespace: &NamespaceName, owner: &EntityPath) -> Vec<u8> {
+    entity_scope(TAG_TOPIC_MODE, namespace, owner)
 }
 
 /// Aggregate reservations shared by a finite primary queue and its DLQ.
@@ -707,6 +718,45 @@ pub fn trailing_deadline(key: &[u8]) -> Option<(Timestamp, SequenceNumber)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn topic_mode_is_exact_owner_metadata_and_never_an_opaque_runtime_family() {
+        let owner = entity();
+        let key = topic_mode(&namespace(), &owner);
+        assert_eq!(key, b"\x19tenant\0orders\0");
+        assert_ne!(key, queue_capacity_mode(&namespace(), &owner));
+        let name = SubscriptionName::new("Alpha").unwrap();
+        let child = owner.subscription(&name).unwrap();
+        let shadow = child.dead_letter_queue().unwrap();
+        let descendants = subscription_topic_mode_prefix(&namespace(), &owner);
+        assert!(topic_mode(&namespace(), &child).starts_with(&descendants));
+        assert!(topic_mode(&namespace(), &shadow).starts_with(&descendants));
+        assert!(!key.starts_with(&descendants));
+        assert!(
+            !topic_mode(&NamespaceName::new("tenant-other").unwrap(), &child)
+                .starts_with(&descendants)
+        );
+        assert!(
+            !topic_mode(
+                &namespace(),
+                &EntityPath::new("orders-other")
+                    .unwrap()
+                    .subscription(&name)
+                    .unwrap()
+            )
+            .starts_with(&descendants)
+        );
+        assert!(
+            entity_runtime_prefixes(&namespace(), &owner)
+                .iter()
+                .all(|(prefix, _)| prefix != &key)
+        );
+        assert!(
+            subscription_runtime_prefixes(&namespace(), &owner)
+                .iter()
+                .all(|(prefix, _)| prefix != &descendants)
+        );
+    }
 
     fn namespace() -> NamespaceName {
         NamespaceName::new("tenant").expect("valid namespace")

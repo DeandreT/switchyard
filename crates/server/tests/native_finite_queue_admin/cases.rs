@@ -181,7 +181,7 @@ pub(super) async fn noop_and_exact_config_limit_batches_have_no_postcommit_read<
                 assert_eq!(after.attempts, before.attempts + 1);
                 assert_eq!(after.commits, before.commits + 1);
                 assert_eq!(after.clocks, before.clocks + 1);
-                assert_eq!(after.scans, before.scans);
+                node.metadata_probes(&before, "orders", 4)?;
                 let mut changed = vec![keys::clock()];
                 if config_change {
                     changed.extend(config_keys.clone());
@@ -215,10 +215,13 @@ pub(super) async fn noop_and_exact_config_limit_batches_have_no_postcommit_read<
             node.clock.manual.set(5_000);
             let before = node.checkpoint()?;
             assert_eq!(node.update(definition(&current)).await?, current);
+            node.metadata_probes(&before, "orders", 4)?;
             node.unchanged(&before, 1)?;
             node.clock.manual.set(0);
             let before = node.checkpoint()?;
             code(node.update(definition(&current)).await, Code::Unavailable);
+            // Host-clock refusal precedes the apply-side metadata checks.
+            node.metadata_probes(&before, "orders", 1)?;
             node.unchanged(&before, 1)?;
             assert_eq!(node.get(get("orders")).await?, current);
             Ok(())
@@ -309,6 +312,7 @@ pub(super) async fn explicit_incarnation_refuses_stale_before_host_clock<P: Stor
             let mut stale = definition(&first);
             stale.config.as_mut().unwrap().max_message_bytes = Some(0);
             code(node.update(stale).await, Code::NotFound);
+            node.metadata_probes(&before, "orders", 0)?;
             node.unchanged(&before, 0)?;
             code(node.update(definition(&second)).await, Code::Unavailable);
             node.unchanged(&before, 1)?;

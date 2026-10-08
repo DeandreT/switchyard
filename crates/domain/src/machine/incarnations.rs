@@ -53,11 +53,11 @@ impl<S: StateStore> StateMachine<S> {
             return Err(BrokerError::DanglingEntityMetadata);
         }
         if queue.is_none() && topic.is_none() {
-            return if record.is_some_and(|record| !record.is_retired()) {
-                Err(BrokerError::DanglingEntityMetadata)
-            } else {
-                Ok(None)
-            };
+            if record.is_some_and(|record| !record.is_retired()) {
+                return Err(BrokerError::DanglingEntityMetadata);
+            }
+            self.reject_orphaned_topic_mode(namespace, owner)?;
+            return Ok(None);
         }
         let config = match kind {
             EntityIncarnationKind::Queue | EntityIncarnationKind::Subscription => {
@@ -219,7 +219,8 @@ impl<S: StateStore> StateMachine<S> {
     }
 
     /// Checks capacity for a topology-checked owner, not binding identity or the whole ledger.
-    /// Queue targets require their complete owner profile; excluded kinds require sidecar absence.
+    /// Queues require their owner profile, topics their mandatory mode, and live
+    /// complete subscriptions their parent mode plus child-sidecar absence.
     pub fn validate_capacity_binding_profile(
         &self,
         namespace: &NamespaceName,
@@ -227,12 +228,82 @@ impl<S: StateStore> StateMachine<S> {
         owner: &EntityPath,
         kind: EntityIncarnationKind,
     ) -> Result<(), BrokerError> {
-        if kind == EntityIncarnationKind::Queue {
-            queue_capacity::validate_owner_profile(self, namespace, target)?;
-            Ok(())
-        } else {
-            self.validate_capacity_sidecar_absence(namespace, owner)
+        match kind {
+            EntityIncarnationKind::Queue => {
+                queue_capacity::validate_owner_profile(self, namespace, target)?;
+                Ok(())
+            }
+            EntityIncarnationKind::Topic => {
+                queue_capacity::validate_topic_mode_profile(self, namespace, owner)
+            }
+            EntityIncarnationKind::Subscription => {
+                self.validate_capacity_sidecar_absence(namespace, owner)?;
+                self.validate_topic_mode_sidecar_absence(namespace, owner)?;
+                self.validate_subscription_topic_mode_parent(namespace, owner)
+            }
         }
+    }
+
+    pub(super) fn validate_subscription_topic_mode_parent(
+        &self,
+        namespace: &NamespaceName,
+        owner: &EntityPath,
+    ) -> Result<(), BrokerError> {
+        let Some((parent, name)) = owner.as_str().rsplit_once(crate::SUBSCRIPTION_PATH_SEGMENT)
+        else {
+            return Err(BrokerError::DanglingSubscriptionMetadata);
+        };
+        let parent =
+            EntityPath::new(parent).map_err(|_| BrokerError::DanglingSubscriptionMetadata)?;
+        let name = crate::SubscriptionName::new(name)
+            .map_err(|_| BrokerError::DanglingSubscriptionMetadata)?;
+        if parent.is_dead_letter_queue()
+            || parent.is_subscription_path()
+            || parent.subscription(&name)? != *owner
+        {
+            return Err(BrokerError::DanglingSubscriptionMetadata);
+        }
+        if self
+            .subscription_config_topology(namespace, &parent, &name)?
+            .is_some()
+        {
+            queue_capacity::validate_topic_mode_profile(self, namespace, &parent)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_topic_mode_sidecar_absence(
+        &self,
+        namespace: &NamespaceName,
+        owner: &EntityPath,
+    ) -> Result<(), BrokerError> {
+        let shadow = owner.dead_letter_queue().ok();
+        for entity in std::iter::once(owner).chain(shadow.as_ref()) {
+            if self
+                .store
+                .get(&keys::topic_mode(namespace, entity))?
+                .is_some()
+            {
+                return Err(BrokerError::TopicCapacityCorrupt);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn reject_orphaned_topic_mode(
+        &self,
+        namespace: &NamespaceName,
+        owner: &EntityPath,
+    ) -> Result<(), BrokerError> {
+        self.validate_topic_mode_sidecar_absence(namespace, owner)?;
+        if !self
+            .store
+            .scan_prefix(&keys::subscription_topic_mode_prefix(namespace, owner), 1)?
+            .is_empty()
+        {
+            return Err(BrokerError::TopicCapacityCorrupt);
+        }
+        Ok(())
     }
 
     /// Checks only Mode/Usage absence on a supplied owner and its representable DLQ.
@@ -363,6 +434,7 @@ impl<S: StateStore> StateMachine<S> {
                 return Err(BrokerError::QueueCapacityCorrupt);
             }
         }
+        self.reject_orphaned_topic_mode(namespace, owner)?;
         Ok(())
     }
 

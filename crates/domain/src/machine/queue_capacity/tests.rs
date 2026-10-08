@@ -168,8 +168,8 @@ fn primary_and_shadow_profiles_share_nine_clock_free_point_reads() {
         assert_eq!(profile.kind(), EntityIncarnationKind::Queue);
         assert_eq!(profile.config(), QueueConfig::default());
         assert_eq!(profile.usage().unwrap().reserved_bytes(), 0);
-        assert_eq!(machine.store().gets.load(Ordering::SeqCst), 9);
-        assert_eq!(machine.store().scans.load(Ordering::SeqCst), 0);
+        assert_eq!(machine.store().gets.load(Ordering::SeqCst), 11);
+        assert_eq!(machine.store().scans.load(Ordering::SeqCst), 1);
         assert_eq!(machine.store().snapshots.load(Ordering::SeqCst), 0);
         assert_eq!(machine.store().applies.load(Ordering::SeqCst), 0);
         assert!(machine.store().inner.get(&keys::clock()).unwrap().is_none());
@@ -207,9 +207,9 @@ fn multiple_retains_use_one_aggregate_and_do_not_apply_or_scan() {
     }
     let mut batch = WriteBatch::default();
     plan.finish(&machine, &mut batch).unwrap();
-    assert_eq!(machine.store().gets.load(Ordering::SeqCst), 13);
+    assert_eq!(machine.store().gets.load(Ordering::SeqCst), 15);
     assert_eq!(machine.store().applies.load(Ordering::SeqCst), 0);
-    assert_eq!(machine.store().scans.load(Ordering::SeqCst), 0);
+    assert_eq!(machine.store().scans.load(Ordering::SeqCst), 1);
     machine.store().inner.apply(batch).unwrap();
     let one = MessageCharge::for_new_record(1, &record(1))
         .unwrap()
@@ -376,8 +376,8 @@ fn valid_base_check_cannot_hide_behind_zero_aggregate_usage() {
     );
     assert_eq!(batch.mutations().len(), 1);
     assert_eq!(machine.store().inner.snapshot().unwrap(), before);
-    assert_eq!(machine.store().gets.load(Ordering::SeqCst), 10);
-    assert_eq!(machine.store().scans.load(Ordering::SeqCst), 0);
+    assert_eq!(machine.store().gets.load(Ordering::SeqCst), 12);
+    assert_eq!(machine.store().scans.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -420,7 +420,7 @@ fn distinct_known_base_charges_must_fit_both_initial_count_and_bytes() {
         assert_eq!(machine.store().inner.snapshot().unwrap(), before);
         assert_eq!(
             machine.store().gets.load(Ordering::SeqCst),
-            if count_understated { 10 } else { 11 }
+            if count_understated { 12 } else { 13 }
         );
     }
 }
@@ -463,7 +463,7 @@ fn known_base_source_must_leave_a_structurally_plausible_unknown_residual() {
         assert!(matches!(&batch.mutations()[0], Mutation::Put { key, value }
             if key.as_slice() == b"old sentinel" && value.as_slice() == b"unchanged"));
         assert_eq!(machine.store().inner.snapshot().unwrap(), before);
-        assert_eq!(machine.store().gets.load(Ordering::SeqCst), 10);
+        assert_eq!(machine.store().gets.load(Ordering::SeqCst), 12);
     }
 }
 
@@ -480,7 +480,7 @@ fn repeated_cached_base_check_counts_coverage_once() {
     let mut batch = WriteBatch::default();
     plan.finish(&machine, &mut batch).unwrap();
     assert!(batch.is_empty());
-    assert_eq!(machine.store().gets.load(Ordering::SeqCst), 10);
+    assert_eq!(machine.store().gets.load(Ordering::SeqCst), 12);
 }
 
 #[test]
@@ -520,7 +520,7 @@ fn staged_new_and_transferred_checks_do_not_claim_base_source_coverage() {
         plan.finish(&machine, &mut batch).unwrap();
         assert_eq!(
             machine.store().gets.load(Ordering::SeqCst),
-            if initially_retained { 12 } else { 13 }
+            if initially_retained { 14 } else { 15 }
         );
         machine.store().inner.apply(batch).unwrap();
         assert_eq!(usage(&machine, &namespace, &owner).message_count(), 1);
@@ -530,7 +530,7 @@ fn staged_new_and_transferred_checks_do_not_claim_base_source_coverage() {
                 .unwrap()
                 .charged_bytes()
         );
-        assert_eq!(machine.store().scans.load(Ordering::SeqCst), 0);
+        assert_eq!(machine.store().scans.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -674,7 +674,7 @@ fn transfer_vector_counts_original_messages_and_bounds_both_ledger_sides() {
     assert_eq!(batch.mutations().len(), MAX_CAPACITY_LEDGER_KEYS + 1);
     assert_eq!(
         machine.store().gets.load(Ordering::SeqCst),
-        9 + 3 * MAX_CAPACITY_MESSAGES
+        11 + 3 * MAX_CAPACITY_MESSAGES
     );
     machine.store().inner.apply(batch).unwrap();
     assert_eq!(usage(&machine, &namespace, &owner).reserved_bytes(), total);
@@ -682,7 +682,7 @@ fn transfer_vector_counts_original_messages_and_bounds_both_ledger_sides() {
         usage(&machine, &namespace, &owner).message_count(),
         MAX_CAPACITY_MESSAGES as u64
     );
-    assert_eq!(machine.store().scans.load(Ordering::SeqCst), 0);
+    assert_eq!(machine.store().scans.load(Ordering::SeqCst), 1);
     assert_eq!(machine.store().applies.load(Ordering::SeqCst), 0);
 
     let mut plan = CapacityPlan::existing(&namespace, &owner);
@@ -946,7 +946,42 @@ fn validated_topic_and_subscription_profiles_refuse_accounting_markers() {
                 keys::topic_config(&namespace, &owner),
                 codec::encode(&TopicConfig::default()).unwrap(),
             );
+            setup.push_put(
+                keys::topic_mode(&namespace, &owner),
+                NonFiniteTopicMode::non_finite(1).unwrap().encode().unwrap(),
+            );
         } else {
+            let (parent, member) = owner
+                .as_str()
+                .rsplit_once(crate::SUBSCRIPTION_PATH_SEGMENT)
+                .unwrap();
+            let parent = EntityPath::new(parent).unwrap();
+            let member = crate::SubscriptionName::new(member).unwrap();
+            setup.push_delete(keys::queue_config(&namespace, &parent));
+            setup.push_delete(keys::queue_config(
+                &namespace,
+                &parent.dead_letter_queue().unwrap(),
+            ));
+            setup.push_delete(keys::queue_capacity_mode(&namespace, &parent));
+            setup.push_put(
+                keys::entity_incarnation(&namespace, &parent),
+                codec::encode(
+                    &EntityIncarnation::new(1, EntityIncarnationKind::Topic, false).unwrap(),
+                )
+                .unwrap(),
+            );
+            setup.push_put(
+                keys::topic_config(&namespace, &parent),
+                codec::encode(&TopicConfig::default()).unwrap(),
+            );
+            setup.push_put(
+                keys::topic_mode(&namespace, &parent),
+                NonFiniteTopicMode::non_finite(1).unwrap().encode().unwrap(),
+            );
+            setup.push_put(
+                keys::subscription(&namespace, &parent, &member),
+                codec::encode(&crate::SubscriptionConfig::default()).unwrap(),
+            );
             setup.push_put(
                 keys::queue_config(&namespace, &owner),
                 codec::encode(&QueueConfig::default()).unwrap(),
@@ -1016,12 +1051,13 @@ fn fresh_topic_override_checks_markers_without_rereading_unstaged_base_topology(
     let mut plan = CapacityPlan::existing(&namespace, &owner);
     plan.prepare_excluded_owner(
         EntityIncarnation::new(1, EntityIncarnationKind::Topic, false).unwrap(),
+        NonFiniteTopicMode::non_finite(1).unwrap(),
     )
     .unwrap();
     let mut batch = WriteBatch::default();
     plan.finish(&machine, &mut batch).unwrap();
     assert!(batch.is_empty());
-    assert_eq!(machine.store().gets.load(Ordering::SeqCst), 4);
+    assert_eq!(machine.store().gets.load(Ordering::SeqCst), 6);
     machine
         .store()
         .inner
@@ -1030,6 +1066,7 @@ fn fresh_topic_override_checks_markers_without_rereading_unstaged_base_topology(
     let mut plan = CapacityPlan::existing(&namespace, &owner);
     plan.prepare_excluded_owner(
         EntityIncarnation::new(1, EntityIncarnationKind::Topic, false).unwrap(),
+        NonFiniteTopicMode::non_finite(1).unwrap(),
     )
     .unwrap();
     assert_eq!(
@@ -1126,6 +1163,50 @@ fn read_operation_and_key_byte_limits_refuse_before_an_extra_backend_read() {
         Err(BrokerError::QueueCapacityWorkLimitExceeded)
     );
     assert_eq!(store.gets.load(Ordering::SeqCst), MAX_CAPACITY_READS);
+    let (namespace, owner) = names();
+    let prefix = keys::subscription_topic_mode_prefix(&namespace, &owner);
+    let mut budget = ReadBudget {
+        reads: MAX_CAPACITY_READS,
+        ..ReadBudget::default()
+    };
+    assert_eq!(
+        budget.absent_topic_mode_descendants(&store, &namespace, &owner),
+        Err(BrokerError::QueueCapacityWorkLimitExceeded)
+    );
+    assert_eq!(store.scans.load(Ordering::SeqCst), 0);
+    let mut budget = ReadBudget {
+        key_bytes: MAX_CAPACITY_READ_KEY_BYTES - prefix.len() + 1,
+        ..ReadBudget::default()
+    };
+    assert_eq!(
+        budget.absent_topic_mode_descendants(&store, &namespace, &owner),
+        Err(BrokerError::QueueCapacityWorkLimitExceeded)
+    );
+    assert_eq!(store.scans.load(Ordering::SeqCst), 0);
+    let child = owner
+        .subscription(&crate::SubscriptionName::new("ghost").unwrap())
+        .unwrap();
+    let key = keys::topic_mode(&namespace, &child);
+    store
+        .inner
+        .apply(WriteBatch::default().put(key.clone(), vec![255; MAX_CAPACITY_READ_VALUE_BYTES + 1]))
+        .unwrap();
+    assert_eq!(
+        ReadBudget::default().absent_topic_mode_descendants(&store, &namespace, &owner),
+        Err(BrokerError::QueueCapacityWorkLimitExceeded)
+    );
+    assert_eq!(store.scans.load(Ordering::SeqCst), 1);
+    let mut oversized_key = prefix;
+    oversized_key.resize(MAX_CAPACITY_READ_KEY_BYTES + 1, b'x');
+    store
+        .inner
+        .apply(WriteBatch::default().delete(key).put(oversized_key, vec![]))
+        .unwrap();
+    assert_eq!(
+        ReadBudget::default().absent_topic_mode_descendants(&store, &namespace, &owner),
+        Err(BrokerError::QueueCapacityWorkLimitExceeded)
+    );
+    assert_eq!(store.scans.load(Ordering::SeqCst), 2);
     let mut budget = ReadBudget::default();
     assert_eq!(
         budget.get(&store, &vec![0; MAX_CAPACITY_READ_KEY_BYTES + 1]),

@@ -217,6 +217,22 @@ fn membership_reader_uses_one_bounded_lookahead_instead_of_an_unbounded_scan<P: 
             .len(),
         MAX_TOPIC_SUBSCRIPTIONS
     );
+    let mut mode_prefix = keys::topic_mode(&fixture.namespace, &fixture.entity);
+    assert_eq!(mode_prefix.pop(), Some(0));
+    mode_prefix.extend_from_slice(domain::SUBSCRIPTION_PATH_SEGMENT.as_bytes());
+    let mut expected = vec![(prefix.clone(), MAX_TOPIC_SUBSCRIPTIONS + 1)];
+    for _ in 0..=MAX_TOPIC_SUBSCRIPTIONS {
+        expected.push((mode_prefix.clone(), 1));
+    }
+    assert_eq!(observations.lock().expect("observations").scans, expected);
+    *observations.lock().expect("observations") = Observations::default();
+    assert_eq!(
+        fixture
+            .machine
+            .subscriptions_topology(&fixture.namespace, &fixture.entity)?
+            .len(),
+        MAX_TOPIC_SUBSCRIPTIONS
+    );
     assert_eq!(
         observations.lock().expect("observations").scans,
         vec![(prefix.clone(), MAX_TOPIC_SUBSCRIPTIONS + 1)]

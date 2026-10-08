@@ -122,8 +122,8 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
                 .post_commit_reads
                 .fetch_add(1, Ordering::SeqCst);
         }
-        // Original ordinary timer handlers finish before the first incarnation read.
-        // Reset for each command so later handlers remain observable in this sweep.
+        // Incarnation reads start the profile bucket, including membership reads
+        // after the parent-mode check. Clock resets it for each command.
         if key == keys::clock().as_slice() {
             self.observed.in_profile.store(false, Ordering::SeqCst);
         }
@@ -463,7 +463,7 @@ fn independent_pages_wrap_without_starving_either_entity_kind<P: StoreProvider>(
     assert_eq!(first.queues_swept, MAX_QUEUES_PER_SWEEP);
     assert!(first.is_idle());
     let reads = node.store.topic_reads();
-    assert_eq!(reads.len(), MAX_TOPICS_PER_SWEEP * 3 + MAX_QUEUES_PER_SWEEP);
+    assert_eq!(reads.len(), MAX_TOPICS_PER_SWEEP * 2 + MAX_QUEUES_PER_SWEEP);
     assert_eq!(
         reads
             .iter()
@@ -476,7 +476,7 @@ fn independent_pages_wrap_without_starving_either_entity_kind<P: StoreProvider>(
             .iter()
             .filter(|read| read.entity.as_str().starts_with("topic-"))
             .count(),
-        MAX_TOPICS_PER_SWEEP * 3
+        MAX_TOPICS_PER_SWEEP * 2
     );
     assert_eq!(node.store.pages(14).len(), 1);
     assert_eq!(node.store.pages(1).len(), 1);
@@ -510,7 +510,7 @@ fn independent_pages_wrap_without_starving_either_entity_kind<P: StoreProvider>(
     ];
     expected.extend(vec![
         cursor(&format!("topic-{:04}", MAX_TOPICS_PER_SWEEP));
-        3
+        2
     ]);
     assert_eq!(node.store.topic_reads(), expected);
     node.store.clear();
@@ -617,7 +617,6 @@ fn corrupt_topic_and_transient_discovery_advance_only_the_attempted_cursor<P: St
         vec![
             cursor("queue"),
             cursor("queue/$deadletterqueue"),
-            cursor("z-due"),
             cursor("z-due"),
             cursor("z-due")
         ]

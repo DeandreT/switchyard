@@ -295,3 +295,75 @@ fn business_and_entry_aggregate_bytes_and_extra_rows_refuse_before_result_copy()
     assert_eq!(business.record(b"extra", 0), Err(Error::Limit));
     Ok(())
 }
+
+#[test]
+fn paired_topic_layout_eighteen_refuses_each_previous_role_without_logical_rewrite() -> TestResult {
+    for role in [Role::State, Role::Log] {
+        let parent = tempfile::TempDir::new()?;
+        let (locations, mut pair) = native(parent.path())?;
+        pair.create(None)?;
+        let expected = pair.capture()?;
+        let old = match role {
+            Role::State => 0xa000_0000 | super::super::super::STORE_FORMAT_V17,
+            Role::Log => 0xb000_0000 | super::super::super::STORE_FORMAT_V17,
+        };
+        let index = if role == Role::State { 0 } else { 1 };
+        let BackendPair::Fjall { state, log } = &mut pair.backend else {
+            panic!("native fixture")
+        };
+        let capsule = if role == Role::State {
+            &state.capsule
+        } else {
+            &log.capsule
+        };
+        let mut batch = capsule
+            .database
+            .batch()
+            .durability(Some(::fjall::PersistMode::SyncAll));
+        batch.insert(
+            &capsule.meta,
+            super::super::super::FORMAT_VERSION_KEY,
+            old.to_be_bytes().to_vec(),
+        );
+        batch.commit()?;
+        drop(pair);
+        let before = [
+            physical_capture_without_admission(&locations.paths[0])?,
+            physical_capture_without_admission(&locations.paths[1])?,
+        ];
+        assert_eq!(
+            reopen_controlled_fixture(&locations, binding()),
+            Err(Error::InvalidLogical)
+        );
+        assert_eq!(
+            physical_capture_without_admission(&locations.paths[0])?,
+            before[0]
+        );
+        assert_eq!(
+            physical_capture_without_admission(&locations.paths[1])?,
+            before[1]
+        );
+        let database = ::fjall::Database::recover(
+            ::fjall::Database::builder(&locations.paths[index])
+                .worker_threads(1)
+                .into_config(),
+        )?;
+        let meta = database.keyspace(
+            super::super::super::META_KEYSPACE,
+            ::fjall::KeyspaceCreateOptions::default,
+        )?;
+        let mut batch = database
+            .batch()
+            .durability(Some(::fjall::PersistMode::SyncAll));
+        batch.insert(
+            &meta,
+            super::super::super::FORMAT_VERSION_KEY,
+            role.format().to_be_bytes().to_vec(),
+        );
+        batch.commit()?;
+        drop(meta);
+        drop(database);
+        assert_eq!(twice(&locations)?, expected);
+    }
+    Ok(())
+}

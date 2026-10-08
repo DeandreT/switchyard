@@ -65,6 +65,7 @@ impl<S: StateStore> StateMachine<S> {
             {
                 return Err(BrokerError::QueueCapacityCorrupt);
             }
+            self.reject_orphaned_topic_mode(namespace, entity)?;
             return Ok(None);
         }
         view(&queue_capacity::validate_owner_profile(

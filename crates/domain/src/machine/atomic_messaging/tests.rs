@@ -13,11 +13,15 @@ struct PointStore {
     memory: MemoryStore,
     commits: Arc<AtomicUsize>,
     scans: Arc<AtomicUsize>,
+    metadata_probes: Arc<AtomicUsize>,
+    topic_mode_probe: Option<Key>,
+    gets: Arc<AtomicUsize>,
     fail: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl StateStore for PointStore {
     fn get(&self, key: &[u8]) -> Result<Option<Value>, StorageError> {
+        self.gets.fetch_add(1, Ordering::SeqCst);
         self.memory.get(key)
     }
     fn apply(&self, batch: WriteBatch) -> Result<(), StorageError> {
@@ -37,7 +41,16 @@ impl StateStore for PointStore {
             detail: String::from("forbidden"),
         })
     }
-    fn scan_from(&self, _: &[u8], _: &[u8], _: usize) -> Result<Vec<(Key, Value)>, StorageError> {
+    fn scan_from(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Key, Value)>, StorageError> {
+        if self.topic_mode_probe.as_deref() == Some(prefix) && start == prefix && limit == 1 {
+            self.metadata_probes.fetch_add(1, Ordering::SeqCst);
+            return self.memory.scan_from(prefix, start, limit);
+        }
         self.scans.fetch_add(1, Ordering::SeqCst);
         Err(StorageError::Backend {
             operation: "scan",
@@ -47,7 +60,7 @@ impl StateStore for PointStore {
 }
 
 fn fixture() -> Result<(StateMachine<PointStore>, EntityBinding), BrokerError> {
-    let store = PointStore::default();
+    let mut store = PointStore::default();
     let setup = StateMachine::new(store.memory.clone());
     let namespace = NamespaceName::new("test")?;
     let entity = EntityPath::new("queue")?;
@@ -59,11 +72,14 @@ fn fixture() -> Result<(StateMachine<PointStore>, EntityBinding), BrokerError> {
             config: QueueConfig::default(),
         },
     ))?;
+    store.topic_mode_probe = Some(keys::subscription_topic_mode_prefix(&namespace, &entity));
     let machine = StateMachine::new(store);
     let binding = machine
         .bind_entity(&namespace, &entity, &entity, EntityIncarnationKind::Queue)?
         .ok_or(BrokerError::QueueNotFound)?;
     machine.store.commits.store(0, Ordering::SeqCst);
+    machine.store.metadata_probes.store(0, Ordering::SeqCst);
+    machine.store.gets.store(0, Ordering::SeqCst);
     Ok((machine, binding))
 }
 
@@ -97,7 +113,7 @@ fn send(id: &str) -> CommandKind {
 }
 
 #[test]
-fn preparation_has_no_backing_scans_and_only_one_real_commit() -> Result<(), BrokerError> {
+fn preparation_allows_only_scoped_metadata_probes_and_one_real_commit() -> Result<(), BrokerError> {
     let (machine, binding) = fixture()?;
     let application = machine
         .apply_atomic_messaging(&envelope(binding.clone(), vec![send("one"), send("two")]))?;
@@ -105,6 +121,8 @@ fn preparation_has_no_backing_scans_and_only_one_real_commit() -> Result<(), Bro
     assert_eq!(application.enqueue_targets, vec![binding.target().clone()]);
     assert_eq!(machine.store.commits.load(Ordering::SeqCst), 1);
     assert_eq!(machine.store.scans.load(Ordering::SeqCst), 0);
+    // Admission plus an ingress and capacity proof for each send.
+    assert_eq!(machine.store.metadata_probes.load(Ordering::SeqCst), 5);
     let counters = machine
         .read::<QueueCounters>(&keys::queue_counters(binding.namespace(), binding.target()))?
         .ok_or(BrokerError::DanglingEntityMetadata)?;
@@ -152,6 +170,7 @@ fn empty_envelope_ignores_clock_but_still_validates_current_identity() -> Result
     assert!(result.outcomes.is_empty() && result.enqueue_targets.is_empty());
     assert_eq!(machine.store.memory.snapshot()?, before);
     assert_eq!(machine.store.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(machine.store.metadata_probes.load(Ordering::SeqCst), 2);
     machine
         .store
         .memory
@@ -167,7 +186,7 @@ fn empty_envelope_ignores_clock_but_still_validates_current_identity() -> Result
 }
 
 #[test]
-fn every_allowed_held_settlement_remains_point_read_only() -> Result<(), BrokerError> {
+fn every_allowed_held_settlement_allows_only_scoped_metadata_probes() -> Result<(), BrokerError> {
     for operation in 0..5 {
         let (machine, binding) = fixture()?;
         let seeder = StateMachine::new(machine.store.memory.clone());
@@ -234,6 +253,91 @@ fn every_allowed_held_settlement_remains_point_read_only() -> Result<(), BrokerE
         assert_eq!(result.enqueue_targets, expected);
         assert_eq!(machine.store.commits.load(Ordering::SeqCst), 1);
         assert_eq!(machine.store.scans.load(Ordering::SeqCst), 0);
+        assert_eq!(machine.store.metadata_probes.load(Ordering::SeqCst), 2);
     }
+    Ok(())
+}
+
+#[test]
+fn atomic_prelude_priority_rejects_before_store_work() -> Result<(), BrokerError> {
+    #[derive(serde::Serialize)]
+    struct BindingBytes {
+        namespace: NamespaceName,
+        target: EntityPath,
+        owner: EntityPath,
+        kind: EntityIncarnationKind,
+        generation: u64,
+    }
+    let (machine, binding) = fixture()?;
+    let invalid: EntityBinding = codec::decode(&codec::encode(&BindingBytes {
+        namespace: binding.namespace().clone(),
+        target: binding.target().clone(),
+        owner: binding.owner().clone(),
+        kind: EntityIncarnationKind::Topic,
+        generation: 0,
+    })?)?;
+    let valid_topic = EntityBinding::new(
+        binding.namespace().clone(),
+        binding.owner().clone(),
+        binding.owner().clone(),
+        EntityIncarnationKind::Topic,
+        binding.generation(),
+    )?;
+    let mut wrong_scope = envelope(invalid.clone(), vec![send("scope")]);
+    wrong_scope.commands[0].namespace = NamespaceName::new("other")?;
+    let mut unsupported = wrong_scope.clone();
+    unsupported.commands[0].kind = CommandKind::ExpireLocks;
+    let mut too_many = wrong_scope.clone();
+    too_many.commands =
+        vec![wrong_scope.commands[0].clone(); crate::MAX_ATOMIC_MESSAGING_ACTIONS + 1];
+    for (input, expected) in [
+        (
+            unsupported,
+            BrokerError::AtomicMessagingOperationNotSupported,
+        ),
+        (too_many, crate::AtomicMessagingLimit::Actions.exceeded()),
+        (wrong_scope, BrokerError::InvalidAtomicMessagingCommand),
+        (envelope(invalid, vec![]), BrokerError::InvalidEntityBinding),
+        (
+            envelope(valid_topic, vec![]),
+            BrokerError::AtomicMessagingOperationNotSupported,
+        ),
+    ] {
+        assert_eq!(
+            machine.validate_atomic_messaging(&input),
+            Err(expected.clone())
+        );
+        assert_eq!(machine.apply_atomic_messaging(&input), Err(expected));
+        assert_eq!(machine.store.gets.load(Ordering::SeqCst), 0);
+        assert_eq!(machine.store.metadata_probes.load(Ordering::SeqCst), 0);
+        assert_eq!(machine.store.scans.load(Ordering::SeqCst), 0);
+        assert_eq!(machine.store.commits.load(Ordering::SeqCst), 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn atomic_gate_rejects_ghost_topic_mode_without_staging_or_commit() -> Result<(), BrokerError> {
+    let (machine, binding) = fixture()?;
+    let child = binding
+        .owner()
+        .subscription(&crate::SubscriptionName::new("ghost")?)?;
+    machine.store.memory.apply(
+        WriteBatch::default().put(keys::topic_mode(binding.namespace(), &child), vec![255]),
+    )?;
+    let before = machine.store.memory.snapshot()?;
+    let input = envelope(binding, vec![send("not-staged")]);
+    assert_eq!(
+        machine.validate_atomic_messaging(&input),
+        Err(BrokerError::TopicCapacityCorrupt)
+    );
+    assert_eq!(
+        machine.apply_atomic_messaging(&input),
+        Err(BrokerError::TopicCapacityCorrupt)
+    );
+    assert_eq!(machine.store.metadata_probes.load(Ordering::SeqCst), 2);
+    assert_eq!(machine.store.scans.load(Ordering::SeqCst), 0);
+    assert_eq!(machine.store.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(machine.store.memory.snapshot()?, before);
     Ok(())
 }

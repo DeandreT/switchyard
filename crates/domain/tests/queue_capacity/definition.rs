@@ -8,6 +8,8 @@ struct DefinitionObservation {
     forbid_clock: bool,
     fail_before_apply: bool,
     reads: Vec<Key>,
+    topic_mode_probe: Option<Key>,
+    mode_probes: Vec<(Key, Key, usize, usize)>,
     commits: usize,
     mutations: Vec<Mutation>,
     before: Option<StoreSnapshot>,
@@ -37,11 +39,29 @@ impl<S: StateStore> StateStore for DefinitionStore<S> {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Key, Value)>, StorageError> {
-        assert!(
-            !self.observation.lock().unwrap().armed,
-            "definition must use point reads"
-        );
-        self.inner.scan_from(prefix, start, limit)
+        let armed = {
+            let observed = self.observation.lock().unwrap();
+            if observed.armed {
+                assert!(!observed.applied, "definition must not scan after apply");
+                assert_eq!(observed.topic_mode_probe.as_deref(), Some(prefix));
+                assert_eq!(start, prefix);
+                assert_eq!(limit, 1);
+            }
+            observed.armed
+        };
+        let rows = self.inner.scan_from(prefix, start, limit)?;
+        if armed {
+            assert!(
+                rows.is_empty(),
+                "healthy definition has no descendant TopicMode"
+            );
+            let mut observed = self.observation.lock().unwrap();
+            assert!(observed.armed && !observed.applied);
+            observed
+                .mode_probes
+                .push((prefix.to_vec(), start.to_vec(), limit, rows.len()));
+        }
+        Ok(rows)
     }
 
     fn snapshot(&self) -> Result<StoreSnapshot, StorageError> {
@@ -115,6 +135,10 @@ fn observed_fixture<P: StoreProvider>(
         limit,
         config,
     )?;
+    observation.lock().unwrap().topic_mode_probe = Some(keys::subscription_topic_mode_prefix(
+        &fixture.namespace,
+        &fixture.entity,
+    ));
     Ok((fixture, observation))
 }
 
@@ -124,11 +148,13 @@ fn arm(
     forbid_clock: bool,
     fail_before_apply: bool,
 ) {
+    let topic_mode_probe = observation.lock().unwrap().topic_mode_probe.clone();
     *observation.lock().unwrap() = DefinitionObservation {
         armed: true,
         forbid_clock,
         fail_before_apply,
         before: Some(before),
+        topic_mode_probe,
         ..DefinitionObservation::default()
     };
 }
@@ -139,6 +165,23 @@ fn disarm(observation: &Arc<Mutex<DefinitionObservation>>) -> DefinitionObservat
     observed.armed = false;
     observed.applied = false;
     result
+}
+
+fn assert_mode_probes(observed: &DefinitionObservation, count: usize) {
+    let prefix = observed
+        .topic_mode_probe
+        .as_ref()
+        .expect("fixed owner scope");
+    assert_eq!(observed.mode_probes.len(), count);
+    assert!(
+        observed
+            .mode_probes
+            .iter()
+            .all(|(query, start, limit, returned)| query == prefix
+                && start == query
+                && *limit == 1
+                && *returned == 0)
+    );
 }
 
 fn instruction(
@@ -239,6 +282,7 @@ fn whole_definition_is_one_batch_and_returns_the_prepared_view<P: StoreProvider>
     arm(&observation, before.clone(), false, false);
     let result = define(&fixture, &binding, 2, desired, 3_000)?;
     let observed = disarm(&observation);
+    assert_mode_probes(&observed, 3);
     let expected = mutations(&binding, 2, Some(desired), Some(3_000))?;
     assert_eq!(observed.commits, 1);
     assert_eq!(observed.mutations, expected);
@@ -287,6 +331,7 @@ fn config_only_and_limit_only_do_not_rewrite_usage_or_other_metadata<P: StorePro
         arm(&observation, before.clone(), false, false);
         define(&fixture, &binding, millis, desired, limit)?;
         let observed = disarm(&observation);
+        assert_mode_probes(&observed, 3);
         let expected = mutations(&binding, millis, config_change, limit_change)?;
         assert_eq!(observed.commits, 1);
         assert_eq!(observed.mutations, expected);
@@ -310,6 +355,7 @@ fn unchanged_definition_keeps_every_row_and_still_checks_clock_regression<P: Sto
         arm(&observation, before.clone(), false, false);
         let result = define(&fixture, &binding, millis, QueueConfig::default(), 2_000)?;
         let observed = disarm(&observation);
+        assert_mode_probes(&observed, 3);
         assert_eq!(observed.commits, 0);
         assert!(observed.mutations.is_empty());
         assert!(observed.reads.contains(&keys::clock()));
@@ -643,6 +689,7 @@ fn stale_and_invalid_bindings_are_refused_before_stored_clock_reads<P: StoreProv
         Err(BrokerError::EntityBindingStale)
     );
     let observed = disarm(&observation);
+    assert_mode_probes(&observed, 0);
     assert_eq!(observed.commits, 0);
     assert_eq!(fixture.machine.store().snapshot()?, before);
     let invalid: EntityBinding = codec::decode(&codec::encode(&(
@@ -657,7 +704,9 @@ fn stale_and_invalid_bindings_are_refused_before_stored_clock_reads<P: StoreProv
         define(&fixture, &invalid, 0, QueueConfig::default(), 3_000),
         Err(BrokerError::InvalidEntityBinding)
     );
-    assert_eq!(disarm(&observation).commits, 0);
+    let observed = disarm(&observation);
+    assert_mode_probes(&observed, 0);
+    assert_eq!(observed.commits, 0);
     assert_eq!(fixture.machine.store().snapshot()?, before);
     Ok(())
 }
@@ -760,6 +809,7 @@ fn preapply_storage_refusal_preserves_all_rows_reopens_and_retries<P: StoreProvi
         Err(BrokerError::Storage(StorageError::Backend { .. }))
     ));
     let observed = disarm(&observation);
+    assert_mode_probes(&observed, 3);
     assert_eq!(observed.commits, 1);
     assert_eq!(observed.mutations, expected);
     assert_eq!(fixture.machine.store().snapshot()?, before);
@@ -768,6 +818,7 @@ fn preapply_storage_refusal_preserves_all_rows_reopens_and_retries<P: StoreProvi
     arm(&observation, before.clone(), false, false);
     let result = define(&fixture, &binding, 2, desired, 3_000)?;
     let observed = disarm(&observation);
+    assert_mode_probes(&observed, 3);
     assert_eq!(observed.commits, 1);
     assert_eq!(observed.mutations, expected);
     assert_eq!(

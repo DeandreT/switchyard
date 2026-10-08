@@ -33,6 +33,8 @@ const RAW_PREFIX: &str = "queue.scan.v1.";
 
 #[derive(Clone, Debug)]
 struct Scan {
+    prefix: Key,
+    start: Key,
     limit: usize,
     rows: Vec<Key>,
 }
@@ -75,6 +77,8 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
         self.observations.reads.fetch_add(1, Ordering::SeqCst);
         let rows = self.inner.scan_from(prefix, start, limit)?;
         self.observations.scans.lock().expect("scans").push(Scan {
+            prefix: prefix.to_vec(),
+            start: start.to_vec(),
             limit,
             rows: rows.iter().map(|(key, _)| key.clone()).collect(),
         });
@@ -210,6 +214,48 @@ fn raw_cursor(token: &str) -> TestResult<GetEntityRequest> {
     )?)
 }
 
+fn discovery_scans(scans: Vec<Scan>, page: &ListEntitiesResponse) -> Vec<Scan> {
+    let namespace = NamespaceName::new("tenant").expect("namespace");
+    let discovery_count = scans
+        .len()
+        .checked_sub(page.entities.len())
+        .expect("returned-owner probes");
+    let (discovery, metadata) = scans.split_at(discovery_count);
+    for (scan, entity) in metadata.iter().zip(&page.entities) {
+        let prefix = keys::subscription_topic_mode_prefix(
+            &namespace,
+            &EntityPath::new(&entity.path).expect("returned Queue owner"),
+        );
+        assert_eq!(scan.prefix, prefix);
+        assert_eq!(scan.start, prefix);
+        assert_eq!(scan.limit, 1);
+        assert!(scan.rows.is_empty());
+    }
+    let prefix = keys::namespace_queue_config_prefix(&namespace);
+    for scan in discovery {
+        assert_eq!(scan.prefix, prefix);
+        assert!(scan.start.starts_with(&prefix));
+        assert!(
+            scan.rows
+                .iter()
+                .all(|row| row.starts_with(&prefix) && row >= &scan.start)
+        );
+        assert!(scan.rows.windows(2).all(|rows| rows[0] < rows[1]));
+    }
+    for adjacent in discovery.windows(2) {
+        assert_eq!(adjacent[0].rows.len(), adjacent[0].limit);
+        let consumed = adjacent[0]
+            .rows
+            .len()
+            .checked_sub(2)
+            .expect("backend lookahead");
+        let mut start = adjacent[0].rows[consumed].clone();
+        start.push(0);
+        assert_eq!(adjacent[1].start, start);
+    }
+    discovery.to_vec()
+}
+
 fn assert_bounds(scans: &[Scan]) {
     assert!(scans.len() <= MAX_NATIVE_QUEUE_SCAN_ROUNDS);
     assert!(scans.iter().map(|scan| scan.rows.len()).sum::<usize>() <= MAX_NATIVE_QUEUE_SCAN_ROWS);
@@ -257,7 +303,7 @@ async fn hidden_prefix_returns_empty_changing_progress_without_stamps<P: StorePr
             raw_cursor(&result.next_page_token)?.path,
             hidden(last_consumed)
         );
-        let scans = node.scans();
+        let scans = discovery_scans(node.scans(), &result);
         assert_eq!(scans.len(), MAX_NATIVE_QUEUE_SCAN_ROUNDS);
         assert_eq!(scans.iter().map(|scan| scan.rows.len()).sum::<usize>(), 48);
         assert_bounds(&scans);
@@ -267,7 +313,7 @@ async fn hidden_prefix_returns_empty_changing_progress_without_stamps<P: StorePr
     let result = node.page(1, &token).await?;
     assert_eq!(paths(&result), ["z-visible"]);
     assert!(result.next_page_token.is_empty());
-    assert_bounds(&node.scans());
+    assert_bounds(&discovery_scans(node.scans(), &result));
     node.unchanged(&before, writes)?;
     assert_eq!(node.broker.handle().last_applied_blocking()?, applied);
     Ok(())
@@ -289,7 +335,7 @@ async fn partial_progress_resumes_without_repeating_the_visible_prefix<P: StoreP
     let first = node.page(2, "").await?;
     assert_eq!(paths(&first), ["0-first"]);
     assert_eq!(raw_cursor(&first.next_page_token)?.path, hidden(30));
-    let scans = node.scans();
+    let scans = discovery_scans(node.scans(), &first);
     assert_eq!(scans.len(), MAX_NATIVE_QUEUE_SCAN_ROUNDS);
     assert_eq!(scans[0].limit, 4);
     assert!(scans[1..].iter().all(|scan| scan.limit == 3));
@@ -299,9 +345,9 @@ async fn partial_progress_resumes_without_repeating_the_visible_prefix<P: StoreP
     let resumed = node.page(2, &first.next_page_token).await?;
     assert_eq!(paths(&resumed), ["z-visible"]);
     assert!(resumed.next_page_token.is_empty());
-    assert_bounds(&node.scans());
+    assert_bounds(&discovery_scans(node.scans(), &resumed));
     assert_eq!(node.page(2, "").await?, first);
-    assert_bounds(&node.scans());
+    assert_bounds(&discovery_scans(node.scans(), &first));
     node.unchanged(&before, writes)?;
     assert_eq!(node.broker.handle().last_applied_blocking()?, applied);
     Ok(())
@@ -321,7 +367,7 @@ async fn physical_row_budget_preserves_the_final_backend_lookahead<P: StoreProvi
     let first = node.page(1_024, "").await?;
     assert!(paths(&first).is_empty());
     assert_eq!(raw_cursor(&first.next_page_token)?.path, hidden(4_091));
-    let scans = node.scans();
+    let scans = discovery_scans(node.scans(), &first);
     assert_eq!(scans.len(), 4);
     assert_eq!(
         scans.iter().map(|scan| scan.rows.len()).sum::<usize>(),
@@ -342,7 +388,7 @@ async fn physical_row_budget_preserves_the_final_backend_lookahead<P: StoreProvi
     let resumed = node.page(1_024, &first.next_page_token).await?;
     assert_eq!(paths(&resumed), ["z-visible"]);
     assert!(resumed.next_page_token.is_empty());
-    assert_bounds(&node.scans());
+    assert_bounds(&discovery_scans(node.scans(), &resumed));
     node.unchanged(&before, writes)?;
     assert_eq!(node.broker.handle().last_applied_blocking()?, applied);
     Ok(())
@@ -370,7 +416,7 @@ async fn deleted_raw_marker_resumes_after_reopen<P: StoreProvider>(provider: P) 
     let result = node.page(1, &first.next_page_token).await?;
     assert_eq!(paths(&result), ["z-visible"]);
     assert!(result.next_page_token.is_empty());
-    assert_bounds(&node.scans());
+    assert_bounds(&discovery_scans(node.scans(), &result));
     node.unchanged(&before, writes)?;
     assert_eq!(node.broker.handle().last_applied_blocking()?, applied);
     Ok(())
@@ -390,7 +436,7 @@ async fn exact_backend_exhaustion_has_no_false_progress_token<P: StoreProvider>(
         let result = node.page(size, "").await?;
         assert!(paths(&result).is_empty());
         assert!(result.next_page_token.is_empty());
-        let scans = node.scans();
+        let scans = discovery_scans(node.scans(), &result);
         assert_eq!(scans.len(), rounds);
         assert_eq!(
             scans.iter().map(|scan| scan.rows.len()).sum::<usize>(),
@@ -426,11 +472,11 @@ async fn dense_queue_pages_keep_legacy_tokens_and_ignore_hidden_shadows<P: Store
         first.next_page_token,
         format!("v1.{}", URL_SAFE_NO_PAD.encode(legacy.encode_to_vec()))
     );
-    assert_bounds(&node.scans());
+    assert_bounds(&discovery_scans(node.scans(), &first));
     let last = node.page(1, &first.next_page_token).await?;
     assert_eq!(paths(&last), ["omega"]);
     assert!(last.next_page_token.is_empty());
-    assert_bounds(&node.scans());
+    assert_bounds(&discovery_scans(node.scans(), &last));
     node.unchanged(&before, writes)?;
     assert_eq!(node.broker.handle().last_applied_blocking()?, applied);
     Ok(())
@@ -555,7 +601,7 @@ async fn raw_cursor_context_and_noncanonical_encodings_fail_before_owner_io<P: S
     let last = node.page(1, &first.next_page_token).await?;
     assert_eq!(paths(&last), ["z-visible"]);
     assert!(last.next_page_token.is_empty());
-    assert_bounds(&node.scans());
+    assert_bounds(&discovery_scans(node.scans(), &last));
     node.unchanged(&before, writes)?;
     assert_eq!(node.broker.handle().last_applied_blocking()?, applied);
     Ok(())

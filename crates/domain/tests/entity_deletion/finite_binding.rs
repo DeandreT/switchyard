@@ -31,11 +31,15 @@ struct ProofStore<S> {
     inner: S,
     observations: Arc<Mutex<ProofObservations>>,
     forbidden_tags: [u8; 2],
+    topic_mode_descendants: Key,
 }
 
 impl<S: StateStore> ProofStore<S> {
     fn new(inner: S, namespace: &NamespaceName, entity: &EntityPath) -> TestResult<Self> {
         entity.dead_letter_queue()?;
+        let mut topic_mode_descendants = keys::topic_mode(namespace, entity);
+        assert_eq!(topic_mode_descendants.pop(), Some(0));
+        topic_mode_descendants.extend_from_slice(domain::SUBSCRIPTION_PATH_SEGMENT.as_bytes());
         Ok(Self {
             inner,
             observations: Arc::new(Mutex::new(ProofObservations::default())),
@@ -43,6 +47,7 @@ impl<S: StateStore> ProofStore<S> {
                 keys::queue_capacity_usage(namespace, entity)[0],
                 keys::message_charge_prefix(namespace, entity)[0],
             ],
+            topic_mode_descendants,
         })
     }
 
@@ -98,7 +103,13 @@ impl<S: StateStore> StateStore for ProofStore<S> {
         let mut observed = self.observations.lock().expect("proof observations");
         if observed.armed {
             assert!(!observed.applied, "post-commit scan");
-            assert!(!observed.forbid_scans, "runtime scan by live binding proof");
+            assert!(
+                !observed.forbid_scans
+                    || (prefix == self.topic_mode_descendants.as_slice()
+                        && start == prefix
+                        && limit == 1),
+                "unexpected scan by live binding proof"
+            );
             observed.reads.push(ReadEvent::Scan {
                 prefix: prefix.to_vec(),
                 start: start.to_vec(),
@@ -199,12 +210,19 @@ fn live_finite_binding_is_read_only_mode_only_and_reopens<P: StoreProvider>(
             ReadEvent::Get(keys::queue_config(&fixture.namespace, &fixture.entity)),
             ReadEvent::Get(keys::queue_config(&fixture.namespace, &shadow)),
             ReadEvent::Get(keys::topic_config(&fixture.namespace, &fixture.entity)),
+            ReadEvent::Get(keys::topic_mode(&fixture.namespace, &fixture.entity)),
             ReadEvent::Get(keys::topic_config(&fixture.namespace, &shadow)),
+            ReadEvent::Get(keys::topic_mode(&fixture.namespace, &shadow)),
             ReadEvent::Get(keys::queue_capacity_mode(
                 &fixture.namespace,
                 &fixture.entity
             )),
             ReadEvent::Get(keys::queue_capacity_mode(&fixture.namespace, &shadow)),
+            ReadEvent::Scan {
+                prefix: store.topic_mode_descendants.clone(),
+                start: store.topic_mode_descendants.clone(),
+                limit: 1,
+            },
         ]
     );
     assert_eq!(fixture.machine.store().snapshot()?, before);
@@ -638,12 +656,29 @@ fn positive_metadata_and_target_refusals_precede_mode_or_clock<P: StoreProvider>
     store.arm(true, true, true);
     machine.bind_finite_queue_for_deletion(&fixture.namespace, &fixture.entity)?;
     assert!(store.disarm().batches.is_empty());
-    store.arm(true, true, true);
+    let anchor = EntityPath::new("anchor")?;
+    let anchor_store =
+        ProofStore::new(fixture.machine.store().clone(), &fixture.namespace, &anchor)?;
+    let anchor_machine = StateMachine::new(anchor_store.clone());
+    anchor_store.arm(true, true, true);
     assert_eq!(
-        machine.bind_finite_queue_for_deletion(&fixture.namespace, &EntityPath::new("anchor")?),
+        anchor_machine.bind_finite_queue_for_deletion(&fixture.namespace, &anchor),
         Err(BrokerError::QueueCapacityNotSupported)
     );
-    assert!(store.disarm().batches.is_empty());
+    let observed = anchor_store.disarm();
+    assert!(observed.batches.is_empty());
+    assert_eq!(
+        observed
+            .reads
+            .into_iter()
+            .filter(|event| matches!(event, ReadEvent::Scan { .. }))
+            .collect::<Vec<_>>(),
+        vec![ReadEvent::Scan {
+            prefix: anchor_store.topic_mode_descendants.clone(),
+            start: anchor_store.topic_mode_descendants.clone(),
+            limit: 1,
+        }]
+    );
     Ok(())
 }
 

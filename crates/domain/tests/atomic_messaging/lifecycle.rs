@@ -51,11 +51,17 @@ pub(super) fn ordered_sends_share_dedup_and_counters<P: StoreProvider>(provider:
     assert_eq!(application.enqueue_targets, vec![fixture.entity.clone()]);
     let observations = observed(&fixture);
     assert_eq!(observations.commits, 1);
-    assert_eq!((observations.scans, observations.snapshots), (0, 0));
-    assert!(observations.reads.len() <= MAX_ATOMIC_MESSAGING_READ_OPERATIONS);
+    assert_health_probes(&envelope.binding, &observations);
     assert!(
-        observations.reads.iter().map(Vec::len).sum::<usize>()
+        observations.reads.len() + observations.scans.len() <= MAX_ATOMIC_MESSAGING_READ_OPERATIONS
+    );
+    assert!(
+        observations.reads.iter().map(Vec::len).sum::<usize>() + observations.scan_key_bytes
             <= MAX_ATOMIC_MESSAGING_READ_KEY_BYTES
+    );
+    assert!(
+        observations.read_value_bytes + observations.scan_value_bytes
+            <= MAX_ATOMIC_MESSAGING_READ_VALUE_BYTES
     );
     for key in [
         keys::queue_counters(&fixture.namespace, &fixture.entity),

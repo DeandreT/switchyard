@@ -8,13 +8,38 @@ use super::*;
 mod overlay;
 use overlay::AtomicOverlay;
 
+fn validate_atomic_prelude(envelope: &AtomicMessagingCommand) -> Result<(), BrokerError> {
+    validate_kinds(
+        envelope.commands.iter().map(|command| &command.kind),
+        envelope.commands.len(),
+    )?;
+    let binding = &envelope.binding;
+    if envelope.commands.iter().any(|command| {
+        &command.namespace != binding.namespace()
+            || &command.entity != binding.target()
+            || command.issued_at != envelope.issued_at
+    }) {
+        return Err(BrokerError::InvalidAtomicMessagingCommand);
+    }
+    binding.validate()?;
+    if binding.kind() != EntityIncarnationKind::Queue || binding.target() != binding.owner() {
+        return Err(BrokerError::AtomicMessagingOperationNotSupported);
+    }
+    Ok(())
+}
+
 impl<S: StateStore> StateMachine<S> {
     /// Validates the envelope and current queue identity without consulting a clock.
     pub fn validate_atomic_messaging(
         &self,
         envelope: &AtomicMessagingCommand,
     ) -> Result<(), BrokerError> {
-        let overlay = AtomicOverlay::new(self.store.clone());
+        validate_atomic_prelude(envelope)?;
+        let overlay = AtomicOverlay::for_queue(
+            self.store.clone(),
+            envelope.binding.namespace(),
+            envelope.binding.owner(),
+        );
         let machine = StateMachine::new(overlay.clone());
         machine
             .validate_atomic_inner(envelope)
@@ -22,22 +47,7 @@ impl<S: StateStore> StateMachine<S> {
     }
 
     fn validate_atomic_inner(&self, envelope: &AtomicMessagingCommand) -> Result<(), BrokerError> {
-        validate_kinds(
-            envelope.commands.iter().map(|command| &command.kind),
-            envelope.commands.len(),
-        )?;
         let binding = &envelope.binding;
-        if envelope.commands.iter().any(|command| {
-            &command.namespace != binding.namespace()
-                || &command.entity != binding.target()
-                || command.issued_at != envelope.issued_at
-        }) {
-            return Err(BrokerError::InvalidAtomicMessagingCommand);
-        }
-        binding.validate()?;
-        if binding.kind() != EntityIncarnationKind::Queue || binding.target() != binding.owner() {
-            return Err(BrokerError::AtomicMessagingOperationNotSupported);
-        }
         self.validate_binding_identity(binding, binding.namespace(), binding.target())?;
         let config = self
             .queue_config(binding.namespace(), binding.owner())?
@@ -76,7 +86,12 @@ impl<S: StateStore> StateMachine<S> {
         &self,
         envelope: &AtomicMessagingCommand,
     ) -> Result<AtomicMessagingApplication, BrokerError> {
-        let overlay = AtomicOverlay::new(self.store.clone());
+        validate_atomic_prelude(envelope)?;
+        let overlay = AtomicOverlay::for_queue(
+            self.store.clone(),
+            envelope.binding.namespace(),
+            envelope.binding.owner(),
+        );
         let machine = StateMachine::new(overlay.clone());
         machine
             .validate_atomic_inner(envelope)

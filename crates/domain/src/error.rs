@@ -20,6 +20,8 @@ pub enum BrokerError {
     QueueCapacityFull,
     #[error("stored queue capacity metadata is inconsistent")]
     QueueCapacityCorrupt,
+    #[error("stored topic capacity metadata is inconsistent")]
+    TopicCapacityCorrupt,
     #[error("finite capacity does not support this queue profile")]
     QueueCapacityNotSupported,
     #[error("queue capacity must be a positive supported limit")]

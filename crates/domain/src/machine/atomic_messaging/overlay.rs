@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use storage::{Key, Mutation, StateStore, StorageError, StoreSnapshot, Value, WriteBatch};
 
-use crate::{AtomicMessagingLimit as Limit, BrokerError};
+use crate::{AtomicMessagingLimit as Limit, BrokerError, EntityPath, NamespaceName, keys};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Failure {
@@ -45,12 +45,13 @@ fn adapter_error() -> StorageError {
     }
 }
 
-/// The allowed handlers use only point reads. No backing writes or scans can
-/// escape this adapter while the transaction is being prepared.
+/// Runtime reads stay point-only; one binding-owned metadata absence probe is allowed.
+/// Backing writes, snapshots and every other scan remain forbidden during preparation.
 #[derive(Clone)]
 pub(super) struct AtomicOverlay<S> {
     base: S,
     state: Arc<Mutex<OverlayState>>,
+    topic_mode_probe: Option<Key>,
 }
 
 impl<S: StateStore> AtomicOverlay<S> {
@@ -58,7 +59,14 @@ impl<S: StateStore> AtomicOverlay<S> {
         Self {
             base,
             state: Arc::new(Mutex::new(OverlayState::default())),
+            topic_mode_probe: None,
         }
+    }
+
+    pub(super) fn for_queue(base: S, namespace: &NamespaceName, owner: &EntityPath) -> Self {
+        let mut overlay = Self::new(base);
+        overlay.topic_mode_probe = Some(keys::subscription_topic_mode_prefix(namespace, owner));
+        overlay
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, OverlayState>, StorageError> {
@@ -97,6 +105,13 @@ impl<S: StateStore> AtomicOverlay<S> {
                 }
                 Mutation::Delete { key } => key,
             };
+            if self
+                .topic_mode_probe
+                .as_ref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+            {
+                return Err(state.fail(Failure::ForbiddenOperation));
+            }
             if !state.mutations.contains_key(key) && new_keys.insert(key.as_slice()) {
                 let existing_keys = state.mutations.len();
                 state.charge(existing_keys, new_keys.len(), Limit::MutationKeys)?;
@@ -181,11 +196,36 @@ impl<S: StateStore> StateStore for AtomicOverlay<S> {
 
     fn scan_from(
         &self,
-        _prefix: &[u8],
-        _start: &[u8],
-        _limit: usize,
+        prefix: &[u8],
+        start: &[u8],
+        limit: usize,
     ) -> Result<Vec<(Key, Value)>, StorageError> {
-        self.forbidden()
+        if self.topic_mode_probe.as_deref() != Some(prefix) || start != prefix || limit != 1 {
+            return self.forbidden();
+        }
+        {
+            let mut state = self.lock()?;
+            let reads = state.reads;
+            state.reads = state.charge(reads, 1, Limit::ReadOperations)?;
+            let key_bytes = state.read_key_bytes;
+            state.read_key_bytes = state.charge(key_bytes, prefix.len(), Limit::ReadKeyBytes)?;
+            let key_bytes = state.read_key_bytes;
+            state.read_key_bytes = state.charge(key_bytes, start.len(), Limit::ReadKeyBytes)?;
+        }
+        // One backend row may be materialized before returned-byte limits are known.
+        let rows = self.base.scan_from(prefix, start, 1)?;
+        let mut state = self.lock()?;
+        if rows.len() > 1 {
+            return Err(state.fail(Failure::ForbiddenOperation));
+        }
+        for (key, value) in &rows {
+            let key_bytes = state.read_key_bytes;
+            state.read_key_bytes = state.charge(key_bytes, key.len(), Limit::ReadKeyBytes)?;
+            let value_bytes = state.read_value_bytes;
+            state.read_value_bytes =
+                state.charge(value_bytes, value.len(), Limit::ReadValueBytes)?;
+        }
+        Ok(rows)
     }
 }
 

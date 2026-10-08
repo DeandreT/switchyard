@@ -27,6 +27,7 @@ mod session;
 mod sql_filter;
 mod time;
 mod topic;
+mod topic_mode;
 
 pub use atomic_messaging::{
     AtomicMessagingApplication, AtomicMessagingCommand, AtomicMessagingInputUsage,

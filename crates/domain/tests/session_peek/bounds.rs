@@ -1,5 +1,22 @@
 use super::*;
 
+fn message_scans<P: StoreProvider>(node: &Node<P>, target: &EntityPath) -> Vec<Scan> {
+    let mut mode_prefix = domain::keys::topic_mode(&node.fixture.namespace, node.source(target));
+    assert_eq!(mode_prefix.pop(), Some(0));
+    mode_prefix.extend_from_slice(b"/subscriptions/");
+    let (metadata, messages): (Vec<_>, Vec<_>) = node
+        .scans()
+        .into_iter()
+        .partition(|scan| scan.prefix == mode_prefix);
+    assert_eq!(metadata.len(), 1, "one completed capacity-profile probe");
+    assert_eq!(metadata[0].start, mode_prefix);
+    assert_eq!(metadata[0].limit, 1);
+    assert_eq!(metadata[0].returned, 0);
+    let prefix = domain::keys::message_prefix(&node.fixture.namespace, target);
+    assert!(messages.iter().all(|scan| scan.prefix == prefix));
+    messages
+}
+
 fn byte_budgets_fit_exact_prefixes_and_reject_an_oversized_first_record<P: StoreProvider>(
     provider: P,
 ) -> TestResult {
@@ -43,7 +60,7 @@ fn byte_budgets_fit_exact_prefixes_and_reject_an_oversized_first_record<P: Store
             )?),
             [1, 2]
         );
-        let scans = node.scans();
+        let scans = message_scans(&node, &target);
         assert_eq!(scans.len(), 3);
         assert!(
             scans
@@ -111,13 +128,13 @@ fn physical_scan_cap_applies_to_all_sessions_and_sparse_named_filters<P: StorePr
             sequences(&deliveries),
             (1..=MAX_INSPECTED as u64).collect::<Vec<_>>()
         );
-        let scans = node.scans();
+        let scans = message_scans(&node, &target);
         assert_eq!(scans.len(), 1);
         assert_eq!(scans[0].limit, MAX_INSPECTED);
         assert_eq!(scans[0].returned, MAX_INSPECTED);
         let deliveries = node.peek(&target, base + 50, 1, u32::MAX, None, Some(u64::MAX))?;
         assert_eq!(deliveries.len(), MAX_INSPECTED);
-        let scans = node.scans();
+        let scans = message_scans(&node, &target);
         assert_eq!(scans.len(), MAX_INSPECTED);
         assert!(
             scans
@@ -129,7 +146,7 @@ fn physical_scan_cap_applies_to_all_sessions_and_sparse_named_filters<P: StorePr
                 node.peek(&target, base + 50, 1, 1, Some("target"), budget)?
                     .is_empty()
             );
-            let scans = node.scans();
+            let scans = message_scans(&node, &target);
             assert_eq!(
                 scans.iter().map(|scan| scan.returned).sum::<usize>(),
                 MAX_INSPECTED
@@ -148,7 +165,9 @@ fn physical_scan_cap_applies_to_all_sessions_and_sparse_named_filters<P: StorePr
                 )?),
                 [MAX_INSPECTED as u64 + 1]
             );
-            node.scans();
+            let scans = message_scans(&node, &target);
+            assert_eq!(scans.len(), 1);
+            assert_eq!(scans[0].returned, 1);
         }
     }
     Ok(())

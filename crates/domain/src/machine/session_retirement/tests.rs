@@ -179,7 +179,21 @@ fn exact_selected_generation_never_scans_unowned_rows() -> Result<(), BrokerErro
     );
     let summary_prefix =
         keys::session_message_lock_summary_prefix(&command.namespace, &command.entity);
+    let mode_prefix = keys::subscription_topic_mode_prefix(&command.namespace, &command.entity);
     let scans = store.scans.lock().expect("probe lock");
+    assert_eq!(
+        scans
+            .iter()
+            .filter(|(prefix, _, _)| prefix == &mode_prefix)
+            .count(),
+        1
+    );
+    assert!(
+        scans
+            .iter()
+            .filter(|(prefix, _, _)| prefix == &mode_prefix)
+            .all(|(prefix, start, limit)| start == prefix && *limit == 1)
+    );
     assert_eq!(
         scans
             .iter()
@@ -187,10 +201,8 @@ fn exact_selected_generation_never_scans_unowned_rows() -> Result<(), BrokerErro
             .count(),
         2
     );
-    assert!(
-        scans.iter().all(|(prefix, _, limit)| *limit == 1
-            && (prefix == &owned_prefix || prefix == &summary_prefix))
-    );
+    assert!(scans.iter().all(|(prefix, _, limit)| *limit == 1
+        && (prefix == &owned_prefix || prefix == &summary_prefix || prefix == &mode_prefix)));
     drop(scans);
     for index in [0, 2] {
         let key = keys::message(&command.namespace, &command.entity, records[index].sequence);

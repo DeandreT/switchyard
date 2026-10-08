@@ -250,6 +250,12 @@ fn exhausted_generations_can_retire_but_never_wrap_on_recreation<P: StoreProvide
                 keys::queue_capacity_mode(&fixture.namespace, &owner),
                 codec::encode(&(1_u8, u64::MAX, 0_u32))?,
             ))?;
+        } else if kind == EntityIncarnationKind::Topic {
+            // Test-owned canonical Topic mode follows the injected incarnation.
+            fixture.machine.store().apply(WriteBatch::default().put(
+                keys::topic_mode(&fixture.namespace, &owner),
+                codec::encode(&(*b"TMOD", 1_u8, u64::MAX, 0_u32))?,
+            ))?;
         }
         let old = bind(&fixture, &owner, &owner, kind)?;
         assert_eq!(old.generation(), u64::MAX);

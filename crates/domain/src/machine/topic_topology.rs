@@ -6,7 +6,7 @@ use crate::{
 use super::*;
 
 impl<S: StateStore> StateMachine<S> {
-    /// Reads and validates the topic's distinct metadata and capacity exclusion.
+    /// Reads and validates the topic's distinct metadata and mandatory mode.
     pub fn topic_config(
         &self,
         namespace: &NamespaceName,
@@ -20,6 +20,8 @@ impl<S: StateStore> StateMachine<S> {
                 entity,
                 crate::EntityIncarnationKind::Topic,
             )?;
+        } else {
+            self.reject_orphaned_topic_mode(namespace, entity)?;
         }
         Ok(config)
     }
@@ -204,8 +206,13 @@ impl<S: StateStore> StateMachine<S> {
             crate::EntityIncarnationKind::Topic,
             batch,
         )?;
+        let mode = crate::topic_mode::NonFiniteTopicMode::non_finite(incarnation.generation())?;
         batch.push_put(key, codec::encode(&config)?);
-        capacity.prepare_excluded_owner(incarnation)?;
+        batch.push_put(
+            keys::topic_mode(&command.namespace, &command.entity),
+            mode.encode()?,
+        );
+        capacity.prepare_excluded_owner(incarnation, mode)?;
         Ok(CommandOutcome::TopicCreated)
     }
 
@@ -318,3 +325,7 @@ impl<S: StateStore> StateMachine<S> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "topic_topology/topic_mode_tests.rs"]
+mod topic_mode_tests;

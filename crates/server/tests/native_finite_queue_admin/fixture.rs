@@ -16,10 +16,20 @@ use super::*;
 pub(super) type Observed =
     Result<Result<TestResult, tokio::time::error::Elapsed>, Box<dyn Any + Send>>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Scan {
+    prefix: Key,
+    start: Key,
+    limit: usize,
+    returned: usize,
+}
+
 #[derive(Default)]
 pub(super) struct Observations {
     pub reads: AtomicUsize,
     pub scans: AtomicUsize,
+    pub scan_calls: Mutex<Vec<Scan>>,
+    pub snapshots: AtomicUsize,
     pub attempts: AtomicUsize,
     pub commits: AtomicUsize,
     pub fail_next: AtomicBool,
@@ -87,11 +97,23 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
     ) -> Result<Vec<(Key, Value)>, StorageError> {
         self.check_read()?;
         self.observations.scans.fetch_add(1, Ordering::SeqCst);
-        self.inner.scan_from(prefix, start, limit)
+        let rows = self.inner.scan_from(prefix, start, limit)?;
+        self.observations
+            .scan_calls
+            .lock()
+            .expect("scan calls")
+            .push(Scan {
+                prefix: prefix.to_vec(),
+                start: start.to_vec(),
+                limit,
+                returned: rows.len(),
+            });
+        Ok(rows)
     }
 
     fn snapshot(&self) -> Result<StoreSnapshot, StorageError> {
         self.check_read()?;
+        self.observations.snapshots.fetch_add(1, Ordering::SeqCst);
         self.inner.snapshot()
     }
 
@@ -148,6 +170,8 @@ pub(super) struct Checkpoint {
     pub image: StoreSnapshot,
     pub reads: usize,
     pub scans: usize,
+    pub scan_calls: Vec<Scan>,
+    pub snapshots: usize,
     pub attempts: usize,
     pub commits: usize,
     pub clocks: usize,
@@ -183,6 +207,8 @@ impl<P: StoreProvider> Node<P> {
             image: self.store.inner.snapshot()?,
             reads: observations.reads.load(Ordering::SeqCst),
             scans: observations.scans.load(Ordering::SeqCst),
+            scan_calls: observations.scan_calls.lock().expect("scan calls").clone(),
+            snapshots: observations.snapshots.load(Ordering::SeqCst),
             attempts: observations.attempts.load(Ordering::SeqCst),
             commits: observations.commits.load(Ordering::SeqCst),
             clocks: self.clock.calls.load(Ordering::SeqCst),
@@ -203,6 +229,33 @@ impl<P: StoreProvider> Node<P> {
         let after = self.checkpoint()?;
         assert_eq!(after.reads, before.reads);
         assert_eq!(after.scans, before.scans);
+        assert_eq!(after.scan_calls, before.scan_calls);
+        assert_eq!(after.snapshots, before.snapshots);
+        Ok(())
+    }
+
+    pub fn metadata_probes(&self, before: &Checkpoint, path: &str, count: usize) -> TestResult {
+        let after = self.checkpoint()?;
+        let prefix = keys::subscription_topic_mode_prefix(&namespace()?, &EntityPath::new(path)?);
+        assert_eq!(after.scans, before.scans + count);
+        assert_eq!(
+            &after.scan_calls[..before.scan_calls.len()],
+            before.scan_calls.as_slice()
+        );
+        assert_eq!(
+            &after.scan_calls[before.scan_calls.len()..],
+            vec![
+                Scan {
+                    prefix: prefix.clone(),
+                    start: prefix,
+                    limit: 1,
+                    returned: 0,
+                };
+                count
+            ]
+            .as_slice()
+        );
+        assert_eq!(after.snapshots, before.snapshots);
         Ok(())
     }
 

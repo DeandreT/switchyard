@@ -16,6 +16,27 @@ mod fixture;
 
 use fixture::{Node, Owner, TestResult, defer, named, renew, required, settle, unlimited};
 
+fn runtime_scans<P: StoreProvider>(
+    node: &Node<P>,
+    entity: &EntityPath,
+    metadata_probes: usize,
+) -> Vec<fixture::Scan> {
+    let mut mode_prefix = keys::topic_mode(&node.namespace, entity);
+    assert_eq!(mode_prefix.pop(), Some(0));
+    mode_prefix.extend_from_slice(b"/subscriptions/");
+    let calls = node.scans.lock().expect("scans").clone();
+    let (metadata, runtime): (Vec<_>, Vec<_>) = calls
+        .iter()
+        .cloned()
+        .partition(|scan| scan.0 == mode_prefix);
+    assert_eq!(
+        metadata,
+        vec![(mode_prefix.clone(), mode_prefix, 1, 0); metadata_probes]
+    );
+    assert_eq!(&calls[runtime.len()..], metadata.as_slice());
+    runtime
+}
+
 fn original_held_receive_and_deferred_stamp_the_presented_generation<P: StoreProvider>(
     provider: P,
 ) -> TestResult {
@@ -563,7 +584,25 @@ fn all_acceptance_paths_block_only_sessions_with_outstanding_rows<P: StoreProvid
     );
     assert_eq!(node.machine.store().snapshot()?, snapshot);
     assert_eq!(node.commits.load(Ordering::SeqCst), 0);
-    assert_eq!(node.scans.lock().expect("scans").len(), 32);
+    let ready_prefix = keys::entity_session_ready_prefix(&node.namespace, &node.entity);
+    let expected_ready: Vec<_> = busy
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            (
+                ready_prefix.clone(),
+                if index == 0 {
+                    ready_prefix.clone()
+                } else {
+                    keys::after_session_ready(&node.namespace, &node.entity, &busy[index - 1].0)
+                },
+                1,
+                1,
+            )
+        })
+        .collect();
+    assert_eq!(expected_ready.len(), 32);
+    assert_eq!(runtime_scans(&node, &node.entity, 1), expected_ready);
     node.reset();
     let CommandOutcome::SessionPage(SessionPageOutcome::Continue(cursor)) = node.at(
         20,
@@ -578,7 +617,7 @@ fn all_acceptance_paths_block_only_sessions_with_outstanding_rows<P: StoreProvid
     assert_eq!(cursor.session_id, busy[31].0);
     assert_eq!(node.machine.store().snapshot()?, snapshot);
     assert_eq!(node.commits.load(Ordering::SeqCst), 0);
-    assert_eq!(node.scans.lock().expect("scans").len(), 32);
+    assert_eq!(runtime_scans(&node, &node.entity, 1), expected_ready);
     node.reset();
     let CommandOutcome::SessionPage(SessionPageOutcome::Accepted(accepted)) = node.at(
         21,
@@ -591,15 +630,20 @@ fn all_acceptance_paths_block_only_sessions_with_outstanding_rows<P: StoreProvid
         panic!("healthy session grant")
     };
     assert_eq!(accepted.session_id, healthy);
-    let probes = node.scans.lock().expect("scans").clone();
+    let probes = runtime_scans(&node, &node.entity, 1);
     assert_eq!(probes.len(), 2);
     assert_eq!(
-        probes[1],
+        probes[0],
         (
-            keys::session_message_lock_forward_prefix(&node.namespace, &node.entity, &healthy,),
-            1
+            ready_prefix,
+            keys::after_session_ready(&node.namespace, &node.entity, &busy[31].0),
+            1,
+            1,
         )
     );
+    let grant_prefix =
+        keys::session_message_lock_forward_prefix(&node.namespace, &node.entity, &healthy);
+    assert_eq!(probes[1], (grant_prefix.clone(), grant_prefix, 1, 0,));
     let healthy_record = node
         .machine
         .session(&node.namespace, &node.entity, &healthy)?;
@@ -875,14 +919,9 @@ fn local_index_corruption_refuses_whole_commands_without_clock_or_apply<P: Store
     assert_eq!(node.summary(&entity, &sid)?, None);
     node.at_entity(&entity, 42, CommandKind::ReleaseSession { session: hold })?;
     node.refuses(&entity, 43, named(&sid), BrokerError::MalformedIndexKey)?;
-    let probes = node.scans.lock().expect("scans").clone();
-    assert_eq!(
-        probes,
-        vec![(
-            keys::session_message_lock_forward_prefix(&node.namespace, &entity, &sid,),
-            1
-        )]
-    );
+    let probes = runtime_scans(&node, &entity, 0);
+    let grant_prefix = keys::session_message_lock_forward_prefix(&node.namespace, &entity, &sid);
+    assert_eq!(probes, vec![(grant_prefix.clone(), grant_prefix, 1, 1,)]);
     Ok(())
 }
 
@@ -1071,7 +1110,7 @@ fn tracking_preserves_command_record_and_value_version_bytes() -> TestResult {
         assert_eq!(postcard::from_bytes::<CommandKind>(&bytes)?, command);
     }
     assert_eq!(codec::ACTIVE_VALUE_FORMAT, 11);
-    assert_eq!(storage::ACTIVE_STORE_FORMAT, 17);
+    assert_eq!(storage::ACTIVE_STORE_FORMAT, 18);
     Ok(())
 }
 

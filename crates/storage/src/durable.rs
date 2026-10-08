@@ -101,13 +101,17 @@ pub const STORE_FORMAT_V16: u32 = 16;
 /// queues retain reservations across every message lifecycle transition.
 pub const STORE_FORMAT_V17: u32 = 17;
 
+/// Version 18: every live primary topic carries a generation-bound, explicit
+/// non-finite mode. Earlier builds cannot enforce that mandatory metadata.
+pub const STORE_FORMAT_V18: u32 = 18;
+
 /// The layout version this build reads and writes.
 ///
 /// Bump it when the bytes in `records` change meaning — a different key
 /// encoding, or a keyspace split. An open refuses any other version in both
 /// directions, because reading a newer store as if it were this one would
 /// silently corrupt queue state rather than fail.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V17;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V18;
 
 /// Replica layouts use a disjoint version namespace so standalone and older
 /// binaries cannot mistake their records for an ordinary store. Record-layout
@@ -379,6 +383,10 @@ mod bounded_tests;
 mod paired_marker_tests;
 
 #[cfg(test)]
+#[path = "durable/topic_mode_tests.rs"]
+mod topic_mode_tests;
+
+#[cfg(test)]
 mod paired_prototype;
 
 #[cfg(test)]
@@ -624,7 +632,7 @@ mod tests {
                 expected: ACTIVE_STORE_FORMAT,
             })
         );
-        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V17);
+        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V18);
         Ok(())
     }
 
@@ -716,7 +724,7 @@ mod tests {
             require_readable_format(&recorded),
             Err(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V16,
-                expected: STORE_FORMAT_V17,
+                expected: ACTIVE_STORE_FORMAT,
             })
         );
         assert_eq!(require_format_version(&recorded, STORE_FORMAT_V16), Ok(()));
@@ -785,13 +793,13 @@ mod tests {
             FjallStore::open(directory.path()).err(),
             Some(StorageError::UnsupportedStoreFormat {
                 found: STORE_FORMAT_V16,
-                expected: STORE_FORMAT_V17,
+                expected: ACTIVE_STORE_FORMAT,
             })
         );
-        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V17);
-        assert_eq!(ACTIVE_REPLICA_STORE_FORMAT, 0x8000_0011);
-        assert_eq!(ACTIVE_CATALOG_REPLICA_STORE_FORMAT, 0xc000_0011);
-        assert_eq!(ACTIVE_PROTECTED_STATE_STORE_FORMAT, 0xd000_0011);
+        assert_eq!(ACTIVE_STORE_FORMAT, STORE_FORMAT_V18);
+        assert_eq!(ACTIVE_REPLICA_STORE_FORMAT, 0x8000_0012);
+        assert_eq!(ACTIVE_CATALOG_REPLICA_STORE_FORMAT, 0xc000_0012);
+        assert_eq!(ACTIVE_PROTECTED_STATE_STORE_FORMAT, 0xd000_0012);
         for format in [
             ACTIVE_REPLICA_STORE_FORMAT,
             ACTIVE_CATALOG_REPLICA_STORE_FORMAT,

@@ -368,7 +368,7 @@ pub(super) fn repeated_reads_charge_values_before_decode<P: StoreProvider>(
             })
             .collect(),
     )?;
-    expect_refusal(
+    expect_health_refusal(
         &fixture,
         &envelope,
         limit(
@@ -411,7 +411,7 @@ pub(super) fn repeated_reads_charge_values_before_decode<P: StoreProvider>(
             lock_token,
         }],
     )?;
-    expect_refusal(
+    expect_health_refusal(
         &fixture,
         &envelope,
         limit(
@@ -444,7 +444,7 @@ pub(super) fn generated_put_bytes_are_cumulative_not_final_size<P: StoreProvider
         })
         .collect();
     let envelope = atomic(&fixture, 3, kinds.clone())?;
-    expect_refusal(
+    expect_health_refusal(
         &fixture,
         &envelope,
         limit(

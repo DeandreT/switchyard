@@ -129,6 +129,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::DanglingEntityMetadata
         | BrokerError::DanglingRuleMetadata
         | BrokerError::QueueCapacityCorrupt
+        | BrokerError::TopicCapacityCorrupt
         | BrokerError::MalformedIndexKey
         | BrokerError::Codec(_)
         | BrokerError::Identifier(_)
@@ -152,6 +153,17 @@ mod tests {
     use domain::{QueueCounterKind, QueueImmutableProperty, SequenceNumber, SessionId, Timestamp};
 
     use super::*;
+
+    #[test]
+    fn topic_mode_corruption_is_a_static_nonretryable_internal_error() {
+        let error = BrokerError::TopicCapacityCorrupt;
+        assert_eq!(condition_for(&error), INTERNAL_ERROR);
+        assert!(!is_retryable(&error));
+        assert_eq!(
+            error.to_string(),
+            "stored topic capacity metadata is inconsistent"
+        );
+    }
 
     #[test]
     fn capacity_refusals_are_static_distinct_nonretryable_conditions() {

@@ -44,7 +44,7 @@ pub(super) fn late_settlement_failures_rollback_every_staged_change<P: StoreProv
                 },
             ],
         )?;
-        expect_refusal(
+        expect_health_refusal(
             &fixture,
             &envelope,
             if missing {
@@ -81,7 +81,7 @@ pub(super) fn late_settlement_failures_rollback_every_staged_change<P: StoreProv
             },
         ],
     )?;
-    expect_refusal(
+    expect_health_refusal(
         &fixture,
         &envelope,
         BrokerError::LockTokenMismatch { sequence },
@@ -101,7 +101,7 @@ pub(super) fn late_settlement_failures_rollback_every_staged_change<P: StoreProv
             },
         ],
     )?;
-    expect_refusal(
+    expect_health_refusal(
         &fixture,
         &envelope,
         BrokerError::LockExpired {
@@ -140,7 +140,7 @@ pub(super) fn late_content_counter_and_stored_record_failures_are_atomic<P: Stor
             },
         ],
     )?;
-    expect_refusal(&fixture, &envelope, error)?;
+    expect_health_refusal(&fixture, &envelope, error)?;
     let envelope = atomic(
         &fixture,
         3,
@@ -176,7 +176,7 @@ pub(super) fn late_content_counter_and_stored_record_failures_are_atomic<P: Stor
         })?,
     ))?;
     let envelope = atomic(&fixture, 3, vec![send("last-legal"), send("exhausted")])?;
-    expect_refusal(
+    expect_health_refusal(
         &fixture,
         &envelope,
         BrokerError::QueueCounterExhausted {
@@ -206,7 +206,7 @@ pub(super) fn late_content_counter_and_stored_record_failures_are_atomic<P: Stor
             },
         ],
     )?;
-    expect_refusal(&fixture, &envelope, error)?;
+    expect_health_refusal(&fixture, &envelope, error)?;
     Ok(())
 }
 
@@ -404,7 +404,7 @@ pub(super) fn scope_stamp_and_stale_guards_precede_clock<P: StoreProvider>(
     }
     let current = atomic(&fixture, 0, vec![send("still-regressed")])?;
     assert_eq!(fixture.machine.validate_atomic_messaging(&current), Ok(()));
-    expect_refusal(
+    expect_health_refusal(
         &fixture,
         &current,
         BrokerError::ClockRegression {
@@ -431,14 +431,9 @@ pub(super) fn empty_envelope_validates_identity_without_clock_or_commit<P: Store
     assert!(application.outcomes.is_empty());
     assert!(application.enqueue_targets.is_empty());
     let observations = observed(&fixture);
-    assert_eq!(
-        (
-            observations.commits,
-            observations.scans,
-            observations.snapshots
-        ),
-        (0, 0, 0)
-    );
+    assert_eq!(observations.commits, 0);
+    assert_health_probes(&empty_envelope.binding, &observations);
+    assert_eq!(observations.scans.len(), 2);
     assert!(!observations.reads.contains(&keys::clock()));
     assert_eq!(fixture.machine.store().snapshot()?, before);
     assert_eq!(

@@ -21,7 +21,7 @@ struct Observation {
     forbid_ledger_gets: bool,
     commits: usize,
     gets: Vec<Key>,
-    scans: Vec<usize>,
+    scans: Vec<(Key, Key, usize)>,
     threads: Vec<ThreadId>,
     mutations: Vec<Mutation>,
     fail_next: bool,
@@ -50,7 +50,7 @@ impl<S: StateStore> OwnerStore<S> {
         result
     }
 
-    fn read(&self, key: Option<&[u8]>, scan: Option<usize>) {
+    fn read(&self, key: Option<&[u8]>, scan: Option<(&[u8], &[u8], usize)>) {
         let mut observation = self.observation.lock().unwrap();
         if !observation.armed {
             return;
@@ -77,8 +77,10 @@ impl<S: StateStore> OwnerStore<S> {
             }
             observation.gets.push(key.to_vec());
         }
-        if let Some(limit) = scan {
-            observation.scans.push(limit);
+        if let Some((prefix, start, limit)) = scan {
+            observation
+                .scans
+                .push((prefix.to_vec(), start.to_vec(), limit));
         }
     }
 }
@@ -94,7 +96,7 @@ impl<S: StateStore> StateStore for OwnerStore<S> {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Key, Value)>, StorageError> {
-        self.read(None, Some(limit));
+        self.read(None, Some((prefix, start, limit)));
         self.inner.scan_from(prefix, start, limit)
     }
     fn snapshot(&self) -> Result<StoreSnapshot, StorageError> {
@@ -228,6 +230,16 @@ fn assert_owner(observation: &Observation, commits: usize) {
     assert!(observation.threads.iter().all(|thread| thread == owner));
 }
 
+fn assert_mode_probes(
+    observation: &Observation,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    count: usize,
+) {
+    let prefix = keys::subscription_topic_mode_prefix(namespace, entity);
+    assert_eq!(observation.scans, vec![(prefix.clone(), prefix, 1); count]);
+}
+
 fn projected_snapshot(before: &StoreSnapshot, mutations: &[Mutation]) -> Vec<(Key, Value)> {
     let mut rows = before.entries().iter().cloned().collect::<BTreeMap<_, _>>();
     for mutation in mutations {
@@ -271,7 +283,7 @@ async fn by_name_reads_and_complete_updates_stay_in_one_owner_turn<P: StoreProvi
     .unwrap();
     let observed = fixture.store.disarm();
     assert_owner(&observed, 0);
-    assert!(observed.scans.is_empty());
+    assert_mode_probes(&observed, &fixture.namespace, &fixture.entity, 1);
     assert_eq!(current.binding, created.binding);
     assert_eq!(fixture.get()?, Some(current.clone()));
     assert_eq!(fixture.store.snapshot()?, before);
@@ -299,7 +311,7 @@ async fn by_name_reads_and_complete_updates_stay_in_one_owner_turn<P: StoreProvi
     .await?;
     let observed = fixture.store.disarm();
     assert_owner(&observed, 1);
-    assert!(observed.scans.is_empty());
+    assert_mode_probes(&observed, &fixture.namespace, &fixture.entity, 5);
     assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), host_reads + 1);
     assert_eq!(updated.binding, current.binding);
     assert_eq!(updated.config, desired);
@@ -673,8 +685,40 @@ async fn pages_validate_skipped_candidates_and_fill_or_prove_exhaustion<P: Store
     let observation = fixture.store.disarm();
     assert_owner(&observation, 0);
     assert_eq!(page, expected[10..110]);
-    assert!(observation.scans.len() >= 2);
-    assert!(observation.scans.iter().all(|limit| *limit <= 129));
+    let mode_prefixes = expected[..110]
+        .iter()
+        .map(|view| keys::subscription_topic_mode_prefix(&fixture.namespace, view.binding.owner()))
+        .collect::<BTreeSet<_>>();
+    let mode_scans = observation
+        .scans
+        .iter()
+        .filter(|(prefix, _, _)| mode_prefixes.contains(prefix))
+        .collect::<Vec<_>>();
+    assert_eq!(mode_scans.len(), 110);
+    assert_eq!(
+        mode_scans
+            .iter()
+            .map(|(prefix, _, _)| prefix.clone())
+            .collect::<BTreeSet<_>>(),
+        mode_prefixes
+    );
+    assert!(
+        mode_scans
+            .iter()
+            .all(|(prefix, start, limit)| prefix == start && *limit == 1)
+    );
+    let discovery = observation
+        .scans
+        .iter()
+        .filter(|(prefix, _, _)| !mode_prefixes.contains(prefix))
+        .collect::<Vec<_>>();
+    assert!(discovery.len() >= 2 && discovery.len() <= 64);
+    let queue_prefix = keys::namespace_queue_config_prefix(&fixture.namespace);
+    assert!(
+        discovery
+            .iter()
+            .all(|(prefix, _, limit)| prefix == &queue_prefix && *limit <= 129)
+    );
     assert_eq!(
         fixture
             .handle
@@ -824,7 +868,7 @@ async fn raw_page_work_exhaustion_refuses_without_a_short_feed<P: StoreProvider>
     let observed = fixture.store.disarm();
     assert_owner(&observed, 0);
     assert!(observed.scans.len() <= 64);
-    assert!(observed.scans.iter().all(|limit| *limit <= 129));
+    assert!(observed.scans.iter().all(|(_, _, limit)| *limit <= 129));
     assert!(observed.gets.is_empty());
     assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), reads);
     assert_eq!(fixture.store.snapshot()?, before);

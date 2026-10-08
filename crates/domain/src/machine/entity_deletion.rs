@@ -415,6 +415,7 @@ impl<S: StateStore> StateMachine<S> {
             self.require_no_runtime(command, &shadow, plan)?;
         }
         plan.add(keys::topic_config(&command.namespace, &command.entity))?;
+        plan.add(keys::topic_mode(&command.namespace, &command.entity))?;
         Ok(removed)
     }
 
@@ -442,6 +443,13 @@ impl<S: StateStore> StateMachine<S> {
             .is_some()
         {
             return Err(BrokerError::QueueCapacityCorrupt);
+        }
+        if self
+            .store
+            .get(&keys::topic_mode(&command.namespace, entity))?
+            .is_some()
+        {
+            return Err(BrokerError::TopicCapacityCorrupt);
         }
         if self
             .store
@@ -547,6 +555,12 @@ impl<S: StateStore> StateMachine<S> {
         )? {
             return Err(BrokerError::QueueCapacityCorrupt);
         }
+        if self.deletion_probe(
+            &keys::subscription_topic_mode_prefix(namespace, topic),
+            plan,
+        )? {
+            return Err(BrokerError::TopicCapacityCorrupt);
+        }
         let prefix = keys::subscription_backing_config_prefix(namespace, topic);
         self.deletion_scan(&prefix, plan, |key, plan| {
             let (ns, entity) =
@@ -603,6 +617,12 @@ impl<S: StateStore> StateMachine<S> {
                 return Err(BrokerError::DanglingSubscriptionMetadata);
             }
         }
+        if self.deletion_probe(
+            &keys::subscription_topic_mode_prefix(&command.namespace, entity),
+            plan,
+        )? {
+            return Err(BrokerError::TopicCapacityCorrupt);
+        }
         Ok(())
     }
 
@@ -618,6 +638,13 @@ impl<S: StateStore> StateMachine<S> {
             .is_some()
         {
             return Err(BrokerError::QueueCapacityCorrupt);
+        }
+        if self
+            .store
+            .get(&keys::topic_mode(&command.namespace, entity))?
+            .is_some()
+        {
+            return Err(BrokerError::TopicCapacityCorrupt);
         }
         for (prefix, _) in keys::entity_runtime_prefixes(&command.namespace, entity) {
             if self.deletion_probe(&prefix, plan)? {

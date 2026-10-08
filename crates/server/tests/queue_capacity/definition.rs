@@ -5,10 +5,19 @@ use std::{collections::BTreeSet, sync::Mutex, thread::ThreadId};
 use domain::{MessageRecord, QueueCapacityView, codec};
 use storage::{Key, Mutation, StorageError, StoreSnapshot, Value};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DefinitionScan {
+    prefix: Key,
+    start: Key,
+    limit: usize,
+    returned: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 struct DefinitionObservation {
     commits: usize,
-    scans: usize,
+    scans: Vec<DefinitionScan>,
+    snapshots: usize,
     mutations: Vec<Mutation>,
     threads: Vec<ThreadId>,
     guard_after_commit: bool,
@@ -36,20 +45,19 @@ impl<S: StateStore> DefinitionStore<S> {
         result
     }
 
-    fn observe_read(&self, scan: bool) {
+    fn observe_read(&self) {
         let mut observation = self.observation.lock().unwrap();
         assert!(
             !observation.guard_after_commit || !observation.committed,
             "definition returned its prepared view by rereading after commit"
         );
         observation.threads.push(std::thread::current().id());
-        observation.scans += usize::from(scan);
     }
 }
 
 impl<S: StateStore> StateStore for DefinitionStore<S> {
     fn get(&self, key: &[u8]) -> Result<Option<Value>, StorageError> {
-        self.observe_read(false);
+        self.observe_read();
         self.inner.get(key)
     }
 
@@ -59,12 +67,20 @@ impl<S: StateStore> StateStore for DefinitionStore<S> {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Key, Value)>, StorageError> {
-        self.observe_read(true);
-        self.inner.scan_from(prefix, start, limit)
+        self.observe_read();
+        let rows = self.inner.scan_from(prefix, start, limit)?;
+        self.observation.lock().unwrap().scans.push(DefinitionScan {
+            prefix: prefix.to_vec(),
+            start: start.to_vec(),
+            limit,
+            returned: rows.len(),
+        });
+        Ok(rows)
     }
 
     fn snapshot(&self) -> Result<StoreSnapshot, StorageError> {
-        self.observe_read(true);
+        self.observe_read();
+        self.observation.lock().unwrap().snapshots += 1;
         self.inner.snapshot()
     }
 
@@ -171,10 +187,28 @@ fn expected_capacity_error(error: BrokerError) -> SubmitError {
     SubmitError::Propose(ProposeError::Broker(error))
 }
 
-fn assert_owner_observation(observation: &DefinitionObservation, commits: usize) {
+fn assert_owner_observation<S: StateStore>(
+    fixture: &DefinitionFixture<S>,
+    observation: &DefinitionObservation,
+    commits: usize,
+    probes: usize,
+) {
     assert_eq!(observation.commits, commits);
-    assert_eq!(observation.scans, 0);
-    let owner = observation.threads.first().expect("owner point reads");
+    assert_eq!(observation.snapshots, 0);
+    let prefix = keys::subscription_topic_mode_prefix(&fixture.namespace, &fixture.entity);
+    assert_eq!(
+        observation.scans,
+        vec![
+            DefinitionScan {
+                prefix: prefix.clone(),
+                start: prefix,
+                limit: 1,
+                returned: 0,
+            };
+            probes
+        ]
+    );
+    let owner = observation.threads.first().expect("owner reads");
     assert_ne!(*owner, std::thread::current().id());
     assert!(observation.threads.iter().all(|thread| thread == owner));
 }
@@ -230,7 +264,7 @@ async fn combined_definition_changes_commit_once_and_affect_only_future_sends<P:
     )
     .await?;
     let observation = fixture.store.disarm();
-    assert_owner_observation(&observation, 1);
+    assert_owner_observation(&fixture, &observation, 1, 4);
     assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), host_reads + 1);
     assert_eq!(updated.binding, current.binding);
     assert_eq!(updated.config, config);
@@ -340,7 +374,7 @@ async fn combined_definition_changes_commit_once_and_affect_only_future_sends<P:
         FiniteQueueCapacity::new(8_192)?,
     )?;
     let observation = fixture.store.disarm();
-    assert_owner_observation(&observation, 1);
+    assert_owner_observation(&fixture, &observation, 1, 4);
     assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), host_reads + 1);
     assert_eq!(updated.binding, current.binding);
     assert_eq!(updated.config, unlimited);
@@ -406,7 +440,7 @@ async fn refused_definitions_preserve_config_limit_usage_and_runtime<P: StorePro
         .await?,
         Err(expected_capacity_error(BrokerError::QueueCapacityFull))
     );
-    assert_owner_observation(&fixture.store.disarm(), 0);
+    assert_owner_observation(&fixture, &fixture.store.disarm(), 0, 4);
     assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), host_reads + 1);
     assert_eq!(fixture.store.snapshot()?, before);
     let host_reads = fixture.clock.reads.load(Ordering::SeqCst);
@@ -419,7 +453,7 @@ async fn refused_definitions_preserve_config_limit_usage_and_runtime<P: StorePro
         ),
         Err(expected_capacity_error(BrokerError::QueueCapacityFull))
     );
-    assert_owner_observation(&fixture.store.disarm(), 0);
+    assert_owner_observation(&fixture, &fixture.store.disarm(), 0, 4);
     assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), host_reads + 1);
     assert_eq!(fixture.store.snapshot()?, before);
 
@@ -439,7 +473,7 @@ async fn refused_definitions_preserve_config_limit_usage_and_runtime<P: StorePro
         ),
         Err(expected_capacity_error(BrokerError::QueueCapacityCorrupt))
     );
-    assert_owner_observation(&fixture.store.disarm(), 0);
+    assert_owner_observation(&fixture, &fixture.store.disarm(), 0, 1);
     assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), host_reads);
     assert_eq!(fixture.store.snapshot()?, damaged);
     Ok(())
@@ -469,7 +503,7 @@ async fn same_definition_is_noop_and_recreated_identity_fences_before_host_clock
         .await?,
         initial
     );
-    assert_owner_observation(&fixture.store.disarm(), 0);
+    assert_owner_observation(&fixture, &fixture.store.disarm(), 0, 4);
     assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), host_reads + 1);
     assert_eq!(fixture.store.snapshot()?, before);
     let host_reads = fixture.clock.reads.load(Ordering::SeqCst);
@@ -482,7 +516,7 @@ async fn same_definition_is_noop_and_recreated_identity_fences_before_host_clock
         )?,
         initial
     );
-    assert_owner_observation(&fixture.store.disarm(), 0);
+    assert_owner_observation(&fixture, &fixture.store.disarm(), 0, 4);
     assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), host_reads + 1);
     assert_eq!(fixture.store.snapshot()?, before);
 
@@ -524,7 +558,7 @@ async fn same_definition_is_noop_and_recreated_identity_fences_before_host_clock
         .await?,
         Err(expected_capacity_error(BrokerError::EntityBindingStale))
     );
-    assert_owner_observation(&fixture.store.disarm(), 0);
+    assert_owner_observation(&fixture, &fixture.store.disarm(), 0, 0);
     fixture.store.arm();
     assert_eq!(
         fixture.handle.set_finite_queue_definition_fenced_blocking(
@@ -534,7 +568,7 @@ async fn same_definition_is_noop_and_recreated_identity_fences_before_host_clock
         ),
         Err(expected_capacity_error(BrokerError::EntityBindingStale))
     );
-    assert_owner_observation(&fixture.store.disarm(), 0);
+    assert_owner_observation(&fixture, &fixture.store.disarm(), 0, 0);
     assert_eq!(fixture.clock.reads.load(Ordering::SeqCst), host_reads);
     assert_eq!(fixture.store.snapshot()?, before);
     Ok(())

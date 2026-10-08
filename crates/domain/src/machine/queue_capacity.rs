@@ -6,6 +6,7 @@ use crate::queue_capacity::{
     MessageCharge, QueueCapacityError, QueueCapacityMode, QueueCapacityUsage,
     RecordChargeObservation,
 };
+use crate::topic_mode::NonFiniteTopicMode;
 use crate::{
     BrokerError, DEAD_LETTER_QUEUE_SUFFIX, EntityIncarnation, EntityIncarnationKind, EntityPath,
     MAX_SEQUENCE_NUMBER, NamespaceName, QueueConfig, SequenceNumber, TopicConfig, codec, keys,
@@ -72,6 +73,40 @@ impl ReadBudget {
     fn absent<S: StateStore>(&mut self, store: &S, key: &[u8]) -> Result<(), BrokerError> {
         if self.get(store, key)?.is_some() {
             return Err(BrokerError::QueueCapacityCorrupt);
+        }
+        Ok(())
+    }
+
+    fn absent_topic_mode_descendants<S: StateStore>(
+        &mut self,
+        store: &S,
+        namespace: &NamespaceName,
+        owner: &EntityPath,
+    ) -> Result<(), BrokerError> {
+        let prefix = keys::subscription_topic_mode_prefix(namespace, owner);
+        self.reads = self
+            .reads
+            .checked_add(1)
+            .filter(|value| *value <= MAX_CAPACITY_READS)
+            .ok_or(BrokerError::QueueCapacityWorkLimitExceeded)?;
+        self.key_bytes = self
+            .key_bytes
+            .checked_add(prefix.len())
+            .filter(|value| *value <= MAX_CAPACITY_READ_KEY_BYTES)
+            .ok_or(BrokerError::QueueCapacityWorkLimitExceeded)?;
+        // The store materializes at most one row before these logical byte checks.
+        if let Some((key, value)) = store.scan_prefix(&prefix, 1)?.into_iter().next() {
+            self.key_bytes = self
+                .key_bytes
+                .checked_add(key.len())
+                .filter(|value| *value <= MAX_CAPACITY_READ_KEY_BYTES)
+                .ok_or(BrokerError::QueueCapacityWorkLimitExceeded)?;
+            self.value_bytes = self
+                .value_bytes
+                .checked_add(value.len())
+                .filter(|value| *value <= MAX_CAPACITY_READ_VALUE_BYTES)
+                .ok_or(BrokerError::QueueCapacityWorkLimitExceeded)?;
+            return Err(BrokerError::TopicCapacityCorrupt);
         }
         Ok(())
     }
@@ -243,6 +278,7 @@ fn read_owner<S: StateStore>(
     }
     for entity in [&owner, &shadow] {
         budget.absent(store, &keys::topic_config(namespace, entity))?;
+        absent_topic_mode(store, budget, namespace, entity)?;
     }
     let bytes = budget
         .get(store, &keys::queue_capacity_mode(namespace, &owner))?
@@ -250,6 +286,7 @@ fn read_owner<S: StateStore>(
     let mode = QueueCapacityMode::decode(&bytes, identity.generation()).map_err(corrupt)?;
     mode.validate_config(&config).map_err(corrupt)?;
     budget.absent(store, &keys::queue_capacity_mode(namespace, &shadow))?;
+    budget.absent_topic_mode_descendants(store, namespace, &owner)?;
     Ok(QueueCapacityOwner {
         namespace: namespace.clone(),
         owner,
@@ -285,34 +322,89 @@ fn read_usage<S: StateStore>(
     Ok(QueueCapacityOwnerProfile { owner, usage })
 }
 
-fn validate_excluded_owner<S: StateStore>(
+fn absent_topic_mode<S: StateStore>(
+    store: &S,
+    budget: &mut ReadBudget,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+) -> Result<(), BrokerError> {
+    if budget
+        .get(store, &keys::topic_mode(namespace, entity))?
+        .is_some()
+    {
+        return Err(BrokerError::TopicCapacityCorrupt);
+    }
+    Ok(())
+}
+
+fn validate_topic_owner<S: StateStore>(
     store: &S,
     budget: &mut ReadBudget,
     namespace: &NamespaceName,
     owner: &EntityPath,
     identity: EntityIncarnation,
 ) -> Result<(), BrokerError> {
+    if owner.is_subscription_path()
+        || owner.is_dead_letter_queue()
+        || identity.kind() != EntityIncarnationKind::Topic
+        || identity.is_retired()
+    {
+        return Err(BrokerError::TopicCapacityCorrupt);
+    }
+    budget.absent(store, &keys::queue_config(namespace, owner))?;
+    let bytes = budget
+        .get(store, &keys::topic_config(namespace, owner))?
+        .ok_or(BrokerError::QueueCapacityCorrupt)?;
+    if bytes.len() > MAX_PROFILE_RECORD_BYTES {
+        return Err(BrokerError::QueueCapacityCorrupt);
+    }
+    let config: TopicConfig = codec::decode(&bytes).map_err(corrupt)?;
+    config.validate().map_err(corrupt)?;
+    // A full-length topic must not need enough path headroom to own a DLQ.
+    if let Ok(shadow) = owner.dead_letter_queue() {
+        budget.absent(store, &keys::queue_config(namespace, &shadow))?;
+        budget.absent(store, &keys::topic_config(namespace, &shadow))?;
+        budget.absent(store, &keys::queue_capacity_mode(namespace, &shadow))?;
+        budget.absent(store, &keys::queue_capacity_usage(namespace, &shadow))?;
+        absent_topic_mode(store, budget, namespace, &shadow)?;
+    }
+    budget.absent(store, &keys::queue_capacity_mode(namespace, owner))?;
+    budget.absent(store, &keys::queue_capacity_usage(namespace, owner))?;
+    let bytes = budget
+        .get(store, &keys::topic_mode(namespace, owner))?
+        .ok_or(BrokerError::TopicCapacityCorrupt)?;
+    NonFiniteTopicMode::decode(&bytes, identity.generation())?;
+    budget.absent_topic_mode_descendants(store, namespace, owner)?;
+    Ok(())
+}
+
+pub(super) fn validate_topic_mode_profile<S: StateStore>(
+    machine: &StateMachine<S>,
+    namespace: &NamespaceName,
+    owner: &EntityPath,
+) -> Result<(), BrokerError> {
+    let identity =
+        machine.require_live_incarnation(namespace, owner, EntityIncarnationKind::Topic)?;
+    validate_topic_owner(
+        machine.store(),
+        &mut ReadBudget::default(),
+        namespace,
+        owner,
+        identity,
+    )
+}
+
+fn validate_excluded_owner<S: StateStore>(
+    machine: &StateMachine<S>,
+    budget: &mut ReadBudget,
+    namespace: &NamespaceName,
+    owner: &EntityPath,
+    identity: EntityIncarnation,
+) -> Result<(), BrokerError> {
+    let store = machine.store();
     match identity.kind() {
         EntityIncarnationKind::Topic => {
-            if owner.is_subscription_path() {
-                return Err(BrokerError::QueueCapacityCorrupt);
-            }
-            budget.absent(store, &keys::queue_config(namespace, owner))?;
-            let bytes = budget
-                .get(store, &keys::topic_config(namespace, owner))?
-                .ok_or(BrokerError::QueueCapacityCorrupt)?;
-            if bytes.len() > MAX_PROFILE_RECORD_BYTES {
-                return Err(BrokerError::QueueCapacityCorrupt);
-            }
-            let config: TopicConfig = codec::decode(&bytes).map_err(corrupt)?;
-            config.validate().map_err(corrupt)?;
-            // Topics do not require enough path headroom to own a DLQ.
-            if let Ok(shadow) = owner.dead_letter_queue() {
-                budget.absent(store, &keys::queue_config(namespace, &shadow))?;
-                budget.absent(store, &keys::topic_config(namespace, &shadow))?;
-                budget.absent(store, &keys::queue_capacity_mode(namespace, &shadow))?;
-                budget.absent(store, &keys::queue_capacity_usage(namespace, &shadow))?;
-            }
+            return validate_topic_owner(store, budget, namespace, owner, identity);
         }
         EntityIncarnationKind::Subscription => {
             if !owner.is_subscription_path() {
@@ -333,6 +425,9 @@ fn validate_excluded_owner<S: StateStore>(
     }
     budget.absent(store, &keys::queue_capacity_mode(namespace, owner))?;
     budget.absent(store, &keys::queue_capacity_usage(namespace, owner))?;
+    absent_topic_mode(store, budget, namespace, owner)?;
+    absent_topic_mode(store, budget, namespace, &owner.dead_letter_queue()?)?;
+    machine.validate_subscription_topic_mode_parent(namespace, owner)?;
     Ok(())
 }
 
@@ -429,7 +524,10 @@ enum Event {
 enum OwnerState {
     Existing,
     Prepared(QueueCapacityOwnerProfile),
-    PreparedTopic,
+    PreparedTopic {
+        identity: EntityIncarnation,
+        mode: NonFiniteTopicMode,
+    },
     Retired(QueueCapacityOwner),
 }
 
@@ -544,6 +642,7 @@ impl CapacityPlan {
     pub(super) fn prepare_excluded_owner(
         &mut self,
         identity: EntityIncarnation,
+        mode: NonFiniteTopicMode,
     ) -> Result<(), BrokerError> {
         if !matches!(self.state, OwnerState::Existing)
             || self.resolved.is_some()
@@ -559,7 +658,8 @@ impl CapacityPlan {
         NamespaceName::new(self.namespace.as_str())?;
         EntityPath::new(self.target.as_str())?;
         identity.validate().map_err(corrupt)?;
-        self.state = OwnerState::PreparedTopic;
+        mode.validate_generation(identity.generation())?;
+        self.state = OwnerState::PreparedTopic { identity, mode };
         Ok(())
     }
 
@@ -569,7 +669,7 @@ impl CapacityPlan {
                 .as_ref()
                 .is_none_or(|profile| profile.usage().is_none())
         }) || matches!(&self.state, OwnerState::Prepared(profile) if profile.usage().is_none())
-            || matches!(self.state, OwnerState::PreparedTopic);
+            || matches!(self.state, OwnerState::PreparedTopic { .. });
         if disabled {
             return Ok(());
         }
@@ -657,7 +757,8 @@ impl CapacityPlan {
         }
         let profile = match &self.state {
             OwnerState::Prepared(profile) => Some(profile.clone()),
-            OwnerState::PreparedTopic => {
+            OwnerState::PreparedTopic { identity, mode } => {
+                mode.validate_generation(identity.generation())?;
                 self.budget.absent(
                     machine.store(),
                     &keys::queue_capacity_mode(&self.namespace, &self.target),
@@ -675,7 +776,14 @@ impl CapacityPlan {
                         machine.store(),
                         &keys::queue_capacity_usage(&self.namespace, &shadow),
                     )?;
+                    absent_topic_mode(machine.store(), &mut self.budget, &self.namespace, &shadow)?;
                 }
+                absent_topic_mode(
+                    machine.store(),
+                    &mut self.budget,
+                    &self.namespace,
+                    &self.target,
+                )?;
                 None
             }
             OwnerState::Retired(_) => return Err(BrokerError::QueueCapacityCorrupt),
@@ -701,7 +809,18 @@ impl CapacityPlan {
                                 ] {
                                     self.budget.absent(machine.store(), &key)?;
                                 }
+                                absent_topic_mode(
+                                    machine.store(),
+                                    &mut self.budget,
+                                    &self.namespace,
+                                    entity,
+                                )?;
                             }
+                            self.budget.absent_topic_mode_descendants(
+                                machine.store(),
+                                &self.namespace,
+                                &owner,
+                            )?;
                             self.resolved = Some(None);
                             return Ok(None);
                         }
@@ -721,7 +840,7 @@ impl CapacityPlan {
                 } else {
                     // Full topic membership/rules remain the caller's validation.
                     validate_excluded_owner(
-                        machine.store(),
+                        machine,
                         &mut self.budget,
                         &self.namespace,
                         &owner,

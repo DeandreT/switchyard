@@ -290,6 +290,7 @@ struct Observations {
     puts: Vec<Key>,
     gets: Vec<Key>,
     scans: Vec<(Key, usize)>,
+    scan_details: Vec<(Key, Key, usize, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -322,7 +323,13 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
             .expect("observations")
             .scans
             .push((prefix.to_vec(), limit));
-        self.inner.scan_from(prefix, start, limit)
+        let rows = self.inner.scan_from(prefix, start, limit)?;
+        self.observations
+            .lock()
+            .expect("observations")
+            .scan_details
+            .push((prefix.to_vec(), start.to_vec(), limit, rows.len()));
+        Ok(rows)
     }
     fn apply(&self, batch: WriteBatch) -> Result<(), StorageError> {
         {

@@ -17,7 +17,7 @@ use storage::{StateStore, StorageError, StoreSnapshot, WriteBatch};
 use testkit::StoreProvider;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
-type Scan = (Vec<u8>, Vec<u8>, usize);
+type Scan = (Vec<u8>, Vec<u8>, usize, usize);
 type Entries = Vec<(Vec<u8>, Vec<u8>)>;
 
 #[derive(Clone)]
@@ -52,12 +52,14 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let rows = self.inner.scan_from(prefix, start, limit)?;
         self.scans.lock().expect("scan observations").push((
             prefix.to_vec(),
             start.to_vec(),
             limit,
+            rows.len(),
         ));
-        self.inner.scan_from(prefix, start, limit)
+        Ok(rows)
     }
 }
 
@@ -250,15 +252,32 @@ impl<P: StoreProvider> Node<P> {
             .clear();
     }
 
-    fn assert_scan(&self) {
+    fn assert_scan(&self, metadata_probes: usize) {
         let prefix = keys::session_lock_prefix(&self.namespace, &self.entity);
+        let mut mode_prefix = keys::topic_mode(&self.namespace, &self.entity);
+        assert_eq!(mode_prefix.pop(), Some(0));
+        mode_prefix.extend_from_slice(b"/subscriptions/");
+        let calls = self
+            .machine
+            .store()
+            .scans
+            .lock()
+            .expect("scan observations")
+            .clone();
+        let (metadata, runtime): (Vec<_>, Vec<_>) = calls
+            .iter()
+            .cloned()
+            .partition(|scan| scan.0 == mode_prefix);
         assert_eq!(
-            *self
-                .machine
-                .store()
-                .scans
-                .lock()
-                .expect("scan observations"),
+            metadata,
+            vec![(mode_prefix.clone(), mode_prefix, 1, 0); metadata_probes]
+        );
+        assert_eq!(&calls[runtime.len()..], metadata.as_slice());
+        assert_eq!(
+            runtime
+                .into_iter()
+                .map(|(prefix, start, limit, _)| (prefix, start, limit))
+                .collect::<Vec<_>>(),
             vec![(prefix.clone(), prefix, TIMER_SCAN_LIMIT)]
         );
     }
@@ -287,7 +306,7 @@ impl<P: StoreProvider> Node<P> {
             self.at(at, CommandKind::ExpireSessionLocks)?,
             CommandOutcome::SessionLocksExpired { released: 0 }
         );
-        self.assert_scan();
+        self.assert_scan(1);
         assert_eq!(self.session_gets(), 0);
         assert_eq!(self.machine.store().applies.load(Ordering::SeqCst), 0);
         assert_eq!(self.machine.store().snapshot()?, snapshot);
@@ -301,7 +320,7 @@ impl<P: StoreProvider> Node<P> {
         self.reset();
         assert_eq!(self.at(at, CommandKind::ExpireSessionLocks), Err(expected));
         assert_eq!(self.machine.store().applies.load(Ordering::SeqCst), 0);
-        self.assert_scan();
+        self.assert_scan(0);
         assert_eq!(self.machine.store().snapshot()?, snapshot);
         assert_eq!(self.machine.last_applied_time()?, clock);
         Ok(())
@@ -333,7 +352,7 @@ fn canonical_expiry_preserves_state_and_scoped_message_locks<P: StoreProvider>(
         node.at(19, CommandKind::ExpireSessionLocks)?,
         CommandOutcome::SessionLocksExpired { released: 0 }
     );
-    node.assert_scan();
+    node.assert_scan(1);
     assert_eq!(node.session_gets(), 0);
     assert_eq!(node.machine.store().applies.load(Ordering::SeqCst), 0);
     assert_eq!(node.machine.store().snapshot()?, before);
@@ -344,7 +363,7 @@ fn canonical_expiry_preserves_state_and_scoped_message_locks<P: StoreProvider>(
         node.at(20, CommandKind::ExpireSessionLocks)?,
         CommandOutcome::SessionLocksExpired { released: 1 }
     );
-    node.assert_scan();
+    node.assert_scan(1);
     assert_eq!(node.session_gets(), 1);
     assert_eq!(node.machine.store().applies.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -669,7 +688,7 @@ fn bounded_session_expiry_resumes_after_restart_without_extra_scan<P: StoreProvi
             released: TIMER_SCAN_LIMIT as u32
         }
     );
-    node.assert_scan();
+    node.assert_scan(1);
     assert_eq!(node.session_gets(), TIMER_SCAN_LIMIT);
     assert_eq!(node.machine.store().applies.load(Ordering::SeqCst), 1);
     for (index, session) in accepted.iter().enumerate() {
@@ -689,7 +708,7 @@ fn bounded_session_expiry_resumes_after_restart_without_extra_scan<P: StoreProvi
         node.at(20, CommandKind::ExpireSessionLocks)?,
         CommandOutcome::SessionLocksExpired { released: 1 }
     );
-    node.assert_scan();
+    node.assert_scan(1);
     assert_eq!(node.session_gets(), 1);
     assert_eq!(node.machine.store().applies.load(Ordering::SeqCst), 1);
     for (index, session) in accepted.iter().enumerate() {
@@ -708,7 +727,7 @@ fn bounded_session_expiry_resumes_after_restart_without_extra_scan<P: StoreProvi
         node.at(21, CommandKind::ExpireSessionLocks)?,
         CommandOutcome::SessionLocksExpired { released: 0 }
     );
-    node.assert_scan();
+    node.assert_scan(1);
     assert_eq!(node.session_gets(), 0);
     assert_eq!(node.machine.store().applies.load(Ordering::SeqCst), 0);
     assert_eq!(node.machine.store().snapshot()?, snapshot);

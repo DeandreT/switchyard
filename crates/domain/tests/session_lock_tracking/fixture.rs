@@ -41,7 +41,8 @@ pub(super) type Summary = (
     u64,
     u64,
 );
-pub(super) type ScanCalls = Arc<Mutex<Vec<(Vec<u8>, usize)>>>;
+pub(super) type Scan = (Vec<u8>, Vec<u8>, usize, usize);
+pub(super) type ScanCalls = Arc<Mutex<Vec<Scan>>>;
 
 #[derive(Clone)]
 pub(super) struct ObservedStore<S> {
@@ -67,11 +68,14 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
-        self.scans
-            .lock()
-            .expect("scan recorder")
-            .push((prefix.to_vec(), limit));
-        self.inner.scan_from(prefix, start, limit)
+        let rows = self.inner.scan_from(prefix, start, limit)?;
+        self.scans.lock().expect("scan recorder").push((
+            prefix.to_vec(),
+            start.to_vec(),
+            limit,
+            rows.len(),
+        ));
+        Ok(rows)
     }
 }
 

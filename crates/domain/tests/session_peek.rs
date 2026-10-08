@@ -23,6 +23,8 @@ const ENTRY_OVERHEAD: u64 = 64;
 
 #[derive(Clone, Debug)]
 struct Scan {
+    prefix: Vec<u8>,
+    start: Vec<u8>,
     limit: usize,
     returned: usize,
 }
@@ -58,6 +60,8 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
     ) -> Result<Vec<(Key, Value)>, StorageError> {
         let rows = self.inner.scan_from(prefix, start, limit)?;
         self.observations.scans.lock().expect("scans").push(Scan {
+            prefix: prefix.to_vec(),
+            start: start.to_vec(),
             limit,
             returned: rows.len(),
         });

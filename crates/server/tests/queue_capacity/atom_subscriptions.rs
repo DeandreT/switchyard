@@ -833,3 +833,6 @@ mod updates;
 
 #[path = "atom_subscriptions/rules.rs"]
 mod rules;
+
+#[path = "atom_subscriptions/topic_mode.rs"]
+mod topic_mode;

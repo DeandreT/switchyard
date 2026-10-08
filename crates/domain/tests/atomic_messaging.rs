@@ -31,7 +31,9 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 struct Observations {
     reads: Vec<Key>,
     read_value_bytes: usize,
-    scans: usize,
+    scans: Vec<(Key, Key, usize)>,
+    scan_key_bytes: usize,
+    scan_value_bytes: usize,
     snapshots: usize,
     commits: usize,
     mutations: Vec<Mutation>,
@@ -60,8 +62,15 @@ impl<S: StateStore> StateStore for ObservedStore<S> {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Key, Value)>, StorageError> {
-        self.observations.lock().expect("observations").scans += 1;
-        self.inner.scan_from(prefix, start, limit)
+        let rows = self.inner.scan_from(prefix, start, limit)?;
+        let mut observations = self.observations.lock().expect("observations");
+        observations
+            .scans
+            .push((prefix.to_vec(), start.to_vec(), limit));
+        observations.scan_key_bytes +=
+            prefix.len() + start.len() + rows.iter().map(|(key, _)| key.len()).sum::<usize>();
+        observations.scan_value_bytes += rows.iter().map(|(_, value)| value.len()).sum::<usize>();
+        Ok(rows)
     }
 
     fn snapshot(&self) -> Result<StoreSnapshot, StorageError> {
@@ -241,10 +250,44 @@ fn counters<P: StoreProvider>(fixture: &QueueFixture<P>) -> TestResult<QueueCoun
     )?)
 }
 
+fn assert_health_probes(binding: &EntityBinding, observations: &Observations) {
+    let mut prefix = keys::topic_mode(binding.namespace(), binding.owner());
+    assert_eq!(prefix.pop(), Some(0));
+    prefix.extend_from_slice(b"/subscriptions/");
+    assert!(
+        !observations.scans.is_empty(),
+        "live queue profile must probe owned metadata"
+    );
+    assert!(
+        observations
+            .scans
+            .iter()
+            .all(|(query, start, limit)| query == &prefix && start == query && *limit == 1)
+    );
+    assert_eq!(observations.snapshots, 0);
+}
+
 fn expect_refusal<P: StoreProvider>(
     fixture: &QueueFixture<ObservedProvider<P>>,
     envelope: &AtomicMessagingCommand,
     error: BrokerError,
+) -> TestResult {
+    expect_refusal_with_probes(fixture, envelope, error, false)
+}
+
+fn expect_health_refusal<P: StoreProvider>(
+    fixture: &QueueFixture<ObservedProvider<P>>,
+    envelope: &AtomicMessagingCommand,
+    error: BrokerError,
+) -> TestResult {
+    expect_refusal_with_probes(fixture, envelope, error, true)
+}
+
+fn expect_refusal_with_probes<P: StoreProvider>(
+    fixture: &QueueFixture<ObservedProvider<P>>,
+    envelope: &AtomicMessagingCommand,
+    error: BrokerError,
+    health_probes: bool,
 ) -> TestResult {
     let before = fixture.machine.store().snapshot()?;
     let clock = fixture.machine.last_applied_time()?;
@@ -252,7 +295,12 @@ fn expect_refusal<P: StoreProvider>(
     assert_eq!(fixture.machine.apply_atomic_messaging(envelope), Err(error));
     let observations = observed(fixture);
     assert_eq!(observations.commits, 0);
-    assert_eq!((observations.scans, observations.snapshots), (0, 0));
+    if health_probes {
+        assert_health_probes(&envelope.binding, &observations);
+    } else {
+        assert!(observations.scans.is_empty());
+        assert_eq!(observations.snapshots, 0);
+    }
     assert_eq!(fixture.machine.store().snapshot()?, before);
     assert_eq!(fixture.machine.last_applied_time()?, clock);
     *fixture

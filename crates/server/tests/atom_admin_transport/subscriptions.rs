@@ -469,3 +469,6 @@ mod updates;
 
 #[path = "subscriptions/rules.rs"]
 mod rules;
+
+#[path = "subscriptions/topic_mode.rs"]
+mod topic_mode;

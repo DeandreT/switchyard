@@ -727,16 +727,21 @@ fn topic_validation_is_bounded_and_targeted_sub_update_does_not_scan_sibling_mem
     }
     reset(&fixture);
     subscription_update(&fixture, "Alpha", 100, SubscriptionConfigUpdate::default())?;
-    assert!(
-        fixture
+    {
+        let observations = fixture
             .machine
             .store()
             .observations
             .lock()
-            .expect("observations")
-            .scans
-            .is_empty()
-    );
+            .expect("observations");
+        let prefix = keys::subscription_topic_mode_prefix(&fixture.namespace, &fixture.entity);
+        assert_eq!(observations.scans, vec![(prefix.clone(), 1); 3]);
+        assert_eq!(
+            observations.scan_details,
+            vec![(prefix.clone(), prefix, 1, 0); 3]
+        );
+        assert_eq!(observations.commits, 0);
+    }
     assert_eq!(fixture.machine.last_applied_time()?, Timestamp::UNIX_EPOCH);
     subscription_update(
         &fixture,

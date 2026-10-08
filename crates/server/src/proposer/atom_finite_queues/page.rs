@@ -9,6 +9,7 @@ const MAX_SKIP: usize = 1_000;
 const RAW_PAGE_SIZE: usize = 128;
 const MAX_ROWS: usize = 4_096;
 const MAX_SCANS: usize = 64;
+const MAX_MODE_PROBES: usize = MAX_SKIP + MAX_TOP;
 const MAX_GETS: usize = 16_384;
 const MAX_KEY_BYTES: usize = 4 * 1_024 * 1_024;
 const MAX_VALUE_BYTES: usize = 16 * 1_024 * 1_024;
@@ -17,6 +18,8 @@ const MAX_VALUE_BYTES: usize = 16 * 1_024 * 1_024;
 struct ReadBudget {
     rows: usize,
     scans: usize,
+    mode_probes: usize,
+    mode_prefix: Option<Key>,
     gets: usize,
     key_bytes: usize,
     value_bytes: usize,
@@ -38,20 +41,38 @@ struct PageStore<S> {
 }
 
 impl<S: StateStore> PageStore<S> {
-    fn reserve_read(&self, key_bytes: usize, scan: bool) -> Result<(), StorageError> {
+    fn reserve_read(&self, key_bytes: usize, scan: bool, mode: bool) -> Result<(), StorageError> {
         let mut budget = self.budget.lock().map_err(|_| StorageError::LockPoisoned)?;
         let next_key_bytes = add(budget.key_bytes, key_bytes, MAX_KEY_BYTES)?;
-        let next = if scan {
+        let next = if mode {
+            add(budget.mode_probes, 1, MAX_MODE_PROBES)?
+        } else if scan {
             add(budget.scans, 1, MAX_SCANS)?
         } else {
             add(budget.gets, 1, MAX_GETS)?
         };
         budget.key_bytes = next_key_bytes;
-        if scan {
+        if mode {
+            budget.mode_probes = next;
+        } else if scan {
             budget.scans = next;
         } else {
             budget.gets = next;
         }
+        Ok(())
+    }
+
+    fn permit_mode_owner(
+        &self,
+        owner: Option<(&NamespaceName, &EntityPath)>,
+    ) -> Result<(), StorageError> {
+        let prefix = owner.map(|(namespace, entity)| {
+            domain::keys::subscription_topic_mode_prefix(namespace, entity)
+        });
+        self.budget
+            .lock()
+            .map_err(|_| StorageError::LockPoisoned)?
+            .mode_prefix = prefix;
         Ok(())
     }
 
@@ -70,7 +91,7 @@ impl<S: StateStore> PageStore<S> {
 
 impl<S: StateStore> StateStore for PageStore<S> {
     fn get(&self, key: &[u8]) -> Result<Option<Value>, StorageError> {
-        self.reserve_read(key.len(), false)?;
+        self.reserve_read(key.len(), false, false)?;
         let value = self.inner.get(key)?;
         if let Some(value) = &value {
             let mut budget = self.budget.lock().map_err(|_| StorageError::LockPoisoned)?;
@@ -89,13 +110,14 @@ impl<S: StateStore> StateStore for PageStore<S> {
             .len()
             .checked_add(start.len())
             .ok_or(StorageError::ReadLimitExceeded)?;
-        {
+        let mode = {
             let budget = self.budget.lock().map_err(|_| StorageError::LockPoisoned)?;
             if limit > MAX_ROWS - budget.rows {
                 return Err(StorageError::ReadLimitExceeded);
             }
-        }
-        self.reserve_read(input_bytes, true)?;
+            limit == 1 && start == prefix && budget.mode_prefix.as_deref() == Some(prefix)
+        };
+        self.reserve_read(input_bytes, true, mode)?;
         let rows = self.inner.scan_from(prefix, start, limit)?;
         let mut budget = self.budget.lock().map_err(|_| StorageError::LockPoisoned)?;
         let mut next = budget.clone();
@@ -156,9 +178,12 @@ pub(super) fn read<S: StateStore, C: Clock>(
                 }
                 // Validate consumed candidates even when the caller skips them.
                 // The separately budgeted backend lookahead is not consumed here.
-                let view = reader
-                    .get_atom_finite_queue(&row_namespace, &entity)?
-                    .ok_or(BrokerError::DanglingEntityMetadata)?;
+                store
+                    .permit_mode_owner(Some((&row_namespace, &entity)))
+                    .map_err(BrokerError::from)?;
+                let result = reader.get_atom_finite_queue(&row_namespace, &entity);
+                store.permit_mode_owner(None).map_err(BrokerError::from)?;
+                let view = result?.ok_or(BrokerError::DanglingEntityMetadata)?;
                 if remaining_skip != 0 {
                     remaining_skip -= 1;
                 } else {

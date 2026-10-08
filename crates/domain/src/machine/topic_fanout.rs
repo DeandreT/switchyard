@@ -298,7 +298,7 @@ impl<S: StateStore> StateMachine<S> {
         if command.entity.is_subscription_path() {
             return Err(BrokerError::SubscriptionPathIsReserved);
         }
-        let config = self.topic_config(&command.namespace, &command.entity)?;
+        let config = self.topic_config_topology(&command.namespace, &command.entity)?;
         if config.is_some()
             && self
                 .store
@@ -306,6 +306,16 @@ impl<S: StateStore> StateMachine<S> {
                 .is_some()
         {
             return Err(BrokerError::DanglingEntityMetadata);
+        }
+        if config.is_some() {
+            self.validate_capacity_binding_profile(
+                &command.namespace,
+                &command.entity,
+                &command.entity,
+                crate::EntityIncarnationKind::Topic,
+            )?;
+        } else {
+            self.reject_orphaned_topic_mode(&command.namespace, &command.entity)?;
         }
         Ok(config)
     }

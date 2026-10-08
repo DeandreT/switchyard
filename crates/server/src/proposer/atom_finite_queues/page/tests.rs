@@ -223,3 +223,176 @@ fn overflow_and_forbidden_storage_operations_fail_without_backend_forwarding() {
     assert_eq!(store.inner.applies.load(Ordering::SeqCst), 0);
     assert_eq!(store.inner.snapshots.load(Ordering::SeqCst), 0);
 }
+
+fn mode_scope() -> (NamespaceName, EntityPath, Key) {
+    let namespace = NamespaceName::new("tenant").unwrap();
+    let entity = EntityPath::new("orders").unwrap();
+    let prefix = domain::keys::subscription_topic_mode_prefix(&namespace, &entity);
+    (namespace, entity, prefix)
+}
+
+#[test]
+fn owner_mode_probes_have_separate_credit_without_expanding_discovery_credit() {
+    let (namespace, entity, prefix) = mode_scope();
+    let store = reader(ReadBudget {
+        scans: MAX_SCANS,
+        mode_probes: MAX_MODE_PROBES - 1,
+        ..ReadBudget::default()
+    });
+    store
+        .permit_mode_owner(Some((&namespace, &entity)))
+        .unwrap();
+    assert_eq!(store.scan_prefix(&prefix, 1), Ok(Vec::new()));
+    assert_eq!(
+        store.scan_prefix(&prefix, 1),
+        Err(StorageError::ReadLimitExceeded)
+    );
+    assert_eq!(store.inner.scans.load(Ordering::SeqCst), 1);
+    assert_eq!(store.budget.lock().unwrap().mode_probes, MAX_MODE_PROBES);
+    assert_eq!(store.budget.lock().unwrap().scans, MAX_SCANS);
+    assert_eq!(store.raw_page_limit(), Err(StorageError::ReadLimitExceeded));
+
+    let other = domain::keys::subscription_topic_mode_prefix(
+        &namespace,
+        &EntityPath::new("other").unwrap(),
+    );
+    let foreign = domain::keys::subscription_topic_mode_prefix(
+        &NamespaceName::new("foreign").unwrap(),
+        &entity,
+    );
+    let later = [prefix.as_slice(), b"later"].concat();
+    for (query, start, limit) in [
+        (other.as_slice(), other.as_slice(), 1),
+        (foreign.as_slice(), foreign.as_slice(), 1),
+        (prefix.as_slice(), later.as_slice(), 1),
+        (prefix.as_slice(), prefix.as_slice(), 2),
+    ] {
+        let store = reader(ReadBudget {
+            scans: MAX_SCANS,
+            ..ReadBudget::default()
+        });
+        store
+            .permit_mode_owner(Some((&namespace, &entity)))
+            .unwrap();
+        assert_eq!(
+            store.scan_from(query, start, limit),
+            Err(StorageError::ReadLimitExceeded)
+        );
+        assert_eq!(store.inner.scans.load(Ordering::SeqCst), 0);
+        assert_eq!(store.budget.lock().unwrap().mode_probes, 0);
+    }
+    let store = reader(ReadBudget {
+        scans: MAX_SCANS,
+        ..ReadBudget::default()
+    });
+    store
+        .permit_mode_owner(Some((&namespace, &entity)))
+        .unwrap();
+    store.permit_mode_owner(None).unwrap();
+    assert_eq!(
+        store.scan_prefix(&prefix, 1),
+        Err(StorageError::ReadLimitExceeded)
+    );
+    assert_eq!(store.inner.scans.load(Ordering::SeqCst), 0);
+    assert_eq!(store.budget.lock().unwrap().mode_probes, 0);
+}
+
+#[test]
+fn mode_probe_requests_share_key_byte_credit_and_refuse_before_extra_io() {
+    let (namespace, entity, prefix) = mode_scope();
+    let request_bytes = prefix.len() * 2;
+    for (headroom, allowed) in [(request_bytes, true), (request_bytes - 1, false)] {
+        let store = reader(ReadBudget {
+            key_bytes: MAX_KEY_BYTES - headroom,
+            ..ReadBudget::default()
+        });
+        store
+            .permit_mode_owner(Some((&namespace, &entity)))
+            .unwrap();
+        if allowed {
+            assert_eq!(store.scan_prefix(&prefix, 1), Ok(Vec::new()));
+            assert_eq!(store.budget.lock().unwrap().key_bytes, MAX_KEY_BYTES);
+            assert_eq!(
+                store.scan_prefix(&prefix, 1),
+                Err(StorageError::ReadLimitExceeded)
+            );
+        } else {
+            assert_eq!(
+                store.scan_prefix(&prefix, 1),
+                Err(StorageError::ReadLimitExceeded)
+            );
+            assert_eq!(
+                store.budget.lock().unwrap().key_bytes,
+                MAX_KEY_BYTES - headroom
+            );
+        }
+        assert_eq!(
+            store.inner.scans.load(Ordering::SeqCst),
+            usize::from(allowed)
+        );
+        assert_eq!(
+            store.budget.lock().unwrap().mode_probes,
+            usize::from(allowed)
+        );
+        assert_eq!(store.budget.lock().unwrap().scans, 0);
+    }
+}
+
+#[test]
+fn mode_probe_rows_share_returned_key_value_and_row_credit() {
+    let (namespace, entity, prefix) = mode_scope();
+    let child = entity
+        .subscription(&domain::SubscriptionName::new("worker").unwrap())
+        .unwrap();
+    let key = domain::keys::topic_mode(&namespace, &child);
+    for budget in [
+        ReadBudget {
+            key_bytes: MAX_KEY_BYTES - prefix.len() * 2 - key.len() + 1,
+            ..ReadBudget::default()
+        },
+        ReadBudget {
+            value_bytes: MAX_VALUE_BYTES - 2,
+            ..ReadBudget::default()
+        },
+    ] {
+        let store = reader(budget.clone());
+        store
+            .inner
+            .inner
+            .apply(WriteBatch::default().put(key.clone(), vec![1; 3]))
+            .unwrap();
+        store
+            .permit_mode_owner(Some((&namespace, &entity)))
+            .unwrap();
+        assert_eq!(
+            store.scan_prefix(&prefix, 1),
+            Err(StorageError::ReadLimitExceeded)
+        );
+        assert_eq!(store.inner.scans.load(Ordering::SeqCst), 1);
+        let actual = store.budget.lock().unwrap();
+        assert_eq!(actual.rows, 0);
+        assert_eq!(actual.key_bytes, budget.key_bytes + prefix.len() * 2);
+        assert_eq!(actual.value_bytes, budget.value_bytes);
+        assert_eq!((actual.scans, actual.mode_probes), (0, 1));
+    }
+    let store = reader(ReadBudget {
+        rows: MAX_ROWS - 1,
+        ..ReadBudget::default()
+    });
+    store
+        .inner
+        .inner
+        .apply(WriteBatch::default().put(key, vec![1]))
+        .unwrap();
+    store
+        .permit_mode_owner(Some((&namespace, &entity)))
+        .unwrap();
+    assert_eq!(store.scan_prefix(&prefix, 1).unwrap().len(), 1);
+    assert_eq!(store.budget.lock().unwrap().rows, MAX_ROWS);
+    assert_eq!(
+        store.scan_prefix(&prefix, 1),
+        Err(StorageError::ReadLimitExceeded)
+    );
+    assert_eq!(store.inner.scans.load(Ordering::SeqCst), 1);
+    assert_eq!(store.budget.lock().unwrap().mode_probes, 1);
+}
