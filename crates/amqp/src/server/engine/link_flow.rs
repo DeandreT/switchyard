@@ -36,7 +36,9 @@ pub(super) fn reserve_credit(
     channel: u16,
     handle: u32,
     incarnation: u64,
-    reply: oneshot::Sender<Result<Option<CreditReservationIdentity>, EngineError>>,
+    commands: mpsc::Sender<Command>,
+    cleanup: mpsc::UnboundedSender<CleanupCommand>,
+    reply: oneshot::Sender<Result<Option<CreditReservation>, EngineError>>,
     sessions: &mut HashMap<u16, SessionState>,
 ) {
     let Some(LinkState::Sending(link)) = sessions
@@ -62,15 +64,21 @@ pub(super) fn reserve_credit(
             break candidate;
         }
     };
-    let reservation = CreditReservationIdentity {
-        channel,
-        handle,
-        incarnation: link.drain.incarnation,
-        reservation_id,
+    let reservation = CreditReservation {
+        identity: CreditReservationIdentity {
+            channel,
+            handle,
+            incarnation: link.drain.incarnation,
+            reservation_id,
+        },
+        commands,
+        cleanup,
+        active: true,
     };
     publish_credit(link);
-    if reply.send(Ok(Some(reservation))).is_err() {
-        // A canceled waiter must not consume a slot that no caller can use.
+    if let Err(Ok(Some(mut reservation))) = reply.send(Ok(Some(reservation))) {
+        // Failed delivery rolls back immediately; do not also enqueue cleanup.
+        reservation.disarm();
         link.credit_reservations.remove(&reservation_id);
         publish_credit(link);
     }

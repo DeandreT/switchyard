@@ -1,3 +1,4 @@
+use super::super::link_flow::has_unreserved_credit;
 use super::*;
 
 #[tokio::test]
@@ -16,6 +17,8 @@ async fn a_reserved_slot_survives_credit_revoke_and_drain_until_sent() {
     link.drain = LinkDrain::new(drain_tx);
     link.credit = credit_tx;
     let incarnation = link.drain.incarnation;
+    let (commands, _command_rx) = mpsc::channel(8);
+    let (cleanup, mut cleanup_rx) = mpsc::unbounded_channel();
     let (mut wire, mut peer) = tokio::io::duplex(64 * 1024);
 
     apply_flow(
@@ -41,6 +44,8 @@ async fn a_reserved_slot_survives_credit_revoke_and_drain_until_sent() {
             channel,
             handle,
             incarnation,
+            commands: commands.clone(),
+            cleanup: cleanup.clone(),
             reply,
         },
         &mut wire,
@@ -54,6 +59,10 @@ async fn a_reserved_slot_survives_credit_revoke_and_drain_until_sent() {
     };
     assert!(link.credit_reservations.is_empty());
     assert!(*credit_ready.borrow());
+    assert!(matches!(
+        cleanup_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 
     let (reply, response) = oneshot::channel();
     test_handle_command(
@@ -61,6 +70,8 @@ async fn a_reserved_slot_survives_credit_revoke_and_drain_until_sent() {
             channel,
             handle,
             incarnation,
+            commands: commands.clone(),
+            cleanup: cleanup.clone(),
             reply,
         },
         &mut wire,
@@ -69,11 +80,13 @@ async fn a_reserved_slot_survives_credit_revoke_and_drain_until_sent() {
     )
     .await
     .expect("credit is reserved");
-    let reservation = response
+    let mut guard = response
         .await
         .expect("reservation response remains live")
         .expect("reservation succeeds")
         .expect("one credit slot is available");
+    let reservation = guard.identity;
+    guard.disarm();
     assert!(!*credit_ready.borrow());
 
     apply_flow(
@@ -186,6 +199,8 @@ async fn releasing_empty_source_reservation_completes_a_zero_credit_drain() {
     link.drain = LinkDrain::new(drain_tx);
     link.credit = credit_tx;
     let incarnation = link.drain.incarnation;
+    let (commands, _command_rx) = mpsc::channel(8);
+    let (cleanup, _cleanup_rx) = mpsc::unbounded_channel();
     let (mut wire, mut peer) = tokio::io::duplex(64 * 1024);
 
     apply_flow(
@@ -208,6 +223,8 @@ async fn releasing_empty_source_reservation_completes_a_zero_credit_drain() {
             channel,
             handle,
             incarnation,
+            commands: commands.clone(),
+            cleanup: cleanup.clone(),
             reply,
         },
         &mut wire,
@@ -216,11 +233,13 @@ async fn releasing_empty_source_reservation_completes_a_zero_credit_drain() {
     )
     .await
     .expect("credit is reserved");
-    let reservation = response
+    let mut guard = response
         .await
         .expect("reservation response remains live")
         .expect("reservation succeeds")
         .expect("one credit slot is available");
+    let reservation = guard.identity;
+    guard.disarm();
 
     apply_flow(
         channel,
@@ -295,6 +314,8 @@ async fn dropping_a_reservation_bypasses_a_full_command_queue() {
     };
     link.drain = LinkDrain::new(drain_tx);
     let incarnation = link.drain.incarnation;
+    let (commands, mut command_rx) = mpsc::channel(1);
+    let (cleanup, mut cleanup_rx) = mpsc::unbounded_channel();
     let (mut wire, mut peer) = tokio::io::duplex(64 * 1024);
 
     apply_flow(
@@ -317,6 +338,8 @@ async fn dropping_a_reservation_bypasses_a_full_command_queue() {
             channel,
             handle,
             incarnation,
+            commands: commands.clone(),
+            cleanup: cleanup.clone(),
             reply,
         },
         &mut wire,
@@ -325,11 +348,12 @@ async fn dropping_a_reservation_bypasses_a_full_command_queue() {
     )
     .await
     .expect("credit is reserved");
-    let identity = response
+    let reservation = response
         .await
         .expect("reservation response remains live")
         .expect("reservation succeeds")
         .expect("one credit slot is available");
+    let identity = reservation.identity;
     apply_flow(
         channel,
         Flow {
@@ -347,7 +371,6 @@ async fn dropping_a_reservation_bypasses_a_full_command_queue() {
     .expect("the drain waits for the reservation");
     assert!(drains.borrow().is_some());
 
-    let (commands, mut command_rx) = mpsc::channel(1);
     let (close_reply, _close_response) = oneshot::channel();
     assert!(
         commands
@@ -358,18 +381,14 @@ async fn dropping_a_reservation_bypasses_a_full_command_queue() {
             .is_ok()
     );
     assert_eq!(commands.capacity(), 0);
-    let (cleanup, mut cleanup_rx) = mpsc::unbounded_channel();
-    drop(CreditReservation {
-        identity,
-        commands,
-        cleanup,
-        active: true,
-    });
+    drop(reservation);
 
     let cleanup = cleanup_rx
         .recv()
         .await
         .expect("drop always queues cleanup while the engine is live");
+    let CleanupCommand::ReleaseCredit { reservation } = &cleanup;
+    assert_eq!(*reservation, identity);
     super::super::handle_cleanup(cleanup, &mut wire, &mut sessions)
         .await
         .expect("cleanup releases the reserved slot");
@@ -396,4 +415,66 @@ async fn dropping_a_reservation_bypasses_a_full_command_queue() {
         panic!("sending link remains attached");
     };
     assert!(link.credit_reservations.is_empty());
+}
+
+#[tokio::test]
+async fn dropping_an_accepted_cached_credit_reply_owns_the_original_cleanup() {
+    let channel = 3;
+    let handle = 1;
+    let mut sessions = queued_sending_session(channel, handle, 1, VecDeque::new());
+    let Some(LinkState::Sending(link)) = sessions[&channel].links.get(&handle) else {
+        panic!("sending link exists");
+    };
+    let incarnation = link.drain.incarnation;
+    let (commands, _command_rx) = mpsc::channel(1);
+    let (cleanup, mut cleanup_rx) = mpsc::unbounded_channel();
+    let (reply, cached_reply) = oneshot::channel();
+    let (mut wire, _peer) = tokio::io::duplex(64 * 1024);
+    test_handle_command(
+        Command::ReserveCredit {
+            channel,
+            handle,
+            incarnation,
+            commands,
+            cleanup: cleanup.clone(),
+            reply,
+        },
+        &mut wire,
+        &mut sessions,
+        u32::MAX,
+    )
+    .await
+    .expect("actor accepted the original reply");
+    let Some(LinkState::Sending(link)) = sessions[&channel].links.get(&handle) else {
+        panic!("sending link remains attached");
+    };
+    assert_eq!(link.credit_reservations.len(), 1);
+    let original_id = *link.credit_reservations.iter().next().unwrap();
+    assert!(!has_unreserved_credit(link));
+    assert!(matches!(
+        cleanup_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    // No receiver poll observed the accepted reply's actual guard.
+    drop(cached_reply);
+    let cleanup = cleanup_rx
+        .try_recv()
+        .expect("cached guard Drop queued cleanup");
+    let CleanupCommand::ReleaseCredit { reservation } = &cleanup;
+    assert_eq!(reservation.channel, channel);
+    assert_eq!(reservation.handle, handle);
+    assert_eq!(reservation.incarnation, incarnation);
+    assert_eq!(reservation.reservation_id, original_id);
+    super::super::handle_cleanup(cleanup, &mut wire, &mut sessions)
+        .await
+        .unwrap();
+    let Some(LinkState::Sending(link)) = sessions[&channel].links.get(&handle) else {
+        panic!("sending link remains attached");
+    };
+    assert!(link.credit_reservations.is_empty());
+    assert!(has_unreserved_credit(link));
+    assert!(matches!(
+        cleanup_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
 }

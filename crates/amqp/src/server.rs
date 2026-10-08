@@ -772,16 +772,13 @@ impl Sender {
                     channel: self.channel,
                     handle: self.handle,
                     incarnation: self.incarnation,
+                    commands: self.commands.clone(),
+                    cleanup: self.cleanup.clone(),
                     reply,
                 })
                 .await?;
-                if let Some(identity) = reserved {
-                    return Ok(CreditReservation {
-                        identity,
-                        commands: self.commands.clone(),
-                        cleanup: self.cleanup.clone(),
-                        active: true,
-                    });
+                if let Some(reservation) = reserved {
+                    return Ok(reservation);
                 }
                 continue;
             }

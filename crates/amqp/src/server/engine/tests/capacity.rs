@@ -242,14 +242,17 @@ async fn reservation_cleanup_after_capacity_wait(cancel: bool) {
         channel,
         handle,
         admission.sender.incarnation,
+        admission.sender.commands.clone(),
+        admission.sender.cleanup.clone(),
         reply,
         &mut sessions,
     );
-    let identity = reserved
+    let reservation = reserved
         .await
         .expect("reservation response remains live")
         .expect("reservation succeeds")
         .expect("one credit is available");
+    let identity = reservation.identity;
     let capacity = Arc::clone(&admission.sender.send_capacity);
     let held = Arc::clone(&capacity)
         .try_acquire_owned()
@@ -260,12 +263,6 @@ async fn reservation_cleanup_after_capacity_wait(cancel: bool) {
         .commands
         .try_send(Command::Close { error: None, reply })
         .expect("the command queue is filled");
-    let reservation = CreditReservation {
-        identity,
-        commands: admission.sender.commands.clone(),
-        cleanup: admission.sender.cleanup.clone(),
-        active: true,
-    };
     let mut wait = Box::pin(admission.sender.send_pending_with_credit(
         reservation,
         Message::data(vec![1]),

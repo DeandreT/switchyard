@@ -153,7 +153,8 @@ driver and reader, retaining results for cancellation-safe retry. Drop requests
 stop only. Join success does not acknowledge AMQP Close: `close` and
 `close_with_error` still require the peer reply. Sender capacity waits observe
 detach and command closure, even when callers retain all 256 confirmation permits.
-Cleanup custody in queued credit-grant replies remains [#81](https://github.com/DeandreT/switchyard/issues/81).
+Queued credit-grant replies own cleanup before observation; dropping an accepted
+reply queues cleanup for its exact reservation, not a replacement link's credit.
 
 Receiving-pump teardown joins its original settlement workers (at most 32)
 before residual route cleanup and session release. Retirement stops unanswered

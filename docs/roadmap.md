@@ -20,6 +20,7 @@ and assignment source. Milestones group work; independent lanes can run in paral
 - [x] Detach-aware sender admission with unchanged bounded capacity ([#67](https://github.com/DeandreT/switchyard/issues/67))
 - [x] Original settlement-worker custody through natural receiving-pump teardown ([#72](https://github.com/DeandreT/switchyard/issues/72))
 - [x] Original Receive/result/credit custody through natural teardown ([#79](https://github.com/DeandreT/switchyard/issues/79))
+- [x] Native queued-credit replies own cleanup before observation ([#81](https://github.com/DeandreT/switchyard/issues/81))
 - [ ] Remaining client semantics, administration and conserved capacity
 - [ ] Real quorum, multi-tenant security, recovery and measured release gates
 
@@ -30,7 +31,7 @@ See [compatibility](compatibility.md).
 
 ## Next Main Increments
 
-1. Close native queued-credit custody (#81), then finish [#7](https://github.com/DeandreT/switchyard/issues/7): session handoff (#80/#73), transport cleanup (#74), task trees (#75/#63), admission/deadlines (#64), then signal shutdown (#65). Joins are not graceful Close acknowledgements.
+1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7): session handoff (#80/#73), transport cleanup (#74), task trees (#75/#63), admission/deadlines (#64), then signal shutdown (#65). Joins are not graceful Close acknowledgements.
 2. Complete [#12](https://github.com/DeandreT/switchyard/issues/12) through sender, receiver/settlement, sessions, then management ([#57](https://github.com/DeandreT/switchyard/issues/57) through [#60](https://github.com/DeandreT/switchyard/issues/60)) using the bound broker API. Wire adapters wait for #7.
 3. Enable [#15](https://github.com/DeandreT/switchyard/issues/15) only after retained authority is complete; no live deletion/recreation claim yet.
 4. Port safe configuration and typed-content increments independently, then their dependent features.
@@ -144,7 +145,7 @@ single PR for the whole row. Update pickup labels when prerequisites merge.
 | Started Receive/AcceptSession custody | [#73](https://github.com/DeandreT/switchyard/issues/73) | [#72](https://github.com/DeandreT/switchyard/issues/72) |
 | Original Receive and reserved credit | [#79](https://github.com/DeandreT/switchyard/issues/79) | [#72](https://github.com/DeandreT/switchyard/issues/72); implemented |
 | Exact session-grant/native-attach handoff | [#80](https://github.com/DeandreT/switchyard/issues/80) | [#79](https://github.com/DeandreT/switchyard/issues/79) |
-| Native queued-credit cleanup custody | [#81](https://github.com/DeandreT/switchyard/issues/81) | [#67](https://github.com/DeandreT/switchyard/issues/67) |
+| Native queued-credit cleanup custody | [#81](https://github.com/DeandreT/switchyard/issues/81) | [#67](https://github.com/DeandreT/switchyard/issues/67); implemented |
 | Cooperative transport/route cleanup | [#74](https://github.com/DeandreT/switchyard/issues/74) | [#73](https://github.com/DeandreT/switchyard/issues/73) |
 | Original session/link task trees | [#75](https://github.com/DeandreT/switchyard/issues/75) | [#74](https://github.com/DeandreT/switchyard/issues/74) |
 | Bounded TCP/WSS admission and aggregate TLS/HTTP/SASL/Open deadline | [#64](https://github.com/DeandreT/switchyard/issues/64) | [#63](https://github.com/DeandreT/switchyard/issues/63) |

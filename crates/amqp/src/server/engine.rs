@@ -44,7 +44,9 @@ pub(super) enum Command {
         channel: u16,
         handle: u32,
         incarnation: u64,
-        reply: oneshot::Sender<Result<Option<CreditReservationIdentity>, EngineError>>,
+        commands: mpsc::Sender<Command>,
+        cleanup: mpsc::UnboundedSender<CleanupCommand>,
+        reply: oneshot::Sender<Result<Option<CreditReservation>, EngineError>>,
     },
     ReleaseCredit {
         reservation: CreditReservationIdentity,
@@ -545,8 +547,18 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             channel,
             handle,
             incarnation,
+            commands,
+            cleanup,
             reply,
-        } => reserve_credit(channel, handle, incarnation, reply, sessions),
+        } => reserve_credit(
+            channel,
+            handle,
+            incarnation,
+            commands,
+            cleanup,
+            reply,
+            sessions,
+        ),
         Command::ReleaseCredit { reservation, reply } => {
             release_credit(reservation, reply, sessions, writer).await?;
         }
