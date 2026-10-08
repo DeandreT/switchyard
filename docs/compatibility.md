@@ -1,8 +1,8 @@
 # Compatibility
 
 Switchyard targets Azure Service Bus Standard. This matrix describes single-node
-`main`, not reference-branch capabilities. Core tests establish behavior;
-protocol/client gates establish the surface. Neither is certification.
+`main`, not reference branches. Core tests establish behavior and protocol/client
+gates establish the surface; neither certifies compatibility.
 
 ## Client Gates
 
@@ -13,22 +13,19 @@ protocol/client gates establish the surface. Neither is certification.
 | Pinned Sift | Planned | No gate implemented |
 | Rust AMQP client | Protocol end-to-end suites | Broader protocol checks; not a substitute for official SDK gates |
 
-The .NET workflows cover queue/batch send, prefetch and independent
-settlement, receive-delete, envelope fidelity, renew/abandon/defer/peek, DLQ,
-queue sessions/state, duplicate detection, queue/topic scheduling and
-cancellation, filtered topic/subscription delivery, rule management, and
-case-insensitive addressing. Selected gates require Linux, .NET 10 and NuGet
-restore; missing prerequisites fail. Ordinary workspace tests ignore them.
-Both selectors use exact ranges and checked-in lockfiles; declared-current is
-a fixed choice, not a latest-release claim. Selected ServiceBus/Core package,
-output and nonce-bound loaded-file hashes must match checked-in approvals.
+Four experimental Memory gates cover two pins over TCP/WSS: queue/batch send,
+prefetch/settlement, receive-delete, envelopes, renew/abandon/defer/peek, DLQ,
+sessions/state, duplicates, scheduling/cancellation, filtered subscriptions, rules
+and case-insensitive addresses. Linux, .NET 10 and NuGet restore are required;
+missing prerequisites fail. Workspace tests ignore these workflows; durable
+coverage remains pending.
 
-TCP uses a permissive certificate callback for a generated test identity. WSS
-uses the platform trust path with a generated root scoped to the child process
-through `SSL_CERT_FILE`, not the TCP callback or a machine-wide trust change.
-Nonce-bound loaded-assembly records match launched file hashes; completion
-follows async disposal. Neither fixture certifies production trust, durable
-SDK or whole-test task-tree shutdown. See [gate commands and limits](sdk-gates.md),
+Exact selectors/lockfiles and approved ServiceBus/Core, output and nonce-bound
+loaded-file hashes are required; completion follows async disposal. TCP uses a
+permissive generated-identity callback; WSS uses platform trust with a child-scoped
+generated root via `SSL_CERT_FILE`, not that callback or machine-wide changes.
+Neither certifies production trust, administration or whole-test task-tree shutdown.
+See [gate commands and limits](sdk-gates.md),
 [TCP gate](../crates/server/tests/amqp_dotnet_current.rs),
 [WSS gate](../crates/server/tests/amqp_dotnet_websockets.rs), and
 [declared project](../crates/conformance/dotnet-current/Switchyard.Conformance.DotNetCurrent.csproj).
@@ -52,26 +49,22 @@ SDK or whole-test task-tree shutdown. See [gate commands and limits](sdk-gates.m
 | Offline identity policy | Pure local RS256 JWT verification with pinned public keys, injected time and local rights; no JWT transport activation |
 | Persistence | Paired memory/Fjall semantics; Fjall journal fsync before applied outcome and single-directory ownership |
 
-Manage includes Send and Listen. Scheduling/cancellation require Send;
-receive-side management requires Listen. CBS grants authorize links
-connection-wide and close them on token expiry; a connection has 20 seconds to
-finish initial CBS authorization. Receiving settle mode selects peek-lock
-(unsettled) or receive-delete (pre-settled). Session attach echoes the granted
-identifier/deadline; renewal and state use `$management`, not automatic link
-renewal. Protocol rejections carry compatible conditions/retry hints rather
-than silently falling back to unsupported behavior.
-Outbound receive reserves remote credit before broker mutation; an empty result
-releases it. Drain completes after reservations are consumed or released.
+Manage includes Send/Listen. Scheduling/cancellation require Send; receive-side
+management requires Listen. CBS authorizes links connection-wide, closes them on
+expiry and allows 20 seconds for initial authorization. Unsettled receiving means
+peek-lock; pre-settled means receive-delete. Session attach echoes identifier/deadline;
+renewal/state use `$management`, not automatic renewal. Unsupported requests reject
+with compatible conditions/retry hints. Outbound receive reserves credit before
+broker mutation, releases empty results, and completes drain after consumption/release.
 
-The [offline JWT API](offline-jwt.md) produces issuer-qualified grants; SAS/PLAIN
-principals are qualified by their verified namespace host. Protocol refresh and
-time consumers still await [#71](https://github.com/DeandreT/switchyard/issues/71);
-JWT CBS activation remains [#17](https://github.com/DeandreT/switchyard/issues/17).
-Existing SAS/PLAIN authentication and resource-scope behavior are unchanged.
-
-The [SQL predicate kernel](sql-predicates.md) is a bounded, ephemeral typed domain
-API only. Its local grammar/error profile does not enable persisted SQL rules,
-subscription fanout or actions; #96/#97 extend it before #20 integration.
+The [offline JWT API](offline-jwt.md) produces issuer-qualified grants;
+SAS/PLAIN principals retain verified namespace-host qualification. Protocol
+refresh/time consumers [#71](https://github.com/DeandreT/switchyard/issues/71) and
+JWT CBS activation [#17](https://github.com/DeandreT/switchyard/issues/17) remain pending.
+The merged [SQL predicate kernel](sql-predicates.md), including #96/#97 IN/LIKE
+and scalar arithmetic, is a bounded ephemeral domain API with an explicitly local
+grammar/error profile. Typed content #16 and rule integration #20/#21 remain
+pending; it enables no persisted SQL rules, fanout or actions.
 
 ## Known Differences And Bounds
 
@@ -88,156 +81,109 @@ subscription fanout or actions; #96/#97 extend it before #20 integration.
 
 ### Atomicity And Lifecycle
 
-Each command derives deadlines from its carried timestamp and commits one
-storage batch. Rejection changes no messages, counters, duplicate history, or
-Clock. Batch validation precedes allocation/history mutation; session batches
-require one session. Duplicate detection is send-side suppression, not
-exactly-once receive: peek-lock still permits redelivery.
+Each command uses its carried timestamp and commits one storage batch. Rejection
+changes no messages, counters, duplicate history or Clock. Validation precedes
+batch allocation/history mutation; session batches require one session. Duplicate
+detection suppresses sends, not peek-lock redelivery.
 
-Peek-lock commits ownership before transfer and deletion only on settlement;
-receive-delete commits deletion first. A live lock can renew without token
-change. Abandon/lock expiry redelivers until maximum delivery count, then sends
-the message to DLQ as `MaxDeliveryCountExceeded`. Deferral hides a message from
-ordinary receive; abandon/expiry of a deferred delivery restores that deferred
-state. Management and delivery-link property updates persist in the envelope.
-Peek never locks or increments delivery count; a non-session receiver can browse
-across sessions, while a held-session receiver sees only its session.
+Peek-lock commits ownership before transfer and deletes only on settlement;
+receive-delete deletes first. Renewal preserves a live token. Abandon/lock expiry
+redelivers until maximum delivery count, then DLQs as `MaxDeliveryCountExceeded`. Deferral hides
+ordinary receive; deferred-delivery abandon/expiry restores deferral. Management
+and delivery-link property updates persist in the envelope. Peek never locks or
+increments delivery count; ordinary receivers browse across sessions, held-session
+receivers only within theirs.
 
-Scheduling stores a browseable, non-receivable placeholder that does not make a
-session available. Activation retires it, allocates an active sequence/enqueue
-time, and starts TTL. For topics, evaluation, every matching subscription copy,
-and the topic counter are atomic. Rules OR together; populated correlation
-fields AND together with exact types; several matches yield one copy. No matches
-still succeeds. Each copy settles, expires, defers, browses, and dead-letters
-independently. Full payload copies, not shared payload references, are stored.
+Scheduled placeholders are browseable, non-receivable and do not make sessions
+available. Activation retires them, allocates active sequence/enqueue time and
+starts TTL. Topic evaluation, matching copies and counter updates are atomic:
+rules OR, populated correlation fields AND with exact types, several matches yield
+one copy, no matches succeeds. Full-payload copies settle, expire, defer, browse
+and dead-letter independently.
 
-`entity/$deadletterqueue` is a reserved real queue: no direct create/send and no
-shadow-of-a-shadow. DLQ messages retain sequence and reason, lose lifetime/session,
-and never dead-letter again. Delivered reasons use `DeadLetterReason` and
-`DeadLetterErrorDescription`; direct DLQ drain has no `DeadLetterSource` (Azure
-uses it for forwarded dead letters). DLQ resubmission/auto-forwarding is absent.
+`entity/$deadletterqueue` is a reserved real queue: no direct create/send or
+shadow-of-shadow.
+DLQ messages retain sequence/reason, lose lifetime/session and never dead-letter
+again. Reasons use `DeadLetterReason`/`DeadLetterErrorDescription`; direct drain
+omits `DeadLetterSource` (Azure uses it for forwarded dead letters). Resubmission
+and auto-forwarding are absent.
 
 ### Topic Integrity
 
-Routing and public subscription pages validate the complete listed graph before
-taking a prefix or committing copies. Keys and stored values must name the exact
-canonical child; each backing queue must match its valid parent-derived receive
-profile. Its real DLQ must match that profile with `u32::MAX` delivery count,
-no TTL/session/duplicate detection, and neither may have a conflicting topic
-record. The bounded scan uses 2,001 entries to enforce the 2,000 cap. Corruption
-refuses atomically as a broker fault; small pages cannot hide a later bad member.
+Routing/subscription pages validate the full listed graph before prefixes/copies:
+keys/values name the exact canonical child; backing queues match valid parent-derived
+receive profiles; real DLQs use that profile with `u32::MAX` delivery count and no
+TTL/session/duplicate detection. Neither may conflict with a topic record. The
+2,001-entry scan enforces the 2,000 cap. Corruption refuses atomically as a broker fault,
+including bad members beyond small pages.
 
-Topic creation refuses orphan membership; subscription creation refuses an
-occupied DLQ rather than overwriting it. The proof excludes unindexed backing
-queues, orphan rules, and retained runtime; it does not newly fence ordinary
-retained-message/rule management or establish live incarnations/capacity. It
-changes no storage/value/wire format. See
-[routing implementation](../crates/domain/src/machine/topic.rs).
+Topic creation refuses orphan membership; subscription creation refuses occupied
+DLQs. Proof excludes unindexed backing queues, orphan rules and retained runtime;
+it establishes no new retained-message/rule fence, live incarnations or capacity.
+Formats are unchanged. See [routing implementation](../crates/domain/src/machine/topic.rs).
 
 ### Storage And Runtime Limits
 
-Fjall fsyncs before returning applied state and preserves messages, locks,
-delivery counts, sessions, and sequence numbers across restart. It does not
-preserve them after loss of the only node; replication is absent. Memory is
-volatile. Production durable startup refuses with a static replication-unavailable
-error before opening storage or listening. Development remains single-node;
-production memory keeps its existing refusal. CLI TLS/auth/storage-argument and
-cluster-validation error precedence is unchanged.
+Fjall fsyncs before applied outcomes and preserves messages, locks, delivery counts,
+sessions and sequences across restart, not loss of the only node. Memory is volatile;
+replication is absent. Production durable startup returns static replication-unavailable
+before storage/listeners; production memory still refuses. Development is single-node.
+CLI TLS/auth/storage/cluster-validation error precedence is unchanged.
 
-A missing format marker is stamped only when known `meta` and `records`
-keyspaces are empty. Existing rows, even empty-valued ones, refuse opening
-without a marker write. Active store format 2 requires private live owner heads;
-format 1 directories refuse, even when empty. Value envelopes remain V1. There
-is no migration, foreign-keyspace proof, or filesystem-byte invariance claim.
+A missing marker is stamped only with empty known `meta`/`records` keyspaces.
+Any row, including empty-valued, refuses opening without a marker write. Store
+format 2 requires private live owner heads; format 1 refuses even empty. Value
+envelopes remain V1; no migration, foreign-keyspace proof or byte-invariance claim.
 See [opener](../crates/storage/src/durable.rs).
 
-Present configurations and listed topic profiles require canonical live owner
-heads; DLQs share their owner's head. Bound broker calls capture immutable
-namespace/target/owner/kind/generation through the owner queue. They recheck the
-live head, forbidden shadow head, generation and existing target profile before
-host or stored Clock, including Complete and session-state/release commands.
-Malformed heads are corruption; same-kind generation drift or a vanished target
-is stale. Wrapper scope mismatch precedes these reads. This is not a whole-store
-or parent-membership proof, live deletion, or a global mixed-corruption priority.
-Wire links, legacy name calls, timers and raw catalog/diagnostic reads remain
-outside retained-authority protection; #57-#60 will adopt it at the edge.
+Configurations/listed topic profiles require canonical live heads; DLQs share their
+owner's head. Bound calls capture immutable namespace/target/owner/kind/generation through the
+owner queue and recheck live/forbidden shadow heads, generation and target profile
+before host/stored Clock, including Complete and session-state/release. Malformed
+heads are corruption; same-kind generation drift/missing targets are stale. Wrapper
+scope mismatch comes first. No whole-store/parent-membership proof, live deletion or
+global mixed-corruption priority is claimed. Wire links, legacy names, timers and
+raw catalog/diagnostic reads await #57-#60 retained-authority adoption.
 
-Native `stop` interrupts driver IO/channel work; `shutdown` joins the original
-driver and reader, retaining results for cancellation-safe retry. Drop requests
-stop only. Join success does not acknowledge AMQP Close: `close` and
-`close_with_error` still require the peer reply. Sender capacity waits observe
-detach and command closure, even when callers retain all 256 confirmation permits.
-Queued credit-grant replies own cleanup before observation; dropping an accepted
-reply queues cleanup for its exact reservation, not a replacement link's credit.
+Current lifecycle contracts are scoped to these owners, not whole task trees:
 
-Receiving-pump teardown joins its original settlement workers (at most 32)
-before residual route cleanup and session release. Retirement stops unanswered
-remote/confirmation waits, not started broker submissions; ready outcomes still
-apply. Second-mode success follows durable settlement. Cancelled finish observers
-retain original handles/results. Drop only requests retirement and detaches.
-Each delivery registration has a private captured identity. Worker/residual
-cleanup and management renewal/disposition writes match that identity under the
-row lock; equal-value or cross-entity replacements survive stale cleanup.
-Cancelled residual cleanup keeps each unfinished handle until removal completes.
-Lookup preference, TTL purge and delayed-install ordering remain unchanged.
+| Owner | Implemented Contract |
+| --- | --- |
+| Native connection | `stop` interrupts driver IO/channel work without command capacity; `shutdown` joins the original driver/reader and caches results for cancelled/repeated observers. Drop requests Stop only; joins do not acknowledge Close, whose waiters still require the peer reply. |
+| Native sender/credit | Capacity waits observe Detach/command closure even with all 256 confirmation permits retained. Queued credit-grant replies own cleanup before observation; dropping an accepted reply cleans its exact reservation, not replacement credit. |
+| Receiving pump | Natural teardown/outer-pump panic retain one Receive/credit, begun Transfer/Delivery/reservation and at most 32 original settlement workers. Retire intake/native/workers before drains; late Pending joins the same retired worker. Ready outcomes use existing auth/settlement rules; second-mode success follows durable settlement. Unanswered remote/confirmation waits retire; begun broker submissions drain. Cleanup drains originals, conditionally removes registrations, then observes one lazy original session release. Drop retires/detaches only. |
+| Attachment/session registry | Borrowed observers retain original native acceptance/session grant. Unused holds get one captured-entity/full-hold release attempt; refusal leaves expiry. Claim before the first helper await; installation rechecks latest claim and original End/Detach after row-lock admission. Failed newest claims preserve installed rows without reviving older work. No atomic link/hold liveness. |
+| Inbound Send/Batch | Natural Detach/auth retirement retains the original result, without replacement, committed-send rollback or new late acknowledgement. Cancelling a queued acknowledgement does not prove it was unsent. Outer-pump panic custody #127 remains pending. |
+| Management | Retirement discards pre-invocation preparation but drains begun commands/post-result registry work and original native acknowledgements/replies/confirmations. No new late reply/confirmation. Outer-pump panic custody #129 remains pending. |
+| CBS | Natural retirement/outer-pump panic retain original token validation/store, native work and completed packets through captured-route cleanup. No installed-grant rollback, selected-route retry, new acknowledgement or second confirmation. Bootstrap needs no existing grant. |
 
-The pump also retains one original Receive and its reserved credit through
-natural teardown. Never-polled work is discarded; a polled attempt is drained
-and cached before residual route/session cleanup. Late results cause no Transfer
-or implicit settlement: PeekLock waits for expiry; ReceiveAndDelete can be lost.
-An outer receiving-pump panic also retains originals and completed packets.
-Cleanup drains intake/native/workers, conditionally removes captured registrations,
-then observes one lazy original session release before resuming the primary panic.
-Cancelled borrowed cleanup retains each phase and raw result. A panicked original
-is terminal-marked without repoll, retry or fabricated success; its accepted work
-is not recovered. This does not protect an aborted ancestor or bound cleanup time.
+Admitted-work rules: discard never-polled retired phases; drain/cache begun originals
+without resubmission. Cancelled borrowed finish retains phases, handles and raw
+results. Receive/session-grant broker invocation starts inside the retained
+original's first poll, including eager adapters; this is not an enqueue receipt.
+Management/CBS returned reply exits close captured channels and identity-unregister;
+original native errors precede cleanup errors. CBS primary faults/native errors
+also precede secondary diagnostic failures.
+Late Receive results cause no Transfer or implicit settlement: PeekLock waits for
+expiry; ReceiveAndDelete can be lost. Auth retirement does not roll back a begun
+Transfer. Merged receiving/CBS panic custody terminal-marks a panicked original
+without repoll, retry or fabricated success; accepted work is not recovered.
 
-Once native transfer starts, teardown retains its original future, Delivery and
-reservation. Intake, transfer and workers retire before drains; a late Pending
-joins the same retired worker owner before its first finish. Ready outcomes use
-existing authorization/settlement rules before route/session cleanup. Auth
-retirement does not roll back an already-started Transfer or guarantee progress
-behind blocked native I/O.
+Captured delivery identities fence worker/residual cleanup and management
+renewal/disposition writes under the row lock; equal-value/cross-entity replacements
+survive. Cancelled residual cleanup retains unfinished handles until removal
+completes. Lookup preference, TTL purge and delayed-install ordering are unchanged.
+Session cleanup matches captured owner/entity/full hold. Original End observes
+End/Stop/driver panic during attachment auth/registry preparation, even with its
+row held; readiness proves neither answering End nor native joins. Receiving auth
+preparation observes captured Detach before Receive.
 
-Entity attaches retain original native acceptance and any session grant through
-borrowed observers. Observed End discards only never-polled phases; polled
-originals are observed and cached. An unused hold gets one release attempt using
-its captured entity/full hold; refusal leaves ordinary expiry. Receiving entity
-attaches claim registry ownership before their first helper await. Installation
-checks the latest claim and observed original End/Detach after write-lock
-admission; stale cleanup matches the captured owner, entity and full hold.
-Failed newest claims preserve installed rows without reviving older pending work.
-This is not atomic link/hold liveness or ancestor-task shielding (#75).
-An owned original-session End observer fences attachment authorization and session
-registry installation. End, Stop or driver panic wakes preparation even while its
-row is held; readiness does not acknowledge the End reply or join native tasks.
-Receiving authorization preparation observes its captured Detach before Receive.
-
-Inbound links retain one original Send/Batch result through borrowed observers
-and natural Detach/auth retirement. Never-polled retired work submits nothing;
-begun work drains without a replacement or new late acknowledgement. A committed
-send is not rolled back, and cancellation of a queued wire acknowledgement is
-not proof it was unsent. Whole-task abortion remains #75.
-Receive and session-grant callers defer broker method invocation to the retained
-original's first poll, including eager adapters. This is not an enqueue receipt.
-
-Management retirement discards preparation before broker invocation, but drains
-begun commands and their post-result registry work. Original native acknowledgements,
-replies and begun confirmations remain owned; no new late reply/confirmation starts.
-Every returned reply exit closes its captured channel and unregisters by identity.
-Original native errors precede cleanup errors; blocked writers still need joined
-native stop. CBS retains the original begun token validation/store and native
-operations, without rolling back installed grants or retrying a selected reply
-route. Retirement starts no new acknowledgement or second confirmation; every
-returned reply exit closes and identity-unregisters its captured channel.
-Outer CBS pump panics retain original token/native work and cached packets until
-captured-route cleanup finishes. Cancelled borrowed finish resumes that custody;
-primary faults and original native errors precede secondary diagnostic failures.
-A panicked original is terminal, not retried or treated as successful.
-CBS bootstrap does not wait for an existing authorization grant. Send/management
-panic custody (#127/#129), task trees (#75) and
-process shutdown remain [roadmap work](roadmap.md#next-main-increments); stalled
-broker/I/O can delay cleanup. These guarantees do not cover an aborted ancestor.
+Native connection-pump panic custody #130 and queue profiles #13 are source-only,
+not merged progress. Early leaf-fault notice #139, task families/ancestor shielding
+#75 and process shutdown #7 remain [roadmap work](roadmap.md#next-main-increments).
+These contracts do not protect aborted ancestors or bound cleanup latency;
+blocked native writers still need native Stop and joined shutdown, and stalled
+broker work may delay cleanup.
 
 Sustained inbound traffic beyond initial credit is not certified. Session
 transfer-window accounting and receiving-credit refill remain
