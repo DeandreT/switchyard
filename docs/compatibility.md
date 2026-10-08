@@ -153,14 +153,21 @@ driver and reader, retaining results for cancellation-safe retry. Drop requests
 stop only. Join success does not acknowledge AMQP Close: `close` and
 `close_with_error` still require the peer reply. Sender capacity waits observe
 detach and command closure, even when callers retain all 256 confirmation permits.
+Cleanup custody in queued credit-grant replies remains [#81](https://github.com/DeandreT/switchyard/issues/81).
 
 Receiving-pump teardown joins its original settlement workers (at most 32)
 before residual route cleanup and session release. Retirement stops unanswered
 remote/confirmation waits, not started broker submissions; ready outcomes still
 apply. Second-mode success follows durable settlement. Cancelled finish observers
 retain original handles/results. Drop only requests retirement and detaches.
-Started Receive/AcceptSession custody, wider transport/task cleanup and ordered
-process shutdown remain [roadmap work](roadmap.md#next-main-increments).
+
+The pump also retains one original Receive and its reserved credit through
+natural teardown. Never-polled work is discarded; a polled attempt is drained
+and cached before residual route/session cleanup. Late results cause no Transfer
+or implicit settlement: PeekLock waits for expiry; ReceiveAndDelete can be lost.
+Cancelled borrowed observers retain custody, not an aborted parent task.
+Session handoff, wider transport/task cleanup and ordered process shutdown remain
+[roadmap work](roadmap.md#next-main-increments). A stalled broker can still stall joins.
 
 Sustained inbound traffic beyond initial credit is not certified. Session
 transfer-window accounting and receiving-credit refill remain

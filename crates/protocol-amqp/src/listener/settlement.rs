@@ -20,7 +20,11 @@ use super::{
     LinkAuthorization, ReceivingLinkProtocol, error_for, rejection_error, unauthorized_error,
 };
 
+mod intake;
+#[cfg(test)]
+mod test_support;
 mod workers;
+use intake::ReceiveIntake;
 use workers::SettlementWorkers;
 
 /// How long a receiving link waits on a wakeup before asking the broker anyway.
@@ -92,6 +96,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
         link_name: link_name.clone(),
     };
     let mut in_flight = SettlementWorkers::new();
+    let mut intake = None;
     let mut registered_locks = HashSet::new();
 
     let exit = 'pump: loop {
@@ -147,21 +152,28 @@ pub(super) async fn serve_receiving_client<B: Broker>(
             }
         };
 
-        // Keep the receive future alive when an earlier settlement completes.
-        // Dropping a broker submission after it committed could strand a lock
-        // until expiry even though its returned Delivery was never observed.
+        // Authorization preparation is not the broker's first-poll frontier.
+        if let Some(authorization) = authorization.as_ref()
+            && authorization.ensure().await.is_err()
+        {
+            break 'pump PumpExit::Unauthorized;
+        }
         let wakeup = broker.deliverable(&namespace, &entity);
         tokio::pin!(wakeup);
-        let fetched = {
-            let fetched = receive_delivery(
-                &broker,
-                &namespace,
-                &entity,
-                mode,
-                session.as_ref(),
-                authorization.as_ref(),
-            );
-            tokio::pin!(fetched);
+        intake = Some(ReceiveIntake::new(
+            reservation,
+            broker.submit(
+                namespace.clone(),
+                entity.clone(),
+                CommandKind::Receive {
+                    mode,
+                    lock_duration_millis: None,
+                    session: session.clone(),
+                },
+            ),
+        ));
+        {
+            let original = intake.as_mut().expect("one reserved Receive attempt");
             loop {
                 tokio::select! {
                     biased;
@@ -176,11 +188,18 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                             break 'pump exit;
                         }
                     }
-                    fetched = &mut fetched => break fetched,
+                    _ = original.observe() => break,
                 }
             }
-        };
-        let delivery = match fetched {
+        }
+        let packet = intake
+            .take()
+            .expect("one reserved Receive attempt")
+            .take_packet()
+            .expect("the observed Receive owns a packet");
+        let reservation = packet.reservation;
+        let fetched = packet.result.expect("active Receive was not retired");
+        let delivery = match received_delivery(fetched) {
             Ok(Some(delivery)) => delivery,
             Ok(None) => {
                 if let Err(error) = reservation.release().await {
@@ -216,10 +235,9 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                 }
                 continue 'pump;
             }
-            Err(NextDeliveryError::Broker(rejection)) => {
+            Err(rejection) => {
                 break 'pump PumpExit::Broker(rejection);
             }
-            Err(NextDeliveryError::Unauthorized) => break 'pump PumpExit::Unauthorized,
         };
 
         // Azure sets DeadLetterSource only after a DLQ message has been
@@ -276,8 +294,31 @@ pub(super) async fn serve_receiving_client<B: Broker>(
     // Retire transport-only waits, but drain every original worker before
     // releasing routes or the session. A submitted broker operation must not
     // lose its result merely because the remote link has gone away.
+    if let Some(original) = intake.as_mut() {
+        original.retire();
+    }
     in_flight.retire();
+    if let Some(original) = intake.as_mut() {
+        debug!(
+            started = original.started(),
+            "draining retired Receive intake"
+        );
+        if let Some(result) = original.finish().await {
+            match result {
+                Ok(CommandOutcome::Received(delivery)) => {
+                    debug!(sequence = ?delivery.as_ref().map(|delivery| delivery.sequence), "retired Receive result observed without transfer");
+                }
+                Ok(other) => warn!(?other, "retired Receive produced an unexpected outcome"),
+                Err(rejection) => debug!(%rejection, "retired Receive was rejected"),
+            }
+        }
+    }
     in_flight.finish().await;
+    if let Some(original) = intake.as_mut() {
+        // Retired transport cannot consume this credit. Drop uses the original
+        // identity on the engine's unbounded cleanup path, not a new wait.
+        drop(original.take_packet());
+    }
     for joined in in_flight.finished() {
         match &joined.result {
             Ok(completion) => {
@@ -404,52 +445,19 @@ pub(super) async fn release_session<B: Broker>(
     }
 }
 
-/// Makes one broker receive attempt.
-///
-/// Reporting an empty result to the pump is significant: only after that
-/// observation may it acknowledge a remote AMQP drain request. The wakeup is
-/// armed by the caller before this command so a concurrent send is not lost.
-async fn receive_delivery<B: Broker>(
-    broker: &B,
-    namespace: &NamespaceName,
-    entity: &EntityPath,
-    mode: ReceiveMode,
-    session: Option<&SessionHold>,
-    authorization: Option<&LinkAuthorization>,
-) -> Result<Option<Delivery>, NextDeliveryError> {
-    if let Some(authorization) = authorization
-        && authorization.ensure().await.is_err()
-    {
-        return Err(NextDeliveryError::Unauthorized);
-    }
-    let outcome = broker
-        .submit(
-            namespace.clone(),
-            entity.clone(),
-            CommandKind::Receive {
-                mode,
-                lock_duration_millis: None,
-                session: session.cloned(),
-            },
-        )
-        .await
-        .map_err(NextDeliveryError::Broker)?;
-
-    match outcome {
+fn received_delivery(
+    result: intake::RawReceiveResult,
+) -> Result<Option<Delivery>, BrokerRejection> {
+    match result? {
         CommandOutcome::Received(delivery) => Ok(delivery),
         other => {
             // A receive that produced anything else means the broker and the
             // edge disagree about the command, which is not a client problem.
-            Err(NextDeliveryError::Broker(BrokerRejection::Unavailable(
-                format!("receive produced an unexpected outcome: {other:?}"),
+            Err(BrokerRejection::Unavailable(format!(
+                "receive produced an unexpected outcome: {other:?}"
             )))
         }
     }
-}
-
-enum NextDeliveryError {
-    Broker(BrokerRejection),
-    Unauthorized,
 }
 
 /// Awaits and applies one independently identified remote disposition.
