@@ -420,12 +420,7 @@ fn in_exact_operand_ceiling_and_scalar_only_grammar_are_fixed() {
         }
     );
     assert!(SqlProgram::compile("1 IN ()").is_err());
-    for expression in [
-        "1 IN (1+1)",
-        "1 IN (EXISTS(x))",
-        "1 IN (1=1)",
-        "(1=1) IN (TRUE)",
-    ] {
+    for expression in ["1 IN (EXISTS(x))", "1 IN (1=1)", "(1=1) IN (TRUE)"] {
         assert!(
             matches!(
                 SqlProgram::compile(expression),
@@ -889,10 +884,6 @@ fn deterministic_dynamic_pattern_corpus_has_no_panics_or_unstable_results() {
 #[test]
 fn later_language_children_and_statement_extensions_are_refused() {
     for expression in [
-        "x+1=2",
-        "-x=1",
-        "p('x')=1",
-        "property('x')=1",
         "newid()=1",
         "CAST(x AS INT)=1",
         "x BETWEEN 1 AND 2",
@@ -1189,5 +1180,587 @@ fn deterministic_malformed_and_typed_property_corpus_has_no_panics() {
             evaluate(&format!("value>{value}"), &values).unwrap(),
             SqlTruth::False
         );
+    }
+}
+
+#[test]
+fn scalar_arithmetic_precedence_associativity_and_unary_are_explicit() {
+    let values = [property("x", SqlValue::Int(1))];
+    for expression in [
+        "2+3*4=14",
+        "(2+3)*4=20",
+        "20/3/2=3",
+        "5-3-1=1",
+        "-7/3=-2",
+        "-7%3=-1",
+        "7%-3=1",
+        "-(x+2)*3=-9",
+        "+x=1",
+        "x+1=2",
+        "-x=-1",
+        "1 IN (1+1,3-2)",
+        "p('x')+1=2",
+        "p('x')=1",
+        "property('x')=1",
+        "property(('x'))*2=2",
+        "-9223372036854775808=-9223372036854775808",
+    ] {
+        assert_eq!(
+            evaluate(expression, &values),
+            Ok(SqlTruth::True),
+            "{expression}"
+        );
+    }
+    assert_eq!(evaluate("1 IN (1+1)", &[]), Ok(SqlTruth::False));
+    assert_eq!(evaluate("-x=1", &values), Ok(SqlTruth::False));
+    for expression in ["x+1", "-x", "p('x')", "1.0/0.0"] {
+        assert_eq!(
+            evaluate(expression, &values),
+            Err(SqlEvaluationError::NonPredicate)
+        );
+    }
+    for expression in [
+        "(TRUE AND TRUE)+1=2",
+        "1 IN (TRUE OR FALSE)",
+        "EXISTS(x)+1=2",
+    ] {
+        assert!(
+            matches!(
+                SqlProgram::compile(expression),
+                Err(SqlCompileError::Unsupported { .. })
+            ),
+            "{expression}"
+        );
+    }
+}
+
+#[test]
+fn scalar_arithmetic_width_promotion_and_literal_origin_controls() {
+    for value in [
+        SqlValue::Byte(1),
+        SqlValue::Ubyte(1),
+        SqlValue::Short(1),
+        SqlValue::Ushort(1),
+        SqlValue::Int(1),
+        SqlValue::Uint(1),
+        SqlValue::Long(1),
+        SqlValue::Ulong(1),
+        SqlValue::Float(1.0),
+        SqlValue::Double(1.0),
+    ] {
+        assert_eq!(
+            evaluate("x+x=2", &[property("x", value)]),
+            Ok(SqlTruth::True)
+        );
+    }
+    let values = [
+        property("u", SqlValue::Ulong(3)),
+        property("s", SqlValue::Long(1)),
+        property("ui", SqlValue::Uint(u32::MAX)),
+        property("i", SqlValue::Int(1)),
+        property("byte", SqlValue::Byte(i8::MAX)),
+        property("large", SqlValue::Float(16_777_216.0)),
+        property("f", SqlValue::Float(1.0)),
+        property("d", SqlValue::Double(1.0)),
+    ];
+    for expression in [
+        "u+1=4",
+        "1+u=4",
+        "u+(1)=4",
+        "u+(-0)=3",
+        "byte+byte=254",
+        "ui+i=4294967296",
+        "i+ui=4294967296",
+        "-ui=-4294967295",
+        "large+f=16777216",
+        "large+d=16777217.0",
+        "large+1=16777216",
+    ] {
+        assert_eq!(
+            evaluate(expression, &values),
+            Ok(SqlTruth::True),
+            "{expression}"
+        );
+    }
+    for expression in [
+        "u+s=4",
+        "s+u=4",
+        "u+-1=2",
+        "u+(1+1)=5",
+        "u+-(+1)=2",
+        "(u+1)=s",
+        "-u=-3",
+    ] {
+        assert_eq!(
+            evaluate(expression, &values),
+            Err(SqlEvaluationError::TypeMismatch),
+            "{expression}"
+        );
+    }
+    for value in -1_i8..=1 {
+        for signed in [
+            SqlValue::Byte(value),
+            SqlValue::Short(i16::from(value)),
+            SqlValue::Int(i32::from(value)),
+            SqlValue::Long(i64::from(value)),
+        ] {
+            let inputs = [property("u", SqlValue::Ulong(3)), property("s", signed)];
+            for expression in ["u+s=3", "s+u=3"] {
+                assert_eq!(
+                    evaluate(expression, &inputs),
+                    Err(SqlEvaluationError::TypeMismatch)
+                );
+            }
+        }
+    }
+    assert_eq!(
+        evaluate(
+            "x+x=4294967294",
+            &[property("x", SqlValue::Uint(i32::MAX as u32))]
+        ),
+        Ok(SqlTruth::True)
+    );
+    assert_eq!(
+        evaluate("x+x=0", &[property("x", SqlValue::Uint(u32::MAX))]),
+        Err(SqlEvaluationError::ArithmeticOverflow)
+    );
+    assert_eq!(
+        evaluate("x+x=0", &[property("x", SqlValue::Int(i32::MAX))]),
+        Err(SqlEvaluationError::ArithmeticOverflow)
+    );
+    assert_eq!(
+        evaluate("x+1=2147483648", &[property("x", SqlValue::Int(i32::MAX))]),
+        Ok(SqlTruth::True)
+    );
+}
+
+#[test]
+fn scalar_arithmetic_checked_overflow_and_integral_zero_controls() {
+    for expression in [
+        "9223372036854775807+1=0",
+        "-9223372036854775808-1=0",
+        "9223372036854775807*2=0",
+        "-9223372036854775808/-1=0",
+        "-9223372036854775808%-1=0",
+        "-(-9223372036854775808)=0",
+    ] {
+        assert_eq!(
+            evaluate(expression, &[]),
+            Err(SqlEvaluationError::ArithmeticOverflow),
+            "{expression}"
+        );
+    }
+    for expression in ["1/0=0", "1%0=0", "-1/0=0", "0%0=0"] {
+        assert_eq!(
+            evaluate(expression, &[]),
+            Err(SqlEvaluationError::DivideByZero),
+            "{expression}"
+        );
+    }
+    for (expression, values) in [
+        ("x+1=0", vec![property("x", SqlValue::Ulong(u64::MAX))]),
+        ("x-1=0", vec![property("x", SqlValue::Ulong(0))]),
+        ("-x=0", vec![property("x", SqlValue::Int(i32::MIN))]),
+        (
+            "x/y=0",
+            vec![
+                property("x", SqlValue::Int(i32::MIN)),
+                property("y", SqlValue::Int(-1)),
+            ],
+        ),
+        (
+            "x%y=0",
+            vec![
+                property("x", SqlValue::Int(i32::MIN)),
+                property("y", SqlValue::Int(-1)),
+            ],
+        ),
+    ] {
+        assert_eq!(
+            evaluate(expression, &values),
+            Err(SqlEvaluationError::ArithmeticOverflow),
+            "{expression}"
+        );
+    }
+    for expression in ["9223372036854775808=0", "1e309=0"] {
+        assert!(matches!(
+            SqlProgram::compile(expression),
+            Err(SqlCompileError::Unsupported { .. })
+        ));
+    }
+}
+
+#[test]
+fn scalar_arithmetic_ieee_infinity_nan_remainder_and_signed_zero_controls() {
+    let values = [
+        property("inf", SqlValue::Double(f64::INFINITY)),
+        property("nan", SqlValue::Double(f64::NAN)),
+        property("zero", SqlValue::Float(0.0)),
+        property("negative", SqlValue::Float(-0.0)),
+        property("one", SqlValue::Float(1.0)),
+        property("fmax", SqlValue::Float(f32::MAX)),
+    ];
+    for expression in [
+        "1.0/0.0=inf",
+        "-1.0/0.0=-inf",
+        "0.0/0.0!=0.0",
+        "inf-inf!=inf",
+        "nan+1!=nan",
+        "nan*0!=0",
+        "5.0%inf=5.0",
+        "inf%5.0!=0.0",
+        "5.0%0.0!=0.0",
+        "-5.5%2.0=-1.5",
+        "5.5%-2.0=1.5",
+        "one/negative=-inf",
+        "one/-negative=inf",
+        "one/-zero=-inf",
+        "one/zero=inf",
+        "fmax*fmax=inf",
+        "negative%one=0",
+    ] {
+        assert_eq!(
+            evaluate(expression, &values),
+            Ok(SqlTruth::True),
+            "{expression}"
+        );
+    }
+    assert_eq!(evaluate("0.0/0.0=0.0", &[]), Ok(SqlTruth::False));
+}
+
+#[test]
+fn scalar_arithmetic_null_type_and_eager_error_priority_controls() {
+    let values = [property("bad", SqlValue::Unsupported)];
+    for expression in [
+        "missing+1=1",
+        "NULL/0=0",
+        "NULL%0=0",
+        "-NULL=0",
+        "NULL+'text'=0",
+    ] {
+        assert_eq!(
+            evaluate(expression, &[]),
+            Ok(SqlTruth::Unknown),
+            "{expression}"
+        );
+    }
+    for expression in ["'a'+'b'='ab'", "TRUE+1=2", "+'1'=1", "1/TRUE=1"] {
+        assert_eq!(
+            evaluate(expression, &[]),
+            Err(SqlEvaluationError::TypeMismatch),
+            "{expression}"
+        );
+    }
+    for expression in ["NULL+bad=1", "FALSE AND bad+1=2", "TRUE OR -bad=0"] {
+        assert_eq!(
+            evaluate(expression, &values),
+            Err(SqlEvaluationError::UnsupportedValue),
+            "{expression}"
+        );
+    }
+    assert_eq!(
+        evaluate("(1/0)+NULL=0", &[]),
+        Err(SqlEvaluationError::DivideByZero)
+    );
+    assert_eq!(
+        evaluate("FALSE AND 1/0=0", &[]),
+        Err(SqlEvaluationError::DivideByZero)
+    );
+    assert_eq!(
+        evaluate("TRUE OR 9223372036854775807+1=0", &[]),
+        Err(SqlEvaluationError::ArithmeticOverflow)
+    );
+    assert_eq!(
+        evaluate("1/0=0 AND bad=1", &values),
+        Err(SqlEvaluationError::DivideByZero)
+    );
+    assert_eq!(
+        evaluate("bad=1 AND 1/0=0", &values),
+        Err(SqlEvaluationError::UnsupportedValue)
+    );
+}
+
+#[test]
+fn static_property_keys_are_raw_and_never_reparse_namespaces_or_quotes() {
+    let values = [
+        property("Color", SqlValue::String("red")),
+        property("user.Color", SqlValue::String("raw-user")),
+        property("sys.MessageId", SqlValue::String("raw-system")),
+        property("MessageId", SqlValue::String("user-id")),
+        property("[Color]", SqlValue::Int(1)),
+        property("\"Color\"", SqlValue::Int(2)),
+        property("a'b", SqlValue::Int(3)),
+        property("sys.Other", SqlValue::Int(4)),
+        property("\u{03c3}", SqlValue::Int(5)),
+        property("\u{03a3}", SqlValue::Int(6)),
+    ];
+    let system = [SqlSystemValue {
+        property: SqlSystemProperty::MessageId,
+        value: SqlValue::String("system-id"),
+    }];
+    let context = SqlMessageContext {
+        application_properties: &values,
+        system_properties: &system,
+    };
+    for expression in [
+        "p('COLOR')='red'",
+        "PROPERTY(('Color'))=user.[Color]",
+        "p('user.Color')='raw-user'",
+        "p('sys.MessageId')='raw-system'",
+        "[sys.MessageId]=p('sys.MessageId')",
+        "sys.MessageId='system-id' AND p('sys.MessageId')='raw-system'",
+        "sys.\"MessageId\"='system-id'",
+        "user.MessageId='user-id'",
+        "p('[Color]')=1",
+        "p('\"Color\"')=2",
+        "p('a''b')=3",
+        "p('sys.Other')=4",
+        "p('\u{03c3}')=5 AND p('\u{03a3}')=6",
+        "p('Color') LIKE 'r%'",
+        "p('missing')+1=0 OR TRUE",
+    ] {
+        assert_eq!(
+            SqlProgram::compile(expression)
+                .unwrap()
+                .evaluate(context, &mut SqlEvaluationBudget::default()),
+            Ok(SqlTruth::True),
+            "{expression}"
+        );
+    }
+    assert_eq!(
+        evaluate("p('sys.MessageId')='x'", &[]),
+        Ok(SqlTruth::Unknown)
+    );
+    assert_eq!(
+        evaluate("sys.MessageId='x'", &values),
+        Err(SqlEvaluationError::MissingSystemProperty)
+    );
+    let ambiguous = [
+        property("Color", SqlValue::Int(1)),
+        property("color", SqlValue::Int(2)),
+    ];
+    assert_eq!(
+        evaluate("p('COLOR')=1", &ambiguous),
+        Err(SqlEvaluationError::AmbiguousProperty)
+    );
+    assert_eq!(
+        evaluate("p('bad')=NULL", &[property("bad", SqlValue::Unsupported)]),
+        Err(SqlEvaluationError::UnsupportedValue)
+    );
+    assert_eq!(
+        evaluate("p('null')=1", &[property("null", SqlValue::Null)]),
+        Ok(SqlTruth::Unknown)
+    );
+}
+
+#[test]
+fn static_property_dynamic_malformed_and_modifier_forms_are_refused() {
+    for expression in [
+        "p()=1",
+        "p('a','b')=1",
+        "p(name)=1",
+        "p(1)=1",
+        "p(NULL)=1",
+        "p('a'+'b')=1",
+        "p(\"Color\")=1",
+        "p('')=1",
+        "p('\n')=1",
+        "p('\u{0000}')=1",
+        "p(DISTINCT 'a')=1",
+        "p('a') OVER ()=1",
+        "p('a') FILTER (WHERE TRUE)=1",
+        "p('a' ORDER BY 'b')=1",
+        "sys.p('a')=1",
+        "\"p\"('a')=1",
+        "property([name])=1",
+        "EXISTS(p('a'))",
+        "p('a') IS NULL",
+        "(1+1) IS NULL",
+        "newid()=1",
+        "CAST(1 AS BIGINT)=1",
+    ] {
+        assert!(SqlProgram::compile(expression).is_err(), "{expression:?}");
+    }
+    for expression in [
+        "p('unterminated)=1",
+        "property('a'))=1",
+        "p('a',)=1",
+        "1+/=2",
+    ] {
+        assert!(SqlProgram::compile(expression).is_err(), "{expression}");
+    }
+}
+
+#[test]
+fn scalar_preflight_charges_hidden_work_and_full_invalid_string_operands() {
+    let context = SqlMessageContext::default();
+    for expression in [
+        "FALSE AND 1/0=0",
+        "TRUE OR 9223372036854775807+1=0",
+        "FALSE AND -(1+2)=0",
+    ] {
+        let program = SqlProgram::compile(expression).unwrap();
+        let mut limited =
+            SqlEvaluationBudget::with_limits(program.metrics().nodes, MAX_SQL_COMPARISON_BYTES);
+        assert_eq!(
+            program.evaluate(context, &mut limited),
+            Err(SqlEvaluationError::Limit {
+                kind: SqlEvaluationLimit::WorkUnits,
+                maximum: program.metrics().nodes
+            }),
+            "{expression}"
+        );
+        assert_eq!(limited.used().work, program.metrics().nodes);
+    }
+    for expression in ["FALSE AND 'long'+1=0", "TRUE OR -'long'=0", "NULL+'long'=0"] {
+        let program = SqlProgram::compile(expression).unwrap();
+        let mut short = SqlEvaluationBudget::with_limits(100, 3);
+        assert_eq!(
+            program.evaluate(context, &mut short),
+            Err(SqlEvaluationError::Limit {
+                kind: SqlEvaluationLimit::ComparisonBytes,
+                maximum: 3
+            }),
+            "{expression}"
+        );
+        assert_eq!(short.used().comparison_bytes, 0);
+        assert_eq!(short.used().work, program.metrics().nodes + 1);
+    }
+    let values = [property("x", SqlValue::String("long"))];
+    let message = SqlMessageContext {
+        application_properties: &values,
+        system_properties: &[],
+    };
+    for expression in ["FALSE AND p('x')+1=0", "TRUE OR -p('x')=0"] {
+        let program = SqlProgram::compile(expression).unwrap();
+        let mut exact = SqlEvaluationBudget::default();
+        assert_eq!(
+            program.evaluate(message, &mut exact),
+            Err(SqlEvaluationError::TypeMismatch)
+        );
+        let used = exact.used();
+        let mut short = SqlEvaluationBudget::with_limits(used.work, used.comparison_bytes - 1);
+        assert!(matches!(
+            program.evaluate(message, &mut short),
+            Err(SqlEvaluationError::Limit {
+                kind: SqlEvaluationLimit::ComparisonBytes,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn scalar_composition_and_shared_compile_evaluation_budget_boundaries() {
+    let values = [
+        property("x", SqlValue::Int(2)),
+        property("pattern", SqlValue::String("a%")),
+    ];
+    let message = SqlMessageContext {
+        application_properties: &values,
+        system_properties: &[],
+    };
+    for expression in [
+        "p('x')+1 IN (6/2,4%3)",
+        "'abc' LIKE property('pattern')",
+        "-p('x')=-2",
+    ] {
+        let program = SqlProgram::compile(expression).unwrap();
+        let metrics = program.metrics();
+        let mut compile =
+            SqlCompileBudget::with_limits(metrics.source_bytes, metrics.tokens, metrics.nodes);
+        assert!(SqlProgram::compile_with_budget(expression, &mut compile).is_ok());
+        assert!(matches!(
+            SqlProgram::compile_with_budget(expression, &mut compile),
+            Err(SqlCompileError::Limit {
+                kind: SqlCompileLimit::AggregateSourceBytes,
+                ..
+            })
+        ));
+        let mut node_short =
+            SqlCompileBudget::with_limits(metrics.source_bytes, metrics.tokens, metrics.nodes - 1);
+        assert!(matches!(
+            SqlProgram::compile_with_budget(expression, &mut node_short),
+            Err(SqlCompileError::Limit {
+                kind: SqlCompileLimit::AggregateNodes,
+                ..
+            })
+        ));
+        let mut baseline = SqlEvaluationBudget::default();
+        assert_eq!(program.evaluate(message, &mut baseline), Ok(SqlTruth::True));
+        let used = baseline.used();
+        let mut exact = SqlEvaluationBudget::with_limits(used.work, used.comparison_bytes);
+        assert_eq!(program.evaluate(message, &mut exact), Ok(SqlTruth::True));
+        assert!(matches!(
+            program.evaluate(message, &mut exact),
+            Err(SqlEvaluationError::Limit { .. })
+        ));
+        let mut work_short = SqlEvaluationBudget::with_limits(used.work - 1, used.comparison_bytes);
+        assert!(matches!(
+            program.evaluate(message, &mut work_short),
+            Err(SqlEvaluationError::Limit {
+                kind: SqlEvaluationLimit::WorkUnits,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn deterministic_scalar_grammar_and_malformed_corpus_has_stable_results() {
+    let mut state = 0x97_u64;
+    let operators = ['+', '-', '*', '/', '%'];
+    let apply = |op, left: i64, right: i64| match op {
+        '+' => left + right,
+        '-' => left - right,
+        '*' => left * right,
+        '/' => left / right,
+        '%' => left % right,
+        _ => unreachable!(),
+    };
+    for _ in 0..256 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        let x = ((state >> 8) % 51) as i32 - 25;
+        let left = ((state >> 16) % 9 + 1) as i64;
+        let right = ((state >> 24) % 9 + 1) as i64;
+        let first = operators[(state as usize) % operators.len()];
+        let second = operators[((state >> 32) as usize) % operators.len()];
+        let expected = apply(second, apply(first, i64::from(x), left), right);
+        let valid = format!("(p('x'){first}{left}){second}{right}={expected}");
+        let values = [property("x", SqlValue::Int(x))];
+        let context = SqlMessageContext {
+            application_properties: &values,
+            system_properties: &[],
+        };
+        for expression in [
+            valid.clone(),
+            format!("{valid})"),
+            format!("p('x',{left})=1"),
+            format!("(p('x'){first}{left}){second}=1"),
+        ] {
+            let mut first_compile = SqlCompileBudget::default();
+            let mut second_compile = SqlCompileBudget::default();
+            let first = SqlProgram::compile_with_budget(&expression, &mut first_compile);
+            let second = SqlProgram::compile_with_budget(&expression, &mut second_compile);
+            assert_eq!(first_compile.used(), second_compile.used());
+            match (first, second) {
+                (Err(left), Err(right)) => {
+                    assert_eq!(left, right);
+                    assert_ne!(expression, valid);
+                }
+                (Ok(left), Ok(right)) => {
+                    assert_eq!(expression, valid);
+                    assert_eq!(left.metrics(), right.metrics());
+                    let mut a = SqlEvaluationBudget::default();
+                    let mut b = SqlEvaluationBudget::default();
+                    assert_eq!(left.evaluate(context, &mut a), Ok(SqlTruth::True));
+                    assert_eq!(right.evaluate(context, &mut b), Ok(SqlTruth::True));
+                    assert_eq!(a.used(), b.used());
+                }
+                _ => panic!("nondeterministic compile: {expression:?}"),
+            }
+        }
     }
 }

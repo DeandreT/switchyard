@@ -169,7 +169,17 @@ impl Builder<'_> {
             Expr::UnaryOp {
                 op: op @ (UnaryOperator::Minus | UnaryOperator::Plus),
                 expr,
-            } => Node::Literal(signed_literal(expr, matches!(op, UnaryOperator::Minus))?),
+            } => {
+                let negative = matches!(op, UnaryOperator::Minus);
+                if numeric_literal(expr) {
+                    Node::Literal(signed_literal(expr, negative)?)
+                } else {
+                    Node::NumericUnary {
+                        input: self.scalar(expr, depth + 1)?,
+                        negative,
+                    }
+                }
+            }
             Expr::BinaryOp { left, op, right } => {
                 let op = match op {
                     BinaryOperator::And => Binary::And,
@@ -180,10 +190,27 @@ impl Builder<'_> {
                     BinaryOperator::GtEq => Binary::Ge,
                     BinaryOperator::Lt => Binary::Lt,
                     BinaryOperator::LtEq => Binary::Le,
+                    BinaryOperator::Plus => Binary::Add,
+                    BinaryOperator::Minus => Binary::Sub,
+                    BinaryOperator::Multiply => Binary::Mul,
+                    BinaryOperator::Divide => Binary::Div,
+                    BinaryOperator::Modulo => Binary::Rem,
                     _ => return Err(unsupported("binary operator")),
                 };
-                let left = self.lower(left, depth + 1)?;
-                let right = self.lower(right, depth + 1)?;
+                let arithmetic = matches!(
+                    op,
+                    Binary::Add | Binary::Sub | Binary::Mul | Binary::Div | Binary::Rem
+                );
+                let left = if arithmetic {
+                    self.scalar(left, depth + 1)?
+                } else {
+                    self.lower(left, depth + 1)?
+                };
+                let right = if arithmetic {
+                    self.scalar(right, depth + 1)?
+                } else {
+                    self.lower(right, depth + 1)?
+                };
                 Node::Binary { op, left, right }
             }
             Expr::IsNull(input) | Expr::IsNotNull(input) => {
@@ -264,7 +291,10 @@ impl Builder<'_> {
                 let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
                     return Err(unsupported("function scope"));
                 };
-                if !name.value.eq_ignore_ascii_case("exists") || name.quote_style.is_some() {
+                let exists = name.value.eq_ignore_ascii_case("exists");
+                let static_property = name.value.eq_ignore_ascii_case("property")
+                    || name.value.eq_ignore_ascii_case("p");
+                if (!exists && !static_property) || name.quote_style.is_some() {
                     return Err(unsupported("function"));
                 }
                 if function.uses_odbc_syntax
@@ -277,7 +307,7 @@ impl Builder<'_> {
                     return Err(unsupported("function modifiers"));
                 }
                 let FunctionArguments::List(arguments) = &function.args else {
-                    return Err(unsupported("EXISTS operand"));
+                    return Err(unsupported("function operand"));
                 };
                 if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
                     return Err(unsupported("function modifiers"));
@@ -285,9 +315,13 @@ impl Builder<'_> {
                 let [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] =
                     arguments.args.as_slice()
                 else {
-                    return Err(unsupported("EXISTS operand"));
+                    return Err(unsupported("function operand"));
                 };
-                Node::Exists(property(argument)?)
+                if exists {
+                    Node::Exists(property(argument)?)
+                } else {
+                    Node::Property(user_property(static_key(argument)?)?)
+                }
             }
             _ => return Err(unsupported("expression")),
         };
@@ -304,8 +338,46 @@ impl Builder<'_> {
                 op: UnaryOperator::Minus | UnaryOperator::Plus,
                 ..
             } => self.lower(expr, depth),
+            Expr::BinaryOp {
+                op:
+                    BinaryOperator::Plus
+                    | BinaryOperator::Minus
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo,
+                ..
+            } => self.lower(expr, depth),
+            Expr::Function(function)
+                if function.name.0.len() == 1
+                    && function.name.0[0].as_ident().is_some_and(|name| {
+                        name.quote_style.is_none()
+                            && (name.value.eq_ignore_ascii_case("property")
+                                || name.value.eq_ignore_ascii_case("p"))
+                    }) =>
+            {
+                self.lower(expr, depth)
+            }
             _ => Err(unsupported("scalar operand")),
         }
+    }
+}
+
+fn numeric_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nested(expr) => numeric_literal(expr),
+        Expr::Value(value) => matches!(value.value, Value::Number(_, false)),
+        _ => false,
+    }
+}
+
+fn static_key(expr: &Expr) -> Result<&str, SqlCompileError> {
+    match expr {
+        Expr::Nested(expr) => static_key(expr),
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(key) => Ok(key),
+            _ => Err(unsupported("static property key")),
+        },
+        _ => Err(unsupported("static property key")),
     }
 }
 
@@ -360,23 +432,24 @@ fn literal(value: &Value) -> Result<Literal, SqlCompileError> {
     }
 }
 
+fn user_property(name: &str) -> Result<Property, SqlCompileError> {
+    if name.is_empty() || name.chars().any(char::is_control) {
+        Err(unsupported("property name"))
+    } else {
+        Ok(Property::User(name.to_owned()))
+    }
+}
+
 fn property(expr: &Expr) -> Result<Property, SqlCompileError> {
-    let user = |name: &str| {
-        if name.is_empty() || name.chars().any(char::is_control) {
-            Err(unsupported("property name"))
-        } else {
-            Ok(Property::User(name.to_owned()))
-        }
-    };
     match expr {
         Expr::Nested(expr) => property(expr),
-        Expr::Identifier(name) => user(&name.value),
+        Expr::Identifier(name) => user_property(&name.value),
         Expr::CompoundIdentifier(parts) => {
             let [scope, name] = parts.as_slice() else {
                 return Err(unsupported("property scope"));
             };
             if scope.value.eq_ignore_ascii_case("user") {
-                user(&name.value)
+                user_property(&name.value)
             } else if scope.value.eq_ignore_ascii_case("sys") {
                 system_property(&name.value).map(Property::System)
             } else {
@@ -484,5 +557,54 @@ mod tests {
         assert_eq!(usize::from(program.root) + 1, program.nodes.len());
         assert_eq!(program.metrics.nodes, program.nodes.len());
         assert_eq!(program.metrics.source_bytes, source.len());
+    }
+
+    #[test]
+    fn scalar_arithmetic_and_static_keys_lower_to_bounded_postorder() {
+        let source = "-(p('raw.key')+value*2) IN (0,1)";
+        let program = SqlProgram::compile(source).unwrap();
+        assert!(
+            matches!(&program.nodes[0], Node::Property(Property::User(key)) if key == "raw.key")
+        );
+        for (index, node) in program.nodes.iter().enumerate() {
+            match node {
+                Node::NumericUnary { input, .. } => assert!(usize::from(*input) < index),
+                Node::Binary { left, right, .. } => {
+                    assert!(usize::from(*left) < index);
+                    assert!(usize::from(*right) < index);
+                }
+                Node::InList {
+                    input,
+                    operands,
+                    len,
+                    ..
+                } => {
+                    assert!(usize::from(*input) < index);
+                    assert!(
+                        operands[..usize::from(*len)]
+                            .iter()
+                            .all(|child| usize::from(*child) < index)
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(program.metrics.nodes, 9);
+        assert_eq!(program.metrics.depth, 5);
+        assert_eq!(usize::from(program.root) + 1, program.nodes.len());
+        assert_eq!(
+            SqlProgram::compile("property(('raw.key'))")
+                .unwrap()
+                .metrics()
+                .nodes,
+            1
+        );
+        assert_eq!(
+            SqlProgram::compile("-(9223372036854775808)")
+                .unwrap()
+                .metrics()
+                .nodes,
+            1
+        );
     }
 }

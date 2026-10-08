@@ -176,6 +176,10 @@ pub enum SqlEvaluationLimit {
 pub enum SqlEvaluationError {
     #[error("SQL operands have incompatible types")]
     TypeMismatch,
+    #[error("SQL integral arithmetic overflows its result type")]
+    ArithmeticOverflow,
+    #[error("SQL integral division or remainder has a zero divisor")]
+    DivideByZero,
     #[error("SQL operand uses an unsupported input value")]
     UnsupportedValue,
     #[error("SQL property lookup is ambiguous")]
@@ -222,6 +226,11 @@ enum Binary {
     Ge,
     Lt,
     Le,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
 }
 
 #[derive(Clone, Debug)]
@@ -229,6 +238,10 @@ enum Node {
     Literal(Literal),
     Property(Property),
     Not(u16),
+    NumericUnary {
+        input: u16,
+        negative: bool,
+    },
     Binary {
         op: Binary,
         left: u16,

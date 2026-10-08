@@ -1,9 +1,8 @@
 # SQL Predicates
 
-The domain exposes an ephemeral typed predicate kernel, not persisted SQL rules
-or subscription routing. `SqlProgram::compile` (or `compile_with_budget`) builds
-a program; `evaluate(SqlMessageContext, &mut SqlEvaluationBudget)` returns
-`SqlTruth` or an error. Only `True.is_match()` matches; `Unknown` does not.
+Ephemeral predicates, not persisted rules/routing. `SqlProgram::compile` /
+`compile_with_budget` -> program; `evaluate(SqlMessageContext,
+&mut SqlEvaluationBudget)` -> `SqlTruth` or error. Only True matches, not Unknown.
 
 ```mermaid
 flowchart LR
@@ -17,118 +16,172 @@ flowchart LR
 
 | Form | Contract |
 | --- | --- |
-| Boolean | `NOT`, `AND`, `OR`, parentheses; three-valued logic |
-| Comparison | `=`, `<>`/`!=`, `<`, `<=`, `>`, `>=`; no implicit string/number coercion |
+| Boolean | `NOT`, `AND`, `OR`, parentheses; three-valued |
+| Comparison | `=`, `<>`/`!=`, `<`, `<=`, `>`, `>=` |
 | Null/existence | Property `IS [NOT] NULL`, `[NOT] EXISTS(property)` |
-| Membership | Scalar `[NOT] IN (scalar, ...)`; 1 through 32 operands |
-| Pattern | Scalar `[NOT] LIKE scalar [ESCAPE scalar]`; `%`/`_`, ordinal whole-input matching |
-| Properties | Bare/user-qualified names, double-quoted or bracket-quoted names; explicit `sys` whitelist |
-| Literals | Boolean, null, single-quoted string, signed `i64`, finite `f64`; unary `+`/`-` only on numeric literals |
+| Membership | Scalar `[NOT] IN (scalar, ...)`; 1-32 operands |
+| Pattern | Scalar `[NOT] LIKE scalar [ESCAPE scalar]`; `%`/`_` |
+| Properties | Bare/user-qualified, double/bracket-quoted; `sys` whitelist |
+| Literals | Boolean, null, single-quoted string, signed `i64`, finite `f64` |
 
-Numeric/string scalar roots can compile, but evaluate as `NonPredicate`.
-Arithmetic, other functions, parameters, statements/subqueries and
-actions are not accepted by this increment.
+```text
+scalar := literal | property | static_lookup | (scalar)
+        | +scalar | -scalar | scalar { + | - | * | / | % } scalar
+static_lookup := { property | p } (single_quoted_static_key)
+```
 
-Membership input/list entries, LIKE input/pattern/escape, and their parentheses
-accept properties or literals, including signed numeric literals. Predicate
-expressions are not scalar operands. LIKE ANY, ILIKE, SIMILAR TO, bracket
-wildcards and regular-expression syntax are not added.
+IN/LIKE operands are scalars, not predicates. Numeric/string roots compile but
+yield `NonPredicate`. Static calls are unquoted, ASCII-insensitive and take one
+single-quoted key, optionally parenthesized. No implicit string/number coercion.
+Precedence: unary signs, `*`/`/`/`%`, `+`/`-`, comparison/membership/pattern,
+`NOT`, `AND`, `OR`; binary arithmetic associates left.
+
+Unsupported: dynamic keys, other functions (`newid` included), casts, parameters,
+statements/subqueries, actions, LIKE ANY, ILIKE, SIMILAR TO, bracket wildcards,
+regex syntax. IS NULL/EXISTS take only property syntax. Compilation refuses
+qualified/quoted function names, modifiers, empty/control-containing keys.
 
 ## Values And Errors
 
-`SqlMessageContext` borrows application/system entries; `SqlValue` retains
-eight integral widths, `Float`/`Double`, Boolean, string, null or Unsupported.
-User names compare ASCII-insensitively; non-ASCII spelling stays distinct.
-Duplicate matching entries refuse as `AmbiguousProperty`.
+`SqlMessageContext` borrows application/system entries; `SqlValue` retains eight
+integral widths, Float/Double, Boolean, string, null and Unsupported. User lookup
+is ASCII-insensitive, non-ASCII distinct; duplicates yield `AmbiguousProperty`.
 
-Missing user properties are Unknown: comparisons propagate Unknown, `IS NULL`
-is true and `EXISTS` is false. Explicit null also makes `IS NULL` true, but
-`EXISTS` is true. Supported system inputs are `CorrelationId`, `MessageId`, `To`,
-`ReplyTo`, `Subject` (`Label` alias), `SessionId`, `ReplyToSessionId`, `ContentType`.
-An absent requested system entry is `MissingSystemProperty`; adapters must
-supply explicit null for known nullable entries. Unknown system names refuse.
+| User input | Comparisons | IS NULL | EXISTS |
+| --- | --- | --- | --- |
+| Missing | Unknown | True | False |
+| Explicit null | Unknown | True | True |
 
-Every referenced Unsupported value errors, including EXISTS/IS NULL and
-null comparisons. Boolean evaluation does not short-circuit away errors or
-budget charges, even under `FALSE AND ...` or `TRUE OR ...`.
-Strings use ordinal, case-sensitive equality/inequality; ordering refuses. Booleans support equality/inequality only.
+System whitelist: `CorrelationId`, `MessageId`, `To`, `ReplyTo`, `Subject`
+(`Label` alias), `SessionId`, `ReplyToSessionId`, `ContentType`. Missing requested
+entries yield `MissingSystemProperty`; adapters supply known nullable entries as
+explicit null. Unknown system names refuse compilation.
 
-Numeric comparisons use a local C#-style profile: Double promotion precedes
-Float. Integral comparisons reject signed properties against Ulong, but allow
-nonnegative integer literals. Narrower integral comparisons remain exact;
-floating promotion can lose precision. Typed NaN compares false for equality
-and ordering against numeric operands, true for inequality; typed infinities
-are allowed. This subset does not claim universal Azure type behavior.
+Referenced Unsupported errors, including EXISTS/IS NULL/null comparisons.
+`FALSE AND ...` / `TRUE OR ...` never hide errors/charges. Resource limits win;
+otherwise the first postorder finite error wins. Strings use ordinal,
+case-sensitive equality/inequality, no ordering; Booleans equality/inequality only.
+
+Comparisons unchanged: Double before Float; Ulong rejects signed properties,
+allows nonnegative integer literals. Narrower integrals stay exact; floating
+promotion may lose precision. NaN: false equality/ordering, true inequality;
+infinities allowed.
+
+## Arithmetic And Static Keys
+
+Symmetric binary promotion: first matching row. Byte/Short/Int/Long are signed;
+U variants unsigned.
+
+| Binary operands | Result type |
+| --- | --- |
+| Either Double | Double |
+| Either Float | Float |
+| Either Ulong | Ulong; signed other operand requires nonnegative literal origin |
+| Either Long | Long |
+| Uint with Byte/Short/Int | Long |
+| Either Uint | Uint |
+| Remaining Byte/Ubyte/Short/Ushort/Int | Int |
+
+| Unary operand | `+` result | `-` result |
+| --- | --- | --- |
+| Byte/Ubyte/Short/Ushort | Int | Int |
+| Int/Long | Same type | Checked same type |
+| Uint | Uint | Long |
+| Ulong | Ulong | TypeMismatch |
+| Float/Double | Same width | Same width, sign inverted |
+
+Literals: Long integers, finite Double decimals/exponents. Direct signed literals
+(including Long minimum) retain origin through parentheses; all computed unary/
+binary results clear it. Ulong `u+1` / `u+(1)` can pass; `u+(1+1)` refuses.
+No folding or constant-expression exception, even for literal-only work.
+
+| Arithmetic case | Result |
+| --- | --- |
+| Integral overflow/underflow; negated Int/Long minimum | `ArithmeticOverflow` in the promoted result type |
+| Integral `/` or `%` zero | `DivideByZero` |
+| Signed minimum `/ -1` or `% -1` | `ArithmeticOverflow`; remainder refusal is explicitly local, not universal C# runtime behavior |
+| Integral division/remainder | Quotient truncates toward zero; nonzero remainder has dividend sign |
+| Null/missing | Unknown before type/zero checks: `NULL/0` is Unknown; eager `(1/0)+NULL` errors |
+| Non-null string/Boolean | `TypeMismatch`; no concatenation/coercion |
+
+Float/Double use promoted width: overflow -> infinity, zero division -> infinity/
+NaN (not `DivideByZero`). `%` is truncating, not IEEE, remainder: finite `%`
+infinity -> dividend; infinity `%` finite, `%` zero or any NaN -> NaN. Native
+operations/unary inversion preserve signed zero; NaN payload/sign unspecified.
+Nonfinite results allowed, source literals refused.
+
+Static calls use user lookup and raw keys after SQL doubled-apostrophe decoding.
+`p('sys.MessageId')`, `p('user.Color')`, `p('[Color]')`, `p('"Color"')` read literal
+application keys, never scopes/delimiters or system entries. Only normal `sys`
+syntax reaches the whitelist; quoted property names decode as identifiers there.
+
+[Service Bus syntax](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-messaging-sql-filter)
+defines arithmetic, patterns/escapes, literals, unknown propagation and
+`property`/`p`, with broader string-valued keys.
+[C# numeric promotions](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/expressions#1247-numeric-promotions)
+and the [arithmetic reference](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/operators/arithmetic-operators)
+inform widths/remainder. Checked-only arithmetic, cleared origin, raw static user
+keys and error priority are local choices, not service-wide equivalence claims.
 
 ## Membership And Patterns
 
-IN compares the input to every list entry using the existing typed equality
-contract. Any true comparison yields True; otherwise any null/missing comparison
-yields Unknown; otherwise the result is False. NOT IN negates that result,
-preserving Unknown. Later incompatible, unsupported, ambiguous or missing-system
-operands still error even after a match. Mixed non-null types do not coerce.
+IN checks every entry with typed equality: any true -> True; else null/missing
+-> Unknown; else False. NOT IN preserves Unknown when negating. Incompatible,
+unsupported, ambiguous or missing-system operands error even after a match;
+non-null types do not coerce.
 
-LIKE is case-sensitive and matches the entire string. `%` matches zero or more
-Unicode scalars, `_` exactly one, including newlines. A combining sequence can
-contain multiple scalars; a supplementary character is one scalar. Every other
-character is literal, including brackets and regex punctuation. There is no
-implicit escape. ESCAPE must be a string containing exactly one Unicode scalar;
-it quotes any following scalar, including itself. A trailing unpaired escape is
-malformed. Literal malformed patterns/escape lengths refuse compilation when
-known; property-backed cases refuse evaluation deterministically.
+| LIKE rule | Contract |
+| --- | --- |
+| Matching | Case-sensitive, ordinal, entire input |
+| `%` / `_` | Zero-or-more / exactly one Unicode scalar, including newlines; combining sequences may have several scalars, supplementary characters one |
+| Other characters | Literal, including brackets/regex punctuation; no implicit escape |
+| ESCAPE | String of exactly one Unicode scalar; quotes any next scalar, including itself |
+| Unpaired trailing escape | Malformed; known literal patterns/escape lengths refuse compilation, property-backed cases refuse evaluation deterministically |
 
-Missing/null input, pattern or escape produces Unknown. Escape and pattern
-validation precedes input null propagation: a non-string pattern/escape errors
-even with null input, and a valid string pattern's malformed escape or engine
-limit cannot be hidden by null/incompatible input. Referenced input errors are
-never converted to Unknown. Null/missing pattern or escape has no regex to build.
-Resource limits outrank finite evaluation errors; otherwise the first error in
-the program's postorder wins, as in the typed kernel.
+Null/missing operands give Unknown, never mask referenced errors. Escape/pattern
+validation precedes input null propagation: non-string pattern/escape errors with
+null input; malformed patterns/engine limits cannot hide behind null/incompatible
+input. Null/missing pattern/escape builds no regex.
 
-The [Service Bus SQL syntax](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-messaging-sql-filter)
-describes scalar pattern/escape expressions and `%`/`_`. This local profile
-deliberately excludes arithmetic/functions, defines Unicode scalar rather than
-UTF-16-code-unit matching, and fixes malformed-pattern/error priority; it does
-not claim service-wide equivalence for unspecified cases.
+Unicode-scalar (not UTF-16-unit) matching and malformed-pattern/error priority
+are local choices, not service-wide equivalence.
 
 ## Bounds
 
-| Budget | Fixed ceiling |
+| Budget | Fixed cap |
 | --- | --- |
 | Each expression | 4,096 UTF-8 bytes; 1,024 UTF-16 units; 128 physical tokens including whitespace/comments; parser depth 32; 128 nodes; expression depth 32 |
 | Shared compilation | 1,048,576 source bytes; 32,768 tokens; 32,768 nodes |
 | Shared evaluation | 1,048,576 work units; 33,554,432 lookup/comparison bytes |
-| Membership list | 32 scalar operands, independent of existing expression ceilings |
+| Membership list | 32 scalars, independent of expression ceilings |
 | LIKE pattern | 16,384 UTF-8 bytes, including property-backed patterns |
-| Regex engine | 1,048,576-byte Thompson NFA build limit and final NFA size check |
+| Regex engine | 1,048,576-byte Thompson NFA build limit plus final NFA size check |
 
-Per-expression limits are fixed. `with_limits` can lower shared ceilings, never
-raise them. Reusing a budget shares accumulated charges across calls; completed
-charges remain after failure. Input counts/names and all referenced lookups are
-charged before evaluation allocation; string comparisons charge full operands.
+`with_limits` only lowers shared ceilings; expression caps stay fixed. Charges
+accumulate, survive failure, cannot wrap/refund. Larger patterns use borrowed
+properties, not enlarged source/literal limits.
 
-Existing source/literal ceilings remain unchanged: the independently larger
-pattern ceiling is reachable through borrowed property values, not larger SQL
-source strings. IN precharges its full input for every list entry plus every
-entry's full string bytes, even after a match. LIKE precharges the full input,
-pattern and escape; any repeated bound-pass property lookup is also charged.
-Before slot or regex allocation, each LIKE reserves `10 * pattern_bytes + 9`
-translation bytes, the 1 MiB engine allocation allowance, and transformed-source
-work plus an engine-state allowance of `1 MiB / size_of::<State>()` work units,
-using the maintained NFA's measured state layout rather than a scalar minimum.
-Checked/saturating accounting cannot wrap or refund completed charges.
+| Preflight, before slot allocation | Charge |
+| --- | --- |
+| Inputs/lookup | Counts/names, all referenced lookups; repeated bound-pass scans separately precharged before scanning |
+| Arithmetic | Extra work unit/node and direct full string bounds, even null/invalid/hidden branches; zero string output bound; nested nodes reserve own operands, no recursive bound-pass arithmetic |
+| Static lookup | Ordinary property-node charges |
+| IN | Full input bytes per entry plus all entry string bytes, even after a match |
+| LIKE | Full input/pattern/escape; `10 * pattern_bytes + 9` translation bytes, 1 MiB engine allocation allowance, transformed-source work plus `1 MiB / size_of::<State>()` work using maintained NFA state layout |
 
-Patterns are translated into anchored literal-safe regexes and built per
-evaluation with maintained `regex-automata` PikeVM, without a retained cache.
-Before cache allocation/matching, evaluation additionally charges
-`(input_bytes + 1) * NFA_states` work and a conservative capture-free cache
-allowance of `64 * NFA_states + 32` bytes. The engine's build limit is approximate
-and may apply to an intermediate representation; the final NFA is also checked.
-Auxiliary compiler allocations are bounded by the fixed pattern/translation
-profile, not claimed to be included in the NFA size measurement.
-All IN/LIKE preflight reservations include Boolean-hidden branches and precede
-regex validation/build work. Regex build/matching work shares the same evaluation
-budget across calls, and matching may refuse an otherwise valid large pattern.
+Arithmetic has no per-operation allocations or durable results. Arithmetic/IN/
+LIKE preflight covers Boolean-hidden branches before regex validation/build.
+Comparisons charge full strings. Maintained `regex-automata` PikeVM builds
+anchored literal-safe regexes per evaluation, no retained cache. Before cache
+allocation/matching charge
+`(input_bytes + 1) * NFA_states` work and capture-free cache allowance
+`64 * NFA_states + 32` bytes. Build/matching share the evaluation budget across
+calls; matching may refuse an otherwise valid large pattern.
 
-See the [API](../crates/domain/src/sql_filter.rs), [compiler](../crates/domain/src/sql_filter/compiler.rs), [evaluator](../crates/domain/src/sql_filter/evaluator.rs) and [tests](../crates/domain/tests/sql_filter.rs).
-The next language increment is [#97 arithmetic/static lookup](https://github.com/DeandreT/switchyard/issues/97); [#20 integration](https://github.com/DeandreT/switchyard/issues/20) remains separate.
+Engine build limits are approximate, may cover intermediate representations;
+final NFA size is checked too. Auxiliary compiler allocations have fixed pattern/
+translation bounds, not claimed within measured NFA size.
+
+Sources: [API](../crates/domain/src/sql_filter.rs), [compiler](../crates/domain/src/sql_filter/compiler.rs), [evaluator](../crates/domain/src/sql_filter/evaluator.rs), [tests](../crates/domain/tests/sql_filter.rs).
+Pure-kernel increment: [#97](https://github.com/DeandreT/switchyard/issues/97);
+[#20 integration](https://github.com/DeandreT/switchyard/issues/20) remains separate.

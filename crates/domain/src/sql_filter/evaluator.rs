@@ -100,6 +100,17 @@ pub(super) fn evaluate<'a>(
     // The bound pass repeats scalar lookups; charge every scan before any runs.
     for node in &program.nodes {
         match node {
+            Node::NumericUnary { input, .. } => {
+                charge_scalar_lookup(program, message, *input, key_bytes, budget)?;
+            }
+            Node::Binary {
+                op: Binary::Add | Binary::Sub | Binary::Mul | Binary::Div | Binary::Rem,
+                left,
+                right,
+            } => {
+                charge_scalar_lookup(program, message, *left, key_bytes, budget)?;
+                charge_scalar_lookup(program, message, *right, key_bytes, budget)?;
+            }
             Node::InList {
                 input,
                 operands,
@@ -130,6 +141,21 @@ pub(super) fn evaluate<'a>(
     // allocating slots, including failed or Boolean-hidden branches.
     for node in &program.nodes {
         match node {
+            Node::NumericUnary { input, .. } => {
+                budget.work(1)?;
+                budget.bytes(scalar_bound(program, message, *input))?;
+            }
+            Node::Binary {
+                op: Binary::Add | Binary::Sub | Binary::Mul | Binary::Div | Binary::Rem,
+                left,
+                right,
+            } => {
+                budget.work(1)?;
+                budget.bytes(
+                    scalar_bound(program, message, *left)
+                        .saturating_add(scalar_bound(program, message, *right)),
+                )?;
+            }
             Node::InList {
                 input,
                 operands,
@@ -211,6 +237,21 @@ pub(super) fn evaluate<'a>(
                     input.string_bound,
                 )
             }
+            Node::NumericUnary { input, negative } => {
+                let input = slots[usize::from(*input)];
+                Slot::new(
+                    input.value.and_then(|value| {
+                        if value.unknown() {
+                            Ok(Value::Unknown)
+                        } else if let Value::Number(value) = value {
+                            numeric::unary(value, *negative).map(Value::Number)
+                        } else {
+                            Err(SqlEvaluationError::TypeMismatch)
+                        }
+                    }),
+                    0,
+                )
+            }
             Node::IsNull { input, negated } => {
                 let input = slots[usize::from(*input)];
                 Slot::new(
@@ -225,7 +266,14 @@ pub(super) fn evaluate<'a>(
                 let right = slots[usize::from(*right)];
                 Slot::new(
                     binary(*op, left, right, budget),
-                    left.string_bound.max(right.string_bound),
+                    if matches!(
+                        op,
+                        Binary::Add | Binary::Sub | Binary::Mul | Binary::Div | Binary::Rem
+                    ) {
+                        0
+                    } else {
+                        left.string_bound.max(right.string_bound)
+                    },
                 )
             }
             Node::InList {
@@ -463,6 +511,22 @@ fn binary<'a>(
             (Binary::Or, SqlTruth::False, SqlTruth::False) => SqlTruth::False,
             _ => SqlTruth::Unknown,
         }));
+    }
+    if matches!(
+        op,
+        Binary::Add | Binary::Sub | Binary::Mul | Binary::Div | Binary::Rem
+    ) {
+        let left = left.value?;
+        let right = right.value?;
+        if left.unknown() || right.unknown() {
+            return Ok(Value::Unknown);
+        }
+        return match (left, right) {
+            (Value::Number(left), Value::Number(right)) => {
+                numeric::arithmetic(op, left, right).map(Value::Number)
+            }
+            _ => Err(SqlEvaluationError::TypeMismatch),
+        };
     }
     budget.work(1)?;
     budget.bytes(left.string_bound.saturating_add(right.string_bound))?;
