@@ -22,21 +22,121 @@ impl<S: StateStore> StateMachine<S> {
         namespace: &crate::NamespaceName,
         topic: &EntityPath,
     ) -> Result<Option<TopicConfig>, BrokerError> {
-        self.read(&keys::topic_config(namespace, topic))
+        let Some(config) = self.read::<TopicConfig>(&keys::topic_config(namespace, topic))? else {
+            return Ok(None);
+        };
+        if config.validate().is_err()
+            || topic.is_subscription()
+            || topic.is_dead_letter_queue()
+            || topic.is_management()
+            || self
+                .store()
+                .get(&keys::queue_config(namespace, topic))?
+                .is_some()
+        {
+            return Err(BrokerError::TopicTopologyCorrupt);
+        }
+        Ok(Some(config))
     }
 
-    /// Durable subscriptions below `topic`, ordered by validated name.
+    /// Validates complete bounded membership before returning the requested prefix.
     pub fn subscriptions(
         &self,
         namespace: &crate::NamespaceName,
         topic: &EntityPath,
         limit: usize,
     ) -> Result<Vec<EntityPath>, BrokerError> {
-        self.store()
-            .scan_prefix(&keys::topic_subscription_prefix(namespace, topic), limit)?
+        Ok(self
+            .subscription_topology(namespace, topic)?
             .into_iter()
-            .map(|(_, value)| codec::decode(&value).map_err(BrokerError::from))
-            .collect()
+            .take(limit)
+            .map(|(entity, _)| entity)
+            .collect())
+    }
+
+    fn subscription_topology(
+        &self,
+        namespace: &crate::NamespaceName,
+        topic: &EntityPath,
+    ) -> Result<Vec<(EntityPath, QueueConfig)>, BrokerError> {
+        let prefix = keys::topic_subscription_prefix(namespace, topic);
+        let entries = self
+            .store()
+            .scan_prefix(&prefix, MAX_TOPIC_SUBSCRIPTIONS + 1)?;
+        let Some(parent) = self.topic_config(namespace, topic)? else {
+            return Err(if entries.is_empty() {
+                BrokerError::TopicNotFound
+            } else {
+                BrokerError::TopicTopologyCorrupt
+            });
+        };
+        if entries.len() > MAX_TOPIC_SUBSCRIPTIONS {
+            return Err(BrokerError::SubscriptionLimitExceeded {
+                maximum: MAX_TOPIC_SUBSCRIPTIONS,
+            });
+        }
+        let mut subscriptions = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            let name = keys::subscription_name_parts(&prefix, &key)
+                .ok_or(BrokerError::MalformedIndexKey)?;
+            let name = SubscriptionName::new(name).map_err(|_| BrokerError::MalformedIndexKey)?;
+            if keys::topic_subscription(namespace, topic, &name) != key {
+                return Err(BrokerError::MalformedIndexKey);
+            }
+            let entity = topic.subscription(&name)?;
+            // Deserialization folds ASCII case, so decoded equality is not a
+            // proof that the stored membership names this canonical child.
+            if value != codec::encode(&entity)? {
+                return Err(BrokerError::TopicTopologyCorrupt);
+            }
+            let config = self.validate_subscription_topology(namespace, &entity, parent)?;
+            subscriptions.push((entity, config));
+        }
+        Ok(subscriptions)
+    }
+
+    fn validate_subscription_topology(
+        &self,
+        namespace: &crate::NamespaceName,
+        entity: &EntityPath,
+        parent: TopicConfig,
+    ) -> Result<QueueConfig, BrokerError> {
+        let backing = self.queue_config(namespace, entity)?.ok_or_else(|| {
+            BrokerError::DanglingSubscription {
+                entity: entity.clone(),
+            }
+        })?;
+        let config = SubscriptionConfig {
+            lock_duration_millis: backing.lock_duration_millis,
+            max_delivery_count: backing.max_delivery_count,
+            default_time_to_live_millis: backing.default_time_to_live_millis,
+        };
+        let expected = config
+            .validate()
+            .map_err(|_| BrokerError::TopicTopologyCorrupt)?
+            .queue_config(parent);
+        let shadow = entity.dead_letter_queue()?;
+        let expected_shadow = QueueConfig {
+            max_delivery_count: u32::MAX,
+            default_time_to_live_millis: None,
+            requires_session: false,
+            requires_duplicate_detection: false,
+            ..expected
+        };
+        if backing != expected
+            || self.queue_config(namespace, &shadow)? != Some(expected_shadow)
+            || self
+                .store()
+                .get(&keys::topic_config(namespace, entity))?
+                .is_some()
+            || self
+                .store()
+                .get(&keys::topic_config(namespace, &shadow))?
+                .is_some()
+        {
+            return Err(BrokerError::TopicTopologyCorrupt);
+        }
+        Ok(backing)
     }
 
     pub(super) fn create_topic(
@@ -63,7 +163,18 @@ impl<S: StateStore> StateMachine<S> {
             return Err(BrokerError::EntityAlreadyExists);
         }
 
-        batch.push_put(key, codec::encode(&config.validate()?)?);
+        let config = config.validate()?;
+        if !self
+            .store()
+            .scan_prefix(
+                &keys::topic_subscription_prefix(&command.namespace, &command.entity),
+                1,
+            )?
+            .is_empty()
+        {
+            return Err(BrokerError::TopicTopologyCorrupt);
+        }
+        batch.push_put(key, codec::encode(&config)?);
         Ok(CommandOutcome::TopicCreated)
     }
 
@@ -113,6 +224,18 @@ impl<S: StateStore> StateMachine<S> {
             requires_duplicate_detection: false,
             ..queue
         };
+
+        if self
+            .store()
+            .get(&keys::queue_config(&command.namespace, &dead_letter_queue))?
+            .is_some()
+            || self
+                .store()
+                .get(&keys::topic_config(&command.namespace, &dead_letter_queue))?
+                .is_some()
+        {
+            return Err(BrokerError::TopicTopologyCorrupt);
+        }
 
         batch.push_put(index_key, codec::encode(&entity)?);
         batch.push_put(queue_key, codec::encode(&queue)?);
@@ -241,28 +364,14 @@ impl<S: StateStore> StateMachine<S> {
         &self,
         command: &Command,
     ) -> Result<TopicFanoutState, BrokerError> {
-        let subscriptions = self.subscriptions(
-            &command.namespace,
-            &command.entity,
-            MAX_TOPIC_SUBSCRIPTIONS + 1,
-        )?;
-        if subscriptions.len() > MAX_TOPIC_SUBSCRIPTIONS {
-            return Err(BrokerError::SubscriptionLimitExceeded {
-                maximum: MAX_TOPIC_SUBSCRIPTIONS,
-            });
+        let topology = self.subscription_topology(&command.namespace, &command.entity)?;
+        let mut subscriptions = Vec::with_capacity(topology.len());
+        let mut state = Vec::with_capacity(topology.len());
+        for (entity, config) in topology {
+            let rules = self.all_rules(&command.namespace, &entity)?;
+            subscriptions.push(entity);
+            state.push((config, rules));
         }
-        let state = subscriptions
-            .iter()
-            .map(|entity| {
-                let config = self
-                    .queue_config(&command.namespace, entity)?
-                    .ok_or_else(|| BrokerError::DanglingSubscription {
-                        entity: entity.clone(),
-                    })?;
-                let rules = self.all_rules(&command.namespace, entity)?;
-                Ok::<_, BrokerError>((config, rules))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         Ok((subscriptions, state))
     }
 }

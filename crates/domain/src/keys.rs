@@ -117,6 +117,13 @@ pub fn topic_subscription(
     key
 }
 
+pub(crate) fn subscription_name_parts<'a>(prefix: &[u8], key: &'a [u8]) -> Option<&'a str> {
+    let suffix = key.strip_prefix(prefix)?;
+    std::str::from_utf8(suffix)
+        .ok()
+        .filter(|name| !name.is_empty())
+}
+
 /// Every rule below one subscription, ordered by canonical rule name.
 pub fn subscription_rule_prefix(namespace: &NamespaceName, subscription: &EntityPath) -> Vec<u8> {
     entity_scope(TAG_SUBSCRIPTION_RULE, namespace, subscription)
@@ -542,6 +549,21 @@ mod tests {
             !topic_subscription(&namespace(), &other, &alpha)
                 .starts_with(&topic_subscription_prefix(&namespace(), &entity()))
         );
+    }
+
+    #[test]
+    fn subscription_membership_suffixes_stay_in_the_exact_parent_scope() {
+        let prefix = topic_subscription_prefix(&namespace(), &entity());
+        let name = SubscriptionName::new("alpha").expect("valid name");
+        let key = topic_subscription(&namespace(), &entity(), &name);
+        assert_eq!(subscription_name_parts(&prefix, &key), Some("alpha"));
+        assert_eq!(subscription_name_parts(&prefix, &prefix), None);
+        let other = EntityPath::new("orders-neighbor").expect("valid path");
+        let foreign = topic_subscription(&namespace(), &other, &name);
+        assert_eq!(subscription_name_parts(&prefix, &foreign), None);
+        let mut invalid = prefix.clone();
+        invalid.push(0xff);
+        assert_eq!(subscription_name_parts(&prefix, &invalid), None);
     }
 
     #[test]

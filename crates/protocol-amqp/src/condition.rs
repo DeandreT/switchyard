@@ -94,6 +94,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         // failures are the broker's problem and are reported as its fault.
         BrokerError::DanglingIndexEntry { .. }
         | BrokerError::DanglingSubscription { .. }
+        | BrokerError::TopicTopologyCorrupt
         | BrokerError::MalformedIndexKey
         | BrokerError::ScheduledEnqueueTimeMissing { .. }
         | BrokerError::Codec(_)
@@ -157,6 +158,11 @@ mod tests {
 
     #[test]
     fn a_broken_index_is_reported_as_the_brokers_fault() {
+        assert_eq!(
+            condition_for(&BrokerError::TopicTopologyCorrupt),
+            INTERNAL_ERROR
+        );
+        assert!(!is_retryable(&BrokerError::TopicTopologyCorrupt));
         assert_eq!(
             condition_for(&BrokerError::MalformedIndexKey),
             INTERNAL_ERROR

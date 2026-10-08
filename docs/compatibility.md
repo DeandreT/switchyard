@@ -97,6 +97,21 @@ behavior it currently enforces:
   correlation filter are ANDed, rules are ORed, and several actionless matches
   still produce one copy. General SQL filters, rule actions, and session IDs are
   explicitly refused.
+- Topic routing validates the complete listed subscription topology before
+  publishing or activating copies. Membership keys and values must name the
+  exact canonical child; its backing queue and real DLQ must match the valid
+  parent-derived receive configuration, without conflicting topic records.
+  Public subscription listing validates that same complete set before taking
+  the requested prefix, so a small page cannot hide a corrupt later member.
+  The proof scans at most 2,001 memberships for the existing 2,000-subscription
+  limit. Corruption refuses without changing messages, counters, or Clock and
+  is reported as a broker fault, not a client configuration error.
+  All-scheduled sends still defer the child/rule snapshot until activation.
+  Topic creation refuses existing orphan membership; subscription creation
+  refuses an occupied DLQ rather than overwriting it. This proof covers listed
+  metadata, not unindexed backing queues, orphan rules, or retained runtime.
+  Ordinary retained-message and rule-management paths are not newly fenced.
+  No incarnation, capacity, storage-format, or stored-value change is included.
 - Receive-delete is at-most-once: the deletion commits before the transfer.
 - Peek is an inclusive, sequence-ordered, read-only snapshot over active,
   locked, scheduled, and deferred records. It never increments delivery count

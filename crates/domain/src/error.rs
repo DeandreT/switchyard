@@ -42,6 +42,8 @@ pub enum BrokerError {
     SubscriptionLimitExceeded { maximum: usize },
     #[error("topic subscription index references missing queue {entity}")]
     DanglingSubscription { entity: EntityPath },
+    #[error("topic ownership metadata is corrupt")]
+    TopicTopologyCorrupt,
     #[error("messages cannot be sent directly to a topic subscription")]
     SubscriptionSendNotAllowed,
     #[error("messages cannot be received directly from a topic")]
