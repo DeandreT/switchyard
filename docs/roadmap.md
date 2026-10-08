@@ -18,6 +18,7 @@ and assignment source. Milestones group work; independent lanes can run in paral
 - [x] Consumed bound broker API with pre-clock authority checks ([#56](https://github.com/DeandreT/switchyard/issues/56)); wire adoption remains pending
 - [x] Original native driver/reader stop and joined shutdown ([#62](https://github.com/DeandreT/switchyard/issues/62)); wider lifecycle remains pending
 - [x] Detach-aware sender admission with unchanged bounded capacity ([#67](https://github.com/DeandreT/switchyard/issues/67))
+- [x] Original settlement-worker custody through natural receiving-pump teardown ([#72](https://github.com/DeandreT/switchyard/issues/72))
 - [ ] Remaining client semantics, administration and conserved capacity
 - [ ] Real quorum, multi-tenant security, recovery and measured release gates
 
@@ -28,7 +29,7 @@ See [compatibility](compatibility.md).
 
 ## Next Main Increments
 
-1. Finish parent [#7](https://github.com/DeandreT/switchyard/issues/7): protocol task ownership [#63](https://github.com/DeandreT/switchyard/issues/63), admission/deadlines [#64](https://github.com/DeandreT/switchyard/issues/64), then signal shutdown [#65](https://github.com/DeandreT/switchyard/issues/65). Native custody and sender admission are implemented; task joins are not graceful Close acknowledgements.
+1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7): acquisition (#73), transport cleanup (#74), task trees (#75/#63), admission/deadlines (#64), then signal shutdown (#65). Native and settlement-worker custody are implemented; joins are not graceful Close acknowledgements.
 2. Complete [#12](https://github.com/DeandreT/switchyard/issues/12) through sender, receiver/settlement, sessions, then management ([#57](https://github.com/DeandreT/switchyard/issues/57) through [#60](https://github.com/DeandreT/switchyard/issues/60)) using the bound broker API. Wire adapters wait for #7.
 3. Enable [#15](https://github.com/DeandreT/switchyard/issues/15) only after retained authority is complete; no live deletion/recreation claim yet.
 4. Port safe configuration and typed-content increments independently, then their dependent features.
@@ -53,7 +54,10 @@ flowchart TD
     Core --> Sender["#57 Sender"]
     Main --> Native["#62 Native stop/join"]
     Native --> Permits["#67 Sender capacity waits"]
-    Permits --> Protocol["#63 Protocol task ownership"]
+    Permits --> Settlement["#72 Settlement workers"]
+    Settlement --> Acquisition["#73 Receive/session acquisitions"]
+    Acquisition --> Transport["#74 Transport/route cleanup"]
+    Transport --> Protocol["#75 Task trees / #63"]
     Protocol --> Admission["#64 Admission/deadlines"]
     Admission --> Signals["#65 Ordered signal shutdown"]
     Signals --> Shutdown["#7 Shutdown complete"]
@@ -93,7 +97,7 @@ pickup. Retained wire authority follows the merged core and connection-lifecycle
 | Lane | Start | Boundary |
 | --- | --- | --- |
 | Retained sender | [#57](https://github.com/DeandreT/switchyard/issues/57) | Wait for #7; sender/listener ownership only |
-| Connection lifecycle | [#63](https://github.com/DeandreT/switchyard/issues/63) | After #62/#67; protocol task ownership only, then #64/#65 |
+| Connection lifecycle | [#63](https://github.com/DeandreT/switchyard/issues/63) | After #72; #73-#75 remain, then #64/#65 |
 | Identity policy | [#8](https://github.com/DeandreT/switchyard/issues/8) | Pure `auth` policy; no listener/CBS activation |
 | Client evidence | [#9](https://github.com/DeandreT/switchyard/issues/9) | Test harness and pin/custody records; no runtime changes |
 | Administration contract | [#10](https://github.com/DeandreT/switchyard/issues/10) | Scrubbed fixtures/closed profiles; no serving endpoint |
@@ -131,7 +135,11 @@ single PR for the whole row. Update pickup labels when prerequisites merge.
 | Bounded AMQP task shutdown | [#7](https://github.com/DeandreT/switchyard/issues/7) | All five ordered children below |
 | Native driver/reader custody | [#62](https://github.com/DeandreT/switchyard/issues/62) | Independent; implemented |
 | Detach-aware sender-capacity waits | [#67](https://github.com/DeandreT/switchyard/issues/67) | [#62](https://github.com/DeandreT/switchyard/issues/62); implemented |
-| Protocol session/link/settlement task ownership | [#63](https://github.com/DeandreT/switchyard/issues/63) | [#62](https://github.com/DeandreT/switchyard/issues/62), [#67](https://github.com/DeandreT/switchyard/issues/67) |
+| Protocol session/link/settlement task ownership | [#63](https://github.com/DeandreT/switchyard/issues/63) | [#62](https://github.com/DeandreT/switchyard/issues/62), [#67](https://github.com/DeandreT/switchyard/issues/67); four ordered children below |
+| Original settlement-worker custody | [#72](https://github.com/DeandreT/switchyard/issues/72) | [#67](https://github.com/DeandreT/switchyard/issues/67); implemented |
+| Started Receive/AcceptSession custody | [#73](https://github.com/DeandreT/switchyard/issues/73) | [#72](https://github.com/DeandreT/switchyard/issues/72) |
+| Cooperative transport/route cleanup | [#74](https://github.com/DeandreT/switchyard/issues/74) | [#73](https://github.com/DeandreT/switchyard/issues/73) |
+| Original session/link task trees | [#75](https://github.com/DeandreT/switchyard/issues/75) | [#74](https://github.com/DeandreT/switchyard/issues/74) |
 | Bounded TCP/WSS admission and aggregate TLS/HTTP/SASL/Open deadline | [#64](https://github.com/DeandreT/switchyard/issues/64) | [#63](https://github.com/DeandreT/switchyard/issues/63) |
 | Signal shutdown: listener cleanup, timer join, broker/runtime | [#65](https://github.com/DeandreT/switchyard/issues/65) | [#64](https://github.com/DeandreT/switchyard/issues/64) |
 | Ordinary queue updates | [#13](https://github.com/DeandreT/switchyard/issues/13) | [#6](https://github.com/DeandreT/switchyard/issues/6) |
@@ -151,6 +159,7 @@ single PR for the whole row. Update pickup labels when prerequisites merge.
 | Two SDK pins and launched-client identity | [#9](https://github.com/DeandreT/switchyard/issues/9) | Independent |
 | Native session transfer windows | [#68](https://github.com/DeandreT/switchyard/issues/68) | [#7](https://github.com/DeandreT/switchyard/issues/7) |
 | Bounded receiving-credit refill | [#69](https://github.com/DeandreT/switchyard/issues/69) | [#68](https://github.com/DeandreT/switchyard/issues/68), [#9](https://github.com/DeandreT/switchyard/issues/9) |
+| Native Flow-echo replies | [#77](https://github.com/DeandreT/switchyard/issues/77) | [#68](https://github.com/DeandreT/switchyard/issues/68) |
 | Native Create/Get/List | [#18](https://github.com/DeandreT/switchyard/issues/18) | [#6](https://github.com/DeandreT/switchyard/issues/6) |
 | TLS native administration and CLI | [#19](https://github.com/DeandreT/switchyard/issues/19) | [#18](https://github.com/DeandreT/switchyard/issues/18), [#8](https://github.com/DeandreT/switchyard/issues/8) |
 | Native lifecycle/rule/mode adapters | [#29](https://github.com/DeandreT/switchyard/issues/29) | [#19](https://github.com/DeandreT/switchyard/issues/19), [#13](https://github.com/DeandreT/switchyard/issues/13), [#14](https://github.com/DeandreT/switchyard/issues/14), [#15](https://github.com/DeandreT/switchyard/issues/15), [#21](https://github.com/DeandreT/switchyard/issues/21), [#28](https://github.com/DeandreT/switchyard/issues/28) |

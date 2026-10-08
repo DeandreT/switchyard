@@ -1,6 +1,6 @@
 //! Receiving-link delivery and settlement.
 
-use std::{collections::HashSet, future::Future, pin::Pin, time::Duration};
+use std::{collections::HashSet, time::Duration};
 
 use amqp::{
     AmqpError, DeliveryConfirmation, DeliveryState, DeliveryTag, EngineError, Fields, Outcome,
@@ -10,8 +10,8 @@ use domain::{
     CommandKind, CommandOutcome, Delivery, EntityPath, LockToken, NamespaceName, ReceiveMode,
     SessionHold,
 };
-use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_amqp::{Value, primitives::Symbol};
+use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::{Broker, BrokerRejection, management::ConnectionManagement};
@@ -19,6 +19,9 @@ use crate::{Broker, BrokerRejection, management::ConnectionManagement};
 use super::{
     LinkAuthorization, ReceivingLinkProtocol, error_for, rejection_error, unauthorized_error,
 };
+
+mod workers;
+use workers::SettlementWorkers;
 
 /// How long a receiving link waits on a wakeup before asking the broker anyway.
 ///
@@ -30,8 +33,6 @@ const EMPTY_QUEUE_FALLBACK: Duration = Duration::from_secs(3);
 /// Bounds broker locks retained by one link even when the peer grants a very
 /// large credit window and delays every disposition.
 const MAX_IN_FLIGHT_DELIVERIES: usize = 32;
-
-type InFlightSettlement = Pin<Box<dyn Future<Output = SettlementCompletion> + Send + 'static>>;
 
 struct SettlementCompletion {
     lock_token: Option<LockToken>,
@@ -90,7 +91,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
         management: management.clone(),
         link_name: link_name.clone(),
     };
-    let mut in_flight = FuturesUnordered::<InFlightSettlement>::new();
+    let mut in_flight = SettlementWorkers::new();
     let mut registered_locks = HashSet::new();
 
     let exit = 'pump: loop {
@@ -265,25 +266,57 @@ pub(super) async fn serve_receiving_client<B: Broker>(
                 }
             }
         };
-        in_flight.push(settlement_future(
-            pending,
-            delivery,
-            settlement_context.clone(),
-        ));
+        let retirement = in_flight.subscribe();
+        in_flight.spawn(
+            lock_token,
+            settle_started_delivery(pending, delivery, settlement_context.clone(), retirement),
+        );
     };
 
-    // Cancel every pending waiter before removing its management route. A
-    // completed future unregisters itself; removing twice is harmless and
-    // makes teardown correct at every possible cancellation point.
-    drop(in_flight);
+    // Retire transport-only waits, but drain every original worker before
+    // releasing routes or the session. A submitted broker operation must not
+    // lose its result merely because the remote link has gone away.
+    in_flight.retire();
+    in_flight.finish().await;
+    for joined in in_flight.finished() {
+        match &joined.result {
+            Ok(completion) => {
+                if let Some(token) = completion.lock_token {
+                    registered_locks.remove(&token);
+                }
+                match &completion.result {
+                    Ok(()) => {}
+                    Err(SettlementFailure::Unauthorized) => {
+                        debug!(task = %joined.id, "retired settlement lost authorization");
+                    }
+                    Err(SettlementFailure::Engine(error)) => {
+                        debug!(task = %joined.id, %error, "retired settlement transport failed");
+                    }
+                    Err(SettlementFailure::Protocol(error)) => {
+                        warn!(task = %joined.id, %error, "retired settlement conversion failed");
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(task = %joined.id, token = ?joined.lock_token, %error, "settlement worker failed while draining");
+            }
+        }
+    }
+    for failed in in_flight.failures() {
+        warn!(task = %failed.id, token = ?failed.lock_token, error = %failed.error, "settlement worker failed during intake");
+    }
     unregister_deliveries(&management, &link_name, &mut registered_locks).await;
     release_session(&broker, &namespace, &entity, session.as_ref()).await;
+    let join_error = in_flight.into_join_error();
 
     match exit {
         // The engine already answered a remote Detach before surfacing the
         // notification. Closing this stale endpoint after the asynchronous
         // lock/session cleanup could target a new link that reused its handle.
-        PumpExit::Clean => Ok(()),
+        PumpExit::Clean => match join_error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        },
         PumpExit::Unauthorized => {
             sender
                 .close_with_error(unauthorized_error("the link's authorization has expired"))
@@ -302,7 +335,10 @@ pub(super) async fn serve_receiving_client<B: Broker>(
         }
         PumpExit::Engine(
             EngineError::RemoteClosed | EngineError::RemoteDetached | EngineError::Stopped,
-        ) => Ok(()),
+        ) => match join_error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        },
         PumpExit::Engine(error) => {
             let _ = sender.close().await;
             Err(error.into())
@@ -416,37 +452,6 @@ enum NextDeliveryError {
     Unauthorized,
 }
 
-fn settlement_future<B: Broker>(
-    pending: PendingDelivery,
-    delivery: Delivery,
-    context: SettlementContext<B>,
-) -> InFlightSettlement {
-    let lock_token = delivery.lock.map(|lock| lock.token);
-    shield_settlement(lock_token, async move {
-        settle_started_delivery(pending, delivery, context).await
-    })
-}
-
-fn shield_settlement<F>(lock_token: Option<LockToken>, settlement: F) -> InFlightSettlement
-where
-    F: Future<Output = Result<(), SettlementFailure>> + Send + 'static,
-{
-    // Once a remote outcome is available, applying it to the broker must
-    // survive link teardown. Dropping a Tokio join handle detaches rather than
-    // cancels its task, so the durable settlement continues even when the pump
-    // discards outcome waiters after Detach or End.
-    let settlement = tokio::spawn(async move {
-        let result = settlement.await;
-        SettlementCompletion { lock_token, result }
-    });
-    Box::pin(async move {
-        settlement.await.unwrap_or(SettlementCompletion {
-            lock_token,
-            result: Err(SettlementFailure::Engine(EngineError::Stopped)),
-        })
-    })
-}
-
 /// Awaits and applies one independently identified remote disposition.
 ///
 /// The lock is already committed and the transfer is already on the wire. A
@@ -456,6 +461,7 @@ async fn settle_started_delivery<B: Broker>(
     pending: PendingDelivery,
     delivery: Delivery,
     context: SettlementContext<B>,
+    mut retirement: watch::Receiver<bool>,
 ) -> Result<(), SettlementFailure> {
     let SettlementContext {
         namespace,
@@ -466,10 +472,18 @@ async fn settle_started_delivery<B: Broker>(
         link_name,
     } = context;
     let lock_token = delivery.lock.map(|lock| lock.token);
-    let remote = pending.await;
+    tokio::pin!(pending);
+    // Observe an already-ready disposition even when retirement is sticky;
+    // only a genuinely unanswered transport wait can be discarded.
+    let remote = tokio::select! {
+        biased;
+        remote = &mut pending => Some(remote),
+        () = wait_for_retirement(&mut retirement) => None,
+    };
     if let Some(lock_token) = lock_token {
         management.unregister_delivery(&link_name, lock_token).await;
     }
+    let Some(remote) = remote else { return Ok(()) };
     let remote = remote.map_err(SettlementFailure::Engine)?;
     let (_, outcome, confirmation) = remote.into_parts();
 
@@ -483,6 +497,7 @@ async fn settle_started_delivery<B: Broker>(
                     "the link's authorization expired before settlement committed",
                 )),
             }),
+            &mut retirement,
         )
         .await?;
         return Err(SettlementFailure::Unauthorized);
@@ -492,7 +507,12 @@ async fn settle_started_delivery<B: Broker>(
         // Receive-and-delete is already durable. In receiver settle mode second
         // the peer still expects its outcome to be acknowledged, so echo the
         // state against this delivery's independent identity.
-        return confirm_if_needed(confirmation, delivery_state_for_outcome(&outcome)).await;
+        return confirm_if_needed(
+            confirmation,
+            delivery_state_for_outcome(&outcome),
+            &mut retirement,
+        )
+        .await;
     };
     let sequence = delivery.sequence;
     let (kind, expected) = match settlement_command(outcome, &delivery, lock.token) {
@@ -503,6 +523,7 @@ async fn settle_started_delivery<B: Broker>(
                 DeliveryState::Rejected(amqp::Rejected {
                     error: Some(error_for(AmqpError::InternalError, error.to_string())),
                 }),
+                &mut retirement,
             )
             .await?;
             return Err(SettlementFailure::Protocol(error));
@@ -511,9 +532,15 @@ async fn settle_started_delivery<B: Broker>(
 
     // Service Bus treats the second-mode confirmation as the result of the
     // durable broker operation, not as an echo of the requested disposition.
+    // A polled submission may already be queued, so retirement cannot cancel it.
     match broker.submit(namespace, entity, kind).await {
         Ok(outcome) if expected.matches(&outcome) => {
-            confirm_if_needed(confirmation, DeliveryState::Accepted(amqp::Accepted)).await?
+            confirm_if_needed(
+                confirmation,
+                DeliveryState::Accepted(amqp::Accepted),
+                &mut retirement,
+            )
+            .await?
         }
         Ok(other) => {
             confirm_if_needed(
@@ -524,6 +551,7 @@ async fn settle_started_delivery<B: Broker>(
                         format!("settlement produced an unexpected outcome: {other:?}"),
                     )),
                 }),
+                &mut retirement,
             )
             .await?;
             warn!(%sequence, ?other, "settlement produced an unexpected broker outcome");
@@ -534,6 +562,7 @@ async fn settle_started_delivery<B: Broker>(
                 DeliveryState::Rejected(amqp::Rejected {
                     error: Some(rejection_error(&rejection)),
                 }),
+                &mut retirement,
             )
             .await?;
             // A settlement that fails is not fatal to the link: the lock
@@ -547,13 +576,23 @@ async fn settle_started_delivery<B: Broker>(
 async fn confirm_if_needed(
     confirmation: Option<DeliveryConfirmation>,
     state: DeliveryState,
+    retirement: &mut watch::Receiver<bool>,
 ) -> Result<(), SettlementFailure> {
     match confirmation {
-        Some(confirmation) => confirmation
-            .confirm(state)
-            .await
-            .map_err(SettlementFailure::Engine),
+        Some(confirmation) => tokio::select! {
+            biased;
+            () = wait_for_retirement(retirement) => Ok(()),
+            result = confirmation.confirm(state) => result.map_err(SettlementFailure::Engine),
+        },
         None => Ok(()),
+    }
+}
+
+async fn wait_for_retirement(retirement: &mut watch::Receiver<bool>) {
+    loop {
+        if *retirement.borrow_and_update() || retirement.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -998,7 +1037,8 @@ mod tests {
         let (started_tx, started) = tokio::sync::oneshot::channel();
         let (release_tx, release) = tokio::sync::oneshot::channel();
         let (finished_tx, finished) = tokio::sync::oneshot::channel();
-        let waiter = shield_settlement(None, async move {
+        let mut workers = SettlementWorkers::new();
+        workers.spawn(None, async move {
             let _ = started_tx.send(());
             let _ = release.await;
             let _ = finished_tx.send(());
@@ -1006,7 +1046,7 @@ mod tests {
         });
 
         started.await.expect("the shielded settlement starts");
-        drop(waiter);
+        drop(workers);
         release_tx
             .send(())
             .expect("dropping the waiter leaves the settlement alive");

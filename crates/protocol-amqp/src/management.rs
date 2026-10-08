@@ -66,7 +66,7 @@ struct RequestResponseDeliveryKey {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ManagedDelivery {
+pub(crate) struct ManagedDelivery {
     entity: EntityPath,
     sequence: SequenceNumber,
     /// Present for deliveries returned inside a management response. It is the
@@ -167,7 +167,11 @@ impl ConnectionManagement {
         });
     }
 
-    async fn delivery(&self, link_name: &str, lock_token: LockToken) -> Option<ManagedDelivery> {
+    pub(crate) async fn delivery(
+        &self,
+        link_name: &str,
+        lock_token: LockToken,
+    ) -> Option<ManagedDelivery> {
         self.deliveries
             .read()
             .await

@@ -153,12 +153,19 @@ driver and reader, retaining results for cancellation-safe retry. Drop requests
 stop only. Join success does not acknowledge AMQP Close: `close` and
 `close_with_error` still require the peer reply. Sender capacity waits observe
 detach and command closure, even when callers retain all 256 confirmation permits.
-Protocol task ownership, bounded admission/pre-open deadlines and ordered process
-shutdown remain [#7 work](roadmap.md#next-main-increments).
+
+Receiving-pump teardown joins its original settlement workers (at most 32)
+before residual route cleanup and session release. Retirement stops unanswered
+remote/confirmation waits, not started broker submissions; ready outcomes still
+apply. Second-mode success follows durable settlement. Cancelled finish observers
+retain original handles/results. Drop only requests retirement and detaches.
+Started Receive/AcceptSession custody, wider transport/task cleanup and ordered
+process shutdown remain [roadmap work](roadmap.md#next-main-increments).
 
 Sustained inbound traffic beyond initial credit is not certified. Session
 transfer-window accounting and receiving-credit refill remain
 [#68](https://github.com/DeandreT/switchyard/issues/68)/[#69](https://github.com/DeandreT/switchyard/issues/69).
+Native Flow-echo replies remain unimplemented ([#77](https://github.com/DeandreT/switchyard/issues/77)).
 
 Timer commands, not local wall-clock mutation, drive activation/expiry. Small
 host-clock regressions hold command time still; large ones refuse and retry,
