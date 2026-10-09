@@ -1,176 +1,126 @@
 # Completion Roadmap
 
-Switchyard is pre-alpha. This roadmap describes merged `main`, not reference
-branches or unmerged source. [GitHub issues](https://github.com/DeandreT/switchyard/issues)
-own live assignments, acceptance and full dependencies.
+Switchyard is pre-alpha. This tracks merged `main`, not references/unmerged source.
+[Live issues](https://github.com/DeandreT/switchyard/issues) own assignments,
+acceptance and full dependencies; [compatibility](compatibility.md) owns guarantees.
 
 ## Main Progress
 
-| Status | Current Main Capability |
-| --- | --- |
-| [x] | Repository-owned AMQP; TCP/TLS/WSS; SASL/CBS SAS |
-| [x] | Queue batching, both receive guarantees, settlement/DLQ/deferral/peek; sessions/state, scheduling/cancellation, duplicates |
-| [x] | Ordinary queue profile updates #13; immutable modes and retained records/deadlines, no administration or capacity activation |
-| [x] | Selected stored queue-profile validation #167; corruption refusal after decode/owner proof, not raw catalogue or whole-store health |
-| [x] | Immediate/scheduled actionless topic rules/subscriptions; bounded listed-topology proof ([PR #1](https://github.com/DeandreT/switchyard/pull/1)) |
-| [x] | Memory/Fjall parity/fsynced apply; unversioned-store refusal ([PR #4](https://github.com/DeandreT/switchyard/pull/4)); production refusal and format-2 live heads |
-| [x] | Opt-in opaque committed-entry journal #144 in the existing store; full-prefix validation and ambiguous-write refusal, no replay/quorum activation |
-| [x] | Pure [durable proposal V1](../crates/domain/src/durable_proposal.rs) #158; frozen original timestamp/captured authority, without rebinding or execution |
-| [x] | Opt-in [indexed writer](../crates/domain/src/indexed.rs) #159/#170; atomic effects/Clock/checkpoint, outcome-free latest duplicate and caught-apply-unwind retirement; exclusive external writes, no replay activation |
-| [x] | Bound broker API/pre-clock authority #56; wire adoption still pending |
-| [x] | Native Stop/joins, Detach-aware admission/credit cleanup; original natural receiving/send/management/CBS custody, first-poll acquisition and exact attach/registry handoffs |
-| [x] | Owned End preparation and captured delivery identities; receiving #111/Send #127/CBS #128/management #129/connection #130/attachment #131 outer-pump panic custody, not ancestor shielding |
-| [x] | Receiving handoff #172 prepares one context before native start and moves it through active/late adoption; no cleanup clone retry |
-| [x] | Primary-fault notice #139 from six spawned leaves and attachment #161 before original drains; captured native Stop and retained receiving worker faults, not cleanup-first faults or task families |
-| [x] | Management cleanup notice #173 caches raw request/reply/Close faults before remaining waits; retained primary/native-error priority, not task-family shielding |
-| [x] | Pure [offline JWT policy](offline-jwt.md) and [SQL kernel](sql-predicates.md); no grant activation or persisted rule integration |
-| [x] | Bounded SDK child/approved loaded-file custody; owned Cargo handoffs/unit CI, Linux frozen-input profile only |
-| [ ] | Remaining client semantics, administration and conserved capacity |
-| [ ] | Quorum, multi-tenant security, recovery and measured release |
-
-Acquisition #73, data-link #84 and CBS #74 coordinators are complete;
-[compatibility contracts](compatibility.md) define their current guarantees.
-
-SDK evidence is four passing experimental Memory gates: two pins over TCP/WSS.
-`declared-current` is ServiceBus 7.21.0 / Core 1.62.0; `previous` is 7.20.2 / 1.60.0,
-not latest. Eight Memory/Fjall cells #101/#9 remain pending. Ordinary workspace
-tests ignore four workflows and one restored-pin control; selected runs are
-reported separately, without durable/administration certification. See
-[SDK gates](sdk-gates.md) and [compatibility](compatibility.md).
+- [x] Repository-owned AMQP TCP/TLS/WSS, SASL/CBS SAS; queue batch/delivery/settlement,
+  DLQ/deferral/peek, sessions/state, scheduling/cancellation/dedup; actionless topic
+  fanout/rules/subscriptions and bounded listed topology ([PR #1](https://github.com/DeandreT/switchyard/pull/1)).
+- [x] Ordinary profile updates #13 and selected profile integrity #167, not catalogue/
+  whole-store health, administration or capacity. Immutable modes/retained deadlines.
+- [x] Memory/Fjall/fsynced apply, unversioned refusal ([PR #4](https://github.com/DeandreT/switchyard/pull/4)),
+  format-2 live heads/production refusal; opt-in journal #144 (full-prefix validation,
+  ambiguous-write refusal), pure [proposal #158](../crates/domain/src/durable_proposal.rs)
+  (frozen time/authority), [indexed apply #159/#170](../crates/domain/src/indexed.rs)
+  (atomic effects/Clock/checkpoint, outcome-free latest duplicate, caught-apply-unwind
+  retirement). External exclusive writes; no replay/quorum activation.
+- [x] Bound API/pre-clock authority #56, not retained wire authority; pure
+  [JWT](offline-jwt.md)/[SQL](sql-predicates.md), not activation/persisted rules.
+- [x] Native Stop/original joins, Detach-aware admission/credit cleanup; first-poll
+  receiving/Send/management/CBS custody, exact attachment/registry/End and delivery
+  identities; outer-pump panic #111/#127-#131, primary notice #139/#161, move-only
+  pre-native receiving context #172 and management raw cleanup notice #173.
+  No ancestor/family shielding; acquisition #73/data-link #84/CBS #74 complete.
+- [x] Bounded SDK child/approved loaded-file custody, owned Cargo handoffs/unit CI;
+  Linux frozen-input profile only. Four experimental Memory TCP/WSS gates use
+  declared-current 7.21.0/1.62.0 and previous 7.20.2/1.60.0, not latest; workspace
+  ignores four workflows/one restored-pin control. Eight durable/Memory cells #101/#9
+  and administration certification remain pending; [commands](sdk-gates.md).
+- [ ] Remaining semantics/administration/conserved capacity.
+- [ ] Quorum, multi-tenant security/recovery and measured release.
 
 ## Next Main Increments
 
-1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7):
-   [#75](https://github.com/DeandreT/switchyard/issues/75)
-   owns #132/#133 task families after merged leaf/attachment primary notices and
-   [#162](https://github.com/DeandreT/switchyard/issues/162) cleanup-first children #173-#177.
-   Receiving handoff #172 and management cleanup #173 are merged; children #174-#177 remain pending. These precede #132;
-   complete #63 only with both families.
-   [#64](https://github.com/DeandreT/switchyard/issues/64) owns #134 listener -> #135 limits
-   -> #136 aggregate deadline, then #65 signals. Child issues own full dependencies.
-2. After #7, complete [#12](https://github.com/DeandreT/switchyard/issues/12):
-   retained sender #57 -> receiver/settlement #58 -> sessions #59 -> management
-   #60. Merged #56 alone is not retained wire authority.
-3. Enable [#15](https://github.com/DeandreT/switchyard/issues/15) retirement/recreation
-   only after #12; no live deletion/recreation claim yet.
-4. Port topic/subscription profile updates and typed content independently, then dependent semantics.
-
-Joins are not graceful Close acknowledgements; source, labels and reference
-tests are not completion evidence. `feat/amqp-message-sections` and
-`feat/topic-mode-metadata` are references, not wholesale ports. Fresh-main
-increments must preserve key tags, the 2,000-child topic bound and error/clock
-contracts. Do not import reference format numbers or infer finite topics from
-metadata. Retire a reference branch only when its capabilities are accounted for.
+Finish cleanup notices, link/session families, listener/deadline/signals (#7), then
+wire authority (#12) before retirement/recreation (#15). Joins do not acknowledge
+Close; labels/source/reference tests do not prove completion or finite latency.
+`feat/amqp-message-sections`/`feat/topic-mode-metadata` are references, not wholesale
+ports. Fresh-main increments preserve key tags, the 2,000-child bound and error/
+Clock contracts; never import format numbers or infer finite capacity from metadata.
+Retire references only when capabilities are accounted for.
 
 ## Dependency Shape
 
-Integration paths, not every prerequisite. Only marked foundations are complete.
+One integration overview, not every prerequisite. "Merged" is the only completion
+marker; linked issues carry exact scopes.
 
 ```mermaid
 flowchart TD
-    Main["Merged foundations and leaf custody"] --> Fault["#139 Primary leaf-fault notice complete"]
-    Main --> Trees
-    Fault --> AttachFault["#161 Attachment primary-fault notice complete"]
-    AttachFault --> ManagementFault["#173 Management cleanup notice complete"]
-    ManagementFault --> DrainFault["#162 Remaining cleanup children #174-#177"]
-    AttachFault --> Handoff["#172 Receiving ready handoff complete"]
-    Handoff --> ReceivingFault["#174 Receiving cleanup-first faults"]
-    ReceivingFault --> DrainFault
-    DrainFault --> Trees["#132 Links -> #133 Sessions / finish #75/#63"]
-    Trees --> Admission["#134 Listener -> #135 Limits -> #136 Deadline / finish #64"]
-    Admission --> Signals["#65 Signal shutdown / finish #7"]
-    Signals --> Authority["#57 -> #58 -> #59 -> #60 / finish #12"]
+    Main["Merged main foundations"] --> Lifecycle["Merged #139/#161 primary, #172 handoff, #173 management cleanup"]
+    Lifecycle --> Cleanup["#162 Remaining children #174-#177"]
+    Cleanup --> Families["#132 Links -> #133 Sessions; finish #75/#63"]
+    Families --> Shutdown["#134 Listener -> #135 Limits -> #136 Deadline -> #65 Signals; finish #64/#7"]
+    Shutdown --> Authority["#57 Sender -> #58 Receiver -> #59 Sessions -> #60 Management; finish #12"]
     Authority --> Delete["#15 Retirement/recreation"]
-    Signals --> Grants["#71 Grant consumers -> #17 JWT activation"]
-    Signals --> Matrix["#101 Eight SDK cells / finish #9"]
-    Signals --> Windows["#68 Windows -> #69 Refill; #77 Echo"]
-    Main --> Profiles["#14 Topic/subscription profiles -> #22 Modes"]
+    Shutdown --> Grants["#71 Grant consumers -> #17 JWT activation"]
+    Shutdown --> Clients["#101/#9 SDK cells; #68 -> #69 and #77 Flow"]
+    Main --> Profiles["#14 Profiles -> #22 Modes"]
     Main --> Content["#16 Typed content"]
-    Kernel["Merged #11 SQL kernel"] --> Rules["#20 Filters -> #21 Actions"]
-    Content --> Rules
-    Profiles --> Queue["#27 Finite queues"]
-    Content --> Queue
+    Content --> Rules["Merged #11 kernel -> #20 Filters -> #21 Actions"]
+    Profiles --> Queues["#27 Finite queues"]
+    Content --> Queues
     Profiles --> Ledger["#26 Topic ledger; also #23/#25"]
     Content --> Ledger
     Rules --> Ledger
     Delete --> Ledger
-    Queue --> Topic["#28 Finite topics"]
-    Ledger --> Topic
-    Main --> Journal["#144 Committed-entry journal complete; opt-in only"]
-    Journal --> Proposal["#158 Durable proposal codec complete; pure only"]
-    Proposal --> Checkpoint["#159 Atomic indexed apply complete; opt-in only"]
-    Checkpoint --> Panic["#170 Apply-unwind retirement complete"]
-    Panic --> Integrity["#167 Selected profile integrity complete"]
-    Integrity --> RuleIntegrity["#178 Stored rule key/filter integrity"]
-    RuleIntegrity --> Cap["#168 Healthy cap refusal provenance"]
-    Cap --> Log["#160 Committed replay / finish #145/#36"]
-    Log --> Snapshots["#37 Snapshots -> #38 Quorum"]
-    Snapshots --> Runtime["#41 All-command production runtime"]
+    Queues --> Topics["#28 Finite topics"]
+    Ledger --> Topics
+    Main --> Durable["Merged #144 journal/#158 proposal/#159 indexed/#170 unwind/#167 profiles"]
+    Durable --> Integrity["#178 Stored rules -> #168 Healthy cap provenance"]
+    Integrity --> Replay["#160 Replay; finish #145/#36 -> #37 Snapshots -> #38 Quorum"]
+    Replay --> Runtime["#41 All-command production runtime"]
     Grants --> Runtime
-    Admin["#18 -> #19 Native administration"] --> Runtime
-    Atom["#10/#30/#31/#32/#48 Atom administration"] --> Gates
-    Runtime --> Gates["Security/recovery/client/release gates"]
-    Matrix --> Gates
-    Windows --> Gates
-    Topic --> Gates
+    Native["#18 -> #19 Native administration"] --> Runtime
+    Atom["#10/#30/#31/#32/#48 Atom administration"] --> Gates["Security/recovery/client/release gates"]
+    Runtime --> Gates
+    Clients --> Gates
+    Topics --> Gates
 ```
 
 ## Parallel Pickup
 
-Check live assignments. Each entry is a scoped lane, not its whole dependency
-chain. Split multi-PR work into child issues before implementation.
+Assign first, merge prerequisites and split multi-PR scopes before implementation.
+`status:ready` is a hint, not evidence. Serialize shared contracts/C# programs,
+freeze verification inputs, reuse artifacts and serialize disk-aware two-job builds.
+See [workflow](../CONTRIBUTING.md).
 
-| Lane | Entry And Boundary |
+| Lane | Entry and overlap boundary |
 | --- | --- |
-| Receiving/ancestors | #139/#161 primary, #172 handoff and #173 management cleanup complete; #162 receiving/Send/CBS/attachment children remain. Then #132 links/#133 sessions; serialize listener/native/registry edits |
-| SQL | #11 pure kernel complete; [#20](https://github.com/DeandreT/switchyard/issues/20) filters waits for #16 typed content, then #21 actions. Serialize compiler/rule paths; no retained integration yet |
-| Auth activation | #8 policy merged; #71 -> #17 waits for #7. Serialize shared authorization/CBS files, not a current parallel pickup |
-| Replication | #144/#158/#159/#170/#167 foundations complete; [#178](https://github.com/DeandreT/switchyard/issues/178) stored rules -> [#168](https://github.com/DeandreT/switchyard/issues/168) cap provenance -> [#160](https://github.com/DeandreT/switchyard/issues/160) replay. Serialize domain/cluster/store edits; retain startup refusal |
-| Administration | [#10](https://github.com/DeandreT/switchyard/issues/10): Atom fixtures/profiles; [#18](https://github.com/DeandreT/switchyard/issues/18): native Create/Get/List service/protobuf. No listener activation |
-| Domain ports | #14 topic/subscription profiles, #16 content, #23 duplicate history; serialize shared command/codec/key-tag/store-fence edits |
-| Client/release evidence | [#101](https://github.com/DeandreT/switchyard/issues/101): test matrix after #7; no runtime fixes |
-
-Assign before pickup; merge prerequisites first. `status:ready` is only a hint.
-Serialize shared contracts and each C# program; freeze inputs during verification.
-Reuse compatible artifacts, serialize two-job builds and check disk headroom.
-See [contribution workflow](../CONTRIBUTING.md).
+| Lifecycle | [#162](https://github.com/DeandreT/switchyard/issues/162) remaining receiving/Send/CBS/attachment cleanup, then [#75](https://github.com/DeandreT/switchyard/issues/75) families; serialize listener/native/registry. |
+| Domain ports | [#14](https://github.com/DeandreT/switchyard/issues/14) profiles, [#16](https://github.com/DeandreT/switchyard/issues/16) content, [#23](https://github.com/DeandreT/switchyard/issues/23) duplicates; serialize command/codec/key-tag/store fences. |
+| SQL | [#20](https://github.com/DeandreT/switchyard/issues/20) after #16, then #21; serialize compiler/rules. |
+| Replication | [#178](https://github.com/DeandreT/switchyard/issues/178) -> [#168](https://github.com/DeandreT/switchyard/issues/168) -> [#160](https://github.com/DeandreT/switchyard/issues/160); serialize domain/cluster/store, retain startup refusal. |
+| Administration | [#10](https://github.com/DeandreT/switchyard/issues/10) Atom fixtures/profiles; [#18](https://github.com/DeandreT/switchyard/issues/18) native Create/Get/List/protobuf, no listener activation. |
+| Deferred lanes | [#71](https://github.com/DeandreT/switchyard/issues/71) auth consumers then #17; [#101](https://github.com/DeandreT/switchyard/issues/101) SDK matrix (tests, not runtime fixes). Both await #7; serialize authorization/CBS. |
 
 ## Issue Index
 
-Milestones index the full scoped backlog. `port` means reference-derived, not
-complete. Update labels after prerequisites merge; verify every child before
-closing its coordinator.
+Milestones index the backlog; `port` means reference-derived, not complete. Refresh
+labels after prerequisites merge; verify children before closing coordinators.
 
 ### Safe Main-Line Foundations
 
-[Milestone 1](https://github.com/DeandreT/switchyard/milestone/1): store/owner safety,
-bounded lifecycle (#7), retained authority (#12), queue/topic/subscription profile
-updates (#13/#14), retirement (#15), typed content/copy overlays (#16).
+[Milestone 1](https://github.com/DeandreT/switchyard/milestone/1): owner/store safety,
+lifecycle #7, retained authority #12, profiles #13/#14, retirement #15, content #16.
 
 ### Client And Capacity Compatibility
 
-[Milestone 2](https://github.com/DeandreT/switchyard/milestone/2) owns:
-
-- Identity/CBS (#71/#17), SDK matrix (#9/#101), windows/refill/Flow echo (#68/#69/#77).
-- Native administration (#18/#19/#29), Atom contract/HTTPS/Get/CRUD/rules
-  (#10/#30/#31/#32/#48), administration-client gates (#50).
-- Merged pure SQL kernel (#11/#95/#96/#97); pending typed content #16 -> filters
-  #20 -> actions #21. Content is separate from the kernel.
-- Held-session settlement/renewal, session fan-out, configurable TTL and topic
-  duplicate history (#24/#25/#33/#23).
-- Capacity profiles -> finite queues/conserved parent-topic ledger -> finite
-  topics (#22/#27/#26/#28); metadata is not a physical-byte ledger.
-- Restricted queue transactions -> AMQP coordinator -> same-group placement ->
-  forwarding outbox (#34/#35/#39/#40); no cross-group atomicity.
+[Milestone 2](https://github.com/DeandreT/switchyard/milestone/2): identity/SDK/Flow
+#71/#17/#9/#101/#68/#69/#77; native/Atom/admin gates #18/#19/#29/#10/#30/#31/#32/#48/#50;
+merged pure SQL #11/#95-#97 versus pending content/rules #16/#20/#21; held-session
+settlement/renewal, fanout/TTL/duplicates #24/#25/#33/#23; finite/conserved capacity
+#22/#27/#26/#28 (metadata is no ledger); restricted transactions/coordinator/
+same-group placement/forwarding #34/#35/#39/#40, never cross-group atomicity.
 
 ### Production And Release Gates
 
-[Milestone 3](https://github.com/DeandreT/switchyard/milestone/3): committed replay
--> full-state snapshots -> quorum/routing -> all-command runtime (#36, children #144/#145; #37/#38/#41),
-OIDC/mTLS/committed RBAC (#42/#43/#49), namespace quota/fairness (#44), KMS
-encryption -> audit/WORM -> backup/restore (#45/#46/#47), readiness/metrics (#51),
-fault/upgrade gates (#52), signed/measured release (#53). Local demos and startup
-refusal do not complete these gates.
+[Milestone 3](https://github.com/DeandreT/switchyard/milestone/3): replay/snapshots/
+quorum/runtime #36/#144/#145/#37/#38/#41; OIDC/mTLS/committed RBAC #42/#43/#49;
+quotas/fairness #44; KMS -> audit/WORM -> backup #45/#46/#47; readiness #51,
+fault/upgrade #52, signed/measured release #53. Demos/refusal do not complete gates.
 
 ## Completion Checks
 
@@ -189,8 +139,7 @@ refusal do not complete these gates.
   encrypted/audited 100k 1KiB messages/s and under-20ms p99 evidence; 5TiB soak
   includes compaction, failover, backup and restore on declared hardware.
 
-[#53](https://github.com/DeandreT/switchyard/issues/53) reaches every workstream.
-Completion requires executed evidence, not code presence or skipped tests.
-Version 1.0 stays reserved until all gates pass. [Architecture](../ARCHITECTURE.md)
-records the target and non-goals: Premium, cross-group atomic transactions, geo
-replication and regulatory certification are not silently added to this release.
+[#53](https://github.com/DeandreT/switchyard/issues/53) reaches every lane. Completion
+requires executed evidence, never skipped tests/code presence; 1.0 stays reserved.
+[Architecture](../ARCHITECTURE.md) preserves non-goals: Premium, cross-group atomic
+transactions, geo replication and regulatory certification are not added promises.
