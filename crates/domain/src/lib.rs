@@ -15,6 +15,7 @@ mod durable_proposal;
 mod entity_binding;
 mod error;
 mod identifier;
+mod indexed;
 mod machine;
 mod message;
 mod queue;
@@ -37,6 +38,7 @@ pub use identifier::{
     MAX_SESSION_ID_BYTES, MAX_SUBSCRIPTION_NAME_CHARACTERS, NamespaceName, PlacementGroupId,
     RuleName, SessionId, SubscriptionName,
 };
+pub use indexed::{IndexedApplyError, IndexedApplyOutcome, IndexedWriter};
 pub use machine::{
     MAX_DEFERRED_RECEIVE_BATCH, MAX_PEEK_BATCH, MAX_PEEK_SCAN, StateMachine, TIMER_SCAN_LIMIT,
 };

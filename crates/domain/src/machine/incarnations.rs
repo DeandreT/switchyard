@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use storage::{StateStore, WriteBatch};
 
 use crate::{
-    BoundCommand, BrokerError, CommandOutcome, DEAD_LETTER_QUEUE_SUFFIX, EntityBinding,
+    BoundCommand, BrokerError, Command, CommandOutcome, DEAD_LETTER_QUEUE_SUFFIX, EntityBinding,
     EntityBindingKind, EntityPath, NamespaceName, SubscriptionName, codec,
     identifier::SUBSCRIPTION_PATH_SEGMENT, keys,
 };
@@ -233,13 +233,23 @@ impl<S: StateStore> StateMachine<S> {
 
     /// Applies only to the exact namespace and physical target originally bound.
     pub fn apply_bound(&self, envelope: &BoundCommand) -> Result<CommandOutcome, BrokerError> {
-        let binding = envelope.binding();
-        let command = envelope.command();
+        let (outcome, batch) = self.prepare_bound(envelope.command(), envelope.binding())?;
+        if !batch.is_empty() {
+            self.store().apply(batch)?;
+        }
+        Ok(outcome)
+    }
+
+    pub(crate) fn prepare_bound(
+        &self,
+        command: &Command,
+        binding: &EntityBinding,
+    ) -> Result<(CommandOutcome, WriteBatch), BrokerError> {
         if &command.namespace != binding.namespace() || &command.entity != binding.target() {
             return Err(BrokerError::InvalidEntityBinding);
         }
         self.validate_binding(binding)?;
-        self.apply(command)
+        self.prepare(command)
     }
 }
 

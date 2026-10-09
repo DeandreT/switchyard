@@ -1,10 +1,10 @@
 //! The deterministic broker state machine.
 //!
-//! [`StateMachine::apply`] is the only entry point that mutates state. It reads
-//! the records a command touches, folds every resulting change into a single
-//! [`WriteBatch`], and commits that batch atomically. A command therefore
-//! either takes effect completely or not at all, and two replicas applying the
-//! same command in the same order reach byte-identical state.
+//! Ordinary application and the opt-in indexed writer share private batch
+//! preparation. It reads the records a command touches and folds every resulting
+//! change into a single [`WriteBatch`], which the caller commits atomically.
+//! A command therefore either takes effect completely or not at all, and two
+//! replicas applying the same command in the same order reach byte-identical state.
 //!
 //! Nothing here reads a clock, generates a random value, or performs I/O beyond
 //! the injected store.
@@ -77,6 +77,17 @@ impl<S: StateStore> StateMachine<S> {
     /// On error nothing is written, so a rejection leaves state untouched on
     /// every replica.
     pub fn apply(&self, command: &Command) -> Result<CommandOutcome, BrokerError> {
+        let (outcome, batch) = self.prepare(command)?;
+        if !batch.is_empty() {
+            self.store.apply(batch)?;
+        }
+        Ok(outcome)
+    }
+
+    pub(crate) fn prepare(
+        &self,
+        command: &Command,
+    ) -> Result<(CommandOutcome, WriteBatch), BrokerError> {
         let last_applied = self.last_applied_time()?;
         if command.issued_at < last_applied {
             return Err(BrokerError::ClockRegression {
@@ -275,9 +286,8 @@ impl<S: StateStore> StateMachine<S> {
             // Advancing the clock in the same batch keeps the applied timestamp
             // and the state it produced consistent under a crash.
             batch.push_put(keys::clock(), codec::encode(&command.issued_at)?);
-            self.store.apply(batch)?;
         }
-        Ok(outcome)
+        Ok((outcome, batch))
     }
 
     // ---- reads -------------------------------------------------------------
