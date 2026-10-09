@@ -107,6 +107,14 @@ logs, quota accounting, encryption, and snapshot installation remain planned. Se
 [storage](crates/storage/src/lib.rs) and
 [Fjall opening/apply](crates/storage/src/durable.rs).
 
+The opt-in [cluster journal](crates/cluster/src/journal.rs) shares that store
+owner under a reserved `0xF0` prefix. An externally exclusive writer appends opaque
+entries before advancing a committed frontier. Reopen validates the full prefix
+in bounded pages; valid uncommitted tails stay uncommitted, corruption refuses,
+and ambiguous write errors require reopening. This is not command replay, quorum,
+or runtime activation; [#145](https://github.com/DeandreT/switchyard/issues/145)
+adds atomic replay next.
+
 ## Production Target: Not Implemented
 
 The intended release is a Rust-native Linux broker with quorum durability,

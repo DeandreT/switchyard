@@ -1,7 +1,14 @@
 #![forbid(unsafe_code)]
 
+mod journal;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub use journal::{
+    JOURNAL_FORMAT_VERSION, JOURNAL_VALIDATION_PAGE_ENTRIES, Journal, JournalEntry, JournalError,
+    MAX_JOURNAL_PAYLOAD_BYTES, MAX_JOURNAL_READ_ENTRIES,
+};
 
 pub const PRODUCTION_MINIMUM_VOTERS: u16 = 3;
 pub const PRODUCTION_REPLICATION_FACTOR: u16 = 3;

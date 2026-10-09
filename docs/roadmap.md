@@ -13,6 +13,7 @@ own live assignments, acceptance and full dependencies.
 | [x] | Ordinary queue profile updates #13; immutable modes and retained records/deadlines, no administration or capacity activation |
 | [x] | Immediate/scheduled actionless topic rules/subscriptions; bounded listed-topology proof ([PR #1](https://github.com/DeandreT/switchyard/pull/1)) |
 | [x] | Memory/Fjall parity/fsynced apply; unversioned-store refusal ([PR #4](https://github.com/DeandreT/switchyard/pull/4)); production refusal and format-2 live heads |
+| [x] | Opt-in opaque committed-entry journal #144 in the existing store; full-prefix validation and ambiguous-write refusal, no replay/quorum activation |
 | [x] | Bound broker API/pre-clock authority #56; wire adoption still pending |
 | [x] | Native Stop/joins, Detach-aware admission/credit cleanup; original natural receiving/send/management/CBS custody, first-poll acquisition and exact attach/registry handoffs |
 | [x] | Owned End preparation and captured delivery identities; receiving #111/CBS #128/management #129/connection #130/attachment #131 outer-pump panic custody, not ancestor shielding |
@@ -83,7 +84,7 @@ flowchart TD
     Delete --> Ledger
     Queue --> Topic["#28 Finite topics"]
     Ledger --> Topic
-    Main --> Journal["#144 Committed-entry journal"]
+    Main --> Journal["#144 Committed-entry journal complete; opt-in only"]
     Journal --> Log["#145 Atomic replay / finish #36"]
     Log --> Snapshots["#37 Snapshots -> #38 Quorum"]
     Snapshots --> Runtime["#41 All-command production runtime"]
@@ -106,7 +107,7 @@ chain. Split multi-PR work into child issues before implementation.
 | Receiving/ancestors | Pending #127/#132/#133/#139 after merged foundations. Serialize listener/native/registry edits |
 | SQL | #11 pure kernel complete; [#20](https://github.com/DeandreT/switchyard/issues/20) filters waits for #16 typed content, then #21 actions. Serialize compiler/rule paths; no retained integration yet |
 | Auth activation | #8 policy merged; #71 -> #17 waits for #7. Serialize shared authorization/CBS files, not a current parallel pickup |
-| Replication | [#144](https://github.com/DeandreT/switchyard/issues/144): cluster/storage journal, no domain/proposer activation; #145 atomic replay follows #144 and completes #36. Retain startup refusal |
+| Replication | #144 journal complete; [#145](https://github.com/DeandreT/switchyard/issues/145) atomic replay completes #36. Serialize cluster/domain/store edits; retain startup refusal |
 | Administration | [#10](https://github.com/DeandreT/switchyard/issues/10): Atom fixtures/profiles; [#18](https://github.com/DeandreT/switchyard/issues/18): native Create/Get/List service/protobuf. No listener activation |
 | Domain ports | #14 topic/subscription profiles, #16 content, #23 duplicate history; serialize shared command/codec/key-tag/store-fence edits |
 | Client/release evidence | [#101](https://github.com/DeandreT/switchyard/issues/101): test matrix after #7; no runtime fixes |
