@@ -33,6 +33,9 @@ const ADDRESS: &str = "management-replies";
 const CHANNEL: u16 = 1;
 const HANDLE: u32 = 1;
 
+#[path = "reply_panic_tests.rs"]
+mod panic_tests;
+
 #[derive(Default)]
 struct WriteState {
     held: bool,

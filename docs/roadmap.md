@@ -15,7 +15,7 @@ own live assignments, acceptance and full dependencies.
 | [x] | Memory/Fjall parity/fsynced apply; unversioned-store refusal ([PR #4](https://github.com/DeandreT/switchyard/pull/4)); production refusal and format-2 live heads |
 | [x] | Bound broker API/pre-clock authority #56; wire adoption still pending |
 | [x] | Native Stop/joins, Detach-aware admission/credit cleanup; original natural receiving/send/management/CBS custody, first-poll acquisition and exact attach/registry handoffs |
-| [x] | Owned End preparation and captured delivery identities; receiving #111/CBS #128/connection #130 outer-pump panic custody, not ancestor shielding |
+| [x] | Owned End preparation and captured delivery identities; receiving #111/CBS #128/management #129/connection #130 outer-pump panic custody, not ancestor shielding |
 | [x] | Pure [offline JWT policy](offline-jwt.md) and [SQL kernel](sql-predicates.md); no grant activation or persisted rule integration |
 | [x] | Bounded SDK child/approved loaded-file custody; owned Cargo handoffs/unit CI, Linux frozen-input profile only |
 | [ ] | Remaining client semantics, administration and conserved capacity |
@@ -33,7 +33,7 @@ reported separately, without durable/administration certification. See
 
 ## Next Main Increments
 
-1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7): management #129.
+1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7):
    [#75](https://github.com/DeandreT/switchyard/issues/75)
    owns ordered #127-#133 leaf/ancestor children, with early-fault notice #139 before
    link-family #132, and completes #63.
@@ -59,11 +59,9 @@ Integration paths, not every prerequisite. Nodes beyond merged foundations are p
 
 ```mermaid
 flowchart TD
-    Main["Merged foundations/custody; #74/#110/#111/#117/#128/#130 complete"] --> Send["#127 Send panic custody"]
-    Main --> Leaves["#129 Management panic custody"]
+    Main["Merged foundations/custody; #74/#110/#111/#117/#128/#129/#130 complete"] --> Send["#127 Send panic custody"]
     Main --> Attachments["#131 Attachment custody"]
-    Leaves --> Fault["#139 Early leaf-fault notification"]
-    Send --> Fault
+    Send --> Fault["#139 Early leaf-fault notification"]
     Main --> Fault
     Attachments --> Trees
     Fault --> Trees["#132 Links -> #133 Sessions / finish #75/#63"]
@@ -107,7 +105,6 @@ chain. Split multi-PR work into child issues before implementation.
 | Lane | Entry And Boundary |
 | --- | --- |
 | Receiving/ancestors | Pending #127/#131-#133/#139 after merged foundations. Serialize listener/native/registry edits |
-| Leaf panic custody | [#129](https://github.com/DeandreT/switchyard/issues/129) management; #128 CBS is merged. Coordinate authorization.rs; live status stays in GitHub |
 | SQL | #11 pure kernel complete; [#20](https://github.com/DeandreT/switchyard/issues/20) filters waits for #16 typed content, then #21 actions. Serialize compiler/rule paths; no retained integration yet |
 | Auth activation | #8 policy merged; #71 -> #17 waits for #7. Serialize shared authorization/CBS files, not a current parallel pickup |
 | Replication | [#144](https://github.com/DeandreT/switchyard/issues/144): cluster/storage journal, no domain/proposer activation; #145 atomic replay follows #144/#13 and completes #36. Retain startup refusal |

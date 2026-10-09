@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
     sync::{Arc, Mutex as StdMutex, Weak},
     time::Duration,
@@ -15,6 +16,7 @@ use domain::{
     CommandKind, CommandOutcome, Delivery, EntityPath, LockToken, NamespaceName, SequenceNumber,
     SessionHold,
 };
+use futures_util::FutureExt;
 use serde_amqp::{
     Value,
     primitives::{Array, Binary, OrderedMap, Timestamp as AmqpTimestamp, Uuid},
@@ -34,7 +36,10 @@ mod response;
 mod rules;
 mod scheduled;
 
-use self::custody::{OperationControl, PendingOperation, RequestBroker};
+use self::custody::{
+    OperationControl, PanicPayload, PendingOperation, PumpPoint, ReplyCustody, RequestBroker,
+    RequestCustody,
+};
 use self::response::ManagementResponse;
 
 pub use deferred::{RECEIVE_BY_SEQUENCE_NUMBER_OPERATION, UPDATE_DISPOSITION_OPERATION};
@@ -658,10 +663,19 @@ pub(crate) async fn serve_management_requests<B: Broker>(
         }
     };
     tokio::pin!(retirement);
-    let exit = loop {
+    loop {
         let received = tokio::select! {
             biased;
-            exit = &mut retirement => break exit,
+            exit = &mut retirement => {
+                if matches!(exit, ManagementRetirement::Unauthorized) {
+                    let mut custody = RequestCustody::default();
+                    custody.close = Some(native_operation(receiver.close_with_error(unauthorized_error(
+                        "the management link's authorization has expired",
+                    ))));
+                    finish_request(&mut custody, &receiver, Ok(Ok(Some(exit)))).await?;
+                }
+                return Ok(());
+            },
             received = receiver.recv() => received,
         };
         let delivery = match received {
@@ -670,106 +684,174 @@ pub(crate) async fn serve_management_requests<B: Broker>(
                 amqp::EngineError::RemoteClosed
                 | amqp::EngineError::RemoteDetached
                 | amqp::EngineError::Stopped,
-            ) => break ManagementRetirement::Detached,
+            ) => return Ok(()),
             Err(error) => return Err(error.into()),
         };
         if let Some(authorization) = authorization.as_ref() {
             let prepared = tokio::select! {
                 biased;
-                exit = &mut retirement => break exit,
-                prepared = authorization.ensure_any() => prepared,
+                exit = &mut retirement => Err(exit),
+                prepared = authorization.ensure_any() => prepared.map_err(|_| ManagementRetirement::Unauthorized),
             };
-            if prepared.is_err() {
-                break ManagementRetirement::Unauthorized;
+            if let Err(exit) = prepared {
+                if matches!(exit, ManagementRetirement::Unauthorized) {
+                    let mut custody = RequestCustody::default();
+                    custody.close = Some(native_operation(receiver.close_with_error(
+                        unauthorized_error("the management link's authorization has expired"),
+                    )));
+                    finish_request(&mut custody, &receiver, Ok(Ok(Some(exit)))).await?;
+                }
+                return Ok(());
             }
         }
-
-        let correlation = delivery
-            .message()
-            .properties
-            .as_ref()
-            .and_then(|properties| {
-                Some((properties.message_id.clone()?, properties.reply_to.clone()?))
-            });
-        let Some((message_id, reply_to)) = correlation else {
-            let mut rejected = native_operation(receiver.reject(&delivery, None));
-            if let Some(exit) = observe_or_retire(&mut rejected, retirement.as_mut()).await {
-                let _ = rejected.finish().await;
-                consume_native_result(&mut rejected, Ok(()))?;
-                break exit;
-            }
-            rejected
-                .take_packet()
-                .expect("observed rejection is consumed once")
-                .result
-                .expect("active rejection has a result")?;
-            continue;
-        };
-
         let request_broker = RequestBroker::new(broker.clone());
-        let mut original = PendingOperation::new(
-            process_request(
-                delivery.message(),
-                message_id,
-                &namespace,
-                &entity,
-                &request_broker,
-                &management,
-                authorization.as_ref(),
-            ),
-            request_broker.control(),
-        );
-        if let Some(exit) = observe_or_retire(&mut original, retirement.as_mut()).await {
-            let _ = original.finish().await;
-            let packet = original
-                .take_packet()
-                .expect("retired request is consumed once");
-            debug!(
-                started = packet.started,
-                retired = packet.retired,
-                response = packet.result.is_some(),
-                "retired management request observed without acknowledgement"
-            );
-            break exit;
+        let mut custody = RequestCustody::default();
+        let result = AssertUnwindSafe(management_request_pump(
+            &receiver,
+            &delivery,
+            &namespace,
+            &entity,
+            &request_broker,
+            &management,
+            authorization.as_ref(),
+            &mut custody,
+            retirement.as_mut(),
+        ))
+        .catch_unwind()
+        .await;
+        if matches!(&result, Ok(Ok(Some(ManagementRetirement::Unauthorized)))) {
+            custody.close = Some(native_operation(receiver.close_with_error(
+                unauthorized_error("the management link's authorization has expired"),
+            )));
         }
-        let response = original
-            .take_packet()
-            .expect("observed request is consumed once")
-            .result
-            .expect("active management request has a response");
-        debug!(correlation_id = ?response.correlation_id, %reply_to, status_code = response.status_code, "management request processed");
-        let mut accepted = native_operation(receiver.accept(&delivery));
-        if let Some(exit) = observe_or_retire(&mut accepted, retirement.as_mut()).await {
-            let _ = accepted.finish().await;
-            consume_native_result(&mut accepted, Ok(()))?;
-            break exit;
+        if finish_request(&mut custody, &receiver, result)
+            .await?
+            .is_some()
+        {
+            return Ok(());
         }
-        accepted
-            .take_packet()
-            .expect("observed acknowledgement is consumed once")
-            .result
-            .expect("active acknowledgement has a result")?;
-        let routed = tokio::select! {
-            biased;
-            exit = &mut retirement => break exit,
-            routed = management.route_response(&reply_to, response) => routed,
-        };
-        if routed.is_err() {
-            debug!(%reply_to, "management reply route disappeared");
-        } else {
-            debug!(%reply_to, "management response routed");
-        }
-    };
-    if matches!(exit, ManagementRetirement::Unauthorized) {
-        guarded_close(
-            receiver.close_with_error(unauthorized_error(
-                "the management link's authorization has expired",
-            )),
-            receiver.on_detach_owned(),
-        )
-        .await?;
     }
-    Ok(())
+}
+
+async fn finish_request(
+    custody: &mut RequestCustody<'_>,
+    receiver: &Receiver,
+    primary: std::thread::Result<Result<Option<ManagementRetirement>, ManagementError>>,
+) -> Result<Option<ManagementRetirement>, ManagementError> {
+    let cleanup = AssertUnwindSafe(custody.finish(receiver.on_detach_owned()))
+        .catch_unwind()
+        .await;
+    let diagnostics = if cleanup.is_ok() {
+        catch_unwind(AssertUnwindSafe(|| custody.report())).err()
+    } else {
+        None
+    };
+    let cleanup_panic = cleanup
+        .err()
+        .or_else(|| custody.take_cleanup_panic())
+        .or(diagnostics);
+    finish_pump(primary, cleanup_panic, custody.take_native_error())
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn management_request_pump<'a, B: Broker>(
+    receiver: &'a Receiver,
+    delivery: &'a amqp::Delivery,
+    namespace: &'a NamespaceName,
+    entity: &'a EntityPath,
+    request_broker: &'a RequestBroker<B>,
+    management: &'a ConnectionManagement,
+    authorization: Option<&'a ManagementAuthorization>,
+    custody: &mut RequestCustody<'a>,
+    mut retirement: Pin<&mut (impl Future<Output = ManagementRetirement> + Send)>,
+) -> Result<Option<ManagementRetirement>, ManagementError> {
+    let correlation = delivery
+        .message()
+        .properties
+        .as_ref()
+        .and_then(|properties| {
+            Some((properties.message_id.clone()?, properties.reply_to.clone()?))
+        });
+    let Some((message_id, reply_to)) = correlation else {
+        custody.native = Some(native_operation(receiver.reject(delivery, None)));
+        if let Some(exit) = observe_or_retire(
+            custody.native.as_mut().unwrap(),
+            retirement.as_mut(),
+            PumpPoint::RequestNative,
+        )
+        .await
+        {
+            return Ok(Some(exit));
+        }
+        custody.capture_native();
+        if let Some(error) = custody.take_native_error() {
+            return Err(error.into());
+        }
+        return Ok(None);
+    };
+    custody.request = Some(PendingOperation::new(
+        process_request(
+            delivery.message(),
+            message_id,
+            namespace,
+            entity,
+            request_broker,
+            management,
+            authorization,
+        ),
+        request_broker.control(),
+    ));
+    #[cfg(test)]
+    custody::pump_checkpoint(PumpPoint::RequestPrepared).await;
+    if let Some(exit) = observe_or_retire(
+        custody.request.as_mut().unwrap(),
+        retirement.as_mut(),
+        PumpPoint::RequestBroker,
+    )
+    .await
+    {
+        return Ok(Some(exit));
+    }
+    custody.capture_request();
+    custody.response = Some(
+        custody
+            .request_packet
+            .as_mut()
+            .unwrap()
+            .result
+            .take()
+            .expect("active management request has a response"),
+    );
+    #[cfg(test)]
+    custody::pump_checkpoint(PumpPoint::RequestResponse).await;
+    let response = custody.response.as_ref().unwrap();
+    debug!(correlation_id = ?response.correlation_id, %reply_to, status_code = response.status_code, "management request processed");
+    custody.native = Some(native_operation(receiver.accept(delivery)));
+    if let Some(exit) = observe_or_retire(
+        custody.native.as_mut().unwrap(),
+        retirement.as_mut(),
+        PumpPoint::RequestNative,
+    )
+    .await
+    {
+        return Ok(Some(exit));
+    }
+    custody.capture_native();
+    if let Some(error) = custody.take_native_error() {
+        return Err(error.into());
+    }
+    let routed = tokio::select! {
+        biased;
+        exit = retirement.as_mut() => return Ok(Some(exit)),
+        () = custody::pump_fault(PumpPoint::RequestRouting) => unreachable!("management fault checkpoint panics"),
+        routed = management.route_response(&reply_to, custody.response.as_ref().unwrap().clone()) => routed,
+    };
+    if routed.is_err() {
+        debug!(%reply_to, "management reply route disappeared");
+    } else {
+        debug!(%reply_to, "management response routed");
+    }
+    Ok(None)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -781,10 +863,12 @@ enum ManagementRetirement {
 async fn observe_or_retire<T: Send>(
     original: &mut PendingOperation<'_, T>,
     retirement: Pin<&mut (impl Future<Output = ManagementRetirement> + Send)>,
+    point: PumpPoint,
 ) -> Option<ManagementRetirement> {
     tokio::select! {
         biased;
         exit = retirement => { original.retire(); Some(exit) }
+        () = custody::pump_fault(point) => unreachable!("management fault checkpoint panics"),
         _ = original.observe() => None,
     }
 }
@@ -805,6 +889,7 @@ fn native_operation<'a, T: Send + 'a>(
     )
 }
 
+#[cfg(test)]
 fn consume_native_result<T: Send>(
     original: &mut PendingOperation<'_, Result<T, EngineError>>,
     cleanup: Result<(), EngineError>,
@@ -828,6 +913,7 @@ fn consume_native_result<T: Send>(
     }
 }
 
+#[cfg(test)]
 async fn guarded_close(
     actual: impl Future<Output = Result<(), EngineError>> + Send,
     detached: impl Future<Output = ()> + Send,
@@ -1333,19 +1419,36 @@ pub(crate) async fn serve_management_replies(
     sender: Sender,
     address: String,
     route: mpsc::Sender<ManagementResponse>,
-    mut responses: mpsc::Receiver<ManagementResponse>,
+    responses: mpsc::Receiver<ManagementResponse>,
     management: Arc<ConnectionManagement>,
     authorization: Option<ManagementAuthorization>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let result = management_reply_loop(&sender, &mut responses, authorization.as_ref()).await;
-    responses.close();
-    management.unregister_reply_route(&address, &route).await;
-    result
+    let mut custody = ReplyCustody::new(responses, address, route, &management);
+    let result = AssertUnwindSafe(management_reply_loop(
+        &sender,
+        &mut custody,
+        authorization.as_ref(),
+    ))
+    .catch_unwind()
+    .await;
+    let cleanup = AssertUnwindSafe(custody.finish(sender.on_detach_owned()))
+        .catch_unwind()
+        .await;
+    let diagnostics = if cleanup.is_ok() {
+        catch_unwind(AssertUnwindSafe(|| custody.report())).err()
+    } else {
+        None
+    };
+    let cleanup_panic = cleanup
+        .err()
+        .or_else(|| custody.take_cleanup_panic())
+        .or(diagnostics);
+    finish_pump(result, cleanup_panic, custody.take_native_error())
 }
 
-async fn management_reply_loop(
-    sender: &Sender,
-    responses: &mut mpsc::Receiver<ManagementResponse>,
+async fn management_reply_loop<'a>(
+    sender: &'a Sender,
+    custody: &mut ReplyCustody<'a>,
     authorization: Option<&ManagementAuthorization>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let detached = sender.on_detach_owned();
@@ -1358,58 +1461,74 @@ async fn management_reply_loop(
     };
     tokio::pin!(retirement);
     loop {
+        #[cfg(test)]
+        custody::pump_checkpoint(PumpPoint::ReplyIdle).await;
         let response = tokio::select! {
             biased;
             exit = &mut retirement => {
                 if matches!(exit, ManagementRetirement::Unauthorized) {
-                    responses.close();
-                    guarded_close(
-                        sender.close_with_error(unauthorized_error("the management link's authorization has expired")),
-                        sender.on_detach_owned(),
-                    ).await?;
+                    custody.close = Some(native_operation(sender.close_with_error(unauthorized_error(
+                        "the management link's authorization has expired",
+                    ))));
                 }
                 return Ok(());
             }
-            response = responses.recv() => response,
+            response = custody.responses.recv() => response,
         };
         let Some(response) = response else {
             return Ok(());
         };
-        debug!(?response.correlation_id, status_code = response.status_code, "sending management response");
         let control = OperationControl::new();
-        let mut original = PendingOperation::new(
+        custody.original = Some(PendingOperation::new(
             send_management_response(sender, response, control.clone()),
             control,
-        );
-        if let Some(exit) = observe_or_retire(&mut original, retirement.as_mut()).await {
-            responses.close();
-            let close_result = if matches!(exit, ManagementRetirement::Unauthorized) {
-                // A queued no-credit start needs local native retirement to
-                // wake it. Keep both originals; stop/join, not dropping an
-                // observer, is what can interrupt a blocked native writer.
-                let (_, closed) = tokio::join!(
-                    original.finish(),
-                    guarded_close(
-                        sender.close_with_error(unauthorized_error(
-                            "the management link's authorization has expired"
-                        )),
-                        sender.on_detach_owned(),
-                    ),
-                );
-                closed
-            } else {
-                let _ = original.finish().await;
-                Ok(())
-            };
-            consume_native_result(&mut original, close_result)?;
+        ));
+        #[cfg(test)]
+        custody::pump_checkpoint(PumpPoint::ReplyPrepared).await;
+        if let Some(exit) = observe_or_retire(
+            custody.original.as_mut().unwrap(),
+            retirement.as_mut(),
+            PumpPoint::ReplyNative,
+        )
+        .await
+        {
+            if matches!(exit, ManagementRetirement::Unauthorized) {
+                custody.close = Some(native_operation(sender.close_with_error(
+                    unauthorized_error("the management link's authorization has expired"),
+                )));
+            }
             return Ok(());
         }
-        original
-            .take_packet()
-            .expect("original management reply is consumed once")
-            .result
-            .expect("active management reply has a result")?;
+        custody.capture_packet();
+        #[cfg(test)]
+        custody::pump_checkpoint(PumpPoint::ReplyResult).await;
+        if let Some(error) = custody.take_native_error() {
+            return Err(error.into());
+        }
+        custody.packet = None;
         debug!("management response sent");
+    }
+}
+
+type ManagementError = Box<dyn std::error::Error + Send + Sync>;
+
+fn finish_pump<T>(
+    primary: std::thread::Result<Result<T, ManagementError>>,
+    cleanup_panic: Option<PanicPayload>,
+    native_error: Option<EngineError>,
+) -> Result<T, ManagementError> {
+    match primary {
+        Err(payload) => resume_unwind(payload),
+        Ok(Err(error)) => Err(error),
+        Ok(Ok(value)) => {
+            if let Some(error) = native_error {
+                return Err(error.into());
+            }
+            if let Some(payload) = cleanup_panic {
+                resume_unwind(payload);
+            }
+            Ok(value)
+        }
     }
 }
 

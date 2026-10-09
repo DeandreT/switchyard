@@ -29,6 +29,9 @@ const LINK: &str = "retained-management-receiver";
 const STATE: &[u8] = b"original committed session state";
 type RawResult = Result<CommandOutcome, BrokerRejection>;
 
+#[path = "request_panic_tests.rs"]
+mod panic_tests;
+
 #[derive(Default)]
 struct ResultGate {
     paused: AtomicBool,
