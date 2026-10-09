@@ -62,7 +62,9 @@ pub enum IndexedApplyError {
 ///
 /// Deliberately not `Clone`. Other store handles and unindexed application can
 /// bypass it, so external exclusive write ownership is a required precondition.
-/// An attempted storage-apply error makes every method unusable until reopening.
+/// An attempted storage apply retires the writer until success and cache update.
+/// A returned error or explicitly caught unwind requires reopening.
+/// No panic is caught here.
 /// This is not quorum, fsync-fault certification, a cached acknowledgement or replay.
 #[derive(Debug)]
 pub struct IndexedWriter<S> {
@@ -170,11 +172,12 @@ impl<S: StateStore> IndexedWriter<S> {
             batch.push_put(key(OWNER_TAG), encode_owner());
         }
         batch.push_put(key(CHECKPOINT_TAG), encode_checkpoint(checkpoint));
+        self.usable = false;
         if let Err(error) = self.machine.store().apply(batch) {
-            self.usable = false;
             return Err(IndexedApplyError::Storage(error));
         }
         self.checkpoint = Some(checkpoint);
+        self.usable = true;
         Ok(result)
     }
 

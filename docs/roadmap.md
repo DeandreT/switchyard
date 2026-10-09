@@ -15,7 +15,7 @@ own live assignments, acceptance and full dependencies.
 | [x] | Memory/Fjall parity/fsynced apply; unversioned-store refusal ([PR #4](https://github.com/DeandreT/switchyard/pull/4)); production refusal and format-2 live heads |
 | [x] | Opt-in opaque committed-entry journal #144 in the existing store; full-prefix validation and ambiguous-write refusal, no replay/quorum activation |
 | [x] | Pure [durable proposal V1](../crates/domain/src/durable_proposal.rs) #158; frozen original timestamp/captured authority, without rebinding or execution |
-| [x] | Opt-in [indexed writer](../crates/domain/src/indexed.rs) #159; effects/Clock/checkpoint in one batch, outcome-free latest duplicate, exclusive external writes; no replay activation |
+| [x] | Opt-in [indexed writer](../crates/domain/src/indexed.rs) #159/#170; atomic effects/Clock/checkpoint, outcome-free latest duplicate and caught-apply-unwind retirement; exclusive external writes, no replay activation |
 | [x] | Bound broker API/pre-clock authority #56; wire adoption still pending |
 | [x] | Native Stop/joins, Detach-aware admission/credit cleanup; original natural receiving/send/management/CBS custody, first-poll acquisition and exact attach/registry handoffs |
 | [x] | Owned End preparation and captured delivery identities; receiving #111/Send #127/CBS #128/management #129/connection #130/attachment #131 outer-pump panic custody, not ancestor shielding |
@@ -40,8 +40,9 @@ reported separately, without durable/administration certification. See
 1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7):
    [#75](https://github.com/DeandreT/switchyard/issues/75)
    owns #132/#133 task families after merged leaf/attachment primary notices and
-   [#162](https://github.com/DeandreT/switchyard/issues/162) cleanup-first faults.
-   These precede link-family #132 and complete #63 only with both families.
+   [#162](https://github.com/DeandreT/switchyard/issues/162) cleanup-first children #173-#177.
+   Receiving child #174 also waits for handoff fix #172. These precede #132;
+   complete #63 only with both families.
    [#64](https://github.com/DeandreT/switchyard/issues/64) owns #134 listener -> #135 limits
    -> #136 aggregate deadline, then #65 signals. Child issues own full dependencies.
 2. After #7, complete [#12](https://github.com/DeandreT/switchyard/issues/12):
@@ -67,7 +68,10 @@ flowchart TD
     Main["Merged foundations and leaf custody"] --> Fault["#139 Primary leaf-fault notice complete"]
     Main --> Trees
     Fault --> AttachFault["#161 Attachment primary-fault notice complete"]
-    AttachFault --> DrainFault["#162 Cleanup-first original faults"]
+    AttachFault --> DrainFault["#162 Cleanup-first children #173-#177"]
+    AttachFault --> Handoff["#172 Receiving ready handoff"]
+    Handoff --> ReceivingFault["#174 Receiving cleanup-first faults"]
+    ReceivingFault --> DrainFault
     DrainFault --> Trees["#132 Links -> #133 Sessions / finish #75/#63"]
     Trees --> Admission["#134 Listener -> #135 Limits -> #136 Deadline / finish #64"]
     Admission --> Signals["#65 Signal shutdown / finish #7"]
@@ -91,8 +95,11 @@ flowchart TD
     Main --> Journal["#144 Committed-entry journal complete; opt-in only"]
     Journal --> Proposal["#158 Durable proposal codec complete; pure only"]
     Proposal --> Checkpoint["#159 Atomic indexed apply complete; opt-in only"]
-    Checkpoint --> Integrity["#167 Profile integrity -> #168 Cap refusal provenance"]
-    Integrity --> Log["#160 Committed replay / finish #145/#36"]
+    Checkpoint --> Panic["#170 Apply-unwind retirement complete"]
+    Panic --> Integrity["#167 Selected profile integrity"]
+    Integrity --> RuleIntegrity["#178 Stored rule key/filter integrity"]
+    RuleIntegrity --> Cap["#168 Healthy cap refusal provenance"]
+    Cap --> Log["#160 Committed replay / finish #145/#36"]
     Log --> Snapshots["#37 Snapshots -> #38 Quorum"]
     Snapshots --> Runtime["#41 All-command production runtime"]
     Grants --> Runtime
@@ -111,10 +118,10 @@ chain. Split multi-PR work into child issues before implementation.
 
 | Lane | Entry And Boundary |
 | --- | --- |
-| Receiving/ancestors | #139/#161 primary complete; #162 cleanup faults, then #132 links/#133 sessions. Serialize listener/native/registry edits |
+| Receiving/ancestors | #139/#161 primary complete; #162 has distinct management/Send/CBS/attachment children. Receiving #174 waits for #172 handoff. Then #132 links/#133 sessions; serialize listener/native/registry edits |
 | SQL | #11 pure kernel complete; [#20](https://github.com/DeandreT/switchyard/issues/20) filters waits for #16 typed content, then #21 actions. Serialize compiler/rule paths; no retained integration yet |
 | Auth activation | #8 policy merged; #71 -> #17 waits for #7. Serialize shared authorization/CBS files, not a current parallel pickup |
-| Replication | #144 journal/#158 codec/#159 indexed apply complete; [#167](https://github.com/DeandreT/switchyard/issues/167) profile integrity -> [#168](https://github.com/DeandreT/switchyard/issues/168) cap provenance -> [#160](https://github.com/DeandreT/switchyard/issues/160) replay finish #145/#36. Serialize domain/cluster/store edits; retain startup refusal |
+| Replication | #144/#158/#159/#170 foundations complete; [#167](https://github.com/DeandreT/switchyard/issues/167) selected profiles -> [#178](https://github.com/DeandreT/switchyard/issues/178) stored rules -> [#168](https://github.com/DeandreT/switchyard/issues/168) cap provenance -> [#160](https://github.com/DeandreT/switchyard/issues/160) replay. Serialize domain/cluster/store edits; retain startup refusal |
 | Administration | [#10](https://github.com/DeandreT/switchyard/issues/10): Atom fixtures/profiles; [#18](https://github.com/DeandreT/switchyard/issues/18): native Create/Get/List service/protobuf. No listener activation |
 | Domain ports | #14 topic/subscription profiles, #16 content, #23 duplicate history; serialize shared command/codec/key-tag/store-fence edits |
 | Client/release evidence | [#101](https://github.com/DeandreT/switchyard/issues/101): test matrix after #7; no runtime fixes |

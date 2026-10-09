@@ -28,6 +28,9 @@ use testkit::{DurableProvider, MemoryProvider, StoreProvider};
 type TestResult = Result<(), Box<dyn Error>>;
 const PREFIX: &[u8] = b"\xF1switchyard/replay\0";
 
+#[path = "indexed_apply/panic_apply_tests.rs"]
+mod panic_apply_tests;
+
 #[derive(Clone, Debug, Default)]
 struct Trace {
     gets: Vec<Key>,

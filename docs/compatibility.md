@@ -93,6 +93,12 @@ changes no messages, counters, duplicate history or Clock. Validation precedes
 batch allocation/history mutation; session batches require one session. Duplicate
 detection suppresses sends, not peek-lock redelivery.
 
+The opt-in indexed writer commits effects, Clock and checkpoint together. A
+returned storage-apply error or explicitly caught unwind from that apply requires
+reopening; only successful apply and cache update restore usability. Under external
+exclusive write ownership, reopen resolves an unapplied index or outcome-free latest
+duplicate, not a recovered panicking operation, quorum or power-cut certification.
+
 Peek-lock commits ownership before transfer and deletes only on settlement;
 receive-delete deletes first. Renewal preserves a live token. Abandon/lock expiry
 redelivers until maximum delivery count, then DLQs as `MaxDeliveryCountExceeded`. Deferral hides
