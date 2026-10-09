@@ -16,7 +16,7 @@ use futures_util::FutureExt;
 use tracing::{debug, warn};
 
 use super::{SendIntake, SendPacket};
-use crate::listener::SendOutcome;
+use crate::listener::{ConnectionRetirementRequest, SendOutcome};
 
 pub(in crate::listener) type PanicPayload = Box<dyn Any + Send>;
 
@@ -121,6 +121,8 @@ pub(in crate::listener) struct SendCustody<'a> {
     pub(in crate::listener) close: Option<NativeSend<'a>>,
     pub(in crate::listener) close_packet: Option<NativePacket>,
     secondary: Option<PanicPayload>,
+    native_panic: Option<PanicPayload>,
+    close_panic: Option<PanicPayload>,
     reported: bool,
 }
 
@@ -158,7 +160,15 @@ impl SendCustody<'_> {
         self.close = None;
     }
 
+    #[cfg(test)]
     pub(in crate::listener) async fn finish(&mut self) {
+        self.finish_with_retirement(None).await;
+    }
+
+    pub(in crate::listener) async fn finish_with_retirement(
+        &mut self,
+        notice: Option<&ConnectionRetirementRequest>,
+    ) {
         if let Some(original) = self.original.as_mut() {
             original.retire();
         }
@@ -169,31 +179,45 @@ impl SendCustody<'_> {
             original.retire();
         }
         if let Some(original) = self.original.as_mut() {
-            if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await {
-                self.secondary = Some(payload);
-            }
+            let fault = match AssertUnwindSafe(original.finish()).catch_unwind().await {
+                Ok(_) => false,
+                Err(payload) => {
+                    self.secondary = Some(payload);
+                    true
+                }
+            };
             self.capture_send();
+            request_retirement(notice, fault);
         }
         if let Some(original) = self.native.as_mut() {
-            if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await
-                && self.secondary.is_none()
-            {
-                self.secondary = Some(payload);
-            }
+            let fault = match AssertUnwindSafe(original.finish()).catch_unwind().await {
+                Ok(_) => false,
+                Err(payload) => {
+                    self.native_panic = Some(payload);
+                    true
+                }
+            };
             self.capture_native();
+            request_retirement(notice, fault);
         }
         if let Some(original) = self.close.as_mut() {
-            if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await
-                && self.secondary.is_none()
-            {
-                self.secondary = Some(payload);
-            }
+            let fault = match AssertUnwindSafe(original.finish()).catch_unwind().await {
+                Ok(_) => false,
+                Err(payload) => {
+                    self.close_panic = Some(payload);
+                    true
+                }
+            };
             self.capture_close();
+            request_retirement(notice, fault);
         }
     }
 
     pub(in crate::listener) fn take_secondary(&mut self) -> Option<PanicPayload> {
-        self.secondary.take()
+        self.secondary
+            .take()
+            .or_else(|| self.native_panic.take())
+            .or_else(|| self.close_panic.take())
     }
 
     pub(in crate::listener) fn take_native_error(&mut self) -> Option<EngineError> {
@@ -244,6 +268,12 @@ impl SendCustody<'_> {
                     result = ?packet.result, "original native Send result retained");
             }
         }
+    }
+}
+
+fn request_retirement(notice: Option<&ConnectionRetirementRequest>, fault: bool) {
+    if fault && let Some(notice) = notice {
+        notice.request();
     }
 }
 

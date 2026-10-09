@@ -833,7 +833,9 @@ async fn finish_send_with_retirement(
     {
         notice.request();
     }
-    let cleanup = AssertUnwindSafe(custody.finish()).catch_unwind().await;
+    let cleanup = AssertUnwindSafe(custody.finish_with_retirement(notice))
+        .catch_unwind()
+        .await;
     let diagnostics = if cleanup.is_ok() {
         catch_unwind(AssertUnwindSafe(|| custody.report())).err()
     } else {

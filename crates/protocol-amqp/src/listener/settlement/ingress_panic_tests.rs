@@ -3,6 +3,9 @@
 #[path = "ingress_leaf_fault_tests.rs"]
 mod leaf_fault_tests;
 
+#[path = "ingress_cleanup_notice_tests.rs"]
+mod cleanup_notice_tests;
+
 use std::{
     io,
     panic::AssertUnwindSafe,
