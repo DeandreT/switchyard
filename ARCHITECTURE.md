@@ -112,8 +112,16 @@ owner under a reserved `0xF0` prefix. An externally exclusive writer appends opa
 entries before advancing a committed frontier. Reopen validates the full prefix
 in bounded pages; valid uncommitted tails stay uncommitted, corruption refuses,
 and ambiguous write errors require reopening. This is not command replay, quorum,
-or runtime activation; [#145](https://github.com/DeandreT/switchyard/issues/145)
-adds atomic replay next.
+or runtime activation. [#145](https://github.com/DeandreT/switchyard/issues/145)
+coordinates the remaining indexed-apply and replay increments.
+
+The pure [durable proposal codec](crates/domain/src/durable_proposal.rs) freezes
+command intent, original timestamp and bound/unbound authority in a one-MiB
+envelope with private V1 DTOs. Decode checks structural identity, not today's
+catalog or authenticated authority, and preserves typed intent the domain may
+refuse. Ordinary command/store encodings stay unchanged; atomic indexed apply
+#159 and committed replay #160 remain pending. The byte cap is not a total-heap
+bound.
 
 ## Production Target: Not Implemented
 

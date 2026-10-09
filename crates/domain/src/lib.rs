@@ -11,6 +11,7 @@ pub mod codec;
 pub mod keys;
 
 mod command;
+mod durable_proposal;
 mod entity_binding;
 mod error;
 mod identifier;
@@ -25,6 +26,9 @@ mod topic;
 
 pub use codec::CodecError;
 pub use command::{Command, CommandKind, CommandOutcome, MessageInput};
+pub use durable_proposal::{
+    DurableProposal, DurableProposalAuthority, DurableProposalError, MAX_DURABLE_PROPOSAL_BYTES,
+};
 pub use entity_binding::{BoundCommand, EntityBinding, EntityBindingKind};
 pub use error::BrokerError;
 pub use identifier::{

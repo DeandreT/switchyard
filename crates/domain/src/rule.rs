@@ -42,6 +42,11 @@ impl CorrelationValue {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    /// Restores already-capped proposal intent without applying current policy.
+    pub(crate) fn from_durable_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
 }
 
 /// Broker-neutral projection of the system and application properties that a

@@ -75,4 +75,8 @@ impl BoundCommand {
     pub fn command(&self) -> &Command {
         &self.command
     }
+
+    pub(crate) fn into_parts(self) -> (EntityBinding, Command) {
+        (self.binding, self.command)
+    }
 }
