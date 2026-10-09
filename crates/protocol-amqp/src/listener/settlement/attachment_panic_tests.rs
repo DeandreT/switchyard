@@ -18,6 +18,9 @@ use super::*;
 use crate::listener::attachments::custody::{AttachmentCustody, PUMP_FAULT, PumpFault, PumpPoint};
 use crate::listener::attachments::{prepare_and_adopt, serve_entity_attachment};
 
+#[path = "attachment_leaf_fault_tests.rs"]
+mod leaf_fault_tests;
+
 fn assert_outer<T>(result: std::thread::Result<T>, fault: &PumpFault) {
     let payload = match result {
         Err(payload) => payload,

@@ -426,6 +426,11 @@ async fn run_entity_handoff<B: Broker>(
     })
     .catch_unwind()
     .await;
+    if matches!(&primary, Err(_) | Ok(Err(_)))
+        && let Some(retirement) = retirement
+    {
+        retirement.request();
+    }
     let cleanup = AssertUnwindSafe(custody.finish(broker, namespace, management))
         .catch_unwind()
         .await;

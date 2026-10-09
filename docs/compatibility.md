@@ -186,11 +186,11 @@ End/Stop/driver panic during attachment auth/registry preparation, even with its
 row held; readiness proves neither answering End nor native joins. Receiving auth
 preparation observes captured Detach before Receive.
 
-Caught primary faults in all six spawned data/CBS/management leaves request the
+Caught primary faults in the six data/CBS/management leaves and attachment guard request the
 captured connection's latched retirement and native Stop before original drains.
 Receiving includes already-retained worker failures; its original protocol cause
 survives best-effort error Close. Benign retirement and broker refusals do not
-signal a fault. Attachment primary faults #161 and cleanup-first faults #162,
+signal a fault. Cleanup-first faults #162,
 task families/ancestor shielding #75 and process shutdown #7 remain
 [roadmap work](roadmap.md#next-main-increments). No aborted-ancestor protection,
 graceful Close acknowledgement or finite broker/cleanup latency is implied.
