@@ -165,7 +165,7 @@ impl<'a, T> OriginalCleanup<'a, T> {
     }
 }
 
-pub(super) struct ReceivingCustody<'a> {
+pub(super) struct ReceivingCustody<'a, B> {
     pub(super) workers: SettlementWorkers,
     pub(super) intake: Option<ReceiveIntake<'a>>,
     pub(super) received: Option<ReceivePacket>,
@@ -174,6 +174,7 @@ pub(super) struct ReceivingCustody<'a> {
     pub(super) transfer: Option<PendingTransfer<'a>>,
     pub(super) transferred: Option<TransferPacket>,
     pub(super) transfer_registration: Option<DeliveryRegistration>,
+    pub(super) transfer_context: Option<SettlementContext<B>>,
     pub(super) registrations: Vec<DeliveryRegistration>,
     pub(super) credit_release: Option<OriginalCleanup<'a, Result<(), EngineError>>>,
     pub(super) session: Option<SessionHold>,
@@ -187,14 +188,14 @@ pub(super) struct ReceivingCustody<'a> {
     reported: bool,
 }
 
-impl ReceivingCustody<'static> {
-    pub(super) fn into_borrowed<'a>(self) -> ReceivingCustody<'a> {
+impl<B> ReceivingCustody<'static, B> {
+    pub(super) fn into_borrowed<'a>(self) -> ReceivingCustody<'a, B> {
         self
     }
 }
 
-impl<'a> ReceivingCustody<'a> {
-    pub(super) fn new<B: Broker>(
+impl<'a, B: Broker> ReceivingCustody<'a, B> {
+    pub(super) fn new(
         context: &SettlementContext<B>,
         session: Option<SessionHold>,
         session_registration: Option<SessionRegistration>,
@@ -223,6 +224,7 @@ impl<'a> ReceivingCustody<'a> {
             transfer: None,
             transferred: None,
             transfer_registration: None,
+            transfer_context: None,
             registrations: Vec::new(),
             credit_release: None,
             session,
@@ -247,7 +249,7 @@ impl<'a> ReceivingCustody<'a> {
 
     /// Cancellation drops only this borrower. Each completed phase and every
     /// exact future/result remains in this holder for the next finish attempt.
-    pub(super) async fn finish<B: Broker>(&mut self, context: &SettlementContext<B>) {
+    pub(super) async fn finish(&mut self, context: &SettlementContext<B>) {
         if let Some(original) = self.intake.as_mut() {
             original.retire();
         }
@@ -294,6 +296,10 @@ impl<'a> ReceivingCustody<'a> {
                 .as_ref()
                 .is_some_and(|packet| matches!(packet.result.as_ref(), Some(Ok(_))))
             {
+                let worker_context = self
+                    .transfer_context
+                    .take()
+                    .expect("prepared native handoff context");
                 let packet = self
                     .transferred
                     .take()
@@ -307,7 +313,7 @@ impl<'a> ReceivingCustody<'a> {
                             pending,
                             packet.delivery,
                             registration,
-                            context.clone(),
+                            worker_context,
                             retirement,
                         ),
                     );

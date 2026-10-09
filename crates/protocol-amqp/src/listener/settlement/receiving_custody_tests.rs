@@ -32,6 +32,9 @@ use crate::{
     management::{ConnectionManagement, SessionRegistration},
 };
 
+#[path = "receiving_custody_tests/handoff_preparation_tests.rs"]
+mod handoff_preparation_tests;
+
 type PumpTask = JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
 
 fn accept(actor: &Actor, id: &SessionId) -> AcceptedSession {
@@ -624,6 +627,7 @@ async fn cancelled_outer_cleanup_adopts_the_same_ready_native_packet_and_origina
                 let mut custody = ReceivingCustody::new(&context, None, None);
                 custody.registrations.push(registration.clone());
                 custody.transfer_registration = Some(registration.clone());
+                custody.transfer_context = Some(context.clone());
                 custody.transfer = Some(PendingTransfer::new(
                     delivery,
                     sender.send_pending_with_credit(

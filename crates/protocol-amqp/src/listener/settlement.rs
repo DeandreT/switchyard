@@ -116,7 +116,7 @@ pub(super) struct PreparedReceivingEntry<B> {
     management: std::sync::Arc<ConnectionManagement>,
     link_name: String,
     context: SettlementContext<B>,
-    custody: ReceivingCustody<'static>,
+    custody: ReceivingCustody<'static, B>,
     detached: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
 }
 
@@ -196,7 +196,7 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
     let pumped = std::panic::AssertUnwindSafe(observe_pump(async {
     let ReceivingCustody {
         workers: in_flight, intake, received, transfer, transferred,
-        transfer_registration, registrations: registered_deliveries,
+        transfer_registration, transfer_context, registrations: registered_deliveries,
         credit_release, ..
     } = &mut custody;
     'pump: loop {
@@ -375,6 +375,12 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
             None => sequence_delivery_tag(delivery.sequence),
         };
 
+        // Prepare the only worker context while the Receive packet and receipt
+        // remain owned. A failing broker clone cannot lose a ready transfer or
+        // be retried by late adoption during cleanup.
+        debug_assert!(transfer_context.is_none());
+        *transfer_context = Some(settlement_context.clone());
+
         // `send_pending` resolves only after this transfer consumed remote
         // credit and was written. Existing remote outcomes remain live while
         // it waits, so slow credit cannot serialize unrelated settlements.
@@ -419,6 +425,7 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
                 *transfer = None;
                 break 'pump PumpExit::Engine(error);
         }
+        let worker_context = transfer_context.take().expect("prepared native handoff context");
         let packet = transferred.take().expect("retained successful native packet");
         *transfer = None;
         let Ok(pending) = packet.result.expect("active native start was not retired") else { unreachable!() };
@@ -431,7 +438,7 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
                 pending,
                 delivery,
                 registration,
-                settlement_context.clone(),
+                worker_context,
                 retirement,
             ),
         );

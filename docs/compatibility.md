@@ -188,6 +188,10 @@ expiry; ReceiveAndDelete can be lost. Auth retirement does not roll back a begun
 Transfer. Merged connection/receiving/Send/management/CBS/attachment panic custody terminal-marks a panicked original
 without repoll, retry or fabricated success; accepted work is not recovered.
 
+Receiving prepares one settlement context while the Receive packet and registration
+remain owned, before native Transfer starts. Active and one late adoption move that
+context; cleanup never retries a failed broker clone or recovers that callback.
+
 Captured delivery identities fence worker/residual cleanup and management
 renewal/disposition writes under the row lock; equal-value/cross-entity replacements
 survive. Cancelled residual cleanup retains unfinished handles until removal
