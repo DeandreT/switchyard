@@ -36,8 +36,11 @@ reported separately, without durable/administration certification. See
 
 1. Finish [#7](https://github.com/DeandreT/switchyard/issues/7):
    [#75](https://github.com/DeandreT/switchyard/issues/75)
-   owns #132/#133 task families after completed leaf custody, with early-fault
-   notice #139 before link-family #132, and completes #63.
+   owns #132/#133 task families after completed leaf custody and early notices:
+   [#139](https://github.com/DeandreT/switchyard/issues/139) primary leaf faults ->
+   [#161](https://github.com/DeandreT/switchyard/issues/161) attachment faults ->
+   [#162](https://github.com/DeandreT/switchyard/issues/162) cleanup-first faults.
+   These precede link-family #132 and complete #63 only with both families.
    [#64](https://github.com/DeandreT/switchyard/issues/64) owns #134 listener -> #135 limits
    -> #136 aggregate deadline, then #65 signals. Child issues own full dependencies.
 2. After #7, complete [#12](https://github.com/DeandreT/switchyard/issues/12):
@@ -60,9 +63,11 @@ Integration paths, not every prerequisite. Nodes beyond merged foundations are p
 
 ```mermaid
 flowchart TD
-    Main["Merged foundations/custody; #74/#110/#111/#117/#127/#128/#129/#130/#131 complete"] --> Fault["#139 Early leaf-fault notification"]
+    Main["Merged foundations and leaf custody"] --> Fault["#139 Primary leaf-fault notice"]
     Main --> Trees
-    Fault --> Trees["#132 Links -> #133 Sessions / finish #75/#63"]
+    Fault --> AttachFault["#161 Attachment primary-fault notice"]
+    AttachFault --> DrainFault["#162 Cleanup-first original faults"]
+    DrainFault --> Trees["#132 Links -> #133 Sessions / finish #75/#63"]
     Trees --> Admission["#134 Listener -> #135 Limits -> #136 Deadline / finish #64"]
     Admission --> Signals["#65 Signal shutdown / finish #7"]
     Signals --> Authority["#57 -> #58 -> #59 -> #60 / finish #12"]
@@ -83,7 +88,9 @@ flowchart TD
     Queue --> Topic["#28 Finite topics"]
     Ledger --> Topic
     Main --> Journal["#144 Committed-entry journal complete; opt-in only"]
-    Journal --> Log["#145 Atomic replay / finish #36"]
+    Journal --> Proposal["#158 Durable proposal codec"]
+    Proposal --> Checkpoint["#159 Atomic indexed apply"]
+    Checkpoint --> Log["#160 Committed replay / finish #145/#36"]
     Log --> Snapshots["#37 Snapshots -> #38 Quorum"]
     Snapshots --> Runtime["#41 All-command production runtime"]
     Grants --> Runtime
@@ -102,10 +109,10 @@ chain. Split multi-PR work into child issues before implementation.
 
 | Lane | Entry And Boundary |
 | --- | --- |
-| Receiving/ancestors | #139 early faults -> #132 links -> #133 sessions after merged leaf custody. Serialize listener/native/registry edits |
+| Receiving/ancestors | #139 primary -> #161 attachment -> #162 cleanup faults, then #132 links/#133 sessions. Serialize listener/native/registry edits |
 | SQL | #11 pure kernel complete; [#20](https://github.com/DeandreT/switchyard/issues/20) filters waits for #16 typed content, then #21 actions. Serialize compiler/rule paths; no retained integration yet |
 | Auth activation | #8 policy merged; #71 -> #17 waits for #7. Serialize shared authorization/CBS files, not a current parallel pickup |
-| Replication | #144 journal complete; [#145](https://github.com/DeandreT/switchyard/issues/145) atomic replay completes #36. Serialize cluster/domain/store edits; retain startup refusal |
+| Replication | #144 journal complete; [#158](https://github.com/DeandreT/switchyard/issues/158) codec -> [#159](https://github.com/DeandreT/switchyard/issues/159) indexed apply -> [#160](https://github.com/DeandreT/switchyard/issues/160) replay complete #145/#36. Serialize domain/cluster/store edits; retain startup refusal |
 | Administration | [#10](https://github.com/DeandreT/switchyard/issues/10): Atom fixtures/profiles; [#18](https://github.com/DeandreT/switchyard/issues/18): native Create/Get/List service/protobuf. No listener activation |
 | Domain ports | #14 topic/subscription profiles, #16 content, #23 duplicate history; serialize shared command/codec/key-tag/store-fence edits |
 | Client/release evidence | [#101](https://github.com/DeandreT/switchyard/issues/101): test matrix after #7; no runtime fixes |
