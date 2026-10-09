@@ -3,6 +3,9 @@
 #[path = "leaf_fault_tests.rs"]
 mod leaf_fault_tests;
 
+#[path = "reply_cleanup_notice_tests.rs"]
+mod cleanup_notice_tests;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::custody::{PUMP_FAULT, PumpFault};

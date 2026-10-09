@@ -3,6 +3,9 @@
 #[path = "request_leaf_fault_tests.rs"]
 mod leaf_fault_tests;
 
+#[path = "request_cleanup_notice_tests.rs"]
+mod cleanup_notice_tests;
+
 use super::super::custody::{PUMP_FAULT, PumpFault};
 use super::*;
 

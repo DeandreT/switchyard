@@ -22,6 +22,7 @@ own live assignments, acceptance and full dependencies.
 | [x] | Owned End preparation and captured delivery identities; receiving #111/Send #127/CBS #128/management #129/connection #130/attachment #131 outer-pump panic custody, not ancestor shielding |
 | [x] | Receiving handoff #172 prepares one context before native start and moves it through active/late adoption; no cleanup clone retry |
 | [x] | Primary-fault notice #139 from six spawned leaves and attachment #161 before original drains; captured native Stop and retained receiving worker faults, not cleanup-first faults or task families |
+| [x] | Management cleanup notice #173 caches raw request/reply/Close faults before remaining waits; retained primary/native-error priority, not task-family shielding |
 | [x] | Pure [offline JWT policy](offline-jwt.md) and [SQL kernel](sql-predicates.md); no grant activation or persisted rule integration |
 | [x] | Bounded SDK child/approved loaded-file custody; owned Cargo handoffs/unit CI, Linux frozen-input profile only |
 | [ ] | Remaining client semantics, administration and conserved capacity |
@@ -43,7 +44,7 @@ reported separately, without durable/administration certification. See
    [#75](https://github.com/DeandreT/switchyard/issues/75)
    owns #132/#133 task families after merged leaf/attachment primary notices and
    [#162](https://github.com/DeandreT/switchyard/issues/162) cleanup-first children #173-#177.
-   Receiving handoff #172 is merged; cleanup child #174 remains pending. These precede #132;
+   Receiving handoff #172 and management cleanup #173 are merged; children #174-#177 remain pending. These precede #132;
    complete #63 only with both families.
    [#64](https://github.com/DeandreT/switchyard/issues/64) owns #134 listener -> #135 limits
    -> #136 aggregate deadline, then #65 signals. Child issues own full dependencies.
@@ -70,7 +71,8 @@ flowchart TD
     Main["Merged foundations and leaf custody"] --> Fault["#139 Primary leaf-fault notice complete"]
     Main --> Trees
     Fault --> AttachFault["#161 Attachment primary-fault notice complete"]
-    AttachFault --> DrainFault["#162 Cleanup-first children #173-#177"]
+    AttachFault --> ManagementFault["#173 Management cleanup notice complete"]
+    ManagementFault --> DrainFault["#162 Remaining cleanup children #174-#177"]
     AttachFault --> Handoff["#172 Receiving ready handoff complete"]
     Handoff --> ReceivingFault["#174 Receiving cleanup-first faults"]
     ReceivingFault --> DrainFault
@@ -120,7 +122,7 @@ chain. Split multi-PR work into child issues before implementation.
 
 | Lane | Entry And Boundary |
 | --- | --- |
-| Receiving/ancestors | #139/#161 primary and #172 handoff complete; #162 has distinct management/receiving/Send/CBS/attachment children. Then #132 links/#133 sessions; serialize listener/native/registry edits |
+| Receiving/ancestors | #139/#161 primary, #172 handoff and #173 management cleanup complete; #162 receiving/Send/CBS/attachment children remain. Then #132 links/#133 sessions; serialize listener/native/registry edits |
 | SQL | #11 pure kernel complete; [#20](https://github.com/DeandreT/switchyard/issues/20) filters waits for #16 typed content, then #21 actions. Serialize compiler/rule paths; no retained integration yet |
 | Auth activation | #8 policy merged; #71 -> #17 waits for #7. Serialize shared authorization/CBS files, not a current parallel pickup |
 | Replication | #144/#158/#159/#170/#167 foundations complete; [#178](https://github.com/DeandreT/switchyard/issues/178) stored rules -> [#168](https://github.com/DeandreT/switchyard/issues/168) cap provenance -> [#160](https://github.com/DeandreT/switchyard/issues/160) replay. Serialize domain/cluster/store edits; retain startup refusal |

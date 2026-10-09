@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::{ConnectionManagement, ManagementResponse};
-use crate::{Broker, BrokerRejection};
+use crate::{Broker, BrokerRejection, listener::connection_custody::ConnectionRetirementRequest};
 
 pub(super) type PanicPayload = Box<dyn Any + Send>;
 
@@ -208,6 +208,8 @@ pub(super) struct RequestCustody<'a> {
     pub(super) close: Option<PendingOperation<'a, Result<(), EngineError>>>,
     pub(super) close_packet: Option<OperationPacket<Result<(), EngineError>>>,
     cleanup_panic: Option<PanicPayload>,
+    native_panic: Option<PanicPayload>,
+    close_panic: Option<PanicPayload>,
 }
 
 impl RequestCustody<'_> {
@@ -233,7 +235,16 @@ impl RequestCustody<'_> {
         self.native = None;
     }
 
+    #[cfg(test)]
     pub(super) async fn finish(&mut self, detached: impl Future<Output = ()> + Send) {
+        self.finish_with_retirement(detached, None).await;
+    }
+
+    pub(super) async fn finish_with_retirement(
+        &mut self,
+        detached: impl Future<Output = ()> + Send,
+        retirement: Option<&ConnectionRetirementRequest>,
+    ) {
         if let Some(original) = self.request.as_mut() {
             original.retire();
         }
@@ -245,22 +256,24 @@ impl RequestCustody<'_> {
                 self.cleanup_panic = Some(payload);
             }
             self.capture_request();
+            request_fault(retirement, self.cleanup_panic.is_some());
         }
         if let Some(original) = self.native.as_mut() {
-            if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await
-                && self.cleanup_panic.is_none()
-            {
-                self.cleanup_panic = Some(payload);
+            if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await {
+                self.native_panic = Some(payload);
             }
             self.capture_native();
+            request_fault(
+                retirement,
+                self.native_panic.is_some() || packet_error(self.native_packet.as_ref()),
+            );
         }
         if let Some(original) = self.close.as_mut() {
             if let Err(payload) = AssertUnwindSafe(finish_close(original, detached))
                 .catch_unwind()
                 .await
-                && self.cleanup_panic.is_none()
             {
-                self.cleanup_panic = Some(payload);
+                self.close_panic = Some(payload);
             }
             self.close_packet = Some(
                 original
@@ -268,11 +281,18 @@ impl RequestCustody<'_> {
                     .expect("request Close capture follows completion"),
             );
             self.close = None;
+            request_fault(
+                retirement,
+                self.close_panic.is_some() || packet_error(self.close_packet.as_ref()),
+            );
         }
     }
 
     pub(super) fn take_cleanup_panic(&mut self) -> Option<PanicPayload> {
-        self.cleanup_panic.take()
+        self.cleanup_panic
+            .take()
+            .or_else(|| self.native_panic.take())
+            .or_else(|| self.close_panic.take())
     }
 
     pub(super) fn take_native_error(&mut self) -> Option<EngineError> {
@@ -339,7 +359,16 @@ impl<'a> ReplyCustody<'a> {
         self.original = None;
     }
 
+    #[cfg(test)]
     pub(super) async fn finish(&mut self, detached: impl Future<Output = ()> + Send) {
+        self.finish_with_retirement(detached, None).await;
+    }
+
+    pub(super) async fn finish_with_retirement(
+        &mut self,
+        detached: impl Future<Output = ()> + Send,
+        retirement: Option<&ConnectionRetirementRequest>,
+    ) {
         if let Some(original) = self.original.as_mut() {
             original.retire();
         }
@@ -348,21 +377,30 @@ impl<'a> ReplyCustody<'a> {
         // Both originals remain owned here if this borrowed finish is cancelled.
         tokio::join!(
             async {
-                if let Some(original) = self.original.as_mut()
-                    && let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await
-                    && self.cleanup_panic.is_none()
-                {
-                    self.cleanup_panic = Some(payload);
+                if let Some(original) = self.original.as_mut() {
+                    if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await {
+                        self.cleanup_panic = Some(payload);
+                    }
+                    request_fault(
+                        retirement,
+                        self.cleanup_panic.is_some()
+                            || matches!(original.result.as_ref(), Some(Err(_))),
+                    );
                 }
             },
             async {
-                if let Some(original) = self.close.as_mut()
-                    && let Err(payload) = AssertUnwindSafe(finish_close(original, detached))
+                if let Some(original) = self.close.as_mut() {
+                    if let Err(payload) = AssertUnwindSafe(finish_close(original, detached))
                         .catch_unwind()
                         .await
-                    && self.close_panic.is_none()
-                {
-                    self.close_panic = Some(payload);
+                    {
+                        self.close_panic = Some(payload);
+                    }
+                    request_fault(
+                        retirement,
+                        self.close_panic.is_some()
+                            || matches!(original.result.as_ref(), Some(Err(_))),
+                    );
                 }
             },
         );
@@ -403,6 +441,16 @@ impl<'a> ReplyCustody<'a> {
             report_packet(packet, "reply close");
         }
     }
+}
+
+fn request_fault(retirement: Option<&ConnectionRetirementRequest>, fault: bool) {
+    if fault && let Some(retirement) = retirement {
+        retirement.request();
+    }
+}
+
+fn packet_error<T>(packet: Option<&OperationPacket<Result<T, EngineError>>>) -> bool {
+    packet.is_some_and(|packet| matches!(packet.result.as_ref(), Some(Err(_))))
 }
 
 async fn finish_close(

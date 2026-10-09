@@ -192,6 +192,11 @@ Receiving prepares one settlement context while the Receive packet and registrat
 remain owned, before native Transfer starts. Active and one late adoption move that
 context; cleanup never retries a failed broker clone or recovers that callback.
 
+Management drains cache newly caught raw faults and request captured Stop before
+remaining native waits, including each reply/Close branch. Borrowed cancellation
+retains those results; primary faults and retained native errors still outrank
+cleanup faults. Broker refusals and reporting-only failures do not notify.
+
 Captured delivery identities fence worker/residual cleanup and management
 renewal/disposition writes under the row lock; equal-value/cross-entity replacements
 survive. Cancelled residual cleanup retains unfinished handles until removal
