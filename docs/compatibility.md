@@ -135,7 +135,7 @@ shielding (Send uses per-delivery pump panic custody):
 | Native connection | Capacity-free sticky Stop interrupts IO/channels. Shutdown joins original driver/reader and caches cancellation/repeat results; outer panic keeps acceptance/Close packets. Retirement discards unstarted work, starts no Close; Drop requests Stop only. Joins do not acknowledge Close; peer reply is required. |
 | Native sender/credit | Detach/command closure interrupts capacity waits with all 256 permits held. Queued grant replies own cleanup before observation; dropped accepted replies clean exact reservations, not replacement credit. |
 | Receiving | Retains one Receive/credit, begun Transfer/Delivery/reservation and at most 32 original workers. Retires intake/native/workers before drains; late Pending joins its retired worker. Fresh raw drain faults cache before captured Stop and remaining waits; old packets/benign exits/refusal/reporting do not notify. Ready auth/settlement rules remain; second-mode success follows durable settlement. Unanswered remote/confirmation waits retire; begun broker work drains. Exact registration removal precedes one lazy original session release; Drop only retires/detaches. |
-| Attachment/session registry | Retains original grants/acceptance/readiness through entry preparation/move-only adoption. Claim before first helper await; installation rechecks newest claim and original End/Detach under row admission. Failed newest claims preserve installed rows, never revive older work. Cancelled cleanup keeps exact unregister and lazy captured entity/full-hold release; refusal leaves expiry. No atomic link/hold liveness or successor-family custody. |
+| Attachment/session registry | Retains original grants/acceptance/readiness through entry preparation/move-only adoption. Claim before first helper await; installation rechecks newest claim and original End/Detach under row admission. Failed newest claims preserve installed rows, never revive older work. Fresh poll panics/non-RemoteDetached native drain errors cache before captured Stop and remaining waits; old results/ReleaseSession refusal/reporting do not notify. Cancelled cleanup keeps exact unregister and lazy captured entity/full-hold release; refusal leaves expiry. No atomic link/hold liveness or successor-family custody. |
 | Send/Batch | Retains original command/raw result/native Accept/Reject/Unauthorized Close through natural/per-delivery panic cleanup. Fresh original-drain panics cache before captured Stop and remaining waits; returned late errors/old packets/reporting do not notify. Selected Detach/auth late native results remain benign; reporting panics suppressed, genuinely panicked originals remain faults. No replacement/rollback/new late acknowledgement; cancelled queued acknowledgement need not be unsent. |
 | Management | Discards uninvoked preparation; retains begun commands/post-result registry work, native acknowledgements/replies/confirmations, both reply/Close outcomes and captured route. Newly caught raw drain faults request captured Stop before remaining waits, independently per reply/Close branch. Primary/native errors outrank cleanup faults; refusal/reporting does not notify. No new late reply/confirmation. |
 | CBS | Retains original validation/store, native work/completed packets through captured-route cleanup. Fresh native drain errors/raw panics cache before captured Stop and route cleanup; old packets/status/refusal/reporting do not notify. Bootstrap needs no grant. No installed-grant rollback, route retry/new acknowledgement/second confirmation. |
@@ -158,9 +158,8 @@ management/CBS/attachment primary/native faults precede diagnostics; attachment
 Detach and selected Send late-native exits retain the exceptions above. The six
 data/CBS/management leaves and attachment guard signal primary faults before drains;
 receiving includes retained worker faults and keeps its cause through best-effort
-error Close. Management/receiving/Send/CBS cleanup notices are merged; attachment
-#177 remains under #162. Non-notifying retirement/refusal and reporting-only faults
-retain the owner-specific policies above.
+error Close. Owner-specific cleanup notices #173-#177 are merged. Non-notifying
+retirement/refusal and reporting-only faults retain the owner-specific policies above.
 
 Borrowed cancellation keeps phases/handles/raw results; panicked originals are
 terminal, not repolled/retried/recovered. Receive/session-grant invocation begins
@@ -178,9 +177,9 @@ Session cleanup matches owner/entity/full hold. Original End observes End/Stop/d
 panic even during row-held auth/registry preparation, proving neither End answer
 nor native joins; receiving auth sees captured Detach before Receive.
 
-[#75](https://github.com/DeandreT/switchyard/issues/75) family/ancestor shielding,
-[#7](https://github.com/DeandreT/switchyard/issues/7) process shutdown and remaining
-cleanup notices are [roadmap work](roadmap.md#next-main-increments). No aborted-ancestor
+[#75](https://github.com/DeandreT/switchyard/issues/75) family/ancestor shielding and
+[#7](https://github.com/DeandreT/switchyard/issues/7) process shutdown remain
+[roadmap work](roadmap.md#next-main-increments). No aborted-ancestor
 protection, graceful Close acknowledgement or finite broker/cleanup latency.
 
 Sustained traffic beyond initial credit is uncertified: [#68](https://github.com/DeandreT/switchyard/issues/68)

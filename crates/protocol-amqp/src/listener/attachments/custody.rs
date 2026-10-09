@@ -17,7 +17,7 @@ use tracing::debug;
 use super::{
     AttachmentHandoff, EntityLink, HandoffPacket, HandoffStep, RawAttachResult, RawGrantResult,
 };
-use crate::{Broker, management::ConnectionManagement};
+use crate::{Broker, listener::ConnectionRetirementRequest, management::ConnectionManagement};
 
 pub(super) type PanicPayload = Box<dyn Any + Send>;
 
@@ -49,9 +49,10 @@ impl<'a, T> OriginalCleanup<'a, T> {
         }
     }
 
-    async fn finish(&mut self) {
+    // A cached terminal original is not a newly observed cleanup fault.
+    async fn finish(&mut self) -> bool {
         if self.actual.is_none() {
-            return;
+            return false;
         }
         poll_fn(|context| {
             self.started = true;
@@ -67,17 +68,17 @@ impl<'a, T> OriginalCleanup<'a, T> {
                 Ok(Poll::Ready(result)) => {
                     self.result = Some(result);
                     self.actual = None;
-                    Poll::Ready(())
+                    Poll::Ready(true)
                 }
                 Err(payload) => {
                     self.panic = Some(payload);
                     self.panicked = true;
                     self.actual = None;
-                    Poll::Ready(())
+                    Poll::Ready(true)
                 }
             }
         })
-        .await;
+        .await
     }
 }
 
@@ -93,6 +94,7 @@ pub(in crate::listener) struct AttachmentCustody<'a> {
     unregister: Option<OriginalCleanup<'a, ()>>,
     release: Option<OriginalCleanup<'a, RawGrantResult>>,
     cleanup_panic: Option<PanicPayload>,
+    retirement: Option<ConnectionRetirementRequest>,
     prepared_cleanup: bool,
     adopted: bool,
     reported: bool,
@@ -112,9 +114,24 @@ impl<'a> AttachmentCustody<'a> {
             unregister: None,
             release: None,
             cleanup_panic: None,
+            retirement: None,
             prepared_cleanup: false,
             adopted: false,
             reported: false,
+        }
+    }
+
+    pub(in crate::listener) fn with_retirement(
+        mut self,
+        retirement: Option<&ConnectionRetirementRequest>,
+    ) -> Self {
+        self.retirement = retirement.cloned();
+        self
+    }
+
+    fn notify_cleanup_fault(&self) {
+        if let Some(retirement) = self.retirement.as_ref() {
+            retirement.request();
         }
     }
 
@@ -208,16 +225,35 @@ impl<'a> AttachmentCustody<'a> {
             return;
         }
         if self.packet.is_none() {
+            let unfinished = self.handoff.actual.is_some();
+            let mut panicked = false;
             if let Err(payload) = AssertUnwindSafe(self.handoff.finish()).catch_unwind().await {
-                self.cleanup_panic = Some(payload);
+                if self.cleanup_panic.is_none() {
+                    self.cleanup_panic = Some(payload);
+                }
+                panicked = true;
             }
             self.capture_packet();
+            if panicked
+                || (unfinished
+                    && matches!(self.packet.as_ref().and_then(|packet| packet.step.as_ref()),
+                    Some(HandoffStep::Native(Err(error))) if !matches!(error, EngineError::RemoteDetached)))
+            {
+                self.notify_cleanup_fault();
+            }
         }
         if let Some(original) = self.refusal.as_mut() {
             original.retire();
-            original.finish().await;
+            let completed = original.finish().await;
+            let fault = completed
+                && (original.panicked
+                    || matches!(original.result.as_ref(),
+                Some(Err(error)) if !matches!(error, EngineError::RemoteDetached)));
             if self.cleanup_panic.is_none() {
                 self.cleanup_panic = original.panic.take();
+            }
+            if fault {
+                self.notify_cleanup_fault();
             }
         }
         if !self.prepared_cleanup {
@@ -250,16 +286,23 @@ impl<'a> AttachmentCustody<'a> {
             }) {
                 let registration = registration.clone();
                 let management = Arc::clone(management);
-                self.unregister = Some(OriginalCleanup::new(async move {
+                let original = OriginalCleanup::new(async move {
                     management.unregister_session(&registration).await;
-                }));
+                });
+                #[cfg(test)]
+                let original = self.unregister.take().unwrap_or(original);
+                self.unregister = Some(original);
             }
             self.prepared_cleanup = true;
         }
         if let Some(original) = self.unregister.as_mut() {
-            original.finish().await;
+            let completed = original.finish().await;
+            let fault = completed && original.panicked;
             if self.cleanup_panic.is_none() {
                 self.cleanup_panic = original.panic.take();
+            }
+            if fault {
+                self.notify_cleanup_fault();
             }
             self.registration = None;
             if let Some(ready) = self.ready.as_mut() {
@@ -267,9 +310,13 @@ impl<'a> AttachmentCustody<'a> {
             }
         }
         if let Some(original) = self.release.as_mut() {
-            original.finish().await;
+            let completed = original.finish().await;
+            let fault = completed && original.panicked;
             if self.cleanup_panic.is_none() {
                 self.cleanup_panic = original.panic.take();
+            }
+            if fault {
+                self.notify_cleanup_fault();
             }
         }
         // No late Close is created for a retired handoff. Ready/native
@@ -287,6 +334,30 @@ impl<'a> AttachmentCustody<'a> {
 
     pub(super) fn take_cleanup_panic(&mut self) -> Option<PanicPayload> {
         self.cleanup_panic.take()
+    }
+
+    #[cfg(test)]
+    pub(in crate::listener) fn seed_unregister_for_test(
+        &mut self,
+        actual: impl Future<Output = ()> + Send + 'a,
+    ) {
+        assert!(!self.prepared_cleanup && self.unregister.is_none());
+        self.unregister = Some(OriginalCleanup::new(actual));
+    }
+
+    #[cfg(test)]
+    pub(in crate::listener) async fn start_refusal_for_test(
+        &mut self,
+        endpoint: LinkEndpoint,
+        error: amqp::Error,
+    ) {
+        self.begin_refusal(endpoint, error);
+        self.observe_refusal().await;
+    }
+
+    #[cfg(test)]
+    pub(in crate::listener) fn cleanup_payload_for_test(&self) -> Option<&PanicPayload> {
+        self.cleanup_panic.as_ref()
     }
 
     pub(super) fn take_native_error(&mut self) -> Option<EngineError> {

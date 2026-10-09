@@ -388,7 +388,7 @@ async fn run_entity_handoff<B: Broker>(
         SenderSettleMode::Settled => ReceiveMode::ReceiveAndDelete,
         SenderSettleMode::Unsettled | SenderSettleMode::Mixed => ReceiveMode::PeekLock,
     };
-    let mut custody = AttachmentCustody::new(session);
+    let mut custody = AttachmentCustody::new(session).with_retirement(retirement);
     let primary = AssertUnwindSafe(async {
         let ready = entity_attachment_pump(
             session,

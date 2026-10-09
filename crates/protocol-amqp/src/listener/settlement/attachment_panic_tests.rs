@@ -21,6 +21,9 @@ use crate::listener::attachments::{prepare_and_adopt, serve_entity_attachment};
 #[path = "attachment_leaf_fault_tests.rs"]
 mod leaf_fault_tests;
 
+#[path = "attachment_cleanup_fault_tests.rs"]
+mod cleanup_fault_tests;
+
 fn assert_outer<T>(result: std::thread::Result<T>, fault: &PumpFault) {
     let payload = match result {
         Err(payload) => payload,
