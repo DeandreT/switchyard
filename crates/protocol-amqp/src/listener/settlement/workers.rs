@@ -14,7 +14,7 @@ use tokio::{
     task::{Id, JoinError, JoinHandle},
 };
 
-use crate::management::DeliveryRegistration;
+use crate::{listener::ConnectionRetirementRequest, management::DeliveryRegistration};
 
 use super::{MAX_IN_FLIGHT_DELIVERIES, SettlementCompletion, SettlementFailure};
 
@@ -193,11 +193,40 @@ impl SettlementWorkers {
 
     /// Retains each original result before the next await, including when this
     /// borrowed finish waiter is dropped and a later waiter retries.
+    #[cfg(test)]
     pub(super) async fn finish(&mut self) -> &[SettlementJoin] {
+        self.finish_with_retirement(None).await
+    }
+
+    pub(super) async fn finish_with_retirement(
+        &mut self,
+        connection_retirement: Option<&ConnectionRetirementRequest>,
+    ) -> &[SettlementJoin] {
         self.finish_started = true;
         self.retire();
         while let Some(joined) = self.pending.next().await {
             self.finished.push(joined);
+            let fault = match &self
+                .finished
+                .last()
+                .expect("joined original is cached")
+                .result
+            {
+                Err(_) => true,
+                Ok(completion) => match &completion.result {
+                    Err(SettlementFailure::Protocol(_)) => true,
+                    Err(SettlementFailure::Engine(error)) => !matches!(
+                        error,
+                        EngineError::RemoteClosed
+                            | EngineError::RemoteDetached
+                            | EngineError::Stopped
+                    ),
+                    Ok(()) | Err(SettlementFailure::Unauthorized) => false,
+                },
+            };
+            if fault && let Some(connection_retirement) = connection_retirement {
+                connection_retirement.request();
+            }
         }
         &self.finished
     }

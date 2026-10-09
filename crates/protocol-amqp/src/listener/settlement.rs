@@ -190,7 +190,7 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
         custody,
         mut detached,
     } = entry;
-    let mut custody = custody.into_borrowed();
+    let mut custody = custody.into_borrowed().with_retirement(retirement.as_ref());
 
     // The pump borrows custody: unwinding it cannot drop admitted originals.
     let pumped = std::panic::AssertUnwindSafe(observe_pump(async {

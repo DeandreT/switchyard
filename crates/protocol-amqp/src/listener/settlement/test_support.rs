@@ -3,6 +3,9 @@
 #[path = "receiving_leaf_fault_tests.rs"]
 mod leaf_fault_tests;
 
+#[path = "receiving_custody_tests/cleanup_notice_tests.rs"]
+mod cleanup_notice_tests;
+
 use std::{
     future::{Future, poll_fn},
     io,

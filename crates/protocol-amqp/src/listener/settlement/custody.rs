@@ -15,6 +15,7 @@ use tracing::{debug, warn};
 
 use crate::{
     Broker,
+    listener::ConnectionRetirementRequest,
     management::{DeliveryRegistration, SessionRegistration},
 };
 
@@ -123,9 +124,9 @@ impl<'a, T> OriginalCleanup<'a, T> {
         }
     }
 
-    pub(super) async fn finish(&mut self) {
+    pub(super) async fn finish(&mut self) -> bool {
         if self.completed || self.poisoned {
-            return;
+            return false;
         }
         poll_fn(|context| {
             let polled = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -141,17 +142,17 @@ impl<'a, T> OriginalCleanup<'a, T> {
                     self.result = Some(result);
                     self.completed = true;
                     self.actual = None;
-                    Poll::Ready(())
+                    Poll::Ready(true)
                 }
                 Err(payload) => {
                     self.poisoned = true;
                     self.panic = Some(payload);
                     self.actual = None;
-                    Poll::Ready(())
+                    Poll::Ready(true)
                 }
             }
         })
-        .await;
+        .await
     }
 
     pub(super) fn result(&self) -> Option<&T> {
@@ -185,6 +186,7 @@ pub(super) struct ReceivingCustody<'a, B> {
     workers_finished: bool,
     primary_panic: Option<PanicPayload>,
     secondary_panics: Vec<PanicPayload>,
+    retirement: Option<ConnectionRetirementRequest>,
     reported: bool,
 }
 
@@ -235,6 +237,7 @@ impl<'a, B: Broker> ReceivingCustody<'a, B> {
             workers_finished: false,
             primary_panic: None,
             secondary_panics: Vec::new(),
+            retirement: None,
             reported: false,
         }
     }
@@ -245,6 +248,20 @@ impl<'a, B: Broker> ReceivingCustody<'a, B> {
 
     fn record_secondary(&mut self, payload: PanicPayload) {
         self.secondary_panics.push(payload);
+    }
+
+    pub(super) fn with_retirement(
+        mut self,
+        retirement: Option<&ConnectionRetirementRequest>,
+    ) -> Self {
+        self.retirement = retirement.cloned();
+        self
+    }
+
+    fn notify_cleanup_fault(&self) {
+        if let Some(retirement) = self.retirement.as_ref() {
+            retirement.request();
+        }
     }
 
     /// Cancellation drops only this borrower. Each completed phase and every
@@ -259,37 +276,61 @@ impl<'a, B: Broker> ReceivingCustody<'a, B> {
         self.workers.retire();
 
         if let Some(original) = self.credit_release.as_mut() {
-            original.finish().await;
+            let completed = original.finish().await;
+            let fault = completed
+                && (original.poisoned
+                    || matches!(original.result(),
+                Some(Err(error)) if !matches!(error,
+                    EngineError::RemoteClosed | EngineError::RemoteDetached | EngineError::Stopped)));
             if let Some(payload) = original.take_panic() {
                 self.record_secondary(payload);
             }
+            if fault {
+                self.notify_cleanup_fault();
+            }
         }
         if !self.intake_finished {
+            let mut fault = false;
             if let Some(original) = self.intake.as_mut().filter(|_| self.received.is_none()) {
                 if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await {
                     self.record_secondary(payload);
+                    fault = true;
                 }
                 if self.received.is_none() {
                     self.received = self.intake.as_mut().and_then(ReceiveIntake::take_packet);
                 }
             }
             self.intake_finished = true;
+            if fault {
+                self.notify_cleanup_fault();
+            }
         }
         if !self.transfer_finished {
+            let mut fault = false;
             if let Some(original) = self
                 .transfer
                 .as_mut()
                 .filter(|_| self.transferred.is_none())
             {
-                if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await {
-                    self.record_secondary(payload);
-                }
+                // A pump-cached terminal packet is not a new drain fault.
+                self.transferred = original.take_packet();
                 if self.transferred.is_none() {
+                    if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await {
+                        self.record_secondary(payload);
+                        fault = true;
+                    }
                     self.transferred = self
                         .transfer
                         .as_mut()
                         .and_then(PendingTransfer::take_packet);
+                    fault |= matches!(self.transferred.as_ref().and_then(|packet| packet.result.as_ref()),
+                        Some(Err(error)) if !matches!(error,
+                            EngineError::RemoteClosed | EngineError::RemoteDetached | EngineError::Stopped));
                 }
+            }
+            if fault {
+                self.transfer_finished = true;
+                self.notify_cleanup_fault();
             }
             if self
                 .transferred
@@ -322,7 +363,9 @@ impl<'a, B: Broker> ReceivingCustody<'a, B> {
             self.transfer_finished = true;
         }
         if !self.workers_finished {
-            self.workers.finish().await;
+            self.workers
+                .finish_with_retirement(self.retirement.as_ref())
+                .await;
             // Only joined completions can remove their own captured receipt.
             for joined in self.workers.finished() {
                 if let Ok(completion) = &joined.result
@@ -343,9 +386,13 @@ impl<'a, B: Broker> ReceivingCustody<'a, B> {
         }
         unregister_deliveries(&context.management, &mut self.registrations).await;
         if let Some(original) = self.release.as_mut() {
-            original.finish().await;
+            let completed = original.finish().await;
+            let fault = completed && original.poisoned;
             if let Some(payload) = original.take_panic() {
                 self.record_secondary(payload);
+            }
+            if fault {
+                self.notify_cleanup_fault();
             }
         }
         if let Some(registration) = self.session_registration.as_ref() {
