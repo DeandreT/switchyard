@@ -9,7 +9,7 @@ use crate::{
 };
 
 use super::{
-    StateMachine,
+    PreparationFailure, StateMachine,
     incarnations::Kind,
     send::{SendInput, effective_time_to_live, message_record},
 };
@@ -188,11 +188,16 @@ impl<S: StateStore> StateMachine<S> {
         name: &SubscriptionName,
         config: SubscriptionConfig,
         batch: &mut WriteBatch,
-    ) -> Result<CommandOutcome, BrokerError> {
+    ) -> Result<CommandOutcome, PreparationFailure> {
         let topic = self.load_topic_config(command)?;
         let index_key = keys::topic_subscription(&command.namespace, &command.entity, name);
-        if self.store().get(&index_key)?.is_some() {
-            return Err(BrokerError::SubscriptionAlreadyExists);
+        if self
+            .store()
+            .get(&index_key)
+            .map_err(BrokerError::from)?
+            .is_some()
+        {
+            return Err(BrokerError::SubscriptionAlreadyExists.into());
         }
 
         let subscriptions = self.subscriptions(
@@ -201,26 +206,38 @@ impl<S: StateStore> StateMachine<S> {
             MAX_TOPIC_SUBSCRIPTIONS + 1,
         )?;
         if subscriptions.len() >= MAX_TOPIC_SUBSCRIPTIONS {
-            return Err(BrokerError::SubscriptionLimitExceeded {
-                maximum: MAX_TOPIC_SUBSCRIPTIONS,
-            });
+            // The complete bounded topology proof leaves only exact-full capacity.
+            return Err(PreparationFailure::HealthySubscriptionCapacity);
         }
 
-        let entity = command.entity.subscription(name)?;
+        let entity = command
+            .entity
+            .subscription(name)
+            .map_err(BrokerError::from)?;
         let queue_key = keys::queue_config(&command.namespace, &entity);
-        if self.store().get(&queue_key)?.is_some()
+        if self
+            .store()
+            .get(&queue_key)
+            .map_err(BrokerError::from)?
+            .is_some()
             || self
                 .store()
-                .get(&keys::topic_config(&command.namespace, &entity))?
+                .get(&keys::topic_config(&command.namespace, &entity))
+                .map_err(BrokerError::from)?
                 .is_some()
         {
-            return Err(BrokerError::EntityAlreadyExists);
+            return Err(BrokerError::EntityAlreadyExists.into());
         }
 
         // Validate the DLQ path now so a valid subscription can never discover
         // that its shadow is unaddressable only when the first message fails.
-        let dead_letter_queue = entity.dead_letter_queue()?;
-        let queue = config.validate()?.queue_config(topic).validate()?;
+        let dead_letter_queue = entity.dead_letter_queue().map_err(BrokerError::from)?;
+        let queue = config
+            .validate()
+            .map_err(BrokerError::from)?
+            .queue_config(topic)
+            .validate()
+            .map_err(BrokerError::from)?;
         let shadow = QueueConfig {
             max_delivery_count: u32::MAX,
             default_time_to_live_millis: None,
@@ -231,22 +248,27 @@ impl<S: StateStore> StateMachine<S> {
 
         if self
             .store()
-            .get(&keys::queue_config(&command.namespace, &dead_letter_queue))?
+            .get(&keys::queue_config(&command.namespace, &dead_letter_queue))
+            .map_err(BrokerError::from)?
             .is_some()
             || self
                 .store()
-                .get(&keys::topic_config(&command.namespace, &dead_letter_queue))?
+                .get(&keys::topic_config(&command.namespace, &dead_letter_queue))
+                .map_err(BrokerError::from)?
                 .is_some()
         {
-            return Err(BrokerError::TopicTopologyCorrupt);
+            return Err(BrokerError::TopicTopologyCorrupt.into());
         }
 
         self.stage_new_owner(&command.namespace, &entity, Kind::Subscription, batch)?;
-        batch.push_put(index_key, codec::encode(&entity)?);
-        batch.push_put(queue_key, codec::encode(&queue)?);
+        batch.push_put(
+            index_key,
+            codec::encode(&entity).map_err(BrokerError::from)?,
+        );
+        batch.push_put(queue_key, codec::encode(&queue).map_err(BrokerError::from)?);
         batch.push_put(
             keys::queue_config(&command.namespace, &dead_letter_queue),
-            codec::encode(&shadow)?,
+            codec::encode(&shadow).map_err(BrokerError::from)?,
         );
         self.stage_default_rule(command, &entity, batch)?;
         Ok(CommandOutcome::SubscriptionCreated { entity })

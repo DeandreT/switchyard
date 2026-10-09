@@ -9,7 +9,7 @@ use crate::{
     identifier::SUBSCRIPTION_PATH_SEGMENT, keys,
 };
 
-use super::StateMachine;
+use super::{PreparationFailure, StateMachine};
 
 const MAX_HEAD_BYTES: usize = 32;
 
@@ -233,7 +233,9 @@ impl<S: StateStore> StateMachine<S> {
 
     /// Applies only to the exact namespace and physical target originally bound.
     pub fn apply_bound(&self, envelope: &BoundCommand) -> Result<CommandOutcome, BrokerError> {
-        let (outcome, batch) = self.prepare_bound(envelope.command(), envelope.binding())?;
+        let (outcome, batch) = self
+            .prepare_bound(envelope.command(), envelope.binding())
+            .map_err(PreparationFailure::into_broker)?;
         if !batch.is_empty() {
             self.store().apply(batch)?;
         }
@@ -244,9 +246,9 @@ impl<S: StateStore> StateMachine<S> {
         &self,
         command: &Command,
         binding: &EntityBinding,
-    ) -> Result<(CommandOutcome, WriteBatch), BrokerError> {
+    ) -> Result<(CommandOutcome, WriteBatch), PreparationFailure> {
         if &command.namespace != binding.namespace() || &command.entity != binding.target() {
-            return Err(BrokerError::InvalidEntityBinding);
+            return Err(BrokerError::InvalidEntityBinding.into());
         }
         self.validate_binding(binding)?;
         self.prepare(command)

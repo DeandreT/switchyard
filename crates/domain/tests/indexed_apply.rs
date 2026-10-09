@@ -31,6 +31,9 @@ const PREFIX: &[u8] = b"\xF1switchyard/replay\0";
 #[path = "indexed_apply/panic_apply_tests.rs"]
 mod panic_apply_tests;
 
+#[path = "indexed_apply/healthy_capacity_tests.rs"]
+mod healthy_capacity_tests;
+
 #[derive(Clone, Debug, Default)]
 struct Trace {
     gets: Vec<Key>,
@@ -992,7 +995,10 @@ fn rule_caps_are_conservative<P: StoreProvider>(provider: P) -> TestResult {
     let error = BrokerError::RuleLimitExceeded {
         maximum: MAX_SUBSCRIPTION_RULES,
     };
-    uncheckpointed(&fixture, &mut writer, 3, &create, error.clone());
+    assert_eq!(
+        writer.apply(3, &create)?,
+        IndexedApplyOutcome::Refused(error.clone())
+    );
     let name = RuleName::new("overfull")?;
     fixture.raw(WriteBatch::default().put(
         keys::subscription_rule(&namespace(), &subscription(), &name),
@@ -1002,11 +1008,11 @@ fn rule_caps_are_conservative<P: StoreProvider>(provider: P) -> TestResult {
             created_at: Timestamp::from_millis(20),
         })?,
     ));
-    uncheckpointed(&fixture, &mut writer, 3, &create, error.clone());
+    uncheckpointed(&fixture, &mut writer, 4, &create, error.clone());
     uncheckpointed(
         &fixture,
         &mut writer,
-        3,
+        4,
         &proposal(
             &subscription(),
             30,
@@ -1020,7 +1026,7 @@ fn rule_caps_are_conservative<P: StoreProvider>(provider: P) -> TestResult {
     let before = fixture.snapshot();
     drop(writer);
     fixture.reopen();
-    assert_eq!(fixture.writer().applied_index()?, 2);
+    assert_eq!(fixture.writer().applied_index()?, 3);
     assert_eq!(fixture.snapshot(), before);
     Ok(())
 }
@@ -1116,24 +1122,27 @@ fn subscription_caps_are_conservative<P: StoreProvider>(provider: P) -> TestResu
     let error = BrokerError::SubscriptionLimitExceeded {
         maximum: MAX_TOPIC_SUBSCRIPTIONS,
     };
-    uncheckpointed(&fixture, &mut writer, 3, &create, error.clone());
+    assert_eq!(
+        writer.apply(3, &create)?,
+        IndexedApplyOutcome::Refused(error.clone())
+    );
     let extra = SubscriptionName::new("overfull")?;
     fixture.raw(WriteBatch::default().put(
         keys::topic_subscription(&namespace(), &topic(), &extra),
         codec::encode(&topic().subscription(&extra)?)?,
     ));
-    uncheckpointed(&fixture, &mut writer, 3, &create, error.clone());
+    uncheckpointed(&fixture, &mut writer, 4, &create, error.clone());
     uncheckpointed(
         &fixture,
         &mut writer,
-        3,
+        4,
         &proposal(&topic(), 30, send("publish")),
         error,
     );
     let before = fixture.snapshot();
     drop(writer);
     fixture.reopen();
-    assert_eq!(fixture.writer().applied_index()?, 2);
+    assert_eq!(fixture.writer().applied_index()?, 3);
     assert_eq!(fixture.snapshot(), before);
     Ok(())
 }
@@ -1756,13 +1765,13 @@ paired!(
     rule_config_origin
 );
 paired!(
-    memory_full_and_overfull_rule_caps_never_checkpoint,
-    fjall_full_and_overfull_rule_caps_never_checkpoint,
+    memory_full_rule_creation_refusal_checkpoints_but_overfull_does_not,
+    fjall_full_rule_creation_refusal_checkpoints_but_overfull_does_not,
     rule_caps_are_conservative
 );
 paired!(
-    memory_full_and_overfull_subscription_caps_never_checkpoint,
-    fjall_full_and_overfull_subscription_caps_never_checkpoint,
+    memory_full_subscription_creation_refusal_checkpoints_but_overfull_does_not,
+    fjall_full_subscription_creation_refusal_checkpoints_but_overfull_does_not,
     subscription_caps_are_conservative
 );
 paired!(

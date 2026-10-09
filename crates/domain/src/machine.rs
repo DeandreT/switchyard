@@ -63,6 +63,34 @@ pub struct StateMachine<S> {
     store: S,
 }
 
+// Only the post-reader creation guards mint capacity origins; public callers erase them.
+#[derive(Debug)]
+pub(crate) enum PreparationFailure {
+    Ordinary(BrokerError),
+    HealthyRuleCapacity,
+    HealthySubscriptionCapacity,
+}
+
+impl PreparationFailure {
+    pub(crate) fn into_broker(self) -> BrokerError {
+        match self {
+            Self::Ordinary(error) => error,
+            Self::HealthyRuleCapacity => BrokerError::RuleLimitExceeded {
+                maximum: crate::MAX_SUBSCRIPTION_RULES,
+            },
+            Self::HealthySubscriptionCapacity => BrokerError::SubscriptionLimitExceeded {
+                maximum: crate::MAX_TOPIC_SUBSCRIPTIONS,
+            },
+        }
+    }
+}
+
+impl From<BrokerError> for PreparationFailure {
+    fn from(error: BrokerError) -> Self {
+        Self::Ordinary(error)
+    }
+}
+
 impl<S: StateStore> StateMachine<S> {
     pub fn new(store: S) -> Self {
         Self { store }
@@ -77,7 +105,9 @@ impl<S: StateStore> StateMachine<S> {
     /// On error nothing is written, so a rejection leaves state untouched on
     /// every replica.
     pub fn apply(&self, command: &Command) -> Result<CommandOutcome, BrokerError> {
-        let (outcome, batch) = self.prepare(command)?;
+        let (outcome, batch) = self
+            .prepare(command)
+            .map_err(PreparationFailure::into_broker)?;
         if !batch.is_empty() {
             self.store.apply(batch)?;
         }
@@ -87,13 +117,14 @@ impl<S: StateStore> StateMachine<S> {
     pub(crate) fn prepare(
         &self,
         command: &Command,
-    ) -> Result<(CommandOutcome, WriteBatch), BrokerError> {
+    ) -> Result<(CommandOutcome, WriteBatch), PreparationFailure> {
         let last_applied = self.last_applied_time()?;
         if command.issued_at < last_applied {
             return Err(BrokerError::ClockRegression {
                 last_applied,
                 proposed: command.issued_at,
-            });
+            }
+            .into());
         }
 
         let mut batch = WriteBatch::default();
@@ -285,7 +316,10 @@ impl<S: StateStore> StateMachine<S> {
         if !batch.is_empty() {
             // Advancing the clock in the same batch keeps the applied timestamp
             // and the state it produced consistent under a crash.
-            batch.push_put(keys::clock(), codec::encode(&command.issued_at)?);
+            batch.push_put(
+                keys::clock(),
+                codec::encode(&command.issued_at).map_err(BrokerError::from)?,
+            );
         }
         Ok((outcome, batch))
     }

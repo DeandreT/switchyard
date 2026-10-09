@@ -74,6 +74,10 @@ require reopen. With external exclusive writes, journal reopen reads append
 presence/commit frontier; indexed reopen exposes an unapplied index or outcome-free
 latest duplicate. Neither recovers a panic or provides quorum/power-cut guarantees.
 
+Validated exactly-full rule/subscription creation can checkpoint a capacity refusal
+without changing domain effects or Clock (#168). Selected corrupt/overfull reader
+failures and unmarked cap errors remain fatal; this is not global catalogue health.
+
 Peek-lock commits ownership before transfer and deletes only on settlement;
 receive-delete deletes first. Renewal preserves
 live tokens; abandon/expiry redeliver until `MaxDeliveryCountExceeded` DLQ.

@@ -7,7 +7,7 @@ use crate::{
     NamespaceName, RuleDefinition, RuleFilter, RuleName, codec, keys,
 };
 
-use super::StateMachine;
+use super::{PreparationFailure, StateMachine};
 
 impl<S: StateStore> StateMachine<S> {
     /// Lists durable rules in canonical-name order.
@@ -34,17 +34,16 @@ impl<S: StateStore> StateMachine<S> {
         name: &RuleName,
         filter: &RuleFilter,
         batch: &mut WriteBatch,
-    ) -> Result<CommandOutcome, BrokerError> {
+    ) -> Result<CommandOutcome, PreparationFailure> {
         self.ensure_subscription(&command.namespace, &command.entity)?;
-        let filter = filter.canonicalized()?;
+        let filter = filter.canonicalized().map_err(BrokerError::from)?;
         let key = keys::subscription_rule(&command.namespace, &command.entity, name);
-        if self.store().get(&key)?.is_some() {
-            return Err(BrokerError::RuleAlreadyExists { name: name.clone() });
+        if self.store().get(&key).map_err(BrokerError::from)?.is_some() {
+            return Err(BrokerError::RuleAlreadyExists { name: name.clone() }.into());
         }
         if self.all_rules(&command.namespace, &command.entity)?.len() >= MAX_SUBSCRIPTION_RULES {
-            return Err(BrokerError::RuleLimitExceeded {
-                maximum: MAX_SUBSCRIPTION_RULES,
-            });
+            // The bounded reader already rejected overfull or invalid touched rows.
+            return Err(PreparationFailure::HealthyRuleCapacity);
         }
 
         let definition = RuleDefinition {
@@ -52,7 +51,7 @@ impl<S: StateStore> StateMachine<S> {
             filter,
             created_at: command.issued_at,
         };
-        batch.push_put(key, codec::encode(&definition)?);
+        batch.push_put(key, codec::encode(&definition).map_err(BrokerError::from)?);
         Ok(CommandOutcome::RuleCreated)
     }
 

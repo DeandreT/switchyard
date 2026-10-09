@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use storage::{StateStore, StorageError, WriteBatch};
 use thiserror::Error;
 
+use crate::machine::PreparationFailure;
 use crate::{
     BrokerError, CommandKind, CommandOutcome, DurableProposal, DurableProposalAuthority,
     DurableProposalError, StateMachine,
@@ -159,10 +160,11 @@ impl<S: StateStore> IndexedWriter<S> {
         };
         let (result, mut batch) = match prepared {
             Ok((outcome, batch)) => (IndexedApplyOutcome::Applied(outcome), batch),
-            Err(error) if deterministic_refusal(&command.kind, &error) => {
-                (IndexedApplyOutcome::Refused(error), WriteBatch::default())
-            }
-            Err(error) => return Err(IndexedApplyError::Domain(error)),
+            Err(error) if deterministic_refusal(&command.kind, &error) => (
+                IndexedApplyOutcome::Refused(error.into_broker()),
+                WriteBatch::default(),
+            ),
+            Err(error) => return Err(IndexedApplyError::Domain(error.into_broker())),
         };
         let checkpoint = Checkpoint {
             index,
@@ -190,7 +192,17 @@ impl<S: StateStore> IndexedWriter<S> {
     }
 }
 
-fn deterministic_refusal(kind: &CommandKind, error: &BrokerError) -> bool {
+fn deterministic_refusal(kind: &CommandKind, failure: &PreparationFailure) -> bool {
+    match failure {
+        PreparationFailure::HealthyRuleCapacity => matches!(kind, CommandKind::CreateRule { .. }),
+        PreparationFailure::HealthySubscriptionCapacity => {
+            matches!(kind, CommandKind::CreateSubscription { .. })
+        }
+        PreparationFailure::Ordinary(error) => ordinary_deterministic_refusal(kind, error),
+    }
+}
+
+fn ordinary_deterministic_refusal(kind: &CommandKind, error: &BrokerError) -> bool {
     use BrokerError as E;
     use CommandKind as C;
     match error {
@@ -251,7 +263,7 @@ fn deterministic_refusal(kind: &CommandKind, error: &BrokerError) -> bool {
                 | C::RenewLock { .. }
         ),
         E::MessageNotScheduled { .. } => matches!(kind, C::CancelScheduled { .. }),
-        // Catalog caps conflate valid full catalogs with corrupt oversized ones.
+        // Bare catalog cap errors have no proof of a validated full reader.
         // Unmatched errors, including future variants, never advance the index.
         _ => false,
     }
