@@ -78,6 +78,11 @@ Validated exactly-full rule/subscription creation can checkpoint a capacity refu
 without changing domain effects or Clock (#168). Selected corrupt/overfull reader
 failures and unmarked cap errors remain fatal; this is not global catalogue health.
 
+Opt-in same-store replay (#160) validates committed schemas before effects and
+preserves recorded time/authority. Its frontier is captured at open; tail payloads
+remain opaque under structural validation. Fatal batch errors/unwinds retire the
+owner until reopen. No refresh, outcomes, startup wiring or quorum is provided.
+
 Peek-lock commits ownership before transfer and deletes only on settlement;
 receive-delete deletes first. Renewal preserves
 live tokens; abandon/expiry redeliver until `MaxDeliveryCountExceeded` DLQ.
