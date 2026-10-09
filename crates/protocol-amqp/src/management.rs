@@ -41,7 +41,7 @@ use self::custody::{
     OperationControl, PanicPayload, PendingOperation, PumpPoint, ReplyCustody, RequestBroker,
     RequestCustody,
 };
-use self::response::ManagementResponse;
+pub(crate) use self::response::ManagementResponse;
 
 pub use deferred::{RECEIVE_BY_SEQUENCE_NUMBER_OPERATION, UPDATE_DISPOSITION_OPERATION};
 pub use peek::PEEK_MESSAGE_OPERATION;
@@ -578,7 +578,7 @@ impl ConnectionManagement {
         (sender, receiver)
     }
 
-    async fn unregister_reply_route(
+    pub(crate) async fn unregister_reply_route(
         &self,
         address: &str,
         sender: &mpsc::Sender<ManagementResponse>,

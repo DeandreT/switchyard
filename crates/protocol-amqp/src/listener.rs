@@ -11,8 +11,8 @@ use std::{
 };
 
 use amqp::{
-    AmqpError, EngineError, Error as AmqpProtocolError, ErrorCondition, Fields, LinkEndpoint,
-    Receiver, Role, ServerConnection, ServerSession,
+    AmqpError, EngineError, Error as AmqpProtocolError, ErrorCondition, Fields, Receiver, Role,
+    ServerConnection, ServerSession,
 };
 use auth::{Permission, ResourceScope};
 use domain::{AcceptedSession, CommandKind, CommandOutcome, EntityPath, NamespaceName};
@@ -28,17 +28,14 @@ use crate::{
     Attachment, Broker, BrokerRejection, IncomingMessages, ProtocolError,
     SharedAccessAuthentication,
     authorization::{ConnectionAuthorization, SharedAccessSaslAcceptor},
-    cbs::{serve_cbs_replies_with_retirement, serve_cbs_requests_with_retirement},
-    management::{
-        ConnectionManagement, ManagementAuthorization, SessionRegistration,
-        serve_management_replies_with_retirement, serve_management_requests_with_retirement,
-    },
+    management::{ConnectionManagement, SessionRegistration},
     parse_attachment, read_incoming_messages,
     websocket::accept_amqp_websocket,
 };
 
 mod attachments;
 pub(crate) mod connection_custody;
+pub(crate) mod control_attachment_custody;
 mod ingress;
 mod settlement;
 
@@ -395,7 +392,7 @@ async fn serve_session_with_retirement<B: Broker>(
             () = &mut ended => break,
             attach = session.next_incoming_attach() => attach,
         };
-        let Some(mut attach) = attach else { break };
+        let Some(attach) = attach else { break };
         let source_address = attach
             .source
             .as_ref()
@@ -407,187 +404,25 @@ async fn serve_session_with_retirement<B: Broker>(
             .and_then(|target| target.address.clone())
             .unwrap_or_default();
 
-        if let Some(authorization) = authorization.as_ref()
-            && (target_address == crate::CBS_NODE || source_address == crate::CBS_NODE)
-        {
-            // The Microsoft duplex CBS link omits this sender field. Azure
-            // accepts it as zero, while the AMQP engine enforces the MUST.
-            if attach.role == Role::Sender && attach.initial_delivery_count.is_none() {
-                attach.initial_delivery_count = Some(0);
-            }
-            debug!(?attach, "accepting CBS link");
-            let endpoint = match session
-                .accept_attach(attach, crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64)
-                .await
-            {
-                Ok(endpoint) => endpoint,
-                Err(EngineError::RemoteDetached) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            let authorization = Arc::clone(authorization);
-            match (target_address.as_str(), source_address.as_str(), endpoint) {
-                (crate::CBS_NODE, _, LinkEndpoint::Receiver(receiver)) => {
-                    let retirement = retirement.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) =
-                            serve_cbs_requests_with_retirement(receiver, authorization, retirement)
-                                .await
-                        {
-                            warn!(%error, "CBS request link ended");
-                        }
-                    });
-                }
-                (_, crate::CBS_NODE, LinkEndpoint::Sender(sender))
-                    if !target_address.is_empty() =>
-                {
-                    let (route, responses) = authorization
-                        .register_reply_route(target_address.clone())
-                        .await;
-                    let retirement = retirement.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = serve_cbs_replies_with_retirement(
-                            sender,
-                            target_address,
-                            route,
-                            responses,
-                            authorization,
-                            retirement,
-                        )
-                        .await
-                        {
-                            warn!(%error, "CBS response link ended");
-                        }
-                    });
-                }
-                (_, _, endpoint) => {
-                    detach_with(
-                        endpoint,
-                        error_for(AmqpError::InvalidField, "invalid CBS link".into()),
-                    )
-                    .await;
-                }
-            }
-            continue;
-        }
-
         let address = address_for_role(&attach.role, &source_address, &target_address);
-        if let Some(entity) = management_entity(address) {
-            if attach.role == Role::Sender && attach.initial_delivery_count.is_none() {
-                attach.initial_delivery_count = Some(0);
-            }
-            let plan = match entity {
-                Ok(entity) => {
-                    let link_authorization = match authorization.as_ref() {
-                        Some(authorization) => match tokio::select! {
-                            biased;
-                            () = &mut ended => break,
-                            result = authorization.authorize_entity_any(
-                                entity.as_str(),
-                                &[Permission::Send, Permission::Listen],
-                            ) => result,
-                        } {
-                            Ok(resource) => Some(ManagementAuthorization::new(
-                                Arc::clone(authorization),
-                                resource,
-                            )),
-                            Err(_) => {
-                                let endpoint = match session
-                                    .accept_attach(
-                                        attach,
-                                        crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64,
-                                    )
-                                    .await
-                                {
-                                    Ok(endpoint) => endpoint,
-                                    Err(EngineError::RemoteDetached) => continue,
-                                    Err(error) => return Err(error.into()),
-                                };
-                                detach_with(
-                                    endpoint,
-                                    unauthorized_error(format!(
-                                        "neither Send nor Listen is authorized for {entity}"
-                                    )),
-                                )
-                                .await;
-                                continue;
-                            }
-                        },
-                        None => None,
-                    };
-                    Ok((entity, link_authorization))
-                }
-                Err(error) => Err(error_for(AmqpError::InvalidField, error.to_string())),
+        if (authorization.is_some()
+            && (target_address == crate::CBS_NODE || source_address == crate::CBS_NODE))
+            || management_entity(address).is_some()
+        {
+            let context = control_attachment_custody::ControlContext {
+                session: &session,
+                broker: &broker,
+                namespace: &namespace,
+                authorization: authorization.as_ref(),
+                management: &management,
+                retirement: retirement.as_ref(),
             };
-
-            debug!(%address, ?attach, "accepting management link");
-            let endpoint = match session
-                .accept_attach(attach, crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64)
-                .await
+            if let Some(admitted) =
+                control_attachment_custody::serve_control_attachment(context, attach).await?
             {
-                Ok(endpoint) => endpoint,
-                Err(EngineError::RemoteDetached) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            let (entity, link_authorization) = match plan {
-                Ok(plan) => plan,
-                Err(error) => {
-                    detach_with(endpoint, error).await;
-                    continue;
-                }
-            };
-            match (target_address.as_str(), source_address.as_str(), endpoint) {
-                (target, _, LinkEndpoint::Receiver(receiver)) if target == address => {
-                    let namespace = namespace.clone();
-                    let broker = broker.clone();
-                    let management = Arc::clone(&management);
-                    let retirement = retirement.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = serve_management_requests_with_retirement(
-                            receiver,
-                            namespace,
-                            entity,
-                            broker,
-                            management,
-                            link_authorization,
-                            retirement,
-                        )
-                        .await
-                        {
-                            warn!(%error, "management request link ended");
-                        }
-                    });
-                }
-                (_, source, LinkEndpoint::Sender(sender))
-                    if source == address && !target_address.is_empty() =>
-                {
-                    let (route, responses) = management
-                        .register_reply_route(target_address.clone())
-                        .await;
-                    let management = Arc::clone(&management);
-                    let retirement = retirement.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = serve_management_replies_with_retirement(
-                            sender,
-                            target_address,
-                            route,
-                            responses,
-                            management,
-                            link_authorization,
-                            retirement,
-                        )
-                        .await
-                        {
-                            warn!(%error, "management response link ended");
-                        }
-                    });
-                }
-                (_, _, endpoint) => {
-                    detach_with(
-                        endpoint,
-                        error_for(AmqpError::InvalidField, "invalid management link".into()),
-                    )
-                    .await;
-                }
+                // The original handle is available for #132; until then,
+                // dropping it preserves the existing detached leaf behavior.
+                drop(admitted.task);
             }
             continue;
         }
@@ -1030,17 +865,6 @@ impl SendOutcome {
                 sequences.len() == expected
             }
             _ => false,
-        }
-    }
-}
-
-async fn detach_with(endpoint: LinkEndpoint, error: AmqpProtocolError) {
-    match endpoint {
-        LinkEndpoint::Sender(sender) => {
-            let _ = sender.close_with_error(error).await;
-        }
-        LinkEndpoint::Receiver(receiver) => {
-            let _ = receiver.close_with_error(error).await;
         }
     }
 }
