@@ -108,14 +108,32 @@ impl<S: StateStore> StateMachine<S> {
                 MAX_SUBSCRIPTION_RULES + 1,
             )?
             .into_iter()
-            .map(|(_, value)| codec::decode(&value).map_err(BrokerError::from))
+            .map(|(key, value)| {
+                codec::decode::<RuleDefinition>(&value)
+                    .map(|definition| (key, definition))
+                    .map_err(BrokerError::from)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         if rules.len() > MAX_SUBSCRIPTION_RULES {
             return Err(BrokerError::RuleLimitExceeded {
                 maximum: MAX_SUBSCRIPTION_RULES,
             });
         }
-        Ok(rules)
+        rules
+            .into_iter()
+            .map(|(key, definition)| {
+                if key != keys::subscription_rule(namespace, subscription, &definition.name)
+                    || definition
+                        .filter
+                        .canonicalized()
+                        .map_err(|_| BrokerError::EntityMetadataCorrupt)?
+                        != definition.filter
+                {
+                    return Err(BrokerError::EntityMetadataCorrupt);
+                }
+                Ok(definition)
+            })
+            .collect()
     }
 
     fn ensure_subscription(

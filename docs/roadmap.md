@@ -11,6 +11,8 @@ acceptance and full dependencies; [compatibility](compatibility.md) owns guarant
   fanout/rules/subscriptions and bounded listed topology ([PR #1](https://github.com/DeandreT/switchyard/pull/1)).
 - [x] Ordinary profile updates #13 and selected profile integrity #167, not catalogue/
   whole-store health, administration or capacity. Immutable modes/retained deadlines.
+- [x] Selected stored-rule key/filter integrity #178; bounded read/error ordering
+  unchanged, no row repair or global catalogue proof.
 - [x] Memory/Fjall/fsynced apply, unversioned refusal ([PR #4](https://github.com/DeandreT/switchyard/pull/4)),
   format-2 live heads/production refusal; opt-in journal #144 (full-prefix validation,
   ambiguous-write refusal), pure [proposal #158](../crates/domain/src/durable_proposal.rs)
@@ -68,8 +70,8 @@ flowchart TD
     Delete --> Ledger
     Queues --> Topics["#28 Finite topics"]
     Ledger --> Topics
-    Main --> Durable["Merged #144 journal/#158 proposal/#159 indexed/#170 unwind/#167 profiles"]
-    Durable --> Integrity["#178 Stored rules -> #168 Healthy cap provenance"]
+    Main --> Durable["Merged #144 journal/#158 proposal/#159 indexed/#170 unwind/#167 profiles/#178 rules"]
+    Durable --> Integrity["#168 Healthy cap provenance"]
     Integrity --> Replay["#160 Replay; finish #145/#36 -> #37 Snapshots -> #38 Quorum"]
     Replay --> Runtime["#41 All-command production runtime"]
     Grants --> Runtime
@@ -92,7 +94,7 @@ See [workflow](../CONTRIBUTING.md).
 | Lifecycle | [#162](https://github.com/DeandreT/switchyard/issues/162) remaining receiving/Send/CBS/attachment cleanup, then [#75](https://github.com/DeandreT/switchyard/issues/75) families; serialize listener/native/registry. |
 | Domain ports | [#14](https://github.com/DeandreT/switchyard/issues/14) profiles, [#16](https://github.com/DeandreT/switchyard/issues/16) content, [#23](https://github.com/DeandreT/switchyard/issues/23) duplicates; serialize command/codec/key-tag/store fences. |
 | SQL | [#20](https://github.com/DeandreT/switchyard/issues/20) after #16, then #21; serialize compiler/rules. |
-| Replication | [#178](https://github.com/DeandreT/switchyard/issues/178) -> [#168](https://github.com/DeandreT/switchyard/issues/168) -> [#160](https://github.com/DeandreT/switchyard/issues/160); serialize domain/cluster/store, retain startup refusal. |
+| Replication | [#168](https://github.com/DeandreT/switchyard/issues/168) -> [#160](https://github.com/DeandreT/switchyard/issues/160); serialize domain/cluster/store, retain startup refusal. |
 | Administration | [#10](https://github.com/DeandreT/switchyard/issues/10) Atom fixtures/profiles; [#18](https://github.com/DeandreT/switchyard/issues/18) native Create/Get/List/protobuf, no listener activation. |
 | Deferred lanes | [#71](https://github.com/DeandreT/switchyard/issues/71) auth consumers then #17; [#101](https://github.com/DeandreT/switchyard/issues/101) SDK matrix (tests, not runtime fixes). Both await #7; serialize authorization/CBS. |
 

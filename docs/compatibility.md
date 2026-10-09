@@ -98,8 +98,13 @@ names the exact canonical child, with valid parent-derived backing profiles and 
 delivery count, no TTL/session/dedup), no topic conflicts. The 2,001-entry scan
 enforces 2,000; corruption refuses atomically, including beyond small pages.
 Creation refuses orphan membership/occupied DLQs. Unindexed backing queues,
-orphan rules/retained runtime, new retained-message/rule fences, live incarnations
+orphan rules/retained runtime, retained-message/rule deletion fences, live incarnations
 and capacity are outside proof; formats unchanged. See [routing](../crates/domain/src/machine/topic.rs).
+
+Selected rule reads retain keys, decode the bounded scan before overfull refusal,
+then require exact generated key/name matches and valid canonical filters.
+Key/filter violations are corruption; no row is rewritten. Unread rows and stored
+timestamps are outside proof.
 
 ### Storage And Runtime Limits
 
