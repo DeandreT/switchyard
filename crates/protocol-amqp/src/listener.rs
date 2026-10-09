@@ -5,7 +5,7 @@
 //! holding one, the lock simply expires and the message is redelivered. That is
 //! what makes an abrupt disconnect safe.
 
-use std::sync::Arc;
+use std::{panic::AssertUnwindSafe, sync::Arc};
 
 use amqp::{
     AmqpError, EngineError, Error as AmqpProtocolError, ErrorCondition, Fields, LinkEndpoint,
@@ -13,6 +13,7 @@ use amqp::{
 };
 use auth::{Permission, ResourceScope};
 use domain::{AcceptedSession, CommandKind, CommandOutcome, EntityPath, NamespaceName};
+use futures_util::FutureExt;
 use rustls::ServerConfig;
 use serde_amqp::{Value, primitives::Symbol};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -34,10 +35,12 @@ use crate::{
 };
 
 mod attachments;
+pub(crate) mod connection_custody;
 mod ingress;
 mod settlement;
 
 use attachments::{EntityLink, accept_entity_link};
+use connection_custody::{ConnectionCustody, NativePacket, PumpPoint};
 use ingress::SendIntake;
 use settlement::serve_receiving_client;
 
@@ -199,7 +202,7 @@ where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     B: Broker,
 {
-    let (mut connection, authorization) = match shared_access_authentication {
+    let (connection, authorization) = match shared_access_authentication {
         Some(config) => {
             let sasl_acceptor = SharedAccessSaslAcceptor::new(&config);
             let connection = ServerConnection::accept(
@@ -216,28 +219,28 @@ where
             None,
         ),
     };
-    let result = serve_open_connection(&mut connection, namespace, broker, authorization).await;
-    let shutdown = connection.shutdown().await;
-    match (result, shutdown) {
-        (Err(error), shutdown) => {
-            if let Err(shutdown) = shutdown {
-                warn!(%shutdown, "native tasks failed during error cleanup");
-            }
-            Err(error)
-        }
-        (Ok(()), shutdown) => {
-            shutdown?;
-            Ok(())
-        }
-    }
+    let mut custody = ConnectionCustody::new(connection);
+    let result = AssertUnwindSafe(serve_open_connection(
+        &mut custody,
+        namespace,
+        broker,
+        authorization,
+    ))
+    .catch_unwind()
+    .await;
+    custody.record_primary(result);
+    custody.finish().await;
+    custody.finish_result()
 }
 
 async fn serve_open_connection<B: Broker>(
-    connection: &mut ServerConnection,
+    custody: &mut ConnectionCustody,
     namespace: NamespaceName,
     broker: B,
     authorization: Option<Arc<ConnectionAuthorization>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let retired = custody.retirement_observer();
+    tokio::pin!(retired);
     let management = ConnectionManagement::new();
     let mut awaiting_authorization = authorization.is_some();
     let timeout = authorization
@@ -246,12 +249,17 @@ async fn serve_open_connection<B: Broker>(
     tokio::pin!(timeout);
 
     loop {
+        if custody.is_retired() {
+            return Ok(());
+        }
         let incoming = if awaiting_authorization {
             let authorization = authorization
                 .as_ref()
                 .expect("authorization is present while it is awaited");
             tokio::select! {
                 biased;
+                () = &mut retired => return Ok(()),
+                () = connection_custody::pump_fault(PumpPoint::Intake) => unreachable!("connection fault checkpoint panics"),
                 () = authorization.wait_for_grant() => {
                     awaiting_authorization = false;
                     continue;
@@ -262,32 +270,64 @@ async fn serve_open_connection<B: Broker>(
                         None => std::future::pending().await,
                     }
                 } => {
-                    connection
-                        .close_with_error(unauthorized_error(
+                    if custody.is_retired() { return Ok(()); }
+                    custody.begin_close(Some(unauthorized_error(
                             "no CBS token was supplied before the authorization deadline",
-                        ))
-                        .await?;
+                        )));
+                    custody.observe_native().await;
+                    #[cfg(test)]
+                    connection_custody::packet_checkpoint().await;
+                    match custody.take_packet() {
+                        Some(NativePacket::Closed(result)) => result?,
+                        None => {},
+                        Some(NativePacket::Accepted(_)) => unreachable!("Close returns a Close packet"),
+                    }
                     return Ok(());
                 }
-                incoming = connection.next_incoming_session() => incoming,
+                incoming = custody.connection.next_incoming_session() => incoming,
             }
         } else {
-            connection.next_incoming_session().await
+            tokio::select! {
+                biased;
+                () = &mut retired => return Ok(()),
+                () = connection_custody::pump_fault(PumpPoint::Intake) => unreachable!("connection fault checkpoint panics"),
+                incoming = custody.connection.next_incoming_session() => incoming,
+            }
         };
         let Some(incoming) = incoming else { break };
-
-        let session = match connection.accept_session(incoming).await {
-            Ok(session) => session,
-            // End may overtake application acceptance, and the channel may
-            // already belong to a newer Begin. That stale work is session-
-            // scoped and must not close the replacement connection.
-            Err(EngineError::RemoteDetached) => continue,
-            Err(error) => return Err(error.into()),
-        };
+        if custody.is_retired() {
+            return Ok(());
+        }
+        custody.begin_accept(incoming);
+        custody.observe_native().await;
+        #[cfg(test)]
+        connection_custody::packet_checkpoint().await;
+        if !custody.packet_ready() {
+            assert!(
+                custody.take_packet().is_none(),
+                "retired unstarted acceptance has no fabricated packet"
+            );
+            return Ok(());
+        }
+        if custody.native_error_ready() {
+            match custody.take_packet() {
+                // End may overtake application acceptance, and the channel may
+                // already belong to a newer Begin. That stale work is session-
+                // scoped and must not close the replacement connection.
+                Some(NativePacket::Accepted(Err(EngineError::RemoteDetached))) => continue,
+                Some(NativePacket::Accepted(Err(error))) => return Err(error.into()),
+                _ => unreachable!("acceptance retains its original native error"),
+            }
+        }
         let broker = broker.clone();
         let namespace = namespace.clone();
         let authorization = authorization.clone();
         let management = Arc::clone(&management);
+        let session = match custody.take_packet() {
+            Some(NativePacket::Accepted(Ok(session))) => session,
+            None => return Ok(()),
+            _ => unreachable!("acceptance retains its original session"),
+        };
         tokio::spawn(async move {
             if let Err(error) =
                 serve_session(session, namespace, broker, authorization, management).await
@@ -300,9 +340,20 @@ async fn serve_open_connection<B: Broker>(
     // The loop ends when the connection is closing. A client that closed first
     // still gets the answering close from the engine; reporting its hang-up as
     // this node's error would make every clean disconnect look like a failure.
-    match connection.close().await {
-        Ok(()) | Err(EngineError::RemoteClosed | EngineError::Stopped) => Ok(()),
-        Err(error) => Err(error.into()),
+    if custody.is_retired() {
+        return Ok(());
+    }
+    custody.begin_close(None);
+    custody.observe_native().await;
+    #[cfg(test)]
+    connection_custody::packet_checkpoint().await;
+    match custody.take_packet() {
+        Some(NativePacket::Closed(
+            Ok(()) | Err(EngineError::RemoteClosed | EngineError::Stopped),
+        ))
+        | None => Ok(()),
+        Some(NativePacket::Closed(Err(error))) => Err(error.into()),
+        Some(NativePacket::Accepted(_)) => unreachable!("Close returns a Close packet"),
     }
 }
 

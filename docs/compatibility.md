@@ -156,7 +156,7 @@ Current lifecycle contracts are scoped to these owners, not whole task trees:
 
 | Owner | Implemented Contract |
 | --- | --- |
-| Native connection | `stop` interrupts driver IO/channel work without command capacity; `shutdown` joins the original driver/reader and caches results for cancelled/repeated observers. Drop requests Stop only; joins do not acknowledge Close, whose waiters still require the peer reply. |
+| Native connection | `stop` interrupts driver IO/channel work without command capacity; `shutdown` joins the original driver/reader and caches results for cancelled/repeated observers. Outer-pump panic retains original acceptance/Close packets and shutdown results; retirement discards unstarted work and starts no fresh Close. Drop requests Stop only; joins do not acknowledge Close, whose waiters still require the peer reply. |
 | Native sender/credit | Capacity waits observe Detach/command closure even with all 256 confirmation permits retained. Queued credit-grant replies own cleanup before observation; dropping an accepted reply cleans its exact reservation, not replacement credit. |
 | Receiving pump | Natural teardown/outer-pump panic retain one Receive/credit, begun Transfer/Delivery/reservation and at most 32 original settlement workers. Retire intake/native/workers before drains; late Pending joins the same retired worker. Ready outcomes use existing auth/settlement rules; second-mode success follows durable settlement. Unanswered remote/confirmation waits retire; begun broker submissions drain. Cleanup drains originals, conditionally removes registrations, then observes one lazy original session release. Drop retires/detaches only. |
 | Attachment/session registry | Borrowed observers retain original native acceptance/session grant. Unused holds get one captured-entity/full-hold release attempt; refusal leaves expiry. Claim before the first helper await; installation rechecks latest claim and original End/Detach after row-lock admission. Failed newest claims preserve installed rows without reviving older work. No atomic link/hold liveness. |
@@ -166,14 +166,15 @@ Current lifecycle contracts are scoped to these owners, not whole task trees:
 
 Admitted-work rules: discard never-polled retired phases; drain/cache begun originals
 without resubmission. Cancelled borrowed finish retains phases, handles and raw
-results. Receive/session-grant broker invocation starts inside the retained
+results. Begun connection acceptance may still hand off a Session after retirement;
+#133 owns session-family custody. Receive/session-grant broker invocation starts inside the retained
 original's first poll, including eager adapters; this is not an enqueue receipt.
 Management/CBS returned reply exits close captured channels and identity-unregister;
-original native errors precede cleanup errors. CBS primary faults/native errors
+original native errors precede cleanup errors. Connection and CBS primary faults/native errors
 also precede secondary diagnostic failures.
 Late Receive results cause no Transfer or implicit settlement: PeekLock waits for
 expiry; ReceiveAndDelete can be lost. Auth retirement does not roll back a begun
-Transfer. Merged receiving/CBS panic custody terminal-marks a panicked original
+Transfer. Merged connection/receiving/CBS panic custody terminal-marks a panicked original
 without repoll, retry or fabricated success; accepted work is not recovered.
 
 Captured delivery identities fence worker/residual cleanup and management
@@ -185,7 +186,6 @@ End/Stop/driver panic during attachment auth/registry preparation, even with its
 row held; readiness proves neither answering End nor native joins. Receiving auth
 preparation observes captured Detach before Receive.
 
-Native connection-pump panic custody #130 is source-only, not merged progress.
 Early leaf-fault notice #139, task families/ancestor shielding
 #75 and process shutdown #7 remain [roadmap work](roadmap.md#next-main-increments).
 These contracts do not protect aborted ancestors or bound cleanup latency;

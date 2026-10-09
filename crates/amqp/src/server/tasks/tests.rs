@@ -26,6 +26,228 @@ use tokio::{
 
 const LIMIT: Duration = Duration::from_secs(3);
 
+#[tokio::test]
+async fn owned_stop_reaches_original_tasks_during_mutable_intake_and_full_commands() {
+    let (mut connection, _peer, probe) = opened().await;
+    let original = task_ids(&connection);
+    let stop = connection.stop_owned();
+    probe.block_write.store(true, Ordering::SeqCst);
+    let mut close = Box::pin(connection.close_owned());
+    assert!(
+        poll_fn(|cx| Poll::Ready(close.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    probe.wait_write().await;
+    let mut queued = 0;
+    loop {
+        let (reply, _response) = oneshot::channel();
+        match connection
+            .commands
+            .try_send(Command::Close { error: None, reply })
+        {
+            Ok(()) => queued += 1,
+            Err(TrySendError::Full(_)) => break,
+            Err(TrySendError::Closed(_)) => {
+                panic!("the actual held writer retains the original command queue")
+            }
+        }
+    }
+    assert_eq!(queued, 256);
+    assert_eq!(connection.commands.capacity(), 0);
+    {
+        let mut intake = Box::pin(connection.next_incoming_session());
+        assert!(
+            poll_fn(|cx| Poll::Ready(intake.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        stop.clone().request();
+        assert!(
+            timeout(LIMIT, intake.as_mut()).await.unwrap().is_none(),
+            "the same borrowed intake finishes after Stop"
+        );
+    }
+    assert!(probe.block_write.load(Ordering::SeqCst));
+    timeout(LIMIT, connection.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task_ids(&connection), original);
+    assert!(matches!(
+        connection.tasks.driver_result.as_ref(),
+        Some(Ok(()))
+    ));
+    assert!(matches!(
+        connection.tasks.reader_result.as_ref(),
+        Some(Ok(()))
+    ));
+    assert!(probe.dropped.load(Ordering::SeqCst));
+    assert!(
+        close.await.is_err(),
+        "retain the original held Close result, not an acknowledgement"
+    );
+}
+
+#[tokio::test]
+async fn old_stop_and_close_captures_cannot_retire_same_named_replacement_connection() {
+    let (mut old, _old_peer, _old_probe) = opened().await;
+    let old_stop = old.stop_owned();
+    let old_close = old.close_owned();
+    old_stop.request();
+    timeout(LIMIT, old.shutdown()).await.unwrap().unwrap();
+    let (mut replacement, mut peer, probe) = opened().await;
+    let original = task_ids(&replacement);
+    let unused = replacement.stop_owned();
+    drop(unused.clone());
+    drop(unused);
+    old_stop.clone().request();
+    old_stop.request();
+    assert!(matches!(old_close.await, Err(crate::EngineError::Stopped)));
+    assert!(!replacement.commands.is_closed());
+    write_frame(
+        &mut peer,
+        &Frame::Amqp {
+            channel: 900,
+            performative: Some(Performative::End(crate::End::default())),
+            payload: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            timeout(LIMIT, read_frame(&mut peer))
+                .await
+                .unwrap()
+                .unwrap(),
+            Frame::Amqp {
+                channel: 900,
+                performative: Some(Performative::End(_)),
+                ..
+            }
+        ),
+        "the replacement positively processes native work"
+    );
+    assert_eq!(task_ids(&replacement), original);
+    assert!(!probe.dropped.load(Ordering::SeqCst));
+    timeout(LIMIT, replacement.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn owned_accept_and_close_captures_are_inert_and_keep_original_incarnation() {
+    let (mut connection, mut peer, probe) = opened().await;
+    write_frame(
+        &mut peer,
+        &Frame::Amqp {
+            channel: 1,
+            performative: Some(Performative::Begin(crate::Begin::default())),
+            payload: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let incoming = timeout(LIMIT, connection.next_incoming_session())
+        .await
+        .unwrap()
+        .unwrap();
+    let old = connection.accept_session_owned(incoming);
+    assert_eq!(
+        connection.commands.capacity(),
+        256,
+        "capturing acceptance sends no command"
+    );
+    write_frame(
+        &mut peer,
+        &Frame::Amqp {
+            channel: 1,
+            performative: Some(Performative::End(crate::End::default())),
+            payload: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        timeout(LIMIT, read_frame(&mut peer))
+            .await
+            .unwrap()
+            .unwrap(),
+        Frame::Amqp {
+            channel: 1,
+            performative: Some(Performative::End(_)),
+            ..
+        }
+    ));
+    write_frame(
+        &mut peer,
+        &Frame::Amqp {
+            channel: 1,
+            performative: Some(Performative::Begin(crate::Begin::default())),
+            payload: Vec::new(),
+        },
+    )
+    .await
+    .unwrap();
+    let incoming = timeout(LIMIT, connection.next_incoming_session())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        timeout(LIMIT, old).await.unwrap(),
+        Err(crate::EngineError::RemoteDetached)
+    ));
+    let (accepted, answer) = timeout(LIMIT, async {
+        tokio::join!(
+            connection.accept_session_owned(incoming),
+            read_frame(&mut peer)
+        )
+    })
+    .await
+    .unwrap();
+    let _session = accepted.unwrap();
+    assert!(matches!(
+        answer.unwrap(),
+        Frame::Amqp {
+            channel: 1,
+            performative: Some(Performative::Begin(_)),
+            ..
+        }
+    ));
+    let unused_close = connection.close_owned();
+    let unused_error_close = connection.close_with_error_owned(crate::Error::new(
+        crate::AmqpError::UnauthorizedAccess,
+        "controlled error",
+        None,
+    ));
+    assert_eq!(
+        connection.commands.capacity(),
+        256,
+        "capturing either Close sends no command"
+    );
+    drop(unused_close);
+    drop(unused_error_close);
+    probe.block_write.store(true, Ordering::SeqCst);
+    let mut original = Box::pin(connection.close_owned());
+    assert!(
+        poll_fn(|cx| Poll::Ready(original.as_mut().poll(cx)))
+            .await
+            .is_pending()
+    );
+    probe.wait_write().await;
+    connection.stop_owned().request();
+    assert!(matches!(
+        timeout(LIMIT, original).await.unwrap(),
+        Err(crate::EngineError::Stopped | crate::EngineError::RemoteClosed)
+    ));
+    timeout(LIMIT, connection.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 #[derive(Default)]
 struct Probe {
     block_write: AtomicBool,

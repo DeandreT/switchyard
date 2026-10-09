@@ -432,6 +432,11 @@ impl ServerConnection {
         self.tasks.stop();
     }
 
+    /// Captures Stop for these original tasks without borrowing the connection.
+    pub fn stop_owned(&self) -> ConnectionStop {
+        self.tasks.stop_owned()
+    }
+
     /// Stops and joins the original driver and reader. A cancelled borrowed
     /// waiter may retry; completed results remain retained for repeated calls.
     pub async fn shutdown(&mut self) -> Result<(), ConnectionShutdownError> {
@@ -442,37 +447,69 @@ impl ServerConnection {
         &self,
         incoming: IncomingSession,
     ) -> Result<ServerSession, EngineError> {
-        let (attach_tx, incoming_attaches) = mpsc::channel(32);
-        let (ended_tx, ended) = watch::channel(false);
-        request(&self.commands, |reply| Command::AcceptSession {
-            channel: incoming.channel,
-            incarnation: incoming.incarnation,
-            attach_tx,
-            ended_tx,
-            reply,
-        })
-        .await?;
-        Ok(ServerSession {
-            channel: incoming.channel,
-            incarnation: incoming.incarnation,
-            commands: self.commands.clone(),
-            cleanup: self.cleanup.clone(),
-            incoming_attaches,
-            ended,
-            pending_attach_identities: Mutex::new(HashMap::new()),
-        })
+        self.accept_session_owned(incoming).await
+    }
+
+    /// Captures the original command sender and offered session incarnation.
+    /// Constructing this waiter starts no native work; enqueue occurs on poll.
+    pub fn accept_session_owned(
+        &self,
+        incoming: IncomingSession,
+    ) -> impl Future<Output = Result<ServerSession, EngineError>> + Send + 'static + use<> {
+        let commands = self.commands.clone();
+        let cleanup = self.cleanup.clone();
+        async move {
+            let (attach_tx, incoming_attaches) = mpsc::channel(32);
+            let (ended_tx, ended) = watch::channel(false);
+            request(&commands, |reply| Command::AcceptSession {
+                channel: incoming.channel,
+                incarnation: incoming.incarnation,
+                attach_tx,
+                ended_tx,
+                reply,
+            })
+            .await?;
+            Ok(ServerSession {
+                channel: incoming.channel,
+                incarnation: incoming.incarnation,
+                commands,
+                cleanup,
+                incoming_attaches,
+                ended,
+                pending_attach_identities: Mutex::new(HashMap::new()),
+            })
+        }
     }
 
     pub async fn close(&self) -> Result<(), EngineError> {
-        self.close_inner(None).await
+        self.close_owned().await
     }
 
     pub async fn close_with_error(&self, error: Error) -> Result<(), EngineError> {
-        self.close_inner(Some(error)).await
+        self.close_with_error_owned(error).await
     }
 
-    async fn close_inner(&self, error: Option<Error>) -> Result<(), EngineError> {
-        request(&self.commands, |reply| Command::Close { error, reply }).await
+    /// An inert owned waiter for Close through this original command sender.
+    pub fn close_owned(
+        &self,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send + 'static + use<> {
+        self.close_inner_owned(None)
+    }
+
+    /// An inert owned waiter for error Close through the original sender.
+    pub fn close_with_error_owned(
+        &self,
+        error: Error,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send + 'static + use<> {
+        self.close_inner_owned(Some(error))
+    }
+
+    fn close_inner_owned(
+        &self,
+        error: Option<Error>,
+    ) -> impl Future<Output = Result<(), EngineError>> + Send + 'static + use<> {
+        let commands = self.commands.clone();
+        async move { request(&commands, |reply| Command::Close { error, reply }).await }
     }
 }
 
@@ -995,7 +1032,7 @@ mod engine;
 use engine::*;
 
 mod tasks;
-pub use tasks::ConnectionShutdownError;
+pub use tasks::{ConnectionShutdownError, ConnectionStop};
 use tasks::{ConnectionTasks, wait_for_stop};
 
 #[cfg(feature = "test-client")]

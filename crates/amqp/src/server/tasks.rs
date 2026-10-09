@@ -24,6 +24,20 @@ pub enum ConnectionShutdownError {
     BothFailed { driver: String, reader: String },
 }
 
+/// An owned request to stop one original connection's native tasks.
+/// Dropping this capability does not stop tasks; requesting Stop is not Close
+/// acknowledgement or evidence that either original task has been joined.
+#[derive(Clone)]
+pub struct ConnectionStop {
+    stop: watch::Sender<bool>,
+}
+
+impl ConnectionStop {
+    pub fn request(&self) {
+        self.stop.send_replace(true);
+    }
+}
+
 pub(super) struct ConnectionTasks {
     stop: watch::Sender<bool>,
     driver: Option<JoinHandle<()>>,
@@ -119,6 +133,12 @@ impl ConnectionTasks {
 
     pub(super) fn stop(&self) {
         self.stop.send_replace(true);
+    }
+
+    pub(super) fn stop_owned(&self) -> ConnectionStop {
+        ConnectionStop {
+            stop: self.stop.clone(),
+        }
     }
 
     pub(super) async fn shutdown(&mut self) -> Result<(), ConnectionShutdownError> {

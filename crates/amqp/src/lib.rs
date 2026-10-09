@@ -13,7 +13,7 @@ pub use crate::{
         write_frame, write_protocol_header,
     },
     server::{
-        ConnectionShutdownError, CreditReservation, Delivery, DeliveryConfirmation,
+        ConnectionShutdownError, ConnectionStop, CreditReservation, Delivery, DeliveryConfirmation,
         DeliveryIdentity, DeliveryOutcome, DrainRequest, EngineError, IncomingSession,
         LinkEndpoint, PendingDelivery, Receiver, SaslAuthenticator, Sender, ServerConnection,
         ServerSession,
