@@ -1,5 +1,8 @@
 //! Native phases and captured route cleanup under an actual outer-pump fault.
 
+#[path = "leaf_fault_tests.rs"]
+mod leaf_fault_tests;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::custody::{PUMP_FAULT, PumpFault};

@@ -28,10 +28,10 @@ use crate::{
     Attachment, Broker, BrokerRejection, IncomingMessages, ProtocolError,
     SharedAccessAuthentication,
     authorization::{ConnectionAuthorization, SharedAccessSaslAcceptor},
-    cbs::{serve_cbs_replies, serve_cbs_requests},
+    cbs::{serve_cbs_replies_with_retirement, serve_cbs_requests_with_retirement},
     management::{
         ConnectionManagement, ManagementAuthorization, SessionRegistration,
-        serve_management_replies, serve_management_requests,
+        serve_management_replies_with_retirement, serve_management_requests_with_retirement,
     },
     parse_attachment, read_incoming_messages,
     websocket::accept_amqp_websocket,
@@ -42,8 +42,8 @@ pub(crate) mod connection_custody;
 mod ingress;
 mod settlement;
 
-use attachments::serve_entity_attachment;
-use connection_custody::{ConnectionCustody, NativePacket, PumpPoint};
+use attachments::serve_entity_attachment_with_retirement;
+use connection_custody::{ConnectionCustody, ConnectionRetirementRequest, NativePacket, PumpPoint};
 use ingress::SendIntake;
 use ingress::custody::{NativeSend, PumpPoint as SendPumpPoint, SendCustody};
 
@@ -326,14 +326,22 @@ async fn serve_open_connection<B: Broker>(
         let namespace = namespace.clone();
         let authorization = authorization.clone();
         let management = Arc::clone(&management);
+        let retirement = custody.request_handle();
         let session = match custody.take_packet() {
             Some(NativePacket::Accepted(Ok(session))) => session,
             None => return Ok(()),
             _ => unreachable!("acceptance retains its original session"),
         };
         tokio::spawn(async move {
-            if let Err(error) =
-                serve_session(session, namespace, broker, authorization, management).await
+            if let Err(error) = serve_session_with_retirement(
+                session,
+                namespace,
+                broker,
+                authorization,
+                management,
+                Some(retirement),
+            )
+            .await
             {
                 warn!(%error, ?error, "session ended");
             }
@@ -360,12 +368,24 @@ async fn serve_open_connection<B: Broker>(
     }
 }
 
+#[cfg(test)]
 async fn serve_session<B: Broker>(
+    session: ServerSession,
+    namespace: NamespaceName,
+    broker: B,
+    authorization: Option<Arc<ConnectionAuthorization>>,
+    management: Arc<ConnectionManagement>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_session_with_retirement(session, namespace, broker, authorization, management, None).await
+}
+
+async fn serve_session_with_retirement<B: Broker>(
     mut session: ServerSession,
     namespace: NamespaceName,
     broker: B,
     authorization: Option<Arc<ConnectionAuthorization>>,
     management: Arc<ConnectionManagement>,
+    retirement: Option<ConnectionRetirementRequest>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ended = session.on_end_owned();
     tokio::pin!(ended);
@@ -407,8 +427,12 @@ async fn serve_session<B: Broker>(
             let authorization = Arc::clone(authorization);
             match (target_address.as_str(), source_address.as_str(), endpoint) {
                 (crate::CBS_NODE, _, LinkEndpoint::Receiver(receiver)) => {
+                    let retirement = retirement.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = serve_cbs_requests(receiver, authorization).await {
+                        if let Err(error) =
+                            serve_cbs_requests_with_retirement(receiver, authorization, retirement)
+                                .await
+                        {
                             warn!(%error, "CBS request link ended");
                         }
                     });
@@ -419,13 +443,15 @@ async fn serve_session<B: Broker>(
                     let (route, responses) = authorization
                         .register_reply_route(target_address.clone())
                         .await;
+                    let retirement = retirement.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = serve_cbs_replies(
+                        if let Err(error) = serve_cbs_replies_with_retirement(
                             sender,
                             target_address,
                             route,
                             responses,
                             authorization,
+                            retirement,
                         )
                         .await
                         {
@@ -514,14 +540,16 @@ async fn serve_session<B: Broker>(
                     let namespace = namespace.clone();
                     let broker = broker.clone();
                     let management = Arc::clone(&management);
+                    let retirement = retirement.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = serve_management_requests(
+                        if let Err(error) = serve_management_requests_with_retirement(
                             receiver,
                             namespace,
                             entity,
                             broker,
                             management,
                             link_authorization,
+                            retirement,
                         )
                         .await
                         {
@@ -536,14 +564,16 @@ async fn serve_session<B: Broker>(
                         .register_reply_route(target_address.clone())
                         .await;
                     let management = Arc::clone(&management);
+                    let retirement = retirement.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = serve_management_replies(
+                        if let Err(error) = serve_management_replies_with_retirement(
                             sender,
                             target_address,
                             route,
                             responses,
                             management,
                             link_authorization,
+                            retirement,
                         )
                         .await
                         {
@@ -567,7 +597,7 @@ async fn serve_session<B: Broker>(
         // source. The other terminus may carry a generated link address.
         debug!(%address, ?attach, "accepting entity link");
 
-        serve_entity_attachment(
+        serve_entity_attachment_with_retirement(
             &session,
             &broker,
             &namespace,
@@ -575,6 +605,7 @@ async fn serve_session<B: Broker>(
             attach,
             authorization.as_ref(),
             &management,
+            retirement.as_ref(),
         )
         .await?;
     }
@@ -696,12 +727,25 @@ fn management_entity(address: &str) -> Option<Result<EntityPath, ProtocolError>>
 }
 
 /// Drives a link the client sends on: every transfer becomes one send command.
+#[cfg(test)]
 async fn serve_sending_client<B: Broker>(
+    receiver: Receiver,
+    namespace: NamespaceName,
+    entity: EntityPath,
+    broker: B,
+    authorization: Option<LinkAuthorization>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_sending_client_with_retirement(receiver, namespace, entity, broker, authorization, None)
+        .await
+}
+
+async fn serve_sending_client_with_retirement<B: Broker>(
     mut receiver: Receiver,
     namespace: NamespaceName,
     entity: EntityPath,
     broker: B,
     authorization: Option<LinkAuthorization>,
+    notice: Option<ConnectionRetirementRequest>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let detached = receiver.on_detach_owned();
     let retirement = async {
@@ -721,7 +765,7 @@ async fn serve_sending_client<B: Broker>(
         let received = tokio::select! {
             biased;
             exit = &mut retirement => {
-                if matches!(exit, SendRetirement::Unauthorized) { close_sending_client(&receiver).await?; }
+                if matches!(exit, SendRetirement::Unauthorized) { close_sending_client(&receiver, notice.as_ref()).await?; }
                 return Ok(());
             },
             received = receiver.recv() => received,
@@ -743,7 +787,7 @@ async fn serve_sending_client<B: Broker>(
             };
             if let Err(exit) = prepared {
                 if matches!(exit, SendRetirement::Unauthorized) {
-                    close_sending_client(&receiver).await?;
+                    close_sending_client(&receiver, notice.as_ref()).await?;
                 }
                 return Ok(());
             }
@@ -760,19 +804,35 @@ async fn serve_sending_client<B: Broker>(
         ))
         .catch_unwind()
         .await;
-        if let Some(exit) = finish_send(&mut custody, primary).await? {
+        if let Some(exit) =
+            finish_send_with_retirement(&mut custody, primary, notice.as_ref()).await?
+        {
             if matches!(exit, SendRetirement::Unauthorized) {
-                close_sending_client(&receiver).await?;
+                close_sending_client(&receiver, notice.as_ref()).await?;
             }
             return Ok(());
         }
     }
 }
 
+#[cfg(test)]
 async fn finish_send(
     custody: &mut SendCustody<'_>,
     primary: std::thread::Result<Result<Option<SendRetirement>, EngineError>>,
 ) -> Result<Option<SendRetirement>, EngineError> {
+    finish_send_with_retirement(custody, primary, None).await
+}
+
+async fn finish_send_with_retirement(
+    custody: &mut SendCustody<'_>,
+    primary: std::thread::Result<Result<Option<SendRetirement>, EngineError>>,
+    notice: Option<&ConnectionRetirementRequest>,
+) -> Result<Option<SendRetirement>, EngineError> {
+    if matches!(&primary, Err(_) | Ok(Err(_)))
+        && let Some(notice) = notice
+    {
+        notice.request();
+    }
     let cleanup = AssertUnwindSafe(custody.finish()).catch_unwind().await;
     let diagnostics = if cleanup.is_ok() {
         catch_unwind(AssertUnwindSafe(|| custody.report())).err()
@@ -910,7 +970,10 @@ async fn observe_send_native(
     Ok(None)
 }
 
-async fn close_sending_client(receiver: &Receiver) -> Result<(), EngineError> {
+async fn close_sending_client(
+    receiver: &Receiver,
+    notice: Option<&ConnectionRetirementRequest>,
+) -> Result<(), EngineError> {
     let mut custody = SendCustody::default();
     custody.close = Some(NativeSend::new(receiver.close_with_error(
         unauthorized_error("the link's authorization has expired"),
@@ -929,7 +992,7 @@ async fn close_sending_client(receiver: &Receiver) -> Result<(), EngineError> {
         if let Some(error) = custody.take_native_error() { return Err(error); }
         Ok(None)
     }).catch_unwind().await;
-    finish_send(&mut custody, primary).await?;
+    finish_send_with_retirement(&mut custody, primary, notice).await?;
     Ok(())
 }
 

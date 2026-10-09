@@ -1,5 +1,8 @@
 //! Actual native frontiers; no descendant-join or ancestor-abort claim.
 
+#[path = "leaf_fault_tests.rs"]
+mod leaf_fault_tests;
+
 use std::{
     future::{Future, poll_fn},
     io,

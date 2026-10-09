@@ -27,9 +27,34 @@ pub(crate) struct ConnectionRetirementRequest {
 }
 
 impl ConnectionRetirementRequest {
+    fn capture_with_observer(connection: &ServerConnection) -> (Self, watch::Receiver<bool>) {
+        let (requested, observer) = watch::channel(false);
+        (
+            Self {
+                stop: connection.stop_owned(),
+                requested,
+            },
+            observer,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture(connection: &ServerConnection) -> Self {
+        Self::capture_with_observer(connection).0
+    }
+
     pub(crate) fn request(&self) {
         self.requested.send_replace(true);
         self.stop.request();
+    }
+
+    pub(crate) fn observer(&self) -> impl Future<Output = ()> + Send + 'static + use<> {
+        wait_for_retirement(self.requested.subscribe())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_requested(&self) -> bool {
+        *self.requested.borrow()
     }
 }
 
@@ -126,11 +151,7 @@ pub(super) struct ConnectionCustody {
 
 impl ConnectionCustody {
     pub(super) fn new(connection: ServerConnection) -> Self {
-        let (requested, observer) = watch::channel(false);
-        let request = ConnectionRetirementRequest {
-            stop: connection.stop_owned(),
-            requested,
-        };
+        let (request, observer) = ConnectionRetirementRequest::capture_with_observer(&connection);
         Self {
             connection,
             request,
@@ -150,7 +171,7 @@ impl ConnectionCustody {
     }
 
     pub(super) fn retirement_observer(&self) -> impl Future<Output = ()> + Send + 'static + use<> {
-        wait_for_retirement(self.requested.clone())
+        self.request_handle().observer()
     }
 
     pub(super) fn is_retired(&self) -> bool {

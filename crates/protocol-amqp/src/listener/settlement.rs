@@ -21,7 +21,8 @@ use crate::{
 };
 
 use super::{
-    LinkAuthorization, ReceivingLinkProtocol, error_for, rejection_error, unauthorized_error,
+    ConnectionRetirementRequest, LinkAuthorization, ReceivingLinkProtocol, error_for,
+    rejection_error, unauthorized_error,
 };
 
 #[cfg(test)]
@@ -105,6 +106,7 @@ pub(super) async fn serve_receiving_client<B: Broker>(
 }
 
 pub(super) struct PreparedReceivingEntry<B> {
+    retirement: Option<ConnectionRetirementRequest>,
     namespace: NamespaceName,
     entity: EntityPath,
     broker: B,
@@ -116,6 +118,16 @@ pub(super) struct PreparedReceivingEntry<B> {
     context: SettlementContext<B>,
     custody: ReceivingCustody<'static>,
     detached: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+}
+
+impl<B> PreparedReceivingEntry<B> {
+    pub(super) fn with_retirement(
+        mut self,
+        retirement: Option<ConnectionRetirementRequest>,
+    ) -> Self {
+        self.retirement = retirement;
+        self
+    }
 }
 
 /// Prepare every callback/allocation-prone receiving-entry field before the
@@ -145,6 +157,7 @@ pub(super) fn prepare_receiving_entry<B: Broker>(
     let custody = ReceivingCustody::new(&settlement_context, session.clone(), session_registration);
     let detached = Box::pin(sender.on_detach_owned());
     PreparedReceivingEntry {
+        retirement: None,
         namespace,
         entity,
         broker,
@@ -164,6 +177,7 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
     entry: PreparedReceivingEntry<B>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let PreparedReceivingEntry {
+        retirement,
         namespace,
         entity,
         broker,
@@ -431,6 +445,15 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
         }
     };
 
+    let faulted = exit.is_none()
+        || !custody.workers.failures().is_empty()
+        || matches!(&exit, Some(PumpExit::Protocol(_)))
+        || matches!(&exit, Some(PumpExit::Engine(error))
+            if !matches!(error, EngineError::RemoteClosed | EngineError::RemoteDetached | EngineError::Stopped));
+    if faulted && let Some(retirement) = retirement.as_ref() {
+        retirement.request();
+    }
+
     custody.finish(&settlement_context).await;
     if let Some(payload) = custody.take_panic() {
         std::panic::resume_unwind(payload);
@@ -462,9 +485,9 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
             Ok(())
         }
         PumpExit::Protocol(error) => {
-            sender
+            let _ = sender
                 .close_with_error(error_for(AmqpError::InternalError, error.to_string()))
-                .await?;
+                .await;
             Err(error.into())
         }
         PumpExit::Engine(

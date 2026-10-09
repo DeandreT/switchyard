@@ -1,5 +1,8 @@
 //! Actual native CBS reply lifetimes and identity-checked channel cleanup.
 
+#[path = "leaf_fault_tests.rs"]
+mod leaf_fault_tests;
+
 use std::{
     future::{Future, poll_fn},
     io,

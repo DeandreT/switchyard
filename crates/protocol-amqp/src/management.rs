@@ -27,6 +27,7 @@ use tokio::{
 };
 use tracing::debug;
 
+use crate::listener::connection_custody::ConnectionRetirementRequest;
 use crate::{Broker, BrokerRejection, authorization::ConnectionAuthorization};
 
 mod custody;
@@ -646,13 +647,35 @@ impl ManagementAuthorization {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn serve_management_requests<B: Broker>(
+    receiver: Receiver,
+    namespace: NamespaceName,
+    entity: EntityPath,
+    broker: B,
+    management: Arc<ConnectionManagement>,
+    authorization: Option<ManagementAuthorization>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_management_requests_with_retirement(
+        receiver,
+        namespace,
+        entity,
+        broker,
+        management,
+        authorization,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn serve_management_requests_with_retirement<B: Broker>(
     mut receiver: Receiver,
     namespace: NamespaceName,
     entity: EntityPath,
     broker: B,
     management: Arc<ConnectionManagement>,
     authorization: Option<ManagementAuthorization>,
+    notice: Option<ConnectionRetirementRequest>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let detached = receiver.on_detach_owned();
     let retirement = async {
@@ -672,7 +695,7 @@ pub(crate) async fn serve_management_requests<B: Broker>(
                     custody.close = Some(native_operation(receiver.close_with_error(unauthorized_error(
                         "the management link's authorization has expired",
                     ))));
-                    finish_request(&mut custody, &receiver, Ok(Ok(Some(exit)))).await?;
+                    finish_request_with_retirement(&mut custody, &receiver, Ok(Ok(Some(exit))), notice.as_ref()).await?;
                 }
                 return Ok(());
             },
@@ -699,7 +722,13 @@ pub(crate) async fn serve_management_requests<B: Broker>(
                     custody.close = Some(native_operation(receiver.close_with_error(
                         unauthorized_error("the management link's authorization has expired"),
                     )));
-                    finish_request(&mut custody, &receiver, Ok(Ok(Some(exit)))).await?;
+                    finish_request_with_retirement(
+                        &mut custody,
+                        &receiver,
+                        Ok(Ok(Some(exit))),
+                        notice.as_ref(),
+                    )
+                    .await?;
                 }
                 return Ok(());
             }
@@ -724,7 +753,7 @@ pub(crate) async fn serve_management_requests<B: Broker>(
                 unauthorized_error("the management link's authorization has expired"),
             )));
         }
-        if finish_request(&mut custody, &receiver, result)
+        if finish_request_with_retirement(&mut custody, &receiver, result, notice.as_ref())
             .await?
             .is_some()
         {
@@ -733,11 +762,17 @@ pub(crate) async fn serve_management_requests<B: Broker>(
     }
 }
 
-async fn finish_request(
+async fn finish_request_with_retirement(
     custody: &mut RequestCustody<'_>,
     receiver: &Receiver,
     primary: std::thread::Result<Result<Option<ManagementRetirement>, ManagementError>>,
+    retirement: Option<&ConnectionRetirementRequest>,
 ) -> Result<Option<ManagementRetirement>, ManagementError> {
+    if matches!(&primary, Err(_) | Ok(Err(_)))
+        && let Some(retirement) = retirement
+    {
+        retirement.request();
+    }
     let cleanup = AssertUnwindSafe(custody.finish(receiver.on_detach_owned()))
         .catch_unwind()
         .await;
@@ -1415,6 +1450,7 @@ fn lock_token(uuid: &Uuid) -> Option<LockToken> {
     )))
 }
 
+#[cfg(test)]
 pub(crate) async fn serve_management_replies(
     sender: Sender,
     address: String,
@@ -1422,6 +1458,27 @@ pub(crate) async fn serve_management_replies(
     responses: mpsc::Receiver<ManagementResponse>,
     management: Arc<ConnectionManagement>,
     authorization: Option<ManagementAuthorization>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_management_replies_with_retirement(
+        sender,
+        address,
+        route,
+        responses,
+        management,
+        authorization,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn serve_management_replies_with_retirement(
+    sender: Sender,
+    address: String,
+    route: mpsc::Sender<ManagementResponse>,
+    responses: mpsc::Receiver<ManagementResponse>,
+    management: Arc<ConnectionManagement>,
+    authorization: Option<ManagementAuthorization>,
+    retirement: Option<ConnectionRetirementRequest>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut custody = ReplyCustody::new(responses, address, route, &management);
     let result = AssertUnwindSafe(management_reply_loop(
@@ -1431,6 +1488,11 @@ pub(crate) async fn serve_management_replies(
     ))
     .catch_unwind()
     .await;
+    if matches!(&result, Err(_) | Ok(Err(_)))
+        && let Some(retirement) = retirement.as_ref()
+    {
+        retirement.request();
+    }
     let cleanup = AssertUnwindSafe(custody.finish(sender.on_detach_owned()))
         .catch_unwind()
         .await;

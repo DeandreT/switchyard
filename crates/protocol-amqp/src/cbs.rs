@@ -15,6 +15,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::authorization::ConnectionAuthorization;
+use crate::listener::connection_custody::ConnectionRetirementRequest;
 
 mod custody;
 
@@ -82,9 +83,18 @@ impl CbsResponse {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn serve_cbs_requests(
+    receiver: Receiver,
+    authorization: Arc<ConnectionAuthorization>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_cbs_requests_with_retirement(receiver, authorization, None).await
+}
+
+pub(crate) async fn serve_cbs_requests_with_retirement(
     mut receiver: Receiver,
     authorization: Arc<ConnectionAuthorization>,
+    retirement: Option<ConnectionRetirementRequest>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let detached = receiver.on_detach_owned();
     tokio::pin!(detached);
@@ -115,6 +125,11 @@ pub(crate) async fn serve_cbs_requests(
         ))
         .catch_unwind()
         .await;
+        if matches!(&result, Err(_) | Ok(Err(_)))
+            && let Some(retirement) = retirement.as_ref()
+        {
+            retirement.request();
+        }
         let cleanup = AssertUnwindSafe(custody.finish()).catch_unwind().await;
         let diagnostics = if cleanup.is_ok() {
             catch_unwind(AssertUnwindSafe(|| custody.report())).err()
@@ -274,6 +289,7 @@ fn string_property<'a>(properties: &'a ApplicationProperties, name: &str) -> Opt
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn serve_cbs_replies(
     sender: Sender,
     address: String,
@@ -281,10 +297,26 @@ pub(crate) async fn serve_cbs_replies(
     responses: mpsc::Receiver<CbsResponse>,
     authorization: Arc<ConnectionAuthorization>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_cbs_replies_with_retirement(sender, address, route, responses, authorization, None).await
+}
+
+pub(crate) async fn serve_cbs_replies_with_retirement(
+    sender: Sender,
+    address: String,
+    route: mpsc::Sender<CbsResponse>,
+    responses: mpsc::Receiver<CbsResponse>,
+    authorization: Arc<ConnectionAuthorization>,
+    retirement: Option<ConnectionRetirementRequest>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut custody = ReplyCustody::new(responses, address, route, &authorization);
     let result = AssertUnwindSafe(cbs_reply_loop(&sender, &mut custody))
         .catch_unwind()
         .await;
+    if matches!(&result, Err(_) | Ok(Err(_)))
+        && let Some(retirement) = retirement.as_ref()
+    {
+        retirement.request();
+    }
     let cleanup = AssertUnwindSafe(custody.finish()).catch_unwind().await;
     let diagnostics = if cleanup.is_ok() {
         catch_unwind(AssertUnwindSafe(|| custody.report())).err()

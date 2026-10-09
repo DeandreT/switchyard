@@ -1,5 +1,8 @@
 //! Shared real-wire and actual-owner fixtures for receiving-link custody tests.
 
+#[path = "receiving_leaf_fault_tests.rs"]
+mod leaf_fault_tests;
+
 use std::{
     future::{Future, poll_fn},
     io,

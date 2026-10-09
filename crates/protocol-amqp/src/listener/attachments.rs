@@ -306,10 +306,12 @@ pub(super) async fn accept_entity_link<B: Broker>(
         authorization,
         management,
         false,
+        None,
     )
     .await
 }
 
+#[cfg(test)]
 pub(super) async fn serve_entity_attachment<B: Broker>(
     session: &ServerSession,
     broker: &B,
@@ -318,6 +320,30 @@ pub(super) async fn serve_entity_attachment<B: Broker>(
     attach: Attach,
     authorization: Option<&Arc<ConnectionAuthorization>>,
     management: &Arc<ConnectionManagement>,
+) -> Result<(), EngineError> {
+    serve_entity_attachment_with_retirement(
+        session,
+        broker,
+        namespace,
+        address,
+        attach,
+        authorization,
+        management,
+        None,
+    )
+    .await
+}
+
+#[expect(clippy::too_many_arguments)]
+pub(super) async fn serve_entity_attachment_with_retirement<B: Broker>(
+    session: &ServerSession,
+    broker: &B,
+    namespace: &NamespaceName,
+    address: &str,
+    attach: Attach,
+    authorization: Option<&Arc<ConnectionAuthorization>>,
+    management: &Arc<ConnectionManagement>,
+    retirement: Option<&super::ConnectionRetirementRequest>,
 ) -> Result<(), EngineError> {
     run_entity_handoff(
         session,
@@ -328,6 +354,7 @@ pub(super) async fn serve_entity_attachment<B: Broker>(
         authorization,
         management,
         true,
+        retirement,
     )
     .await
     .map(|_| ())
@@ -343,6 +370,7 @@ async fn run_entity_handoff<B: Broker>(
     authorization: Option<&Arc<ConnectionAuthorization>>,
     management: &Arc<ConnectionManagement>,
     serve: bool,
+    retirement: Option<&super::ConnectionRetirementRequest>,
 ) -> Result<Option<EntityLink>, EngineError> {
     let resolved = resolve_entity(address, attach.role.clone())
         .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()));
@@ -381,13 +409,14 @@ async fn run_entity_handoff<B: Broker>(
         }
         pump_checkpoint(PumpPoint::Ready).await;
         if serve {
-            prepare_and_adopt(
+            prepare_and_adopt_with_retirement(
                 session,
                 broker,
                 namespace,
                 address,
                 management,
                 &mut custody,
+                retirement,
             )
             .await;
             Ok(None)
@@ -622,6 +651,7 @@ async fn entity_attachment_pump<'a, B: Broker>(
     Ok(true)
 }
 
+#[cfg(test)]
 pub(super) async fn prepare_and_adopt<B: Broker>(
     session: &ServerSession,
     broker: &B,
@@ -629,6 +659,21 @@ pub(super) async fn prepare_and_adopt<B: Broker>(
     address: &str,
     management: &Arc<ConnectionManagement>,
     custody: &mut AttachmentCustody<'_>,
+) {
+    prepare_and_adopt_with_retirement(
+        session, broker, namespace, address, management, custody, None,
+    )
+    .await
+}
+
+async fn prepare_and_adopt_with_retirement<B: Broker>(
+    session: &ServerSession,
+    broker: &B,
+    namespace: &NamespaceName,
+    address: &str,
+    management: &Arc<ConnectionManagement>,
+    custody: &mut AttachmentCustody<'_>,
+    retirement: Option<&super::ConnectionRetirementRequest>,
 ) {
     let ready = custody
         .ready
@@ -640,6 +685,7 @@ pub(super) async fn prepare_and_adopt<B: Broker>(
             let entity = ready.entity.clone();
             let broker = broker.clone();
             let authorization = ready.authorization.clone();
+            let retirement = retirement.cloned();
             pump_checkpoint(PumpPoint::EntryPrepared).await;
             info!(%address, entity = %ready.entity, "link attached");
             if session.is_ended() || receiver.on_detach_owned().now_or_never().is_some() {
@@ -653,9 +699,15 @@ pub(super) async fn prepare_and_adopt<B: Broker>(
                 unreachable!("ready receiving endpoint retains its role")
             };
             tokio::spawn(async move {
-                if let Err(error) =
-                    super::serve_sending_client(receiver, namespace, entity, broker, authorization)
-                        .await
+                if let Err(error) = super::serve_sending_client_with_retirement(
+                    receiver,
+                    namespace,
+                    entity,
+                    broker,
+                    authorization,
+                    retirement,
+                )
+                .await
                 {
                     warn!(%error, "sending link ended");
                 }
@@ -674,7 +726,8 @@ pub(super) async fn prepare_and_adopt<B: Broker>(
                     management: Arc::clone(management),
                     session_registration: ready.registration.clone(),
                 },
-            );
+            )
+            .with_retirement(retirement.cloned());
             pump_checkpoint(PumpPoint::EntryPrepared).await;
             info!(%address, entity = %ready.entity,
                 session = ready.accepted.as_ref().map(|accepted| accepted.session_id.as_str()), "link attached");

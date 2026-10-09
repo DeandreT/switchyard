@@ -1,5 +1,8 @@
 //! Outer-pump faults keep the actual broker command and its post-result work.
 
+#[path = "request_leaf_fault_tests.rs"]
+mod leaf_fault_tests;
+
 use super::super::custody::{PUMP_FAULT, PumpFault};
 use super::*;
 

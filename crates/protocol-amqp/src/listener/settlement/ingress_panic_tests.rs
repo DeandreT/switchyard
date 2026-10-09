@@ -1,5 +1,8 @@
 //! Actual pump fronts are distinct from typed custody and poison controls.
 
+#[path = "ingress_leaf_fault_tests.rs"]
+mod leaf_fault_tests;
+
 use std::{
     io,
     panic::AssertUnwindSafe,
