@@ -25,8 +25,9 @@ acceptance and full dependencies; [compatibility](compatibility.md) owns guarant
   receiving/Send/management/CBS custody, exact attachment/registry/End and delivery
   identities; outer-pump panic #111/#127-#131, primary notice #139/#161, move-only
   pre-native receiving context #172, owner-specific cleanup notices #173-#177 and
-  management cleanup freshness #196 and control-link admission #189.
-  No ancestor/family shielding; acquisition #73/data-link #84/CBS #74 complete.
+  management cleanup freshness #196, control-link admission #189 and session-owned
+  original link families #132. Connection-owned sessions remain #133; no ancestor
+  shielding. Acquisition #73/data-link #84/CBS #74 complete.
 - [x] Bounded SDK child/approved loaded-file custody, owned Cargo handoffs/unit CI;
   Linux frozen-input profile only. Four experimental Memory TCP/WSS gates use
   declared-current 7.21.0/1.62.0 and previous 7.20.2/1.60.0, not latest; workspace
@@ -37,7 +38,7 @@ acceptance and full dependencies; [compatibility](compatibility.md) owns guarant
 
 ## Next Main Increments
 
-Finish link/session families (#132/#133), listener/deadline/signals (#7), then wire
+Finish connection-owned session families (#133), listener/deadline/signals (#7), then wire
 authority (#12) before retirement/recreation (#15).
 Joins do not acknowledge Close; labels/source/reference tests do not prove
 completion or finite latency.
@@ -55,7 +56,8 @@ marker; linked issues carry exact scopes.
 flowchart TD
     Main["Merged main foundations"] --> Lifecycle["Merged #139/#161 primary, #172 handoff, #173-#177/#196 cleanup"]
     Lifecycle --> Control["Merged #189 Control attachment admission custody"]
-    Control --> Families["#132 Links -> #133 Sessions; finish #75/#63"]
+    Control --> Links["Merged #132 Session-owned original link family"]
+    Links --> Families["#133 Connection-owned sessions; finish #75/#63"]
     Families --> Shutdown["#134 Listener -> #135 Limits -> #136 Deadline -> #65 Signals; finish #64/#7"]
     Shutdown --> Authority["#57 Sender -> #58 Receiver -> #59 Sessions -> #60 Management; finish #12"]
     Authority --> Delete["#15 Retirement/recreation"]
@@ -93,7 +95,7 @@ See [workflow](../CONTRIBUTING.md).
 
 | Lane | Entry and overlap boundary |
 | --- | --- |
-| Lifecycle | [#132](https://github.com/DeandreT/switchyard/issues/132) links -> [#133](https://github.com/DeandreT/switchyard/issues/133) sessions, completing [#75](https://github.com/DeandreT/switchyard/issues/75); serialize listener/native/registry. |
+| Lifecycle | [#133](https://github.com/DeandreT/switchyard/issues/133) connection-owned sessions after merged #132 links, completing [#75](https://github.com/DeandreT/switchyard/issues/75); serialize listener/native/registry. |
 | Domain ports | [#14](https://github.com/DeandreT/switchyard/issues/14) profiles, [#16](https://github.com/DeandreT/switchyard/issues/16) content, [#23](https://github.com/DeandreT/switchyard/issues/23) duplicates; serialize command/codec/key-tag/store fences. |
 | SQL | [#20](https://github.com/DeandreT/switchyard/issues/20) after #16, then #21; serialize compiler/rules. |
 | Replication | [#168](https://github.com/DeandreT/switchyard/issues/168) -> [#160](https://github.com/DeandreT/switchyard/issues/160); serialize domain/cluster/store, retain startup refusal. |

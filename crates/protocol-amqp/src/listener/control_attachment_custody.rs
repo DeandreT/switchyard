@@ -13,9 +13,13 @@ use amqp::{Attach, EngineError, LinkEndpoint, Role, Sender, ServerSession};
 use auth::Permission;
 use domain::NamespaceName;
 use futures_util::FutureExt;
-use tokio::{sync::mpsc, task::JoinHandle};
-use tracing::{debug, warn};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
+use tracing::debug;
 
+use super::session_custody::{LeafKind, LeafResult, PreparedLeafTask};
 use super::{ConnectionRetirementRequest, error_for, management_entity, unauthorized_error};
 use crate::{
     Broker,
@@ -113,6 +117,8 @@ pub(crate) enum RoutePacket {
 
 pub(crate) struct AdmittedTask {
     pub(crate) task: JoinHandle<()>,
+    pub(crate) kind: LeafKind,
+    pub(crate) result: oneshot::Receiver<LeafResult>,
 }
 
 pub(crate) struct ControlContext<'a, B> {
@@ -640,15 +646,13 @@ pub(crate) async fn serve_control_attachment<B: Broker>(
                 Some(LinkEndpoint::Receiver(_)) if target == crate::CBS_NODE => {
                     let authorization = Arc::clone(authorization);
                     let retirement = context.retirement.cloned();
+                    let prepared_task = PreparedLeafTask::new(LeafKind::CbsRequest);
                     pump_checkpoint(PumpPoint::Prepared).await;
                     if custody.is_retired() { return Ok(()); }
                     if let Some(LinkEndpoint::Receiver(receiver)) = custody.take_endpoint() {
-                        let task = tokio::spawn(async move {
-                            if let Err(error) = serve_cbs_requests_with_retirement(receiver, authorization, retirement).await {
-                                warn!(%error, "CBS request link ended");
-                            }
-                        });
-                        custody.admitted = Some(AdmittedTask { task });
+                        custody.admitted = Some(prepared_task.spawn(async move {
+                            serve_cbs_requests_with_retirement(receiver, authorization, retirement).await
+                        }));
                     }
                 }
                 Some(LinkEndpoint::Sender(_)) if source == crate::CBS_NODE && !target.is_empty() => {
@@ -657,15 +661,13 @@ pub(crate) async fn serve_control_attachment<B: Broker>(
                     }
                     pump_checkpoint(PumpPoint::RoutePacket).await;
                     let retirement = context.retirement.cloned();
+                    let prepared_task = PreparedLeafTask::new(LeafKind::CbsReply);
                     pump_checkpoint(PumpPoint::Prepared).await;
                     if custody.is_retired() { return Ok(()); }
                     if let Some((sender, RoutePacket::Cbs { registry, address, route, responses })) = custody.take_reply(true) {
-                        let task = tokio::spawn(async move {
-                            if let Err(error) = serve_cbs_replies_with_retirement(sender, address, route, responses, registry, retirement).await {
-                                warn!(%error, "CBS response link ended");
-                            }
-                        });
-                        custody.admitted = Some(AdmittedTask { task });
+                        custody.admitted = Some(prepared_task.spawn(async move {
+                            serve_cbs_replies_with_retirement(sender, address, route, responses, registry, retirement).await
+                        }));
                     }
                 }
                 _ => refuse(&mut custody, error_for(amqp::AmqpError::InvalidField, "invalid CBS link".into())).await,
@@ -716,15 +718,13 @@ pub(crate) async fn serve_control_attachment<B: Broker>(
                 let broker = context.broker.clone();
                 let management = Arc::clone(context.management);
                 let retirement = context.retirement.cloned();
+                let prepared_task = PreparedLeafTask::new(LeafKind::ManagementRequest);
                 pump_checkpoint(PumpPoint::Prepared).await;
                 if custody.is_retired() { return Ok(()); }
                 if let Some(LinkEndpoint::Receiver(receiver)) = custody.take_endpoint() {
-                    let task = tokio::spawn(async move {
-                        if let Err(error) = serve_management_requests_with_retirement(receiver, namespace, entity, broker, management, link_authorization, retirement).await {
-                            warn!(%error, "management request link ended");
-                        }
-                    });
-                    custody.admitted = Some(AdmittedTask { task });
+                    custody.admitted = Some(prepared_task.spawn(async move {
+                        serve_management_requests_with_retirement(receiver, namespace, entity, broker, management, link_authorization, retirement).await
+                    }));
                 }
             }
             Some(LinkEndpoint::Sender(_)) if source == address && !target.is_empty() => {
@@ -733,15 +733,13 @@ pub(crate) async fn serve_control_attachment<B: Broker>(
                 }
                 pump_checkpoint(PumpPoint::RoutePacket).await;
                 let retirement = context.retirement.cloned();
+                let prepared_task = PreparedLeafTask::new(LeafKind::ManagementReply);
                 pump_checkpoint(PumpPoint::Prepared).await;
                 if custody.is_retired() { return Ok(()); }
                 if let Some((sender, RoutePacket::Management { registry, address, route, responses })) = custody.take_reply(false) {
-                    let task = tokio::spawn(async move {
-                        if let Err(error) = serve_management_replies_with_retirement(sender, address, route, responses, registry, link_authorization, retirement).await {
-                            warn!(%error, "management response link ended");
-                        }
-                    });
-                    custody.admitted = Some(AdmittedTask { task });
+                    custody.admitted = Some(prepared_task.spawn(async move {
+                        serve_management_replies_with_retirement(sender, address, route, responses, registry, link_authorization, retirement).await
+                    }));
                 }
             }
             _ => refuse(&mut custody, error_for(amqp::AmqpError::InvalidField, "invalid management link".into())).await,

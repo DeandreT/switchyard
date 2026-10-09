@@ -37,12 +37,14 @@ mod attachments;
 pub(crate) mod connection_custody;
 pub(crate) mod control_attachment_custody;
 mod ingress;
+pub(crate) mod session_custody;
 mod settlement;
 
-use attachments::serve_entity_attachment_with_retirement;
+use attachments::{EntityAdmissionExit, serve_entity_attachment_into_family};
 use connection_custody::{ConnectionCustody, ConnectionRetirementRequest, NativePacket, PumpPoint};
 use ingress::SendIntake;
 use ingress::custody::{NativeSend, PumpPoint as SendPumpPoint, SendCustody};
+use session_custody::{SessionCustody, SessionPumpExit, SessionPumpResult};
 
 const LOCKED_UNTIL_UTC_PROPERTY: &str = "com.microsoft:locked-until-utc";
 const DOTNET_UNIX_EPOCH_TICKS: u64 = 621_355_968_000_000_000;
@@ -377,21 +379,37 @@ async fn serve_session<B: Broker>(
 }
 
 async fn serve_session_with_retirement<B: Broker>(
-    mut session: ServerSession,
+    session: ServerSession,
     namespace: NamespaceName,
     broker: B,
     authorization: Option<Arc<ConnectionAuthorization>>,
     management: Arc<ConnectionManagement>,
     retirement: Option<ConnectionRetirementRequest>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ended = session.on_end_owned();
-    tokio::pin!(ended);
+    let mut custody = SessionCustody::new(session, retirement);
+    let primary = AssertUnwindSafe(serve_session_pump(
+        &mut custody,
+        namespace,
+        broker,
+        authorization,
+        management,
+    ))
+    .catch_unwind()
+    .await;
+    custody.record_primary(primary);
+    custody.finish().await;
+    custody.into_result()
+}
+
+async fn serve_session_pump<B: Broker>(
+    custody: &mut SessionCustody,
+    namespace: NamespaceName,
+    broker: B,
+    authorization: Option<Arc<ConnectionAuthorization>>,
+    management: Arc<ConnectionManagement>,
+) -> SessionPumpResult {
     loop {
-        let attach = tokio::select! {
-            biased;
-            () = &mut ended => break,
-            attach = session.next_incoming_attach() => attach,
-        };
+        let attach = custody.next_attach().await;
         let Some(attach) = attach else { break };
         let source_address = attach
             .source
@@ -409,20 +427,19 @@ async fn serve_session_with_retirement<B: Broker>(
             && (target_address == crate::CBS_NODE || source_address == crate::CBS_NODE))
             || management_entity(address).is_some()
         {
+            let (session, pending_admitted, retirement) = custody.admission_parts();
             let context = control_attachment_custody::ControlContext {
-                session: &session,
+                session,
                 broker: &broker,
                 namespace: &namespace,
                 authorization: authorization.as_ref(),
                 management: &management,
-                retirement: retirement.as_ref(),
+                retirement,
             };
-            if let Some(admitted) =
-                control_attachment_custody::serve_control_attachment(context, attach).await?
-            {
-                // The original handle is available for #132; until then,
-                // dropping it preserves the existing detached leaf behavior.
-                drop(admitted.task);
+            *pending_admitted =
+                control_attachment_custody::serve_control_attachment(context, attach).await?;
+            if let Some((kind, id)) = custody.adopt_pending() {
+                session_custody::adopted_checkpoint(kind, id).await;
             }
             continue;
         }
@@ -432,19 +449,28 @@ async fn serve_session_with_retirement<B: Broker>(
         // source. The other terminus may carry a generated link address.
         debug!(%address, ?attach, "accepting entity link");
 
-        serve_entity_attachment_with_retirement(
-            &session,
+        let (session, pending_admitted, retirement) = custody.admission_parts();
+        let admission = serve_entity_attachment_into_family(
+            session,
             &broker,
             &namespace,
             address,
             attach,
             authorization.as_ref(),
             &management,
-            retirement.as_ref(),
+            retirement,
+            pending_admitted,
         )
         .await?;
+        let adopted = custody.adopt_pending();
+        if let EntityAdmissionExit::ReportOnly(payload) = admission {
+            return Ok(SessionPumpExit::ReportOnly(payload));
+        }
+        if let Some((kind, id)) = adopted {
+            session_custody::adopted_checkpoint(kind, id).await;
+        }
     }
-    Ok(())
+    Ok(SessionPumpExit::Complete)
 }
 
 #[derive(Clone)]

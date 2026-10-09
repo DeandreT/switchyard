@@ -31,6 +31,10 @@ use super::{
     LinkAuthorization, ReceivingLinkProtocol, error_for, rejection_error, resolve_entity,
     session_attach_properties, settlement, unauthorized_error,
 };
+use super::{
+    control_attachment_custody::AdmittedTask,
+    session_custody::{LeafKind, PreparedLeafTask},
+};
 
 pub(super) mod custody;
 use custody::{AttachmentCustody, PumpPoint, pump_checkpoint, pump_fault};
@@ -243,6 +247,27 @@ pub(super) struct EntityLink {
     pub(super) mode: ReceiveMode,
 }
 
+pub(super) enum EntityAdmissionExit {
+    Complete,
+    ReportOnly(super::session_custody::PanicPayload),
+}
+
+enum EntityHandoffExit {
+    Complete(Option<Box<EntityLink>>),
+    // Only the caught post-cleanup reporter can produce this exit.
+    ReportOnly(super::session_custody::PanicPayload),
+}
+
+impl EntityHandoffExit {
+    #[cfg(test)]
+    fn into_direct_result(self) -> Option<EntityLink> {
+        match self {
+            Self::Complete(result) => result.map(|link| *link),
+            Self::ReportOnly(payload) => resume_unwind(payload),
+        }
+    }
+}
+
 struct PreparedLink {
     entity: EntityPath,
     authorization: Option<LinkAuthorization>,
@@ -307,8 +332,10 @@ pub(super) async fn accept_entity_link<B: Broker>(
         management,
         false,
         None,
+        None,
     )
     .await
+    .map(EntityHandoffExit::into_direct_result)
 }
 
 #[cfg(test)]
@@ -334,6 +361,7 @@ pub(super) async fn serve_entity_attachment<B: Broker>(
     .await
 }
 
+#[cfg(test)]
 #[expect(clippy::too_many_arguments)]
 pub(super) async fn serve_entity_attachment_with_retirement<B: Broker>(
     session: &ServerSession,
@@ -355,9 +383,46 @@ pub(super) async fn serve_entity_attachment_with_retirement<B: Broker>(
         management,
         true,
         retirement,
+        None,
     )
     .await
-    .map(|_| ())
+    .map(|result| {
+        let _ = result.into_direct_result();
+    })
+}
+
+#[expect(clippy::too_many_arguments)]
+pub(super) async fn serve_entity_attachment_into_family<B: Broker>(
+    session: &ServerSession,
+    broker: &B,
+    namespace: &NamespaceName,
+    address: &str,
+    attach: Attach,
+    authorization: Option<&Arc<ConnectionAuthorization>>,
+    management: &Arc<ConnectionManagement>,
+    retirement: Option<&super::ConnectionRetirementRequest>,
+    admitted: &mut Option<AdmittedTask>,
+) -> Result<EntityAdmissionExit, EngineError> {
+    run_entity_handoff(
+        session,
+        broker,
+        namespace,
+        address,
+        attach,
+        authorization,
+        management,
+        true,
+        retirement,
+        Some(admitted),
+    )
+    .await
+    .map(|result| match result {
+        EntityHandoffExit::Complete(result) => {
+            drop(result);
+            EntityAdmissionExit::Complete
+        }
+        EntityHandoffExit::ReportOnly(payload) => EntityAdmissionExit::ReportOnly(payload),
+    })
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -371,7 +436,15 @@ async fn run_entity_handoff<B: Broker>(
     management: &Arc<ConnectionManagement>,
     serve: bool,
     retirement: Option<&super::ConnectionRetirementRequest>,
-) -> Result<Option<EntityLink>, EngineError> {
+    admitted: Option<&mut Option<AdmittedTask>>,
+) -> Result<EntityHandoffExit, EngineError> {
+    // The production slot belongs to SessionCustody, outside this caught pump.
+    // Unit-return test adapters keep the original detached-task behavior.
+    let mut detached = None;
+    let admitted = match admitted {
+        Some(admitted) => admitted,
+        None => &mut detached,
+    };
     let resolved = resolve_entity(address, attach.role.clone())
         .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()));
     // Capture attachment ordering before authorization, grant, or native work
@@ -417,6 +490,7 @@ async fn run_entity_handoff<B: Broker>(
                 management,
                 &mut custody,
                 retirement,
+                admitted,
             )
             .await;
             Ok(None)
@@ -439,24 +513,26 @@ async fn run_entity_handoff<B: Broker>(
     } else {
         None
     };
-    let secondary = cleanup
-        .err()
-        .or_else(|| custody.take_cleanup_panic())
-        .or(diagnostics);
+    let cleanup_panic = cleanup.err().or_else(|| custody.take_cleanup_panic());
     match primary {
         Err(payload) => resume_unwind(payload),
         Ok(Err(error)) => Err(error),
         Ok(Ok(result)) => {
             if let Some(error) = custody.take_native_error() {
                 return match error {
-                    EngineError::RemoteDetached => Ok(result),
+                    EngineError::RemoteDetached => {
+                        Ok(EntityHandoffExit::Complete(result.map(Box::new)))
+                    }
                     error => Err(error),
                 };
             }
-            if let Some(payload) = secondary {
+            if let Some(payload) = cleanup_panic {
                 resume_unwind(payload);
             }
-            Ok(result)
+            if let Some(payload) = diagnostics {
+                return Ok(EntityHandoffExit::ReportOnly(payload));
+            }
+            Ok(EntityHandoffExit::Complete(result.map(Box::new)))
         }
     }
 }
@@ -665,12 +741,21 @@ pub(super) async fn prepare_and_adopt<B: Broker>(
     management: &Arc<ConnectionManagement>,
     custody: &mut AttachmentCustody<'_>,
 ) {
+    let mut detached = None;
     prepare_and_adopt_with_retirement(
-        session, broker, namespace, address, management, custody, None,
+        session,
+        broker,
+        namespace,
+        address,
+        management,
+        custody,
+        None,
+        &mut detached,
     )
     .await
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn prepare_and_adopt_with_retirement<B: Broker>(
     session: &ServerSession,
     broker: &B,
@@ -679,6 +764,7 @@ async fn prepare_and_adopt_with_retirement<B: Broker>(
     management: &Arc<ConnectionManagement>,
     custody: &mut AttachmentCustody<'_>,
     retirement: Option<&super::ConnectionRetirementRequest>,
+    admitted: &mut Option<AdmittedTask>,
 ) {
     let ready = custody
         .ready
@@ -691,6 +777,7 @@ async fn prepare_and_adopt_with_retirement<B: Broker>(
             let broker = broker.clone();
             let authorization = ready.authorization.clone();
             let retirement = retirement.cloned();
+            let prepared_task = PreparedLeafTask::new(LeafKind::DataSend);
             pump_checkpoint(PumpPoint::EntryPrepared).await;
             info!(%address, entity = %ready.entity, "link attached");
             if session.is_ended() || receiver.on_detach_owned().now_or_never().is_some() {
@@ -703,8 +790,8 @@ async fn prepare_and_adopt_with_retirement<B: Broker>(
             else {
                 unreachable!("ready receiving endpoint retains its role")
             };
-            tokio::spawn(async move {
-                if let Err(error) = super::serve_sending_client_with_retirement(
+            *admitted = Some(prepared_task.spawn(async move {
+                super::serve_sending_client_with_retirement(
                     receiver,
                     namespace,
                     entity,
@@ -713,10 +800,7 @@ async fn prepare_and_adopt_with_retirement<B: Broker>(
                     retirement,
                 )
                 .await
-                {
-                    warn!(%error, "sending link ended");
-                }
-            });
+            }));
         }
         LinkEndpoint::Sender(sender) => {
             let entry = settlement::prepare_receiving_entry(
@@ -733,6 +817,7 @@ async fn prepare_and_adopt_with_retirement<B: Broker>(
                 },
             )
             .with_retirement(retirement.cloned());
+            let prepared_task = PreparedLeafTask::new(LeafKind::DataReceive);
             pump_checkpoint(PumpPoint::EntryPrepared).await;
             info!(%address, entity = %ready.entity,
                 session = ready.accepted.as_ref().map(|accepted| accepted.session_id.as_str()), "link attached");
@@ -746,11 +831,10 @@ async fn prepare_and_adopt_with_retirement<B: Broker>(
             else {
                 unreachable!("ready sending endpoint retains its role")
             };
-            tokio::spawn(async move {
-                if let Err(error) = settlement::serve_receiving_entry(sender, entry).await {
-                    warn!(%error, "receiving link ended");
-                }
-            });
+            *admitted = Some(
+                prepared_task
+                    .spawn(async move { settlement::serve_receiving_entry(sender, entry).await }),
+            );
         }
     }
 }
