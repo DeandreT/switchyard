@@ -716,3 +716,136 @@ async fn actual_request_status_and_report_do_not_notice_memory() {
 async fn actual_request_status_and_report_do_not_notice_fjall() {
     request_status_and_report_are_non_faults(true).await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn qualified_management_cleanup_freshness_request_native_cache_and_new_faults() {
+    // Manual observation without packet capture is not an ordinary pump window.
+    for phase in 0..3 {
+        for cached in [false, true] {
+            for capable in [false, true] {
+                let message = correlated(state_request());
+                let (mut native, receiver, delivery) = NativeRequest::new(&message).await;
+                let notice = ConnectionRetirementRequest::capture(&native.connection);
+                let control = OperationControl::new();
+                let polls = Arc::new(AtomicUsize::new(0));
+                let original = PendingOperation::new(
+                    counted(
+                        async {
+                            assert!(control.begin());
+                            match phase {
+                                0 => receiver.accept(&delivery).await,
+                                1 => receiver.reject(&delivery, None).await,
+                                _ => {
+                                    receiver
+                                        .close_with_error(unauthorized_error("freshness control"))
+                                        .await
+                                }
+                            }
+                        },
+                        Arc::clone(&polls),
+                    ),
+                    control.clone(),
+                );
+                let mut custody = RequestCustody::default();
+                if phase == 2 {
+                    custody.close = Some(original);
+                } else {
+                    custody.native = Some(original);
+                }
+                native.hold.held.store(true, Ordering::SeqCst);
+                let original = if phase == 2 {
+                    custody.close.as_mut().unwrap()
+                } else {
+                    custody.native.as_mut().unwrap()
+                };
+                let mut observation = Box::pin(original.observe());
+                timeout(WAIT, async {
+                    tokio::select! {
+                        result = observation.as_mut() => {
+                            let _ = result;
+                            panic!("actual request native write is held");
+                        }
+                        () = native.hold.reached.notified() => {}
+                    }
+                })
+                .await
+                .unwrap();
+                drop(observation);
+                assert!(control.started());
+                assert!(!notice.is_requested());
+                // Explicit fixture Stop produces the native error, not the notice.
+                native.connection.stop();
+                timeout(WAIT, native.connection.shutdown())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(native.hold.held.load(Ordering::SeqCst));
+                if cached {
+                    let original = if phase == 2 {
+                        custody.close.as_mut().unwrap()
+                    } else {
+                        custody.native.as_mut().unwrap()
+                    };
+                    let retained = timeout(WAIT, original.observe()).await.unwrap().unwrap();
+                    assert!(matches!(retained, Err(EngineError::Stopped)));
+                    let pointer = retained as *const Result<(), EngineError>;
+                    let terminal_polls = polls.load(Ordering::SeqCst);
+                    assert_eq!(
+                        original.observe().await.unwrap() as *const Result<(), EngineError>,
+                        pointer
+                    );
+                    assert_eq!(polls.load(Ordering::SeqCst), terminal_polls);
+                }
+                timeout(
+                    WAIT,
+                    custody.finish_with_retirement(
+                        receiver.on_detach_owned(),
+                        capable.then_some(&notice),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(notice.is_requested(), capable && !cached);
+                let packet = if phase == 2 {
+                    custody.close_packet.as_ref().unwrap()
+                } else {
+                    custody.native_packet.as_ref().unwrap()
+                };
+                assert!(packet.started && !packet.panicked);
+                assert!(matches!(
+                    packet.result.as_ref(),
+                    Some(Err(EngineError::Stopped))
+                ));
+                let pointer = packet.result.as_ref().unwrap() as *const Result<(), EngineError>;
+                let terminal_polls = polls.load(Ordering::SeqCst);
+                for _ in 0..2 {
+                    timeout(
+                        WAIT,
+                        custody.finish_with_retirement(
+                            receiver.on_detach_owned(),
+                            capable.then_some(&notice),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    let packet = if phase == 2 {
+                        custody.close_packet.as_ref().unwrap()
+                    } else {
+                        custody.native_packet.as_ref().unwrap()
+                    };
+                    assert_eq!(
+                        packet.result.as_ref().unwrap() as *const Result<(), EngineError>,
+                        pointer
+                    );
+                    assert_eq!(polls.load(Ordering::SeqCst), terminal_polls);
+                    assert_eq!(notice.is_requested(), capable && !cached);
+                }
+                assert!(custody.take_cleanup_panic().is_none());
+                assert!(matches!(
+                    custody.take_native_error(),
+                    Some(EngineError::Stopped)
+                ));
+            }
+        }
+    }
+}

@@ -252,29 +252,42 @@ impl RequestCustody<'_> {
             original.retire();
         }
         if let Some(original) = self.request.as_mut() {
-            if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await {
-                self.cleanup_panic = Some(payload);
-            }
+            let new_panic =
+                if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await {
+                    self.cleanup_panic = Some(payload);
+                    true
+                } else {
+                    false
+                };
             self.capture_request();
-            request_fault(retirement, self.cleanup_panic.is_some());
+            request_fault(retirement, new_panic);
         }
         if let Some(original) = self.native.as_mut() {
-            if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await {
-                self.native_panic = Some(payload);
-            }
+            let unfinished = original.actual.is_some();
+            let new_panic =
+                if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await {
+                    self.native_panic = Some(payload);
+                    true
+                } else {
+                    false
+                };
             self.capture_native();
             request_fault(
                 retirement,
-                self.native_panic.is_some() || packet_error(self.native_packet.as_ref()),
+                new_panic || (unfinished && packet_error(self.native_packet.as_ref())),
             );
         }
         if let Some(original) = self.close.as_mut() {
-            if let Err(payload) = AssertUnwindSafe(finish_close(original, detached))
+            let unfinished = original.actual.is_some();
+            let new_panic = if let Err(payload) = AssertUnwindSafe(finish_close(original, detached))
                 .catch_unwind()
                 .await
             {
                 self.close_panic = Some(payload);
-            }
+                true
+            } else {
+                false
+            };
             self.close_packet = Some(
                 original
                     .take_packet()
@@ -283,7 +296,7 @@ impl RequestCustody<'_> {
             self.close = None;
             request_fault(
                 retirement,
-                self.close_panic.is_some() || packet_error(self.close_packet.as_ref()),
+                new_panic || (unfinished && packet_error(self.close_packet.as_ref())),
             );
         }
     }
@@ -375,31 +388,43 @@ impl<'a> ReplyCustody<'a> {
         self.responses.close();
         // An unauthorized Close can wake an already queued no-credit reply.
         // Both originals remain owned here if this borrowed finish is cancelled.
+        // A retry must not promote the retained terminal result or panic cache.
         tokio::join!(
             async {
                 if let Some(original) = self.original.as_mut() {
-                    if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await {
+                    let unfinished = original.actual.is_some();
+                    let new_panic = if let Err(payload) =
+                        AssertUnwindSafe(original.finish()).catch_unwind().await
+                    {
                         self.cleanup_panic = Some(payload);
-                    }
+                        true
+                    } else {
+                        false
+                    };
                     request_fault(
                         retirement,
-                        self.cleanup_panic.is_some()
-                            || matches!(original.result.as_ref(), Some(Err(_))),
+                        new_panic
+                            || (unfinished && matches!(original.result.as_ref(), Some(Err(_)))),
                     );
                 }
             },
             async {
                 if let Some(original) = self.close.as_mut() {
-                    if let Err(payload) = AssertUnwindSafe(finish_close(original, detached))
-                        .catch_unwind()
-                        .await
+                    let unfinished = original.actual.is_some();
+                    let new_panic = if let Err(payload) =
+                        AssertUnwindSafe(finish_close(original, detached))
+                            .catch_unwind()
+                            .await
                     {
                         self.close_panic = Some(payload);
-                    }
+                        true
+                    } else {
+                        false
+                    };
                     request_fault(
                         retirement,
-                        self.close_panic.is_some()
-                            || matches!(original.result.as_ref(), Some(Err(_))),
+                        new_panic
+                            || (unfinished && matches!(original.result.as_ref(), Some(Err(_)))),
                     );
                 }
             },

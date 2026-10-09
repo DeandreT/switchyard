@@ -750,3 +750,474 @@ async fn reply_cached_actual_success_and_report_or_unstarted_work_do_not_notify(
         wire.stop().await;
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn qualified_management_cleanup_freshness_reply_native_cache_and_new_faults() {
+    // Observe-before-capture is manual custody composition, not pump reachability.
+    for close in [false, true] {
+        for cached in [false, true] {
+            for capable in [false, true] {
+                let (mut wire, endpoint) =
+                    Wire::new(Role::Receiver, 0, ReceiverSettleMode::First).await;
+                let LinkEndpoint::Sender(sender) = endpoint else {
+                    panic!("actual native reply sender");
+                };
+                let notice = wire.retirement_request();
+                let management = ConnectionManagement::new();
+                let (route, responses) = management.register_reply_route(ADDRESS.to_owned()).await;
+                let mut custody =
+                    ReplyCustody::new(responses, ADDRESS.to_owned(), route.clone(), &management);
+                let control = OperationControl::new();
+                let polls = Arc::new(AtomicUsize::new(0));
+                if close {
+                    let begun = control.clone();
+                    let endpoint = &sender;
+                    custody.close = Some(PendingOperation::new(
+                        witness(
+                            async move {
+                                assert!(begun.begin());
+                                endpoint
+                                    .close_with_error(unauthorized_error("freshness control"))
+                                    .await
+                            },
+                            &polls,
+                        ),
+                        control.clone(),
+                    ));
+                    wire.writes.arm(false);
+                    let mut observation = Box::pin(custody.close.as_mut().unwrap().observe());
+                    timeout(WAIT, async {
+                        tokio::select! {
+                            result = observation.as_mut() => {
+                                let _ = result;
+                                panic!("actual reply Close write is held");
+                            }
+                            () = wire.writes.reached() => {}
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    drop(observation);
+                    wire.writes.fail_held_write();
+                    // Wait for driver cleanup without observing the original result.
+                    timeout(WAIT, sender.on_detach_owned()).await.unwrap();
+                } else {
+                    custody.original = Some(PendingOperation::new(
+                        witness(
+                            send_management_response(&sender, response(42), control.clone()),
+                            &polls,
+                        ),
+                        control.clone(),
+                    ));
+                    pending_once(
+                        Box::pin(tokio::task::unconstrained(
+                            custody.original.as_mut().unwrap().observe(),
+                        ))
+                        .as_mut(),
+                    )
+                    .await;
+                    wire.barrier().await;
+                    peer_detach(&mut wire).await;
+                    timeout(WAIT, sender.on_detach_owned()).await.unwrap();
+                }
+                assert!(control.started());
+                assert!(!notice.is_requested());
+                if cached {
+                    let pointer = if close {
+                        let original = custody.close.as_mut().unwrap();
+                        let retained = timeout(WAIT, original.observe()).await.unwrap().unwrap();
+                        assert!(matches!(retained, Err(EngineError::Stopped)));
+                        let pointer = retained as *const Result<(), EngineError>;
+                        let terminal_polls = polls.load(Ordering::SeqCst);
+                        assert_eq!(
+                            original.observe().await.unwrap() as *const Result<(), EngineError>,
+                            pointer
+                        );
+                        assert_eq!(polls.load(Ordering::SeqCst), terminal_polls);
+                        pointer as usize
+                    } else {
+                        let original = custody.original.as_mut().unwrap();
+                        let retained = timeout(WAIT, original.observe()).await.unwrap().unwrap();
+                        assert!(matches!(retained, Err(EngineError::RemoteDetached)));
+                        let pointer = retained as *const Result<Outcome, EngineError>;
+                        let terminal_polls = polls.load(Ordering::SeqCst);
+                        assert_eq!(
+                            original.observe().await.unwrap()
+                                as *const Result<Outcome, EngineError>,
+                            pointer
+                        );
+                        assert_eq!(polls.load(Ordering::SeqCst), terminal_polls);
+                        pointer as usize
+                    };
+                    assert_ne!(pointer, 0);
+                }
+                let (replacement, mut replacement_responses) =
+                    management.register_reply_route(ADDRESS.to_owned()).await;
+                let held = management.routes.lock().await;
+                pending_once(
+                    Box::pin(tokio::task::unconstrained(custody.finish_with_retirement(
+                        sender.on_detach_owned(),
+                        capable.then_some(&notice),
+                    )))
+                    .as_mut(),
+                )
+                .await;
+                assert_eq!(notice.is_requested(), capable && !cached);
+                assert!(route.is_closed());
+                assert!(
+                    held.senders
+                        .get(ADDRESS)
+                        .unwrap()
+                        .same_channel(&replacement)
+                );
+                let retained = if close {
+                    let packet = custody.close_packet.as_ref().unwrap();
+                    assert!(packet.started && !packet.panicked);
+                    raw_error(packet)
+                } else {
+                    let packet = custody.packet.as_ref().unwrap();
+                    assert!(packet.started && packet.retired && !packet.panicked);
+                    raw_error(packet)
+                };
+                assert_eq!(matches!(retained, EngineError::Stopped), close);
+                assert_eq!(matches!(retained, EngineError::RemoteDetached), !close);
+                let pointer = retained as *const EngineError;
+                let terminal_polls = polls.load(Ordering::SeqCst);
+                for _ in 0..2 {
+                    pending_once(
+                        Box::pin(tokio::task::unconstrained(custody.finish_with_retirement(
+                            sender.on_detach_owned(),
+                            capable.then_some(&notice),
+                        )))
+                        .as_mut(),
+                    )
+                    .await;
+                    let retained = if close {
+                        raw_error(custody.close_packet.as_ref().unwrap())
+                    } else {
+                        raw_error(custody.packet.as_ref().unwrap())
+                    };
+                    assert_eq!(retained as *const EngineError, pointer);
+                    assert_eq!(polls.load(Ordering::SeqCst), terminal_polls);
+                    assert_eq!(notice.is_requested(), capable && !cached);
+                }
+                drop(held);
+                timeout(
+                    WAIT,
+                    custody.finish_with_retirement(
+                        sender.on_detach_owned(),
+                        capable.then_some(&notice),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(polls.load(Ordering::SeqCst), terminal_polls);
+                assert_eq!(notice.is_requested(), capable && !cached);
+                replacement_survives(&management, &mut replacement_responses).await;
+                assert!(custody.take_cleanup_panic().is_none());
+                let error = custody.take_native_error().unwrap();
+                assert_eq!(matches!(error, EngineError::Stopped), close);
+                assert_eq!(matches!(error, EngineError::RemoteDetached), !close);
+                wire.stop().await;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn qualified_management_cleanup_freshness_reply_poison_retry_and_opposite_faults() {
+    // Both slot futures are injected originals; native IO only supplies a real
+    // captured capability and liveness witness. This is not an engine panic or
+    // an ordinary pump window between observation and synchronous capture.
+    for old_reply in [false, true] {
+        for opposite in 0..3 {
+            for capable in [false, true] {
+                let (mut wire, endpoint) =
+                    Wire::new(Role::Receiver, 0, ReceiverSettleMode::First).await;
+                let LinkEndpoint::Sender(_sender) = endpoint else {
+                    panic!("actual connection for qualified original composition");
+                };
+                let notice = wire.retirement_request();
+                let management = ConnectionManagement::new();
+                let (route, responses) = management.register_reply_route(ADDRESS.to_owned()).await;
+                let mut custody =
+                    ReplyCustody::new(responses, ADDRESS.to_owned(), route.clone(), &management);
+                let old_fault = OriginalFault::new();
+                let new_fault = OriginalFault::new();
+                assert!(!Arc::ptr_eq(&old_fault.payload, &new_fault.payload));
+                let release = Arc::new(Notify::new());
+                let old_polls = Arc::new(AtomicUsize::new(0));
+                let opposite_polls = Arc::new(AtomicUsize::new(0));
+                let old_control = OperationControl::new();
+                let opposite_control = OperationControl::new();
+                if old_reply {
+                    custody.original = Some(PendingOperation::new(
+                        witness(
+                            original_poison(old_control.clone(), Arc::clone(&old_fault)),
+                            &old_polls,
+                        ),
+                        old_control.clone(),
+                    ));
+                    let begun = opposite_control.clone();
+                    let released = Arc::clone(&release);
+                    let fault = Arc::clone(&new_fault);
+                    custody.close = Some(PendingOperation::new(
+                        witness(
+                            async move {
+                                assert!(begun.begin());
+                                released.notified().await;
+                                match opposite {
+                                    0 => Ok(()),
+                                    1 => Err(EngineError::Stopped),
+                                    _ => std::panic::panic_any(Arc::clone(&fault.payload)),
+                                }
+                            },
+                            &opposite_polls,
+                        ),
+                        opposite_control.clone(),
+                    ));
+                    pending_once(
+                        Box::pin(tokio::task::unconstrained(
+                            custody.original.as_mut().unwrap().observe(),
+                        ))
+                        .as_mut(),
+                    )
+                    .await;
+                } else {
+                    custody.close = Some(PendingOperation::new(
+                        witness(
+                            original_poison(old_control.clone(), Arc::clone(&old_fault)),
+                            &old_polls,
+                        ),
+                        old_control.clone(),
+                    ));
+                    let begun = opposite_control.clone();
+                    let released = Arc::clone(&release);
+                    let fault = Arc::clone(&new_fault);
+                    custody.original = Some(PendingOperation::new(
+                        witness(
+                            async move {
+                                assert!(begun.begin());
+                                released.notified().await;
+                                match opposite {
+                                    0 => Ok(Outcome::Accepted(Accepted)),
+                                    1 => Err(EngineError::Stopped),
+                                    _ => std::panic::panic_any(Arc::clone(&fault.payload)),
+                                }
+                            },
+                            &opposite_polls,
+                        ),
+                        opposite_control.clone(),
+                    ));
+                    pending_once(
+                        Box::pin(tokio::task::unconstrained(
+                            custody.close.as_mut().unwrap().observe(),
+                        ))
+                        .as_mut(),
+                    )
+                    .await;
+                }
+                assert!(old_control.started());
+                if old_reply {
+                    pending_once(
+                        Box::pin(tokio::task::unconstrained(
+                            custody.close.as_mut().unwrap().observe(),
+                        ))
+                        .as_mut(),
+                    )
+                    .await;
+                } else {
+                    pending_once(
+                        Box::pin(tokio::task::unconstrained(
+                            custody.original.as_mut().unwrap().observe(),
+                        ))
+                        .as_mut(),
+                    )
+                    .await;
+                }
+                assert!(opposite_control.started());
+                old_fault.trigger.notify_one();
+                let (replacement, mut replacement_responses) =
+                    management.register_reply_route(ADDRESS.to_owned()).await;
+                let held = management.routes.lock().await;
+                // First finish catches and retains the old raw poison without a
+                // capability, then is cancelled at the opposite original wait.
+                pending_once(
+                    Box::pin(tokio::task::unconstrained(
+                        custody.finish_with_retirement(std::future::pending(), None),
+                    ))
+                    .as_mut(),
+                )
+                .await;
+                assert!(opposite_control.started());
+                assert!(custody.packet.is_none() && custody.close_packet.is_none());
+                assert!(!notice.is_requested());
+                let terminal_old_polls = old_polls.load(Ordering::SeqCst);
+                if old_reply {
+                    assert!(custody.original.as_mut().unwrap().observe().await.is_none());
+                } else {
+                    assert!(custody.close.as_mut().unwrap().observe().await.is_none());
+                }
+                assert_eq!(old_polls.load(Ordering::SeqCst), terminal_old_polls);
+                for _ in 0..2 {
+                    pending_once(
+                        Box::pin(tokio::task::unconstrained(custody.finish_with_retirement(
+                            std::future::pending(),
+                            capable.then_some(&notice),
+                        )))
+                        .as_mut(),
+                    )
+                    .await;
+                    assert!(custody.packet.is_none() && custody.close_packet.is_none());
+                    assert_eq!(old_polls.load(Ordering::SeqCst), terminal_old_polls);
+                    assert!(!notice.is_requested());
+                }
+                wire.barrier().await;
+                release.notify_one();
+                pending_once(
+                    Box::pin(tokio::task::unconstrained(custody.finish_with_retirement(
+                        std::future::pending(),
+                        capable.then_some(&notice),
+                    )))
+                    .as_mut(),
+                )
+                .await;
+                assert_eq!(notice.is_requested(), capable && opposite != 0);
+                assert!(route.is_closed());
+                assert!(
+                    held.senders
+                        .get(ADDRESS)
+                        .unwrap()
+                        .same_channel(&replacement)
+                );
+                let old_packet_panicked = if old_reply {
+                    let packet = custody.packet.as_ref().unwrap();
+                    assert!(packet.started && packet.retired && packet.result.is_none());
+                    packet.panicked
+                } else {
+                    let packet = custody.close_packet.as_ref().unwrap();
+                    assert!(packet.started && packet.result.is_none());
+                    packet.panicked
+                };
+                assert!(old_packet_panicked);
+                let opposite_pointer = if old_reply {
+                    let packet = custody.close_packet.as_ref().unwrap();
+                    assert!(packet.started);
+                    assert_eq!(packet.panicked, opposite == 2);
+                    assert_eq!(packet.result.is_none(), opposite == 2);
+                    match opposite {
+                        0 => assert!(matches!(packet.result.as_ref(), Some(Ok(())))),
+                        1 => assert!(matches!(
+                            packet.result.as_ref(),
+                            Some(Err(EngineError::Stopped))
+                        )),
+                        _ => {}
+                    }
+                    packet.result.as_ref().map(|raw| raw as *const _ as usize)
+                } else {
+                    let packet = custody.packet.as_ref().unwrap();
+                    assert!(packet.started && packet.retired);
+                    assert_eq!(packet.panicked, opposite == 2);
+                    assert_eq!(packet.result.is_none(), opposite == 2);
+                    match opposite {
+                        0 => assert!(matches!(
+                            packet.result.as_ref(),
+                            Some(Ok(Outcome::Accepted(_)))
+                        )),
+                        1 => assert!(matches!(
+                            packet.result.as_ref(),
+                            Some(Err(EngineError::Stopped))
+                        )),
+                        _ => {}
+                    }
+                    packet.result.as_ref().map(|raw| raw as *const _ as usize)
+                };
+                let terminal_opposite_polls = opposite_polls.load(Ordering::SeqCst);
+                for _ in 0..2 {
+                    pending_once(
+                        Box::pin(tokio::task::unconstrained(custody.finish_with_retirement(
+                            std::future::pending(),
+                            capable.then_some(&notice),
+                        )))
+                        .as_mut(),
+                    )
+                    .await;
+                    let retained_pointer = if old_reply {
+                        custody
+                            .close_packet
+                            .as_ref()
+                            .unwrap()
+                            .result
+                            .as_ref()
+                            .map(|raw| raw as *const _ as usize)
+                    } else {
+                        custody
+                            .packet
+                            .as_ref()
+                            .unwrap()
+                            .result
+                            .as_ref()
+                            .map(|raw| raw as *const _ as usize)
+                    };
+                    assert_eq!(retained_pointer, opposite_pointer);
+                    assert_eq!(old_polls.load(Ordering::SeqCst), terminal_old_polls);
+                    assert_eq!(
+                        opposite_polls.load(Ordering::SeqCst),
+                        terminal_opposite_polls
+                    );
+                    assert_eq!(notice.is_requested(), capable && opposite != 0);
+                }
+                drop(held);
+                timeout(
+                    WAIT,
+                    custody
+                        .finish_with_retirement(std::future::pending(), capable.then_some(&notice)),
+                )
+                .await
+                .unwrap();
+                assert_eq!(old_polls.load(Ordering::SeqCst), terminal_old_polls);
+                assert_eq!(
+                    opposite_polls.load(Ordering::SeqCst),
+                    terminal_opposite_polls
+                );
+                assert_eq!(notice.is_requested(), capable && opposite != 0);
+                replacement_survives(&management, &mut replacement_responses).await;
+                let first = custody.take_cleanup_panic().unwrap();
+                let first_payload = if opposite == 2 && !old_reply {
+                    &new_fault.payload
+                } else {
+                    &old_fault.payload
+                };
+                assert!(Arc::ptr_eq(
+                    first.downcast_ref::<Arc<str>>().unwrap(),
+                    first_payload
+                ));
+                if opposite == 2 {
+                    let second = custody.take_cleanup_panic().unwrap();
+                    let second_payload = if old_reply {
+                        &new_fault.payload
+                    } else {
+                        &old_fault.payload
+                    };
+                    assert!(Arc::ptr_eq(
+                        second.downcast_ref::<Arc<str>>().unwrap(),
+                        second_payload
+                    ));
+                }
+                assert!(custody.take_cleanup_panic().is_none());
+                if opposite == 1 {
+                    let error = custody.take_native_error().unwrap();
+                    assert!(matches!(error, EngineError::Stopped));
+                    let result = finish_pump(Ok(Ok(())), Some(first), Some(error)).unwrap_err();
+                    assert!(matches!(
+                        result.downcast_ref::<EngineError>(),
+                        Some(EngineError::Stopped)
+                    ));
+                } else {
+                    assert!(custody.take_native_error().is_none());
+                }
+                wire.stop().await;
+            }
+        }
+    }
+}

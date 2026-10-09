@@ -24,7 +24,8 @@ acceptance and full dependencies; [compatibility](compatibility.md) owns guarant
 - [x] Native Stop/original joins, Detach-aware admission/credit cleanup; first-poll
   receiving/Send/management/CBS custody, exact attachment/registry/End and delivery
   identities; outer-pump panic #111/#127-#131, primary notice #139/#161, move-only
-  pre-native receiving context #172 and owner-specific cleanup notices #173-#177.
+  pre-native receiving context #172, owner-specific cleanup notices #173-#177 and
+  management cleanup freshness #196.
   No ancestor/family shielding; acquisition #73/data-link #84/CBS #74 complete.
 - [x] Bounded SDK child/approved loaded-file custody, owned Cargo handoffs/unit CI;
   Linux frozen-input profile only. Four experimental Memory TCP/WSS gates use
@@ -52,7 +53,7 @@ marker; linked issues carry exact scopes.
 
 ```mermaid
 flowchart TD
-    Main["Merged main foundations"] --> Lifecycle["Merged #139/#161 primary, #172 handoff, #173-#177 cleanup"]
+    Main["Merged main foundations"] --> Lifecycle["Merged #139/#161 primary, #172 handoff, #173-#177/#196 cleanup"]
     Lifecycle --> Control["#189 Control attachment admission custody"]
     Control --> Families["#132 Links -> #133 Sessions; finish #75/#63"]
     Families --> Shutdown["#134 Listener -> #135 Limits -> #136 Deadline -> #65 Signals; finish #64/#7"]
