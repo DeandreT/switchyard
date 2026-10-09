@@ -74,10 +74,16 @@ External include/build-script inputs and unrelated environment variables must
 remain frozen; the helper does not fingerprint them.
 
 Run [the tiny fixture](tools/tests/cargo_handoff_fixture.py) on two CPUs with a new
-external directory. It compares exact known test IDs/executables against a fresh
-dependency-free reference; only fixture timestamps change. A non-reproduction
-does not prove universal Cargo cache correctness. Review source-bound expected
-test identities/statuses separately for real workspace gates.
+external directory. Its dependency-free library/consumer probes cover older-mtime
+A-to-B-to-A and same-root content reversions, with guarded runs and isolated
+references. It retains every phase's original output, exact test ID/value and
+linked-library/executable proof; only disposable fixture timestamps change.
+Raw probes may be fresh, and arbitrary failures are not stale-cache evidence.
+An identical Cargo fingerprint is not a content proof. A non-reproduction does
+not prove universal cache correctness; review source-bound expected test
+identities/statuses separately for real workspace gates. Keep real workspace
+targets guarded; only this disposable fixture runs controlled raw probes. Never
+adopt a preexisting cache to run it.
 
 ## Durable Compatibility
 

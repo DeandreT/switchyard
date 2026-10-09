@@ -383,6 +383,148 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(created[0].returncode, -signal.SIGKILL)
         self.assertEqual(int((directory / "original.stdout").read_text().strip()), created[0].pid)
 
+    def test_same_guarded_inputs_reuse_without_cleanup(self):
+        commands = []
+
+        def original(command, root, environment, directory, name, timeout):
+            commands.append(command)
+            self.assertEqual(command[:2], ["cargo", "test"])
+            self.assertTrue(guard.read_json(self.target.parent / guard.MARKER)["pending"])
+            with self.assertRaisesRegex(guard.Refused, "active lock"):
+                with guard.exclusive(self.target.parent / guard.GUARD):
+                    self.fail("original command lost its owner lock")
+            self.target.mkdir(exist_ok=True)
+            (self.target / "CACHEDIR.TAG").write_text("test double of Cargo's own cache tag\n")
+            result = {"command": command, "exit_code": 0}
+            for output in ("stdout", "stderr"):
+                path = directory / (name + "." + output)
+                body = (output + " original\n").encode()
+                path.write_bytes(body)
+                result[output] = {"path": str(path), "sha256": guard.digest(body), "bytes": len(body)}
+            return result
+
+        with patch.object(guard, "target_path", return_value=self.target), patch.object(guard.os, "sched_getaffinity", return_value={14, 15}), patch.object(guard.subprocess, "check_output", side_effect=lambda command, **kwargs: command[0] + " 1.97.1 (pinned)\n"), patch.object(guard, "configuration", return_value={}), patch.object(guard, "original_process", side_effect=original):
+            guard.initialize(self.root, self.target)
+            for phase in ("first", "same-input"):
+                guard.run(self.root, self.target, ["cargo", "test", "--workspace"], self.base / phase, 0, 10)
+        first = guard.read_json(self.base / "first/receipt.json")
+        second = guard.read_json(self.base / "same-input/receipt.json")
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[0], commands[1])
+        self.assertTrue(first["pristine_bootstrap"])
+        self.assertFalse(second["pristine_bootstrap"])
+        self.assertEqual(first["invalidated"], [])
+        self.assertEqual(second["invalidated"], [])
+        self.assertEqual(first["source_before"], second["source_before"])
+        for report in (first, second):
+            self.assertTrue(report["accepted"])
+            self.assertEqual(report["source_before"], report["source_after"])
+            self.assertEqual(len(report["commands"]), 1)
+            for output in ("stdout", "stderr"):
+                recorded = report["commands"][0][output]
+                self.assertEqual(guard.digest(Path(recorded["path"]).read_bytes()), recorded["sha256"])
+        marker = guard.read_json(self.target.parent / guard.MARKER)
+        self.assertFalse(marker["pending"])
+        self.assertEqual(marker["snapshot"], second["source_after"])
+
+    def test_a_b_a_content_reversion_invalidates_owned_dependents(self):
+        commands = []
+
+        def original(command, root, environment, directory, name, timeout):
+            commands.append(command)
+            self.assertTrue(guard.read_json(self.target.parent / guard.MARKER)["pending"])
+            self.target.mkdir(exist_ok=True)
+            (self.target / "CACHEDIR.TAG").write_text("test double of Cargo's own cache tag\n")
+            retained = self.target / "independent-evidence"
+            if retained.exists():
+                self.assertEqual(retained.read_bytes(), b"unrelated owned package\n")
+            else:
+                retained.write_bytes(b"unrelated owned package\n")
+            result = {"command": command, "exit_code": 0}
+            for output in ("stdout", "stderr"):
+                path = directory / (name + "." + output)
+                body = (name + " " + output + "\n").encode()
+                path.write_bytes(body)
+                result[output] = {"path": str(path), "sha256": guard.digest(body), "bytes": len(body)}
+            return result
+
+        path = self.root / "api/src/lib.rs"
+        old_timestamp = path.stat().st_mtime_ns - 3_600_000_000_000
+        with patch.object(guard, "target_path", return_value=self.target), patch.object(guard.os, "sched_getaffinity", return_value={14, 15}), patch.object(guard.subprocess, "check_output", side_effect=lambda command, **kwargs: command[0] + " 1.97.1 (pinned)\n"), patch.object(guard, "configuration", return_value={}), patch.object(guard, "original_process", side_effect=original):
+            guard.initialize(self.root, self.target)
+            for phase, value in (("a", 1), ("b", 2), ("return-a", 1)):
+                path.write_text(f"pub fn value()->u32 {{ {value} }}\n")
+                os.utime(path, ns=(old_timestamp, old_timestamp))
+                guard.run(self.root, self.target, ["cargo", "test", "--workspace"], self.base / phase, 0, 10)
+                self.assertEqual(path.stat().st_mtime_ns, old_timestamp)
+        reports = [guard.read_json(self.base / phase / "receipt.json") for phase in ("a", "b", "return-a")]
+        self.assertEqual([report["invalidated"] for report in reports], [[], ["api", "consumer"], ["api", "consumer"]])
+        self.assertEqual(reports[0]["source_before"], reports[2]["source_before"])
+        self.assertNotEqual(reports[0]["source_before"]["packages"]["api"], reports[1]["source_before"]["packages"]["api"])
+        self.assertEqual([command[1] for command in commands], ["test", "clean", "clean", "test", "clean", "clean", "test"])
+        for report in reports[1:]:
+            for result in report["commands"][:2]:
+                selected = [result["command"][index + 1] for index, argument in enumerate(result["command"]) if argument == "-p"]
+                self.assertEqual(selected, ["path+" + (self.root / name).as_uri() + "#" + name for name in ("api", "consumer")])
+            self.assertTrue(report["accepted"])
+            self.assertEqual(report["source_before"], report["source_after"])
+        self.assertEqual((self.target / "independent-evidence").read_bytes(), b"unrelated owned package\n")
+        marker = guard.read_json(self.target.parent / guard.MARKER)
+        self.assertFalse(marker["pending"])
+        self.assertEqual(marker["snapshot"], reports[2]["source_after"])
+
+    def test_failed_original_retains_pending_and_forces_all_owned_cleanup(self):
+        commands = []
+        originals = 0
+
+        def original(command, root, environment, directory, name, timeout):
+            nonlocal originals
+            commands.append(command)
+            self.assertTrue(guard.read_json(self.target.parent / guard.MARKER)["pending"])
+            self.target.mkdir(exist_ok=True)
+            (self.target / "CACHEDIR.TAG").write_text("test double of Cargo's own cache tag\n")
+            if name == "cargo":
+                originals += 1
+            result = {"command": command, "exit_code": 7 if name == "cargo" and originals == 2 else 0}
+            for output in ("stdout", "stderr"):
+                path = directory / (name + "." + output)
+                body = (name + " retained " + output + "\n").encode()
+                path.write_bytes(body)
+                result[output] = {"path": str(path), "sha256": guard.digest(body), "bytes": len(body)}
+            return result
+
+        with patch.object(guard, "target_path", return_value=self.target), patch.object(guard.os, "sched_getaffinity", return_value={14, 15}), patch.object(guard.subprocess, "check_output", side_effect=lambda command, **kwargs: command[0] + " 1.97.1 (pinned)\n"), patch.object(guard, "configuration", return_value={}), patch.object(guard, "original_process", side_effect=original):
+            guard.initialize(self.root, self.target)
+            guard.run(self.root, self.target, ["cargo", "test", "--workspace"], self.base / "success", 0, 10)
+            trusted = guard.read_json(self.target.parent / guard.MARKER)["snapshot"]
+            with self.assertRaisesRegex(guard.Refused, "original Cargo command failed"):
+                guard.run(self.root, self.target, ["cargo", "test", "--workspace"], self.base / "failed", 0, 10)
+            marker = guard.read_json(self.target.parent / guard.MARKER)
+            self.assertTrue(marker["pending"])
+            self.assertEqual(marker["snapshot"], trusted)
+            failed = guard.read_json(self.base / "failed/receipt.json")
+            self.assertFalse(failed["accepted"])
+            self.assertEqual(failed["invalidated"], [])
+            self.assertEqual(len(failed["commands"]), 1)
+            self.assertEqual(failed["commands"][0]["exit_code"], 7)
+            for output in ("stdout", "stderr"):
+                recorded = failed["commands"][0][output]
+                body = ("cargo retained " + output + "\n").encode()
+                self.assertEqual(Path(recorded["path"]).read_bytes(), body)
+                self.assertEqual(recorded["sha256"], guard.digest(body))
+            guard.run(self.root, self.target, ["cargo", "test", "--workspace"], self.base / "retry", 0, 10)
+        retry = guard.read_json(self.base / "retry/receipt.json")
+        self.assertEqual(retry["invalidated"], ["api", "consumer", "independent"])
+        self.assertEqual(retry["source_before"], trusted)
+        self.assertEqual([command[1] for command in commands], ["test", "test", "clean", "clean", "test"])
+        for result in retry["commands"][:2]:
+            selected = [result["command"][index + 1] for index, argument in enumerate(result["command"]) if argument == "-p"]
+            self.assertEqual(selected, ["path+" + (self.root / name).as_uri() + "#" + name for name in ("api", "consumer", "independent")])
+        self.assertTrue(retry["accepted"])
+        marker = guard.read_json(self.target.parent / guard.MARKER)
+        self.assertFalse(marker["pending"])
+        self.assertEqual(marker["snapshot"], trusted)
+
 
 if __name__ == "__main__":
     unittest.main()
