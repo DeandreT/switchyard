@@ -16,7 +16,11 @@ impl<S: StateStore> StateMachine<S> {
             return Ok(None);
         };
         self.require_queue_owner(namespace, entity)?;
-        Ok(Some(config))
+        Ok(Some(
+            config
+                .validate()
+                .map_err(|_| BrokerError::EntityMetadataCorrupt)?,
+        ))
     }
 
     pub(super) fn raw_queue_config(

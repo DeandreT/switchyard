@@ -64,6 +64,11 @@ TTL, message-size and history changes govern future work, not existing deadlines
 Topic/subscription propagation, administration setters and capacity accounting
 remain pending.
 
+Operational profile reads refuse invalid selected stored queue limits as corruption
+after decoding and owner proof, including backing queues and DLQs. This does not
+certify unread rows or raw catalogue listings; legacy unbound operations that do
+not select a profile remain unchanged.
+
 The [offline JWT API](offline-jwt.md) produces issuer-qualified grants;
 SAS/PLAIN principals retain verified namespace-host qualification. Protocol
 refresh/time consumers [#71](https://github.com/DeandreT/switchyard/issues/71) and

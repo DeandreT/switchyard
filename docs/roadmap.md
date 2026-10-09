@@ -11,6 +11,7 @@ own live assignments, acceptance and full dependencies.
 | [x] | Repository-owned AMQP; TCP/TLS/WSS; SASL/CBS SAS |
 | [x] | Queue batching, both receive guarantees, settlement/DLQ/deferral/peek; sessions/state, scheduling/cancellation, duplicates |
 | [x] | Ordinary queue profile updates #13; immutable modes and retained records/deadlines, no administration or capacity activation |
+| [x] | Selected stored queue-profile validation #167; corruption refusal after decode/owner proof, not raw catalogue or whole-store health |
 | [x] | Immediate/scheduled actionless topic rules/subscriptions; bounded listed-topology proof ([PR #1](https://github.com/DeandreT/switchyard/pull/1)) |
 | [x] | Memory/Fjall parity/fsynced apply; unversioned-store refusal ([PR #4](https://github.com/DeandreT/switchyard/pull/4)); production refusal and format-2 live heads |
 | [x] | Opt-in opaque committed-entry journal #144 in the existing store; full-prefix validation and ambiguous-write refusal, no replay/quorum activation |
@@ -96,7 +97,7 @@ flowchart TD
     Journal --> Proposal["#158 Durable proposal codec complete; pure only"]
     Proposal --> Checkpoint["#159 Atomic indexed apply complete; opt-in only"]
     Checkpoint --> Panic["#170 Apply-unwind retirement complete"]
-    Panic --> Integrity["#167 Selected profile integrity"]
+    Panic --> Integrity["#167 Selected profile integrity complete"]
     Integrity --> RuleIntegrity["#178 Stored rule key/filter integrity"]
     RuleIntegrity --> Cap["#168 Healthy cap refusal provenance"]
     Cap --> Log["#160 Committed replay / finish #145/#36"]
@@ -121,7 +122,7 @@ chain. Split multi-PR work into child issues before implementation.
 | Receiving/ancestors | #139/#161 primary complete; #162 has distinct management/Send/CBS/attachment children. Receiving #174 waits for #172 handoff. Then #132 links/#133 sessions; serialize listener/native/registry edits |
 | SQL | #11 pure kernel complete; [#20](https://github.com/DeandreT/switchyard/issues/20) filters waits for #16 typed content, then #21 actions. Serialize compiler/rule paths; no retained integration yet |
 | Auth activation | #8 policy merged; #71 -> #17 waits for #7. Serialize shared authorization/CBS files, not a current parallel pickup |
-| Replication | #144/#158/#159/#170 foundations complete; [#167](https://github.com/DeandreT/switchyard/issues/167) selected profiles -> [#178](https://github.com/DeandreT/switchyard/issues/178) stored rules -> [#168](https://github.com/DeandreT/switchyard/issues/168) cap provenance -> [#160](https://github.com/DeandreT/switchyard/issues/160) replay. Serialize domain/cluster/store edits; retain startup refusal |
+| Replication | #144/#158/#159/#170/#167 foundations complete; [#178](https://github.com/DeandreT/switchyard/issues/178) stored rules -> [#168](https://github.com/DeandreT/switchyard/issues/168) cap provenance -> [#160](https://github.com/DeandreT/switchyard/issues/160) replay. Serialize domain/cluster/store edits; retain startup refusal |
 | Administration | [#10](https://github.com/DeandreT/switchyard/issues/10): Atom fixtures/profiles; [#18](https://github.com/DeandreT/switchyard/issues/18): native Create/Get/List service/protobuf. No listener activation |
 | Domain ports | #14 topic/subscription profiles, #16 content, #23 duplicate history; serialize shared command/codec/key-tag/store-fence edits |
 | Client/release evidence | [#101](https://github.com/DeandreT/switchyard/issues/101): test matrix after #7; no runtime fixes |
