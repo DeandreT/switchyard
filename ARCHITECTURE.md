@@ -40,8 +40,9 @@ Accepted native connections retain their original driver and reader handles.
 Sticky stop bypasses bounded commands and interrupts driver IO/channel waits
 before normal link cleanup. `shutdown` joins both and caches results across
 canceled waiters; Drop requests stop without joining. Joined shutdown is not a
-peer Close acknowledgement. Sender-capacity waits, protocol task ownership,
-connection admission/pre-open deadlines, and process signals remain planned.
+peer Close acknowledgement. Sender-capacity waits observe Detach and command
+closure. Full task-family ownership, connection admission/pre-open deadlines,
+and process signals remain planned.
 See [native custody](crates/amqp/src/server/tasks.rs) and the
 [shutdown sequence](docs/roadmap.md#next-main-increments).
 
