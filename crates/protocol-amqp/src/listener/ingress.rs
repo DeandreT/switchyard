@@ -2,6 +2,7 @@
 
 use std::{
     future::{Future, poll_fn},
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
     task::Poll,
 };
@@ -10,11 +11,14 @@ use domain::CommandOutcome;
 
 use crate::BrokerRejection;
 
+pub(super) mod custody;
+
 pub(super) type RawSendResult = Result<CommandOutcome, BrokerRejection>;
 
 pub(super) struct SendPacket {
     pub(super) started: bool,
     pub(super) retired: bool,
+    pub(super) panicked: bool,
     pub(super) result: Option<RawSendResult>,
 }
 
@@ -24,6 +28,7 @@ pub(super) struct SendIntake<'a> {
     retired: bool,
     result: Option<RawSendResult>,
     consumed: bool,
+    panicked: bool,
 }
 
 impl<'a> SendIntake<'a> {
@@ -34,35 +39,44 @@ impl<'a> SendIntake<'a> {
             retired: false,
             result: None,
             consumed: false,
+            panicked: false,
         }
     }
 
+    #[cfg(test)]
     pub(super) fn started(&self) -> bool {
         self.started
     }
 
     /// A dropped observer retains the original future and cached result. None
-    /// means retirement before the first actual poll, not an empty outcome.
+    /// means unstarted retirement or terminal poison, never an empty outcome.
+    /// The terminal packet's panicked flag distinguishes a poisoned original.
     pub(super) async fn observe(&mut self) -> Option<&RawSendResult> {
         assert!(!self.consumed, "cannot observe a consumed send intake");
-        if self.retired && !self.started {
+        if self.panicked || (self.retired && !self.started) {
             return None;
         }
         if self.result.is_none() {
             poll_fn(|context| {
                 self.started = true;
-                match self
-                    .actual
-                    .as_mut()
-                    .expect("send intake must retain its original future")
-                    .as_mut()
-                    .poll(context)
-                {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(result) => {
+                let polled = catch_unwind(AssertUnwindSafe(|| {
+                    self.actual
+                        .as_mut()
+                        .expect("send intake must retain its original future")
+                        .as_mut()
+                        .poll(context)
+                }));
+                match polled {
+                    Ok(Poll::Pending) => Poll::Pending,
+                    Ok(Poll::Ready(result)) => {
                         self.result = Some(result);
                         self.actual = None;
                         Poll::Ready(())
+                    }
+                    Err(payload) => {
+                        self.panicked = true;
+                        self.actual = None;
+                        resume_unwind(payload)
                     }
                 }
             })
@@ -91,6 +105,7 @@ impl<'a> SendIntake<'a> {
         Some(SendPacket {
             started: self.started,
             retired: self.retired,
+            panicked: self.panicked,
             result: self.result.take(),
         })
     }

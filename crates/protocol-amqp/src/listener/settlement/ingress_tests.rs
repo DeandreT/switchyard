@@ -1,5 +1,8 @@
 //! Original inbound broker results across positively observed link retirement.
 
+#[path = "ingress_panic_tests.rs"]
+mod panic_tests;
+
 use std::{
     future::Future,
     sync::{

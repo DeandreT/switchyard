@@ -160,7 +160,7 @@ Current lifecycle contracts are scoped to these owners, not whole task trees:
 | Native sender/credit | Capacity waits observe Detach/command closure even with all 256 confirmation permits retained. Queued credit-grant replies own cleanup before observation; dropping an accepted reply cleans its exact reservation, not replacement credit. |
 | Receiving pump | Natural teardown/outer-pump panic retain one Receive/credit, begun Transfer/Delivery/reservation and at most 32 original settlement workers. Retire intake/native/workers before drains; late Pending joins the same retired worker. Ready outcomes use existing auth/settlement rules; second-mode success follows durable settlement. Unanswered remote/confirmation waits retire; begun broker submissions drain. Cleanup drains originals, conditionally removes registrations, then observes one lazy original session release. Drop retires/detaches only. |
 | Attachment/session registry | Natural retirement/outer-pump panic retain original grants, native acceptance and ready packets through receiving-entry preparation and move-only adoption. Cancelled cleanup keeps exact unregister and one lazy captured-entity/full-hold release; refusal leaves expiry. Claim before the first helper await; installation rechecks latest claim and original End/Detach after row-lock admission. Failed newest claims preserve installed rows without reviving older work. No atomic link/hold liveness or successor task-family custody. |
-| Inbound Send/Batch | Natural Detach/auth retirement retains the original result, without replacement, committed-send rollback or new late acknowledgement. Cancelling a queued acknowledgement does not prove it was unsent. Outer-pump panic custody #127 remains pending. |
+| Inbound Send/Batch | Natural retirement/per-delivery pump panic retain one original command, raw result and native Accept/Reject/Unauthorized Close until cleanup. Selected Detach/auth exits keep late native results benign and suppress reporting-only panics; genuinely panicked drain originals remain faults. No replacement, rollback or new late acknowledgement; cancelling a queued acknowledgement does not prove it was unsent. |
 | Management | Natural retirement/outer-pump panic discard pre-invocation preparation but retain begun commands/post-result registry work and original native acknowledgements/replies/confirmations. Cancelled cleanup keeps both reply/Close outcomes and captured-route identity. No new late reply/confirmation. |
 | CBS | Natural retirement/outer-pump panic retain original token validation/store, native work and completed packets through captured-route cleanup. No installed-grant rollback, selected-route retry, new acknowledgement or second confirmation. Bootstrap needs no existing grant. |
 
@@ -174,7 +174,7 @@ original native errors precede cleanup errors. Connection, management, CBS and a
 also precede secondary diagnostic failures; native attachment Detach remains benign.
 Late Receive results cause no Transfer or implicit settlement: PeekLock waits for
 expiry; ReceiveAndDelete can be lost. Auth retirement does not roll back a begun
-Transfer. Merged connection/receiving/management/CBS/attachment panic custody terminal-marks a panicked original
+Transfer. Merged connection/receiving/Send/management/CBS/attachment panic custody terminal-marks a panicked original
 without repoll, retry or fabricated success; accepted work is not recovered.
 
 Captured delivery identities fence worker/residual cleanup and management

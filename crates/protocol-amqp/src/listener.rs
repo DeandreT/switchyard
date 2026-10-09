@@ -5,7 +5,10 @@
 //! holding one, the lock simply expires and the message is redelivered. That is
 //! what makes an abrupt disconnect safe.
 
-use std::{panic::AssertUnwindSafe, sync::Arc};
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    sync::Arc,
+};
 
 use amqp::{
     AmqpError, EngineError, Error as AmqpProtocolError, ErrorCondition, Fields, LinkEndpoint,
@@ -42,6 +45,7 @@ mod settlement;
 use attachments::serve_entity_attachment;
 use connection_custody::{ConnectionCustody, NativePacket, PumpPoint};
 use ingress::SendIntake;
+use ingress::custody::{NativeSend, PumpPoint as SendPumpPoint, SendCustody};
 
 const LOCKED_UNTIL_UTC_PROPERTY: &str = "com.microsoft:locked-until-utc";
 const DOTNET_UNIX_EPOCH_TICKS: u64 = 621_355_968_000_000_000;
@@ -700,20 +704,26 @@ async fn serve_sending_client<B: Broker>(
     authorization: Option<LinkAuthorization>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let detached = receiver.on_detach_owned();
-    tokio::pin!(detached);
-    let unauthorized = async {
-        match authorization.as_ref() {
-            Some(authorization) => authorization.wait_until_unauthorized().await,
-            None => std::future::pending().await,
+    let retirement = async {
+        tokio::select! {
+            biased;
+            () = detached => SendRetirement::Detached,
+            () = async {
+                match authorization.as_ref() {
+                    Some(authorization) => authorization.wait_until_unauthorized().await,
+                    None => std::future::pending().await,
+                }
+            } => SendRetirement::Unauthorized,
         }
     };
-    tokio::pin!(unauthorized);
-
-    let retirement = loop {
+    tokio::pin!(retirement);
+    loop {
         let received = tokio::select! {
             biased;
-            () = &mut detached => break SendRetirement::Detached,
-            () = &mut unauthorized => break SendRetirement::Unauthorized,
+            exit = &mut retirement => {
+                if matches!(exit, SendRetirement::Unauthorized) { close_sending_client(&receiver).await?; }
+                return Ok(());
+            },
             received = receiver.recv() => received,
         };
         let delivery = match received {
@@ -721,145 +731,205 @@ async fn serve_sending_client<B: Broker>(
             // The engine already answered a remote Detach. A late local close
             // could detach a replacement link that reused this handle.
             Err(EngineError::RemoteClosed | EngineError::RemoteDetached | EngineError::Stopped) => {
-                break SendRetirement::Detached;
+                return Ok(());
             }
             Err(error) => return Err(error.into()),
         };
         if let Some(authorization) = authorization.as_ref() {
             let prepared = tokio::select! {
                 biased;
-                () = &mut detached => break SendRetirement::Detached,
-                () = &mut unauthorized => break SendRetirement::Unauthorized,
-                prepared = authorization.ensure() => prepared,
+                exit = &mut retirement => Err(exit),
+                prepared = authorization.ensure() => prepared.map_err(|_| SendRetirement::Unauthorized),
             };
-            if prepared.is_err() {
-                break SendRetirement::Unauthorized;
+            if let Err(exit) = prepared {
+                if matches!(exit, SendRetirement::Unauthorized) {
+                    close_sending_client(&receiver).await?;
+                }
+                return Ok(());
             }
         }
-        let incoming = match read_incoming_messages(
-            delivery.message_format(),
-            delivery.message(),
-            delivery.encoded_message(),
-        ) {
-            Ok(incoming) => incoming,
-            Err(error) => {
-                // The client's message, the client's fault: reject this transfer
-                // and keep the link.
-                tokio::select! {
-                    biased;
-                    () = &mut detached => break SendRetirement::Detached,
-                    () = &mut unauthorized => break SendRetirement::Unauthorized,
-                    rejected = receiver.reject(
-                        &delivery,
-                        Some(error_for(AmqpError::InvalidField, error.to_string())),
-                    ) => rejected?,
-                }
-                continue;
+        let mut custody = SendCustody::default();
+        let primary = AssertUnwindSafe(send_delivery_pump(
+            &receiver,
+            &delivery,
+            &namespace,
+            &entity,
+            &broker,
+            &mut custody,
+            retirement.as_mut(),
+        ))
+        .catch_unwind()
+        .await;
+        if let Some(exit) = finish_send(&mut custody, primary).await? {
+            if matches!(exit, SendRetirement::Unauthorized) {
+                close_sending_client(&receiver).await?;
             }
-        };
-
-        let (command, expected) = match incoming {
-            IncomingMessages::Single(incoming) => (
-                CommandKind::Send {
-                    message_id: incoming.message_id,
-                    body: incoming.body,
-                    time_to_live_millis: incoming.time_to_live_millis,
-                    session_id: incoming.session_id,
-                    scheduled_enqueue_at: incoming.scheduled_enqueue_at,
-                    envelope: Some(incoming.envelope),
-                },
-                SendOutcome::Single,
-            ),
-            IncomingMessages::Batch(messages) => {
-                let count = messages.len();
-                (
-                    CommandKind::SendBatch {
-                        messages: messages.into_iter().map(Into::into).collect(),
-                    },
-                    SendOutcome::Batch(count),
-                )
-            }
-        };
-        let mut original = SendIntake::new(async {
-            broker
-                .submit(namespace.clone(), entity.clone(), command)
-                .await
-        });
-        let retired = tokio::select! {
-            biased;
-            () = &mut detached => Some(SendRetirement::Detached),
-            () = &mut unauthorized => Some(SendRetirement::Unauthorized),
-            _ = original.observe() => None,
-        };
-        if let Some(retirement) = retired {
-            debug!(started = original.started(), "draining retired Send intake");
-            #[cfg(test)]
-            let _ = SEND_INTAKE_RETIREMENT.try_with(|witness| witness.notify_one());
-            let _ = original.finish().await;
-            let packet = original
-                .take_packet()
-                .expect("finished Send owns one terminal packet");
-            debug!(
-                started = packet.started,
-                retired = packet.retired,
-                "retired Send result observed without new acknowledgement"
-            );
-            match packet.result {
-                Some(Ok(other)) if !expected.matches(&other) => {
-                    warn!(?other, "retired Send produced an unexpected outcome");
-                }
-                Some(Err(rejection)) => debug!(%rejection, "retired Send was rejected"),
-                _ => {}
-            }
-            break retirement;
+            return Ok(());
         }
-        let packet = original
-            .take_packet()
-            .expect("observed Send owns one terminal packet");
-        debug_assert!(packet.started && !packet.retired);
-        let outcome = packet.result.expect("active Send was not retired");
+    }
+}
 
-        // Accepting only after the command committed is what makes the
-        // acknowledgement mean the message is durable.
-        let acknowledgement = async {
-            match outcome {
-                Ok(outcome) if expected.matches(&outcome) => receiver.accept(&delivery).await,
-                Ok(other) => {
-                    receiver
-                        .reject(
-                            &delivery,
-                            Some(error_for(
-                                AmqpError::InternalError,
-                                format!("send produced an unexpected outcome: {other:?}"),
-                            )),
-                        )
-                        .await
+async fn finish_send(
+    custody: &mut SendCustody<'_>,
+    primary: std::thread::Result<Result<Option<SendRetirement>, EngineError>>,
+) -> Result<Option<SendRetirement>, EngineError> {
+    let cleanup = AssertUnwindSafe(custody.finish()).catch_unwind().await;
+    let diagnostics = if cleanup.is_ok() {
+        catch_unwind(AssertUnwindSafe(|| custody.report())).err()
+    } else {
+        None
+    };
+    let cleanup_panic = cleanup.err().or_else(|| custody.take_secondary());
+    match primary {
+        Err(payload) => resume_unwind(payload),
+        Ok(Err(error)) => Err(error),
+        Ok(Ok(exit)) => {
+            if exit.is_some() {
+                if let Some(payload) = cleanup_panic {
+                    resume_unwind(payload);
                 }
-                Err(rejection) => {
-                    receiver
-                        .reject(&delivery, Some(rejection_error(&rejection)))
-                        .await
-                }
+                return Ok(exit);
             }
-        };
-        tokio::select! {
-            biased;
-            () = &mut detached => break SendRetirement::Detached,
-            () = &mut unauthorized => break SendRetirement::Unauthorized,
-            acknowledged = acknowledgement => acknowledged?,
+            if let Some(error) = custody.take_native_error() {
+                return Err(error);
+            }
+            if let Some(payload) = cleanup_panic.or(diagnostics) {
+                resume_unwind(payload);
+            }
+            Ok(exit)
+        }
+    }
+}
+
+async fn send_delivery_pump<'a, B: Broker>(
+    receiver: &'a Receiver,
+    delivery: &'a amqp::Delivery,
+    namespace: &'a NamespaceName,
+    entity: &'a EntityPath,
+    broker: &'a B,
+    custody: &mut SendCustody<'a>,
+    mut retirement: std::pin::Pin<&mut (impl std::future::Future<Output = SendRetirement> + Send)>,
+) -> Result<Option<SendRetirement>, EngineError> {
+    let incoming = match read_incoming_messages(
+        delivery.message_format(),
+        delivery.message(),
+        delivery.encoded_message(),
+    ) {
+        Ok(incoming) => incoming,
+        Err(error) => {
+            // The client's message, the client's fault: reject this transfer
+            // and keep the link.
+            custody.native = Some(NativeSend::new(receiver.reject(
+                delivery,
+                Some(error_for(AmqpError::InvalidField, error.to_string())),
+            )));
+            return observe_send_native(custody, retirement.as_mut()).await;
         }
     };
 
-    if matches!(retirement, SendRetirement::Unauthorized) {
+    let (command, expected) = match incoming {
+        IncomingMessages::Single(incoming) => (
+            CommandKind::Send {
+                message_id: incoming.message_id,
+                body: incoming.body,
+                time_to_live_millis: incoming.time_to_live_millis,
+                session_id: incoming.session_id,
+                scheduled_enqueue_at: incoming.scheduled_enqueue_at,
+                envelope: Some(incoming.envelope),
+            },
+            SendOutcome::Single,
+        ),
+        IncomingMessages::Batch(messages) => {
+            let count = messages.len();
+            (
+                CommandKind::SendBatch {
+                    messages: messages.into_iter().map(Into::into).collect(),
+                },
+                SendOutcome::Batch(count),
+            )
+        }
+    };
+    custody.expected = Some(expected);
+    custody.original = Some(SendIntake::new(async {
+        broker
+            .submit(namespace.clone(), entity.clone(), command)
+            .await
+    }));
+    ingress::custody::pump_checkpoint(SendPumpPoint::Prepared).await;
+    let retired = tokio::select! {
+        biased;
+        exit = retirement.as_mut() => Some(exit),
+        () = ingress::custody::pump_fault(SendPumpPoint::Send) => unreachable!("Send checkpoint panics"),
+        _ = custody.original.as_mut().unwrap().observe() => None,
+    };
+    if let Some(retirement) = retired {
+        #[cfg(test)]
+        let _ = SEND_INTAKE_RETIREMENT.try_with(|witness| witness.notify_one());
+        return Ok(Some(retirement));
+    }
+    custody.capture_send();
+    ingress::custody::pump_checkpoint(SendPumpPoint::Packet).await;
+    let packet = custody.packet.as_ref().unwrap();
+    debug_assert!(packet.started && !packet.retired);
+    let outcome = packet.result.as_ref().expect("active Send was not retired");
+
+    // Accepting only after the command committed is what makes the
+    // acknowledgement mean the message is durable.
+    custody.native = Some(match outcome {
+        Ok(outcome) if expected.matches(outcome) => NativeSend::new(receiver.accept(delivery)),
+        Ok(other) => NativeSend::new(receiver.reject(
+            delivery,
+            Some(error_for(
+                AmqpError::InternalError,
+                format!("send produced an unexpected outcome: {other:?}"),
+            )),
+        )),
+        Err(rejection) => {
+            NativeSend::new(receiver.reject(delivery, Some(rejection_error(rejection))))
+        }
+    });
+    observe_send_native(custody, retirement.as_mut()).await
+}
+
+async fn observe_send_native(
+    custody: &mut SendCustody<'_>,
+    mut retirement: std::pin::Pin<&mut (impl std::future::Future<Output = SendRetirement> + Send)>,
+) -> Result<Option<SendRetirement>, EngineError> {
+    ingress::custody::pump_checkpoint(SendPumpPoint::NativePrepared).await;
+    tokio::select! {
+        biased;
+        exit = retirement.as_mut() => return Ok(Some(exit)),
+        () = ingress::custody::pump_fault(SendPumpPoint::Native) => unreachable!("native Send checkpoint panics"),
+        _ = custody.native.as_mut().unwrap().observe() => {},
+    }
+    custody.capture_native();
+    ingress::custody::pump_checkpoint(SendPumpPoint::NativePacket).await;
+    if let Some(error) = custody.take_native_error() {
+        return Err(error);
+    }
+    Ok(None)
+}
+
+async fn close_sending_client(receiver: &Receiver) -> Result<(), EngineError> {
+    let mut custody = SendCustody::default();
+    custody.close = Some(NativeSend::new(receiver.close_with_error(
+        unauthorized_error("the link's authorization has expired"),
+    )));
+    let primary = AssertUnwindSafe(async {
+        ingress::custody::pump_checkpoint(SendPumpPoint::ClosePrepared).await;
         // Prefer observed original-link retirement to a new local auth Close.
         tokio::select! {
             biased;
-            () = &mut detached => {}
-            closed = receiver.close_with_error(unauthorized_error(
-                "the link's authorization has expired",
-            )) => closed?,
+            () = receiver.on_detach_owned() => return Ok(Some(SendRetirement::Detached)),
+            () = ingress::custody::pump_fault(SendPumpPoint::Close) => unreachable!("Send Close checkpoint panics"),
+            _ = custody.close.as_mut().unwrap().observe() => {},
         }
-    }
+        custody.capture_close();
+        ingress::custody::pump_checkpoint(SendPumpPoint::ClosePacket).await;
+        if let Some(error) = custody.take_native_error() { return Err(error); }
+        Ok(None)
+    }).catch_unwind().await;
+    finish_send(&mut custody, primary).await?;
     Ok(())
 }
 
