@@ -14,8 +14,8 @@ acceptance and full dependencies; [compatibility](compatibility.md) owns guarant
 - [x] Selected stored-rule key/filter integrity #178; bounded read/error ordering
   unchanged, no row repair or global catalogue proof.
 - [x] Memory/Fjall/fsynced apply, unversioned refusal ([PR #4](https://github.com/DeandreT/switchyard/pull/4)),
-  format-2 live heads/production refusal; opt-in journal #144 (full-prefix validation,
-  ambiguous-write refusal), pure [proposal #158](../crates/domain/src/durable_proposal.rs)
+  format-2 live heads/production refusal; opt-in journal #144/#190 (full-prefix
+  validation, ambiguous-write/unwind retirement), pure [proposal #158](../crates/domain/src/durable_proposal.rs)
   (frozen time/authority), [indexed apply #159/#170](../crates/domain/src/indexed.rs)
   (atomic effects/Clock/checkpoint, outcome-free latest duplicate, caught-apply-unwind
   retirement). External exclusive writes; no replay/quorum activation.
@@ -71,7 +71,7 @@ flowchart TD
     Delete --> Ledger
     Queues --> Topics["#28 Finite topics"]
     Ledger --> Topics
-    Main --> Durable["Merged #144 journal/#158 proposal/#159 indexed/#170 unwind/#167 profiles/#178 rules"]
+    Main --> Durable["Merged #144/#190 journal/#158 proposal/#159 indexed/#170 unwind/#167 profiles/#178 rules"]
     Durable --> Integrity["#168 Healthy cap provenance"]
     Integrity --> Replay["#160 Replay; finish #145/#36 -> #37 Snapshots -> #38 Quorum"]
     Replay --> Runtime["#41 All-command production runtime"]

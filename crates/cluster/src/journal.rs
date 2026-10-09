@@ -78,6 +78,9 @@ pub enum JournalError {
 /// caller constructing a journal over a cloned store. Such concurrent writers,
 /// or raw mutations of this prefix, violate the ownership precondition. No
 /// database-wide registry or compare-and-swap is implied by `&mut self`.
+/// An attempted storage apply retires this owner before invocation; only success
+/// and cache updates restore usability. A returned error or explicitly caught
+/// unwind requires reopen. No panic is caught here.
 #[derive(Debug)]
 pub struct Journal<S> {
     store: S,
@@ -183,9 +186,9 @@ impl<S: StateStore> Journal<S> {
     /// Durably appends exactly the next index, without advancing the frontier.
     ///
     /// The first append atomically writes root, frontier zero, and entry one.
-    /// A duplicate is refused even if its opaque payload matches. After any
-    /// apply error the owner is unusable until reopen: an error does not prove
-    /// the original batch was absent from the durable store.
+    /// A duplicate is refused even if its opaque payload matches. A returned
+    /// storage-apply error or explicitly caught unwind requires reopen: neither
+    /// proves that the original batch was absent from the durable store.
     pub fn append(&mut self, index: u64, payload: &[u8]) -> Result<(), JournalError> {
         self.require_usable()?;
         let expected = next_index(self.last_appended)?;
@@ -213,6 +216,7 @@ impl<S: StateStore> Journal<S> {
         self.persist(batch)?;
         self.initialized = true;
         self.last_appended = index;
+        self.usable = true;
         Ok(())
     }
 
@@ -237,6 +241,7 @@ impl<S: StateStore> Journal<S> {
             WriteBatch::default().put(metadata_key(FRONTIER_TAG), encode_frontier(index)),
         )?;
         self.committed = index;
+        self.usable = true;
         Ok(())
     }
 
@@ -292,8 +297,8 @@ impl<S: StateStore> Journal<S> {
     }
 
     fn persist(&mut self, batch: WriteBatch) -> Result<(), JournalError> {
+        self.usable = false;
         if let Err(error) = self.store.apply(batch) {
-            self.usable = false;
             return Err(JournalError::Storage(error));
         }
         Ok(())

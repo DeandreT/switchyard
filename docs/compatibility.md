@@ -67,11 +67,12 @@ Commands carry time and commit one batch. Rejection changes no messages, counter
 history or Clock; validation precedes allocation/history mutation. Session batches
 share one session. Deduplication suppresses sends, not lock redelivery.
 
-Opt-in indexed apply atomically commits effects/Clock/checkpoint. Returned storage-apply
-errors or explicitly caught storage-apply unwinds require reopen; only successful apply
-and cache update restore usability. With external exclusive writes, reopen resolves
-an unapplied index or outcome-free latest duplicate, not a recovered panic, quorum
-or power-cut guarantee.
+Opt-in indexed apply atomically commits effects/Clock/checkpoint. Both it and the
+opt-in journal retire before storage apply; only success and cache updates restore
+usability. Returned storage-apply errors or explicitly caught storage-apply unwinds
+require reopen. With external exclusive writes, journal reopen reads append
+presence/commit frontier; indexed reopen exposes an unapplied index or outcome-free
+latest duplicate. Neither recovers a panic or provides quorum/power-cut guarantees.
 
 Peek-lock commits ownership before transfer and deletes only on settlement;
 receive-delete deletes first. Renewal preserves

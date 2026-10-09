@@ -1,6 +1,9 @@
 //! Real backends with explicit logical reopen and simulated apply errors.
 //! These controls do not simulate a power cut or a failed fsync syscall.
 
+#[path = "committed_journal/panic_apply_tests.rs"]
+mod panic_apply_tests;
+
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
