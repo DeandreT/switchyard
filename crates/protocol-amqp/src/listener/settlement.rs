@@ -89,6 +89,7 @@ enum PumpExit {
 /// remote credit and reached the wire. Once started, its remote disposition is
 /// independent: several peek locks may remain outstanding and settle in any
 /// order without stalling new credit.
+#[cfg(test)]
 pub(super) async fn serve_receiving_client<B: Broker>(
     sender: Sender,
     namespace: NamespaceName,
@@ -98,6 +99,36 @@ pub(super) async fn serve_receiving_client<B: Broker>(
     session: Option<SessionHold>,
     protocol: ReceivingLinkProtocol,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let entry =
+        prepare_receiving_entry(&sender, namespace, entity, broker, mode, session, protocol);
+    serve_receiving_entry(sender, entry).await
+}
+
+pub(super) struct PreparedReceivingEntry<B> {
+    namespace: NamespaceName,
+    entity: EntityPath,
+    broker: B,
+    mode: ReceiveMode,
+    session: Option<SessionHold>,
+    authorization: Option<LinkAuthorization>,
+    management: std::sync::Arc<ConnectionManagement>,
+    link_name: String,
+    context: SettlementContext<B>,
+    custody: ReceivingCustody<'static>,
+    detached: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+}
+
+/// Prepare every callback/allocation-prone receiving-entry field before the
+/// attachment owner transfers its ready Sender and exact session grant.
+pub(super) fn prepare_receiving_entry<B: Broker>(
+    sender: &Sender,
+    namespace: NamespaceName,
+    entity: EntityPath,
+    broker: B,
+    mode: ReceiveMode,
+    session: Option<SessionHold>,
+    protocol: ReceivingLinkProtocol,
+) -> PreparedReceivingEntry<B> {
     let ReceivingLinkProtocol {
         authorization,
         management,
@@ -111,10 +142,41 @@ pub(super) async fn serve_receiving_client<B: Broker>(
         authorization: authorization.clone(),
         management: management.clone(),
     };
-    let mut custody =
-        ReceivingCustody::new(&settlement_context, session.clone(), session_registration);
-    let detached = sender.on_detach_owned();
-    tokio::pin!(detached);
+    let custody = ReceivingCustody::new(&settlement_context, session.clone(), session_registration);
+    let detached = Box::pin(sender.on_detach_owned());
+    PreparedReceivingEntry {
+        namespace,
+        entity,
+        broker,
+        mode,
+        session,
+        authorization,
+        management,
+        link_name,
+        context: settlement_context,
+        custody,
+        detached,
+    }
+}
+
+pub(super) async fn serve_receiving_entry<B: Broker>(
+    sender: Sender,
+    entry: PreparedReceivingEntry<B>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let PreparedReceivingEntry {
+        namespace,
+        entity,
+        broker,
+        mode,
+        session,
+        authorization,
+        management,
+        link_name,
+        context: settlement_context,
+        custody,
+        mut detached,
+    } = entry;
+    let mut custody = custody.into_borrowed();
 
     // The pump borrows custody: unwinding it cannot drop admitted originals.
     let pumped = std::panic::AssertUnwindSafe(observe_pump(async {
@@ -471,6 +533,7 @@ async fn wait_until_link_unauthorized(authorization: Option<&LinkAuthorization>)
 
 /// Frees the session a link held, so the next receiver need not wait out the
 /// lock. Failure is survivable: expiry frees it anyway.
+#[cfg(test)]
 pub(super) async fn release_session<B: Broker>(
     broker: &B,
     namespace: &NamespaceName,

@@ -19,7 +19,7 @@ use serde_amqp::{Value, primitives::Symbol};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::{
     Attachment, Broker, BrokerRejection, IncomingMessages, ProtocolError,
@@ -39,10 +39,9 @@ pub(crate) mod connection_custody;
 mod ingress;
 mod settlement;
 
-use attachments::{EntityLink, accept_entity_link};
+use attachments::serve_entity_attachment;
 use connection_custody::{ConnectionCustody, NativePacket, PumpPoint};
 use ingress::SendIntake;
-use settlement::serve_receiving_client;
 
 const LOCKED_UNTIL_UTC_PROPERTY: &str = "com.microsoft:locked-until-utc";
 const DOTNET_UNIX_EPOCH_TICKS: u64 = 621_355_968_000_000_000;
@@ -564,14 +563,7 @@ async fn serve_session<B: Broker>(
         // source. The other terminus may carry a generated link address.
         debug!(%address, ?attach, "accepting entity link");
 
-        let Some(EntityLink {
-            endpoint,
-            entity,
-            accepted,
-            registration,
-            authorization: link_authorization,
-            mode,
-        }) = accept_entity_link(
+        serve_entity_attachment(
             &session,
             &broker,
             &namespace,
@@ -580,56 +572,7 @@ async fn serve_session<B: Broker>(
             authorization.as_ref(),
             &management,
         )
-        .await?
-        else {
-            continue;
-        };
-
-        info!(%address, entity = %entity, session = accepted.as_ref().map(|accepted| accepted.session_id.as_str()), "link attached");
-        let broker = broker.clone();
-        let namespace = namespace.clone();
-        match endpoint {
-            // The client sends; this end receives.
-            LinkEndpoint::Receiver(receiver) => {
-                tokio::spawn(async move {
-                    if let Err(error) = serve_sending_client(
-                        receiver,
-                        namespace,
-                        entity,
-                        broker,
-                        link_authorization,
-                    )
-                    .await
-                    {
-                        warn!(%error, "sending link ended");
-                    }
-                });
-            }
-            // The client receives; this end sends.
-            LinkEndpoint::Sender(sender) => {
-                let hold = accepted.map(|accepted| accepted.hold());
-                let connection_management = Arc::clone(&management);
-                tokio::spawn(async move {
-                    let result = serve_receiving_client(
-                        sender,
-                        namespace,
-                        entity.clone(),
-                        broker,
-                        mode,
-                        hold.clone(),
-                        ReceivingLinkProtocol {
-                            authorization: link_authorization,
-                            management: Arc::clone(&connection_management),
-                            session_registration: registration,
-                        },
-                    )
-                    .await;
-                    if let Err(error) = result {
-                        warn!(%error, "receiving link ended");
-                    }
-                });
-            }
-        }
+        .await?;
     }
     Ok(())
 }

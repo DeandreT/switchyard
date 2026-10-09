@@ -187,6 +187,12 @@ pub(super) struct ReceivingCustody<'a> {
     reported: bool,
 }
 
+impl ReceivingCustody<'static> {
+    pub(super) fn into_borrowed<'a>(self) -> ReceivingCustody<'a> {
+        self
+    }
+}
+
 impl<'a> ReceivingCustody<'a> {
     pub(super) fn new<B: Broker>(
         context: &SettlementContext<B>,

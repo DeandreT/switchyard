@@ -41,6 +41,9 @@ const CHANNEL: u16 = 1;
 const HANDLE: u32 = 1;
 const LINK: &str = "exact-handoff";
 
+#[path = "attachment_panic_tests.rs"]
+mod panic_tests;
+
 fn frame(channel: u16, performative: Performative) -> Frame {
     Frame::Amqp {
         channel,

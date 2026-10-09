@@ -2,6 +2,7 @@
 
 use std::{
     future::{Future, poll_fn},
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     pin::Pin,
     sync::Arc,
     task::Poll,
@@ -17,19 +18,22 @@ use domain::{
 };
 use futures_util::FutureExt;
 use serde_amqp::primitives::Symbol;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 use crate::{
     Broker, BrokerRejection, SessionRequest,
     authorization::ConnectionAuthorization,
-    management::{ConnectionManagement, SessionRegistration},
+    management::{ConnectionManagement, SessionClaim, SessionRegistration},
     read_session_filter, stamp_session_filter,
 };
 
 use super::{
-    LinkAuthorization, detach_with, error_for, rejection_error, resolve_entity,
+    LinkAuthorization, ReceivingLinkProtocol, error_for, rejection_error, resolve_entity,
     session_attach_properties, settlement, unauthorized_error,
 };
+
+pub(super) mod custody;
+use custody::{AttachmentCustody, PumpPoint, pump_checkpoint, pump_fault};
 
 pub(super) type RawGrantResult = Result<CommandOutcome, BrokerRejection>;
 pub(super) type RawAttachResult = Result<LinkEndpoint, EngineError>;
@@ -50,6 +54,7 @@ pub(super) struct HandoffPacket {
     pub(super) phase: HandoffPhase,
     pub(super) started: bool,
     pub(super) retired: bool,
+    pub(super) panicked: bool,
     pub(super) accepted: Option<AcceptedSession>,
     pub(super) step: Option<HandoffStep>,
 }
@@ -64,6 +69,7 @@ pub(super) struct AttachmentHandoff<'a> {
     available: bool,
     result: Option<HandoffStep>,
     accepted: Option<AcceptedSession>,
+    panicked: bool,
 }
 
 impl<'a> AttachmentHandoff<'a> {
@@ -78,6 +84,7 @@ impl<'a> AttachmentHandoff<'a> {
             available: true,
             result: None,
             accepted: None,
+            panicked: false,
         }
     }
 
@@ -147,7 +154,7 @@ impl<'a> AttachmentHandoff<'a> {
         if self.session.is_ended() {
             self.retire();
         }
-        if self.retired && !self.started {
+        if self.panicked || (self.retired && !self.started) {
             return None;
         }
         if self.result.is_none() {
@@ -159,18 +166,24 @@ impl<'a> AttachmentHandoff<'a> {
                     return Poll::Ready(());
                 }
                 self.started = true;
-                match self
-                    .actual
-                    .as_mut()
-                    .expect("handoff retains its original phase")
-                    .as_mut()
-                    .poll(context)
-                {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(result) => {
+                let polled = catch_unwind(AssertUnwindSafe(|| {
+                    self.actual
+                        .as_mut()
+                        .expect("handoff retains its original phase")
+                        .as_mut()
+                        .poll(context)
+                }));
+                match polled {
+                    Ok(Poll::Pending) => Poll::Pending,
+                    Ok(Poll::Ready(result)) => {
                         self.result = Some(result);
                         self.actual = None;
                         Poll::Ready(())
+                    }
+                    Err(payload) => {
+                        self.panicked = true;
+                        self.actual = None;
+                        resume_unwind(payload)
                     }
                 }
             })
@@ -214,6 +227,7 @@ impl<'a> AttachmentHandoff<'a> {
             phase: self.phase,
             started: self.started,
             retired: self.retired,
+            panicked: self.panicked,
             accepted: self.accepted.take(),
             step: self.result.take(),
         })
@@ -273,14 +287,62 @@ async fn prepare_link(
     })
 }
 
+#[cfg(test)]
 pub(super) async fn accept_entity_link<B: Broker>(
     session: &ServerSession,
     broker: &B,
     namespace: &NamespaceName,
     address: &str,
-    mut attach: Attach,
+    attach: Attach,
     authorization: Option<&Arc<ConnectionAuthorization>>,
     management: &Arc<ConnectionManagement>,
+) -> Result<Option<EntityLink>, EngineError> {
+    run_entity_handoff(
+        session,
+        broker,
+        namespace,
+        address,
+        attach,
+        authorization,
+        management,
+        false,
+    )
+    .await
+}
+
+pub(super) async fn serve_entity_attachment<B: Broker>(
+    session: &ServerSession,
+    broker: &B,
+    namespace: &NamespaceName,
+    address: &str,
+    attach: Attach,
+    authorization: Option<&Arc<ConnectionAuthorization>>,
+    management: &Arc<ConnectionManagement>,
+) -> Result<(), EngineError> {
+    run_entity_handoff(
+        session,
+        broker,
+        namespace,
+        address,
+        attach,
+        authorization,
+        management,
+        true,
+    )
+    .await
+    .map(|_| ())
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn run_entity_handoff<B: Broker>(
+    session: &ServerSession,
+    broker: &B,
+    namespace: &NamespaceName,
+    address: &str,
+    attach: Attach,
+    authorization: Option<&Arc<ConnectionAuthorization>>,
+    management: &Arc<ConnectionManagement>,
+    serve: bool,
 ) -> Result<Option<EntityLink>, EngineError> {
     let resolved = resolve_entity(address, attach.role.clone())
         .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()));
@@ -298,14 +360,93 @@ pub(super) async fn accept_entity_link<B: Broker>(
         SenderSettleMode::Settled => ReceiveMode::ReceiveAndDelete,
         SenderSettleMode::Unsettled | SenderSettleMode::Mixed => ReceiveMode::PeekLock,
     };
-    let mut handoff = AttachmentHandoff::new(session);
+    let mut custody = AttachmentCustody::new(session);
+    let primary = AssertUnwindSafe(async {
+        let ready = entity_attachment_pump(
+            session,
+            broker,
+            namespace,
+            address,
+            attach,
+            authorization,
+            management,
+            resolved,
+            claim.as_ref(),
+            mode,
+            &mut custody,
+        )
+        .await?;
+        if !ready {
+            return Ok(None);
+        }
+        pump_checkpoint(PumpPoint::Ready).await;
+        if serve {
+            prepare_and_adopt(
+                session,
+                broker,
+                namespace,
+                address,
+                management,
+                &mut custody,
+            )
+            .await;
+            Ok(None)
+        } else {
+            Ok(Some(custody.adopt()))
+        }
+    })
+    .catch_unwind()
+    .await;
+    let cleanup = AssertUnwindSafe(custody.finish(broker, namespace, management))
+        .catch_unwind()
+        .await;
+    let diagnostics = if cleanup.is_ok() {
+        catch_unwind(AssertUnwindSafe(|| custody.report())).err()
+    } else {
+        None
+    };
+    let secondary = cleanup
+        .err()
+        .or_else(|| custody.take_cleanup_panic())
+        .or(diagnostics);
+    match primary {
+        Err(payload) => resume_unwind(payload),
+        Ok(Err(error)) => Err(error),
+        Ok(Ok(result)) => {
+            if let Some(error) = custody.take_native_error() {
+                return match error {
+                    EngineError::RemoteDetached => Ok(result),
+                    error => Err(error),
+                };
+            }
+            if let Some(payload) = secondary {
+                resume_unwind(payload);
+            }
+            Ok(result)
+        }
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+async fn entity_attachment_pump<'a, B: Broker>(
+    session: &'a ServerSession,
+    broker: &'a B,
+    namespace: &NamespaceName,
+    address: &str,
+    mut attach: Attach,
+    authorization: Option<&Arc<ConnectionAuthorization>>,
+    management: &Arc<ConnectionManagement>,
+    resolved: Result<EntityPath, AmqpProtocolError>,
+    claim: Option<&SessionClaim>,
+    mode: ReceiveMode,
+    custody: &mut AttachmentCustody<'a>,
+) -> Result<bool, EngineError> {
     let ended = session.on_end_owned();
     tokio::pin!(ended);
     let mut plan = tokio::select! {
         biased;
         () = &mut ended => {
-            retire_handoff(&mut handoff, broker, namespace, None, management, None).await;
-            return Ok(None);
+            return Ok(false);
         }
         plan = async {
             match resolved {
@@ -315,11 +456,11 @@ pub(super) async fn accept_entity_link<B: Broker>(
         } => plan,
     };
     if session.is_ended() {
-        retire_handoff(&mut handoff, broker, namespace, None, management, None).await;
-        return Ok(None);
+        return Ok(false);
     }
 
     if let Ok(prepared) = &plan {
+        custody.entity = Some(prepared.entity.clone());
         let session_id = match &prepared.session {
             SessionRequest::None => None,
             SessionRequest::NextAvailable => Some(None),
@@ -332,113 +473,104 @@ pub(super) async fn accept_entity_link<B: Broker>(
                 session_id,
                 lock_duration_millis: None,
             };
-            handoff.begin_grant(async move {
+            custody.handoff.begin_grant(async move {
                 broker.submit(grant_namespace, grant_entity, command).await
             });
-            let _ = handoff.observe().await;
-            let grant = match handoff.take_step() {
-                Some(HandoffStep::Grant(grant)) => grant,
-                None => {
-                    retire_handoff(
-                        &mut handoff,
-                        broker,
-                        namespace,
-                        Some(&prepared.entity),
-                        management,
-                        None,
-                    )
-                    .await;
-                    return Ok(None);
+            pump_checkpoint(PumpPoint::Prepared).await;
+            tokio::select! {
+                biased;
+                () = pump_fault(PumpPoint::Grant) => unreachable!("attachment fault checkpoint panics"),
+                _ = custody.handoff.observe() => {},
+            }
+            custody.capture_grant();
+            pump_checkpoint(PumpPoint::GrantResult).await;
+            match custody.grant.as_ref() {
+                None => return Ok(false),
+                Some(Ok(CommandOutcome::SessionAccepted(Some(accepted)))) => {
+                    custody.handoff.remember_session(accepted.clone())
                 }
-                Some(HandoffStep::Native(_)) => unreachable!("grant phase returns a grant"),
-            };
-            match grant {
-                Ok(CommandOutcome::SessionAccepted(Some(accepted))) => {
-                    handoff.remember_session(accepted)
-                }
-                Ok(CommandOutcome::SessionAccepted(None)) => {
+                Some(Ok(CommandOutcome::SessionAccepted(None))) => {
                     plan = Err(AmqpProtocolError::new(
                         ErrorCondition::Custom(Symbol::from(crate::TIMEOUT)),
                         String::from("no session is available to accept"),
                         None,
                     ))
                 }
-                Ok(other) => {
+                Some(Ok(other)) => {
                     plan = Err(error_for(
                         AmqpError::InternalError,
                         format!("accepting a session produced an unexpected outcome: {other:?}"),
                     ))
                 }
-                Err(rejection) => plan = Err(rejection_error(&rejection)),
+                Some(Err(rejection)) => plan = Err(rejection_error(rejection)),
             }
         }
     }
 
     if session.is_ended() {
-        let entity = plan.as_ref().ok().map(|prepared| &prepared.entity);
-        retire_handoff(&mut handoff, broker, namespace, entity, management, None).await;
-        return Ok(None);
+        return Ok(false);
     }
-    if let Some(accepted) = handoff.accepted()
+    if let Some(accepted) = custody.handoff.accepted()
         && let Some(source) = attach.source.as_mut()
     {
         stamp_session_filter(source, &accepted.session_id);
     }
-    let properties = handoff.accepted().map(session_attach_properties);
-    handoff.begin_accept(session.accept_attach_with_properties(
-        attach,
-        crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64,
-        properties,
-    ));
-    let _ = handoff.observe().await;
-    let native = match handoff.take_step() {
-        Some(HandoffStep::Native(native)) => native,
-        None => {
-            let entity = plan.as_ref().ok().map(|prepared| &prepared.entity);
-            retire_handoff(&mut handoff, broker, namespace, entity, management, None).await;
-            return Ok(None);
+    let properties = custody.handoff.accepted().map(session_attach_properties);
+    custody
+        .handoff
+        .begin_accept(session.accept_attach_with_properties(
+            attach,
+            crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64,
+            properties,
+        ));
+    tokio::select! {
+        biased;
+        () = pump_fault(PumpPoint::Native) => unreachable!("attachment fault checkpoint panics"),
+        _ = custody.handoff.observe() => {},
+    }
+    custody.capture_native();
+    pump_checkpoint(PumpPoint::NativeResult).await;
+    if !matches!(custody.native, Some(Ok(_))) {
+        if matches!(custody.native, Some(Err(EngineError::RemoteDetached))) {
+            return Ok(false);
         }
-        Some(HandoffStep::Grant(_)) => unreachable!("native phase returns a native result"),
-    };
-    let endpoint = match native {
-        Ok(endpoint) => endpoint,
-        Err(error) => {
-            let entity = plan.as_ref().ok().map(|prepared| &prepared.entity);
-            retire_handoff(&mut handoff, broker, namespace, entity, management, None).await;
-            return match error {
-                EngineError::RemoteDetached => Ok(None),
-                error => Err(error),
-            };
-        }
-    };
+        return match custody.native.take() {
+            None => Ok(false),
+            Some(Err(error)) => Err(error),
+            Some(Ok(_)) => unreachable!("successful native result remains captured"),
+        };
+    }
     if session.is_ended() {
         // Observed End/driver exit has retired this endpoint. Dropping an
         // otherwise-live endpoint is not a Detach and is not used for refusal.
-        drop(endpoint);
-        let entity = plan.as_ref().ok().map(|prepared| &prepared.entity);
-        retire_handoff(&mut handoff, broker, namespace, entity, management, None).await;
-        return Ok(None);
+        return Ok(false);
     }
     let prepared = match plan {
         Ok(prepared) => prepared,
         Err(error) => {
             warn!(%address, condition = ?error.condition, "refusing link");
-            detach_with(endpoint, error).await;
-            retire_handoff(&mut handoff, broker, namespace, None, management, None).await;
-            return Ok(None);
+            let Some(Ok(endpoint)) = custody.native.take() else {
+                unreachable!("captured native endpoint")
+            };
+            custody.begin_refusal(endpoint, error);
+            tokio::select! {
+                biased;
+                () = pump_fault(PumpPoint::Refusal) => unreachable!("attachment fault checkpoint panics"),
+                _ = custody.observe_refusal() => {},
+            }
+            return Ok(false);
         }
     };
-    let registration = match (&endpoint, handoff.accepted()) {
-        (LinkEndpoint::Sender(sender), Some(accepted)) => {
+    let registration = match (custody.native.as_ref(), custody.handoff.accepted()) {
+        (Some(Ok(LinkEndpoint::Sender(sender))), Some(accepted)) => {
             let mut detached = std::pin::pin!(sender.on_detach_owned());
             let mut retired = false;
             let registration = tokio::select! {
                 biased;
                 () = &mut ended => None,
+                () = pump_fault(PumpPoint::Registry) => unreachable!("attachment fault checkpoint panics"),
                 registration = management.install_session(
-                    claim
-                        .as_ref()
-                        .expect("a receiving attachment captured its claim"),
+                    claim.expect("a receiving attachment captured its claim"),
                     accepted.hold(),
                     || {
                         retired = session.is_ended() || detached.as_mut().now_or_never().is_some();
@@ -447,86 +579,120 @@ pub(super) async fn accept_entity_link<B: Broker>(
                 ) => registration,
             };
             if registration.is_none() {
-                if retired || session.is_ended() || detached.as_mut().now_or_never().is_some() {
-                    drop(endpoint);
-                } else {
-                    detach_with(
+                if !(retired || session.is_ended() || detached.as_mut().now_or_never().is_some()) {
+                    let Some(Ok(endpoint)) = custody.native.take() else {
+                        unreachable!("captured native endpoint")
+                    };
+                    custody.begin_refusal(
                         endpoint,
                         error_for(
                             AmqpError::IllegalState,
                             "session attachment was superseded".to_owned(),
                         ),
-                    )
-                    .await;
+                    );
+                    tokio::select! {
+                        biased;
+                        () = pump_fault(PumpPoint::Refusal) => unreachable!("attachment fault checkpoint panics"),
+                        _ = custody.observe_refusal() => {},
+                    }
                 }
-                retire_handoff(
-                    &mut handoff,
-                    broker,
-                    namespace,
-                    Some(&prepared.entity),
-                    management,
-                    None,
-                )
-                .await;
-                return Ok(None);
+                return Ok(false);
             }
             registration
         }
         _ => None,
     };
+    custody.registration = registration;
+    pump_checkpoint(PumpPoint::Installed).await;
     if session.is_ended() {
-        drop(endpoint);
-        retire_handoff(
-            &mut handoff,
-            broker,
-            namespace,
-            Some(&prepared.entity),
-            management,
-            registration.as_ref(),
-        )
-        .await;
-        return Ok(None);
+        return Ok(false);
     }
-    let packet = handoff
-        .take_packet()
-        .expect("all original handoff work has been observed");
-    Ok(Some(EntityLink {
+    custody.capture_packet();
+    let Some(Ok(endpoint)) = custody.native.take() else {
+        unreachable!("captured native endpoint")
+    };
+    custody.ready = Some(EntityLink {
         endpoint,
         entity: prepared.entity,
-        accepted: packet.accepted,
-        registration,
+        accepted: custody.packet.as_mut().unwrap().accepted.take(),
+        registration: custody.registration.take(),
         authorization: prepared.authorization,
         mode,
-    }))
+    });
+    Ok(true)
 }
 
-async fn retire_handoff<B: Broker>(
-    handoff: &mut AttachmentHandoff<'_>,
+pub(super) async fn prepare_and_adopt<B: Broker>(
+    session: &ServerSession,
     broker: &B,
     namespace: &NamespaceName,
-    entity: Option<&EntityPath>,
+    address: &str,
     management: &Arc<ConnectionManagement>,
-    registration: Option<&SessionRegistration>,
+    custody: &mut AttachmentCustody<'_>,
 ) {
-    let _ = handoff.finish().await;
-    let packet = handoff
-        .take_packet()
-        .expect("retired handoff has no unobserved original work");
-    debug!(phase = ?packet.phase, started = packet.started, retired = packet.retired, "retiring entity attach handoff");
-    if let Some(HandoffStep::Native(Ok(endpoint))) = packet.step {
-        drop(endpoint);
-    }
-    if let Some(accepted) = packet.accepted {
-        let hold = accepted.hold();
-        if let Some(registration) = registration {
-            management.unregister_session(registration).await;
+    let ready = custody
+        .ready
+        .as_ref()
+        .expect("entry preparation borrows its ready packet");
+    match &ready.endpoint {
+        LinkEndpoint::Receiver(receiver) => {
+            let namespace = namespace.clone();
+            let entity = ready.entity.clone();
+            let broker = broker.clone();
+            let authorization = ready.authorization.clone();
+            pump_checkpoint(PumpPoint::EntryPrepared).await;
+            info!(%address, entity = %ready.entity, "link attached");
+            if session.is_ended() || receiver.on_detach_owned().now_or_never().is_some() {
+                return;
+            }
+            let EntityLink {
+                endpoint: LinkEndpoint::Receiver(receiver),
+                ..
+            } = custody.adopt()
+            else {
+                unreachable!("ready receiving endpoint retains its role")
+            };
+            tokio::spawn(async move {
+                if let Err(error) =
+                    super::serve_sending_client(receiver, namespace, entity, broker, authorization)
+                        .await
+                {
+                    warn!(%error, "sending link ended");
+                }
+            });
         }
-        settlement::release_session(
-            broker,
-            namespace,
-            entity.expect("a captured grant has an entity"),
-            Some(&hold),
-        )
-        .await;
+        LinkEndpoint::Sender(sender) => {
+            let entry = settlement::prepare_receiving_entry(
+                sender,
+                namespace.clone(),
+                ready.entity.clone(),
+                broker.clone(),
+                ready.mode,
+                ready.accepted.as_ref().map(AcceptedSession::hold),
+                ReceivingLinkProtocol {
+                    authorization: ready.authorization.clone(),
+                    management: Arc::clone(management),
+                    session_registration: ready.registration.clone(),
+                },
+            );
+            pump_checkpoint(PumpPoint::EntryPrepared).await;
+            info!(%address, entity = %ready.entity,
+                session = ready.accepted.as_ref().map(|accepted| accepted.session_id.as_str()), "link attached");
+            if session.is_ended() || sender.on_detach_owned().now_or_never().is_some() {
+                return;
+            }
+            let EntityLink {
+                endpoint: LinkEndpoint::Sender(sender),
+                ..
+            } = custody.adopt()
+            else {
+                unreachable!("ready sending endpoint retains its role")
+            };
+            tokio::spawn(async move {
+                if let Err(error) = settlement::serve_receiving_entry(sender, entry).await {
+                    warn!(%error, "receiving link ended");
+                }
+            });
+        }
     }
 }
