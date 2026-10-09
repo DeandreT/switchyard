@@ -24,8 +24,8 @@ acceptance and full dependencies; [compatibility](compatibility.md) owns guarant
 - [x] Native Stop/original joins, Detach-aware admission/credit cleanup; first-poll
   receiving/Send/management/CBS custody, exact attachment/registry/End and delivery
   identities; outer-pump panic #111/#127-#131, primary notice #139/#161, move-only
-  pre-native receiving context #172 and management/receiving/Send cleanup notices
-  #173-#175.
+  pre-native receiving context #172 and management/receiving/Send/CBS cleanup notices
+  #173-#176.
   No ancestor/family shielding; acquisition #73/data-link #84/CBS #74 complete.
 - [x] Bounded SDK child/approved loaded-file custody, owned Cargo handoffs/unit CI;
   Linux frozen-input profile only. Four experimental Memory TCP/WSS gates use
@@ -52,8 +52,8 @@ marker; linked issues carry exact scopes.
 
 ```mermaid
 flowchart TD
-    Main["Merged main foundations"] --> Lifecycle["Merged #139/#161 primary, #172 handoff, #173-#175 cleanup"]
-    Lifecycle --> Cleanup["#162 Remaining CBS/attachment #176/#177"]
+    Main["Merged main foundations"] --> Lifecycle["Merged #139/#161 primary, #172 handoff, #173-#176 cleanup"]
+    Lifecycle --> Cleanup["#162 Remaining attachment #177"]
     Cleanup --> Families["#132 Links -> #133 Sessions; finish #75/#63"]
     Families --> Shutdown["#134 Listener -> #135 Limits -> #136 Deadline -> #65 Signals; finish #64/#7"]
     Shutdown --> Authority["#57 Sender -> #58 Receiver -> #59 Sessions -> #60 Management; finish #12"]
@@ -92,7 +92,7 @@ See [workflow](../CONTRIBUTING.md).
 
 | Lane | Entry and overlap boundary |
 | --- | --- |
-| Lifecycle | [#162](https://github.com/DeandreT/switchyard/issues/162) remaining CBS/attachment cleanup, then [#75](https://github.com/DeandreT/switchyard/issues/75) families; serialize listener/native/registry. |
+| Lifecycle | [#162](https://github.com/DeandreT/switchyard/issues/162) remaining attachment cleanup, then [#75](https://github.com/DeandreT/switchyard/issues/75) families; serialize listener/native/registry. |
 | Domain ports | [#14](https://github.com/DeandreT/switchyard/issues/14) profiles, [#16](https://github.com/DeandreT/switchyard/issues/16) content, [#23](https://github.com/DeandreT/switchyard/issues/23) duplicates; serialize command/codec/key-tag/store fences. |
 | SQL | [#20](https://github.com/DeandreT/switchyard/issues/20) after #16, then #21; serialize compiler/rules. |
 | Replication | [#168](https://github.com/DeandreT/switchyard/issues/168) -> [#160](https://github.com/DeandreT/switchyard/issues/160); serialize domain/cluster/store, retain startup refusal. |

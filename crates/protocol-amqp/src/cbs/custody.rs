@@ -16,6 +16,7 @@ use tracing::debug;
 
 use super::CbsResponse;
 use crate::authorization::ConnectionAuthorization;
+use crate::listener::connection_custody::ConnectionRetirementRequest;
 
 pub(super) type PanicPayload = Box<dyn Any + Send>;
 
@@ -194,6 +195,7 @@ pub(super) struct RequestCustody<'a> {
     pub(super) native: Option<PendingOperation<'a, Result<(), EngineError>>>,
     pub(super) native_packet: Option<OperationPacket<Result<(), EngineError>>>,
     cleanup_panic: Option<PanicPayload>,
+    native_panic: Option<PanicPayload>,
 }
 
 impl RequestCustody<'_> {
@@ -219,7 +221,15 @@ impl RequestCustody<'_> {
         self.native = None;
     }
 
+    #[cfg(test)]
     pub(super) async fn finish(&mut self) {
+        self.finish_with_retirement(None).await;
+    }
+
+    pub(super) async fn finish_with_retirement(
+        &mut self,
+        retirement: Option<&ConnectionRetirementRequest>,
+    ) {
         if let Some(original) = self.token.as_mut() {
             original.retire();
         }
@@ -227,23 +237,33 @@ impl RequestCustody<'_> {
             original.retire();
         }
         if let Some(original) = self.token.as_mut() {
+            let mut fault = false;
             if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await {
                 self.cleanup_panic = Some(payload);
+                fault = true;
             }
             self.capture_token();
+            request_fault(retirement, fault);
         }
         if let Some(original) = self.native.as_mut() {
-            if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await
-                && self.cleanup_panic.is_none()
-            {
-                self.cleanup_panic = Some(payload);
+            let unfinished = original.actual.is_some();
+            let mut fault = false;
+            if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await {
+                self.native_panic = Some(payload);
+                fault = true;
             }
             self.capture_native();
+            request_fault(
+                retirement,
+                fault || unfinished && packet_error(self.native_packet.as_ref()),
+            );
         }
     }
 
     pub(super) fn take_cleanup_panic(&mut self) -> Option<PanicPayload> {
-        self.cleanup_panic.take()
+        self.cleanup_panic
+            .take()
+            .or_else(|| self.native_panic.take())
     }
 
     pub(super) fn take_native_error(&mut self) -> Option<EngineError> {
@@ -325,16 +345,31 @@ impl<'a> ReplyCustody<'a> {
             })
     }
 
+    #[cfg(test)]
     pub(super) async fn finish(&mut self) {
+        self.finish_with_retirement(None).await;
+    }
+
+    pub(super) async fn finish_with_retirement(
+        &mut self,
+        retirement: Option<&ConnectionRetirementRequest>,
+    ) {
         if let Some(original) = self.original.as_mut() {
             original.retire();
         }
         self.responses.close();
         if let Some(original) = self.original.as_mut() {
+            let unfinished = original.actual.is_some();
+            let mut fault = false;
             if let Err(payload) = AssertUnwindSafe(original.finish()).catch_unwind().await {
                 self.cleanup_panic = Some(payload);
+                fault = true;
             }
             self.capture_packet();
+            request_fault(
+                retirement,
+                fault || unfinished && packet_error(self.packet.as_ref()),
+            );
         }
         if !self.unregistered {
             self.authorization
@@ -358,6 +393,16 @@ impl<'a> ReplyCustody<'a> {
             );
         }
     }
+}
+
+fn request_fault(retirement: Option<&ConnectionRetirementRequest>, fault: bool) {
+    if fault && let Some(retirement) = retirement {
+        retirement.request();
+    }
+}
+
+fn packet_error<T>(packet: Option<&OperationPacket<Result<T, EngineError>>>) -> bool {
+    packet.is_some_and(|packet| matches!(packet.result.as_ref(), Some(Err(_))))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

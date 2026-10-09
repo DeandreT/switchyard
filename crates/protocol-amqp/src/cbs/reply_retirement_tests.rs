@@ -3,6 +3,9 @@
 #[path = "leaf_fault_tests.rs"]
 mod leaf_fault_tests;
 
+#[path = "cleanup_notice_tests.rs"]
+mod cleanup_notice_tests;
+
 use std::{
     future::{Future, poll_fn},
     io,

@@ -130,7 +130,14 @@ pub(crate) async fn serve_cbs_requests_with_retirement(
         {
             retirement.request();
         }
-        let cleanup = AssertUnwindSafe(custody.finish()).catch_unwind().await;
+        let cleanup = AssertUnwindSafe(custody.finish_with_retirement(retirement.as_ref()))
+            .catch_unwind()
+            .await;
+        if cleanup.is_err()
+            && let Some(retirement) = retirement.as_ref()
+        {
+            retirement.request();
+        }
         let diagnostics = if cleanup.is_ok() {
             catch_unwind(AssertUnwindSafe(|| custody.report())).err()
         } else {
@@ -317,7 +324,14 @@ pub(crate) async fn serve_cbs_replies_with_retirement(
     {
         retirement.request();
     }
-    let cleanup = AssertUnwindSafe(custody.finish()).catch_unwind().await;
+    let cleanup = AssertUnwindSafe(custody.finish_with_retirement(retirement.as_ref()))
+        .catch_unwind()
+        .await;
+    if cleanup.is_err()
+        && let Some(retirement) = retirement.as_ref()
+    {
+        retirement.request();
+    }
     let diagnostics = if cleanup.is_ok() {
         catch_unwind(AssertUnwindSafe(|| custody.report())).err()
     } else {
