@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AcceptedSession, Delivery, EntityPath, LockToken, MessageEnvelope, NamespaceName, QueueConfig,
-    ReceiveMode, RuleDefinition, RuleFilter, RuleName, SequenceNumber, SessionHold, SessionId,
-    SubscriptionConfig, SubscriptionName, Timestamp, TopicConfig,
+    QueueConfigUpdate, ReceiveMode, RuleDefinition, RuleFilter, RuleName, SequenceNumber,
+    SessionHold, SessionId, SubscriptionConfig, SubscriptionName, Timestamp, TopicConfig,
 };
 
 /// One message supplied to an atomic broker operation.
@@ -218,6 +218,10 @@ pub enum CommandKind {
     /// Proposed by the leader's timer worker. Removes message identifiers whose
     /// duplicate-detection history window elapsed.
     ExpireDuplicateHistory,
+    /// Changes future queue admissions/locks without rewriting existing records.
+    UpdateQueue {
+        update: QueueConfigUpdate,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -304,4 +308,5 @@ pub enum CommandOutcome {
     SessionLocksExpired {
         released: u32,
     },
+    QueueUpdated,
 }

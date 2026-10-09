@@ -10,6 +10,7 @@ own live assignments, acceptance and full dependencies.
 | --- | --- |
 | [x] | Repository-owned AMQP; TCP/TLS/WSS; SASL/CBS SAS |
 | [x] | Queue batching, both receive guarantees, settlement/DLQ/deferral/peek; sessions/state, scheduling/cancellation, duplicates |
+| [x] | Ordinary queue profile updates #13; immutable modes and retained records/deadlines, no administration or capacity activation |
 | [x] | Immediate/scheduled actionless topic rules/subscriptions; bounded listed-topology proof ([PR #1](https://github.com/DeandreT/switchyard/pull/1)) |
 | [x] | Memory/Fjall parity/fsynced apply; unversioned-store refusal ([PR #4](https://github.com/DeandreT/switchyard/pull/4)); production refusal and format-2 live heads |
 | [x] | Bound broker API/pre-clock authority #56; wire adoption still pending |
@@ -24,8 +25,7 @@ Acquisition #73, data-link #84 and CBS #74 coordinators are complete;
 [compatibility contracts](compatibility.md) define their current guarantees.
 
 Native connection-pump custody [#130](https://github.com/DeandreT/switchyard/issues/130)
-and queue profiles [#13](https://github.com/DeandreT/switchyard/issues/13) are
-source-only, not merged progress.
+is source-only, not merged progress.
 
 SDK evidence is four passing experimental Memory gates: two pins over TCP/WSS.
 `declared-current` is ServiceBus 7.21.0 / Core 1.62.0; `previous` is 7.20.2 / 1.60.0,
@@ -47,7 +47,7 @@ reported separately, without durable/administration certification. See
    #60. Merged #56 alone is not retained wire authority.
 3. Enable [#15](https://github.com/DeandreT/switchyard/issues/15) retirement/recreation
    only after #12; no live deletion/recreation claim yet.
-4. Port safe profile updates and typed content independently, then dependent semantics.
+4. Port topic/subscription profile updates and typed content independently, then dependent semantics.
 
 Joins are not graceful Close acknowledgements; source, labels and reference
 tests are not completion evidence. `feat/amqp-message-sections` and
@@ -78,7 +78,7 @@ flowchart TD
     Signals --> Grants["#71 Grant consumers -> #17 JWT activation"]
     Signals --> Matrix["#101 Eight SDK cells / finish #9"]
     Signals --> Windows["#68 Windows -> #69 Refill; #77 Echo"]
-    Main --> Profiles["#13/#14 Profiles -> #22 Modes"]
+    Main --> Profiles["#14 Topic/subscription profiles -> #22 Modes"]
     Main --> Content["#16 Typed content"]
     Kernel["Merged #11 SQL kernel"] --> Rules["#20 Filters -> #21 Actions"]
     Content --> Rules
@@ -116,7 +116,7 @@ chain. Split multi-PR work into child issues before implementation.
 | Auth activation | #8 policy merged; #71 -> #17 waits for #7. Serialize shared authorization/CBS files, not a current parallel pickup |
 | Replication | [#144](https://github.com/DeandreT/switchyard/issues/144): cluster/storage journal, no domain/proposer activation; #145 atomic replay follows #144/#13 and completes #36. Retain startup refusal |
 | Administration | [#10](https://github.com/DeandreT/switchyard/issues/10): Atom fixtures/profiles; [#18](https://github.com/DeandreT/switchyard/issues/18): native Create/Get/List service/protobuf. No listener activation |
-| Domain ports | #13 profiles, #16 content, #23 duplicate history; serialize shared command/codec/key-tag/store-fence edits |
+| Domain ports | #14 topic/subscription profiles, #16 content, #23 duplicate history; serialize shared command/codec/key-tag/store-fence edits |
 | Client/release evidence | [#101](https://github.com/DeandreT/switchyard/issues/101): test matrix after #7; no runtime fixes |
 
 Assign before pickup; merge prerequisites first. `status:ready` is only a hint.

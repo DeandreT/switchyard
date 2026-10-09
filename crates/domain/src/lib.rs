@@ -45,7 +45,7 @@ pub use queue::{
     DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS, DEFAULT_LOCK_DURATION_MILLIS,
     DEFAULT_MAX_DELIVERY_COUNT, DEFAULT_MAX_MESSAGE_BYTES, MAX_DUPLICATE_DETECTION_HISTORY_MILLIS,
     MAX_LOCK_DURATION_MILLIS, MIN_DUPLICATE_DETECTION_HISTORY_MILLIS, QueueConfig,
-    QueueConfigError, QueueCounters,
+    QueueConfigError, QueueConfigUpdate, QueueCounters, QueueTimeToLiveUpdate,
 };
 pub use rule::{
     CorrelationFilter, CorrelationValue, DEFAULT_RULE_NAME, FilterProperties,

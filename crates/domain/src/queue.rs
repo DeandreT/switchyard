@@ -32,6 +32,64 @@ pub struct QueueConfig {
     pub duplicate_detection_history_millis: u64,
 }
 
+/// Explicit replacement of a queue's default lifetime; an absent patch keeps it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueTimeToLiveUpdate {
+    Finite { millis: u64 },
+    Unlimited,
+}
+
+/// Partial settings update for an ordinary queue, not a topology change.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QueueConfigUpdate {
+    pub lock_duration_millis: Option<u64>,
+    pub max_delivery_count: Option<u32>,
+    pub default_time_to_live_millis: Option<QueueTimeToLiveUpdate>,
+    pub max_message_bytes: Option<usize>,
+    pub requires_session: Option<bool>,
+    pub requires_duplicate_detection: Option<bool>,
+    pub duplicate_detection_history_millis: Option<u64>,
+}
+
+impl QueueConfigUpdate {
+    pub fn apply(self, current: QueueConfig) -> Result<QueueConfig, QueueConfigError> {
+        current.validate()?;
+        if self
+            .requires_session
+            .is_some_and(|value| value != current.requires_session)
+        {
+            return Err(QueueConfigError::RequiresSessionImmutable);
+        }
+        if self
+            .requires_duplicate_detection
+            .is_some_and(|value| value != current.requires_duplicate_detection)
+        {
+            return Err(QueueConfigError::RequiresDuplicateDetectionImmutable);
+        }
+        QueueConfig {
+            lock_duration_millis: self
+                .lock_duration_millis
+                .unwrap_or(current.lock_duration_millis),
+            max_delivery_count: self
+                .max_delivery_count
+                .unwrap_or(current.max_delivery_count),
+            default_time_to_live_millis: match self.default_time_to_live_millis {
+                Some(QueueTimeToLiveUpdate::Finite { millis }) => Some(millis),
+                Some(QueueTimeToLiveUpdate::Unlimited) => None,
+                None => current.default_time_to_live_millis,
+            },
+            max_message_bytes: self.max_message_bytes.unwrap_or(current.max_message_bytes),
+            duplicate_detection_history_millis: self
+                .duplicate_detection_history_millis
+                .unwrap_or(current.duplicate_detection_history_millis),
+            ..current
+        }
+        .validate()
+    }
+}
+
 impl Default for QueueConfig {
     fn default() -> Self {
         Self {
@@ -47,6 +105,16 @@ impl Default for QueueConfig {
 }
 
 impl QueueConfig {
+    pub(crate) fn dead_letter_shadow(self) -> Self {
+        Self {
+            max_delivery_count: u32::MAX,
+            default_time_to_live_millis: None,
+            requires_session: false,
+            requires_duplicate_detection: false,
+            ..self
+        }
+    }
+
     pub fn validate(self) -> Result<Self, QueueConfigError> {
         if self.lock_duration_millis == 0 {
             return Err(QueueConfigError::LockDurationTooShort);
@@ -115,6 +183,10 @@ pub enum QueueConfigError {
     DuplicateDetectionHistoryTooShort { minimum_millis: u64 },
     #[error("duplicate-detection history cannot exceed {maximum_millis} milliseconds")]
     DuplicateDetectionHistoryTooLong { maximum_millis: u64 },
+    #[error("requires_session cannot be changed after queue creation")]
+    RequiresSessionImmutable,
+    #[error("requires_duplicate_detection cannot be changed after queue creation")]
+    RequiresDuplicateDetectionImmutable,
 }
 
 #[cfg(test)]

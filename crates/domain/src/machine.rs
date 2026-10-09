@@ -27,9 +27,9 @@ use storage::{StateStore, WriteBatch};
 use crate::{
     AcceptedSession, BrokerError, Command, CommandKind, CommandOutcome, DeadLetterInfo,
     DeadLetterReason, Delivery, DeliveryLock, DeliveryOrigin, EntityPath, LockToken,
-    MessageEnvelope, MessageRecord, MessageState, NamespaceName, QueueConfig, QueueCounters,
-    ReceiveMode, SequenceNumber, SessionHold, SessionId, SessionLock, SessionRecord, Timestamp,
-    codec, keys,
+    MessageEnvelope, MessageRecord, MessageState, NamespaceName, QueueConfig, QueueConfigUpdate,
+    QueueCounters, ReceiveMode, SequenceNumber, SessionHold, SessionId, SessionLock, SessionRecord,
+    Timestamp, codec, keys,
 };
 
 use self::deferred::replace_envelope;
@@ -260,6 +260,9 @@ impl<S: StateStore> StateMachine<S> {
             CommandKind::ExpireDuplicateHistory => {
                 self.expire_duplicate_history(command, &mut batch)?
             }
+            CommandKind::UpdateQueue { update } => {
+                self.update_queue(command, *update, &mut batch)?
+            }
         };
 
         // A command that changed nothing commits nothing. The clock advance is
@@ -486,13 +489,7 @@ impl<S: StateStore> StateMachine<S> {
         // Failing here, rather than at the first dead-lettering, is why a
         // parent whose shadow path would be too long cannot be created.
         let dead_letter_queue = command.entity.dead_letter_queue()?;
-        let shadow = QueueConfig {
-            max_delivery_count: u32::MAX,
-            default_time_to_live_millis: None,
-            requires_session: false,
-            requires_duplicate_detection: false,
-            ..config
-        };
+        let shadow = config.dead_letter_shadow();
         if self
             .store
             .get(&keys::queue_config(&command.namespace, &dead_letter_queue))?
@@ -511,6 +508,62 @@ impl<S: StateStore> StateMachine<S> {
             codec::encode(&shadow)?,
         );
         Ok(CommandOutcome::QueueCreated)
+    }
+
+    fn update_queue(
+        &self,
+        command: &Command,
+        update: QueueConfigUpdate,
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        if command.entity.is_dead_letter_queue() {
+            return Err(BrokerError::DeadLetterQueueIsReserved);
+        }
+        if command.entity.is_subscription() || command.entity.is_management() {
+            return Err(BrokerError::EntityPathReserved);
+        }
+        let parent_key = keys::queue_config(&command.namespace, &command.entity);
+        let Some(raw) = self.store.get(&parent_key)? else {
+            return if self
+                .store
+                .get(&keys::entity_metadata(&command.namespace, &command.entity))?
+                .is_some()
+                && self
+                    .store
+                    .get(&keys::topic_config(&command.namespace, &command.entity))?
+                    .is_none()
+            {
+                Err(BrokerError::EntityMetadataCorrupt)
+            } else {
+                Err(BrokerError::QueueNotFound)
+            };
+        };
+        self.require_queue_owner(&command.namespace, &command.entity)?;
+        let current: QueueConfig =
+            codec::decode(&raw).map_err(|_| BrokerError::EntityMetadataCorrupt)?;
+        current
+            .validate()
+            .map_err(|_| BrokerError::EntityMetadataCorrupt)?;
+        if codec::encode(&current)? != raw {
+            return Err(BrokerError::EntityMetadataCorrupt);
+        }
+        let shadow_key =
+            keys::queue_config(&command.namespace, &command.entity.dead_letter_queue()?);
+        let shadow = current.dead_letter_shadow();
+        if self.store.get(&shadow_key)? != Some(codec::encode(&shadow)?) {
+            return Err(BrokerError::EntityMetadataCorrupt);
+        }
+        let updated = update.apply(current)?;
+        let updated_shadow = updated.dead_letter_shadow();
+        // Validate the complete patch and both existing profiles before staging
+        // anything; owner heads and every data/index key remain untouched.
+        if updated != current {
+            batch.push_put(parent_key, codec::encode(&updated)?);
+        }
+        if updated_shadow != shadow {
+            batch.push_put(shadow_key, codec::encode(&updated_shadow)?);
+        }
+        Ok(CommandOutcome::QueueUpdated)
     }
 
     fn receive(

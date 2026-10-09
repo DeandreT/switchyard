@@ -42,6 +42,7 @@ See [gate commands and limits](sdk-gates.md),
 | Message management | Renew, abandon, defer/retrieve, ordered peek, schedule/cancel, custom dead-letter, DLQ receive/complete |
 | Queue sessions | Named/next-available attach filter, exclusive locks, renewal, opaque state, release on link close |
 | Queue duplicates | Exact non-empty message ID suppression across immediate, batch, and scheduled sends; bounded history cleanup |
+| Queue profiles | Domain-only partial ordinary-queue updates; unchanged patches write nothing; existing records/deadlines and owner identity stay intact |
 | Topics/subscriptions | Non-session immediate/scheduled singular/batch fanout, topic placeholder peek/cancel, independent subscription queue lifecycle |
 | Rules | Durable `$Default`, actionless true/false/correlation, typed equality; create/delete/paginated AMQP rule management |
 | Time | Bounded runtime activation plus lock, TTL, session-lock, and duplicate-history expiry |
@@ -56,6 +57,12 @@ peek-lock; pre-settled means receive-delete. Session attach echoes identifier/de
 renewal/state use `$management`, not automatic renewal. Unsupported requests reject
 with compatible conditions/retry hints. Outbound receive reserves credit before
 broker mutation, releases empty results, and completes drain after consumption/release.
+
+Queue profile updates validate the parent and exact DLQ before atomically changing
+only their profiles and Clock. Session/duplicate enablement is immutable; lock,
+TTL, message-size and history changes govern future work, not existing deadlines.
+Topic/subscription propagation, administration setters and capacity accounting
+remain pending.
 
 The [offline JWT API](offline-jwt.md) produces issuer-qualified grants;
 SAS/PLAIN principals retain verified namespace-host qualification. Protocol
@@ -178,8 +185,8 @@ End/Stop/driver panic during attachment auth/registry preparation, even with its
 row held; readiness proves neither answering End nor native joins. Receiving auth
 preparation observes captured Detach before Receive.
 
-Native connection-pump panic custody #130 and queue profiles #13 are source-only,
-not merged progress. Early leaf-fault notice #139, task families/ancestor shielding
+Native connection-pump panic custody #130 is source-only, not merged progress.
+Early leaf-fault notice #139, task families/ancestor shielding
 #75 and process shutdown #7 remain [roadmap work](roadmap.md#next-main-increments).
 These contracts do not protect aborted ancestors or bound cleanup latency;
 blocked native writers still need native Stop and joined shutdown, and stalled
