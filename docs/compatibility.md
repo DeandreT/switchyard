@@ -146,6 +146,7 @@ shielding (Send uses per-delivery pump panic custody):
 
 | Owner | Acquisition and drain contract |
 | --- | --- |
+| TCP listener | [`into_tcp_service`](../crates/protocol-amqp/src/listener.rs) retains the listener, original task IDs and typed exits. `retirement_handle().request()` only requests; borrowed `serve`/`finish` permit cancellation/retry with a surviving owner. Drained `take_exit` extracts once; live completions are reaped without stopping admission. Priority: parent panic > accept error > outer JoinError > returned error > missing exit > known report > diagnostic; raw origins remain. Legacy `serve` keeps `io::Result`: returns accept errors, resumes parent panics, does not return child/report outcomes. |
 | Native connection | Capacity-free sticky Stop interrupts IO/channels. Shutdown joins original driver/reader and caches cancellation/repeat results; outer panic keeps acceptance/Close packets. Retirement discards unstarted work, starts no Close; Drop requests Stop only. Joins do not acknowledge Close; peer reply is required. |
 | Connection session family | Keeps begun acceptance and ready Sessions through context preparation; adopts the same task and typed result without intervening callbacks. Live reaping consumes healthy history. Retirement stops intake, drains original native work/shutdown, then original session joins; cancelled finish retains packets. Reaping child errors and typed reports adds no Stop request. |
 | Native sender/credit | Detach/command closure interrupts capacity waits with all 256 permits held. Queued grant replies own cleanup before observation; dropped accepted replies clean exact reservations, not replacement credit. |
@@ -203,6 +204,13 @@ keeps raw faults before typed session reports, then connection/family diagnostic
 [#7](https://github.com/DeandreT/switchyard/issues/7) process shutdown
 remains [roadmap work](roadmap.md#next-main-increments). No aborted-ancestor
 protection, graceful Close acknowledgement or finite broker/cleanup latency.
+
+The [TCP service](../crates/protocol-amqp/src/listener/service.rs) (#224) installs
+the same native Ready connection in custody before grant/authorization/reporting.
+Retirement selects unfinished TLS/SASL/Open or the borrowed pump, then drains
+native work/shutdown before original session joins. Requesting retirement is not
+join proof; owner-drop/abort survival is excluded. WSS custody #225, admission
+#135 and deadlines #136 remain separate; accepted broker drains stay unbounded.
 
 Sustained traffic beyond initial credit is uncertified: [#68](https://github.com/DeandreT/switchyard/issues/68)
 windows/[#69](https://github.com/DeandreT/switchyard/issues/69) refill and
