@@ -1,9 +1,12 @@
 //! The atomic storage contract and its backends.
 //!
-//! Everything above this crate sees only [`StateStore`]: read one key, walk an
+//! Normal operations above this crate use [`StateStore`]: read one key, walk an
 //! ordered prefix, commit a batch. Both backends implement that contract and
 //! the same conformance suite runs against both, so a queue behaves identically
 //! whether its state lives in memory or on disk.
+//!
+//! [`capture_logical_snapshot`] records logical evidence only. Durable metadata
+//! inspection is an opt-in [`FjallStore::snapshot_with_provenance`] operation.
 
 #![forbid(unsafe_code)]
 
@@ -77,6 +80,60 @@ impl StoreSnapshot {
     pub fn entries(&self) -> &[(Key, Value)] {
         &self.entries
     }
+}
+
+/// An immutable logical image paired with the provenance observed during capture.
+/// Provenance describes storage metadata, not authentication or semantic health.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotWithProvenance {
+    snapshot: StoreSnapshot,
+    provenance: SnapshotProvenance,
+}
+
+impl SnapshotWithProvenance {
+    pub fn snapshot(&self) -> &StoreSnapshot {
+        &self.snapshot
+    }
+
+    pub fn provenance(&self) -> &SnapshotProvenance {
+        &self.provenance
+    }
+}
+
+/// The selected storage evidence, independent of the contents of logical records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotProvenance {
+    /// Only the unchanged [`StateStore::snapshot`] contract was used.
+    LogicalOnly,
+    /// Exact selected-backend metadata accompanied the record image.
+    Fjall(FjallSnapshotMetadata),
+}
+
+/// A checked format marker from the exact `meta`/`records` keyspace inventory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FjallSnapshotMetadata {
+    format_marker: [u8; 4],
+}
+
+impl FjallSnapshotMetadata {
+    pub fn format_marker(&self) -> &[u8; 4] {
+        &self.format_marker
+    }
+
+    pub fn format_version(&self) -> u32 {
+        u32::from_be_bytes(self.format_marker)
+    }
+}
+
+/// Captures logical records without claiming any backend-format evidence.
+/// This always returns [`SnapshotProvenance::LogicalOnly`], even for Fjall.
+pub fn capture_logical_snapshot<S: StateStore>(
+    store: &S,
+) -> Result<SnapshotWithProvenance, StorageError> {
+    Ok(SnapshotWithProvenance {
+        snapshot: store.snapshot()?,
+        provenance: SnapshotProvenance::LogicalOnly,
+    })
 }
 
 pub trait StateStore: Clone + Send + Sync + 'static {

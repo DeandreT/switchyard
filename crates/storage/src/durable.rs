@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
 
-use crate::{Key, Mutation, StateStore, StorageError, StoreSnapshot, Value, WriteBatch};
+use crate::{
+    FjallSnapshotMetadata, Key, Mutation, SnapshotProvenance, SnapshotWithProvenance, StateStore,
+    StorageError, StoreSnapshot, Value, WriteBatch,
+};
 
 /// Historical layout before domain entities required persisted owner identities.
 pub const STORE_FORMAT_V1: u32 = 1;
@@ -29,6 +32,7 @@ const FORMAT_VERSION_KEY: &[u8] = b"format_version";
 pub struct FjallStore {
     database: Database,
     records: Keyspace,
+    meta: Keyspace,
     directory: PathBuf,
 }
 
@@ -81,12 +85,95 @@ impl FjallStore {
         Ok(Self {
             database,
             records,
+            meta,
             directory,
         })
     }
 
     pub fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    /// Captures logical records with exact selected-backend format metadata.
+    ///
+    /// The caller must exclude every writer through all store clones and raw
+    /// database/keyspace handles, including keyspace creation, deletion and
+    /// configuration changes, throughout this operation. The keyspace inventory
+    /// is a live read; metadata and records then share one cross-keyspace snapshot.
+    /// Neither this borrow nor the directory's open lock enforces that exclusivity.
+    /// Exact inventory plus exclusivity makes the current known-handle lookups
+    /// noncreating; their IDs must match the retained handles. If exclusivity is
+    /// violated, those native create-or-open lookups could create a missing name,
+    /// so the no-write and coherent-capture guarantees do not apply.
+    ///
+    /// This inspects an already-open store and makes no logical writes. Ordinary
+    /// [`Self::open`] may already have created keyspaces or stamped empty metadata;
+    /// this is not a read-only directory opener or a zero-I/O/byte-identical-directory
+    /// guarantee. Capturing the full image copies O(total image bytes) and does not
+    /// bound allocations from hostile stored values. Provenance is neither
+    /// authentication nor semantic validation of the logical records.
+    pub fn snapshot_with_provenance(&self) -> Result<SnapshotWithProvenance, StorageError> {
+        let keyspaces = self.database.list_keyspace_names();
+        if keyspaces.len() != 2
+            || !keyspaces
+                .iter()
+                .any(|name| name.as_bytes() == META_KEYSPACE.as_bytes())
+            || !keyspaces
+                .iter()
+                .any(|name| name.as_bytes() == RECORDS_KEYSPACE.as_bytes())
+        {
+            return Err(StorageError::CorruptMetadata {
+                detail: String::from(
+                    "snapshot provenance requires exactly the meta and records keyspaces",
+                ),
+            });
+        }
+
+        // Exclusive topology and the exact inventory keep both lookups noncreating.
+        let current_meta = self
+            .database
+            .keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)
+            .map_err(|error| StorageError::backend("inspect the metadata keyspace", &error))?;
+        let current_records = self
+            .database
+            .keyspace(RECORDS_KEYSPACE, KeyspaceCreateOptions::default)
+            .map_err(|error| StorageError::backend("inspect the record keyspace", &error))?;
+        if current_meta.id() != self.meta.id() || current_records.id() != self.records.id() {
+            return Err(StorageError::CorruptMetadata {
+                detail: String::from(
+                    "snapshot provenance requires the original meta and records keyspace handles",
+                ),
+            });
+        }
+
+        let snapshot = self.database.snapshot();
+        let mut metadata = snapshot.iter(&self.meta);
+        let (key, recorded) = metadata
+            .next()
+            .map(read_entry)
+            .transpose()?
+            .ok_or_else(|| StorageError::CorruptMetadata {
+                detail: String::from("snapshot provenance requires the format version marker"),
+            })?;
+        if key.as_slice() != FORMAT_VERSION_KEY
+            || metadata.next().map(read_entry).transpose()?.is_some()
+        {
+            return Err(StorageError::CorruptMetadata {
+                detail: String::from("snapshot provenance requires only the format version marker"),
+            });
+        }
+        require_readable_format(&recorded)?;
+        let mut format_marker = [0; 4];
+        format_marker.copy_from_slice(&recorded);
+
+        let mut entries = Vec::new();
+        for guard in snapshot.iter(&self.records) {
+            entries.push(read_entry(guard)?);
+        }
+        Ok(SnapshotWithProvenance {
+            snapshot: StoreSnapshot { entries },
+            provenance: SnapshotProvenance::Fjall(FjallSnapshotMetadata { format_marker }),
+        })
     }
 }
 
@@ -98,6 +185,7 @@ impl Clone for FjallStore {
         Self {
             database: self.database.clone(),
             records: self.records.clone(),
+            meta: self.meta.clone(),
             directory: self.directory.clone(),
         }
     }
@@ -191,6 +279,9 @@ fn read_entry(guard: fjall::Guard) -> Result<(Key, Value), StorageError> {
         .map_err(|error| StorageError::backend("read a scanned record", &error))?;
     Ok((key.to_vec(), value.to_vec()))
 }
+
+#[cfg(test)]
+mod provenance_tests;
 
 #[cfg(test)]
 mod tests {
