@@ -74,9 +74,9 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::DuplicateDeferredSequence { .. }
         | BrokerError::DeferredMessageSessionMismatch { .. } => NOT_ALLOWED,
 
-        BrokerError::SubscriptionLimitExceeded { .. } | BrokerError::RuleLimitExceeded { .. } => {
-            RESOURCE_LIMIT_EXCEEDED
-        }
+        BrokerError::SubscriptionLimitExceeded { .. }
+        | BrokerError::RuleLimitExceeded { .. }
+        | BrokerError::SequenceNumberExhausted => RESOURCE_LIMIT_EXCEEDED,
 
         BrokerError::MessageTooLarge { .. } => MESSAGE_SIZE_EXCEEDED,
         BrokerError::MessageIdTooLong { .. }
@@ -210,6 +210,13 @@ mod tests {
     #[test]
     fn the_subscription_cap_is_a_resource_limit() {
         let error = BrokerError::SubscriptionLimitExceeded { maximum: 2_000 };
+        assert_eq!(condition_for(&error), RESOURCE_LIMIT_EXCEEDED);
+        assert!(!is_retryable(&error));
+    }
+
+    #[test]
+    fn sequence_exhaustion_is_a_nonretryable_resource_limit() {
+        let error = BrokerError::SequenceNumberExhausted;
         assert_eq!(condition_for(&error), RESOURCE_LIMIT_EXCEEDED);
         assert!(!is_retryable(&error));
     }

@@ -104,8 +104,12 @@ impl<S: StateStore> StateMachine<S> {
         let mut prepared = Vec::with_capacity(inputs.len());
         let mut sequences = Vec::with_capacity(inputs.len());
         for (input, store_message) in inputs.iter().zip(store_message) {
+            let next_sequence = counters
+                .next_sequence
+                .checked_add(1)
+                .ok_or(BrokerError::SequenceNumberExhausted)?;
             let sequence = SequenceNumber::new(counters.next_sequence);
-            counters.next_sequence = counters.next_sequence.saturating_add(1);
+            counters.next_sequence = next_sequence;
             sequences.push(sequence);
             if store_message {
                 let lifetime_millis = effective_time_to_live(

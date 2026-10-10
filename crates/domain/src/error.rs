@@ -80,6 +80,8 @@ pub enum BrokerError {
     MessageIdTooLong { characters: usize, maximum: usize },
     #[error("a message batch must contain at least one message")]
     EmptyMessageBatch,
+    #[error("sequence number space exhausted")]
+    SequenceNumberExhausted,
     #[error("every message in a batch sent to a session queue must use the same session")]
     MessageBatchSessionMismatch,
     #[error("peek must request at least one message")]

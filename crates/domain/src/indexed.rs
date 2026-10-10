@@ -263,6 +263,7 @@ fn ordinary_deterministic_refusal(kind: &CommandKind, error: &BrokerError) -> bo
                 | C::RenewLock { .. }
         ),
         E::MessageNotScheduled { .. } => matches!(kind, C::CancelScheduled { .. }),
+        E::SequenceNumberExhausted => matches!(kind, C::Send { .. } | C::SendBatch { .. }),
         // Bare catalog cap errors have no proof of a validated full reader.
         // Unmatched errors, including future variants, never advance the index.
         _ => false,
