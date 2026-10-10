@@ -96,8 +96,12 @@ impl<S: StateStore> StateMachine<S> {
             }
 
             let lifetime_millis = scheduled_lifetime(&record, enqueue_at);
+            let next_sequence = counters
+                .next_sequence
+                .checked_add(1)
+                .ok_or(BrokerError::SequenceNumberExhausted)?;
             let active_sequence = SequenceNumber::new(counters.next_sequence);
-            counters.next_sequence = counters.next_sequence.saturating_add(1);
+            counters.next_sequence = next_sequence;
 
             batch.push_delete(index_key);
             batch.push_delete(keys::message(namespace, entity, placeholder_sequence));
