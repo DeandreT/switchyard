@@ -33,7 +33,12 @@ pub use crate::{
         RESOURCE_LIMIT_EXCEEDED, RESOURCE_LOCKED, SESSION_CANNOT_BE_LOCKED, SESSION_LOCK_LOST,
         TIMEOUT, condition_for, is_retryable,
     },
-    listener::AmqpListener,
+    listener::{
+        AmqpListener,
+        service::{
+            AmqpListenerExit, AmqpListenerFailure, AmqpListenerRetirement, AmqpListenerService,
+        },
+    },
     management::{
         ADD_RULE_OPERATION, ASSOCIATED_LINK_NAME_PROPERTY, CANCEL_SCHEDULED_MESSAGE_OPERATION,
         ENUMERATE_RULES_OPERATION, ERROR_CONDITION_PROPERTY, EXPIRATION, EXPIRATIONS,

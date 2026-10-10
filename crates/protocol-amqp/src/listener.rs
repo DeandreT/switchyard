@@ -38,6 +38,7 @@ pub(crate) mod connection_custody;
 mod connection_session_family;
 pub(crate) mod control_attachment_custody;
 mod ingress;
+pub(super) mod service;
 pub(crate) mod session_custody;
 mod settlement;
 
@@ -93,47 +94,18 @@ impl<B: Broker> AmqpListener<B> {
     /// A connection that fails takes only itself down: one client's protocol
     /// error is not the node's.
     pub async fn serve(self, listener: TcpListener) -> std::io::Result<()> {
-        loop {
-            let (stream, peer) = listener.accept().await?;
-            debug!(%peer, "connection accepted");
-
-            let broker = self.broker.clone();
-            let namespace = self.namespace.clone();
-            let container_id = self.container_id.clone();
-            let tls_acceptor = self.tls_acceptor.clone();
-            let shared_access_authentication = self.shared_access_authentication.clone();
-            tokio::spawn(async move {
-                let result = match tls_acceptor {
-                    Some(acceptor) => match acceptor.accept(stream).await {
-                        Ok(stream) => {
-                            debug!(%peer, "TLS established");
-                            serve_connection(
-                                stream,
-                                container_id,
-                                namespace,
-                                broker,
-                                shared_access_authentication,
-                            )
-                            .await
-                        }
-                        Err(error) => Err(error.into()),
-                    },
-                    None => {
-                        serve_connection(
-                            stream,
-                            container_id,
-                            namespace,
-                            broker,
-                            shared_access_authentication,
-                        )
-                        .await
-                    }
-                };
-                if let Err(error) = result {
-                    warn!(%peer, %error, "connection ended");
-                }
-            });
+        let mut service = self.into_tcp_service(listener);
+        service.serve().await;
+        service.finish().await;
+        match service.take_exit() {
+            Some(exit) => service::legacy_result(exit),
+            None => unreachable!("listener completion is extracted once"),
         }
+    }
+
+    /// Retains the listener and accepted tasks outside borrowed service calls.
+    pub fn into_tcp_service(self, listener: TcpListener) -> service::AmqpListenerService<B> {
+        service::AmqpListenerService::new(self, listener)
     }
 
     /// Accepts AMQP tunneled through the Service Bus WebSocket endpoint.
