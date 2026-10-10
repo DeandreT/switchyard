@@ -13,8 +13,9 @@ use crate::Timestamp;
 
 pub use catalog::validate_catalog;
 pub use state::{
-    MessageRowsValidation, SessionRowsValidation, SnapshotSessionError, SnapshotStateError,
-    validate_message_rows, validate_session_rows,
+    DuplicateRowsValidation, MessageRowsValidation, SessionRowsValidation, SnapshotDuplicateError,
+    SnapshotSessionError, SnapshotStateError, validate_duplicate_rows, validate_message_rows,
+    validate_session_rows,
 };
 
 /// Catalog-only observations; pending row counts are not health evidence.

@@ -14,9 +14,11 @@ use crate::{
 
 use super::{CatalogValidation, SnapshotCatalogError, validate_catalog};
 
+mod duplicates;
 mod messages;
 mod sessions;
 
+pub use duplicates::{DuplicateRowsValidation, SnapshotDuplicateError, validate_duplicate_rows};
 pub use sessions::{SessionRowsValidation, SnapshotSessionError, validate_session_rows};
 
 pub(super) type Scope = (NamespaceName, EntityPath);
