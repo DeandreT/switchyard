@@ -42,7 +42,9 @@ pub(crate) mod session_custody;
 mod settlement;
 
 use attachments::{EntityAdmissionExit, serve_entity_attachment_into_family};
-use connection_custody::{ConnectionCustody, ConnectionRetirementRequest, NativePacket, PumpPoint};
+use connection_custody::{
+    ConnectionCustody, ConnectionRetirementRequest, ConnectionTaskExit, NativePacket, PumpPoint,
+};
 use ingress::SendIntake;
 use ingress::custody::{NativeSend, PumpPoint as SendPumpPoint, SendCustody};
 use session_custody::{SessionCustody, SessionPumpExit, SessionPumpResult, SessionTaskExit};
@@ -205,22 +207,48 @@ where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     B: Broker,
 {
+    serve_connection_task(
+        stream,
+        container_id,
+        namespace,
+        broker,
+        shared_access_authentication,
+    )
+    .await
+    .into_result()
+}
+
+async fn serve_connection_task<Io, B>(
+    stream: Io,
+    container_id: String,
+    namespace: NamespaceName,
+    broker: B,
+    shared_access_authentication: Option<SharedAccessAuthentication>,
+) -> ConnectionTaskExit
+where
+    Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    B: Broker,
+{
     let (connection, authorization) = match shared_access_authentication {
         Some(config) => {
             let sasl_acceptor = SharedAccessSaslAcceptor::new(&config);
-            let connection = ServerConnection::accept(
+            let connection = match ServerConnection::accept(
                 stream,
                 container_id,
                 Some(Arc::new(sasl_acceptor.clone())),
             )
-            .await?;
+            .await
+            {
+                Ok(connection) => connection,
+                Err(error) => return ConnectionTaskExit::Complete(Err(error.into())),
+            };
             let authorization = ConnectionAuthorization::new(config, sasl_acceptor.grant());
             (connection, Some(authorization))
         }
-        None => (
-            ServerConnection::accept(stream, container_id, None).await?,
-            None,
-        ),
+        None => match ServerConnection::accept(stream, container_id, None).await {
+            Ok(connection) => (connection, None),
+            Err(error) => return ConnectionTaskExit::Complete(Err(error.into())),
+        },
     };
     let mut custody = ConnectionCustody::new(connection);
     let result = AssertUnwindSafe(serve_open_connection(
@@ -233,7 +261,7 @@ where
     .await;
     custody.record_primary(result);
     custody.finish().await;
-    custody.finish_result()
+    custody.finish_exit()
 }
 
 async fn serve_open_connection<B: Broker>(

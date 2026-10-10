@@ -24,6 +24,20 @@ pub(super) type ConnectionError = Box<dyn std::error::Error + Send + Sync>;
 type PanicPayload = Box<dyn Any + Send>;
 type Primary = std::thread::Result<Result<(), ConnectionError>>;
 
+pub(super) enum ConnectionTaskExit {
+    Complete(Result<(), ConnectionError>),
+    ReportOnly(PanicPayload),
+}
+
+impl ConnectionTaskExit {
+    pub(super) fn into_result(self) -> Result<(), ConnectionError> {
+        match self {
+            Self::Complete(result) => result,
+            Self::ReportOnly(payload) => resume_unwind(payload),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ConnectionRetirementRequest {
     stop: ConnectionStop,
@@ -341,7 +355,12 @@ impl ConnectionCustody {
         self.finished = true;
     }
 
+    #[cfg(test)]
     pub(super) fn finish_result(&mut self) -> Result<(), ConnectionError> {
+        self.finish_exit().into_result()
+    }
+
+    pub(super) fn finish_exit(&mut self) -> ConnectionTaskExit {
         assert!(
             self.finished,
             "native and session cleanup finish before reporting"
@@ -369,7 +388,7 @@ impl ConnectionCustody {
             Some(primary) => primary,
             None => unreachable!("retained primary pump result"),
         };
-        resolve_terminal(ConnectionTerminalParts {
+        resolve_terminal_exit(ConnectionTerminalParts {
             primary,
             native_error: self.native_error.take(),
             shutdown: self.shutdown.take(),
@@ -462,29 +481,34 @@ pub(super) struct ConnectionTerminalParts {
     pub(super) diagnostic: Option<PanicPayload>,
 }
 
+#[cfg(test)]
 pub(super) fn resolve_terminal(parts: ConnectionTerminalParts) -> Result<(), ConnectionError> {
+    resolve_terminal_exit(parts).into_result()
+}
+
+pub(super) fn resolve_terminal_exit(parts: ConnectionTerminalParts) -> ConnectionTaskExit {
     match parts.primary {
         Err(payload) => resume_unwind(payload),
-        Ok(Err(error)) => return Err(error),
+        Ok(Err(error)) => return ConnectionTaskExit::Complete(Err(error)),
         Ok(Ok(())) => {}
     }
     if let Some(error) = parts.native_error {
-        return Err(error.into());
+        return ConnectionTaskExit::Complete(Err(error.into()));
     }
     if let Some(Err(error)) = parts.shutdown {
-        return Err(error.into());
+        return ConnectionTaskExit::Complete(Err(error.into()));
     }
     if let Some(payload) = parts.secondary_panic {
         resume_unwind(payload);
     }
     if let Some(error) = parts.family.join_error {
-        return Err(error.into());
+        return ConnectionTaskExit::Complete(Err(error.into()));
     }
     if let Some(error) = parts.family.returned_error {
-        return Err(error);
+        return ConnectionTaskExit::Complete(Err(error));
     }
     if let Some(error) = parts.family.bridge_fault {
-        return Err(error.into());
+        return ConnectionTaskExit::Complete(Err(error.into()));
     }
     if let Some(payload) = parts
         .family
@@ -492,9 +516,9 @@ pub(super) fn resolve_terminal(parts: ConnectionTerminalParts) -> Result<(), Con
         .or(parts.diagnostic)
         .or(parts.family.diagnostic)
     {
-        resume_unwind(payload);
+        return ConnectionTaskExit::ReportOnly(payload);
     }
-    Ok(())
+    ConnectionTaskExit::Complete(Ok(()))
 }
 
 #[cfg(test)]

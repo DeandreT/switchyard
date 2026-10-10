@@ -659,3 +659,315 @@ async fn qualified_connection_custody_late_original_after_drain_keeps_cached_pri
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_typed_connection_exit_keeps_report_and_originals_through_cancelled_drain() {
+    use crate::listener::connection_custody::ConnectionTaskExit;
+    // Four Memory rows: actual before/after Send hold x no/stronger injected Intake panic.
+    for after in [false, true] {
+        for stronger in [false, true] {
+            let actor = Actor::new(false, false);
+            let (mut wire, connection) = ConnectionWire::open().await;
+            let mut custody = ConnectionCustody::new(connection);
+            let notice = custody.request_handle();
+            let observer = FamilyObserver::new(None, false);
+            let fault = PumpFault::new(PumpPoint::Intake);
+            let reached = Arc::new(AtomicUsize::new(0));
+            let family_reached = Arc::new(AtomicUsize::new(0));
+            let report = Arc::<str>::from("same actual report across typed cancelled drain");
+            let other = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let dispatch = tracing::Dispatch::new(ReportFault {
+                attachment_reached: Arc::clone(&reached),
+                family_reached: Arc::clone(&family_reached),
+                attachment: Arc::clone(&report),
+                family: Arc::from("unexpected family reporting fault"),
+            });
+            std::thread::spawn(tracing::callsite::rebuild_interest_cache)
+                .join()
+                .unwrap();
+            let mut original = Box::pin(
+                PUMP_FAULT
+                    .scope(
+                        Arc::clone(&fault),
+                        FAMILY_OBSERVER.scope(
+                            Arc::clone(&observer),
+                            AssertUnwindSafe(serve_open_connection(
+                                &mut custody,
+                                actor.namespace.clone(),
+                                actor.broker.as_ref().unwrap().clone(),
+                                None,
+                            ))
+                            .catch_unwind(),
+                        ),
+                    )
+                    .with_subscriber(dispatch),
+            );
+            for channel in 1..=2 {
+                wire.begin(channel).await;
+                drive(original.as_mut(), wire.begin_answer(channel)).await;
+                drive(original.as_mut(), adopted(&observer, channel as usize)).await;
+            }
+            let first = facts(&observer, FamilyPoint::Adopted, 0).id.unwrap();
+            let second = facts(&observer, FamilyPoint::Adopted, 1).id.unwrap();
+            wire.offer(2, 1, false).await;
+            drive(original.as_mut(), wire.accepted(2, 1)).await;
+            actor.gate.arm_put(actor.key(SequenceNumber::new(1)));
+            if !after {
+                actor.gate.release(true);
+            }
+            wire.send(2, 1, 20).await;
+            drive(original.as_mut(), actor.gate.reached(false)).await;
+            if after {
+                actor.gate.release(false);
+                drive(original.as_mut(), actor.gate.reached(true)).await;
+            }
+            // Do not poll the parent now: the first raw report must stay in the original child.
+            wire.offer(1, 1, true).await;
+            timeout(WAIT, wire.refused(1, 1)).await.unwrap();
+            timeout(WAIT, async {
+                while reached.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(reached.load(Ordering::SeqCst), 1);
+            assert_eq!(family_reached.load(Ordering::SeqCst), 0);
+            assert!(!notice.is_requested());
+            if stronger {
+                fault.request();
+            } else {
+                notice.request();
+            }
+            let primary = timeout(WAIT, original.as_mut()).await.unwrap();
+            drop(original);
+            let primary_address = primary
+                .as_ref()
+                .err()
+                .map(|payload| &**payload as *const _ as *const () as usize);
+            if stronger {
+                assert!(Arc::ptr_eq(
+                    primary
+                        .as_ref()
+                        .unwrap_err()
+                        .downcast_ref::<Arc<()>>()
+                        .unwrap(),
+                    &fault.identity
+                ));
+            } else {
+                assert!(primary.as_ref().unwrap().is_ok());
+            }
+            custody.record_primary(primary);
+            partial_finish(&mut custody, first).await;
+            assert!(custody.shutdown_cached());
+            assert_eq!(custody.family().pending_ids(), vec![second]);
+            assert_eq!(custody.family().finished().len(), 1);
+            let packet = &custody.family().finished()[0];
+            assert_eq!(packet.id, first);
+            assert!(packet.joined.is_ok() && packet.bridge_fault.is_none());
+            let Some(SessionTaskExit::ReportOnly(payload)) = packet.exit.as_ref() else {
+                panic!("actual report returned a successful unit join and typed original packet");
+            };
+            same_panic(&**payload, &report);
+            let raw_address = &**payload as *const _ as *const () as usize;
+            let kept = packet_address(packet);
+            for _ in 0..2 {
+                let mut finish = Box::pin(custody.finish());
+                pending_once(finish.as_mut()).await;
+                drop(finish);
+                assert_eq!(custody.family().pending_ids(), vec![second]);
+                let packet = &custody.family().finished()[0];
+                assert_eq!(packet.id, first);
+                assert_eq!(packet_address(packet), kept);
+                let Some(SessionTaskExit::ReportOnly(payload)) = packet.exit.as_ref() else {
+                    panic!("cached report");
+                };
+                assert_eq!(&**payload as *const _ as *const () as usize, raw_address);
+                same_panic(&**payload, &report);
+                assert_eq!(invocations(&actor), 1);
+            }
+            actor.gate.release_all();
+            timeout(WAIT, custody.finish()).await.unwrap();
+            assert_eq!(custody.family().finished().len(), 2);
+            assert_eq!(custody.family().finished()[1].id, second);
+            assert_eq!(packet_address(&custody.family().finished()[0]), kept);
+            assert_eq!(actor.gate.state.lock().unwrap().commits, 1);
+            assert_eq!(invocations(&actor), 1);
+            let exit = catch_unwind(AssertUnwindSafe(|| custody.finish_exit()));
+            if stronger {
+                let Err(payload) = exit else {
+                    panic!("genuine retained parent panic still unwinds");
+                };
+                assert_eq!(
+                    Some(&*payload as *const _ as *const () as usize),
+                    primary_address
+                );
+                assert!(Arc::ptr_eq(
+                    payload.downcast_ref::<Arc<()>>().unwrap(),
+                    &fault.identity
+                ));
+            } else {
+                let ConnectionTaskExit::ReportOnly(payload) = exit.unwrap() else {
+                    panic!("known report origin stays typed");
+                };
+                assert_eq!(&*payload as *const _ as *const () as usize, raw_address);
+                same_panic(&*payload, &report);
+            }
+            assert_eq!(reached.load(Ordering::SeqCst), 1);
+            assert_eq!(family_reached.load(Ordering::SeqCst), 0);
+            drop(other);
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_typed_connection_wrapper_keeps_both_handshake_branches_and_legacy_results() {
+    use crate::SharedAccessAuthentication;
+    use crate::listener::{
+        connection_custody::ConnectionTaskExit, serve_connection, serve_connection_task,
+    };
+    use amqp::{Close, SaslCode, SaslInit, SaslPerformative};
+    use auth::{
+        PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule,
+    };
+    use serde_amqp::primitives::Symbol;
+    fn authentication() -> SharedAccessAuthentication {
+        let rule = SharedAccessRule::new(
+            "typed",
+            ResourceScope::namespace("tenant.servicebus.windows.net").unwrap(),
+            SharedAccessKey::new("secret").unwrap(),
+            None,
+            PermissionSet::MANAGE,
+        )
+        .unwrap();
+        SharedAccessAuthentication::new(
+            SharedAccessPolicy::new([rule]).unwrap(),
+            "tenant.servicebus.windows.net",
+        )
+        .unwrap()
+    }
+    // Eight raw duplex rows: auth/no auth x typed/legacy x early EOF/healthy OPEN-Close.
+    // This is wrapper negotiation, not listener TCP/WSS task adoption or abort survival.
+    for authenticated in [false, true] {
+        for legacy in [false, true] {
+            for early_eof in [false, true] {
+                let actor = Actor::new(false, false);
+                let (stream, mut peer) = duplex(64 * 1024);
+                let config = authenticated.then(authentication);
+                let broker = actor.broker.as_ref().unwrap().clone();
+                let namespace = actor.namespace.clone();
+                let server = async move {
+                    if legacy {
+                        ConnectionTaskExit::Complete(
+                            serve_connection(
+                                stream,
+                                "typed-connection".to_owned(),
+                                namespace,
+                                broker,
+                                config,
+                            )
+                            .await,
+                        )
+                    } else {
+                        serve_connection_task(
+                            stream,
+                            "typed-connection".to_owned(),
+                            namespace,
+                            broker,
+                            config,
+                        )
+                        .await
+                    }
+                };
+                if early_eof {
+                    drop(peer);
+                    let ConnectionTaskExit::Complete(Err(error)) =
+                        timeout(WAIT, server).await.unwrap()
+                    else {
+                        panic!("native handshake failure stays Complete Err");
+                    };
+                    assert!(
+                        matches!(error.downcast_ref::<amqp::EngineError>(), Some(amqp::EngineError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof)
+                    );
+                    assert_eq!(invocations(&actor), 0);
+                    continue;
+                }
+                let (exit, ()) = timeout(WAIT, async {
+                    tokio::join!(server, async {
+                        if authenticated {
+                            write_protocol_header(&mut peer, ProtocolHeader::SASL)
+                                .await
+                                .unwrap();
+                            assert_eq!(
+                                read_protocol_header(&mut peer).await.unwrap(),
+                                ProtocolHeader::SASL
+                            );
+                            let Frame::Sasl(SaslPerformative::Mechanisms(mechanisms)) =
+                                read_frame(&mut peer).await.unwrap()
+                            else {
+                                panic!("actual SASL mechanisms");
+                            };
+                            assert!(mechanisms.mechanisms.contains(&Symbol::from("PLAIN")));
+                            write_frame(
+                                &mut peer,
+                                &Frame::Sasl(SaslPerformative::Init(SaslInit {
+                                    mechanism: Symbol::from("PLAIN"),
+                                    initial_response: Some(b"\0typed\0secret".to_vec().into()),
+                                    hostname: None,
+                                })),
+                            )
+                            .await
+                            .unwrap();
+                            let Frame::Sasl(SaslPerformative::Outcome(outcome)) =
+                                read_frame(&mut peer).await.unwrap()
+                            else {
+                                panic!("actual SASL outcome");
+                            };
+                            assert_eq!(outcome.code, SaslCode::Ok);
+                        }
+                        write_protocol_header(&mut peer, ProtocolHeader::AMQP)
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            read_protocol_header(&mut peer).await.unwrap(),
+                            ProtocolHeader::AMQP
+                        );
+                        write_frame(
+                            &mut peer,
+                            &connection_frame(0, Performative::Open(Open::new("typed-peer"))),
+                        )
+                        .await
+                        .unwrap();
+                        let Frame::Amqp {
+                            channel: 0,
+                            performative: Some(Performative::Open(open)),
+                            ..
+                        } = read_frame(&mut peer).await.unwrap()
+                        else {
+                            panic!("actual OPEN answer");
+                        };
+                        assert_eq!(open.container_id, "typed-connection");
+                        write_frame(
+                            &mut peer,
+                            &connection_frame(0, Performative::Close(Close::default())),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(matches!(
+                            read_frame(&mut peer).await.unwrap(),
+                            Frame::Amqp {
+                                channel: 0,
+                                performative: Some(Performative::Close(_)),
+                                ..
+                            }
+                        ));
+                    })
+                })
+                .await
+                .unwrap();
+                assert!(matches!(exit, ConnectionTaskExit::Complete(Ok(()))));
+                assert_eq!(invocations(&actor), 0);
+            }
+        }
+    }
+}

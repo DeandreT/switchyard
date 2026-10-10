@@ -670,3 +670,166 @@ async fn qualified_connection_terminal_child_reporting_precedence_is_diagnostic_
     drop(other);
     assert!(resolve_terminal(terminal(empty_failures())).is_ok());
 }
+
+fn selected_typed(
+    rank: Rank,
+    result: std::thread::Result<crate::listener::connection_custody::ConnectionTaskExit>,
+    expected: &Expected,
+) {
+    use crate::listener::connection_custody::ConnectionTaskExit;
+    if matches!(
+        rank,
+        Rank::Report | Rank::ConnectionReport | Rank::FamilyReport
+    ) {
+        let ConnectionTaskExit::ReportOnly(payload) = result.unwrap() else {
+            panic!("known reporting origin stays typed");
+        };
+        assert_eq!(address(&*payload), expected.address);
+        same_panic(&*payload, &expected.identity);
+    } else {
+        selected(
+            rank,
+            result.map(|exit| {
+                let ConnectionTaskExit::Complete(result) = exit else {
+                    panic!("genuine failure is not report-only");
+                };
+                result
+            }),
+            expected,
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn qualified_typed_connection_exit_preserves_all_terminal_ranks_and_raw_identity() {
+    use crate::listener::connection_custody::{ConnectionTaskExit, resolve_terminal_exit};
+    use std::panic::catch_unwind;
+    // These are qualified terminal parts, not native fault reachability.
+    for (higher, rank) in RANKS.iter().copied().enumerate() {
+        let mut parts = terminal(empty_failures());
+        let expected = install(&mut parts, rank, "same single typed category").await;
+        selected_typed(
+            rank,
+            catch_unwind(AssertUnwindSafe(|| resolve_terminal_exit(parts))),
+            &expected,
+        );
+        for lower in RANKS.iter().copied().skip(higher + 1) {
+            if matches!(rank, Rank::PrimaryPanic) && matches!(lower, Rank::PrimaryError) {
+                continue;
+            }
+            let mut parts = terminal(empty_failures());
+            let expected = install(&mut parts, rank, "same stronger typed category").await;
+            install(&mut parts, lower, "lower typed category").await;
+            selected_typed(
+                rank,
+                catch_unwind(AssertUnwindSafe(|| resolve_terminal_exit(parts))),
+                &expected,
+            );
+        }
+    }
+    assert!(matches!(
+        resolve_terminal_exit(terminal(empty_failures())),
+        ConnectionTaskExit::Complete(Ok(()))
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn qualified_typed_connection_exit_legacy_adapter_keeps_boxes_and_join_origin() {
+    use crate::listener::connection_custody::ConnectionTaskExit;
+    // Actual Tokio tasks, but composed exits rather than listener adoption.
+    for legacy in [false, true] {
+        for case in 0..4 {
+            let raw = identity("same typed connection adapter payload");
+            let mut nested_id = None;
+            let exit = match case {
+                0 => ConnectionTaskExit::Complete(Ok(())),
+                1 => ConnectionTaskExit::Complete(Err(raw_error(&raw))),
+                2 => ConnectionTaskExit::ReportOnly(raw_panic(&raw)),
+                _ => {
+                    let error = original_join_error(&raw).await;
+                    nested_id = Some(error.id());
+                    ConnectionTaskExit::Complete(Err(Box::new(error)))
+                }
+            };
+            let raw_address = match &exit {
+                ConnectionTaskExit::Complete(Err(error)) => Some(address(&**error)),
+                ConnectionTaskExit::ReportOnly(payload) => Some(address(&**payload)),
+                _ => None,
+            };
+            let task = tokio::spawn(async move {
+                if legacy {
+                    ConnectionTaskExit::Complete(exit.into_result())
+                } else {
+                    exit
+                }
+            });
+            let id = task.id();
+            let joined = task.await;
+            if legacy && case == 2 {
+                let Err(error) = joined else {
+                    panic!("legacy report remains a raw task panic");
+                };
+                assert_eq!(error.id(), id);
+                let payload = error.into_panic();
+                assert_eq!(Some(address(&*payload)), raw_address);
+                same_panic(&*payload, &raw);
+                continue;
+            }
+            match joined.unwrap() {
+                ConnectionTaskExit::Complete(Ok(())) => assert_eq!(case, 0),
+                ConnectionTaskExit::ReportOnly(payload) => {
+                    assert!(!legacy && case == 2);
+                    assert_eq!(Some(address(&*payload)), raw_address);
+                    same_panic(&*payload, &raw);
+                }
+                ConnectionTaskExit::Complete(Err(error)) => {
+                    assert_eq!(Some(address(&*error)), raw_address);
+                    if case == 1 {
+                        same_error(&*error, &raw);
+                    } else {
+                        assert_eq!(case, 3);
+                        let error = *error.downcast::<tokio::task::JoinError>().unwrap();
+                        assert_eq!(Some(error.id()), nested_id);
+                        same_panic(&*error.into_panic(), &raw);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn qualified_typed_connection_exit_reached_family_report_does_not_hide_raw_error() {
+    use crate::listener::connection_custody::{ConnectionTaskExit, resolve_terminal_exit};
+    let mut family = ConnectionSessionFamily::new();
+    let raw = identity("composed returned error with actual reached warning");
+    let error = raw_error(&raw);
+    let raw_address = address(&*error);
+    let receipt =
+        PreparedSessionTask::new().spawn(std::future::ready(SessionTaskExit::Complete(Err(error))));
+    completed(&receipt).await;
+    let id = receipt.id;
+    family.adopt(receipt);
+    let reached = Arc::new(AtomicUsize::new(0));
+    let other = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let dispatch = tracing::Dispatch::new(Reporter {
+        reached: Arc::clone(&reached),
+        payload: identity("reached lower family diagnostic"),
+    });
+    std::thread::spawn(tracing::callsite::rebuild_interest_cache)
+        .join()
+        .unwrap();
+    timeout(WAIT, family.finish().with_subscriber(dispatch))
+        .await
+        .unwrap();
+    assert_eq!(reached.load(Ordering::SeqCst), 1);
+    assert_eq!(family.finished()[0].id, id);
+    let ConnectionTaskExit::Complete(Err(error)) =
+        resolve_terminal_exit(terminal(family.take_failures()))
+    else {
+        panic!("raw returned error outranks reached reporting fault");
+    };
+    assert_eq!(address(&*error), raw_address);
+    same_error(&*error, &raw);
+    drop(other);
+}
