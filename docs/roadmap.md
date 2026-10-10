@@ -1,103 +1,95 @@
 # Completion Roadmap
 
-Switchyard is pre-alpha. Only merged `main` counts as complete. The
-[issue board](https://github.com/DeandreT/switchyard/issues) owns scope, assignment
-and acceptance; [compatibility](compatibility.md) owns tested guarantees.
+Pre-alpha: only verified, merged `main` is complete.
+[Issues](https://github.com/DeandreT/switchyard/issues) own scope;
+[compatibility](compatibility.md) records guarantees.
 
 ## Main Progress
 
-- [x] Repository-owned AMQP TCP/TLS/WSS and SASL/CBS SAS; queue delivery/settlement,
-  DLQ, deferral, peek, sessions, scheduling and queue duplicates.
-- [x] Actionless topic fanout, rules/subscriptions and bounded topology; ordinary
-  queue-profile updates and selected profile/rule/capacity integrity.
-- [x] Memory/Fjall storage and format-2 ownership; opt-in journal, atomic indexed
-  apply and same-store committed replay (#144/#145/#36). Production still refuses.
-- [x] Bound local authority, pure JWT/SQL kernels; native/link-family lifecycle
-  custody through #133. Process shutdown remains #7.
-- [x] Source-bound build custody and four experimental Memory SDK TCP/WSS gates.
-  Declared-current/previous pins are not latest or a durable compatibility matrix.
+- [x] AMQP/SASL/CBS; settlement, DLQ, deferral, peek, sessions, scheduling, queue duplicates.
+- [x] Actionless topics/rules, bounded topology and selected profile integrity.
+- [x] Memory/Fjall format-2 and opt-in journal/indexed apply/local replay.
+- [x] Local authority, JWT/SQL kernels and native/link/session/connection custody.
+- [x] Source-bound builds and pinned Memory SDK TCP/WSS gates.
 - [ ] Remaining semantics, administration and conserved physical-byte capacity.
 - [ ] Full recovery, quorum, multi-tenant security and measured release.
 
 ## Next Main Increments
 
-Lifecycle: listener/deadline/signals #7 -> retained wire authority #12 ->
-retirement/recreation #15. Snapshot children can proceed alongside that lane.
-Joins are not Close acknowledgements; no finite latency is inferred.
-
-`feat/amqp-message-sections` and `feat/topic-mode-metadata` are references, not
-whole-branch ports. Preserve key tags, the 2,000-child bound and error/Clock
-contracts; account for capabilities before retiring references.
+#222 connection/#224 TCP are merged/verified; #225 WSS is assigned/unexecuted.
+#134/#7 stay open.
+#135/#136/#65 own admission/deadlines/process; joins have no Close/latency guarantee.
+Reference branches are not main evidence or whole-branch ports (#15).
 
 ```mermaid
 flowchart TD
-    Main["Merged main"] --> Lifecycle["#7 Shutdown -> #12 Authority -> #15 Retirement"]
-    Main --> Domain["#14 Profiles / #16 Content / #23 Duplicates"]
-    Domain --> Semantics["#20/#21 Rules -> #26/#27/#28 Capacity"]
-    Lifecycle --> Semantics
-    Main --> Recovery["#37 Snapshot children -> #38 Quorum"]
-    Recovery --> Runtime["#41 Production runtime"]
-    Lifecycle --> Security["#71 Grants -> #17 JWT; #42/#43/#49 Identity"]
-    Security --> Runtime
-    Admin["#10 Atom / #18 Native administration"] --> Gates["Client/security/recovery gates -> #53 Release"]
-    Runtime --> Gates
-    Semantics --> Gates
+    Main["Main"] --> Lifecycle["#7 Shutdown -> #12 Authority -> #15 Retirement"] --> Semantics["#20/#21 Rules -> #26-#28 Capacity"]
+    Main --> Domain["#14/#16/#23 Domain"] --> Semantics
+    Main --> Recovery["#37 Snapshots -> #38 Quorum"] --> Runtime["#41 Runtime"]
+    Lifecycle --> Security["#71 Grants -> #17 JWT; #42/#43/#49 Identity"] --> Runtime
+    Admin["#10/#18 Administration"] --> Gates["#53 Release"]
+    Runtime --> Gates; Semantics --> Gates
 ```
 
 ## Snapshot Recovery
 
-#36 local replay is complete; #37 full-state recovery is not. Each child is one
-focused main-based PR. The six unfinished snapshot children retain their listed
-dependencies; only #204 is available for unassigned pickup.
+#36 local replay is merged; #37 full recovery is not.
 
-- [x] #203 Pure record format.
-- [ ] #204 Catalog validation (ready, unassigned).
-- [ ] #205 Message/index/session validation (blocked).
-- [x] #206 Backend provenance, including #212 known-handle identity refusal.
-- [ ] #207 Coherent capture (blocked).
-- [ ] #208 Offline atomic install (blocked).
-- [ ] #209 Applied-safe journal anchor (blocked).
-- [ ] #210 Recovery selection/compaction (blocked).
+- [x] #203 Record format.
+- [x] #204 Catalog validation (partial).
+- [x] #206 Backend provenance.
+- [ ] #205 State audit: assigned #229, then parallel #230/#231 and #232.
+- [ ] #207 Coherent capture.
+- [ ] #208 Offline atomic install.
+- [ ] #209 Applied-safe anchor.
+- [ ] #210 Selection/compaction.
+
+#229 is unexecuted; #232 also depends on #227. #207-#210 remain blocked.
+#227 DLQ refusal is merged/verified. #228 is assigned for allocation scoping,
+not executed.
 
 ```mermaid
 flowchart LR
-    Format["#203 Pure format"] --> Capture["#207 Coherent capture"]
-    Catalog["#204 Catalog validation"] --> State["#205 Message/index/session validation"]
-    State --> Capture
-    Metadata["#206 Backend provenance"] --> Capture
-    Capture --> Install["#208 Offline atomic install"]
+    Format["#203 Format"] --> Capture["#207 Capture"]
+    Catalog["#204 Catalog"] --> Rows["#229 Messages"] --> Sessions["#230 Sessions"]
+    Rows --> Duplicates["#231 Duplicates"]
+    Sessions --> State["#232 Allocation/graph"]; Duplicates --> State
+    DLQ["#227 DLQ refusal"] --> State
+    State --> Audit["#205 Audit"] --> Capture; Metadata["#206 Provenance"] --> Capture
+    Capture --> Install["#208 Install"]
     Metadata --> Install
-    Install --> Anchor["#209 Applied-safe journal anchor"]
-    Anchor --> Compact["#210 Recovery selection/compaction"]
+    Install --> Anchor["#209 Applied anchor"] --> Compact["#210 Selection/compaction"]
     Install --> Compact
 ```
 
-Pure format does not prove store health. Capture must validate the exact complete
-image; install requires all-writer exclusivity. Pruning stops at applied A, not
-committed C. Sequence/token counters are not byte quotas. Quorum #38, runtime #41
-and encrypted backup #47 remain separate.
+Partial validation is not full-state health or install authority. Capture needs
+the complete image; install needs all-writer exclusivity. Prune at applied A,
+not committed C; counters are not byte quotas.
 
 ## Parallel Pickup
 
-Assign before coding; split multi-PR scopes and merge prerequisites first.
-`status:ready` is a coordination hint, not evidence. Serialize shared files and
-disk-aware two-job builds; see [workflow](../CONTRIBUTING.md).
+Assign before coding. Serialize shared files and two-job builds; merge focused
+PRs in dependency order ([workflow](../CONTRIBUTING.md)). Ready is not evidence.
 
-| Lane | Entry / overlap boundary |
+| Lane | Pickup / overlap |
 | --- | --- |
-| Lifecycle | [#7](https://github.com/DeandreT/switchyard/issues/7); serialize listener/native/registry. |
-| Domain | [#14](https://github.com/DeandreT/switchyard/issues/14), [#16](https://github.com/DeandreT/switchyard/issues/16), [#23](https://github.com/DeandreT/switchyard/issues/23); serialize command/codec/key tags. |
-| Snapshots | [#204](https://github.com/DeandreT/switchyard/issues/204) catalog is ready/unassigned; #205/#207-#210 are blocked. [#203](https://github.com/DeandreT/switchyard/issues/203) format and [#206](https://github.com/DeandreT/switchyard/issues/206) provenance are merged. |
-| Administration | [#10](https://github.com/DeandreT/switchyard/issues/10) Atom fixtures, [#18](https://github.com/DeandreT/switchyard/issues/18) native contract; no listener activation. |
-| Deferred | [#71](https://github.com/DeandreT/switchyard/issues/71) grant consumers and [#101](https://github.com/DeandreT/switchyard/issues/101) SDK matrix await #7; serialize authorization/CBS/client programs. |
+| WSS | [#225](https://github.com/DeandreT/switchyard/issues/225) assigned; listener/service. |
+| Snapshots | [#229](https://github.com/DeandreT/switchyard/issues/229) assigned; parallel #230/#231 after its merge. |
+| Domain | [#14](https://github.com/DeandreT/switchyard/issues/14)/[#16](https://github.com/DeandreT/switchyard/issues/16)/[#23](https://github.com/DeandreT/switchyard/issues/23) Ready/unassigned; serialize command/codec/keys. |
+| Atom/admin | [#10](https://github.com/DeandreT/switchyard/issues/10)/[#18](https://github.com/DeandreT/switchyard/issues/18) Ready/unassigned; distinct paths. |
+| SDK/security | #71/#101 blocked on #7. |
+
+SDK evidence is experimental current/previous Memory, not latest/durable.
+Production still refuses; quorum/recovery/runtime remain pending.
+[Docs #236](https://github.com/DeandreT/switchyard/issues/236) waits for #234.
 
 ## Milestones
 
-| Milestone | Remaining work |
+| Gate | Remaining work |
 | --- | --- |
-| [M1](https://github.com/DeandreT/switchyard/milestone/1) Foundations | Lifecycle, retained authority, profiles, retirement, typed content. |
-| [M2](https://github.com/DeandreT/switchyard/milestone/2) Compatibility | SDK/admin gates, sustained Flow, rules/actions, sessions/TTL, conserved capacity, same-group transactions/forwarding. |
-| [M3](https://github.com/DeandreT/switchyard/milestone/3) Production | Snapshots/quorum/runtime, identity/RBAC/fairness, KMS/audit/backup, readiness/fault/upgrade and signed measured release. |
+| [M1](https://github.com/DeandreT/switchyard/milestone/1) | Lifecycle, authority, profiles, reference retirement, typed content. |
+| [M2](https://github.com/DeandreT/switchyard/milestone/2) | SDK/admin semantics, sustained Flow, capacity, same-group transactions. |
+| [M3](https://github.com/DeandreT/switchyard/milestone/3) | Recovery/quorum, identity/fairness, encrypted audit/backup, measured release. |
 
 ## Completion Checks
 
