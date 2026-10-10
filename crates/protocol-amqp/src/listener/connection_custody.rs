@@ -30,6 +30,7 @@ pub(super) enum ConnectionTaskExit {
 }
 
 impl ConnectionTaskExit {
+    #[cfg(test)]
     pub(super) fn into_result(self) -> Result<(), ConnectionError> {
         match self {
             Self::Complete(result) => result,

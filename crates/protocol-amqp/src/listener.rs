@@ -10,27 +10,31 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
+use amqp::ServerConnection;
 use amqp::{
     AmqpError, EngineError, Error as AmqpProtocolError, ErrorCondition, Fields, Receiver, Role,
-    ServerConnection, ServerSession,
+    ServerSession,
 };
 use auth::{Permission, ResourceScope};
 use domain::{AcceptedSession, CommandKind, CommandOutcome, EntityPath, NamespaceName};
 use futures_util::FutureExt;
 use rustls::ServerConfig;
 use serde_amqp::{Value, primitives::Symbol};
+#[cfg(test)]
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, warn};
+use tracing::debug;
 
+#[cfg(test)]
+use crate::authorization::SharedAccessSaslAcceptor;
 use crate::{
     Attachment, Broker, BrokerRejection, IncomingMessages, ProtocolError,
     SharedAccessAuthentication,
-    authorization::{ConnectionAuthorization, SharedAccessSaslAcceptor},
+    authorization::ConnectionAuthorization,
     management::{ConnectionManagement, SessionRegistration},
     parse_attachment, read_incoming_messages,
-    websocket::accept_amqp_websocket,
 };
 
 mod attachments;
@@ -43,9 +47,9 @@ pub(crate) mod session_custody;
 mod settlement;
 
 use attachments::{EntityAdmissionExit, serve_entity_attachment_into_family};
-use connection_custody::{
-    ConnectionCustody, ConnectionRetirementRequest, ConnectionTaskExit, NativePacket, PumpPoint,
-};
+#[cfg(test)]
+use connection_custody::ConnectionTaskExit;
+use connection_custody::{ConnectionCustody, ConnectionRetirementRequest, NativePacket, PumpPoint};
 use ingress::SendIntake;
 use ingress::custody::{NativeSend, PumpPoint as SendPumpPoint, SendCustody};
 use session_custody::{SessionCustody, SessionPumpExit, SessionPumpResult, SessionTaskExit};
@@ -114,60 +118,22 @@ impl<B: Broker> AmqpListener<B> {
     /// broker process requires TLS for this transport; permitting an unwrapped
     /// stream here keeps the protocol binding independently testable.
     pub async fn serve_websockets(self, listener: TcpListener) -> std::io::Result<()> {
-        loop {
-            let (stream, peer) = listener.accept().await?;
-            debug!(%peer, "WebSocket connection accepted");
-
-            let broker = self.broker.clone();
-            let namespace = self.namespace.clone();
-            let container_id = self.container_id.clone();
-            let tls_acceptor = self.tls_acceptor.clone();
-            let shared_access_authentication = self.shared_access_authentication.clone();
-            tokio::spawn(async move {
-                let result = match tls_acceptor {
-                    Some(acceptor) => match acceptor.accept(stream).await {
-                        Ok(stream) => {
-                            debug!(%peer, "WebSocket TLS established");
-                            match accept_amqp_websocket(stream).await {
-                                Ok(stream) => {
-                                    debug!(%peer, "AMQP WebSocket upgraded");
-                                    serve_connection(
-                                        stream,
-                                        container_id,
-                                        namespace,
-                                        broker,
-                                        shared_access_authentication,
-                                    )
-                                    .await
-                                }
-                                Err(error) => Err(error.into()),
-                            }
-                        }
-                        Err(error) => Err(error.into()),
-                    },
-                    None => match accept_amqp_websocket(stream).await {
-                        Ok(stream) => {
-                            debug!(%peer, "AMQP WebSocket upgraded");
-                            serve_connection(
-                                stream,
-                                container_id,
-                                namespace,
-                                broker,
-                                shared_access_authentication,
-                            )
-                            .await
-                        }
-                        Err(error) => Err(error.into()),
-                    },
-                };
-                if let Err(error) = result {
-                    warn!(%peer, %error, "WebSocket connection ended");
-                }
-            });
+        let mut service = self.into_wss_service(listener);
+        service.serve().await;
+        service.finish().await;
+        match service.take_exit() {
+            Some(exit) => service::legacy_result(exit),
+            None => unreachable!("listener completion is extracted once"),
         }
+    }
+
+    /// Retains the WebSocket listener and its original connection task family.
+    pub fn into_wss_service(self, listener: TcpListener) -> service::AmqpListenerService<B> {
+        service::AmqpListenerService::new_wss(self, listener)
     }
 }
 
+#[cfg(test)]
 async fn serve_connection<Io, B>(
     stream: Io,
     container_id: String,
@@ -190,6 +156,7 @@ where
     .into_result()
 }
 
+#[cfg(test)]
 async fn serve_connection_task<Io, B>(
     stream: Io,
     container_id: String,

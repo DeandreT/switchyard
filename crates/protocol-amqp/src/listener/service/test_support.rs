@@ -561,3 +561,90 @@ impl Drop for Actor {
         drop(self.owner.take());
     }
 }
+
+pub(super) async fn wss_owner<B: Broker>(
+    broker: B,
+) -> (AmqpListenerService<B>, std::net::SocketAddr) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    (
+        AmqpListener::new(broker, NamespaceName::new("tenant").unwrap()).into_wss_service(listener),
+        address,
+    )
+}
+
+pub(super) fn wss_test_server_tls() -> rustls::ServerConfig {
+    crate::tls_server_config(
+        WSS_TEST_CERTIFICATE.as_bytes(),
+        WSS_TEST_PRIVATE_KEY.as_bytes(),
+    )
+    .unwrap()
+}
+
+pub(super) fn wss_test_client_tls() -> tokio_rustls::TlsConnector {
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in rustls_pemfile::certs(&mut std::io::Cursor::new(WSS_TEST_CERTIFICATE)) {
+        roots.add(certificate.unwrap()).unwrap();
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+}
+
+// Synthetic localhost-only identity. It is never used outside these controls.
+const WSS_TEST_CERTIFICATE: &str = "-----BEGIN CERTIFICATE-----
+MIIDSzCCAjOgAwIBAgIUIUfbpECmAHezITJMrbcNW6jsoKwwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTAxMDA5NDEzMloYDzIxMjYw
+OTE2MDk0MTMyWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB
+AQUAA4IBDwAwggEKAoIBAQCeRwezsxOZ7MrV85NqW5Q2FWiB5JHLzTPLpAMkEJ7g
+u6obCOhBWuZCnuiZmLaH/pDrJndJu9vePYUSjJdtcWSg1NZHWzmLEvFUODYup9bP
+EsGQHszp3o2337oLow0qhPztBEJBR5kzeeYeYV3GFvpPghyR9axk9v7YxikPOl3A
+cRzmMF7KOKHu4doyn+a2DhqMbx0SvAdEYMimI9KhfcBTlogrLR3U9te4RnVONtLN
+O5dNNzMIfXp1ZrWsuY6vW9xjM+lknCNiD/5zZ5+O++iWJdoGKQxg+DULFEOOKPdk
+tQNvl4ft1RSq8EDvca5fr4jybtex+Es5RkyFj3ItJje7AgMBAAGjgZIwgY8wHQYD
+VR0OBBYEFJC/fJxWYrV1jQjb13Q3WDG8SoMsMB8GA1UdIwQYMBaAFJC/fJxWYrV1
+jQjb13Q3WDG8SoMsMBoGA1UdEQQTMBGCCWxvY2FsaG9zdIcEfwAAATAMBgNVHRMB
+Af8EAjAAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMA4GA1UdDwEB/wQEAwIFoDANBgkq
+hkiG9w0BAQsFAAOCAQEAOqgIn0krYmtGzHxplSLUQF8Rkwjt2R1g4DqTSJaiduSF
++HRScpPRpJKdCpuzlMl4MFimCbsCBfhMdj555I2nUU3aZbi6HPFu3KKWrdUsdhzn
+82CCsI9LP4V2kmvQW//0/SvH8XN7Z+XGquO1b8WFiRRaD7reVHk7mJCM4Te1KWgW
+90f/86j2VxJlivNs1fyc169HCIYkD8ePjOcuplEc0b2fj31PTq6rO1hz8HaT4LAp
+FMiMeIgTBPL0ZVTPdWNolRP4qbQ9TsAvmyF0N45iPZvObGXzZ4BLaRdzciG8PDVf
+L+0LkM09zmRvlcm6WcZhiyuLBrPA5nQctTT75l8mcw==
+-----END CERTIFICATE-----
+";
+
+const WSS_TEST_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCeRwezsxOZ7MrV
+85NqW5Q2FWiB5JHLzTPLpAMkEJ7gu6obCOhBWuZCnuiZmLaH/pDrJndJu9vePYUS
+jJdtcWSg1NZHWzmLEvFUODYup9bPEsGQHszp3o2337oLow0qhPztBEJBR5kzeeYe
+YV3GFvpPghyR9axk9v7YxikPOl3AcRzmMF7KOKHu4doyn+a2DhqMbx0SvAdEYMim
+I9KhfcBTlogrLR3U9te4RnVONtLNO5dNNzMIfXp1ZrWsuY6vW9xjM+lknCNiD/5z
+Z5+O++iWJdoGKQxg+DULFEOOKPdktQNvl4ft1RSq8EDvca5fr4jybtex+Es5RkyF
+j3ItJje7AgMBAAECggEASetzeeX/GArCemStKuWFVTLvYYat3shB0fAR9XR7twp+
+Oe0Rh4Bb/K45hI6RZPcrmF8ZJAsD9wm1TgHyMM9eB00PnDjLKZwZsFMmXujNBl3E
+n7n6ypjBiCgJPCkU25BLjahJBzLYpnVeVz7y7DJMCfkCvdpGfsrqH7SAdZe1NEwD
+g8svbthN8FiZPKaR6BTtU2Ybbq//tcqUZt1Ach/jjvyAOg38UtAqn83rdTY1Z1ir
+/ZwNGKqiuAEcqPg/ozVfRVAMjF/iJ7VK/743gMjyqNlb7Wle86IUQYMOgwdjRM/s
+CuLpBjwDngpA//XUkn21hFIlsK87cgZ1o/toSW/egQKBgQDK1Uk75zofDW1wqcxj
+NVmV0eY9F9m+y0GT5gOR8U4XdIvOyOPp43Jf6e5wagCUk+RNVHUEJMtpfJxyfs9S
+2Dlnc2kmROP2nHpern6tcEjwP8OEwUAaNmMRRgCYtdi2p77wLYWko41rbxaB0S1w
+/OYTAhrwCGz2nOxe1Q89qDefgQKBgQDHw+xoaXFiPCDOLQu/kTmxx0YHAPk0lMmX
+RjYp5tIqbhpRJcd9zIUA+as1hcoqyjRFOQoXMlo+4nfUe0uBeIEv7JCnnH1K1ukt
+qMna2OCMyXSSlDXajxvZw8T5jadF844u+DD+gmw2e+Ps15v19HfWMwqh4QPELO1n
+mD6yQ671OwKBgGkIc4jqnwVPfbmWo/lHuiFD9Vbzj9UmCcpdlMGxVD//IRqump8W
+IbcbO1bI/Y3y24lTz9iaeR8h4R3FHvUGdQtmDzA7AlVFCHUZJQ4JFCwcyNFpBRnN
+yhU6y7pIiHVlfhF/cTIlY2kbuGr29/IHc9iqAWsE4e/+qMQezmqePleBAoGAXUN+
+atzXn7pcwoVLV9uwaOyVKA3vSvowB90yymtGMaMHzFzr/zJt4h+uLCXTVhjjQHI5
+4MyUT4mh0mThwoeFIN+8RVSNNlSRtsx3uSHJ7FDdiNWDMw/fO9Lncm8M6l6kQg+D
+qD8x0FoU9m1PFgxVqn5X9227OWqUR+pPUyDAXSMCgYAQ+VI1kqmvPBSaX1AUsGd0
+8g+3BkoSVSZlSsEMAk/vqqG/o9bV2eff090sCefYNczDM9fDRShboDtrqO6UGg8S
+rmqYg3OR5VjRUAMbIz5q/g1dhUn753hNEsydLU0/NiD1/twDo6jH0cmuQ/oJbR+X
+T4pfboaIZXmuEC7SglvKqw==
+-----END PRIVATE KEY-----
+";

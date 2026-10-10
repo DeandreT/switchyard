@@ -1,4 +1,4 @@
-//! Concrete TCP listener custody. Borrowers never own accepted tasks.
+//! Concrete TCP and WebSocket listener custody. Borrowers never own accepted tasks.
 
 use std::{
     any::Any,
@@ -22,17 +22,19 @@ use tokio::{
 use tracing::debug;
 
 use super::{
-    AmqpListener, ConnectionAuthorization, SharedAccessSaslAcceptor,
+    AmqpListener, ConnectionAuthorization,
     connection_custody::{ConnectionCustody, ConnectionTaskExit, wait_for_retirement},
     serve_open_connection,
 };
-use crate::Broker;
+use crate::{Broker, authorization::SharedAccessSaslAcceptor, websocket::accept_amqp_websocket};
 
 mod connection_family;
 #[cfg(test)]
 mod tcp_tests;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod wss_tests;
 
 use connection_family::{AdmittedConnectionTask, ConnectionFamily, FamilyFailures, PreparedTask};
 
@@ -42,6 +44,12 @@ type Primary = std::thread::Result<io::Result<()>>;
 enum PumpExit {
     Retired,
     Accept(io::Error),
+}
+
+#[derive(Clone, Copy)]
+enum Binding {
+    Tcp,
+    WebSocket,
 }
 
 /// Requests retirement only; this capability does not certify completed joins.
@@ -130,6 +138,7 @@ struct PreparedConnection<B> {
 /// Retains one TCP listener and the original accepted connection task family.
 pub struct AmqpListenerService<B> {
     config: AmqpListener<B>,
+    binding: Binding,
     listener: Option<TcpListener>,
     retirement: AmqpListenerRetirement,
     accepted: Option<(TcpStream, SocketAddr)>,
@@ -145,6 +154,7 @@ impl<B: Broker> AmqpListenerService<B> {
     pub(super) fn new(config: AmqpListener<B>, listener: TcpListener) -> Self {
         Self {
             config,
+            binding: Binding::Tcp,
             listener: Some(listener),
             retirement: AmqpListenerRetirement::new(),
             accepted: None,
@@ -154,6 +164,13 @@ impl<B: Broker> AmqpListenerService<B> {
             primary: None,
             finished: false,
             extracted: false,
+        }
+    }
+
+    pub(super) fn new_wss(config: AmqpListener<B>, listener: TcpListener) -> Self {
+        Self {
+            binding: Binding::WebSocket,
+            ..Self::new(config, listener)
         }
     }
 
@@ -221,8 +238,10 @@ impl<B: Broker> AmqpListenerService<B> {
                     None => unreachable!("prepared original connection context"),
                 };
                 let task_retirement = bridge.retirement();
-                self.receipt =
-                    Some(bridge.spawn(peer, serve_tcp_task(stream, config, task_retirement)));
+                self.receipt = Some(bridge.spawn(
+                    peer,
+                    serve_binding_task(stream, config, task_retirement, self.binding),
+                ));
                 self.finished = false;
                 #[cfg(test)]
                 self.checkpoint(test_support::Point::ReceiptCached).await;
@@ -345,6 +364,51 @@ pub(super) fn legacy_result(exit: AmqpListenerExit) -> io::Result<()> {
     }
 }
 
+async fn serve_binding_task<B: Broker>(
+    stream: TcpStream,
+    config: AmqpListener<B>,
+    retirement: AmqpListenerRetirement,
+    binding: Binding,
+) -> ConnectionTaskExit {
+    match binding {
+        Binding::Tcp => serve_tcp_task(stream, config, retirement).await,
+        Binding::WebSocket => serve_wss_task(stream, config, retirement).await,
+    }
+}
+
+async fn serve_wss_task<B: Broker>(
+    stream: TcpStream,
+    config: AmqpListener<B>,
+    retirement: AmqpListenerRetirement,
+) -> ConnectionTaskExit {
+    match config.tls_acceptor.clone() {
+        Some(acceptor) => {
+            match until_retired(&retirement, acceptor.accept(stream), Stage::Tls).await {
+                Some(Ok(stream)) => serve_wss_stream(stream, config, retirement).await,
+                Some(Err(error)) => ConnectionTaskExit::Complete(Err(error.into())),
+                None => ConnectionTaskExit::Complete(Ok(())),
+            }
+        }
+        None => serve_wss_stream(stream, config, retirement).await,
+    }
+}
+
+async fn serve_wss_stream<Io, B>(
+    stream: Io,
+    config: AmqpListener<B>,
+    retirement: AmqpListenerRetirement,
+) -> ConnectionTaskExit
+where
+    Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    B: Broker,
+{
+    match until_retired(&retirement, accept_amqp_websocket(stream), Stage::Upgrade).await {
+        Some(Ok(stream)) => serve_retained_connection(stream, config, retirement).await,
+        Some(Err(error)) => ConnectionTaskExit::Complete(Err(error.into())),
+        None => ConnectionTaskExit::Complete(Ok(())),
+    }
+}
+
 async fn serve_tcp_task<B: Broker>(
     stream: TcpStream,
     config: AmqpListener<B>,
@@ -365,6 +429,7 @@ async fn serve_tcp_task<B: Broker>(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stage {
     Tls,
+    Upgrade,
     Protocol,
 }
 
