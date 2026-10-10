@@ -27,7 +27,10 @@ flowchart TD
     Main --> Domain["#14/#16/#23 Domain"] --> Semantics
     Main --> Recovery["#37 Snapshots -> #38 Quorum"] --> Runtime["#41 Runtime"]
     Lifecycle --> Security["#71 Grants -> #17 JWT; #42/#43/#49 Identity"] --> Runtime
-    Admin["#10/#18 Administration"] --> Gates["#53 Release"]
+    Atom["#10 Atom"] --> Gates["#53 Release"]
+    Admin["#18 Coordinator"] --> Catalog["#243 Catalog"] --> Broker["#244 Broker"] --> Gates
+    Allocation["#228 Queue ACKs"] --> Activation["#238 Activation"]
+    Allocation --> Topic["#239 Topic"]; Allocation --> Tokens["#240 Tokens"]
     Runtime --> Gates; Semantics --> Gates
 ```
 
@@ -45,8 +48,7 @@ flowchart TD
 - [ ] #210 Selection/compaction.
 
 #229 is unexecuted; #232 also depends on #227. #207-#210 remain blocked.
-#227 DLQ refusal is merged/verified. #228 is assigned for allocation scoping,
-not executed.
+#227 DLQ refusal is merged/verified.
 
 ```mermaid
 flowchart LR
@@ -76,12 +78,18 @@ PRs in dependency order ([workflow](../CONTRIBUTING.md)). Ready is not evidence.
 | WSS | [#225](https://github.com/DeandreT/switchyard/issues/225) assigned; listener/service. |
 | Snapshots | [#229](https://github.com/DeandreT/switchyard/issues/229) assigned; parallel #230/#231 after its merge. |
 | Domain | [#14](https://github.com/DeandreT/switchyard/issues/14)/[#16](https://github.com/DeandreT/switchyard/issues/16)/[#23](https://github.com/DeandreT/switchyard/issues/23) Ready/unassigned; serialize command/codec/keys. |
-| Atom/admin | [#10](https://github.com/DeandreT/switchyard/issues/10)/[#18](https://github.com/DeandreT/switchyard/issues/18) Ready/unassigned; distinct paths. |
+| Atom | [#10](https://github.com/DeandreT/switchyard/issues/10) Ready/unassigned. |
+| Admin | #18 Blocked coordinator; [#243](https://github.com/DeandreT/switchyard/issues/243) Ready/unassigned -> #244 Blocked/unassigned. |
+| Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228) queue ACK exhaustion merged/verified (PR247); #238/#239/#240 Blocked/unassigned. |
 | SDK/security | #71/#101 blocked on #7. |
+
+Shared: #243 keys.rs with #229, machine.rs with #240; #244 serializes broker
+ownership. Allocator error/condition/indexed edits serialize; #239 also
+coordinates #14/#23.
 
 SDK evidence is experimental current/previous Memory, not latest/durable.
 Production still refuses; quorum/recovery/runtime remain pending.
-[Docs #236](https://github.com/DeandreT/switchyard/issues/236) waits for #234.
+#234 and [#236](https://github.com/DeandreT/switchyard/issues/236) are closed/verified; PR246 split the lifecycle reference.
 
 ## Milestones
 
