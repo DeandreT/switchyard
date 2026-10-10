@@ -44,7 +44,7 @@ use attachments::{EntityAdmissionExit, serve_entity_attachment_into_family};
 use connection_custody::{ConnectionCustody, ConnectionRetirementRequest, NativePacket, PumpPoint};
 use ingress::SendIntake;
 use ingress::custody::{NativeSend, PumpPoint as SendPumpPoint, SendCustody};
-use session_custody::{SessionCustody, SessionPumpExit, SessionPumpResult};
+use session_custody::{SessionCustody, SessionPumpExit, SessionPumpResult, SessionTaskExit};
 
 const LOCKED_UNTIL_UTC_PROPERTY: &str = "com.microsoft:locked-until-utc";
 const DOTNET_UNIX_EPOCH_TICKS: u64 = 621_355_968_000_000_000;
@@ -386,6 +386,26 @@ async fn serve_session_with_retirement<B: Broker>(
     management: Arc<ConnectionManagement>,
     retirement: Option<ConnectionRetirementRequest>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_session_task(
+        session,
+        namespace,
+        broker,
+        authorization,
+        management,
+        retirement,
+    )
+    .await
+    .into_result()
+}
+
+pub(crate) async fn serve_session_task<B: Broker>(
+    session: ServerSession,
+    namespace: NamespaceName,
+    broker: B,
+    authorization: Option<Arc<ConnectionAuthorization>>,
+    management: Arc<ConnectionManagement>,
+    retirement: Option<ConnectionRetirementRequest>,
+) -> SessionTaskExit {
     let mut custody = SessionCustody::new(session, retirement);
     let primary = AssertUnwindSafe(serve_session_pump(
         &mut custody,
@@ -398,7 +418,7 @@ async fn serve_session_with_retirement<B: Broker>(
     .await;
     custody.record_primary(primary);
     custody.finish().await;
-    custody.into_result()
+    custody.into_exit()
 }
 
 async fn serve_session_pump<B: Broker>(

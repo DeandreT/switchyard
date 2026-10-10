@@ -31,6 +31,20 @@ pub(crate) enum SessionPumpExit {
     ReportOnly(PanicPayload),
 }
 
+pub(crate) enum SessionTaskExit {
+    Complete(LeafResult),
+    ReportOnly(PanicPayload),
+}
+
+impl SessionTaskExit {
+    pub(crate) fn into_result(self) -> LeafResult {
+        match self {
+            Self::Complete(result) => result,
+            Self::ReportOnly(payload) => resume_unwind(payload),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -272,11 +286,16 @@ impl SessionFamily {
         &self.finished
     }
 
+    #[cfg(test)]
     pub(crate) fn into_result(self) -> LeafResult {
-        self.resolve(None)
+        self.into_exit().into_result()
     }
 
-    fn resolve(mut self, admission_report: Option<PanicPayload>) -> LeafResult {
+    pub(crate) fn into_exit(self) -> SessionTaskExit {
+        self.resolve_exit(None)
+    }
+
+    fn resolve_exit(mut self, admission_report: Option<PanicPayload>) -> SessionTaskExit {
         assert!(
             self.pending.is_empty() && self.live_ready.is_none(),
             "original link tasks must finish before final resolution"
@@ -299,18 +318,18 @@ impl SessionFamily {
             }
         }
         if let Some(error) = self.first_join_error {
-            return Err(Box::new(error));
+            return SessionTaskExit::Complete(Err(Box::new(error)));
         }
         if let Some(error) = self.first_leaf_error {
-            return Err(error);
+            return SessionTaskExit::Complete(Err(error));
         }
         if let Some(error) = self.first_bridge_fault {
-            return Err(Box::new(error));
+            return SessionTaskExit::Complete(Err(Box::new(error)));
         }
         if let Some(payload) = admission_report.or(self.diagnostics) {
-            resume_unwind(payload);
+            return SessionTaskExit::ReportOnly(payload);
         }
-        Ok(())
+        SessionTaskExit::Complete(Ok(()))
     }
 }
 
@@ -424,7 +443,12 @@ impl SessionCustody {
         self.family.finish().await
     }
 
+    #[cfg(test)]
     pub(crate) fn into_result(self) -> LeafResult {
+        self.into_exit().into_result()
+    }
+
+    pub(crate) fn into_exit(self) -> SessionTaskExit {
         assert!(
             self.pending_admitted.is_none()
                 && self.family.pending.is_empty()
@@ -433,14 +457,14 @@ impl SessionCustody {
         );
         match self.primary {
             Some(Err(payload)) => resume_unwind(payload),
-            Some(Ok(Err(error))) => Err(error),
-            Some(Ok(Ok(SessionPumpExit::Complete))) => self.family.into_result(),
+            Some(Ok(Err(error))) => SessionTaskExit::Complete(Err(error)),
+            Some(Ok(Ok(SessionPumpExit::Complete))) => self.family.into_exit(),
             Some(Ok(Ok(SessionPumpExit::ReportOnly(payload)))) => {
-                self.family.resolve(Some(payload))
+                self.family.resolve_exit(Some(payload))
             }
-            None => Err(Box::new(std::io::Error::other(
+            None => SessionTaskExit::Complete(Err(Box::new(std::io::Error::other(
                 "session has no retained primary result",
-            ))),
+            )))),
         }
     }
 

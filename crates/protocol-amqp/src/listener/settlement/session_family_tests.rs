@@ -835,3 +835,174 @@ async fn actual_session_refused_attachment_report_preserves_raw_diagnostic_and_l
     drop(other);
     wire.stop().await;
 }
+
+// Typed entrypoint companion to the unchanged compatibility-wrapper control.
+#[tokio::test(flavor = "current_thread")]
+async fn actual_typed_session_refused_attachment_report_returns_raw_diagnostic_without_stop() {
+    use crate::listener::{serve_session_task, session_custody::SessionTaskExit};
+    use std::sync::atomic::AtomicUsize;
+    use tracing::instrument::WithSubscriber;
+    let actor = Actor::new(false, false);
+    let (mut wire, session) = AdmissionWire::new().await;
+    let independent = wire.begin(FAMILY_CHANNEL + 1).await;
+    let notice = ConnectionRetirementRequest::capture(&wire.connection);
+    let observer = AdoptionObserver::new(false);
+    let reached = Arc::new(AtomicUsize::new(0));
+    let payload: Arc<str> = Arc::from("typed actual refused-attachment diagnostic");
+    let other = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let dispatch = tracing::Dispatch::new(AttachmentReportFault {
+        reached: Arc::clone(&reached),
+        payload: Arc::clone(&payload),
+    });
+    std::thread::spawn(tracing::callsite::rebuild_interest_cache)
+        .join()
+        .unwrap();
+    let original = tokio::spawn(
+        ADOPTIONS.scope(
+            Arc::clone(&observer),
+            serve_session_task(
+                session,
+                actor.namespace.clone(),
+                actor.broker.as_ref().unwrap().clone(),
+                Some(authorization()),
+                ConnectionManagement::new(),
+                Some(notice.clone()),
+            )
+            .with_subscriber(dispatch),
+        ),
+    );
+    let mut invalid = Admission::DataSend.attach(1, ReceiverSettleMode::First, None);
+    invalid.target.as_mut().unwrap().address = Some(String::new());
+    write_frame(
+        &mut wire.peer,
+        &family_frame(FAMILY_CHANNEL, Performative::Attach(Box::new(invalid))),
+    )
+    .await
+    .unwrap();
+    wire.accepted(Admission::DataSend, 1).await;
+    let Performative::Detach(detach) = wire.control(FAMILY_CHANNEL).await else {
+        panic!("positive actual refusal Detach")
+    };
+    assert_eq!(detach.handle, 1);
+    assert!(detach.error.is_some());
+    let SessionTaskExit::ReportOnly(raw) = timeout(WAIT, original).await.unwrap().unwrap() else {
+        panic!("reached admission reporting retains its typed origin after drain")
+    };
+    assert!(Arc::ptr_eq(
+        raw.downcast_ref::<Arc<str>>().unwrap(),
+        &payload
+    ));
+    assert_eq!(reached.load(Ordering::SeqCst), 1);
+    assert!(observer.records.lock().unwrap().is_empty());
+    assert!(actor.log.lock().unwrap().is_empty());
+    assert!(!notice.is_requested());
+    // Direct native endpoint use proves connection usability, not a second
+    // served-session admission, sibling-isolation or recovery guarantee.
+    independent_session_usable(&mut wire, independent, FAMILY_CHANNEL + 1).await;
+    assert!(!notice.is_requested());
+    drop(other);
+    wire.stop().await;
+}
+
+struct TypedFamilyReportFault(AttachmentReportFault);
+
+impl tracing::Subscriber for TypedFamilyReportFault {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target().ends_with("::listener::session_custody")
+    }
+    fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::Subscriber::new_span(&self.0, attributes)
+    }
+    fn record(&self, span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        tracing::Subscriber::record(&self.0, span, values);
+    }
+    fn record_follows_from(&self, span: &tracing::span::Id, follows: &tracing::span::Id) {
+        tracing::Subscriber::record_follows_from(&self.0, span, follows);
+    }
+    fn event(&self, event: &tracing::Event<'_>) {
+        tracing::Subscriber::event(&self.0, event);
+    }
+    fn enter(&self, span: &tracing::span::Id) {
+        tracing::Subscriber::enter(&self.0, span);
+    }
+    fn exit(&self, span: &tracing::span::Id) {
+        tracing::Subscriber::exit(&self.0, span);
+    }
+}
+
+#[derive(Debug)]
+struct TypedReportedLeaf(Arc<str>);
+
+impl std::fmt::Display for TypedReportedLeaf {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TypedReportedLeaf {}
+
+// Real session/family reporting; the already-spawned leaf outcome is injected,
+// not an ordinary admitted native failure or a violated concurrent contract.
+#[tokio::test(flavor = "current_thread")]
+async fn qualified_native_session_typed_family_report_returns_injected_leaf_error_without_stop() {
+    use crate::listener::session_custody::{PreparedLeafTask, SessionPumpExit, SessionTaskExit};
+    use std::sync::atomic::AtomicUsize;
+    use tracing::instrument::WithSubscriber;
+    let (mut wire, session) = AdmissionWire::new().await;
+    let notice = ConnectionRetirementRequest::capture(&wire.connection);
+    let mut custody = SessionCustody::new(session, Some(notice.clone()));
+    let identity: Arc<str> = Arc::from("qualified raw leaf causes reached family report");
+    let error = Box::new(TypedReportedLeaf(Arc::clone(&identity)))
+        as Box<dyn std::error::Error + Send + Sync>;
+    let error_address =
+        (&*error as *const (dyn std::error::Error + Send + Sync) as *const ()) as usize;
+    let receipt = PreparedLeafTask::new(LeafKind::DataSend).spawn(std::future::ready(Err(error)));
+    let id = receipt.task.id();
+    timeout(WAIT, async {
+        while !receipt.task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("same injected original positively completed");
+    let (_, pending, _) = custody.admission_parts();
+    *pending = Some(receipt);
+    custody.record_primary(Ok(Ok(SessionPumpExit::Complete)));
+    let reached = Arc::new(AtomicUsize::new(0));
+    let report: Arc<str> = Arc::from("reached family diagnostic cannot replace raw leaf");
+    let other = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let dispatch = tracing::Dispatch::new(TypedFamilyReportFault(AttachmentReportFault {
+        reached: Arc::clone(&reached),
+        payload: Arc::clone(&report),
+    }));
+    std::thread::spawn(tracing::callsite::rebuild_interest_cache)
+        .join()
+        .unwrap();
+    timeout(WAIT, custody.finish().with_subscriber(dispatch))
+        .await
+        .unwrap();
+    assert_eq!(reached.load(Ordering::SeqCst), 1);
+    assert_eq!(custody.family().finished().len(), 1);
+    let packet = &custody.family().finished()[0];
+    assert_eq!(packet.id, id);
+    assert!(packet.joined.is_ok() && packet.bridge_fault.is_none());
+    let retained = packet.leaf.as_ref().unwrap().as_ref().unwrap_err();
+    assert_eq!(
+        (&**retained as *const (dyn std::error::Error + Send + Sync) as *const ()) as usize,
+        error_address
+    );
+    let SessionTaskExit::Complete(Err(raw)) = custody.into_exit() else {
+        panic!("reached family reporting keeps the stronger original error")
+    };
+    assert_eq!(
+        (&*raw as *const (dyn std::error::Error + Send + Sync) as *const ()) as usize,
+        error_address
+    );
+    assert!(Arc::ptr_eq(
+        &raw.downcast_ref::<TypedReportedLeaf>().unwrap().0,
+        &identity
+    ));
+    assert!(!notice.is_requested());
+    drop(other);
+    wire.stop().await;
+}

@@ -621,3 +621,344 @@ async fn qualified_session_report_only_exit_retains_raw_priority_across_cancelle
         timeout(WAIT, connection.shutdown()).await.unwrap().unwrap();
     }
 }
+
+fn payload_address(payload: &(dyn std::any::Any + Send)) -> usize {
+    (payload as *const (dyn std::any::Any + Send) as *const ()) as usize
+}
+
+fn error_address(error: &(dyn Error + Send + Sync)) -> usize {
+    (error as *const (dyn Error + Send + Sync) as *const ()) as usize
+}
+
+fn typed_error(exit: SessionTaskExit) -> Box<dyn Error + Send + Sync> {
+    match exit {
+        SessionTaskExit::Complete(Err(error)) => error,
+        _ => panic!("typed completion retains the original error"),
+    }
+}
+
+fn typed_report(exit: SessionTaskExit, expected: &Arc<str>, address: usize) {
+    let SessionTaskExit::ReportOnly(payload) = exit else {
+        panic!("known report remains a typed diagnostic after drain")
+    };
+    assert_eq!(payload_address(payload.as_ref()), address);
+    assert!(Arc::ptr_eq(
+        payload.downcast_ref::<Arc<str>>().unwrap(),
+        expected
+    ));
+}
+
+// Two cache origins plus healthy completion. Family-only seeding is synthetic.
+#[tokio::test(flavor = "current_thread")]
+async fn qualified_typed_session_report_origins_keep_originals_across_cancelled_finish() {
+    for admission in [false, true] {
+        let (mut connection, _peer, session) = native_session().await;
+        let notice = ConnectionRetirementRequest::capture(&connection);
+        let mut custody = SessionCustody::new(session, Some(notice.clone()));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let first = PreparedLeafTask::new(LeafKind::CbsRequest)
+            .spawn(witness(std::future::ready(Ok(())), &polls));
+        completed(&first).await;
+        let first_id = first.task.id();
+        custody.pending_admitted = Some(first);
+        let (release, held) = oneshot::channel::<LeafResult>();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::clone(&runs);
+        let second = PreparedLeafTask::new(LeafKind::ManagementReply).spawn(async move {
+            entered.fetch_add(1, Ordering::SeqCst);
+            held.await.unwrap()
+        });
+        let second_id = second.task.id();
+        assert_eq!(custody.family.adopt(second), second_id);
+        let identity: Arc<str> = Arc::from("known terminal report cache");
+        let payload = Box::new(Arc::clone(&identity)) as PanicPayload;
+        let report_address = payload_address(payload.as_ref());
+        let primary = if admission {
+            SessionPumpExit::ReportOnly(payload)
+        } else {
+            // Diagnostic-only family success is not an ordinary reached warning.
+            custody.family.diagnostics = Some(payload);
+            SessionPumpExit::Complete
+        };
+        custody.record_primary(Ok(Ok(primary)));
+        let mut packet_address = None;
+        for _ in 0..2 {
+            let mut finish = Box::pin(custody.finish());
+            pending_once(finish.as_mut()).await;
+            drop(finish);
+            assert_eq!(custody.family().len(), 1);
+            assert_eq!(custody.family().finished().len(), 1);
+            let packet = &custody.family().finished()[0];
+            assert_eq!(packet.id, first_id);
+            assert!(packet.joined.is_ok() && packet.leaf.as_ref().unwrap().is_ok());
+            let address = (&**packet as *const JoinedLeafTask) as usize;
+            assert_eq!(*packet_address.get_or_insert(address), address);
+            let retained = if admission {
+                custody.report_payload()
+            } else {
+                custody.family.diagnostics.as_ref()
+            }
+            .unwrap();
+            assert_eq!(payload_address(retained.as_ref()), report_address);
+            assert!(Arc::ptr_eq(
+                retained.downcast_ref::<Arc<str>>().unwrap(),
+                &identity
+            ));
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert!(!notice.is_requested());
+        }
+        release.send(Ok(())).unwrap();
+        timeout(WAIT, custody.finish()).await.unwrap();
+        assert_eq!(custody.family().finished().len(), 2);
+        assert_eq!(custody.family().finished()[1].id, second_id);
+        assert_eq!(
+            (&*custody.family().finished()[0] as *const JoinedLeafTask) as usize,
+            packet_address.unwrap()
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        typed_report(custody.into_exit(), &identity, report_address);
+        assert!(!notice.is_requested());
+        connection.stop();
+        timeout(WAIT, connection.shutdown()).await.unwrap().unwrap();
+    }
+    let (mut connection, _peer, session) = native_session().await;
+    let notice = ConnectionRetirementRequest::capture(&connection);
+    let mut custody = SessionCustody::new(session, Some(notice.clone()));
+    custody.record_primary(Ok(Ok(SessionPumpExit::Complete)));
+    timeout(WAIT, custody.finish()).await.unwrap();
+    assert!(matches!(
+        custody.into_exit(),
+        SessionTaskExit::Complete(Ok(()))
+    ));
+    assert!(!notice.is_requested());
+    connection.stop();
+    timeout(WAIT, connection.shutdown()).await.unwrap().unwrap();
+}
+
+// Three competing-category rows and one two-cache selection. Raw task faults
+// and missing bridge are explicit compositions, not native admission outcomes.
+#[tokio::test(flavor = "current_thread")]
+async fn qualified_typed_family_original_errors_outrank_both_report_origins() {
+    for category in 0..3 {
+        let mut family = SessionFamily::new();
+        let bridge = composed(LeafKind::CbsReply, None, None);
+        completed(&bridge).await;
+        let bridge_id = family.adopt(bridge);
+        assert!(family.next().await);
+        let (raw, identity) = failure("first returned raw leaf");
+        let leaf_address = error_address(raw.as_ref().unwrap_err().as_ref());
+        if category >= 1 {
+            let leaf = PreparedLeafTask::new(LeafKind::DataSend).spawn(std::future::ready(raw));
+            completed(&leaf).await;
+            family.adopt(leaf);
+            assert!(family.next().await);
+            let later = PreparedLeafTask::new(LeafKind::DataSend).spawn(std::future::ready(
+                failure("later leaf cannot replace first").0,
+            ));
+            completed(&later).await;
+            family.adopt(later);
+            assert!(family.next().await);
+        }
+        let panic: Arc<str> = Arc::from("first original raw join panic");
+        let mut join_id = None;
+        if category == 2 {
+            let joined = composed(
+                LeafKind::DataReceive,
+                Some(Ok(())),
+                Some(Arc::clone(&panic)),
+            );
+            completed(&joined).await;
+            join_id = Some(family.adopt(joined));
+            assert!(family.next().await);
+            let later = composed(
+                LeafKind::DataReceive,
+                None,
+                Some(Arc::<str>::from("later join cannot replace first")),
+            );
+            completed(&later).await;
+            family.adopt(later);
+            assert!(family.next().await);
+        }
+        family.diagnostics = Some(Box::new(Arc::<str>::from("family report below originals")));
+        let admission =
+            Box::new(Arc::<str>::from("admission report below originals")) as PanicPayload;
+        timeout(WAIT, family.finish()).await.unwrap();
+        let error = typed_error(family.resolve_exit(Some(admission)));
+        match category {
+            0 => assert_eq!(error.downcast::<BridgeFault>().unwrap().id, bridge_id),
+            1 => {
+                assert_eq!(error_address(error.as_ref()), leaf_address);
+                exact_error(error.as_ref(), &identity);
+            }
+            _ => {
+                let joined = *error.downcast::<tokio::task::JoinError>().unwrap();
+                assert_eq!(joined.id(), join_id.unwrap());
+                assert!(Arc::ptr_eq(
+                    joined.into_panic().downcast_ref::<Arc<str>>().unwrap(),
+                    &panic
+                ));
+            }
+        }
+    }
+    let mut family = SessionFamily::new();
+    family.diagnostics = Some(Box::new(Arc::<str>::from("lower family report")));
+    let identity: Arc<str> = Arc::from("higher admission report");
+    let payload = Box::new(Arc::clone(&identity)) as PanicPayload;
+    let address = payload_address(payload.as_ref());
+    timeout(WAIT, family.finish()).await.unwrap();
+    typed_report(family.resolve_exit(Some(payload)), &identity, address);
+}
+
+// Three qualified primary rows; only a genuine retained parent fault requests
+// retirement. Later record_primary calls must not replace the first packet.
+#[tokio::test(flavor = "current_thread")]
+async fn qualified_typed_session_primary_faults_preserve_raw_identity_and_request_priority() {
+    for primary in 0..3 {
+        let (mut connection, _peer, session) = native_session().await;
+        let notice = ConnectionRetirementRequest::capture(&connection);
+        let mut custody = SessionCustody::new(session, Some(notice.clone()));
+        let (child, child_identity) = failure("child raw leaf below primary");
+        let child_panic: Arc<str> = Arc::from("child raw join below primary");
+        let receipt = composed(
+            LeafKind::DataSend,
+            Some(child),
+            Some(Arc::clone(&child_panic)),
+        );
+        completed(&receipt).await;
+        let child_id = receipt.task.id();
+        custody.pending_admitted = Some(receipt);
+        custody.family.diagnostics = Some(Box::new(Arc::<str>::from("synthetic family report")));
+        let (parent_error, parent_identity) = failure("first active primary error");
+        let parent_error_address = error_address(parent_error.as_ref().unwrap_err().as_ref());
+        let parent_panic: Arc<str> = Arc::from("first raw primary panic");
+        let payload = Box::new(Arc::clone(&parent_panic)) as PanicPayload;
+        let parent_panic_address = payload_address(payload.as_ref());
+        custody.record_primary(match primary {
+            0 => Ok(Ok(SessionPumpExit::Complete)),
+            1 => Ok(parent_error.map(|()| SessionPumpExit::Complete)),
+            _ => Err(payload),
+        });
+        custody.record_primary(Err(Box::new(Arc::<str>::from("later primary ignored"))));
+        assert_eq!(notice.is_requested(), primary != 0);
+        timeout(WAIT, custody.finish()).await.unwrap();
+        let packet = &custody.family().finished()[0];
+        assert_eq!(packet.id, child_id);
+        exact_error(
+            packet.leaf.as_ref().unwrap().as_ref().unwrap_err().as_ref(),
+            &child_identity,
+        );
+        if primary == 2 {
+            let raw = match std::panic::catch_unwind(AssertUnwindSafe(|| custody.into_exit())) {
+                Err(payload) => payload,
+                Ok(_) => panic!("active primary panic remains an unwind"),
+            };
+            assert_eq!(payload_address(raw.as_ref()), parent_panic_address);
+            assert!(Arc::ptr_eq(
+                raw.downcast_ref::<Arc<str>>().unwrap(),
+                &parent_panic
+            ));
+        } else {
+            let error = typed_error(custody.into_exit());
+            if primary == 1 {
+                assert_eq!(error_address(error.as_ref()), parent_error_address);
+                exact_error(error.as_ref(), &parent_identity);
+            } else {
+                let joined = *error.downcast::<tokio::task::JoinError>().unwrap();
+                assert_eq!(joined.id(), child_id);
+                assert!(Arc::ptr_eq(
+                    joined.into_panic().downcast_ref::<Arc<str>>().unwrap(),
+                    &child_panic
+                ));
+            }
+        }
+        assert_eq!(notice.is_requested(), primary != 0);
+        connection.stop();
+        timeout(WAIT, connection.shutdown()).await.unwrap().unwrap();
+    }
+}
+
+// Fresh owned terminal packets; no already-resolved custody is reconstructed.
+#[test]
+fn qualified_typed_exit_compatibility_adapter_preserves_original_payload_and_error() {
+    let identity: Arc<str> = Arc::from("raw compatible diagnostic");
+    let payload = Box::new(Arc::clone(&identity)) as PanicPayload;
+    let address = payload_address(payload.as_ref());
+    let raw = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+        SessionTaskExit::ReportOnly(payload).into_result()
+    })) {
+        Err(payload) => payload,
+        Ok(_) => panic!("compatibility adapter resumes its same report payload"),
+    };
+    assert_eq!(payload_address(raw.as_ref()), address);
+    assert!(Arc::ptr_eq(
+        raw.downcast_ref::<Arc<str>>().unwrap(),
+        &identity
+    ));
+    let (result, identity) = failure("raw compatible leaf error");
+    let address = error_address(result.as_ref().unwrap_err().as_ref());
+    let error = SessionTaskExit::Complete(result).into_result().unwrap_err();
+    assert_eq!(error_address(error.as_ref()), address);
+    exact_error(error.as_ref(), &identity);
+    assert!(SessionTaskExit::Complete(Ok(())).into_result().is_ok());
+}
+
+// Reached family warnings on three qualified raw error compositions. There is
+// no healthy-success warning path; the diagnostic cannot replace its cause.
+#[tokio::test(flavor = "current_thread")]
+async fn qualified_typed_family_reached_reporting_fault_keeps_raw_error_priority() {
+    use tracing::instrument::WithSubscriber;
+    for category in 0..3 {
+        let mut family = SessionFamily::new();
+        let (raw, identity) = failure("raw leaf causes real reporting");
+        let leaf_address = error_address(raw.as_ref().unwrap_err().as_ref());
+        let panic: Arc<str> = Arc::from("raw original join causes real reporting");
+        let receipt = composed(
+            LeafKind::ManagementReply,
+            (category != 2).then_some(raw),
+            (category == 1).then(|| Arc::clone(&panic)),
+        );
+        completed(&receipt).await;
+        let id = family.adopt(receipt);
+        let other = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let reached = Arc::new(AtomicUsize::new(0));
+        let report: Arc<str> = Arc::from("reached family warning panic");
+        let dispatch = tracing::Dispatch::new(ReportFault {
+            reached: Arc::clone(&reached),
+            payload: Arc::clone(&report),
+        });
+        std::thread::spawn(tracing::callsite::rebuild_interest_cache)
+            .join()
+            .unwrap();
+        timeout(WAIT, family.finish().with_subscriber(dispatch))
+            .await
+            .unwrap();
+        assert_eq!(reached.load(Ordering::SeqCst), 1);
+        assert_eq!(family.finished()[0].id, id);
+        assert!(Arc::ptr_eq(
+            family
+                .diagnostics
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<Arc<str>>()
+                .unwrap(),
+            &report
+        ));
+        let error = typed_error(family.into_exit());
+        match category {
+            0 => {
+                assert_eq!(error_address(error.as_ref()), leaf_address);
+                exact_error(error.as_ref(), &identity);
+            }
+            1 => {
+                let joined = *error.downcast::<tokio::task::JoinError>().unwrap();
+                assert_eq!(joined.id(), id);
+                assert!(Arc::ptr_eq(
+                    joined.into_panic().downcast_ref::<Arc<str>>().unwrap(),
+                    &panic
+                ));
+            }
+            _ => assert_eq!(error.downcast::<BridgeFault>().unwrap().id, id),
+        }
+        drop(other);
+    }
+}
