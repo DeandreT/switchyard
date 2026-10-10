@@ -147,6 +147,7 @@ shielding (Send uses per-delivery pump panic custody):
 | Owner | Acquisition and drain contract |
 | --- | --- |
 | Native connection | Capacity-free sticky Stop interrupts IO/channels. Shutdown joins original driver/reader and caches cancellation/repeat results; outer panic keeps acceptance/Close packets. Retirement discards unstarted work, starts no Close; Drop requests Stop only. Joins do not acknowledge Close; peer reply is required. |
+| Connection session family | Keeps begun acceptance and ready Sessions through context preparation; adopts the same task and typed result without intervening callbacks. Live reaping consumes healthy history. Retirement stops intake, drains original native work/shutdown, then original session joins; cancelled finish retains packets. Reaping child errors and typed reports adds no Stop request. |
 | Native sender/credit | Detach/command closure interrupts capacity waits with all 256 permits held. Queued grant replies own cleanup before observation; dropped accepted replies clean exact reservations, not replacement credit. |
 | Control-link admission | Retains one borrowed acceptance, typed route/refusal and raw results through cancellation/panic. Retirement discards unstarted work and drains begun originals; cleanup removes only the captured route. Active primary faults request captured Stop before drains. Adoption hands the same spawned task to its session family. |
 | Session link family | Retains original data/CBS/management handles and raw leaf results. Live success history is consumed; retirement freezes admission and joins the same children. Cancelled borrowed finish keeps cached packets. Active parent panic/error requests captured Stop before drain; child errors and report-only exits do not notify. Priority: parent panic, parent error, child JoinError, leaf error, bridge fault, diagnostic panic. No session-level Stop or finite join latency. |
@@ -181,8 +182,9 @@ retirement/refusal and reporting-only faults retain the owner-specific policies 
 Borrowed cancellation keeps phases/handles/raw results; panicked originals are
 terminal, not repolled/retried/recovered. Receive/session-grant invocation begins
 inside original first poll (including eager adapters), not an enqueue receipt.
-Begun acceptance may still hand off a Session (#133). Late Receive starts no
-Transfer/implicit settlement: peek-lock expires; receive-delete may be lost. Auth
+Retired connection acceptance retains ready Sessions but starts no new session
+task. Late Receive starts no Transfer/implicit settlement: peek-lock expires;
+receive-delete may be lost. Auth
 retirement never rolls back begun Transfer. Receiving prepares one settlement context while
 Receive/registration remain owned, before native start; active/one late adoption
 move it, never retry failed broker cloning.
@@ -194,11 +196,12 @@ Session cleanup matches owner/entity/full hold. Original End observes End/Stop/d
 panic even during row-held auth/registry preparation, proving neither End answer
 nor native joins; receiving auth sees captured Detach before Receive.
 
-Session-owned link families #132 are joined. Connection-owned sessions
-[#133](https://github.com/DeandreT/switchyard/issues/133), completing
-[#75](https://github.com/DeandreT/switchyard/issues/75), and
-[#7](https://github.com/DeandreT/switchyard/issues/7) process shutdown remain
-[roadmap work](roadmap.md#next-main-increments). No aborted-ancestor
+Session/link ownership covers #132 and
+[#133](https://github.com/DeandreT/switchyard/issues/133). Connection
+[terminal precedence](../crates/protocol-amqp/src/listener/connection_custody.rs)
+keeps raw faults before typed session reports, then connection/family diagnostics.
+[#7](https://github.com/DeandreT/switchyard/issues/7) process shutdown
+remains [roadmap work](roadmap.md#next-main-increments). No aborted-ancestor
 protection, graceful Close acknowledgement or finite broker/cleanup latency.
 
 Sustained traffic beyond initial credit is uncertified: [#68](https://github.com/DeandreT/switchyard/issues/68)

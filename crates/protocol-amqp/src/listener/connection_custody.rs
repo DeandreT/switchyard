@@ -16,6 +16,10 @@ use futures_util::FutureExt;
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
+use super::connection_session_family::{
+    AdmittedSessionTask, ConnectionSessionFamily, FamilyPoint, SessionFamilyFailures, checkpoint,
+};
+
 pub(super) type ConnectionError = Box<dyn std::error::Error + Send + Sync>;
 type PanicPayload = Box<dyn Any + Send>;
 type Primary = std::thread::Result<Result<(), ConnectionError>>;
@@ -146,6 +150,10 @@ pub(super) struct ConnectionCustody {
     shutdown: Option<Result<(), ConnectionShutdownError>>,
     secondary_panic: Option<PanicPayload>,
     shutdown_poisoned: bool,
+    family: ConnectionSessionFamily,
+    pending_session: Option<AdmittedSessionTask>,
+    #[cfg(test)]
+    acceptance_preparations: usize,
     finished: bool,
 }
 
@@ -162,6 +170,10 @@ impl ConnectionCustody {
             shutdown: None,
             secondary_panic: None,
             shutdown_poisoned: false,
+            family: ConnectionSessionFamily::new(),
+            pending_session: None,
+            #[cfg(test)]
+            acceptance_preparations: 0,
             finished: false,
         }
     }
@@ -186,6 +198,43 @@ impl ConnectionCustody {
         self.original = Some(OriginalNative::new(NativeFuture::Accept(Box::pin(
             self.connection.accept_session_owned(incoming),
         ))));
+        #[cfg(test)]
+        {
+            self.acceptance_preparations += 1;
+        }
+    }
+
+    pub(super) async fn next_incoming_session(&mut self) -> Option<IncomingSession> {
+        loop {
+            let incoming = tokio::select! {
+                biased;
+                true = self.family.next(), if !self.family.is_empty() => {
+                    #[cfg(test)]
+                    let id = self.family.reaped_id();
+                    #[cfg(not(test))]
+                    let id = None;
+                    checkpoint(self, FamilyPoint::LiveReaped, id).await;
+                    continue;
+                },
+                incoming = self.connection.next_incoming_session() => incoming,
+            };
+            return incoming;
+        }
+    }
+
+    pub(super) fn capture_session(&mut self, receipt: AdmittedSessionTask) {
+        assert!(
+            self.pending_session.is_none(),
+            "one external session receipt at a time"
+        );
+        self.pending_session = Some(receipt);
+        self.finished = false;
+    }
+
+    pub(super) fn adopt_pending(&mut self) -> Option<tokio::task::Id> {
+        let receipt = self.pending_session.take()?;
+        self.finished = false;
+        Some(self.family.adopt(receipt))
     }
 
     pub(super) fn begin_close(&mut self, error: Option<amqp::Error>) {
@@ -242,11 +291,14 @@ impl ConnectionCustody {
     pub(super) fn record_primary(&mut self, primary: Primary) {
         assert!(self.primary.is_none(), "one primary pump result");
         self.primary = Some(primary);
+        self.family.retire();
     }
 
     /// Cancellation drops only this borrower, not originals or retained results.
     pub(super) async fn finish(&mut self) {
         self.request_handle().request();
+        self.family.retire();
+        let _ = self.adopt_pending();
         if let Some(original) = self.original.as_mut() {
             original.retire();
             if let Err(payload) = original.observe().await
@@ -284,11 +336,21 @@ impl ConnectionCustody {
                 }
             }
         }
+        checkpoint(self, FamilyPoint::NativeShutdownCached, None).await;
+        self.family.finish().await;
         self.finished = true;
     }
 
     pub(super) fn finish_result(&mut self) -> Result<(), ConnectionError> {
-        assert!(self.finished, "native cleanup finishes before reporting");
+        assert!(
+            self.finished,
+            "native and session cleanup finish before reporting"
+        );
+        assert!(
+            self.pending_session.is_none(),
+            "all external session receipts must be adopted"
+        );
+        self.family.assert_drained();
         let diagnostics = std::panic::catch_unwind(AssertUnwindSafe(|| {
             if let Some(Err(error)) = self.shutdown.as_ref() {
                 warn!(%error, "native tasks failed during connection cleanup");
@@ -303,23 +365,136 @@ impl ConnectionCustody {
             }
         }))
         .err();
-        match self.primary.take().expect("retained primary pump result") {
-            Err(payload) => resume_unwind(payload),
-            Ok(Err(error)) => Err(error),
-            Ok(Ok(())) => {
-                if let Some(error) = self.native_error.take() {
-                    return Err(error.into());
-                }
-                if let Some(Err(error)) = self.shutdown.take() {
-                    return Err(error.into());
-                }
-                if let Some(payload) = self.secondary_panic.take().or(diagnostics) {
-                    resume_unwind(payload);
-                }
-                Ok(())
-            }
+        let primary = match self.primary.take() {
+            Some(primary) => primary,
+            None => unreachable!("retained primary pump result"),
+        };
+        resolve_terminal(ConnectionTerminalParts {
+            primary,
+            native_error: self.native_error.take(),
+            shutdown: self.shutdown.take(),
+            secondary_panic: self.secondary_panic.take(),
+            family: self.family.take_failures(),
+            diagnostic: diagnostics,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn accepted_end_observer(
+        &self,
+    ) -> Option<impl Future<Output = ()> + Send + 'static + use<>> {
+        match self
+            .original
+            .as_ref()
+            .and_then(|original| original.packet.as_ref())
+        {
+            Some(NativePacket::Accepted(Ok(session))) => Some(session.on_end_owned()),
+            _ => None,
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn acceptance_packet_address(&self) -> Option<usize> {
+        self.original
+            .as_ref()
+            .and_then(|original| original.packet.as_ref())
+            .map(|packet| std::ptr::from_ref(packet) as usize)
+    }
+
+    #[cfg(test)]
+    pub(super) fn acceptance_started(&self) -> bool {
+        self.original
+            .as_ref()
+            .is_some_and(|original| original.started)
+    }
+
+    #[cfg(test)]
+    pub(super) fn acceptance_preparations(&self) -> usize {
+        self.acceptance_preparations
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_receipt_id(&self) -> Option<tokio::task::Id> {
+        self.pending_session.as_ref().map(|receipt| receipt.id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn shutdown_cached(&self) -> bool {
+        self.shutdown.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn family(&self) -> &ConnectionSessionFamily {
+        &self.family
+    }
+
+    #[cfg(test)]
+    pub(super) fn family_facts(
+        &self,
+        point: FamilyPoint,
+        id: Option<tokio::task::Id>,
+    ) -> super::connection_session_family::FamilyFacts {
+        super::connection_session_family::FamilyFacts {
+            point,
+            id,
+            pending: self.family.len(),
+            live_ready: self.family.live_ready_count(),
+            finished: self.family.finished().len(),
+            accepted_cached: matches!(
+                self.original
+                    .as_ref()
+                    .and_then(|original| original.packet.as_ref()),
+                Some(NativePacket::Accepted(Ok(_)))
+            ),
+            receipt_cached: self.pending_session.is_some(),
+            shutdown_cached: self.shutdown_cached(),
+            packet_address: self.acceptance_packet_address(),
+        }
+    }
+}
+
+pub(super) struct ConnectionTerminalParts {
+    pub(super) primary: Primary,
+    pub(super) native_error: Option<EngineError>,
+    pub(super) shutdown: Option<Result<(), ConnectionShutdownError>>,
+    pub(super) secondary_panic: Option<PanicPayload>,
+    pub(super) family: SessionFamilyFailures,
+    pub(super) diagnostic: Option<PanicPayload>,
+}
+
+pub(super) fn resolve_terminal(parts: ConnectionTerminalParts) -> Result<(), ConnectionError> {
+    match parts.primary {
+        Err(payload) => resume_unwind(payload),
+        Ok(Err(error)) => return Err(error),
+        Ok(Ok(())) => {}
+    }
+    if let Some(error) = parts.native_error {
+        return Err(error.into());
+    }
+    if let Some(Err(error)) = parts.shutdown {
+        return Err(error.into());
+    }
+    if let Some(payload) = parts.secondary_panic {
+        resume_unwind(payload);
+    }
+    if let Some(error) = parts.family.join_error {
+        return Err(error.into());
+    }
+    if let Some(error) = parts.family.returned_error {
+        return Err(error);
+    }
+    if let Some(error) = parts.family.bridge_fault {
+        return Err(error.into());
+    }
+    if let Some(payload) = parts
+        .family
+        .report_only
+        .or(parts.diagnostic)
+        .or(parts.family.diagnostic)
+    {
+        resume_unwind(payload);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

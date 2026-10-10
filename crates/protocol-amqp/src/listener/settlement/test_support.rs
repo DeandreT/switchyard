@@ -9,6 +9,12 @@ mod cleanup_notice_tests;
 #[path = "session_family_tests.rs"]
 mod session_family_tests;
 
+#[path = "connection_family_fixture.rs"]
+mod connection_family_fixture;
+
+#[path = "connection_family_tests.rs"]
+mod connection_family_tests;
+
 use std::{
     future::{Future, poll_fn},
     io,

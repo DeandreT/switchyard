@@ -235,6 +235,31 @@ async fn adopted_data_leaf_faults_publish_the_original_connection_request() {
         parent.record_primary(primary);
         timeout(LIMIT, parent.retirement_observer()).await.unwrap();
         timeout(LIMIT, parent.finish()).await.unwrap();
-        parent.finish_result().unwrap();
+        let returned = parent
+            .family()
+            .finished()
+            .iter()
+            .find_map(|packet| match packet.exit.as_ref() {
+                Some(crate::listener::session_custody::SessionTaskExit::Complete(Err(error))) => {
+                    assert!(packet.joined.is_ok());
+                    Some(error)
+                }
+                _ => None,
+            })
+            .expect("original returned leaf fault is cached");
+        let original_id = returned
+            .downcast_ref::<tokio::task::JoinError>()
+            .unwrap()
+            .id();
+        let original_address = &**returned as *const _ as *const () as usize;
+        let error = parent.finish_result().unwrap_err();
+        assert_eq!(&*error as *const _ as *const () as usize, original_address);
+        let error = *error.downcast::<tokio::task::JoinError>().unwrap();
+        assert_eq!(error.id(), original_id);
+        assert!(error.is_panic());
+        assert_eq!(
+            error.into_panic().downcast_ref::<&str>(),
+            Some(&"controlled admitted data-leaf original fault")
+        );
     }
 }

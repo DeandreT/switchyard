@@ -13,7 +13,7 @@ and acceptance; [compatibility](compatibility.md) owns tested guarantees.
 - [x] Memory/Fjall storage and format-2 ownership; opt-in journal, atomic indexed
   apply and same-store committed replay (#144/#145/#36). Production still refuses.
 - [x] Bound local authority, pure JWT/SQL kernels; native/link-family lifecycle
-  custody through #132. Connection-owned sessions remain #133.
+  custody through #133. Process shutdown remains #7.
 - [x] Source-bound build custody and four experimental Memory SDK TCP/WSS gates.
   Declared-current/previous pins are not latest or a durable compatibility matrix.
 - [ ] Remaining semantics, administration and conserved physical-byte capacity.
@@ -21,7 +21,7 @@ and acceptance; [compatibility](compatibility.md) owns tested guarantees.
 
 ## Next Main Increments
 
-Lifecycle: #133 -> listener/deadline/signals #7 -> retained wire authority #12 ->
+Lifecycle: listener/deadline/signals #7 -> retained wire authority #12 ->
 retirement/recreation #15. Snapshot children can proceed alongside that lane.
 Joins are not Close acknowledgements; no finite latency is inferred.
 
@@ -31,7 +31,7 @@ contracts; account for capabilities before retiring references.
 
 ```mermaid
 flowchart TD
-    Main["Merged main"] --> Lifecycle["#133 Sessions -> #7 Shutdown -> #12 Authority -> #15 Retirement"]
+    Main["Merged main"] --> Lifecycle["#7 Shutdown -> #12 Authority -> #15 Retirement"]
     Main --> Domain["#14 Profiles / #16 Content / #23 Duplicates"]
     Domain --> Semantics["#20/#21 Rules -> #26/#27/#28 Capacity"]
     Lifecycle --> Semantics
@@ -85,7 +85,7 @@ disk-aware two-job builds; see [workflow](../CONTRIBUTING.md).
 
 | Lane | Entry / overlap boundary |
 | --- | --- |
-| Lifecycle | [#133](https://github.com/DeandreT/switchyard/issues/133); serialize listener/native/registry. |
+| Lifecycle | [#7](https://github.com/DeandreT/switchyard/issues/7); serialize listener/native/registry. |
 | Domain | [#14](https://github.com/DeandreT/switchyard/issues/14), [#16](https://github.com/DeandreT/switchyard/issues/16), [#23](https://github.com/DeandreT/switchyard/issues/23); serialize command/codec/key tags. |
 | Snapshots | [#204](https://github.com/DeandreT/switchyard/issues/204) catalog is ready/unassigned; #205/#207-#210 are blocked. [#203](https://github.com/DeandreT/switchyard/issues/203) format and [#206](https://github.com/DeandreT/switchyard/issues/206) provenance are merged. |
 | Administration | [#10](https://github.com/DeandreT/switchyard/issues/10) Atom fixtures, [#18](https://github.com/DeandreT/switchyard/issues/18) native contract; no listener activation. |

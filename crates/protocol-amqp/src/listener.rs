@@ -35,6 +35,7 @@ use crate::{
 
 mod attachments;
 pub(crate) mod connection_custody;
+mod connection_session_family;
 pub(crate) mod control_attachment_custody;
 mod ingress;
 pub(crate) mod session_custody;
@@ -286,14 +287,14 @@ async fn serve_open_connection<B: Broker>(
                     }
                     return Ok(());
                 }
-                incoming = custody.connection.next_incoming_session() => incoming,
+                incoming = custody.next_incoming_session() => incoming,
             }
         } else {
             tokio::select! {
                 biased;
                 () = &mut retired => return Ok(()),
                 () = connection_custody::pump_fault(PumpPoint::Intake) => unreachable!("connection fault checkpoint panics"),
-                incoming = custody.connection.next_incoming_session() => incoming,
+                incoming = custody.next_incoming_session() => incoming,
             }
         };
         let Some(incoming) = incoming else { break };
@@ -321,30 +322,14 @@ async fn serve_open_connection<B: Broker>(
                 _ => unreachable!("acceptance retains its original native error"),
             }
         }
-        let broker = broker.clone();
-        let namespace = namespace.clone();
-        let authorization = authorization.clone();
-        let management = Arc::clone(&management);
-        let retirement = custody.request_handle();
-        let session = match custody.take_packet() {
-            Some(NativePacket::Accepted(Ok(session))) => session,
-            None => return Ok(()),
-            _ => unreachable!("acceptance retains its original session"),
-        };
-        tokio::spawn(async move {
-            if let Err(error) = serve_session_with_retirement(
-                session,
-                namespace,
-                broker,
-                authorization,
-                management,
-                Some(retirement),
-            )
-            .await
-            {
-                warn!(%error, ?error, "session ended");
-            }
-        });
+        connection_session_family::admit_session(
+            custody,
+            &namespace,
+            &broker,
+            &authorization,
+            &management,
+        )
+        .await;
     }
 
     // The loop ends when the connection is closing. A client that closed first
@@ -378,6 +363,7 @@ async fn serve_session<B: Broker>(
     serve_session_with_retirement(session, namespace, broker, authorization, management, None).await
 }
 
+#[cfg(test)]
 async fn serve_session_with_retirement<B: Broker>(
     session: ServerSession,
     namespace: NamespaceName,
