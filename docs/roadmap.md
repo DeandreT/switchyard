@@ -40,14 +40,14 @@ flowchart TD
 - [x] #203 Record format.
 - [x] #204 Catalog validation (partial).
 - [x] #206 Backend provenance.
-- [ ] #205 State audit: verified partials #229/#230; #231, then #232.
+- [ ] #205 State audit: verified partials #229/#230/#231; #232 pending.
 - [ ] #207 Coherent capture.
 - [ ] #208 Offline atomic install.
 - [ ] #209 Applied-safe anchor.
 - [ ] #210 Selection/compaction.
 
 #250 API/#253 metadata handoffs are sealed.
-#232 Blocked/unassigned: verify #231/#238/#239/#240; #227/#228 verified; #207-#210 blocked.
+#232 Blocked/unassigned: verify #239/#240; #227/#228/#238 and partials verified; #207-#210 blocked.
 
 ```mermaid
 flowchart LR
@@ -76,11 +76,11 @@ PRs in dependency order ([workflow](../CONTRIBUTING.md)). Ready is not evidence.
 
 | Lane | Pickup / overlap |
 | --- | --- |
-| Snapshots | #230 `validate_session_rows` verified; #231 `validate_duplicate_rows` raw/unwired/unexecuted. Serialize state.rs/mod.rs. |
+| Snapshots | #230 `validate_session_rows`; #231 `validate_duplicate_rows` ([PR260](https://github.com/DeandreT/switchyard/pull/260)): verified partials. Serialize state.rs/mod.rs. |
 | Domain | [#14](https://github.com/DeandreT/switchyard/issues/14)/[#16](https://github.com/DeandreT/switchyard/issues/16)/[#23](https://github.com/DeandreT/switchyard/issues/23) Ready/unassigned; serialize command/codec/keys. |
 | Atom | [#10](https://github.com/DeandreT/switchyard/issues/10) Ready/unassigned. |
 | Admin | #18 Blocked coordinator; [#243](https://github.com/DeandreT/switchyard/issues/243) Ready/unassigned -> #244 Blocked/unassigned. |
-| Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228) verified; #238 assigned: RED retained, GREEN/CI pending; #239/#240 Ready/unassigned, unimplemented. |
+| Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228) and #238 ([PR258](https://github.com/DeandreT/switchyard/pull/258)) verified; #239 Ready/unassigned; #240 assigned; controls unexecuted. |
 | SDK/security | #71/#101 blocked on #7. |
 
 Shared: #243 keys.rs (released by #229); machine.rs overlaps #240. #244 serializes broker
