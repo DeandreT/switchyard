@@ -62,6 +62,13 @@ fn decode_live(raw: &[u8], expected: Kind) -> Result<Record, BrokerError> {
     Ok(record)
 }
 
+pub(crate) fn decode_catalog_owner(
+    raw: &[u8],
+    expected: EntityBindingKind,
+) -> Result<u64, BrokerError> {
+    decode_live(raw, expected.into()).map(|record| record.generation)
+}
+
 fn primary_path(value: &str) -> Option<EntityPath> {
     let path = EntityPath::new(value).ok()?;
     (!path.is_dead_letter_queue() && !path.is_subscription() && !path.is_management())

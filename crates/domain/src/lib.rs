@@ -9,6 +9,7 @@
 
 pub mod codec;
 pub mod keys;
+pub mod snapshot_validation;
 
 mod command;
 mod durable_proposal;

@@ -381,6 +381,54 @@ pub fn trailing_deadline(key: &[u8]) -> Option<(Timestamp, SequenceNumber)> {
     Some((Timestamp::from_millis(u64::from_be_bytes(bytes)), sequence))
 }
 
+fn catalog_scope_parts(key: &[u8]) -> Option<(NamespaceName, EntityPath, &[u8])> {
+    let rest = key.get(1..)?;
+    let namespace_end = rest.iter().position(|byte| *byte == SEPARATOR)?;
+    let namespace = NamespaceName::new(std::str::from_utf8(&rest[..namespace_end]).ok()?).ok()?;
+    let tail = rest.get(namespace_end + 1..)?;
+    let entity_end = tail.iter().position(|byte| *byte == SEPARATOR)?;
+    let entity = EntityPath::from_internal(std::str::from_utf8(&tail[..entity_end]).ok()?).ok()?;
+    Some((namespace, entity, tail.get(entity_end + 1..)?))
+}
+
+/// Strict whole-key parsing for the scalar catalog records only.
+pub(crate) fn catalog_entity_parts(key: &[u8]) -> Option<(NamespaceName, EntityPath)> {
+    let tag = *key.first()?;
+    if !matches!(
+        tag,
+        TAG_QUEUE_CONFIG | TAG_QUEUE_COUNTERS | TAG_TOPIC_CONFIG | TAG_ENTITY_METADATA
+    ) {
+        return None;
+    }
+    let (namespace, entity, suffix) = catalog_scope_parts(key)?;
+    (suffix.is_empty() && entity_scope(tag, &namespace, &entity) == key)
+        .then_some((namespace, entity))
+}
+
+pub(crate) fn catalog_subscription_parts(
+    key: &[u8],
+) -> Option<(NamespaceName, EntityPath, SubscriptionName)> {
+    if key.first() != Some(&TAG_TOPIC_SUBSCRIPTION) {
+        return None;
+    }
+    let (namespace, topic, suffix) = catalog_scope_parts(key)?;
+    let name = SubscriptionName::new(std::str::from_utf8(suffix).ok()?).ok()?;
+    (topic_subscription(&namespace, &topic, &name) == key).then_some((namespace, topic, name))
+}
+
+pub(crate) fn catalog_rule_parts(key: &[u8]) -> Option<(NamespaceName, EntityPath, RuleName)> {
+    if key.first() != Some(&TAG_SUBSCRIPTION_RULE) {
+        return None;
+    }
+    let (namespace, subscription, suffix) = catalog_scope_parts(key)?;
+    let name = RuleName::new(std::str::from_utf8(suffix).ok()?).ok()?;
+    (subscription_rule(&namespace, &subscription, &name) == key).then_some((
+        namespace,
+        subscription,
+        name,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

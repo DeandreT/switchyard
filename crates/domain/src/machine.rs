@@ -36,6 +36,7 @@ use self::deferred::replace_envelope;
 use self::incarnations::Kind;
 use self::send::SendInput;
 
+pub(crate) use self::incarnations::decode_catalog_owner;
 pub use self::peek::{MAX_PEEK_BATCH, MAX_PEEK_SCAN};
 
 /// Ready entries a single receive may walk past while discarding expired
