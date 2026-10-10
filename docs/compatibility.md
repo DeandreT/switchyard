@@ -83,6 +83,11 @@ preserves recorded time/authority. Its frontier is captured at open; tail payloa
 remain opaque under structural validation. Fatal batch errors/unwinds retire the
 owner until reopen. No refresh, outcomes, startup wiring or quorum is provided.
 
+Snapshot recovery is split into #203-#210 under #37. The pure-format increment
+defines caller-capped canonical raw records, declared frontiers and a byte digest;
+it does not certify domain/F0/F1 health, backend provenance or authenticity.
+Capture, offline installation, anchors and compaction remain separate work.
+
 Peek-lock commits ownership before transfer and deletes only on settlement;
 receive-delete deletes first. Renewal preserves
 live tokens; abandon/expiry redeliver until `MaxDeliveryCountExceeded` DLQ.

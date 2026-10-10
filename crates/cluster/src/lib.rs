@@ -2,6 +2,7 @@
 
 mod journal;
 mod replay;
+mod snapshot;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -11,6 +12,11 @@ pub use journal::{
     MAX_JOURNAL_PAYLOAD_BYTES, MAX_JOURNAL_READ_ENTRIES,
 };
 pub use replay::{CommittedReplay, ReplayError, ReplayProgress};
+pub use snapshot::{
+    SNAPSHOT_FORMAT_VERSION, SNAPSHOT_FRAME_DIGEST_BYTES, SNAPSHOT_FRAME_HASH_SCOPE,
+    SNAPSHOT_LAYOUT_VERSION, SNAPSHOT_MAGIC, SnapshotFormat, SnapshotFormatError, SnapshotLimit,
+    SnapshotLimits, SnapshotManifest, SnapshotView,
+};
 
 pub const PRODUCTION_MINIMUM_VOTERS: u16 = 3;
 pub const PRODUCTION_REPLICATION_FACTOR: u16 = 3;
