@@ -12,7 +12,10 @@ use thiserror::Error;
 use crate::Timestamp;
 
 pub use catalog::validate_catalog;
-pub use state::{MessageRowsValidation, SnapshotStateError, validate_message_rows};
+pub use state::{
+    MessageRowsValidation, SessionRowsValidation, SnapshotSessionError, SnapshotStateError,
+    validate_message_rows, validate_session_rows,
+};
 
 /// Catalog-only observations; pending row counts are not health evidence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
