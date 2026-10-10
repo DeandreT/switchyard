@@ -16,14 +16,13 @@ Pre-alpha: only verified, merged `main` is complete.
 
 ## Next Main Increments
 
-#222 connection/#224 TCP are merged/verified; #225 WSS is assigned/unexecuted.
-#134/#7 stay open.
+#222/#224/#225 verified; #134 custody audit closed; #7 open. #248 wire bounds Blocked/unassigned.
 #135/#136/#65 own admission/deadlines/process; joins have no Close/latency guarantee.
-Reference branches are not main evidence or whole-branch ports (#15).
+Reference branches are not main evidence; #15 is entity retirement. #255's qualified history audit is closed.
 
 ```mermaid
 flowchart TD
-    Main["Main"] --> Lifecycle["#7 Shutdown -> #12 Authority -> #15 Retirement"] --> Semantics["#20/#21 Rules -> #26-#28 Capacity"]
+    Main["Main"] --> Lifecycle["#7 Shutdown -> #12 Authority -> #15 Entity retirement"] --> Semantics["#20/#21 Rules -> #26-#28 Capacity"]
     Main --> Domain["#14/#16/#23 Domain"] --> Semantics
     Main --> Recovery["#37 Snapshots -> #38 Quorum"] --> Runtime["#41 Runtime"]
     Lifecycle --> Security["#71 Grants -> #17 JWT; #42/#43/#49 Identity"] --> Runtime
@@ -41,14 +40,14 @@ flowchart TD
 - [x] #203 Record format.
 - [x] #204 Catalog validation (partial).
 - [x] #206 Backend provenance.
-- [ ] #205 State audit: assigned #229, then parallel #230/#231 and #232.
+- [ ] #205 State audit: verified partials #229/#230; #231, then #232.
 - [ ] #207 Coherent capture.
 - [ ] #208 Offline atomic install.
 - [ ] #209 Applied-safe anchor.
 - [ ] #210 Selection/compaction.
 
-#229 is unexecuted; #232 also depends on #227. #207-#210 remain blocked.
-#227 DLQ refusal is merged/verified.
+#250 API/#253 metadata handoffs are sealed.
+#232 Blocked/unassigned: verify #231/#238/#239/#240; #227/#228 verified; #207-#210 blocked.
 
 ```mermaid
 flowchart LR
@@ -57,6 +56,8 @@ flowchart LR
     Rows --> Duplicates["#231 Duplicates"]
     Sessions --> State["#232 Allocation/graph"]; Duplicates --> State
     DLQ["#227 DLQ refusal"] --> State
+    API["#250 API handoff"] --> Sessions; API --> Duplicates
+    Handoff["#253 Metadata"]; Allocators["#228/#238/#239/#240"] --> State; Handoff --> State
     State --> Audit["#205 Audit"] --> Capture; Metadata["#206 Provenance"] --> Capture
     Capture --> Install["#208 Install"]
     Metadata --> Install
@@ -75,15 +76,14 @@ PRs in dependency order ([workflow](../CONTRIBUTING.md)). Ready is not evidence.
 
 | Lane | Pickup / overlap |
 | --- | --- |
-| WSS | [#225](https://github.com/DeandreT/switchyard/issues/225) assigned; listener/service. |
-| Snapshots | [#229](https://github.com/DeandreT/switchyard/issues/229) assigned; parallel #230/#231 after its merge. |
+| Snapshots | #230 `validate_session_rows` verified; #231 `validate_duplicate_rows` raw/unwired/unexecuted. Serialize state.rs/mod.rs. |
 | Domain | [#14](https://github.com/DeandreT/switchyard/issues/14)/[#16](https://github.com/DeandreT/switchyard/issues/16)/[#23](https://github.com/DeandreT/switchyard/issues/23) Ready/unassigned; serialize command/codec/keys. |
 | Atom | [#10](https://github.com/DeandreT/switchyard/issues/10) Ready/unassigned. |
 | Admin | #18 Blocked coordinator; [#243](https://github.com/DeandreT/switchyard/issues/243) Ready/unassigned -> #244 Blocked/unassigned. |
-| Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228) queue ACK exhaustion merged/verified (PR247); #238/#239/#240 Blocked/unassigned. |
+| Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228) verified; #238 assigned: RED retained, GREEN/CI pending; #239/#240 Ready/unassigned, unimplemented. |
 | SDK/security | #71/#101 blocked on #7. |
 
-Shared: #243 keys.rs with #229, machine.rs with #240; #244 serializes broker
+Shared: #243 keys.rs (released by #229); machine.rs overlaps #240. #244 serializes broker
 ownership. Allocator error/condition/indexed edits serialize; #239 also
 coordinates #14/#23.
 
@@ -95,7 +95,7 @@ Production still refuses; quorum/recovery/runtime remain pending.
 
 | Gate | Remaining work |
 | --- | --- |
-| [M1](https://github.com/DeandreT/switchyard/milestone/1) | Lifecycle, authority, profiles, reference retirement, typed content. |
+| [M1](https://github.com/DeandreT/switchyard/milestone/1) | Lifecycle, authority, profiles, entity retirement, typed content. |
 | [M2](https://github.com/DeandreT/switchyard/milestone/2) | SDK/admin semantics, sustained Flow, capacity, same-group transactions. |
 | [M3](https://github.com/DeandreT/switchyard/milestone/3) | Recovery/quorum, identity/fairness, encrypted audit/backup, measured release. |
 
