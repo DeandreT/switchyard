@@ -46,9 +46,18 @@ flowchart TD
 
 ## Snapshot Recovery
 
-#36 local replay is complete; #37 full-state recovery is not. Each node is one
-focused main-based PR; #203 is assigned, #204/#206 are available for parallel
-pickup. Other children wait for their listed dependencies.
+#36 local replay is complete; #37 full-state recovery is not. Each child is one
+focused main-based PR. The six unfinished snapshot children retain their listed
+dependencies; only #204 is available for unassigned pickup.
+
+- [x] #203 Pure record format.
+- [ ] #204 Catalog validation (ready, unassigned).
+- [ ] #205 Message/index/session validation (blocked).
+- [x] #206 Backend provenance, including #212 known-handle identity refusal.
+- [ ] #207 Coherent capture (blocked).
+- [ ] #208 Offline atomic install (blocked).
+- [ ] #209 Applied-safe journal anchor (blocked).
+- [ ] #210 Recovery selection/compaction (blocked).
 
 ```mermaid
 flowchart LR
@@ -78,7 +87,7 @@ disk-aware two-job builds; see [workflow](../CONTRIBUTING.md).
 | --- | --- |
 | Lifecycle | [#133](https://github.com/DeandreT/switchyard/issues/133); serialize listener/native/registry. |
 | Domain | [#14](https://github.com/DeandreT/switchyard/issues/14), [#16](https://github.com/DeandreT/switchyard/issues/16), [#23](https://github.com/DeandreT/switchyard/issues/23); serialize command/codec/key tags. |
-| Snapshots | [#203](https://github.com/DeandreT/switchyard/issues/203) format, [#204](https://github.com/DeandreT/switchyard/issues/204) catalog, [#206](https://github.com/DeandreT/switchyard/issues/206) metadata; separate owned files. |
+| Snapshots | [#204](https://github.com/DeandreT/switchyard/issues/204) catalog is ready/unassigned; #205/#207-#210 are blocked. [#203](https://github.com/DeandreT/switchyard/issues/203) format and [#206](https://github.com/DeandreT/switchyard/issues/206) provenance are merged. |
 | Administration | [#10](https://github.com/DeandreT/switchyard/issues/10) Atom fixtures, [#18](https://github.com/DeandreT/switchyard/issues/18) native contract; no listener activation. |
 | Deferred | [#71](https://github.com/DeandreT/switchyard/issues/71) grant consumers and [#101](https://github.com/DeandreT/switchyard/issues/101) SDK matrix await #7; serialize authorization/CBS/client programs. |
 
