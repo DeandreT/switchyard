@@ -54,7 +54,7 @@ defaults to port 5671; `--transport amqp-websockets` requires TLS and defaults t
 | `amqp` | Repository-owned framing, sessions, links, SASL, and AMQP types |
 | `protocol-amqp`, `server` | Service Bus adaptation, listener/runtime, local proposer, timers |
 | `auth` | Implemented SAS policy; future identity/security boundary |
-| `cluster` | Configuration invariants; replication remains planned |
+| `cluster` | Configuration; opt-in [journal](crates/cluster/src/journal.rs), [replay](crates/cluster/src/replay.rs), and [raw snapshot format](crates/cluster/src/snapshot/format.rs); replication remains planned |
 | `admin-api`, `switchyardctl` | [Native contract](proto/switchyard/admin/v1/admin.proto) and CLI scaffold |
 | `testkit`, `conformance` | Fixtures and client gates |
 

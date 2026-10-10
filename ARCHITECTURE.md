@@ -93,35 +93,32 @@ immediately. The proposer holds time still for small host-clock regressions and
 refuses larger ones, logged/retried but not wired to readiness. The state machine
 rejects regressing command time.
 
-Fjall uses one `records` keyspace for domain keys and `meta` for a big-endian
-layout marker. Atomic batches are journalled and fsynced before apply returns;
-snapshots cannot observe a partial batch. A directory has one live owner.
-Missing markers are initialized only if both known keyspaces are empty; any
-existing row, including an empty value, refuses opening without adding a marker.
-Active format 2 requires owner metadata; format 1 refuses even when empty.
-There is no migration, foreign-keyspace validation or filesystem-byte guarantee.
+The [storage contract](crates/storage/src/lib.rs) provides atomic memory/Fjall
+batches. [Fjall opening](crates/storage/src/durable.rs) accepts format 2. It refuses
+format 1 or a missing marker with any known-keyspace row; empty known stores may
+be stamped.
+A directory has one live owner. Domain keys are big-endian with V1 values;
+ordinary opening does not validate foreign keyspaces.
 
-The domain uses big-endian keys and V1 value envelopes. Memory and Fjall share
-the storage contract and paired tests. Split production keyspaces, replicated
-logs, quota accounting, encryption, and snapshot installation remain planned. See
-[storage](crates/storage/src/lib.rs) and
-[Fjall opening/apply](crates/storage/src/durable.rs).
+The opt-in [journal](crates/cluster/src/journal.rs) reserves `0xF0` for opaque
+entries and commitment. The [proposal codec](crates/domain/src/durable_proposal.rs)
+retains intent, time and authority, not authentication.
+[Indexed apply](crates/domain/src/indexed.rs) checkpoints domain effects under
+`0xF1`; [committed replay](crates/cluster/src/replay.rs) validates committed
+proposals and uses their original time/authority through a captured frontier.
+Callers must serialize all relevant cloned/raw and unindexed writers; `&mut self`
+is not CAS.
 
-The opt-in [cluster journal](crates/cluster/src/journal.rs) shares that store
-owner under a reserved `0xF0` prefix. An externally exclusive writer appends opaque
-entries before advancing a committed frontier. Reopen validates the full prefix
-in bounded pages; valid uncommitted tails stay uncommitted, corruption refuses,
-and ambiguous write errors require reopening. This is not command replay, quorum,
-or runtime activation. [#145](https://github.com/DeandreT/switchyard/issues/145)
-coordinates the remaining indexed-apply and replay increments.
+The [snapshot format](crates/cluster/src/snapshot/format.rs) checks framing,
+ordered records, declared frontiers and a digest, not domain/journal health.
+[Fjall provenance](crates/storage/src/durable.rs) checks keyspace inventory and
+original handle identity, then reads metadata and records through one snapshot.
+Callers must exclude all writers and keyspace creation, deletion and configuration
+changes; it is not authentication or a read-only directory opener.
 
-The pure [durable proposal codec](crates/domain/src/durable_proposal.rs) freezes
-command intent, original timestamp and bound/unbound authority in a one-MiB
-envelope with private V1 DTOs. Decode checks structural identity, not today's
-catalog or authenticated authority, and preserves typed intent the domain may
-refuse. Ordinary command/store encodings stay unchanged; atomic indexed apply
-#159 and committed replay #160 remain pending. The byte cap is not a total-heap
-bound.
+Production startup remains refused. These libraries do not activate runtime
+replay, quorum, full-state recovery, installation or compaction. Encryption and
+quota accounting remain planned; see [compatibility](docs/compatibility.md).
 
 ## Production Target: Not Implemented
 
