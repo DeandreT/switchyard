@@ -807,6 +807,9 @@ impl<S: StateStore> StateMachine<S> {
         replacement_envelope: Option<&MessageEnvelope>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
+        if command.entity.is_dead_letter_queue() {
+            return Err(BrokerError::DeadLetterQueueIsReserved);
+        }
         let config = self.load_config(command)?;
         let (mut record, _, _) = self.held_lock(command, sequence, lock_token)?;
         replace_envelope(&config, &mut record, replacement_envelope)?;
