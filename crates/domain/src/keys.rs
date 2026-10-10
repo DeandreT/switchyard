@@ -429,6 +429,138 @@ pub(crate) fn catalog_rule_parts(key: &[u8]) -> Option<(NamespaceName, EntityPat
     ))
 }
 
+/// Whole-key state forms; numeric components accept every encoded u64.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum StateKey {
+    Message(NamespaceName, EntityPath, SequenceNumber),
+    Ready(NamespaceName, EntityPath, SequenceNumber),
+    Lock(NamespaceName, EntityPath, Timestamp, SequenceNumber),
+    Expiry(NamespaceName, EntityPath, Timestamp, SequenceNumber),
+    Deferred(NamespaceName, EntityPath, SequenceNumber),
+    Session(NamespaceName, EntityPath, SessionId),
+    SessionReady(NamespaceName, EntityPath, SessionId, SequenceNumber),
+    SessionLock(NamespaceName, EntityPath, Timestamp, SessionId),
+    Scheduled(NamespaceName, EntityPath, Timestamp, SequenceNumber),
+    DuplicateId(NamespaceName, EntityPath, String),
+    DuplicateExpiry(NamespaceName, EntityPath, Timestamp, String),
+}
+
+impl StateKey {
+    pub(crate) fn scope(&self) -> (&NamespaceName, &EntityPath) {
+        match self {
+            Self::Message(n, e, _)
+            | Self::Ready(n, e, _)
+            | Self::Lock(n, e, _, _)
+            | Self::Expiry(n, e, _, _)
+            | Self::Deferred(n, e, _)
+            | Self::Session(n, e, _)
+            | Self::SessionReady(n, e, _, _)
+            | Self::SessionLock(n, e, _, _)
+            | Self::Scheduled(n, e, _, _)
+            | Self::DuplicateId(n, e, _)
+            | Self::DuplicateExpiry(n, e, _, _) => (n, e),
+        }
+    }
+}
+
+/// Unlike operational suffix readers, this checks the tag, complete suffix and
+/// exact regenerated key, including canonical namespace/entity spelling.
+pub(crate) fn state_parts(key: &[u8]) -> Option<StateKey> {
+    let tag = *key.first()?;
+    let (n, e, suffix) = catalog_scope_parts(key)?;
+    let number = |bytes: &[u8]| -> Option<u64> { Some(u64::from_be_bytes(bytes.try_into().ok()?)) };
+    let sequence = || Some(SequenceNumber::new(number(suffix)?));
+    let deadline_sequence = || -> Option<(Timestamp, SequenceNumber)> {
+        (suffix.len() == 16).then_some(())?;
+        Some((
+            Timestamp::from_millis(number(&suffix[..8])?),
+            SequenceNumber::new(number(&suffix[8..])?),
+        ))
+    };
+    let (parsed, canonical) = match tag {
+        TAG_MESSAGE => {
+            let s = sequence()?;
+            (
+                StateKey::Message(n.clone(), e.clone(), s),
+                message(&n, &e, s),
+            )
+        }
+        TAG_READY => {
+            let s = sequence()?;
+            (StateKey::Ready(n.clone(), e.clone(), s), ready(&n, &e, s))
+        }
+        TAG_LOCK => {
+            let (t, s) = deadline_sequence()?;
+            (
+                StateKey::Lock(n.clone(), e.clone(), t, s),
+                lock(&n, &e, t, s),
+            )
+        }
+        TAG_EXPIRY => {
+            let (t, s) = deadline_sequence()?;
+            (
+                StateKey::Expiry(n.clone(), e.clone(), t, s),
+                expiry(&n, &e, t, s),
+            )
+        }
+        TAG_DEFERRED => {
+            let s = sequence()?;
+            (
+                StateKey::Deferred(n.clone(), e.clone(), s),
+                deferred(&n, &e, s),
+            )
+        }
+        TAG_SESSION => {
+            let id = SessionId::new(std::str::from_utf8(suffix.strip_suffix(&[0])?).ok()?).ok()?;
+            (
+                StateKey::Session(n.clone(), e.clone(), id.clone()),
+                session(&n, &e, &id),
+            )
+        }
+        TAG_SESSION_READY => {
+            let end = suffix.iter().position(|byte| *byte == 0)?;
+            let id = SessionId::new(std::str::from_utf8(&suffix[..end]).ok()?).ok()?;
+            let s = SequenceNumber::new(number(suffix.get(end + 1..)?)?);
+            (
+                StateKey::SessionReady(n.clone(), e.clone(), id.clone(), s),
+                session_ready(&n, &e, &id, s),
+            )
+        }
+        TAG_SESSION_LOCK => {
+            let t = Timestamp::from_millis(number(suffix.get(..8)?)?);
+            let id = SessionId::new(std::str::from_utf8(suffix.get(8..)?).ok()?).ok()?;
+            (
+                StateKey::SessionLock(n.clone(), e.clone(), t, id.clone()),
+                session_lock(&n, &e, t, &id),
+            )
+        }
+        TAG_SCHEDULED => {
+            let (t, s) = deadline_sequence()?;
+            (
+                StateKey::Scheduled(n.clone(), e.clone(), t, s),
+                scheduled(&n, &e, t, s),
+            )
+        }
+        TAG_DUPLICATE_ID => {
+            let id = std::str::from_utf8(suffix).ok()?.to_owned();
+            (
+                StateKey::DuplicateId(n.clone(), e.clone(), id.clone()),
+                duplicate_id(&n, &e, &id),
+            )
+        }
+        TAG_DUPLICATE_EXPIRY => {
+            let t = Timestamp::from_millis(number(suffix.get(..8)?)?);
+            let id = std::str::from_utf8(suffix.get(8..)?).ok()?.to_owned();
+            (
+                StateKey::DuplicateExpiry(n.clone(), e.clone(), t, id.clone()),
+                duplicate_expiry(&n, &e, t, &id),
+            )
+        }
+        _ => return None,
+    };
+    (canonical == key).then_some(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
