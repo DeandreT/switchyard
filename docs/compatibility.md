@@ -63,154 +63,33 @@ and activation [#17](https://github.com/DeandreT/switchyard/issues/17), typed co
 
 ### Atomicity And Lifecycle
 
-Commands carry time and commit one batch. Rejection changes no messages, counters,
-history or Clock; validation precedes allocation/history mutation. Session batches
-share one session. Deduplication suppresses sends, not lock redelivery.
-
-Opt-in indexed apply atomically commits effects/Clock/checkpoint. Both it and the
-opt-in journal retire before storage apply; only success and cache updates restore
-usability. Returned storage-apply errors or explicitly caught storage-apply unwinds
-require reopen. With external exclusive writes, journal reopen reads append
-presence/commit frontier; indexed reopen exposes an unapplied index or outcome-free
-latest duplicate. Neither recovers a panic or provides quorum/power-cut guarantees.
-
-Validated exactly-full rule/subscription creation can checkpoint a capacity refusal
-without changing domain effects or Clock (#168). Selected corrupt/overfull reader
-failures and unmarked cap errors remain fatal; this is not global catalogue health.
-
-Opt-in same-store replay (#160) validates committed schemas before effects and
-preserves recorded time/authority. Its frontier is captured at open; tail payloads
-remain opaque under structural validation. Fatal batch errors/unwinds retire the
-owner until reopen. No refresh, outcomes, startup wiring or quorum is provided.
-
-Snapshot recovery is split into #203-#210 under #37. The pure-format increment
-defines caller-capped canonical raw records, declared frontiers and a byte digest;
-it does not certify domain/F0/F1 health, backend provenance or authenticity.
-Capture, offline installation, anchors and compaction remain separate work.
-
-Peek-lock commits ownership before transfer and deletes only on settlement;
-receive-delete deletes first. Renewal preserves
-live tokens; abandon/expiry redeliver until `MaxDeliveryCountExceeded` DLQ.
-Deferral hides ordinary receive; deferred abandon/expiry restores deferral.
-Management/delivery property updates persist. Peek never locks/increments delivery;
-ordinary receivers browse sessions, held-session receivers browse only their own.
-
-Scheduled placeholders are browseable, not receivable/session-available. Activation
-retires them, allocates active sequence/enqueue time and starts TTL. Atomic topic evaluation
-ORs rules, ANDs populated exact-typed correlation fields, makes one copy despite
-multiple matches and succeeds without matches. Full copies settle/expire/defer/
-browse/DLQ independently.
-
-Reserved `entity/$deadletterqueue` permits no direct create/send or shadow-of-shadow.
-Messages keep sequence/reason, lose lifetime/session, never DLQ again. Reasons use
-`DeadLetterReason`/`DeadLetterErrorDescription`; direct drain omits Azure's forwarded
-`DeadLetterSource`. No resubmission/forwarding.
+Commands commit one batch; domain refusals preserve messages, counters, history
+and Clock. Indexed apply, journal and replay have separate checkpoint/retire/reopen
+rules, not panic recovery or quorum guarantees. Snapshot format is structural,
+not complete state/backend-provenance/authenticity proof or capture/install.
+See [atomicity and lifecycle](lifecycle.md#atomicity-and-lifecycle) for settlement,
+deferral, scheduling, DLQ and replay contracts.
 
 ### Topic Integrity
 
-Routing/pages validate the full listed graph before prefixes or copies: each key/value
-names the exact canonical child, with valid parent-derived backing profiles and matching DLQs (`u32::MAX`
-delivery count, no TTL/session/dedup), no topic conflicts. The 2,001-entry scan
-enforces 2,000; corruption refuses atomically, including beyond small pages.
-Creation refuses orphan membership/occupied DLQs. Unindexed backing queues,
-orphan rules/retained runtime, retained-message/rule deletion fences, live incarnations
-and capacity are outside proof; formats unchanged. See [routing](../crates/domain/src/machine/topic.rs).
-
-Selected rule reads retain keys, decode the bounded scan before overfull refusal,
-then require exact generated key/name matches and valid canonical filters.
-Key/filter violations are corruption; no row is rewritten. Unread rows and stored
-timestamps are outside proof.
+Selected routing/page and rule readers validate listed graphs and canonical rows
+before returning prefixes or copies; corruption refuses atomically. This is not
+global catalogue health, live-incarnation or retained-runtime proof.
+See [topic integrity](lifecycle.md#topic-integrity) for exact bounds and exclusions.
 
 ### Storage And Runtime Limits
 
-Fjall restart preserves messages, locks/counts, sessions/sequences, not node loss.
-Memory is volatile; no replication. Production durable startup returns static
-replication-unavailable before storage/listeners; production Memory refuses too. Development is single-node;
-CLI TLS/auth/storage/cluster error precedence is unchanged.
+Memory is volatile; neither backend is replicated. Production durable startup
+returns static replication-unavailable before storage/listeners; production Memory
+refuses too. Fjall restart is not node-loss recovery; development is single-node.
 
-Missing markers are stamped only if known `meta`/`records` are empty; any row
-(even empty-valued) refuses without marker mutation. Format 2 requires private
-live owner heads; format 1 refuses even empty. Value envelopes remain V1; no
-migration/foreign-keyspace proof/byte-invariance claim. See [opener](../crates/storage/src/durable.rs).
-
-Configurations/listed topic profiles require canonical live heads; DLQs share
-owners. Bound calls capture immutable namespace/target/owner/kind/generation through
-the owner queue; scope mismatch comes first. Live/forbidden-shadow heads,
-generation/target profile precede host/stored Clock, including Complete and session
-state/release. Malformed heads are corruption; missing targets/same-kind generation
-drift are stale. No whole-store/parent-membership/global corruption-priority proof
-or live deletion. Wire/timers/legacy/raw diagnostic adoption awaits #57-#60.
-
-Natural retirement/outer-pump panic custody is owner-scoped, not whole-task-tree
-shielding (Send uses per-delivery pump panic custody):
-
-| Owner | Acquisition and drain contract |
-| --- | --- |
-| TCP listener | [`into_tcp_service`](../crates/protocol-amqp/src/listener.rs) retains the listener, original task IDs and typed exits. `retirement_handle().request()` only requests; borrowed `serve`/`finish` permit cancellation/retry with a surviving owner. Drained `take_exit` extracts once; live completions are reaped without stopping admission. Priority: parent panic > accept error > outer JoinError > returned error > missing exit > known report > diagnostic; raw origins remain. Legacy `serve` keeps `io::Result`: returns accept errors, resumes parent panics, does not return child/report outcomes. |
-| Native connection | Capacity-free sticky Stop interrupts IO/channels. Shutdown joins original driver/reader and caches cancellation/repeat results; outer panic keeps acceptance/Close packets. Retirement discards unstarted work, starts no Close; Drop requests Stop only. Joins do not acknowledge Close; peer reply is required. |
-| Connection session family | Keeps begun acceptance and ready Sessions through context preparation; adopts the same task and typed result without intervening callbacks. Live reaping consumes healthy history. Retirement stops intake, drains original native work/shutdown, then original session joins; cancelled finish retains packets. Reaping child errors and typed reports adds no Stop request. |
-| Native sender/credit | Detach/command closure interrupts capacity waits with all 256 permits held. Queued grant replies own cleanup before observation; dropped accepted replies clean exact reservations, not replacement credit. |
-| Control-link admission | Retains one borrowed acceptance, typed route/refusal and raw results through cancellation/panic. Retirement discards unstarted work and drains begun originals; cleanup removes only the captured route. Active primary faults request captured Stop before drains. Adoption hands the same spawned task to its session family. |
-| Session link family | Retains original data/CBS/management handles and raw leaf results. Live success history is consumed; retirement freezes admission and joins the same children. Cancelled borrowed finish keeps cached packets. Active parent panic/error requests captured Stop before drain; child errors and report-only exits do not notify. Priority: parent panic, parent error, child JoinError, leaf error, bridge fault, diagnostic panic. No session-level Stop or finite join latency. |
-| Receiving | Retains one Receive/credit, begun Transfer/Delivery/reservation and at most 32 original workers. Retires intake/native/workers before drains; late Pending joins its retired worker. Fresh raw drain faults cache before captured Stop and remaining waits; old packets/benign exits/refusal/reporting do not notify. Ready auth/settlement rules remain; second-mode success follows durable settlement. Unanswered remote/confirmation waits retire; begun broker work drains. Exact registration removal precedes one lazy original session release; Drop only retires/detaches. |
-| Attachment/session registry | Retains original grants/acceptance/readiness through entry preparation/move-only adoption. Claim before first helper await; installation rechecks newest claim and original End/Detach under row admission. Failed newest claims preserve installed rows, never revive older work. Fresh poll panics/non-RemoteDetached native drain errors cache before captured Stop and remaining waits; old results/ReleaseSession refusal/reporting do not notify. Cancelled cleanup keeps exact unregister and lazy captured entity/full-hold release; refusal leaves expiry. No atomic link/hold liveness or successor-family custody. |
-| Send/Batch | Retains original command/raw result/native Accept/Reject/Unauthorized Close through natural/per-delivery panic cleanup. Fresh original-drain panics cache before captured Stop and remaining waits; returned late errors/old packets/reporting do not notify. Selected Detach/auth late native results remain benign; reporting panics suppressed, genuinely panicked originals remain faults. No replacement/rollback/new late acknowledgement; cancelled queued acknowledgement need not be unsent. |
-| Management | Discards uninvoked preparation; retains begun commands/post-result registry work, native acknowledgements/replies/confirmations, both reply/Close outcomes and captured route. Newly caught original panics/newly completed native errors cache before captured Stop and remaining waits, independently per reply/Close branch. Old terminal results/prior panic slots do not notify on retry. Primary/native errors outrank cleanup faults; refusal/reporting does not notify. No new late reply/confirmation. |
-| CBS | Retains original validation/store, native work/completed packets through captured-route cleanup. Fresh native drain errors/raw panics cache before captured Stop and route cleanup; old packets/status/refusal/reporting do not notify. Bootstrap needs no grant. No installed-grant rollback, route retry/new acknowledgement/second confirmation. |
-
-```mermaid
-flowchart LR
-    Held["Owned phase"] --> Begun["First poll: begun original"]
-    Held --> Discard["Retired before first poll: discard"]
-    Begun --> Cache["Drain/cache raw result; cancellation retains custody"]
-    Cache --> Notice["Caught supported fault: captured retirement + Stop"]
-    Notice --> Drain["Drain remaining originals; identity-conditional cleanup"]
-    Cache --> Normal["Benign result/refusal/report: no fault notice"]
-    Drain --> Priority["Management: primary > retained native error > cleanup > diagnostic"]
-    Priority --> Terminal["No repoll, resubmit, fabricated success or recovery"]
-```
-
-Priority/notice scope is owner-specific: management/CBS returned exits close captured
-channels and identity-unregister; original native errors precede cleanup. Connection,
-management/CBS/attachment primary/native faults precede diagnostics; attachment
-Detach and selected Send late-native exits retain the exceptions above. The six
-data/CBS/management leaves and attachment guard signal primary faults before drains;
-receiving includes retained worker faults and keeps its cause through best-effort
-error Close. Cleanup notices #173-#177, management freshness #196 and control-link
-admission #189 are merged. Non-notifying
-retirement/refusal and reporting-only faults retain the owner-specific policies above.
-
-Borrowed cancellation keeps phases/handles/raw results; panicked originals are
-terminal, not repolled/retried/recovered. Receive/session-grant invocation begins
-inside original first poll (including eager adapters), not an enqueue receipt.
-Retired connection acceptance retains ready Sessions but starts no new session
-task. Late Receive starts no Transfer/implicit settlement: peek-lock expires;
-receive-delete may be lost. Auth
-retirement never rolls back begun Transfer. Receiving prepares one settlement context while
-Receive/registration remain owned, before native start; active/one late adoption
-move it, never retry failed broker cloning.
-
-Captured row-locked delivery identity fences worker/residual cleanup and management
-renewal/disposition; equal-value/cross-entity replacements survive. Cancelled residual
-cleanup retains handles until removal; lookup/TTL purge/delayed-install order stay.
-Session cleanup matches owner/entity/full hold. Original End observes End/Stop/driver
-panic even during row-held auth/registry preparation, proving neither End answer
-nor native joins; receiving auth sees captured Detach before Receive.
-
-Session/link ownership covers #132 and
-[#133](https://github.com/DeandreT/switchyard/issues/133). Connection
-[terminal precedence](../crates/protocol-amqp/src/listener/connection_custody.rs)
-keeps raw faults before typed session reports, then connection/family diagnostics.
-[#7](https://github.com/DeandreT/switchyard/issues/7) process shutdown
-remains [roadmap work](roadmap.md#next-main-increments). No aborted-ancestor
-protection, graceful Close acknowledgement or finite broker/cleanup latency.
-
-The [TCP service](../crates/protocol-amqp/src/listener/service.rs) (#224) installs
-the same native Ready connection in custody before grant/authorization/reporting.
-Retirement selects unfinished TLS/SASL/Open or the borrowed pump, then drains
-native work/shutdown before original session joins. Requesting retirement is not
-join proof; owner-drop/abort survival is excluded. WSS custody #225, admission
-#135 and deadlines #136 remain separate; accepted broker drains stay unbounded.
+Custody is owner-scoped, not whole-task-tree shielding. Borrowed cancellation/retry
+requires a surviving owner; retirement requests prove neither joins nor peer answers.
+Raw priorities and cleanup notices differ by owner. Begun broker/cleanup drains
+remain unbounded; owner-drop and aborted-ancestor survival are excluded. TCP custody
+is included; WSS #225, admission #135, deadlines #136 and process shutdown #7 remain
+separate. See [storage limits](lifecycle.md#storage-and-runtime-limits) and the
+[eleven owner contracts](lifecycle.md#owner-custody).
 
 Sustained traffic beyond initial credit is uncertified: [#68](https://github.com/DeandreT/switchyard/issues/68)
 windows/[#69](https://github.com/DeandreT/switchyard/issues/69) refill and
