@@ -1098,11 +1098,27 @@ mod tests {
         handle.requests.send(Request::Stop).unwrap();
         let behind = enqueue_queue(&handle, "behind");
         resume.send(()).unwrap();
-        assert_eq!(first.recv().unwrap().unwrap(), CommandOutcome::QueueCreated);
-        assert_eq!(ahead.recv().unwrap().unwrap(), CommandOutcome::QueueCreated);
-        assert!(behind.recv().is_err(), "a request behind Stop need not run");
-        drop(handle);
+        let timeout = std::time::Duration::from_secs(30);
+        assert_eq!(
+            first.recv_timeout(timeout).unwrap().unwrap(),
+            CommandOutcome::QueueCreated
+        );
+        assert_eq!(
+            ahead.recv_timeout(timeout).unwrap().unwrap(),
+            CommandOutcome::QueueCreated
+        );
+        // Join the owner before testing admission through a retained handle.
         drop(broker);
+        assert_eq!(
+            handle.last_applied_blocking(),
+            Err(SubmitError::BrokerStopped)
+        );
+        // Flume retains buffered requests until every channel handle drops.
+        drop(handle);
+        assert!(matches!(
+            behind.recv_timeout(timeout),
+            Err(flume::RecvTimeoutError::Disconnected)
+        ));
         let machine = StateMachine::new(store.clone());
         assert!(
             machine
