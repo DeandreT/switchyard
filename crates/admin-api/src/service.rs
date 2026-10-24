@@ -410,6 +410,7 @@ impl EntityOptions {
                 max_message_bytes: self
                     .max_message_bytes
                     .unwrap_or(TopicConfig::default().max_message_bytes),
+                ..TopicConfig::default()
             }),
             EntityKind::Subscription => {
                 let defaults = SubscriptionConfig::default();
