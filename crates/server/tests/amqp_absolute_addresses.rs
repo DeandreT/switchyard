@@ -146,7 +146,7 @@ async fn peek(session: &mut Session, path: &str, index: usize) -> TestResult {
         .message()
         .application_properties
         .as_ref()
-        .and_then(|properties| properties.get("status-code"));
+        .and_then(|properties| properties.get(protocol_amqp::STATUS_CODE_PROPERTY));
     assert!(
         matches!(status, Some(Value::Int(200 | 204))),
         "unexpected management status: {status:?}"
@@ -360,7 +360,7 @@ async fn described_session_filters_hold_the_grant_for_management_and_settlement(
                     .message()
                     .application_properties
                     .as_ref()
-                    .and_then(|properties| properties.get("status-code")),
+                    .and_then(|properties| properties.get(protocol_amqp::STATUS_CODE_PROPERTY)),
                 Some(&Value::Int(200))
             );
             replies.accept(&reply).await?;
