@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<grammar xmlns="http://relaxng.org/ns/structure/1.0">
+  <include href="common.rng"/>
+  <start><ref name="envelope"/></start>
+  <define name="runtime-queue"><empty/></define>
+  <define name="runtime-topic"><empty/></define>
+  <define name="runtime-subscription"><empty/></define>
+</grammar>

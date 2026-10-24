@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Selected local refusal shape, NOT an observed Azure or Switchyard response. -->
+<Error>
+  <Code>400</Code>
+  <Detail>This request requires runtime statistics unavailable in this profile.</Detail>
+</Error>

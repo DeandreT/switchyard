@@ -1,0 +1,211 @@
+{
+  "schema": 1,
+  "evidence_kind": "source-derived-synthetic",
+  "observed_wire_captures": false,
+  "server_activation": false,
+  "origin": "https://fixture.invalid",
+  "sources": {
+    "dotnet-current": {
+      "selector": "declared-current",
+      "service_bus": "7.21.0",
+      "azure_core": "1.62.0",
+      "api_version": "2024-05",
+      "local_pin": "../pins/declared-current/approved-assets.json",
+      "repository": "https://github.com/Azure/azure-sdk-for-net",
+      "release_tag": "Azure.Messaging.ServiceBus_7.21.0",
+      "commit": "4e4c19469fe598b9f28a73d065514106985e7560",
+      "path_prefix": "sdk/servicebus/Azure.Messaging.ServiceBus/src/Administration/",
+      "files_sha256": {
+        "AdministrationClientConstants.cs": "5c5a0f89575a765718bc631460c588b31373b94a305c9d2b43f995e941c73ca6",
+        "HttpRequestAndResponse.cs": "b1d9e9c687e2942a572c60428ba9c643afe4cf7ca92d8ddfae3550b66fff41de",
+        "ServiceBusAdministrationClient.cs": "738b22e1918374b08c62d3c31e70438033d08e200c8806180f0fb34f31ec2ba8",
+        "ServiceBusAdministrationClientOptions.cs": "58ea80e15728474946ca1b416401ae8d41045cabd178c8c452de6b7ccea0c46b",
+        "ServiceVersionExtensions.cs": "e374daba424bd8c60592bbb5c6cef92d4406dd984a0c12b53428f662b89d2f84",
+        "QueuePropertiesExtensions.cs": "684b7f7da217c5ab0989f4d1b03e597562222a15f26c7701f305265fc53bf88e",
+        "QueueRuntimePropertiesExtensions.cs": "6329cd462551fb4c3a41b869cca1d68128331274cd441fd379ccaa731b5df902",
+        "TopicPropertiesExtensions.cs": "9b790cca4413dbfb5c1bdef5792bb4e381bcb931decd3b429da7230cf14b66be",
+        "TopicRuntimePropertiesExtensions.cs": "51bc61339cf3182318021dbe93f710538dd47ff1c34e6025981fed350c435198",
+        "SubscriptionPropertiesExtensions.cs": "a1914b83f83ab8d10fb76e27e9b0ad2135ba50f62bde59245e78562e3a549b67",
+        "SubscriptionRuntimePropertiesExtensions.cs": "13a0492f0962d2ae46ed6e8ffe15731473257a22274450726eca694917af2726",
+        "ServiceBusRequestFailedDetailsParser.cs": "ccc07f8c72ceabde012df9de2c83935424ac24c3be8e158a3cc2a4706f4cd399"
+      }
+    },
+    "dotnet-previous": {
+      "selector": "previous",
+      "service_bus": "7.20.2",
+      "azure_core": "1.60.0",
+      "api_version": "2021-05",
+      "local_pin": "../pins/previous/approved-assets.json",
+      "repository": "https://github.com/Azure/azure-sdk-for-net",
+      "release_tag": "Azure.Messaging.ServiceBus_7.20.2",
+      "commit": "f81988005453a91be7a974bba8c1b69012758e0f",
+      "path_prefix": "sdk/servicebus/Azure.Messaging.ServiceBus/src/Administration/",
+      "files_sha256": {
+        "AdministrationClientConstants.cs": "5c5a0f89575a765718bc631460c588b31373b94a305c9d2b43f995e941c73ca6",
+        "HttpRequestAndResponse.cs": "b1d9e9c687e2942a572c60428ba9c643afe4cf7ca92d8ddfae3550b66fff41de",
+        "ServiceBusAdministrationClient.cs": "738b22e1918374b08c62d3c31e70438033d08e200c8806180f0fb34f31ec2ba8",
+        "ServiceBusAdministrationClientOptions.cs": "e84485d4c88efcd95480bf353db0b401dcfae54becbb090091cd3f63b2fa30c8",
+        "ServiceVersionExtensions.cs": "3a5a06c8c95fe0a53800e86be46f02af441d4abca633a2b27e035b58b27642f2",
+        "QueuePropertiesExtensions.cs": "684b7f7da217c5ab0989f4d1b03e597562222a15f26c7701f305265fc53bf88e",
+        "QueueRuntimePropertiesExtensions.cs": "6329cd462551fb4c3a41b869cca1d68128331274cd441fd379ccaa731b5df902",
+        "TopicPropertiesExtensions.cs": "9b790cca4413dbfb5c1bdef5792bb4e381bcb931decd3b429da7230cf14b66be",
+        "TopicRuntimePropertiesExtensions.cs": "399c3a96a764331ddd14f865e6dba138d8836e77d58b088279d1e87aab1ea0d1",
+        "SubscriptionPropertiesExtensions.cs": "a1914b83f83ab8d10fb76e27e9b0ad2135ba50f62bde59245e78562e3a549b67",
+        "SubscriptionRuntimePropertiesExtensions.cs": "13a0492f0962d2ae46ed6e8ffe15731473257a22274450726eca694917af2726",
+        "ServiceBusRequestFailedDetailsParser.cs": "ccc07f8c72ceabde012df9de2c83935424ac24c3be8e158a3cc2a4706f4cd399"
+      }
+    },
+    "sift-research": {
+      "conformance_pin_status": "selected-source-only",
+      "executed_compatibility_gate": false,
+      "actual_interception_status": "unverified",
+      "api_version": "2021-05",
+      "repository": "https://github.com/DeandreT/sift",
+      "commit": "5ee62ada4ac8901d5756c73c551dd42243a07c32",
+      "files_sha256": {
+        "crates/mgmt/src/client.rs": "e39f1fdbe7f3066ccb9ec60d7d887cbedc65d45b05e70968955744d423808f5b",
+        "crates/mgmt/src/atom.rs": "dd85c582ef8bbe277b3083c1a4b94b75ffde14346d6eb8a78db5d4d54d0da2bb",
+        "crates/mgmt/src/model.rs": "8da2b575a6c9fc8890ecc08f9f63690cedce734b8efe69e80d8871761836ddf4",
+        "crates/mgmt/src/write.rs": "bad5902b7e2584a2a3eea1e6b150c3f05c4cadecd3616e41d02b3a831519373a",
+        "Cargo.lock": "abf61aedc9aa34ae066d0a0465b45d8e281c8ed619685ef82d614a87c02fc40f"
+      }
+    }
+  },
+  "namespaces": {
+    "atom": "http://www.w3.org/2005/Atom",
+    "connect": "http://schemas.microsoft.com/netservices/2010/10/servicebus/connect",
+    "counts": "http://schemas.microsoft.com/netservices/2011/06/servicebus",
+    "xsi": "http://www.w3.org/2001/XMLSchema-instance",
+    "xsd": "http://www.w3.org/2001/XMLSchema",
+    "serialization": "http://schemas.microsoft.com/2003/10/Serialization/"
+  },
+  "query_templates": {
+    "dotnet-collection": "api-version={api_version}&enrich=False&$skip={skip}&$top=100",
+    "dotnet-definition-singleton": "api-version={api_version}&enrich=False",
+    "dotnet-runtime-singleton": "api-version={api_version}&enrich=True",
+    "sift-collection": "api-version=2021-05&%24skip={skip}&%24top=100",
+    "sift-singleton": "api-version=2021-05"
+  },
+  "query_expansion": {
+    "api_version": "sources[client].api_version",
+    "initial_skip": 0,
+    "next_skip": "previous skip + 100 when parsed page count is at least 100; supported pages must not exceed 100",
+    "page_termination": "parsed page count < 100; no server continuation link is consumed",
+    "encoding_note": "Sift url::query_pairs_mut form-encodes dollar signs; .NET UriBuilder input retains dollar signs. Transport reserialization has not been observed."
+  },
+  "requests": [
+    {
+      "id": "dotnet-queues",
+      "clients": ["dotnet-current", "dotnet-previous"],
+      "kind": ["definition-collection", "runtime-collection"],
+      "client_methods": ["GetQueuesAsync", "GetQueuesRuntimePropertiesAsync"],
+      "method": "GET", "path": "/$Resources/queues", "query": "dotnet-collection",
+      "example_target_current": "/$Resources/queues?api-version=2024-05&enrich=False&$skip=0&$top=100",
+      "example_target_previous": "/$Resources/queues?api-version=2021-05&enrich=False&$skip=0&$top=100",
+      "definition_response": "responses/definition-queues.xml",
+      "combined_response": "responses/combined-queues.xml",
+      "required_namespaces": ["atom", "connect", "counts"],
+      "refusal_profile": "runtime-unavailable"
+    },
+    {
+      "id": "dotnet-topics",
+      "clients": ["dotnet-current", "dotnet-previous"],
+      "kind": ["definition-collection", "runtime-collection"],
+      "client_methods": ["GetTopicsAsync", "GetTopicsRuntimePropertiesAsync"],
+      "method": "GET", "path": "/$Resources/topics", "query": "dotnet-collection",
+      "example_target_current": "/$Resources/topics?api-version=2024-05&enrich=False&$skip=0&$top=100",
+      "example_target_previous": "/$Resources/topics?api-version=2021-05&enrich=False&$skip=0&$top=100",
+      "definition_response": "responses/definition-topics.xml",
+      "combined_response": "responses/combined-topics.xml",
+      "required_namespaces": ["atom", "connect", "counts"],
+      "refusal_profile": "runtime-unavailable"
+    },
+    {
+      "id": "dotnet-subscriptions",
+      "clients": ["dotnet-current", "dotnet-previous"],
+      "kind": ["definition-collection", "runtime-collection"],
+      "client_methods": ["GetSubscriptionsAsync", "GetSubscriptionsRuntimePropertiesAsync"],
+      "method": "GET", "path": "/fixture-topic/Subscriptions", "query": "dotnet-collection",
+      "example_target_current": "/fixture-topic/Subscriptions?api-version=2024-05&enrich=False&$skip=0&$top=100",
+      "example_target_previous": "/fixture-topic/Subscriptions?api-version=2021-05&enrich=False&$skip=0&$top=100",
+      "definition_response": "responses/definition-subscriptions.xml",
+      "combined_response": "responses/combined-subscriptions.xml",
+      "required_namespaces": ["atom", "connect", "counts"],
+      "refusal_profile": "runtime-unavailable"
+    },
+    {
+      "id": "sift-queues", "clients": ["sift-research"], "kind": ["combined-collection"],
+      "client_methods": ["list_queues"], "method": "GET", "path": "/$Resources/queues", "query": "sift-collection",
+      "example_target": "/$Resources/queues?api-version=2021-05&%24skip=0&%24top=100",
+      "combined_response": "responses/combined-queues.xml",
+      "required_namespaces": ["atom", "connect", "counts"], "refusal_profile": "runtime-unavailable"
+    },
+    {
+      "id": "sift-topics", "clients": ["sift-research"], "kind": ["combined-collection"],
+      "client_methods": ["list_topics"], "method": "GET", "path": "/$Resources/topics", "query": "sift-collection",
+      "example_target": "/$Resources/topics?api-version=2021-05&%24skip=0&%24top=100",
+      "combined_response": "responses/combined-topics.xml",
+      "required_namespaces": ["atom", "connect", "counts"], "refusal_profile": "runtime-unavailable"
+    },
+    {
+      "id": "sift-subscriptions", "clients": ["sift-research"], "kind": ["combined-collection"],
+      "client_methods": ["list_subscriptions"], "method": "GET", "path": "/fixture-topic/subscriptions", "query": "sift-collection",
+      "example_target": "/fixture-topic/subscriptions?api-version=2021-05&%24skip=0&%24top=100",
+      "combined_response": "responses/combined-subscriptions.xml",
+      "required_namespaces": ["atom", "connect", "counts"], "refusal_profile": "runtime-unavailable"
+    }
+  ],
+  "singleton_requests": {
+    "dotnet": {
+      "clients": ["dotnet-current", "dotnet-previous"], "method": "GET",
+      "entities": [
+        {"path": "/fixture-queue", "definition_method": "GetQueueAsync", "runtime_method": "GetQueueRuntimePropertiesAsync"},
+        {"path": "/fixture-topic", "definition_method": "GetTopicAsync", "runtime_method": "GetTopicRuntimePropertiesAsync"},
+        {"path": "/fixture-topic/Subscriptions/fixture-subscription", "definition_method": "GetSubscriptionAsync", "runtime_method": "GetSubscriptionRuntimePropertiesAsync"}
+      ],
+      "definition_query": "dotnet-definition-singleton",
+      "runtime_query": "dotnet-runtime-singleton",
+      "distinguishable": true,
+      "definition_status": "source-shape-only; no activated read adapter",
+      "runtime_refusal_profile": "runtime-unavailable"
+    },
+    "sift": {
+      "clients": ["sift-research"], "method": "GET",
+      "paths": ["/fixture-queue", "/fixture-topic", "/fixture-topic/subscriptions/fixture-subscription"],
+      "client_methods": ["get_queue", "get_topic", "get_subscription"],
+      "query": "sift-singleton", "refusal_profile": "runtime-unavailable"
+    }
+  },
+  "response_profiles": {
+    "definition": {
+      "grammar": "profiles/definition.rng", "required_namespaces": ["atom", "connect"],
+      "content_type": "application/atom+xml", "role": "negative example for ambiguous collection routes; definition syntax only"
+    },
+    "combined": {
+      "grammar": "profiles/combined.rng", "required_namespaces": ["atom", "connect", "counts"],
+      "content_type": "application/atom+xml", "role": "synthetic parser input; not a materialized server response",
+      "runtime_values": "arbitrary nonzero test values; never broker observations"
+    }
+  },
+  "refusal_profiles": {
+    "runtime-unavailable": {
+      "status": 400, "content_type": "application/xml", "response": "responses/refusal.xml", "grammar": "profiles/refusal.rng",
+      "wire_status": "selected local design; not observed", "mutation": "none",
+      "dotnet_source_mapping": "HttpRequestAndResponse.ThrowIfRequestFailed maps HTTP 400 to ArgumentException",
+      "scope": "all ambiguous collections, all requested runtime singletons, all Sift combined singletons; including empty/later pages"
+    },
+    "unsupported-input": {
+      "status": 400, "mutation": "none",
+      "scope": "unknown/duplicate query, malformed or unsupported XML, out-of-profile operation; error detail must identify the category without echoing private input"
+    }
+  },
+  "adapter_tests": "controls.json",
+  "dotnet_interception_harness": {
+    "project": "dotnet/Switchyard.Conformance.Atom.csproj",
+    "instructions": "dotnet/README.md",
+    "selectors": ["declared-current", "previous"],
+    "transport": "in-memory-no-network",
+    "observations": "separate nonce-bound invocation output; this manifest remains source-derived",
+    "sift_interception": false
+  }
+}

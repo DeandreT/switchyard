@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Synthetic counters describe only this test input; NOT broker statistics. -->
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title type="text">fixture-topic</title>
+    <content type="application/xml">
+      <TopicDescription xmlns="http://schemas.microsoft.com/netservices/2010/10/servicebus/connect"
+                        xmlns:c="http://schemas.microsoft.com/netservices/2011/06/servicebus">
+        <DefaultMessageTimeToLive>PT1H</DefaultMessageTimeToLive>
+        <RequiresDuplicateDetection>false</RequiresDuplicateDetection>
+        <DuplicateDetectionHistoryTimeWindow>PT10M</DuplicateDetectionHistoryTimeWindow>
+        <SizeInBytes>8192</SizeInBytes>
+        <SubscriptionCount>4</SubscriptionCount>
+        <SqlFilterCount>3</SqlFilterCount>
+        <CorrelationFilterCount>2</CorrelationFilterCount>
+        <CreatedAt>2026-01-01T00:00:00Z</CreatedAt>
+        <UpdatedAt>2026-01-02T00:00:00Z</UpdatedAt>
+        <AccessedAt>2026-01-03T00:00:00Z</AccessedAt>
+        <CountDetails>
+          <c:ScheduledMessageCount>5</c:ScheduledMessageCount>
+        </CountDetails>
+      </TopicDescription>
+    </content>
+  </entry>
+</feed>

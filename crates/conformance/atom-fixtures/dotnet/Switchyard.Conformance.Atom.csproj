@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AtomSdkPinDirectory>$(MSBuildThisFileDirectory)../../pins/$(AtomSdkSelector)</AtomSdkPinDirectory>
+  </PropertyGroup>
+  <Import Project="$(AtomSdkPinDirectory)/SdkPin.props"
+          Condition="'$(AtomSdkSelector)' == 'declared-current' Or '$(AtomSdkSelector)' == 'previous'" />
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <NuGetLockFilePath>$(AtomSdkPinDirectory)/packages.lock.json</NuGetLockFilePath>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Azure.Messaging.ServiceBus" Version="$(SwitchyardServiceBusVersion)" />
+    <Compile Include="../../shared/SdkCustody.cs" Link="SdkCustody.cs" />
+    <AssemblyMetadata Include="SwitchyardSdkSelector" Value="$(SwitchyardSdkSelector)" />
+  </ItemGroup>
+  <Target Name="RequireAtomSdkPin" BeforeTargets="Restore;PrepareForBuild">
+    <Error Condition="'$(AtomSdkSelector)' != 'declared-current' And '$(AtomSdkSelector)' != 'previous'"
+           Text="AtomSdkSelector must explicitly select declared-current or previous." />
+    <Error Condition="'$(SwitchyardSdkSelector)' != '$(AtomSdkSelector)'"
+           Text="The imported SDK selector does not match the requested selector." />
+  </Target>
+</Project>

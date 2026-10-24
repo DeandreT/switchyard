@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Synthetic counters describe only this test input; NOT broker statistics. -->
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title type="text">fixture-queue</title>
+    <content type="application/xml">
+      <QueueDescription xmlns="http://schemas.microsoft.com/netservices/2010/10/servicebus/connect"
+                        xmlns:c="http://schemas.microsoft.com/netservices/2011/06/servicebus">
+        <LockDuration>PT1M</LockDuration>
+        <RequiresDuplicateDetection>false</RequiresDuplicateDetection>
+        <RequiresSession>false</RequiresSession>
+        <DefaultMessageTimeToLive>PT1H</DefaultMessageTimeToLive>
+        <DeadLetteringOnMessageExpiration>true</DeadLetteringOnMessageExpiration>
+        <DuplicateDetectionHistoryTimeWindow>PT10M</DuplicateDetectionHistoryTimeWindow>
+        <MaxDeliveryCount>10</MaxDeliveryCount>
+        <SizeInBytes>4096</SizeInBytes>
+        <MessageCount>28</MessageCount>
+        <CreatedAt>2026-01-01T00:00:00Z</CreatedAt>
+        <UpdatedAt>2026-01-02T00:00:00Z</UpdatedAt>
+        <AccessedAt>2026-01-03T00:00:00Z</AccessedAt>
+        <CountDetails>
+          <c:ActiveMessageCount>11</c:ActiveMessageCount>
+          <c:DeadLetterMessageCount>3</c:DeadLetterMessageCount>
+          <c:ScheduledMessageCount>5</c:ScheduledMessageCount>
+          <c:TransferMessageCount>7</c:TransferMessageCount>
+          <c:TransferDeadLetterMessageCount>2</c:TransferDeadLetterMessageCount>
+        </CountDetails>
+      </QueueDescription>
+    </content>
+  </entry>
+</feed>
