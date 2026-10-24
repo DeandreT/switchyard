@@ -108,6 +108,22 @@ impl AdminCatalogCursor {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    /// Checks the namespace and kind binding without consulting any store.
+    ///
+    /// Adapters can reject a foreign continuation before requesting a reader.
+    /// This establishes neither authorization nor a cross-page snapshot.
+    pub fn validate_scope(
+        &self,
+        namespace: &NamespaceName,
+        kind: AdminCatalogKind,
+    ) -> Result<(), AdminCatalogError> {
+        let (bound_kind, bound_namespace, _, _) = parse_cursor(self.as_bytes())?;
+        if bound_kind != kind || &bound_namespace != namespace {
+            return Err(AdminCatalogError::CursorScopeMismatch);
+        }
+        Ok(())
+    }
 }
 
 /// Invalid requests, selected catalog corruption, or an underlying read failure.
@@ -411,13 +427,11 @@ impl<S: StateStore> StateMachine<S> {
             return Err(AdminCatalogError::InvalidPageSize { requested: limit });
         }
         let position = after
-            .map(|after| parse_cursor(after.as_bytes()))
+            .map(|after| {
+                after.validate_scope(namespace, kind)?;
+                parse_cursor(after.as_bytes())
+            })
             .transpose()?;
-        if let Some((bound_kind, bound_namespace, _, _)) = &position
-            && (*bound_kind != kind || bound_namespace != namespace)
-        {
-            return Err(AdminCatalogError::CursorScopeMismatch);
-        }
         let mut entries = Vec::with_capacity(limit);
         let mut budget = MAX_ADMIN_CATALOG_SCAN;
         let mut last = None;

@@ -594,6 +594,10 @@ fn cursor_controls<P: StoreProvider>(provider: P) {
         .expect("first")
         .continuation
         .expect("cursor");
+    assert_eq!(
+        after.validate_scope(&namespace, AdminCatalogKind::Topics),
+        Ok(())
+    );
     let mut malformed = vec![vec![], vec![1], vec![1, 9], vec![0; 513], vec![255, 1]];
     for change in 0..5 {
         let mut raw = after.as_bytes().to_vec();
@@ -631,6 +635,10 @@ fn cursor_controls<P: StoreProvider>(provider: P) {
             (namespace.clone(), AdminCatalogKind::Queues),
             (namespace.clone(), AdminCatalogKind::Subscriptions),
         ] {
+            assert_eq!(
+                after.validate_scope(&foreign, kind),
+                Err(AdminCatalogError::CursorScopeMismatch)
+            );
             assert_eq!(
                 page(reader, &foreign, kind, Some(&after), 1),
                 Err(AdminCatalogError::CursorScopeMismatch)
