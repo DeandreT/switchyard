@@ -98,6 +98,11 @@ pub fn queue_config_prefix() -> Vec<u8> {
     vec![TAG_QUEUE_CONFIG]
 }
 
+/// Queue configurations in exactly one canonical namespace, including internal queues.
+pub fn namespace_queue_config_prefix(namespace: &NamespaceName) -> Vec<u8> {
+    namespace_catalog_prefix(TAG_QUEUE_CONFIG, namespace)
+}
+
 pub fn topic_config(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
     entity_scope(TAG_TOPIC_CONFIG, namespace, entity)
 }
@@ -106,6 +111,24 @@ pub fn topic_config(namespace: &NamespaceName, entity: &EntityPath) -> Vec<u8> {
 /// lets the timer worker discover topic-owned scheduled placeholders.
 pub fn topic_config_prefix() -> Vec<u8> {
     vec![TAG_TOPIC_CONFIG]
+}
+
+/// Topic configurations in exactly one canonical namespace.
+pub fn namespace_topic_config_prefix(namespace: &NamespaceName) -> Vec<u8> {
+    namespace_catalog_prefix(TAG_TOPIC_CONFIG, namespace)
+}
+
+/// Explicit subscription memberships in exactly one canonical namespace.
+pub fn namespace_subscription_prefix(namespace: &NamespaceName) -> Vec<u8> {
+    namespace_catalog_prefix(TAG_TOPIC_SUBSCRIPTION, namespace)
+}
+
+fn namespace_catalog_prefix(tag: u8, namespace: &NamespaceName) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(namespace.as_str().len() + 2);
+    prefix.push(tag);
+    prefix.extend_from_slice(namespace.as_str().as_bytes());
+    prefix.push(SEPARATOR);
+    prefix
 }
 
 pub fn topic_subscription_prefix(namespace: &NamespaceName, topic: &EntityPath) -> Vec<u8> {

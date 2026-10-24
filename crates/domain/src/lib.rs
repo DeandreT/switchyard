@@ -41,6 +41,8 @@ pub use identifier::{
 };
 pub use indexed::{IndexedApplyError, IndexedApplyOutcome, IndexedWriter};
 pub use machine::{
+    AdminCatalogCursor, AdminCatalogEntry, AdminCatalogError, AdminCatalogKind, AdminCatalogPage,
+    AdminQueue, AdminSubscription, AdminTopic, MAX_ADMIN_CATALOG_PAGE, MAX_ADMIN_CATALOG_SCAN,
     MAX_DEFERRED_RECEIVE_BATCH, MAX_PEEK_BATCH, MAX_PEEK_SCAN, StateMachine, TIMER_SCAN_LIMIT,
 };
 pub use message::{
