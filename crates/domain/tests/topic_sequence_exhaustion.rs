@@ -1007,7 +1007,7 @@ fn priorities<P: StoreProvider>(provider: P) -> TestResult {
         &f,
         111,
         send(input("a", None, None)),
-        BrokerError::Codec(rule_error.clone()),
+        BrokerError::Codec(rule_error),
     )?;
     unchanged_error(
         &f,
@@ -1067,7 +1067,7 @@ fn priorities<P: StoreProvider>(provider: P) -> TestResult {
             &f,
             300,
             CommandKind::ActivateScheduled,
-            BrokerError::Codec(message_error.clone()),
+            BrokerError::Codec(message_error),
         )?;
         for (record, error) in [
             (
@@ -1108,7 +1108,7 @@ fn priorities<P: StoreProvider>(provider: P) -> TestResult {
         &f,
         300,
         CommandKind::ActivateScheduled,
-        BrokerError::Codec(counter_error.clone()),
+        BrokerError::Codec(counter_error),
     )?;
     unchanged_error(
         &f,
