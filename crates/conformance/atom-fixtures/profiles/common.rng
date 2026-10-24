@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<grammar xmlns="http://relaxng.org/ns/structure/1.0"
+         ns="http://schemas.microsoft.com/netservices/2010/10/servicebus/connect"
+         datatypeLibrary="http://www.w3.org/2001/XMLSchema-datatypes">
+  <define name="envelope">
+    <choice>
+      <ref name="entry"/>
+      <element name="feed" ns="http://www.w3.org/2005/Atom">
+        <zeroOrMore><ref name="entry"/></zeroOrMore>
+      </element>
+    </choice>
+  </define>
+  <define name="entry">
+    <element name="entry" ns="http://www.w3.org/2005/Atom">
+      <element name="title"><attribute name="type"><value>text</value></attribute><data type="string"><param name="minLength">1</param></data></element>
+      <element name="content">
+        <attribute name="type"><value>application/xml</value></attribute>
+        <choice><ref name="queue"/><ref name="topic"/><ref name="subscription"/></choice>
+      </element>
+    </element>
+  </define>
+  <define name="queue">
+    <element name="QueueDescription">
+      <element name="LockDuration"><data type="duration"/></element>
+      <element name="RequiresDuplicateDetection"><data type="boolean"/></element>
+      <element name="RequiresSession"><data type="boolean"/></element>
+      <element name="DefaultMessageTimeToLive"><data type="duration"/></element>
+      <element name="DeadLetteringOnMessageExpiration"><data type="boolean"/></element>
+      <element name="DuplicateDetectionHistoryTimeWindow"><data type="duration"/></element>
+      <element name="MaxDeliveryCount"><data type="positiveInteger"><param name="maxInclusive">2147483647</param></data></element>
+      <ref name="runtime-queue"/>
+    </element>
+  </define>
+  <define name="topic">
+    <element name="TopicDescription">
+      <element name="DefaultMessageTimeToLive"><data type="duration"/></element>
+      <element name="RequiresDuplicateDetection"><data type="boolean"/></element>
+      <element name="DuplicateDetectionHistoryTimeWindow"><data type="duration"/></element>
+      <ref name="runtime-topic"/>
+    </element>
+  </define>
+  <define name="subscription">
+    <element name="SubscriptionDescription">
+      <element name="LockDuration"><data type="duration"/></element>
+      <element name="RequiresSession"><data type="boolean"/></element>
+      <element name="DefaultMessageTimeToLive"><data type="duration"/></element>
+      <element name="DeadLetteringOnMessageExpiration"><data type="boolean"/></element>
+      <element name="MaxDeliveryCount"><data type="positiveInteger"><param name="maxInclusive">2147483647</param></data></element>
+      <ref name="runtime-subscription"/>
+    </element>
+  </define>
+  <define name="count"><data type="long"><param name="minInclusive">0</param></data></define>
+  <define name="int-count"><data type="int"><param name="minInclusive">0</param></data></define>
+  <define name="timestamps">
+    <element name="CreatedAt"><data type="dateTime"/></element>
+    <element name="UpdatedAt"><data type="dateTime"/></element>
+    <element name="AccessedAt"><data type="dateTime"/></element>
+  </define>
+  <define name="count-details">
+    <element name="CountDetails">
+      <element name="ActiveMessageCount" ns="http://schemas.microsoft.com/netservices/2011/06/servicebus"><ref name="count"/></element>
+      <element name="DeadLetterMessageCount" ns="http://schemas.microsoft.com/netservices/2011/06/servicebus"><ref name="count"/></element>
+      <element name="ScheduledMessageCount" ns="http://schemas.microsoft.com/netservices/2011/06/servicebus"><ref name="count"/></element>
+      <element name="TransferMessageCount" ns="http://schemas.microsoft.com/netservices/2011/06/servicebus"><ref name="count"/></element>
+      <element name="TransferDeadLetterMessageCount" ns="http://schemas.microsoft.com/netservices/2011/06/servicebus"><ref name="count"/></element>
+    </element>
+  </define>
+</grammar>

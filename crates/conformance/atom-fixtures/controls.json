@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "status": "test vectors specified before adapter implementation; not executable routing evidence",
+  "request_controls": [
+    {"id": "dotnet-collision", "requests": ["dotnet-queues", "dotnet-topics", "dotnet-subscriptions"], "clients": ["dotnet-current", "dotnet-previous"], "expect": "definition and runtime have identical method/path/query, including enrich=False"},
+    {"id": "singletons-distinguishable", "expect": "explicit enrich=False and enrich=True are different for every dotnet singleton"},
+    {"id": "no-fake-empty", "requests": "all collections", "state": "empty catalog or exhausted page", "expect": "runtime-unavailable refusal; never infer definition intent from absence of entities"},
+    {"id": "later-page", "base": "dotnet-queues", "query": "api-version=2024-05&enrich=False&$skip=100&$top=100", "expect": "runtime-unavailable refusal"},
+    {"id": "decode-dollar-key-once", "query_pairs": ["$skip=0", "%24skip=0"], "expect": "same key after exactly one percent decode; never two separate keys"},
+    {"id": "duplicate-enrich", "query": "api-version=2024-05&enrich=False&enrich=True", "expect": "unsupported-input; never first/last-wins"},
+    {"id": "encoded-duplicate", "query": "api-version=2024-05&$skip=0&%24skip=1&$top=100", "expect": "unsupported-input"},
+    {"id": "unknown-query", "query": "api-version=2024-05&enrich=False&$filter=true", "expect": "unsupported-input"},
+    {"id": "unsupported-version", "query": "api-version=2099-01&enrich=False", "expect": "unsupported-input; not silently latest"},
+    {"id": "missing-version", "query": "enrich=False", "expect": "unsupported-input"},
+    {"id": "invalid-page", "queries": ["$skip=-1&$top=100", "$skip=0&$top=0", "$skip=0&$top=101", "$skip=18446744073709551616&$top=100"], "expect": "unsupported-input after adding a supported api-version; checked integer parse, no wrapping"},
+    {"id": "no-user-agent-routing", "requests": "all collections", "vary": ["User-Agent", "Authorization", "request ordering"], "expect": "never classify definition versus runtime from these fields"},
+    {"id": "path-case", "paths": ["/fixture-topic/Subscriptions", "/fixture-topic/subscriptions"], "expect": "same subscription collection; both runtime-unavailable"},
+    {"id": "writes-refused", "methods": ["PUT", "POST", "PATCH", "DELETE"], "expect": "unsupported-input; no domain writes or Clock/counter changes"},
+    {"id": "unsupported-routes", "paths": ["/$namespaceinfo", "/fixture-topic/Subscriptions/fixture-subscription/rules"], "expect": "out of this profile; no claim of support"}
+  ],
+  "xml_controls": [
+    {"id": "definition-not-runtime", "input": "responses/definition-queues.xml", "grammar": "profiles/combined.rng", "expect": "reject missing runtime fields, never zero-fill"},
+    {"id": "runtime-not-definition", "input": "responses/combined-queues.xml", "grammar": "profiles/definition.rng", "expect": "reject extra runtime fields"},
+    {"id": "wrong-count-namespace", "input": "rejected/wrong-count-namespace.xml", "grammar": "profiles/combined.rng", "expect": "reject despite correct local names"},
+    {"id": "missing-count", "input": "rejected/missing-count.xml", "grammar": "profiles/combined.rng", "expect": "reject missing ScheduledMessageCount"},
+    {"id": "unknown-field", "input": "rejected/unknown-field.xml", "grammar": "profiles/combined.rng", "expect": "reject FutureFeature"},
+    {"id": "duplicate-field", "input": "responses/combined-queues.xml", "replace": ["<MessageCount>28</MessageCount>", "<MessageCount>28</MessageCount><MessageCount>29</MessageCount>"], "expect": "reject"},
+    {"id": "negative-count", "input": "responses/combined-queues.xml", "replace": ["<c:ScheduledMessageCount>5</c:ScheduledMessageCount>", "<c:ScheduledMessageCount>-1</c:ScheduledMessageCount>"], "expect": "reject"},
+    {"id": "overflow-count", "input": "responses/combined-queues.xml", "replace": ["<MessageCount>28</MessageCount>", "<MessageCount>9223372036854775808</MessageCount>"], "expect": "reject"},
+    {"id": "foreign-description", "input": "responses/combined-queues.xml", "replace": ["http://schemas.microsoft.com/netservices/2010/10/servicebus/connect", "urn:foreign"], "expect": "reject"},
+    {"id": "wrong-atom", "input": "responses/combined-queues.xml", "replace": ["http://www.w3.org/2005/Atom", "urn:foreign"], "expect": "reject"},
+    {"id": "prefix-independent", "input": "responses/combined-queues.xml", "replace": ["c:", "another:"], "also_replace": ["xmlns:c=", "xmlns:another="], "expect": "accept expanded names unchanged"},
+    {"id": "nil-count", "input": "responses/combined-queues.xml", "replace": ["<MessageCount>28</MessageCount>", "<MessageCount xmlns:i=\"http://www.w3.org/2001/XMLSchema-instance\" i:nil=\"true\"/>"], "expect": "reject, not zero"},
+    {"id": "mixed-feed", "expect": "reject a topic description in a queue collection even if generic envelope grammar accepts it"},
+    {"id": "dtd-and-entities", "expect": "reject DOCTYPE, external and internal entities before grammar validation; never fetch resources"},
+    {"id": "resource-bounds", "expect": "reject oversized bodies, deep trees and excess entries before allocation; concrete adapter budgets must be fixed before implementation"},
+    {"id": "no-prefix-success", "expect": "malformed or unsupported final entry rejects the whole page; no partial successful prefix"}
+  ],
+  "client_controls": [
+    {"id": "nonzero-runtime", "input": "responses/combined-queues.xml", "expected": {"MessageCount": 28, "SizeInBytes": 4096, "ActiveMessageCount": 11, "DeadLetterMessageCount": 3, "ScheduledMessageCount": 5, "TransferMessageCount": 7, "TransferDeadLetterMessageCount": 2}, "purpose": "detect absent/default-zero runtime projection; synthetic values only"},
+    {"id": "topic-version-difference", "input": "responses/combined-topics.xml", "expected_current": {"SqlFilterCount": 3, "CorrelationFilterCount": 2, "SubscriptionCount": 4, "ScheduledMessageCount": 5}, "expected_previous": "no SqlFilterCount/CorrelationFilterCount public properties; do not claim exposure"},
+    {"id": "paging-full", "page_counts": [100, 1], "expected_skip": [0, 100], "expect": "101 entries; second short page terminates without third request"},
+    {"id": "paging-exact", "page_counts": [100, 0], "expected_skip": [0, 100], "expect": "terminal empty page required after exact full page; no server next-link assumption"},
+    {"id": "error-not-empty", "input": "responses/refusal.xml", "status": 400, "expect": "client error; never success, empty feed or zero statistics"}
+  ]
+}

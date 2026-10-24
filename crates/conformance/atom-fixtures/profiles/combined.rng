@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<grammar xmlns="http://relaxng.org/ns/structure/1.0"
+         ns="http://schemas.microsoft.com/netservices/2010/10/servicebus/connect"
+         datatypeLibrary="http://www.w3.org/2001/XMLSchema-datatypes">
+  <include href="common.rng"/>
+  <start><ref name="envelope"/></start>
+  <define name="runtime-queue">
+    <element name="SizeInBytes"><ref name="count"/></element>
+    <element name="MessageCount"><ref name="count"/></element>
+    <ref name="timestamps"/>
+    <ref name="count-details"/>
+  </define>
+  <define name="runtime-topic">
+    <element name="SizeInBytes"><ref name="count"/></element>
+    <element name="SubscriptionCount"><ref name="int-count"/></element>
+    <element name="SqlFilterCount"><ref name="int-count"/></element>
+    <element name="CorrelationFilterCount"><ref name="int-count"/></element>
+    <ref name="timestamps"/>
+    <element name="CountDetails">
+      <element name="ScheduledMessageCount" ns="http://schemas.microsoft.com/netservices/2011/06/servicebus"><ref name="count"/></element>
+    </element>
+  </define>
+  <define name="runtime-subscription">
+    <element name="SizeInBytes"><ref name="count"/></element>
+    <element name="MessageCount"><ref name="count"/></element>
+    <ref name="timestamps"/>
+    <ref name="count-details"/>
+  </define>
+</grammar>

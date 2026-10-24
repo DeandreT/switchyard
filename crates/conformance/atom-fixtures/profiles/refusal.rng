@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<element name="Error" xmlns="http://relaxng.org/ns/structure/1.0" ns="">
+  <element name="Code"><value>400</value></element>
+  <element name="Detail"><text/></element>
+</element>

@@ -10,7 +10,7 @@ not compatibility certification.
 | --- | --- |
 | Official .NET | Four opt-in experimental Memory TCP/WSS gates: declared-current ServiceBus 7.21.0 / Core 1.62.0 and previous 7.20.2 / 1.60.0, not latest. Isolated locked graphs/roots; approved ServiceBus/Core, output and nonce-bound loaded-file bytes; completion after async disposal. |
 | Rust AMQP | Broader protocol end-to-end suites, not official-SDK substitutes. |
-| Pinned Sift | Planned; no gate. |
+| Pinned Sift | Source-only Atom fixture pin; no execution gate. |
 
 .NET gates cover queue/batch send, prefetch/settlement, receive-delete, envelopes,
 renew/abandon/defer/peek, DLQ, sessions/state, duplicates, scheduling/cancellation,
@@ -23,6 +23,12 @@ or whole-test task-tree shutdown. See [selectors/limits](sdk-gates.md),
 [TCP](../crates/server/tests/amqp_dotnet_current.rs),
 [WSS](../crates/server/tests/amqp_dotnet_websockets.rs) and
 [declared project](../crates/conformance/dotnet-current/Switchyard.Conformance.DotNetCurrent.csproj).
+
+Source-derived [Atom profiles](../crates/conformance/atom-fixtures/README.md)
+record indistinguishable definition/runtime collection requests and closed XML
+shapes. The in-memory .NET controls exercise request construction and synthetic
+response parsing, not a running endpoint. Atom remains unimplemented; ambiguous
+collections require refusal until truthful combined runtime data is available.
 
 ## Implemented Surface
 
