@@ -284,6 +284,9 @@ fn read_entry(guard: fjall::Guard) -> Result<(Key, Value), StorageError> {
 mod provenance_tests;
 
 #[cfg(test)]
+mod image_install_tests;
+
+#[cfg(test)]
 mod tests {
     use tempfile::TempDir;
 
