@@ -100,7 +100,7 @@ pub fn validate_session_rows(
     Ok(report)
 }
 
-fn validate(facts: &Facts<'_>) -> Result<(), SnapshotSessionError> {
+pub(super) fn validate(facts: &Facts<'_>) -> Result<(), SnapshotSessionError> {
     // A session record's exact companion wins before any reverse orphan.
     for row in &facts.rows {
         match &row.value.key {

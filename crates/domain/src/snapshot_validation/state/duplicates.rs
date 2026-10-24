@@ -101,7 +101,7 @@ pub fn validate_duplicate_rows(
     Ok(report)
 }
 
-fn validate(facts: &Facts<'_>) -> Result<usize, SnapshotDuplicateError> {
+pub(super) fn validate(facts: &Facts<'_>) -> Result<usize, SnapshotDuplicateError> {
     // Current companions are mandatory before any stale reverse-row tolerance.
     for row in &facts.rows {
         let StateKey::DuplicateId(namespace, entity, id) = &row.value.key else {
