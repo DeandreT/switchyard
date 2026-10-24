@@ -1011,11 +1011,6 @@ mod tests {
         result
     }
 
-    struct NoopWake;
-    impl std::task::Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
     async fn full_channel_cancellation<P: testkit::StoreProvider>(provider: P) {
         use admin_api::{
             CreateEntityRequest, EntityAddress, EntityKind, EntityOptions, GetEntityRequest,
@@ -1058,9 +1053,9 @@ mod tests {
             kind: EntityKind::Queue,
             options: EntityOptions::default(),
         }));
-        let waker = Waker::from(Arc::new(NoopWake));
+        let waker = Waker::noop();
         assert!(matches!(
-            pending.as_mut().poll(&mut Context::from_waker(&waker)),
+            pending.as_mut().poll(&mut Context::from_waker(waker)),
             Poll::Pending
         ));
         assert_eq!(handle.requests.len(), COMMAND_QUEUE_DEPTH);

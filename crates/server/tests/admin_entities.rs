@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
-    task::{Context, Poll, Wake, Waker},
+    task::{Context, Poll, Waker},
     thread::{self, ThreadId},
     time::Duration,
 };
@@ -203,14 +203,10 @@ fn owner<S: StateStore>(store: S, clock: CountingClock) -> (Broker, AdminService
 
 // One poll establishes exact admission without sleeping, scheduler timing or a
 // helper task that might be aborted before it has ever polled the service call.
-struct NoopWake;
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-}
 fn poll_pending<F: Future>(future: Pin<&mut F>) {
-    let waker = Waker::from(Arc::new(NoopWake));
+    let waker = Waker::noop();
     assert!(matches!(
-        future.poll(&mut Context::from_waker(&waker)),
+        future.poll(&mut Context::from_waker(waker)),
         Poll::Pending
     ));
 }
