@@ -242,13 +242,14 @@ async fn absolute_addresses_cannot_expand_entity_or_namespace_authority() -> Tes
         {
             let mut connection = node.connect().await?;
             let mut session = Session::begin(&mut connection).await?;
-            match Sender::attach(&mut session, format!("denied-{index}"), target).await {
-                Ok(mut sender) => assert!(
+            if let Ok(mut sender) =
+                Sender::attach(&mut session, format!("denied-{index}"), target).await
+            {
+                assert!(
                     tokio::time::timeout(Duration::from_secs(5), sender.send(message()))
                         .await?
                         .is_err()
-                ),
-                Err(_) => {}
+                );
             }
             let _ = connection.close().await;
         }
