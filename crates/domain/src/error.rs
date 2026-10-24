@@ -82,6 +82,8 @@ pub enum BrokerError {
     EmptyMessageBatch,
     #[error("sequence number space exhausted")]
     SequenceNumberExhausted,
+    #[error("lock token space exhausted")]
+    LockTokenExhausted,
     #[error("every message in a batch sent to a session queue must use the same session")]
     MessageBatchSessionMismatch,
     #[error("peek must request at least one message")]

@@ -662,7 +662,10 @@ impl<S: StateStore> StateMachine<S> {
                 ReceiveMode::PeekLock => {
                     let mut counters = self.load_counters(command)?;
                     let token = LockToken::new(counters.next_lock_token);
-                    counters.next_lock_token = counters.next_lock_token.saturating_add(1);
+                    counters.next_lock_token = counters
+                        .next_lock_token
+                        .checked_add(1)
+                        .ok_or(BrokerError::LockTokenExhausted)?;
 
                     let lock_duration_millis =
                         lock_duration_millis.unwrap_or(config.lock_duration_millis);
@@ -906,7 +909,10 @@ impl<S: StateStore> StateMachine<S> {
         let entity = &command.entity;
         let mut counters = self.load_counters(command)?;
         let token = LockToken::new(counters.next_lock_token);
-        counters.next_lock_token = counters.next_lock_token.saturating_add(1);
+        counters.next_lock_token = counters
+            .next_lock_token
+            .checked_add(1)
+            .ok_or(BrokerError::LockTokenExhausted)?;
 
         // An elapsed lock still owns an index entry, which the sweep may not
         // have reached yet.

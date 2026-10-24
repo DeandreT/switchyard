@@ -55,6 +55,7 @@ and activation [#17](https://github.com/DeandreT/switchyard/issues/17), typed co
 | Session ID on ordinary queue | Refused (Azure ignores it); only session queues promise FIFO. |
 | Session settlement | Live message token/deadline suffice after session-lock loss; Azure also requires session ownership. |
 | Next session | At most 32 candidates; all held returns unavailable/retry, not a full walk. |
+| Lock tokens | Message and session holds share the selected queue's token counter. MAX-1 is the last fresh token; MAX refuses new holds with nonretryable `LockTokenExhausted` (`amqp:resource-limit-exceeded`, management 403). Empty/no-selection and receive-delete operations need no token; named empty session acquisition does. Existing holds and expiry remain usable. |
 | TTL | Always DLQs as `TTLExpiredException`; Azure's configurable expiration policy defaults off. Live locks remain settleable until expiry. |
 | Duplicate gaps/history | Suppression consumes acknowledgement sequence slots, stores no message. History starts at command time; hits do not extend it, nor settlement/cancellation/expiry/DLQ erase it. Missing raw-AMQP IDs bypass it. |
 | Scheduled topics | Children/rules snapshot at activation: later subscriptions may receive older publications. All-scheduled sends do not prove topology early. |
@@ -67,6 +68,11 @@ Commands commit one batch; domain refusals preserve messages, counters, history
 and Clock. Indexed apply, journal and replay have separate checkpoint/retire/reopen
 rules, not panic recovery or quorum guarantees. Snapshot format is structural,
 not complete state/backend-provenance/authenticity proof or capture/install.
+Token-exhausted receive, deferred receive and session acceptance discard every
+staged effect, including earlier TTL routing in the same command. Indexed refusals
+may initialize their private owner and advance only the `0xF1` checkpoint; domain
+rows and Clock stay unchanged. These checks do not repair previously reused tokens
+or certify naturally reached exhaustion.
 See [atomicity and lifecycle](lifecycle.md#atomicity-and-lifecycle) for settlement,
 deferral, scheduling, DLQ and replay contracts.
 

@@ -267,6 +267,10 @@ fn ordinary_deterministic_refusal(kind: &CommandKind, error: &BrokerError) -> bo
             kind,
             C::Send { .. } | C::SendBatch { .. } | C::ActivateScheduled
         ),
+        E::LockTokenExhausted => matches!(
+            kind,
+            C::Receive { .. } | C::ReceiveDeferred { .. } | C::AcceptSession { .. }
+        ),
         // Bare catalog cap errors have no proof of a validated full reader.
         // Unmatched errors, including future variants, never advance the index.
         _ => false,
@@ -341,6 +345,48 @@ fn corrupt(detail: &'static str) -> IndexedApplyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_exhaustion_is_checkpointed_only_for_hold_acquisition() {
+        use crate::ReceiveMode;
+
+        let error = BrokerError::LockTokenExhausted;
+        for kind in [
+            CommandKind::Receive {
+                mode: ReceiveMode::PeekLock,
+                lock_duration_millis: None,
+                session: None,
+            },
+            CommandKind::ReceiveDeferred {
+                sequences: vec![crate::SequenceNumber::new(1)],
+                mode: ReceiveMode::PeekLock,
+                lock_duration_millis: None,
+                session: None,
+            },
+            CommandKind::AcceptSession {
+                session_id: None,
+                lock_duration_millis: None,
+            },
+        ] {
+            assert!(ordinary_deterministic_refusal(&kind, &error));
+            assert!(!ordinary_deterministic_refusal(
+                &kind,
+                &BrokerError::SequenceNumberExhausted
+            ));
+        }
+        for kind in [
+            CommandKind::SendBatch { messages: vec![] },
+            CommandKind::ActivateScheduled,
+            CommandKind::ExpireLocks,
+            CommandKind::ExpireSessionLocks,
+            CommandKind::Complete {
+                sequence: crate::SequenceNumber::new(1),
+                lock_token: crate::LockToken::new(1),
+            },
+        ] {
+            assert!(!ordinary_deterministic_refusal(&kind, &error));
+        }
+    }
 
     #[test]
     fn private_owner_and_checkpoint_v1_bytes_are_frozen() {
