@@ -736,7 +736,10 @@ mod tests {
     fn fjall_all_limit_refusals_and_abandoned_preparation_make_zero_apply_calls() {
         let dir = TempDir::new().unwrap();
         let new = limits_and_abandonment_never_apply(FjallStore::open(dir.path()).unwrap());
-        assert_eq!(FjallStore::open(dir.path()).unwrap().snapshot().unwrap(), new);
+        assert_eq!(
+            FjallStore::open(dir.path()).unwrap().snapshot().unwrap(),
+            new
+        );
     }
 
     #[test]
