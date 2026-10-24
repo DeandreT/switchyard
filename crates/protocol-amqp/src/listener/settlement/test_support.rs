@@ -45,7 +45,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, DuplexStream, ReadBuf, duplex},
     sync::Notify,
     task::Id,
-    time::timeout,
+    time::{Instant, timeout, timeout_at},
 };
 
 use crate::listener::settlement::{SettlementContext, lock_delivery_tag};
@@ -56,6 +56,14 @@ pub(super) const WAIT: Duration = Duration::from_secs(5);
 pub(super) const CHANNEL: u16 = 1;
 pub(super) const HANDLE: u32 = 1;
 pub(super) const LINK: &str = "owned-settlement";
+
+// This only bounds cooperative async work. Blocking Actor operations and fixture
+// destruction still require the qualification runner's external process deadline.
+async fn native_wait_until<F: Future>(deadline: Instant, phase: &str, future: F) -> F::Output {
+    timeout_at(deadline, future)
+        .await
+        .unwrap_or_else(|_| panic!("native fixture async deadline expired: {phase}"))
+}
 
 #[derive(Default)]
 pub(super) struct CommitState {
@@ -559,12 +567,19 @@ pub(super) fn frame(performative: Performative) -> Frame {
 }
 
 pub(super) async fn performative(peer: &mut DuplexStream) -> Performative {
+    performative_until(peer, Instant::now() + WAIT, "wire response").await
+}
+
+async fn performative_until(
+    peer: &mut DuplexStream,
+    deadline: Instant,
+    phase: &str,
+) -> Performative {
     let Frame::Amqp {
         performative: Some(performative),
         ..
-    } = timeout(WAIT, read_frame(peer))
+    } = native_wait_until(deadline, phase, read_frame(peer))
         .await
-        .expect("wire response deadline")
         .unwrap()
     else {
         panic!("actual AMQP frame");
@@ -587,13 +602,15 @@ impl Wire {
     }
 
     pub(super) async fn new_with_credit(mode: ReceiverSettleMode, credit: u32) -> Self {
+        // All setup steps, including attach, share one async budget.
+        let deadline = Instant::now() + WAIT;
         let (inner, mut peer) = duplex(64 * 1024);
         let writes = Arc::new(WriteGate::default());
         let stream = GatedIo {
             inner,
             gate: Arc::clone(&writes),
         };
-        let (connection, ()) = timeout(WAIT, async {
+        let (connection, ()) = native_wait_until(deadline, "Wire setup: Open exchange", async {
             tokio::join!(
                 ServerConnection::accept(stream, "settlement-server", None),
                 async {
@@ -611,28 +628,40 @@ impl Wire {
                     *channel = 0;
                     write_frame(&mut peer, &open).await.unwrap();
                     assert!(matches!(
-                        performative(&mut peer).await,
+                        performative_until(&mut peer, deadline, "Wire setup: Open response").await,
                         Performative::Open(_)
                     ));
                 }
             )
         })
-        .await
-        .expect("Open deadline");
+        .await;
         let mut connection = connection.unwrap();
-        write_frame(&mut peer, &frame(Performative::Begin(Begin::default())))
-            .await
-            .unwrap();
-        let incoming = timeout(WAIT, connection.next_incoming_session())
-            .await
-            .unwrap()
-            .unwrap();
-        let mut session = connection.accept_session(incoming).await.unwrap();
+        native_wait_until(
+            deadline,
+            "Wire setup: write Begin",
+            write_frame(&mut peer, &frame(Performative::Begin(Begin::default()))),
+        )
+        .await
+        .unwrap();
+        let incoming = native_wait_until(
+            deadline,
+            "Wire setup: incoming session",
+            connection.next_incoming_session(),
+        )
+        .await
+        .unwrap();
+        let mut session = native_wait_until(
+            deadline,
+            "Wire setup: accept session",
+            connection.accept_session(incoming),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
-            performative(&mut peer).await,
+            performative_until(&mut peer, deadline, "Wire setup: Begin response").await,
             Performative::Begin(_)
         ));
-        let sender = Self::attach(&mut session, &mut peer, mode.clone(), credit).await;
+        let sender = Self::attach(&mut session, &mut peer, mode.clone(), credit, deadline).await;
         Self {
             connection,
             _session: session,
@@ -648,51 +677,69 @@ impl Wire {
         peer: &mut DuplexStream,
         mode: ReceiverSettleMode,
         credit: u32,
+        deadline: Instant,
     ) -> Sender {
-        write_frame(
-            peer,
-            &frame(Performative::Attach(Box::new(Attach {
-                name: LINK.to_owned(),
-                handle: HANDLE,
-                role: Role::Receiver,
-                snd_settle_mode: SenderSettleMode::Unsettled,
-                rcv_settle_mode: mode.clone(),
-                source: Some(Source::new("orders")),
-                target: None,
-                unsettled: None,
-                incomplete_unsettled: false,
-                initial_delivery_count: None,
-                max_message_size: None,
-                offered_capabilities: None,
-                desired_capabilities: None,
-                properties: None,
-            }))),
+        native_wait_until(
+            deadline,
+            "Wire attach: write Attach",
+            write_frame(
+                peer,
+                &frame(Performative::Attach(Box::new(Attach {
+                    name: LINK.to_owned(),
+                    handle: HANDLE,
+                    role: Role::Receiver,
+                    snd_settle_mode: SenderSettleMode::Unsettled,
+                    rcv_settle_mode: mode.clone(),
+                    source: Some(Source::new("orders")),
+                    target: None,
+                    unsettled: None,
+                    incomplete_unsettled: false,
+                    initial_delivery_count: None,
+                    max_message_size: None,
+                    offered_capabilities: None,
+                    desired_capabilities: None,
+                    properties: None,
+                }))),
+            ),
         )
         .await
         .unwrap();
-        let incoming = timeout(WAIT, session.next_incoming_attach())
-            .await
-            .unwrap()
-            .unwrap();
-        let LinkEndpoint::Sender(sender) =
-            session.accept_attach(incoming, 1024 * 1024).await.unwrap()
-        else {
+        let incoming = native_wait_until(
+            deadline,
+            "Wire attach: incoming attach",
+            session.next_incoming_attach(),
+        )
+        .await
+        .unwrap();
+        let LinkEndpoint::Sender(sender) = native_wait_until(
+            deadline,
+            "Wire attach: accept attach",
+            session.accept_attach(incoming, 1024 * 1024),
+        )
+        .await
+        .unwrap() else {
             panic!("actual native sender");
         };
-        let Performative::Attach(response) = performative(peer).await else {
+        let Performative::Attach(response) =
+            performative_until(peer, deadline, "Wire attach: Attach response").await
+        else {
             panic!("Attach response");
         };
         assert_eq!(response.rcv_settle_mode, mode);
-        write_frame(
-            peer,
-            &frame(Performative::Flow(Flow {
-                handle: Some(HANDLE),
-                delivery_count: Some(0),
-                link_credit: Some(credit),
-                incoming_window: 2048,
-                outgoing_window: 2048,
-                ..Flow::default()
-            })),
+        native_wait_until(
+            deadline,
+            "Wire attach: write Flow",
+            write_frame(
+                peer,
+                &frame(Performative::Flow(Flow {
+                    handle: Some(HANDLE),
+                    delivery_count: Some(0),
+                    link_credit: Some(credit),
+                    incoming_window: 2048,
+                    outgoing_window: 2048,
+                    ..Flow::default()
+                })),
+            ),
         )
         .await
         .unwrap();
@@ -705,11 +752,13 @@ impl Wire {
             &mut self.peer,
             self.mode.clone(),
             credit,
+            Instant::now() + WAIT,
         )
         .await
     }
 
     pub(super) async fn session_barrier(&mut self, channel: u16) -> ServerSession {
+        let deadline = Instant::now() + WAIT;
         let mut begin = frame(Performative::Begin(Begin::default()));
         let Frame::Amqp {
             channel: actual, ..
@@ -718,23 +767,38 @@ impl Wire {
             unreachable!()
         };
         *actual = channel;
-        write_frame(&mut self.peer, &begin).await.unwrap();
-        let incoming = timeout(WAIT, self.connection.next_incoming_session())
-            .await
-            .unwrap()
-            .unwrap();
-        let session = timeout(WAIT, self.connection.accept_session(incoming))
-            .await
-            .unwrap()
-            .unwrap();
+        native_wait_until(
+            deadline,
+            "Wire barrier: write Begin",
+            write_frame(&mut self.peer, &begin),
+        )
+        .await
+        .unwrap();
+        let incoming = native_wait_until(
+            deadline,
+            "Wire barrier: incoming session",
+            self.connection.next_incoming_session(),
+        )
+        .await
+        .unwrap();
+        let session = native_wait_until(
+            deadline,
+            "Wire barrier: accept session",
+            self.connection.accept_session(incoming),
+        )
+        .await
+        .unwrap();
         let Frame::Amqp {
             channel: actual,
             performative: Some(Performative::Begin(_)),
             payload,
-        } = timeout(WAIT, read_frame(&mut self.peer))
-            .await
-            .unwrap()
-            .unwrap()
+        } = native_wait_until(
+            deadline,
+            "Wire barrier: Begin response",
+            read_frame(&mut self.peer),
+        )
+        .await
+        .unwrap()
         else {
             panic!("original native command FIFO Begin barrier");
         };
@@ -1111,4 +1175,123 @@ pub(super) fn acquisition_counters(actor: &Actor) -> domain::QueueCounters {
         .unwrap()
         .map(|bytes| domain::codec::decode(&bytes).unwrap())
         .unwrap_or_default()
+}
+
+mod native_fixture_controls {
+    //! Establish each gate ordering by polling and triggering it explicitly,
+    //! rather than relying on scheduler delays or sleeps.
+
+    use super::*;
+    use std::{sync::atomic::AtomicUsize, task::Wake};
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn blocked_writer() -> (GatedIo, DuplexStream, Arc<WriteGate>) {
+        let (inner, peer) = duplex(16);
+        let gate = Arc::new(WriteGate::default());
+        gate.block();
+        (
+            GatedIo {
+                inner,
+                gate: Arc::clone(&gate),
+            },
+            peer,
+            gate,
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[should_panic(expected = "native fixture async deadline expired: pending deadline control")]
+    async fn expired_native_deadline_rejects_pending_work_with_its_phase() {
+        native_wait_until(
+            Instant::now() - Duration::from_secs(1),
+            "pending deadline control",
+            std::future::pending::<()>(),
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_deadline_preserves_ready_work() {
+        assert_eq!(
+            native_wait_until(Instant::now() + WAIT, "ready control", async { 17 }).await,
+            17
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_gate_observes_notification_before_wait() {
+        let (mut writer, _peer, gate) = blocked_writer();
+        let _release = gate.release_on_drop();
+        let waker = Waker::from(Arc::new(WakeCount::default()));
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut writer).poll_write(&mut cx, b"x").is_pending());
+
+        // notify_waiters retained no permit: the sticky entered state must be
+        // sufficient when the observer starts only after the writer's poll.
+        let mut reached = Box::pin(gate.reached());
+        assert!(reached.as_mut().poll(&mut cx).is_ready());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_gate_wakes_waiter_registered_before_notification() {
+        let (mut writer, _peer, gate) = blocked_writer();
+        let _release = gate.release_on_drop();
+        let observer_wakes = Arc::new(WakeCount::default());
+        let observer_waker = Waker::from(Arc::clone(&observer_wakes));
+        let mut observer_cx = Context::from_waker(&observer_waker);
+        let mut reached = Box::pin(gate.reached());
+        assert!(reached.as_mut().poll(&mut observer_cx).is_pending());
+        assert_eq!(observer_wakes.0.load(Ordering::SeqCst), 0);
+
+        let writer_waker = Waker::from(Arc::new(WakeCount::default()));
+        let mut writer_cx = Context::from_waker(&writer_waker);
+        assert!(
+            Pin::new(&mut writer)
+                .poll_write(&mut writer_cx, b"x")
+                .is_pending()
+        );
+        assert_eq!(observer_wakes.0.load(Ordering::SeqCst), 1);
+        assert!(reached.as_mut().poll(&mut observer_cx).is_ready());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_release_guard_wakes_the_original_writer_once() {
+        let (mut writer, mut peer, gate) = blocked_writer();
+        let release = gate.release_on_drop();
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut writer).poll_write(&mut cx, b"x").is_pending());
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+
+        drop(release);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        assert!(!gate.state.lock().unwrap().blocked);
+        assert!(matches!(
+            Pin::new(&mut writer).poll_write(&mut cx, b"x"),
+            Poll::Ready(Ok(1))
+        ));
+        gate.release();
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+
+        let mut bytes = [0];
+        let mut read = ReadBuf::new(&mut bytes);
+        assert!(matches!(
+            Pin::new(&mut peer).poll_read(&mut cx, &mut read),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(read.filled(), b"x");
+    }
 }
