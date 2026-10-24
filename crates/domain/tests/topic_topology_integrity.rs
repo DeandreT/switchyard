@@ -350,14 +350,14 @@ fn parent_backing_and_shadow_profiles_are_proved_before_routing<P: StoreProvider
     let mut faults = vec![
         WriteBatch::default().put(
             parent_key.clone(),
-            codec::encode(&TopicConfig {
+            codec::topic::encode(&TopicConfig {
                 max_message_bytes: 0,
                 ..TopicConfig::default()
             })?,
         ),
         WriteBatch::default().put(
             parent_key.clone(),
-            codec::encode(&TopicConfig {
+            codec::topic::encode(&TopicConfig {
                 default_time_to_live_millis: Some(0),
                 ..TopicConfig::default()
             })?,
@@ -369,11 +369,11 @@ fn parent_backing_and_shadow_profiles_are_proved_before_routing<P: StoreProvider
         WriteBatch::default().delete(shadow_key.clone()),
         WriteBatch::default().put(
             keys::topic_config(&fixture.namespace, &child),
-            codec::encode(&TopicConfig::default())?,
+            codec::topic::encode(&TopicConfig::default())?,
         ),
         WriteBatch::default().put(
             keys::topic_config(&fixture.namespace, &shadow),
-            codec::encode(&TopicConfig::default())?,
+            codec::topic::encode(&TopicConfig::default())?,
         ),
     ];
     for corrupted in [
@@ -469,7 +469,7 @@ fn parent_backing_and_shadow_profiles_are_proved_before_routing<P: StoreProvider
     for reserved in [&child, &shadow, &EntityPath::new("events/$management")?] {
         fixture.raw().apply(WriteBatch::default().put(
             keys::topic_config(&fixture.namespace, reserved),
-            codec::encode(&TopicConfig::default())?,
+            codec::topic::encode(&TopicConfig::default())?,
         ))?;
         assert_eq!(
             fixture.machine.topic_config(&fixture.namespace, reserved),
@@ -959,7 +959,7 @@ fn full_membership_lookahead_preserves_limit_and_admission_priority<P: StoreProv
     assert!(trace.scans.is_empty());
     fixture.raw().apply(WriteBatch::default().put(
         keys::topic_config(&fixture.namespace, &fixture.topic),
-        codec::encode(&TopicConfig {
+        codec::topic::encode(&TopicConfig {
             max_message_bytes: 0,
             ..TopicConfig::default()
         })?,
@@ -988,6 +988,7 @@ fn healthy_public_pages_and_maximum_composite_addresses_survive_reopen<P: StoreP
     let parent = TopicConfig {
         default_time_to_live_millis: Some(5_000),
         max_message_bytes: 1_024,
+        ..TopicConfig::default()
     };
     let receive = SubscriptionConfig {
         lock_duration_millis: domain::MAX_LOCK_DURATION_MILLIS,

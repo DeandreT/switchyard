@@ -66,6 +66,33 @@ ORs rules, ANDs populated exact-typed correlation fields, makes one copy despite
 multiple matches and succeeds without matches. Full copies settle/expire/defer/
 browse/DLQ independently.
 
+### Topic Duplicate History
+
+Topic duplicate enablement and window are creation-only. Defaults are disabled and
+600,000ms; the inclusive 20,000–604,800,000ms window is validated even when disabled.
+Identity is namespace, topic and exact case-sensitive nonempty message ID. Anonymous
+offers bypass history; subscription backings and DLQs never own it. Every offered
+item consumes a topic ACK slot, including suppressed offers. Suppression creates
+no placeholder, copy or child-local sequence and reports no populated destination.
+Full input/filter validation and immediate-offer topology proof precede suppression;
+all-scheduled offers still defer topology/rules to activation.
+
+An identifier suppresses only while its deadline exceeds command time. Equality
+allows reuse, including a saturated deadline at timestamp MAX; hits do not extend
+history. Acceptance stages exact lookup/ordered-expiry pairs with all other changes
+atomically. Refused batches leave history, counters, copies and Clock untouched.
+Scheduling records history only at offer acceptance. Activation allocates its fresh
+topic slot without rechecking or refreshing history. Settlement, cancellation, TTL,
+DLQ movement, zero subscribers and no matching rules retain it. Profile updates
+preserve both settings and all retained deadlines.
+
+The shared bounded expiry command handles queues and topics with stale-generation
+protection. The timer sweeps topic history independently even after an activation
+error, using the existing per-command/per-index/catalog budgets. Snapshot catalog
+and state facets share the canonical topic codec and permit history only for enabled
+ordinary queues or topics. Original row ordinals, phase priority, partial meanings
+and legal ACK gaps remain unchanged; these checks are not recovery certification.
+
 Reserved `entity/$deadletterqueue` permits no direct create/send or shadow-of-shadow.
 Messages keep sequence/reason, lose lifetime/session, never DLQ again. Reasons use
 `DeadLetterReason`/`DeadLetterErrorDescription`; direct drain omits Azure's forwarded
@@ -107,17 +134,19 @@ Owner heads/bindings, membership/rules, counters, retained records, indexes and
 recorded lock/TTL/schedule deadlines are unchanged. New settings govern subsequent
 admission and lock work; they do not rewrite history. This proof covers listed
 profiles, not orphan discovery or global message/rule health. No admin/wire setters,
-capacity changes, deletion, sessions or duplicate-mode changes are activated.
+capacity changes, deletion, sessions or mutable duplicate settings are activated.
 
 Existing commands retain byte-identical frozen durable V1 DTOs, including invalid
 numeric intent. Only these two update commands use frozen private V2 DTOs with
 canonical framing, bounded identifiers and retained parent-topic authority checks.
 V1 cannot represent them and explicitly refuses capture; V1-only readers refuse the
-V2 envelope. Current readers accept both versions, retaining invalid patch values
+V2 envelope. Current readers accept V1/V2/V3, retaining invalid patch values
 for domain refusal rather than silently repairing them. The one-MiB envelope limit
-still applies. Stored config/value, journal and checkpoint formats are unchanged;
-old-command checkpoint hashes remain identical. A downgrade cannot replay committed
-V2 proposals and must not rewrite or discard those records to bypass refusal.
+still applies. Nonlegacy topic creation alone uses frozen V3 with V1 creation
+authority rules (not V2 update-only restrictions); V1 capture refuses lossy conversion
+and V1 restore supplies explicit disabled/600,000ms defaults. Journal/checkpoint
+formats and legacy-command hashes remain identical. See the
+[topic-local storage fence and rollback requirements](compatibility.md#topic-integrity).
 
 ## Storage And Runtime Limits
 
@@ -128,7 +157,8 @@ CLI TLS/auth/storage/cluster error precedence is unchanged.
 
 Missing markers are stamped only if known `meta`/`records` are empty; any row
 (even empty-valued) refuses without marker mutation. Format 2 requires private
-live owner heads; format 1 refuses even empty. Value envelopes remain V1; no
+live owner heads; format 1 refuses even empty. Generic value envelopes remain V1;
+nonlegacy topic profiles use their canonical topic-specific V2 fence. No
 migration/foreign-keyspace proof/byte-invariance claim. See [opener](../crates/storage/src/durable.rs).
 
 Configurations/listed topic profiles require canonical live heads; DLQs share

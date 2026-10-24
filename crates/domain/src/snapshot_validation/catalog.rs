@@ -113,7 +113,8 @@ impl<'a> Catalog<'a> {
                 }
                 0x0E => {
                     let scope = entity_parts(key, row)?;
-                    let config = decode::<TopicConfig>(value, row)?;
+                    let config = codec::topic::decode(value)
+                        .map_err(|_| invalid_value(row, "topic value is not canonical"))?;
                     config
                         .validate()
                         .map_err(|_| invalid_value(row, "topic profile violates current policy"))?;

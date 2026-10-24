@@ -22,6 +22,7 @@ impl TopicConfigUpdate {
                 current.default_time_to_live_millis,
             ),
             max_message_bytes: self.max_message_bytes.unwrap_or(current.max_message_bytes),
+            ..current
         }
         .validate()
     }

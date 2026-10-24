@@ -33,6 +33,8 @@ use tempfile::TempDir;
 
 #[path = "committed_replay/fixtures.rs"]
 mod fixtures;
+#[path = "committed_replay/topic_duplicates.rs"]
+mod topic_duplicates;
 use fixtures::*;
 
 fn adoption_and_adapter(durable: bool) -> TestResult {
@@ -404,7 +406,7 @@ fn malformed_v2_committed_profiles(durable: bool) -> TestResult {
 fn malformed_proposals() -> Vec<Vec<u8>> {
     let original = noop(10).encode().unwrap();
     let mut version = original.clone();
-    version[7] = 3;
+    version[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
     let mut length = original.clone();
     length[11] ^= 1;
     let mut trailing = original.clone();
@@ -417,7 +419,7 @@ fn malformed_proposals() -> Vec<Vec<u8>> {
     tag[12] = 127;
     assert_eq!(
         DurableProposal::decode(&version),
-        Err(DurableProposalError::UnsupportedVersion(3))
+        Err(DurableProposalError::UnsupportedVersion(u32::MAX))
     );
     assert_eq!(
         DurableProposal::decode(&alias),

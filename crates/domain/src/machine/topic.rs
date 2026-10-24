@@ -30,9 +30,10 @@ impl<S: StateStore> StateMachine<S> {
         namespace: &crate::NamespaceName,
         topic: &EntityPath,
     ) -> Result<Option<TopicConfig>, BrokerError> {
-        let Some(config) = self.read::<TopicConfig>(&keys::topic_config(namespace, topic))? else {
+        let Some(raw) = self.store().get(&keys::topic_config(namespace, topic))? else {
             return Ok(None);
         };
+        let config = codec::topic::decode(&raw)?;
         if config.validate().is_err()
             || topic.is_subscription()
             || topic.is_dead_letter_queue()
@@ -189,7 +190,7 @@ impl<S: StateStore> StateMachine<S> {
             return Err(BrokerError::TopicTopologyCorrupt);
         }
         self.stage_new_owner(&command.namespace, &command.entity, Kind::Topic, batch)?;
-        batch.push_put(key, codec::encode(&config)?);
+        batch.push_put(key, codec::topic::encode(&config)?);
         Ok(CommandOutcome::TopicCreated)
     }
 
@@ -318,16 +319,26 @@ impl<S: StateStore> StateMachine<S> {
             (Vec::new(), Vec::new())
         };
 
+        let stored = self.stage_topic_duplicate_history(
+            command,
+            &topic,
+            inputs.iter().map(|input| input.message_id),
+            batch,
+        )?;
+
         let mut counters = self.load_counters(command)?;
         let mut sequences = Vec::with_capacity(inputs.len());
         let mut populated = vec![false; subscriptions.len()];
-        for (input, properties) in inputs.iter().zip(&properties) {
+        for ((input, properties), stored) in inputs.iter().zip(&properties).zip(stored) {
             let sequence = SequenceNumber::new(counters.next_sequence);
             counters.next_sequence = counters
                 .next_sequence
                 .checked_add(1)
                 .ok_or(BrokerError::SequenceNumberExhausted)?;
             sequences.push(sequence);
+            if !stored {
+                continue;
+            }
 
             let topic_lifetime = effective_time_to_live(
                 input.time_to_live_millis,

@@ -478,6 +478,9 @@ impl Kind {
             CommandKind::CreateQueue { config } => Self::CreateQueue {
                 config: Queue::capture(*config)?,
             },
+            CommandKind::CreateTopic { config } if !config.is_legacy_representable() => {
+                return Err(Error::UnsupportedCommandVersion(1));
+            }
             CommandKind::CreateTopic { config } => Self::CreateTopic {
                 config: Topic {
                     default_time_to_live_millis: config.default_time_to_live_millis,
@@ -654,6 +657,9 @@ impl Kind {
                 config: TopicConfig {
                     default_time_to_live_millis: config.default_time_to_live_millis,
                     max_message_bytes: native_size(config.max_message_bytes)?,
+                    requires_duplicate_detection: false,
+                    duplicate_detection_history_millis:
+                        crate::DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS,
                 },
             },
             Self::CreateSubscription { name, config } => CommandKind::CreateSubscription {

@@ -5,8 +5,9 @@ mod updates;
 pub use updates::{SubscriptionConfigUpdate, TopicConfigUpdate};
 
 use crate::{
-    DEFAULT_LOCK_DURATION_MILLIS, DEFAULT_MAX_DELIVERY_COUNT, DEFAULT_MAX_MESSAGE_BYTES,
-    MAX_LOCK_DURATION_MILLIS, QueueConfig,
+    DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS, DEFAULT_LOCK_DURATION_MILLIS,
+    DEFAULT_MAX_DELIVERY_COUNT, DEFAULT_MAX_MESSAGE_BYTES, MAX_DUPLICATE_DETECTION_HISTORY_MILLIS,
+    MAX_LOCK_DURATION_MILLIS, MIN_DUPLICATE_DETECTION_HISTORY_MILLIS, QueueConfig,
 };
 
 /// Maximum durable subscriptions on one Standard-tier topic.
@@ -17,6 +18,10 @@ pub struct TopicConfig {
     /// `None` means messages do not expire at the topic boundary.
     pub default_time_to_live_millis: Option<u64>,
     pub max_message_bytes: usize,
+    /// Creation-only: suppress repeated nonempty identifiers at topic acceptance.
+    pub requires_duplicate_detection: bool,
+    /// Creation-only history window; validated even when detection is disabled.
+    pub duplicate_detection_history_millis: u64,
 }
 
 impl Default for TopicConfig {
@@ -24,6 +29,8 @@ impl Default for TopicConfig {
         Self {
             default_time_to_live_millis: None,
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+            requires_duplicate_detection: false,
+            duplicate_detection_history_millis: DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS,
         }
     }
 }
@@ -36,7 +43,22 @@ impl TopicConfig {
         if self.max_message_bytes == 0 {
             return Err(TopicConfigError::MaxMessageBytesTooSmall);
         }
+        if self.duplicate_detection_history_millis < MIN_DUPLICATE_DETECTION_HISTORY_MILLIS {
+            return Err(TopicConfigError::DuplicateDetectionHistoryTooShort {
+                minimum_millis: MIN_DUPLICATE_DETECTION_HISTORY_MILLIS,
+            });
+        }
+        if self.duplicate_detection_history_millis > MAX_DUPLICATE_DETECTION_HISTORY_MILLIS {
+            return Err(TopicConfigError::DuplicateDetectionHistoryTooLong {
+                maximum_millis: MAX_DUPLICATE_DETECTION_HISTORY_MILLIS,
+            });
+        }
         Ok(self)
+    }
+
+    pub(crate) fn is_legacy_representable(self) -> bool {
+        !self.requires_duplicate_detection
+            && self.duplicate_detection_history_millis == DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS
     }
 }
 
@@ -100,6 +122,10 @@ pub enum TopicConfigError {
     TimeToLiveTooShort,
     #[error("maximum message size must be at least one byte")]
     MaxMessageBytesTooSmall,
+    #[error("duplicate detection history must be at least {minimum_millis} milliseconds")]
+    DuplicateDetectionHistoryTooShort { minimum_millis: u64 },
+    #[error("duplicate detection history exceeds {maximum_millis} milliseconds")]
+    DuplicateDetectionHistoryTooLong { maximum_millis: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]

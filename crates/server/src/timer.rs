@@ -2,8 +2,8 @@
 //!
 //! The state machine has no clock of its own, so nothing expires until something
 //! asks it to. This is that something: on every tick it walks the queues and
-//! topics, activates scheduled messages, and proposes the four queue-only
-//! expiry commands. Without it, scheduled messages remain hidden, locks are
+//! topics, activates scheduled messages, sweeps their duplicate history, and
+//! proposes queue lifecycle expiry commands. Without it, scheduled messages remain hidden, locks are
 //! held forever, messages outlive their time to live, and duplicate history
 //! grows forever.
 //!
@@ -169,6 +169,11 @@ impl<'a> TimerWorker<'a> {
             if let Err(error) = self.activate_scheduled_topic(&namespace, &entity, report) {
                 record_entity_failure(report, &error)?;
                 warn!(%namespace, %entity, %error, "topic activation failed; continuing sweep");
+            }
+            // Independent commands: corrupt due work must not pin history forever.
+            if let Err(error) = self.expire_duplicate_history(&namespace, &entity, report) {
+                record_entity_failure(report, &error)?;
+                warn!(%namespace, %entity, %error, "topic history expiry failed; continuing sweep");
             }
         }
         let page_saturated = report.work_remaining;

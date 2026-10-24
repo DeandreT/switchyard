@@ -313,7 +313,8 @@ async fn profiles_and_errors<P: StoreProvider>(provider: P) {
         topic.profile,
         EntityProfile::Topic(TopicConfig {
             default_time_to_live_millis: Some(600),
-            max_message_bytes: 5
+            max_message_bytes: 5,
+            ..TopicConfig::default()
         })
     );
     let child = service

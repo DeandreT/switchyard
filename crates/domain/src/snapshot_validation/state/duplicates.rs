@@ -167,13 +167,14 @@ fn require_owner(
         .owners
         .get(&(namespace.clone(), entity.clone()))
         .ok_or_else(|| inconsistent(row, "duplicate history has no catalog endpoint"))?;
-    if !matches!(&owner.value.profile, Profile::Queue(config) if config.requires_duplicate_detection)
-        || owner.value.shadow
-        || owner.value.subscription
-    {
+    let enabled = match &owner.value.profile {
+        Profile::Queue(config) => config.requires_duplicate_detection,
+        Profile::Topic(config) => config.requires_duplicate_detection,
+    };
+    if !enabled || owner.value.shadow || owner.value.subscription {
         return Err(inconsistent(
             row,
-            "duplicate history endpoint is not an enabled ordinary queue",
+            "duplicate history endpoint is not an enabled ordinary queue or topic",
         ));
     }
     if id.is_empty() {

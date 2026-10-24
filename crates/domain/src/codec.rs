@@ -1,6 +1,8 @@
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
+pub mod topic;
+
 /// Leading byte of every stored value.
 pub const VALUE_FORMAT_V1: u8 = 1;
 

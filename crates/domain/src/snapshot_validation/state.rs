@@ -309,11 +309,14 @@ impl<'a> Facts<'a> {
                 0x01 | 0x0E => {
                     let scope =
                         keys::catalog_entity_parts(key).ok_or_else(|| invalid_key(ordinal))?;
-                    let profile = if key[0] == 0x01 {
-                        Profile::Queue(decode(raw, ordinal)?)
-                    } else {
-                        Profile::Topic(decode(raw, ordinal)?)
-                    };
+                    let profile =
+                        if key[0] == 0x01 {
+                            Profile::Queue(decode(raw, ordinal)?)
+                        } else {
+                            Profile::Topic(codec::topic::decode(raw).map_err(|_| {
+                                invalid_value(ordinal, "topic value is not canonical")
+                            })?)
+                        };
                     let shadow = scope.1.is_dead_letter_queue();
                     let subscription = scope.1.is_subscription();
                     let owner_path = scope
