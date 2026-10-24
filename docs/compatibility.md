@@ -55,7 +55,39 @@ the whole page. Pages return at most 100 entries and consume at most 256 raw row
 plus one lookahead, in queue/topic/subscription key order. Namespace/kind-bound
 opaque cursors can continue an empty page through internal rows. Callers must
 exclude all writers during each complete read; there is no cross-page snapshot,
-runtime-statistics estimate, global health proof or network administration API.
+runtime-statistics estimate or global health proof.
+
+The typed `admin-api::EntityService` binds a canonical namespace and the server's
+`AdminService` adapter uses the existing bounded broker owner. Create/Get/List
+support queues, topics and explicit subscriptions; subscription addresses carry
+parent and name separately. Foreign namespaces, reserved/malformed addresses and
+wrong-scope cursors refuse before dispatch, even after the owner stops. Each Get
+or complete bounded page occupies one owner turn without host or persisted Clock
+access, writes or a separate store writer. Raw store users must still exclude
+writes while the owner is active. Continuations do not provide cross-page snapshots.
+
+Create uses existing owner-stamped commands, without existence preflights or early
+domain configuration validation, preserving clock/duplicate/domain error priority.
+Success requires the exact created outcome, including the subscription path.
+Supported omitted settings select domain defaults (unlimited TTL, 60 s locks,
+10 deliveries, 256 KiB queue/topic message size); explicit zero limits refuse.
+Duplicate-history zero retains its 600000 ms default. Returned profiles are
+effective domain settings, not usage estimates. Placement, entity capacity and
+usage are absent and requests for them refuse. Message size is not entity capacity;
+subscriptions inherit it from their topic. Topic sessions/duplicates and independent
+subscription message limits remain unsupported. Errors preserve typed catalog,
+domain, storage, clock, unexpected-outcome and stopped-owner information.
+
+The channel remains bounded to 1024 requests with asynchronous admission
+backpressure. Cancelling an unadmitted request does not enqueue it; dropping a
+reply after admission does not undo Create. Stop remains a queued request: work
+ahead completes, work behind may observe a stopped owner. No stronger drain or
+shutdown guarantee is implied. The additive protobuf profile fields preserve
+existing numbers and legacy duplicate-history zero semantics; presence on scalar
+profile/availability fields distinguishes omission from explicit values. Its
+contract does not activate a network administration API: HTTP/OpenAPI, generated
+gRPC handlers/listeners, startup wiring, authentication, CLI, Update/Delete, rules,
+placement/capacity mutation and runtime counters remain outside this surface.
 
 Selected operational queue-profile reads validate after decode/owner proof,
 including backing queues/DLQs; invalid limits are corruption. Unread rows/raw

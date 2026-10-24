@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+mod admin;
 mod broker;
 mod clock;
 mod proposer;
@@ -20,6 +21,7 @@ use storage::{FjallStore, MemoryStore, StorageError};
 use thiserror::Error;
 
 pub use crate::{
+    admin::{AdminError, AdminService},
     broker::{Broker, BrokerHandle, SubmitError},
     clock::{Clock, ManualClock, SystemClock},
     proposer::{DEFAULT_MAX_CLOCK_REGRESSION_MILLIS, LocalProposer, ProposeError},

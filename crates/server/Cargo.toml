@@ -11,6 +11,7 @@ name = "switchyard"
 path = "src/main.rs"
 
 [dependencies]
+admin-api.workspace = true
 auth.workspace = true
 clap.workspace = true
 cluster.workspace = true

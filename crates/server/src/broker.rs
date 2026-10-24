@@ -21,13 +21,17 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use domain::{CommandKind, CommandOutcome, EntityBinding, EntityPath, NamespaceName, Timestamp};
+use admin_api::{EntityTarget, ServiceError};
+use domain::{
+    AdminCatalogCursor, AdminCatalogEntry, AdminCatalogKind, AdminCatalogPage, CommandKind,
+    CommandOutcome, EntityBinding, EntityPath, NamespaceName, Timestamp,
+};
 use storage::StateStore;
 use thiserror::Error;
 use tokio::sync::Notify;
 use tracing::debug;
 
-use crate::{Clock, LocalProposer, ProposeError};
+use crate::{AdminError, Clock, LocalProposer, ProposeError};
 
 /// Commands that may be waiting ahead of a caller's own.
 ///
@@ -37,6 +41,18 @@ use crate::{Clock, LocalProposer, ProposeError};
 const COMMAND_QUEUE_DEPTH: usize = 1_024;
 
 enum Request {
+    AdminGet {
+        namespace: NamespaceName,
+        target: EntityTarget,
+        reply: flume::Sender<Result<Option<AdminCatalogEntry>, AdminError>>,
+    },
+    AdminList {
+        namespace: NamespaceName,
+        kind: AdminCatalogKind,
+        after: Option<AdminCatalogCursor>,
+        limit: usize,
+        reply: flume::Sender<Result<AdminCatalogPage, AdminError>>,
+    },
     Bind {
         namespace: NamespaceName,
         entity: EntityPath,
@@ -175,6 +191,50 @@ pub struct BrokerHandle {
 }
 
 impl BrokerHandle {
+    pub(crate) async fn admin_get(
+        &self,
+        namespace: NamespaceName,
+        target: EntityTarget,
+    ) -> Result<Option<AdminCatalogEntry>, AdminError> {
+        let (reply, result) = flume::bounded(1);
+        self.requests
+            .send_async(Request::AdminGet {
+                namespace,
+                target,
+                reply,
+            })
+            .await
+            .map_err(|_| ServiceError::Backend(SubmitError::BrokerStopped))?;
+        result
+            .recv_async()
+            .await
+            .map_err(|_| ServiceError::Backend(SubmitError::BrokerStopped))?
+    }
+
+    pub(crate) async fn admin_list(
+        &self,
+        namespace: NamespaceName,
+        kind: AdminCatalogKind,
+        after: Option<AdminCatalogCursor>,
+        limit: usize,
+    ) -> Result<AdminCatalogPage, AdminError> {
+        let (reply, result) = flume::bounded(1);
+        self.requests
+            .send_async(Request::AdminList {
+                namespace,
+                kind,
+                after,
+                limit,
+                reply,
+            })
+            .await
+            .map_err(|_| ServiceError::Backend(SubmitError::BrokerStopped))?;
+        result
+            .recv_async()
+            .await
+            .map_err(|_| ServiceError::Backend(SubmitError::BrokerStopped))?
+    }
+
     /// Applies a command, blocking the calling thread until it commits.
     ///
     /// For callers with a thread of their own, such as the timer worker. An
@@ -388,6 +448,46 @@ impl Broker {
             .spawn(move || {
                 while let Ok(request) = incoming.recv() {
                     match request {
+                        Request::AdminGet {
+                            namespace,
+                            target,
+                            reply,
+                        } => {
+                            // Both queue/topic probes are inside this one owner
+                            // turn; no queued mutation can run between them.
+                            let machine = proposer.machine();
+                            let entry = (|| match target {
+                                EntityTarget::Entity(path) => {
+                                    if let Some(queue) = machine.admin_queue(&namespace, &path)? {
+                                        Ok(Some(AdminCatalogEntry::Queue(queue)))
+                                    } else {
+                                        machine
+                                            .admin_topic(&namespace, &path)
+                                            .map(|topic| topic.map(AdminCatalogEntry::Topic))
+                                    }
+                                }
+                                EntityTarget::Subscription { topic, name, .. } => machine
+                                    .admin_subscription(&namespace, &topic, &name)
+                                    .map(|subscription| {
+                                        subscription.map(AdminCatalogEntry::Subscription)
+                                    }),
+                            })()
+                            .map_err(ServiceError::Catalog);
+                            let _ = reply.send(entry);
+                        }
+                        Request::AdminList {
+                            namespace,
+                            kind,
+                            after,
+                            limit,
+                            reply,
+                        } => {
+                            let page = proposer
+                                .machine()
+                                .admin_catalog_page(&namespace, kind, after.as_ref(), limit)
+                                .map_err(ServiceError::Catalog);
+                            let _ = reply.send(page);
+                        }
                         Request::Bind {
                             namespace,
                             entity,
@@ -844,5 +944,223 @@ mod tests {
             }
         );
         Ok(())
+    }
+
+    struct PausedClock {
+        entered: std::sync::mpsc::Sender<()>,
+        resume: Mutex<std::sync::mpsc::Receiver<()>>,
+        first: std::sync::atomic::AtomicBool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Clock for PausedClock {
+        fn now(&self) -> Timestamp {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.first.swap(false, Ordering::SeqCst) {
+                self.entered.send(()).expect("the test waits for admission");
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .expect("the test releases the owner");
+            }
+            Timestamp::from_millis(1_000)
+        }
+    }
+
+    fn paused_broker<S: StateStore>(
+        store: S,
+    ) -> (
+        Broker,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let broker = Broker::spawn(LocalProposer::new(
+            StateMachine::new(store),
+            PausedClock {
+                entered,
+                resume: Mutex::new(paused),
+                first: std::sync::atomic::AtomicBool::new(true),
+                calls: calls.clone(),
+            },
+        ));
+        (broker, waiting, resume, calls)
+    }
+
+    fn enqueue_queue(
+        handle: &BrokerHandle,
+        entity: &str,
+    ) -> flume::Receiver<Result<CommandOutcome, ProposeError>> {
+        let (reply, result) = flume::bounded(1);
+        handle
+            .requests
+            .send(Request::Apply {
+                namespace: names().0,
+                entity: EntityPath::new(entity).unwrap(),
+                kind: Box::new(CommandKind::CreateQueue {
+                    config: QueueConfig::default(),
+                }),
+                reply,
+            })
+            .unwrap();
+        result
+    }
+
+    async fn full_channel_cancellation<P: testkit::StoreProvider>(provider: P) {
+        use admin_api::{
+            CreateEntityRequest, EntityAddress, EntityKind, EntityOptions, GetEntityRequest,
+        };
+        use std::{
+            future::Future,
+            sync::atomic::Ordering,
+            task::{Context, Poll, Waker},
+        };
+
+        let store = provider.open().unwrap();
+        let (broker, entered, resume, calls) = paused_broker(store.clone());
+        let handle = broker.handle();
+        let first = enqueue_queue(&handle, "orders");
+        entered
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        for _ in 0..COMMAND_QUEUE_DEPTH {
+            let (reply, _cancelled) = flume::bounded(1);
+            handle
+                .requests
+                .try_send(Request::Bind {
+                    namespace: names().0,
+                    entity: names().1,
+                    reply,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            handle.requests.len(),
+            1_024,
+            "the production queue bound is unchanged"
+        );
+        let service = crate::AdminService::new(names().0, handle.clone());
+        let mut pending = Box::pin(service.create(CreateEntityRequest {
+            namespace: "tenant".into(),
+            address: EntityAddress::Entity {
+                path: "unadmitted".into(),
+            },
+            kind: EntityKind::Queue,
+            options: EntityOptions::default(),
+        }));
+        let waker = Waker::noop();
+        assert!(matches!(
+            pending.as_mut().poll(&mut Context::from_waker(waker)),
+            Poll::Pending
+        ));
+        assert_eq!(handle.requests.len(), COMMAND_QUEUE_DEPTH);
+        drop(pending);
+        resume.send(()).unwrap();
+        assert_eq!(first.recv().unwrap().unwrap(), CommandOutcome::QueueCreated);
+        assert!(matches!(
+            service
+                .get(GetEntityRequest {
+                    namespace: "tenant".into(),
+                    address: EntityAddress::Entity {
+                        path: "unadmitted".into()
+                    },
+                })
+                .await,
+            Err(ServiceError::NotFound { .. })
+        ));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "cancelled unadmitted Create never stamped"
+        );
+        let before = store.snapshot().unwrap();
+        drop(service);
+        drop(handle);
+        drop(broker);
+        drop(store);
+        assert_eq!(provider.open().unwrap().snapshot().unwrap(), before);
+    }
+
+    fn queued_stop<P: testkit::StoreProvider>(provider: P) {
+        let store = provider.open().unwrap();
+        let (broker, entered, resume, _) = paused_broker(store.clone());
+        let handle = broker.handle();
+        let first = enqueue_queue(&handle, "first");
+        entered
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        let ahead = enqueue_queue(&handle, "ahead");
+        handle.requests.send(Request::Stop).unwrap();
+        let behind = enqueue_queue(&handle, "behind");
+        resume.send(()).unwrap();
+        let timeout = std::time::Duration::from_secs(30);
+        assert_eq!(
+            first.recv_timeout(timeout).unwrap().unwrap(),
+            CommandOutcome::QueueCreated
+        );
+        assert_eq!(
+            ahead.recv_timeout(timeout).unwrap().unwrap(),
+            CommandOutcome::QueueCreated
+        );
+        // Join the owner before testing admission through a retained handle.
+        drop(broker);
+        assert_eq!(
+            handle.last_applied_blocking(),
+            Err(SubmitError::BrokerStopped)
+        );
+        // Flume retains buffered requests until every channel handle drops.
+        drop(handle);
+        assert!(matches!(
+            behind.recv_timeout(timeout),
+            Err(flume::RecvTimeoutError::Disconnected)
+        ));
+        let machine = StateMachine::new(store.clone());
+        assert!(
+            machine
+                .admin_queue(&names().0, &EntityPath::new("first").unwrap())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            machine
+                .admin_queue(&names().0, &EntityPath::new("ahead").unwrap())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            machine
+                .admin_queue(&names().0, &EntityPath::new("behind").unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let before = store.snapshot().unwrap();
+        drop(machine);
+        drop(store);
+        assert_eq!(provider.open().unwrap().snapshot().unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn memory_full_channel_cancellation_does_not_admit_create() {
+        full_channel_cancellation(testkit::MemoryProvider::new()).await;
+    }
+
+    #[tokio::test]
+    async fn fjall_full_channel_cancellation_does_not_admit_create() {
+        full_channel_cancellation(testkit::DurableProvider::temporary().unwrap()).await;
+    }
+
+    #[test]
+    fn memory_queued_stop_preserves_only_work_ahead() {
+        queued_stop(testkit::MemoryProvider::new());
+    }
+
+    #[test]
+    fn fjall_queued_stop_preserves_only_work_ahead() {
+        queued_stop(testkit::DurableProvider::temporary().unwrap());
     }
 }
