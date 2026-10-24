@@ -80,6 +80,10 @@ impl ConnectionAuthorization {
         self.authorization_timeout
     }
 
+    pub(crate) fn audience_host(&self) -> &str {
+        &self.audience_host
+    }
+
     pub(crate) async fn has_valid_grant(&self) -> bool {
         let now = epoch_seconds();
         self.grants

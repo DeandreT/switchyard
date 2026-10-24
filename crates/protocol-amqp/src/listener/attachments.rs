@@ -445,8 +445,12 @@ async fn run_entity_handoff<B: Broker>(
         Some(admitted) => admitted,
         None => &mut detached,
     };
-    let resolved = resolve_entity(address, attach.role.clone())
-        .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()));
+    let resolved = crate::normalize_link_address(
+        address,
+        authorization.map(|authorization| authorization.audience_host()),
+    )
+    .and_then(|address| resolve_entity(&address, attach.role.clone()))
+    .map_err(|error| error_for(AmqpError::InvalidField, error.to_string()));
     // Capture attachment ordering before authorization, grant, or native work
     // can await. Filling in a hold later must not mint a newer ownership claim.
     let claim = if attach.role == Role::Receiver && !session.is_ended() {

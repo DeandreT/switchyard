@@ -676,7 +676,12 @@ pub(crate) async fn serve_control_attachment<B: Broker>(
         }
 
         let address = super::address_for_role(&attach.role, &source, &target);
-        let Some(entity) = management_entity(address) else {
+        let normalized = crate::normalize_link_address(address, context.authorization.map(|authorization| authorization.audience_host()));
+        let entity = match normalized {
+            Ok(normalized) => management_entity(&normalized),
+            Err(error) => Some(Err(error)),
+        };
+        let Some(entity) = entity else {
             return Err(EngineError::InvalidState("control admission requires a service address".into()));
         };
         let plan = match entity {

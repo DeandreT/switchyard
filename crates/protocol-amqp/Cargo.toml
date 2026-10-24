@@ -11,6 +11,7 @@ amqp.workspace = true
 auth.workspace = true
 domain.workspace = true
 futures-util.workspace = true
+percent-encoding.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 serde_amqp.workspace = true
