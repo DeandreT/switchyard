@@ -15,9 +15,11 @@ service NamespaceService {
 }
 
 service EntityService {
+  // Library contract only; no gRPC/HTTP listener or runtime activation exists.
   rpc CreateEntity(CreateEntityRequest) returns (Entity);
   rpc GetEntity(GetEntityRequest) returns (Entity);
   rpc ListEntities(ListEntitiesRequest) returns (ListEntitiesResponse);
+  // Reserved contract: deletion is not implemented by the local service.
   rpc DeleteEntity(DeleteEntityRequest) returns (Operation);
 }
 
@@ -94,27 +96,58 @@ message CreateEntityRequest {
   string namespace = 1;
   string path = 2;
   EntityKind kind = 3;
-  string placement_group_id = 4;
-  uint64 max_size_bytes = 5;
-  uint64 default_ttl_millis = 6;
-  uint64 lock_duration_millis = 7;
-  uint32 max_delivery_count = 8;
-  bool requires_session = 9;
-  bool requires_duplicate_detection = 10;
+  // Presence is wire-compatible at the existing field numbers. Absent supported
+  // fields select domain defaults; explicitly encoded zero limits are invalid.
+  // Placement/capacity are unavailable: any presence, even empty/zero, refuses.
+  optional string placement_group_id = 4;
+  optional uint64 max_size_bytes = 5;
+  // Absent means unlimited, not zero. Applies to all supported kinds.
+  optional uint64 default_ttl_millis = 6;
+  // Queue/subscription only.
+  optional uint64 lock_duration_millis = 7;
+  optional uint32 max_delivery_count = 8;
+  // Queue only; presence on a topic/subscription is unsupported, even false.
+  optional bool requires_session = 9;
+  optional bool requires_duplicate_detection = 10;
   // Zero selects the 600000 ms (10 minute) default. Nonzero values must be
   // between 20000 ms and 604800000 ms, inclusive.
   uint64 duplicate_detection_history_millis = 11;
+  // Queue/topic only. Subscription message size is inherited from its parent.
+  optional uint64 max_message_bytes = 12;
+  // Subscription addresses use these components, with path empty. Queue/topic
+  // addresses use path with both components absent. Kind must match the address.
+  optional string subscription_topic = 13;
+  optional string subscription_name = 14;
+  // Usage is unavailable; any presence is unsupported, even zero.
+  optional uint64 used_logical_bytes = 15;
+  // Duplicate history retains legacy zero-means-default, including on the wire.
+  // For topic/subscription, legacy zero is omitted when adapting this request;
+  // nonzero duplicate history is unsupported.
 }
 
 message GetEntityRequest {
   string namespace = 1;
   string path = 2;
+  optional string subscription_topic = 3;
+  optional string subscription_name = 4;
+}
+
+enum EntitySelection {
+  ENTITY_SELECTION_ALL = 0;
+  ENTITY_SELECTION_QUEUES = 1;
+  ENTITY_SELECTION_TOPICS = 2;
+  ENTITY_SELECTION_SUBSCRIPTIONS = 3;
 }
 
 message ListEntitiesRequest {
   string namespace = 1;
-  string page_token = 2;
+  // Legacy textual slot retained; no textual token adapter is implemented.
+  string page_token = 2 [deprecated = true];
+  // Required range 1..100, not zero-means-default.
   uint32 page_size = 3;
+  EntitySelection selection = 4;
+  // Opaque versioned local cursor; namespace and selection must match.
+  optional bytes continuation = 5;
 }
 
 message DeleteEntityRequest {
@@ -126,17 +159,31 @@ message Entity {
   string namespace = 1;
   string path = 2;
   EntityKind kind = 3;
-  string placement_group_id = 4;
-  uint64 max_size_bytes = 5;
-  uint64 used_logical_bytes = 6;
+  // Unavailable fields are absent, never fabricated zero/empty values.
+  optional string placement_group_id = 4;
+  optional uint64 max_size_bytes = 5;
+  optional uint64 used_logical_bytes = 6;
   bool requires_duplicate_detection = 7;
   // The entity's concrete effective history window, including the default.
   uint64 duplicate_detection_history_millis = 8;
+  // Effective profile: TTL absent means unlimited; receive limits are absent
+  // on topics; per-message limit is absent on subscriptions (parent-inherited).
+  optional uint64 default_ttl_millis = 9;
+  optional uint64 lock_duration_millis = 10;
+  optional uint32 max_delivery_count = 11;
+  optional uint64 max_message_bytes = 12;
+  optional bool requires_session = 13;
+  optional string subscription_topic = 14;
+  optional string subscription_name = 15;
+  // Legacy duplicate fields 7/8 describe queues only; other kinds do not gain
+  // duplicate detection. Returned path may exceed the ordinary top-level bound.
 }
 
 message ListEntitiesResponse {
   repeated Entity entities = 1;
-  string next_page_token = 2;
+  string next_page_token = 2 [deprecated = true];
+  // Can accompany an empty entity list when internal rows consume the budget.
+  optional bytes continuation = 3;
 }
 
 message StartBackupRequest {
