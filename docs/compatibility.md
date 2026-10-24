@@ -137,8 +137,13 @@ the attach response.
 
 Commands commit one batch; domain refusals preserve messages, counters, history
 and Clock. Indexed apply, journal and replay have separate checkpoint/retire/reopen
-rules, not panic recovery or quorum guarantees. Snapshot format is structural,
-not complete state/backend-provenance/authenticity proof or capture/install.
+rules, not panic recovery or quorum guarantees. Snapshot format is structural;
+opt-in offline capture validates and encodes one exact domain/F0/F1 image without
+source writes. Post-read caps precede semantic decoding, but do not bound backend
+snapshot allocation. Callers must exclude every writer and raw/keyspace handle; the
+API does not enforce exclusion or enable online capture. Fjall provenance stays
+typed beside the result, never in the unchanged SWSS frame. Neither capture nor
+decoding proves authenticity, historical authority or installability.
 Token-exhausted receive, deferred receive and session acceptance discard every
 staged effect, including earlier TTL routing in the same command. Indexed refusals
 may initialize their private owner and advance only the `0xF1` checkpoint; domain

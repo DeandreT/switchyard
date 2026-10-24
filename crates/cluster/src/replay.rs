@@ -77,7 +77,7 @@ impl<S: StateStore> CommittedReplay<S> {
     pub fn open(store: S) -> Result<Self, ReplayError> {
         let shared = SharedStore(Arc::new(store));
         let journal = Journal::open(shared.clone())?;
-        let mut writer = IndexedWriter::open(shared)?;
+        let writer = IndexedWriter::open(shared)?;
         let applied = writer.applied_index()?;
         let committed = journal.committed_index()?;
         let last_appended = journal.last_appended_index()?;
@@ -88,9 +88,7 @@ impl<S: StateStore> CommittedReplay<S> {
         if applied != 0 {
             let proposal =
                 latest.ok_or_else(|| corrupt("the latest applied proposal is missing"))?;
-            if writer.apply(applied, &proposal)? != IndexedApplyOutcome::AlreadyApplied {
-                return Err(corrupt("the latest checkpoint was not an exact duplicate"));
-            }
+            writer.verify_latest_applied(&proposal)?;
         }
         Ok(Self {
             journal,
@@ -115,6 +113,13 @@ impl<S: StateStore> CommittedReplay<S> {
     pub fn last_appended_index(&self) -> Result<u64, ReplayError> {
         self.require_usable()?;
         Ok(self.last_appended)
+    }
+
+    /// Read-only indexed proposal identity from the current applied checkpoint.
+    /// This is not the journal envelope checksum or a snapshot frame digest.
+    pub fn latest_applied_digest(&self) -> Result<Option<[u8; 32]>, ReplayError> {
+        self.require_usable()?;
+        Ok(self.writer.latest_applied_digest()?)
     }
 
     /// Applies up to 64 next originals with their recorded time and authority.

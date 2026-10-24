@@ -164,6 +164,14 @@ impl SnapshotView<'_> {
 #[derive(Debug)]
 pub struct SnapshotFormat;
 
+/// Internal preflight facts; these do not certify the records' domain meaning.
+#[derive(Debug)]
+pub(crate) struct FrameSize {
+    count: u64,
+    section_length: u64,
+    encoded_bytes: usize,
+}
+
 impl SnapshotFormat {
     /// Preflights the whole frame before one fallible output reservation.
     pub fn encode(
@@ -172,45 +180,11 @@ impl SnapshotFormat {
         limits: SnapshotLimits,
     ) -> Result<Vec<u8>, SnapshotFormatError> {
         manifest.validate()?;
-        let count = wire_length(records.len())?;
-        check_limit(SnapshotLimit::Records, count, limits.max_records)?;
-        let mut section_bytes = 0;
-        let mut previous: Option<&[u8]> = None;
-        for (key, value) in records {
-            check_limit(
-                SnapshotLimit::KeyBytes,
-                wire_length(key.len())?,
-                limits.max_key_bytes,
-            )?;
-            check_limit(
-                SnapshotLimit::ValueBytes,
-                wire_length(value.len())?,
-                limits.max_value_bytes,
-            )?;
-            if previous.is_some_and(|previous| previous >= key.as_slice()) {
-                return Err(SnapshotFormatError::NonCanonicalRecords);
-            }
-            section_bytes = checked_add(section_bytes, RECORD_LENGTH_BYTES)?;
-            section_bytes = checked_add(section_bytes, key.len())?;
-            section_bytes = checked_add(section_bytes, value.len())?;
-            previous = Some(key);
-        }
-        let section_length = wire_length(section_bytes)?;
-        let identity_bytes = if manifest.latest_applied_digest.is_some() {
-            32
-        } else {
-            0
-        };
-        let header_bytes = checked_add(HEADER_WITHOUT_IDENTITY_BYTES, identity_bytes)?;
-        let encoded_bytes = checked_add(
-            checked_add(header_bytes, section_bytes)?,
-            SNAPSHOT_FRAME_DIGEST_BYTES,
-        )?;
-        check_limit(
-            SnapshotLimit::EncodedBytes,
-            wire_length(encoded_bytes)?,
-            limits.max_encoded_bytes,
-        )?;
+        let FrameSize {
+            count,
+            section_length,
+            encoded_bytes,
+        } = Self::preflight(manifest.latest_applied_digest.is_some(), records, limits)?;
 
         let mut output = Vec::new();
         output
@@ -240,6 +214,58 @@ impl SnapshotFormat {
         let digest = frame_digest(&output);
         output.extend_from_slice(&digest);
         Ok(output)
+    }
+
+    /// The encoder's exact record checks and size arithmetic, without allocation.
+    /// Identity presence selects only the header width, not verified ownership.
+    /// Capture may supply an untrusted structural hint before semantic validation;
+    /// encode validates the manifest and repeats these checks with its identity.
+    pub(crate) fn preflight(
+        has_applied_identity: bool,
+        records: &[(Key, Value)],
+        limits: SnapshotLimits,
+    ) -> Result<FrameSize, SnapshotFormatError> {
+        let count = wire_length(records.len())?;
+        check_limit(SnapshotLimit::Records, count, limits.max_records)?;
+        let mut section_bytes = 0;
+        let mut previous: Option<&[u8]> = None;
+        for (key, value) in records {
+            check_limit(
+                SnapshotLimit::KeyBytes,
+                wire_length(key.len())?,
+                limits.max_key_bytes,
+            )?;
+            check_limit(
+                SnapshotLimit::ValueBytes,
+                wire_length(value.len())?,
+                limits.max_value_bytes,
+            )?;
+            if previous.is_some_and(|previous| previous >= key.as_slice()) {
+                return Err(SnapshotFormatError::NonCanonicalRecords);
+            }
+            section_bytes = checked_add(section_bytes, RECORD_LENGTH_BYTES)?;
+            section_bytes = checked_add(section_bytes, key.len())?;
+            section_bytes = checked_add(section_bytes, value.len())?;
+            previous = Some(key);
+        }
+        let section_length = wire_length(section_bytes)?;
+        let identity_bytes = if has_applied_identity { 32 } else { 0 };
+        let header_bytes = checked_add(HEADER_WITHOUT_IDENTITY_BYTES, identity_bytes)?;
+        let encoded_bytes = checked_add(
+            checked_add(header_bytes, section_bytes)?,
+            SNAPSHOT_FRAME_DIGEST_BYTES,
+        )?;
+        check_limit(
+            SnapshotLimit::EncodedBytes,
+            wire_length(encoded_bytes)?,
+            limits.max_encoded_bytes,
+        )?;
+
+        Ok(FrameSize {
+            count,
+            section_length,
+            encoded_bytes,
+        })
     }
 
     /// Validates the complete capped input without allocating owned records.
@@ -430,4 +456,193 @@ fn frame_digest(bytes: &[u8]) -> [u8; 32] {
 
 fn malformed(detail: &'static str) -> SnapshotFormatError {
     SnapshotFormatError::Malformed { detail }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UNBOUNDED: SnapshotLimits = SnapshotLimits {
+        max_encoded_bytes: usize::MAX,
+        max_records: usize::MAX,
+        max_key_bytes: usize::MAX,
+        max_value_bytes: usize::MAX,
+    };
+
+    #[test]
+    fn shared_preflight_preserves_exact_identity_and_record_boundaries() {
+        let records = vec![(vec![1], vec![0, 255]), (vec![2, 3], vec![])];
+        for identity in [None, Some([0x42; 32])] {
+            let applied = u64::from(identity.is_some());
+            let manifest =
+                SnapshotManifest::new(SNAPSHOT_LAYOUT_VERSION, applied, 1, 1, identity).unwrap();
+            let size = SnapshotFormat::preflight(identity.is_some(), &records, UNBOUNDED).unwrap();
+            assert_eq!(size.count, 2);
+            assert_eq!(size.section_length, 37);
+            assert_eq!(
+                size.encoded_bytes,
+                if identity.is_some() { 154 } else { 122 }
+            );
+            let exact = SnapshotLimits {
+                max_encoded_bytes: size.encoded_bytes,
+                max_records: 2,
+                max_key_bytes: 2,
+                max_value_bytes: 2,
+            };
+            assert_eq!(
+                SnapshotFormat::preflight(identity.is_some(), &records, exact)
+                    .unwrap()
+                    .encoded_bytes,
+                size.encoded_bytes
+            );
+            let encoded = SnapshotFormat::encode(&manifest, &records, exact).unwrap();
+            assert_eq!(encoded.len(), size.encoded_bytes);
+            assert_eq!(
+                SnapshotFormat::encode(&manifest, &records, UNBOUNDED).unwrap(),
+                encoded
+            );
+            for kind in [
+                SnapshotLimit::Records,
+                SnapshotLimit::KeyBytes,
+                SnapshotLimit::ValueBytes,
+                SnapshotLimit::EncodedBytes,
+            ] {
+                let mut smaller = exact;
+                let cap = match kind {
+                    SnapshotLimit::Records => &mut smaller.max_records,
+                    SnapshotLimit::KeyBytes => &mut smaller.max_key_bytes,
+                    SnapshotLimit::ValueBytes => &mut smaller.max_value_bytes,
+                    SnapshotLimit::EncodedBytes => &mut smaller.max_encoded_bytes,
+                };
+                let requested = *cap;
+                *cap -= 1;
+                let expected = SnapshotFormatError::LimitExceeded {
+                    kind,
+                    requested: u64::try_from(requested).unwrap(),
+                    maximum: requested - 1,
+                };
+                assert_eq!(
+                    SnapshotFormat::preflight(identity.is_some(), &records, smaller).unwrap_err(),
+                    expected
+                );
+                assert_eq!(
+                    SnapshotFormat::encode(&manifest, &records, smaller).unwrap_err(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_preflight_keeps_empty_frame_and_validation_priority() {
+        let manifest = SnapshotManifest::new(SNAPSHOT_LAYOUT_VERSION, 0, 0, 0, None).unwrap();
+        let exact = SnapshotLimits {
+            max_encoded_bytes: 85,
+            max_records: 0,
+            max_key_bytes: 0,
+            max_value_bytes: 0,
+        };
+        assert_eq!(
+            SnapshotFormat::preflight(false, &[], exact)
+                .unwrap()
+                .encoded_bytes,
+            85
+        );
+        assert_eq!(
+            SnapshotFormat::encode(&manifest, &[], exact).unwrap().len(),
+            85
+        );
+        let smaller = SnapshotLimits {
+            max_encoded_bytes: 84,
+            ..exact
+        };
+        let expected = SnapshotFormatError::LimitExceeded {
+            kind: SnapshotLimit::EncodedBytes,
+            requested: 85,
+            maximum: 84,
+        };
+        assert_eq!(
+            SnapshotFormat::preflight(false, &[], smaller).unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            SnapshotFormat::encode(&manifest, &[], smaller).unwrap_err(),
+            expected
+        );
+
+        let duplicates = vec![(vec![1], vec![]), (vec![1], vec![])];
+        assert_eq!(
+            SnapshotFormat::preflight(false, &duplicates, UNBOUNDED).unwrap_err(),
+            SnapshotFormatError::NonCanonicalRecords
+        );
+        assert_eq!(
+            SnapshotFormat::encode(&manifest, &duplicates, UNBOUNDED).unwrap_err(),
+            SnapshotFormatError::NonCanonicalRecords
+        );
+        let capped = SnapshotLimits {
+            max_records: 1,
+            ..UNBOUNDED
+        };
+        let expected = SnapshotFormatError::LimitExceeded {
+            kind: SnapshotLimit::Records,
+            requested: 2,
+            maximum: 1,
+        };
+        assert_eq!(
+            SnapshotFormat::preflight(false, &duplicates, capped).unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            SnapshotFormat::encode(&manifest, &duplicates, capped).unwrap_err(),
+            expected
+        );
+    }
+
+    #[test]
+    fn encode_validates_manifest_before_shared_record_preflight() {
+        let valid = SnapshotManifest::new(SNAPSHOT_LAYOUT_VERSION, 0, 0, 0, None).unwrap();
+        let records = vec![(vec![1], vec![])];
+        let capped = SnapshotLimits {
+            max_records: 0,
+            ..UNBOUNDED
+        };
+        for (manifest, expected) in [
+            (
+                SnapshotManifest {
+                    layout_version: u32::MAX,
+                    ..valid
+                },
+                SnapshotFormatError::UnsupportedLayoutVersion {
+                    found: u32::MAX,
+                    expected: SNAPSHOT_LAYOUT_VERSION,
+                },
+            ),
+            (
+                SnapshotManifest {
+                    committed: 1,
+                    ..valid
+                },
+                SnapshotFormatError::InvalidFrontiers {
+                    applied: 0,
+                    committed: 1,
+                    last_appended: 0,
+                },
+            ),
+            (
+                SnapshotManifest {
+                    latest_applied_digest: Some([0; 32]),
+                    ..valid
+                },
+                SnapshotFormatError::InvalidLatestIdentity {
+                    applied: 0,
+                    has_digest: true,
+                },
+            ),
+        ] {
+            assert_eq!(
+                SnapshotFormat::encode(&manifest, &records, capped).unwrap_err(),
+                expected
+            );
+        }
+    }
 }

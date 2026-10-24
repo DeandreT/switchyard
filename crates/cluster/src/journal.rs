@@ -309,6 +309,17 @@ fn corrupt(detail: &'static str) -> JournalError {
     JournalError::Corrupt { detail }
 }
 
+/// Capture covers the entire F0 tag, unlike ordinary journal open, which owns
+/// only its exact prefix. Canonical keys and envelopes inside that prefix are
+/// still checked by `Journal::open`; foreign F0 namespaces cannot disappear
+/// behind its prefix scan. This deliberately does not change open's policy.
+pub(crate) fn validate_snapshot_namespace(key: &[u8]) -> Result<(), JournalError> {
+    if key.first() == Some(&0xF0) && !key.starts_with(PREFIX) {
+        return Err(corrupt("snapshot contains an unowned F0 namespace"));
+    }
+    Ok(())
+}
+
 fn next_index(last: u64) -> Result<u64, JournalError> {
     last.checked_add(1).ok_or(JournalError::IndexExhausted)
 }
@@ -421,6 +432,30 @@ fn decode_frontier(value: &[u8]) -> Result<u64, JournalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_namespace_covers_all_f0_without_widening_journal_open() {
+        for key in [
+            vec![0xF0],
+            b"\xF0other".to_vec(),
+            PREFIX[..PREFIX.len() - 1].to_vec(),
+        ] {
+            assert!(validate_snapshot_namespace(&key).is_err());
+            let store = storage::MemoryStore::default();
+            store
+                .apply(WriteBatch::default().put(key, vec![0]))
+                .unwrap();
+            assert_eq!(Journal::open(store).unwrap().last_appended_index(), Ok(0));
+        }
+        for key in [
+            metadata_key(ROOT_TAG),
+            metadata_key(FRONTIER_TAG),
+            entry_key(1),
+        ] {
+            assert_eq!(validate_snapshot_namespace(&key), Ok(()));
+        }
+        assert_eq!(validate_snapshot_namespace(b"\xF1other"), Ok(()));
+    }
 
     #[test]
     fn journal_index_arithmetic_refuses_wraparound() {

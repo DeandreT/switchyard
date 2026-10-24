@@ -118,6 +118,31 @@ impl<S: StateStore> IndexedWriter<S> {
         Ok(self.checkpoint.map_or(0, |checkpoint| checkpoint.index))
     }
 
+    /// The owner's canonical proposal digest, not a journal or snapshot checksum.
+    /// Reading it neither accesses domain state nor records an application.
+    pub fn latest_applied_digest(&self) -> Result<Option<[u8; 32]>, IndexedApplyError> {
+        self.require_usable()?;
+        Ok(self.checkpoint.map(|checkpoint| checkpoint.proposal_hash))
+    }
+
+    /// Checks the latest checkpoint identity without invoking the apply path.
+    /// No domain, authority or Clock access occurs, even for a mismatch.
+    pub fn verify_latest_applied(
+        &self,
+        proposal: &DurableProposal,
+    ) -> Result<(), IndexedApplyError> {
+        self.require_usable()?;
+        let latest = self
+            .checkpoint
+            .ok_or_else(|| corrupt("there is no latest applied checkpoint"))?;
+        if checksum(PROPOSAL_HASH_SCOPE, &proposal.encode()?) != latest.proposal_hash {
+            return Err(IndexedApplyError::ConflictingProposal {
+                index: latest.index,
+            });
+        }
+        Ok(())
+    }
+
     /// Hashes the canonical persistence proposal, then prepares one next index.
     /// A latest duplicate never reads domain state, authority or Clock, and
     /// returns no previous outcome. Failed preparation drops all staged effects.
@@ -348,6 +373,70 @@ fn corrupt(detail: &'static str) -> IndexedApplyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct NoIo;
+
+    impl StateStore for NoIo {
+        fn get(&self, _: &[u8]) -> Result<Option<storage::Value>, StorageError> {
+            panic!("checkpoint identity must not read the store")
+        }
+        fn apply(&self, _: WriteBatch) -> Result<(), StorageError> {
+            panic!("checkpoint identity must not apply")
+        }
+        fn snapshot(&self) -> Result<storage::StoreSnapshot, StorageError> {
+            panic!("checkpoint identity must not capture")
+        }
+        fn scan_from(
+            &self,
+            _: &[u8],
+            _: &[u8],
+            _: usize,
+        ) -> Result<Vec<(storage::Key, storage::Value)>, StorageError> {
+            panic!("checkpoint identity must not scan")
+        }
+    }
+
+    #[test]
+    fn checkpoint_identity_bridge_is_read_only_and_uses_the_owner_hash() {
+        let proposal = DurableProposal::unbound(crate::Command::new(
+            crate::NamespaceName::new("tenant").unwrap(),
+            crate::EntityPath::new("orders").unwrap(),
+            crate::Timestamp::from_millis(1),
+            CommandKind::ExpireSessionLocks,
+        ));
+        let digest = checksum(PROPOSAL_HASH_SCOPE, &proposal.encode().unwrap());
+        let mut writer = IndexedWriter {
+            machine: StateMachine::new(NoIo),
+            checkpoint: None,
+            usable: true,
+        };
+        assert_eq!(writer.latest_applied_digest(), Ok(None));
+        assert!(matches!(
+            writer.verify_latest_applied(&proposal),
+            Err(IndexedApplyError::Corrupt { .. })
+        ));
+        writer.checkpoint = Some(Checkpoint {
+            index: 7,
+            proposal_hash: digest,
+        });
+        assert_eq!(writer.latest_applied_digest(), Ok(Some(digest)));
+        assert_eq!(writer.verify_latest_applied(&proposal), Ok(()));
+        writer.checkpoint.as_mut().unwrap().proposal_hash[0] ^= 1;
+        assert_eq!(
+            writer.verify_latest_applied(&proposal),
+            Err(IndexedApplyError::ConflictingProposal { index: 7 })
+        );
+        writer.usable = false;
+        assert_eq!(
+            writer.latest_applied_digest(),
+            Err(IndexedApplyError::Unusable)
+        );
+        assert_eq!(
+            writer.verify_latest_applied(&proposal),
+            Err(IndexedApplyError::Unusable)
+        );
+    }
 
     #[test]
     fn token_exhaustion_is_checkpointed_only_for_hold_acquisition() {
