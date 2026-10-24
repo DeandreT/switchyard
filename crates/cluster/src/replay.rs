@@ -84,6 +84,13 @@ impl<S: StateStore> CommittedReplay<S> {
         if applied > committed {
             return Err(ReplayError::AppliedAhead { applied, committed });
         }
+        if let Some(anchor) = journal.snapshot_anchor()?
+            && applied < anchor.applied_index()
+        {
+            return Err(corrupt(
+                "applied checkpoint regresses behind the snapshot anchor",
+            ));
+        }
         let latest = validate_committed(&journal, applied, committed)?;
         if applied != 0 {
             let proposal =
@@ -188,8 +195,15 @@ fn validate_committed<S: StateStore>(
     applied: u64,
     committed: u64,
 ) -> Result<Option<DurableProposal>, ReplayError> {
-    let mut validated = 0_u64;
+    let mut validated = journal.removed_through()?;
     let mut latest = None;
+    if let Some(anchor) = journal.snapshot_anchor()? {
+        // Always decode the retained original, even after P advances beyond A.
+        let original = anchor.original_proposal()?;
+        if applied == anchor.applied_index() {
+            latest = Some(original);
+        }
+    }
     while validated < committed {
         let next = validated
             .checked_add(1)

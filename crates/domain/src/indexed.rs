@@ -18,6 +18,7 @@ const PREFIX: &[u8] = b"\xF1switchyard/replay\0";
 const OWNER_TAG: u8 = 0;
 const CHECKPOINT_TAG: u8 = 1;
 const VERSION: u32 = 1;
+const ANCHORED_OWNER_VERSION: u32 = 2;
 const OWNER_MAGIC: &[u8; 4] = b"SWIA";
 const OWNER_BYTES: usize = 40;
 const CHECKPOINT_BYTES: usize = 72;
@@ -71,6 +72,7 @@ pub enum IndexedApplyError {
 pub struct IndexedWriter<S> {
     machine: StateMachine<S>,
     checkpoint: Option<Checkpoint>,
+    owner_version: u32,
     usable: bool,
 }
 
@@ -89,6 +91,7 @@ impl<S: StateStore> IndexedWriter<S> {
         if entries.len() > 2 {
             return Err(corrupt("unexpected ownership rows"));
         }
+        let mut owner_version = VERSION;
         let checkpoint = if entries.is_empty() {
             for tag in 0x00..=0x11 {
                 if !store.scan_prefix(&[tag], 1)?.is_empty() {
@@ -103,12 +106,13 @@ impl<S: StateStore> IndexedWriter<S> {
             {
                 return Err(corrupt("ownership keys are incomplete or noncanonical"));
             }
-            decode_owner(&entries[0].1)?;
+            owner_version = decode_owner(&entries[0].1)?;
             Some(decode_checkpoint(&entries[1].1)?)
         };
         Ok(Self {
             machine: StateMachine::new(store),
             checkpoint,
+            owner_version,
             usable: true,
         })
     }
@@ -125,6 +129,60 @@ impl<S: StateStore> IndexedWriter<S> {
         Ok(self.checkpoint.map(|checkpoint| checkpoint.proposal_hash))
     }
 
+    /// The domain-owned proposal identity, distinct from journal/frame hashes.
+    pub fn proposal_digest(proposal: &DurableProposal) -> Result<[u8; 32], IndexedApplyError> {
+        Ok(checksum(PROPOSAL_HASH_SCOPE, &proposal.encode()?))
+    }
+
+    /// Inspect only the exact indexed owner record, without adopting domain state.
+    /// Used to check the journal-container/owner fence pair on the same image.
+    /// Full checkpoint/namespace validation remains the indexed opener's job.
+    pub fn persisted_owner_version(store: &S) -> Result<Option<u32>, IndexedApplyError> {
+        store
+            .get(&key(OWNER_TAG))?
+            .map(|bytes| decode_owner(&bytes))
+            .transpose()
+    }
+
+    /// Read the exact V2 ownership/checkpoint pair for an anchored journal.
+    /// No domain adoption, checkpoint advancement or outcome recovery occurs.
+    pub fn snapshot_anchor_checkpoint(store: &S) -> Result<(u64, [u8; 32]), IndexedApplyError> {
+        let rows = store.scan_prefix(&[0xF1], 3)?;
+        if rows.len() != 2 || rows[0].0 != key(OWNER_TAG) || rows[1].0 != key(CHECKPOINT_TAG) {
+            return Err(corrupt("ownership keys are incomplete or noncanonical"));
+        }
+        if decode_owner(&rows[0].1)? != ANCHORED_OWNER_VERSION {
+            return Err(corrupt("snapshot anchor requires owner version two"));
+        }
+        let checkpoint = decode_checkpoint(&rows[1].1)?;
+        Ok((checkpoint.index, checkpoint.proposal_hash))
+    }
+
+    /// Check attachment identity and return the canonical owner key and encoded
+    /// value length without encoding a value or staging a batch. The layout
+    /// stays domain-owned when the caller preflights its complete resulting image.
+    pub fn snapshot_anchor_owner_shape(
+        &self,
+        original: &DurableProposal,
+    ) -> Result<(Vec<u8>, usize), IndexedApplyError> {
+        self.verify_latest_applied(original)?;
+        if self.owner_version != VERSION {
+            return Err(corrupt("snapshot owner is already anchored"));
+        }
+        Ok((key(OWNER_TAG), OWNER_BYTES))
+    }
+
+    /// Stage only the V2 owner fence for exact-image snapshot attachment.
+    /// Does not write, advance a checkpoint, synthesize outcomes, or change its
+    /// digest. The caller must atomically publish the matching journal anchor.
+    pub fn prepare_snapshot_anchor_owner(
+        &self,
+        original: &DurableProposal,
+    ) -> Result<WriteBatch, IndexedApplyError> {
+        let (key, _) = self.snapshot_anchor_owner_shape(original)?;
+        Ok(WriteBatch::default().put(key, encode_owner_version(ANCHORED_OWNER_VERSION)))
+    }
+
     /// Checks the latest checkpoint identity without invoking the apply path.
     /// No domain, authority or Clock access occurs, even for a mismatch.
     pub fn verify_latest_applied(
@@ -135,7 +193,7 @@ impl<S: StateStore> IndexedWriter<S> {
         let latest = self
             .checkpoint
             .ok_or_else(|| corrupt("there is no latest applied checkpoint"))?;
-        if checksum(PROPOSAL_HASH_SCOPE, &proposal.encode()?) != latest.proposal_hash {
+        if Self::proposal_digest(proposal)? != latest.proposal_hash {
             return Err(IndexedApplyError::ConflictingProposal {
                 index: latest.index,
             });
@@ -155,7 +213,7 @@ impl<S: StateStore> IndexedWriter<S> {
         if index == 0 {
             return Err(IndexedApplyError::ZeroIndex);
         }
-        let proposal_hash = checksum(PROPOSAL_HASH_SCOPE, &proposal.encode()?);
+        let proposal_hash = Self::proposal_digest(proposal)?;
         if let Some(latest) = self.checkpoint
             && index == latest.index
         {
@@ -196,7 +254,7 @@ impl<S: StateStore> IndexedWriter<S> {
             proposal_hash,
         };
         if self.checkpoint.is_none() {
-            batch.push_put(key(OWNER_TAG), encode_owner());
+            batch.push_put(key(OWNER_TAG), encode_owner_version(self.owner_version));
         }
         batch.push_put(key(CHECKPOINT_TAG), encode_checkpoint(checkpoint));
         self.usable = false;
@@ -318,14 +376,14 @@ fn checksum(scope: &[u8], bytes: &[u8]) -> [u8; 32] {
     hash.finalize().into()
 }
 
-fn encode_owner() -> Vec<u8> {
+fn encode_owner_version(version: u32) -> Vec<u8> {
     let mut bytes = OWNER_MAGIC.to_vec();
-    bytes.extend_from_slice(&VERSION.to_be_bytes());
+    bytes.extend_from_slice(&version.to_be_bytes());
     bytes.extend_from_slice(&checksum(OWNER_HASH_SCOPE, &bytes));
     bytes
 }
 
-fn decode_owner(bytes: &[u8]) -> Result<(), IndexedApplyError> {
+fn decode_owner(bytes: &[u8]) -> Result<u32, IndexedApplyError> {
     if bytes.len() != OWNER_BYTES || &bytes[..4] != OWNER_MAGIC {
         return Err(corrupt("owner framing is malformed"));
     }
@@ -333,13 +391,13 @@ fn decode_owner(bytes: &[u8]) -> Result<(), IndexedApplyError> {
         return Err(corrupt("owner checksum does not match"));
     }
     let version = u32::from_be_bytes(bytes[4..8].try_into().expect("four version bytes"));
-    if version != VERSION {
+    if version != VERSION && version != ANCHORED_OWNER_VERSION {
         return Err(IndexedApplyError::UnsupportedVersion {
             found: version,
             expected: VERSION,
         });
     }
-    Ok(())
+    Ok(version)
 }
 
 fn encode_checkpoint(checkpoint: Checkpoint) -> Vec<u8> {
@@ -409,6 +467,7 @@ mod tests {
         let mut writer = IndexedWriter {
             machine: StateMachine::new(NoIo),
             checkpoint: None,
+            owner_version: VERSION,
             usable: true,
         };
         assert_eq!(writer.latest_applied_digest(), Ok(None));
@@ -487,7 +546,7 @@ mod tests {
             0xaa, 0x94, 0xec, 0x5e, 0xa3, 0xe5, 0x63, 0x46, 0x8c, 0xa9, 0x1d, 0xc1, 0x1f, 0xd6,
             0xa9, 0x67, 0x15, 0x03, 0x0e, 0xe7, 0x86, 0x77, 0xc6, 0x57,
         ];
-        assert_eq!(encode_owner(), owner_golden);
+        assert_eq!(encode_owner_version(VERSION), owner_golden);
         decode_owner(&owner_golden).unwrap();
         let mut checkpoint_golden = vec![0, 0, 0, 0, 0, 0, 0, 1];
         checkpoint_golden.extend_from_slice(&[0x42; 32]);
@@ -508,5 +567,67 @@ mod tests {
         assert_eq!(decoded.proposal_hash, [0x42; 32]);
         assert_eq!(key(OWNER_TAG), b"\xF1switchyard/replay\0\0");
         assert_eq!(key(CHECKPOINT_TAG), b"\xF1switchyard/replay\0\x01");
+    }
+
+    #[test]
+    fn snapshot_owner_v2_is_narrow_staging_and_survives_later_apply() {
+        let store = storage::MemoryStore::default();
+        let proposal = DurableProposal::unbound(crate::Command::new(
+            crate::NamespaceName::new("n").unwrap(),
+            crate::EntityPath::new("q").unwrap(),
+            crate::Timestamp::from_millis(7),
+            CommandKind::ExpireSessionLocks,
+        ));
+        let mut writer = IndexedWriter::open(store.clone()).unwrap();
+        assert!(writer.prepare_snapshot_anchor_owner(&proposal).is_err());
+        assert!(writer.snapshot_anchor_owner_shape(&proposal).is_err());
+        writer.apply(1, &proposal).unwrap();
+        let before = store.snapshot().unwrap();
+        let checkpoint = store.get(&key(CHECKPOINT_TAG)).unwrap().unwrap();
+        let staged = writer.prepare_snapshot_anchor_owner(&proposal).unwrap();
+        let (owner_key, owner_bytes) = writer.snapshot_anchor_owner_shape(&proposal).unwrap();
+        assert_eq!(owner_key, key(OWNER_TAG));
+        let storage::Mutation::Put {
+            key: staged_key,
+            value,
+        } = &staged.mutations()[0]
+        else {
+            panic!("owner fence must be a put")
+        };
+        assert_eq!(staged_key, &owner_key);
+        assert_eq!(value.len(), owner_bytes);
+        assert_eq!(store.snapshot().unwrap(), before);
+        assert_eq!(staged.mutations().len(), 1);
+        let golden = vec![
+            0x53, 0x57, 0x49, 0x41, 0, 0, 0, 2, 0x37, 0x19, 0x34, 0x05, 0x75, 0x7b, 0x06, 0x98,
+            0x8c, 0xbb, 0xc5, 0xe3, 0x48, 0x74, 0x7b, 0x7b, 0xa8, 0x69, 0x71, 0x21, 0x41, 0x6b,
+            0x37, 0xcb, 0x02, 0xfd, 0x8b, 0xaa, 0x25, 0x78, 0x89, 0xdc,
+        ];
+        assert_eq!(encode_owner_version(2), golden);
+        assert_eq!(decode_owner(&golden), Ok(2));
+        // The V1 decoder's checksum remains valid, but its version gate refuses.
+        assert_eq!(golden[8..], checksum(OWNER_HASH_SCOPE, &golden[..8]));
+        assert_ne!(
+            u32::from_be_bytes(golden[4..8].try_into().unwrap()),
+            VERSION
+        );
+        drop(writer);
+        store.apply(staged).unwrap();
+        assert_eq!(
+            store.get(&key(CHECKPOINT_TAG)).unwrap().unwrap(),
+            checkpoint
+        );
+        let mut writer = IndexedWriter::open(store.clone()).unwrap();
+        writer.verify_latest_applied(&proposal).unwrap();
+        assert!(writer.prepare_snapshot_anchor_owner(&proposal).is_err());
+        assert!(writer.snapshot_anchor_owner_shape(&proposal).is_err());
+        writer.apply(2, &proposal).unwrap();
+        assert_eq!(store.get(&key(OWNER_TAG)).unwrap().unwrap(), golden);
+        assert_eq!(writer.applied_index(), Ok(2));
+        assert_eq!(IndexedWriter::persisted_owner_version(&store), Ok(Some(2)));
+        assert!(matches!(
+            decode_owner(&encode_owner_version(3)),
+            Err(IndexedApplyError::UnsupportedVersion { found: 3, .. })
+        ));
     }
 }

@@ -83,6 +83,14 @@ impl SnapshotCapture {
         &self.encoded
     }
 
+    /// Identity of this immutable frame, not a later recapture containing an
+    /// attached anchor. Distinct from the indexed and journal entry digests.
+    pub fn frame_digest(&self) -> [u8; 32] {
+        self.encoded[self.encoded.len() - super::SNAPSHOT_FRAME_DIGEST_BYTES..]
+            .try_into()
+            .expect("capture contains a complete encoded frame")
+    }
+
     fn from_image(
         image: SnapshotWithProvenance,
         limits: SnapshotLimits,
@@ -138,7 +146,7 @@ fn validate_records(records: &[(Key, Value)]) -> Result<(), SnapshotCaptureError
 /// No access to the live source survives into validation. Apply is prohibited,
 /// and capture never invokes replay_batch or an indexed apply operation.
 #[derive(Clone, Debug)]
-struct FrozenImage(Arc<SnapshotWithProvenance>);
+pub(super) struct FrozenImage(pub(super) Arc<SnapshotWithProvenance>);
 
 impl StateStore for FrozenImage {
     fn get(&self, key: &[u8]) -> Result<Option<Value>, StorageError> {
