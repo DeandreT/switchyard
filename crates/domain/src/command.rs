@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AcceptedSession, Delivery, EntityPath, LockToken, MessageEnvelope, NamespaceName, QueueConfig,
     QueueConfigUpdate, ReceiveMode, RuleDefinition, RuleFilter, RuleName, SequenceNumber,
-    SessionHold, SessionId, SubscriptionConfig, SubscriptionName, Timestamp, TopicConfig,
+    SessionHold, SessionId, SubscriptionConfig, SubscriptionConfigUpdate, SubscriptionName,
+    Timestamp, TopicConfig, TopicConfigUpdate,
 };
 
 /// One message supplied to an atomic broker operation.
@@ -222,6 +223,15 @@ pub enum CommandKind {
     UpdateQueue {
         update: QueueConfigUpdate,
     },
+    /// Updates the parent topic and propagates its size limit to listed children.
+    UpdateTopic {
+        update: TopicConfigUpdate,
+    },
+    /// Updates one subscription below the parent topic in `Command::entity`.
+    UpdateSubscription {
+        name: SubscriptionName,
+        update: SubscriptionConfigUpdate,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -309,4 +319,6 @@ pub enum CommandOutcome {
         released: u32,
     },
     QueueUpdated,
+    TopicUpdated,
+    SubscriptionUpdated,
 }

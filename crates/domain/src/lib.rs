@@ -74,6 +74,6 @@ pub use sql_filter::{
 };
 pub use time::Timestamp;
 pub use topic::{
-    MAX_TOPIC_SUBSCRIPTIONS, SubscriptionConfig, SubscriptionConfigError, TopicConfig,
-    TopicConfigError,
+    MAX_TOPIC_SUBSCRIPTIONS, SubscriptionConfig, SubscriptionConfigError, SubscriptionConfigUpdate,
+    TopicConfig, TopicConfigError, TopicConfigUpdate,
 };

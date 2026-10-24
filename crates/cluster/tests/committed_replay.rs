@@ -18,8 +18,9 @@ use cluster::{
 use domain::{
     BoundCommand, BrokerError, Command, CommandKind, DurableProposal, DurableProposalError,
     EntityPath, IndexedApplyError, IndexedApplyOutcome, IndexedWriter, MAX_SUBSCRIPTION_RULES,
-    MAX_TOPIC_SUBSCRIPTIONS, NamespaceName, QueueConfig, ReceiveMode, RuleDefinition, RuleFilter,
-    RuleName, StateMachine, SubscriptionConfig, SubscriptionName, Timestamp, TopicConfig, codec,
+    MAX_TOPIC_SUBSCRIPTIONS, NamespaceName, QueueConfig, QueueTimeToLiveUpdate, ReceiveMode,
+    RuleDefinition, RuleFilter, RuleName, StateMachine, SubscriptionConfig,
+    SubscriptionConfigUpdate, SubscriptionName, Timestamp, TopicConfig, TopicConfigUpdate, codec,
     keys,
 };
 use serde::Serialize;
@@ -153,10 +154,257 @@ fn structure_and_identity(durable: bool) -> TestResult {
     Ok(())
 }
 
+fn mixed_profile_versions(durable: bool) -> TestResult {
+    let mut fixture = Fixture::new(durable)?;
+    let originals = [
+        proposal(
+            &topic(),
+            1,
+            CommandKind::CreateTopic {
+                config: TopicConfig::default(),
+            },
+        ),
+        proposal(
+            &topic(),
+            2,
+            CommandKind::CreateSubscription {
+                name: SubscriptionName::new("worker")?,
+                config: SubscriptionConfig::default(),
+            },
+        ),
+        proposal(
+            &topic(),
+            3,
+            CommandKind::UpdateTopic {
+                update: TopicConfigUpdate {
+                    max_message_bytes: Some(64),
+                    default_time_to_live_millis: Some(QueueTimeToLiveUpdate::Finite {
+                        millis: 900,
+                    }),
+                },
+            },
+        ),
+        proposal(
+            &topic(),
+            4,
+            CommandKind::SendBatch {
+                messages: vec![domain::MessageInput {
+                    body: b"retained".to_vec(),
+                    ..domain::MessageInput::default()
+                }],
+            },
+        ),
+        proposal(
+            &topic(),
+            5,
+            CommandKind::UpdateSubscription {
+                name: SubscriptionName::new("worker")?,
+                update: SubscriptionConfigUpdate {
+                    lock_duration_millis: Some(20),
+                    max_delivery_count: Some(3),
+                    default_time_to_live_millis: Some(QueueTimeToLiveUpdate::Finite {
+                        millis: 100,
+                    }),
+                },
+            },
+        ),
+        proposal(
+            &topic(),
+            6,
+            CommandKind::UpdateTopic {
+                update: TopicConfigUpdate::default(),
+            },
+        ),
+        proposal(
+            &topic(),
+            7,
+            CommandKind::UpdateSubscription {
+                name: SubscriptionName::new("worker")?,
+                update: SubscriptionConfigUpdate {
+                    lock_duration_millis: Some(0),
+                    ..SubscriptionConfigUpdate::default()
+                },
+            },
+        ),
+        proposal(
+            &subscription(),
+            8,
+            CommandKind::Receive {
+                mode: ReceiveMode::PeekLock,
+                lock_duration_millis: None,
+                session: None,
+            },
+        ),
+    ];
+    for (original, version) in originals.iter().zip([1, 1, 2, 1, 2, 2, 2, 1]) {
+        assert_eq!(&original.encode()?[4..8], &u32::to_be_bytes(version));
+    }
+    fixture.proposals(&originals, originals.len() as u64);
+    let journal = reserved(&fixture.snapshot(), F0);
+    let mut replay = fixture.open()?;
+    assert_eq!(replay.replay_batch(4)?, progress(4, 8, 4));
+    let first = fixture.snapshot();
+    drop(replay);
+    fixture.reopen()?;
+    assert_eq!(fixture.snapshot(), first);
+    let mut replay = fixture.open()?;
+    assert_eq!(replay.replay_batch(4)?, progress(8, 8, 4));
+    assert_eq!(reserved(&fixture.snapshot(), F0), journal);
+    let machine = StateMachine::new(fixture.store().clone());
+    let config = machine.queue_config(&ns(), &subscription())?.unwrap();
+    assert_eq!(config.max_message_bytes, 64);
+    assert_eq!(config.lock_duration_millis, 20);
+    assert_eq!(config.default_time_to_live_millis, Some(100));
+    let message = machine
+        .message(&ns(), &subscription(), domain::SequenceNumber::new(1))?
+        .unwrap();
+    assert_eq!(
+        message.expires_at,
+        Some(Timestamp::from_millis(904)),
+        "profile patch preserves earlier TTL deadline"
+    );
+    let expected = Fixture::new(durable)?;
+    expected.seed(&originals);
+    assert_eq!(
+        reserved(&fixture.snapshot(), F1),
+        reserved(&expected.snapshot(), F1)
+    );
+    let domain_rows = |rows: Vec<(Key, Value)>| {
+        rows.into_iter()
+            .filter(|(key, _)| key[0] < 0xF0)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        domain_rows(fixture.snapshot()),
+        domain_rows(expected.snapshot())
+    );
+    let complete = fixture.snapshot();
+    drop(machine);
+    drop(replay);
+    fixture.reopen()?;
+    assert_eq!(fixture.snapshot(), complete);
+    let mut replay = fixture.open()?;
+    caught_up(&mut replay, &fixture, 8, 8);
+    Ok(())
+}
+
+fn malformed_v2_committed_profiles(durable: bool) -> TestResult {
+    let originals = [
+        proposal(
+            &topic(),
+            1,
+            CommandKind::CreateTopic {
+                config: TopicConfig::default(),
+            },
+        ),
+        proposal(
+            &topic(),
+            2,
+            CommandKind::CreateSubscription {
+                name: SubscriptionName::new("worker")?,
+                config: SubscriptionConfig::default(),
+            },
+        ),
+        proposal(
+            &topic(),
+            3,
+            CommandKind::UpdateTopic {
+                update: TopicConfigUpdate {
+                    max_message_bytes: Some(64),
+                    ..TopicConfigUpdate::default()
+                },
+            },
+        ),
+        proposal(
+            &topic(),
+            4,
+            CommandKind::UpdateSubscription {
+                name: SubscriptionName::new("worker")?,
+                update: SubscriptionConfigUpdate {
+                    lock_duration_millis: Some(20),
+                    ..SubscriptionConfigUpdate::default()
+                },
+            },
+        ),
+    ];
+    let authority_machine = StateMachine::new(MemoryStore::default());
+    for original in &originals[..2] {
+        authority_machine.apply(original.command())?;
+    }
+    let binding = authority_machine.bind_entity(&ns(), &topic())?;
+    for bad_index in [3_usize, 4] {
+        let encoded = originals[bad_index - 1].encode()?;
+        assert_eq!(&encoded[4..8], &2_u32.to_be_bytes());
+
+        // Keep framing exact so refusal exercises the V2 payload decoder.
+        let mut malformed = encoded.clone();
+        assert!(malformed.pop().is_some());
+        let length = (malformed.len() - 12) as u32;
+        malformed[8..12].copy_from_slice(&length.to_be_bytes());
+        let mut alias = encoded;
+        alias[12] |= 128;
+        alias.insert(13, 0);
+        let length = (alias.len() - 12) as u32;
+        alias[8..12].copy_from_slice(&length.to_be_bytes());
+
+        let mut authority = DurableProposal::bound(BoundCommand::new(
+            binding.clone(),
+            originals[bad_index - 1].command().clone(),
+        ))?
+        .encode()?;
+        // Equal-length canonical namespace drift changes only the command,
+        // retaining the original parent-topic authority and exact framing.
+        let command_namespace = authority
+            .windows(6)
+            .rposition(|bytes| bytes == b"tenant")
+            .unwrap();
+        authority[command_namespace..command_namespace + 6].copy_from_slice(b"otherx");
+
+        for (payload, expected) in [
+            (malformed, DurableProposalError::Malformed),
+            (alias, DurableProposalError::NonCanonical),
+            (authority, DurableProposalError::InvalidAuthority),
+        ] {
+            assert_eq!(DurableProposal::decode(&payload), Err(expected));
+            for applied in [0, bad_index - 1] {
+                let mut fixture = Fixture::new(durable)?;
+                let mut payloads = originals
+                    .iter()
+                    .map(DurableProposal::encode)
+                    .collect::<Result<Vec<_>, _>>()?;
+                payloads[bad_index - 1] = payload.clone();
+                fixture.log(&payloads, 4);
+                if applied > 0 {
+                    fixture.seed(&originals[..applied]);
+                }
+                let before = fixture.snapshot();
+                let checkpoint = reserved(&before, F1);
+                for reopen in [false, true] {
+                    if reopen {
+                        fixture.reopen()?;
+                    }
+                    fixture.reset();
+                    assert_eq!(
+                        fixture.open().err(),
+                        Some(ReplayError::Proposal {
+                            index: bad_index as u64,
+                            source: expected,
+                        })
+                    );
+                    assert!(fixture.trace().batches.is_empty());
+                    assert_eq!(fixture.snapshot(), before);
+                    assert_eq!(reserved(&fixture.snapshot(), F1), checkpoint);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn malformed_proposals() -> Vec<Vec<u8>> {
     let original = noop(10).encode().unwrap();
     let mut version = original.clone();
-    version[7] = 2;
+    version[7] = 3;
     let mut length = original.clone();
     length[11] ^= 1;
     let mut trailing = original.clone();
@@ -169,7 +417,7 @@ fn malformed_proposals() -> Vec<Vec<u8>> {
     tag[12] = 127;
     assert_eq!(
         DurableProposal::decode(&version),
-        Err(DurableProposalError::UnsupportedVersion(2))
+        Err(DurableProposalError::UnsupportedVersion(3))
     );
     assert_eq!(
         DurableProposal::decode(&alias),
@@ -945,6 +1193,17 @@ paired!(
     memory_empty_adoption_moves_original_and_forwards_prefix,
     fjall_empty_adoption_moves_original_and_forwards_prefix,
     adoption_and_adapter
+);
+
+paired!(
+    memory_mixed_v1_v2_profiles_replay_and_reopen,
+    fjall_mixed_v1_v2_profiles_replay_and_reopen,
+    mixed_profile_versions
+);
+paired!(
+    memory_malformed_v2_committed_profiles_preserve_effects_and_checkpoint,
+    fjall_malformed_v2_committed_profiles_preserve_effects_and_checkpoint,
+    malformed_v2_committed_profiles
 );
 paired!(
     memory_structure_frontier_and_latest_identity_refuse_without_edits,

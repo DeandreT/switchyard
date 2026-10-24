@@ -6,7 +6,7 @@ use domain::{
     FilterProperties, LockToken, MAX_DURABLE_PROPOSAL_BYTES, MessageEnvelope, MessageInput,
     NamespaceName, QueueConfig, QueueConfigUpdate, QueueTimeToLiveUpdate, ReceiveMode, RuleFilter,
     RuleName, SequenceNumber, SessionHold, SessionId, StateMachine, SubscriptionConfig,
-    SubscriptionName, Timestamp, TopicConfig,
+    SubscriptionConfigUpdate, SubscriptionName, Timestamp, TopicConfig, TopicConfigUpdate,
 };
 use storage::{MemoryStore, StateStore, WriteBatch};
 
@@ -160,6 +160,222 @@ fn variants() -> Vec<CommandKind> {
             },
         },
     ]
+}
+
+#[test]
+fn topic_profile_commands_have_separate_v2_goldens_and_retain_invalid_intent() {
+    let cases = [
+        (
+            CommandKind::UpdateTopic {
+                update: TopicConfigUpdate {
+                    max_message_bytes: Some(0),
+                    default_time_to_live_millis: Some(QueueTimeToLiveUpdate::Finite { millis: 0 }),
+                },
+            },
+            "53574450000000020000000c00016e017107000100000100",
+        ),
+        (
+            CommandKind::UpdateSubscription {
+                name: SubscriptionName::new("s").unwrap(),
+                update: SubscriptionConfigUpdate {
+                    lock_duration_millis: Some(0),
+                    max_delivery_count: Some(0),
+                    default_time_to_live_millis: Some(QueueTimeToLiveUpdate::Finite { millis: 0 }),
+                },
+            },
+            "53574450000000020000001000016e01710701017301000100010000",
+        ),
+        (
+            CommandKind::UpdateTopic {
+                update: TopicConfigUpdate::default(),
+            },
+            "53574450000000020000000900016e017107000000",
+        ),
+        (
+            CommandKind::UpdateTopic {
+                update: TopicConfigUpdate {
+                    default_time_to_live_millis: Some(QueueTimeToLiveUpdate::Unlimited),
+                    ..TopicConfigUpdate::default()
+                },
+            },
+            "53574450000000020000000a00016e01710700010100",
+        ),
+    ];
+    for (kind, golden) in cases {
+        let original = DurableProposal::unbound(command(kind));
+        let encoded = original.encode().unwrap();
+        assert_eq!(encoded, bytes(golden));
+        assert_eq!(DurableProposal::decode(&encoded).unwrap(), original);
+    }
+    for kind in [
+        CommandKind::UpdateTopic {
+            update: TopicConfigUpdate {
+                max_message_bytes: Some(usize::MAX),
+                default_time_to_live_millis: Some(QueueTimeToLiveUpdate::Finite {
+                    millis: u64::MAX,
+                }),
+            },
+        },
+        CommandKind::UpdateSubscription {
+            name: SubscriptionName::new("s".repeat(domain::MAX_SUBSCRIPTION_NAME_CHARACTERS))
+                .unwrap(),
+            update: SubscriptionConfigUpdate {
+                lock_duration_millis: Some(u64::MAX),
+                max_delivery_count: Some(u32::MAX),
+                default_time_to_live_millis: Some(QueueTimeToLiveUpdate::Unlimited),
+            },
+        },
+        CommandKind::UpdateSubscription {
+            name: SubscriptionName::new("s").unwrap(),
+            update: SubscriptionConfigUpdate::default(),
+        },
+    ] {
+        let mut original = command(kind);
+        original.entity = EntityPath::new("t".repeat(domain::MAX_ENTITY_PATH_BYTES)).unwrap();
+        original.issued_at = Timestamp::from_millis(u64::MAX);
+        let original = DurableProposal::unbound(original);
+        assert_eq!(
+            DurableProposal::decode(&original.encode().unwrap()).unwrap(),
+            original
+        );
+    }
+}
+
+#[test]
+fn v2_retains_only_parent_topic_authority_and_original_generation() {
+    let store = MemoryStore::default();
+    let machine = StateMachine::new(store.clone());
+    machine
+        .apply(&command(CommandKind::CreateTopic {
+            config: TopicConfig::default(),
+        }))
+        .unwrap();
+    let binding = machine
+        .bind_entity(
+            &NamespaceName::new("n").unwrap(),
+            &EntityPath::new("q").unwrap(),
+        )
+        .unwrap();
+    let value = DurableProposal::bound(BoundCommand::new(
+        binding.clone(),
+        command(CommandKind::UpdateSubscription {
+            name: SubscriptionName::new("s").unwrap(),
+            update: SubscriptionConfigUpdate::default(),
+        }),
+    ))
+    .unwrap();
+    assert_eq!(
+        value.encode().unwrap(),
+        bytes("53574450000000020000001401016e017101710001016e017107010173000000")
+    );
+    let mut remove = WriteBatch::default();
+    for (key, _) in store.snapshot().unwrap().entries() {
+        remove.push_delete(key.clone());
+    }
+    store.apply(remove).unwrap();
+    let decoded = DurableProposal::decode(&value.encode().unwrap()).unwrap();
+    assert_eq!(
+        decoded.authority(),
+        DurableProposalAuthority::Bound(&binding)
+    );
+    assert_eq!(decoded, value);
+    machine
+        .apply(&command(CommandKind::CreateQueue {
+            config: QueueConfig::default(),
+        }))
+        .unwrap();
+    let queue_binding = machine
+        .bind_entity(
+            &NamespaceName::new("n").unwrap(),
+            &EntityPath::new("q").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        DurableProposal::bound(BoundCommand::new(
+            queue_binding,
+            command(CommandKind::UpdateTopic {
+                update: TopicConfigUpdate::default()
+            })
+        )),
+        Err(DurableProposalError::InvalidAuthority)
+    );
+}
+
+#[test]
+fn v2_framing_canonical_tags_lengths_and_resource_bounds_are_strict() {
+    let original = DurableProposal::unbound(command(CommandKind::UpdateTopic {
+        update: TopicConfigUpdate::default(),
+    }))
+    .encode()
+    .unwrap();
+    for end in 0..original.len() {
+        assert!(DurableProposal::decode(&original[..end]).is_err());
+    }
+    for index in [12, 13, 15, 17, 18] {
+        let mut alias = original.clone();
+        alias[index] |= 128;
+        alias.insert(index + 1, 0);
+        alias[11] += 1;
+        assert_eq!(
+            DurableProposal::decode(&alias),
+            Err(DurableProposalError::NonCanonical),
+            "offset {index}"
+        );
+    }
+    for index in [12, 18, 19, 20] {
+        let mut tag = original.clone();
+        tag[index] = 127;
+        assert_eq!(
+            DurableProposal::decode(&tag),
+            Err(DurableProposalError::Malformed)
+        );
+    }
+    let mut legacy = original.clone();
+    legacy[7] = 1;
+    assert_eq!(
+        DurableProposal::decode(&legacy),
+        Err(DurableProposalError::Malformed)
+    );
+    let mut unknown = original.clone();
+    unknown[7] = 3;
+    assert_eq!(
+        DurableProposal::decode(&unknown),
+        Err(DurableProposalError::UnsupportedVersion(3))
+    );
+    let mut trailing = original.clone();
+    trailing.push(0);
+    assert_eq!(
+        DurableProposal::decode(&trailing),
+        Err(DurableProposalError::Malformed)
+    );
+    trailing[11] += 1;
+    assert_eq!(
+        DurableProposal::decode(&trailing),
+        Err(DurableProposalError::Malformed)
+    );
+    let mut huge_length = original.clone();
+    huge_length.splice(13..14, [255, 255, 255, 255, 15]);
+    huge_length[11] += 4;
+    assert_eq!(
+        DurableProposal::decode(&huge_length),
+        Err(DurableProposalError::Malformed)
+    );
+    let mut invalid_utf8 = original.clone();
+    invalid_utf8[14] = 255;
+    assert_eq!(
+        DurableProposal::decode(&invalid_utf8),
+        Err(DurableProposalError::Malformed)
+    );
+    let mut noncanonical = original;
+    noncanonical[14] = b'N';
+    assert_eq!(
+        DurableProposal::decode(&noncanonical),
+        Err(DurableProposalError::NonCanonical)
+    );
+    assert_eq!(
+        DurableProposal::decode(&vec![0; MAX_DURABLE_PROPOSAL_BYTES + 1]),
+        Err(DurableProposalError::TooLarge)
+    );
 }
 
 fn bytes(hex: &str) -> Vec<u8> {
@@ -613,10 +829,10 @@ fn framing_versions_tags_lengths_and_trailing_data_are_strict() {
         );
     }
     let mut changed = original.clone();
-    changed[7] = 2;
+    changed[7] = 3;
     assert_eq!(
         DurableProposal::decode(&changed),
-        Err(DurableProposalError::UnsupportedVersion(2))
+        Err(DurableProposalError::UnsupportedVersion(3))
     );
     for index in [8, 9, 10, 11] {
         let mut changed = original.clone();

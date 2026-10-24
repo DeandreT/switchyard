@@ -248,8 +248,11 @@ fn ordinary_deterministic_refusal(kind: &CommandKind, error: &BrokerError) -> bo
             kind,
             C::CreateQueue { .. } | C::UpdateQueue { .. } | C::CreateSubscription { .. }
         ),
-        E::TopicConfig(_) => matches!(kind, C::CreateTopic { .. }),
-        E::SubscriptionConfig(_) => matches!(kind, C::CreateSubscription { .. }),
+        E::TopicConfig(_) => matches!(kind, C::CreateTopic { .. } | C::UpdateTopic { .. }),
+        E::SubscriptionConfig(_) => matches!(
+            kind,
+            C::CreateSubscription { .. } | C::UpdateSubscription { .. }
+        ),
         E::RuleConfig(_) => matches!(
             kind,
             C::CreateRule { .. } | C::Send { .. } | C::SendBatch { .. }
