@@ -16,7 +16,7 @@ use domain::{
 use sha2::{Digest, Sha256};
 use storage::{
     FjallStore, ImageInstallBackend, ImageInstallError, ImageInstallLimits, MemoryStore,
-    SnapshotProvenance, StateStore, StoreSnapshot, WriteBatch,
+    SnapshotProvenance, StateStore, WriteBatch,
 };
 use tempfile::TempDir;
 
@@ -390,7 +390,7 @@ fn source_and_target_provenance_matrix_requires_explicit_cross_backend_opt_in() 
 fn corrupt_target<S: ImageInstallBackend>(target: S, case: usize, capture: &SnapshotCapture) -> S {
     if case == 11 {
         rich(&target);
-    } else if case < 9 || case >= 12 {
+    } else if !(9..12).contains(&case) {
         small(&target, 1);
     }
     let mutation = match case {
