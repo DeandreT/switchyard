@@ -17,6 +17,13 @@ use super::{
 type SubscriptionFanoutState = (QueueConfig, Vec<RuleDefinition>);
 type TopicFanoutState = (Vec<EntityPath>, Vec<SubscriptionFanoutState>);
 
+/// Captured by the complete bounded topology proof, before any update is staged.
+pub(super) struct SubscriptionProfile {
+    pub entity: EntityPath,
+    pub backing: QueueConfig,
+    pub shadow: QueueConfig,
+}
+
 impl<S: StateStore> StateMachine<S> {
     pub fn topic_config(
         &self,
@@ -52,15 +59,15 @@ impl<S: StateStore> StateMachine<S> {
             .subscription_topology(namespace, topic)?
             .into_iter()
             .take(limit)
-            .map(|(entity, _)| entity)
+            .map(|profile| profile.entity)
             .collect())
     }
 
-    fn subscription_topology(
+    pub(super) fn subscription_topology(
         &self,
         namespace: &crate::NamespaceName,
         topic: &EntityPath,
-    ) -> Result<Vec<(EntityPath, QueueConfig)>, BrokerError> {
+    ) -> Result<Vec<SubscriptionProfile>, BrokerError> {
         let prefix = keys::topic_subscription_prefix(namespace, topic);
         let entries = self
             .store()
@@ -92,7 +99,11 @@ impl<S: StateStore> StateMachine<S> {
                 return Err(BrokerError::TopicTopologyCorrupt);
             }
             let config = self.validate_subscription_topology(namespace, &entity, parent)?;
-            subscriptions.push((entity, config));
+            subscriptions.push(SubscriptionProfile {
+                entity,
+                backing: config,
+                shadow: config.dead_letter_shadow(),
+            });
         }
         Ok(subscriptions)
     }
@@ -397,10 +408,10 @@ impl<S: StateStore> StateMachine<S> {
         let topology = self.subscription_topology(&command.namespace, &command.entity)?;
         let mut subscriptions = Vec::with_capacity(topology.len());
         let mut state = Vec::with_capacity(topology.len());
-        for (entity, config) in topology {
-            let rules = self.all_rules(&command.namespace, &entity)?;
-            subscriptions.push(entity);
-            state.push((config, rules));
+        for profile in topology {
+            let rules = self.all_rules(&command.namespace, &profile.entity)?;
+            subscriptions.push(profile.entity);
+            state.push((profile.backing, rules));
         }
         Ok((subscriptions, state))
     }

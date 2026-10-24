@@ -42,6 +42,7 @@ collections require refusal until truthful combined runtime data is available.
 | Sessions | Named/next-available attach echoes identifier/deadline; exclusive locks, opaque state, release on close. Renewal/state use `$management`, not automatic renewal. |
 | Duplicates | Exact non-empty message IDs across immediate/batch/scheduled sends; bounded history expiry. |
 | Profiles | Domain-only partial ordinary-queue updates atomically validate/change parent and exact DLQ profiles plus Clock. No-op patches write nothing; owner, records/deadlines remain. Session/duplicate modes are immutable; lock/TTL/message-size/history changes govern future work. |
+| Topic profiles | Domain-only parent-topic size/TTL and named-subscription lock/delivery-count/TTL patches prove all listed children before changing profiles. Size propagates to backing queues/DLQs; topic TTL does not overwrite child TTL. No-op direct calls preserve Clock; no administration or protocol activation. |
 | Topics/rules | Non-session immediate/scheduled singular/batch fanout; placeholder peek/cancel; independent subscription queues. Durable `$Default`, actionless true/false/correlation, typed equality; create/delete/paginated AMQP rules. |
 | Time/identity | Bounded activation/lock/TTL/session-lock/history expiry. ASCII-folded namespace/entity/subscription addresses and SAS scope; session/placement IDs retain case. |
 | Local APIs | [Offline RS256 JWT](offline-jwt.md): pinned keys, injected time/local rights, issuer-qualified grants; SAS/PLAIN retain verified namespace-host qualification. [SQL kernel](sql-predicates.md): bounded ephemeral local grammar/errors, IN/LIKE/scalar arithmetic. No JWT wire activation or persisted SQL rules/fanout/actions. |
@@ -58,8 +59,8 @@ runtime-statistics estimate, global health proof or network administration API.
 
 Selected operational queue-profile reads validate after decode/owner proof,
 including backing queues/DLQs; invalid limits are corruption. Unread rows/raw
-catalogues are not certified; profile-free legacy operations remain unchanged. Topic/subscription
-profile propagation, administration setters/capacity, JWT consumers [#71](https://github.com/DeandreT/switchyard/issues/71)
+catalogues are not certified; profile-free legacy operations remain unchanged.
+Administration setters/capacity, JWT consumers [#71](https://github.com/DeandreT/switchyard/issues/71)
 and activation [#17](https://github.com/DeandreT/switchyard/issues/17), typed content
 #16 and rule integration #20/#21 remain pending.
 
@@ -120,6 +121,13 @@ Selected routing/page and rule readers validate listed graphs and canonical rows
 before returning prefixes or copies; corruption refuses atomically. This is not
 global catalogue health, live-incarnation or retained-runtime proof.
 See [topic integrity](lifecycle.md#topic-integrity) for exact bounds and exclusions.
+
+Durable proposals preserve every existing command's private V1 encoding and
+checkpoint identity. Only topic/subscription profile updates use private V2 DTOs;
+new readers accept V1 and V2, while V1-only binaries refuse V2. Stored configuration,
+journal and indexed-checkpoint formats do not change. Rollback requires a reader
+supporting every retained committed proposal; downgrading cannot replay V2 entries.
+See [profile lifecycle](lifecycle.md#profile-updates).
 
 ### Storage And Runtime Limits
 

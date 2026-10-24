@@ -63,6 +63,39 @@ then require exact generated key/name matches and valid canonical filters.
 Key/filter violations are corruption; no row is rewritten. Unread rows and stored
 timestamps are outside proof.
 
+### Profile Updates
+
+`UpdateTopic` and `UpdateSubscription` address the parent topic in `Command::entity`;
+the latter also carries a `SubscriptionName`. Retained authority is bound to the
+parent topic, not its backing child. Both handlers complete the bounded 2,001-row
+listed-topology proof before patch validation, including empty/equal-value patches
+and missing selected children. A late corrupt sibling refuses the whole update;
+overfull or corrupt stored profiles do not become indexed input refusals.
+
+Topic maximum message bytes propagates to every listed backing queue and DLQ.
+Topic TTL is independent of each child's TTL. Subscription lock duration, delivery
+count and TTL alter only the selected backing profile and its derived DLQ; the DLQ
+keeps unlimited TTL and delivery count. TTL patches distinguish omission, finite
+milliseconds and explicit unlimited. Only changed profiles and their accompanying
+Clock are staged, in one atomic batch. Direct no-ops write nothing and do not advance
+Clock. Indexed no-ops/input refusals may advance only their checkpoint.
+
+Owner heads/bindings, membership/rules, counters, retained records, indexes and
+recorded lock/TTL/schedule deadlines are unchanged. New settings govern subsequent
+admission and lock work; they do not rewrite history. This proof covers listed
+profiles, not orphan discovery or global message/rule health. No admin/wire setters,
+capacity changes, deletion, sessions or duplicate-mode changes are activated.
+
+Existing commands retain byte-identical frozen durable V1 DTOs, including invalid
+numeric intent. Only these two update commands use frozen private V2 DTOs with
+canonical framing, bounded identifiers and retained parent-topic authority checks.
+V1 cannot represent them and explicitly refuses capture; V1-only readers refuse the
+V2 envelope. Current readers accept both versions, retaining invalid patch values
+for domain refusal rather than silently repairing them. The one-MiB envelope limit
+still applies. Stored config/value, journal and checkpoint formats are unchanged;
+old-command checkpoint hashes remain identical. A downgrade cannot replay committed
+V2 proposals and must not rewrite or discard those records to bypass refusal.
+
 ## Storage And Runtime Limits
 
 Fjall restart preserves messages, locks/counts, sessions/sequences, not node loss.

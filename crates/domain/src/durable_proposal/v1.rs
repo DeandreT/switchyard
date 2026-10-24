@@ -639,6 +639,9 @@ impl Kind {
             CommandKind::UpdateQueue { update } => Self::UpdateQueue {
                 update: QueueUpdate::capture(*update)?,
             },
+            CommandKind::UpdateTopic { .. } | CommandKind::UpdateSubscription { .. } => {
+                return Err(Error::UnsupportedCommandVersion(1));
+            }
         })
     }
 

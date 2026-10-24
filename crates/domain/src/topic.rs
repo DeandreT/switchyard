@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod updates;
+pub use updates::{SubscriptionConfigUpdate, TopicConfigUpdate};
+
 use crate::{
     DEFAULT_LOCK_DURATION_MILLIS, DEFAULT_MAX_DELIVERY_COUNT, DEFAULT_MAX_MESSAGE_BYTES,
     MAX_LOCK_DURATION_MILLIS, QueueConfig,
