@@ -312,7 +312,10 @@ impl<S: StateStore> StateMachine<S> {
         let mut populated = vec![false; subscriptions.len()];
         for (input, properties) in inputs.iter().zip(&properties) {
             let sequence = SequenceNumber::new(counters.next_sequence);
-            counters.next_sequence = counters.next_sequence.saturating_add(1);
+            counters.next_sequence = counters
+                .next_sequence
+                .checked_add(1)
+                .ok_or(BrokerError::SequenceNumberExhausted)?;
             sequences.push(sequence);
 
             let topic_lifetime = effective_time_to_live(

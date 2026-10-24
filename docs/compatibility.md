@@ -59,6 +59,7 @@ and activation [#17](https://github.com/DeandreT/switchyard/issues/17), typed co
 | TTL | Always DLQs as `TTLExpiredException`; Azure's configurable expiration policy defaults off. Live locks remain settleable until expiry. |
 | Duplicate gaps/history | Suppression consumes acknowledgement sequence slots, stores no message. History starts at command time; hits do not extend it, nor settlement/cancellation/expiry/DLQ erase it. Missing raw-AMQP IDs bypass it. |
 | Scheduled topics | Children/rules snapshot at activation: later subscriptions may receive older publications. All-scheduled sends do not prove topology early. |
+| Topic sequences | Each offered publication and selected due placeholder consumes one topic-owned slot, even with no matching subscriptions; fanout copies consume none. MAX-1 is the last fresh slot and MAX refuses with nonretryable `SequenceNumberExhausted`. Crossing batches or bounded activation sets retain every original record, counter and Clock without partial fanout. Idle activation and cancellation need no slot. |
 | Browse/deferred | Positive signed peek count, reply cap 250, scan to cap/end; deferred retrieval atomically accepts at most 32 sequences in caller order. |
 | Service limits | 2,000 subscriptions/topic; separate topic/subscription name bounds; Standard default 256 KiB wire-message limit. Commercial namespace/operation quotas absent. |
 
