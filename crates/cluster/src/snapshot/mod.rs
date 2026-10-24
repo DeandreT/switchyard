@@ -7,10 +7,15 @@
 
 mod capture;
 mod format;
+mod install;
 
 pub use capture::{SnapshotCapture, SnapshotCaptureError};
 pub use format::{
     SNAPSHOT_FORMAT_VERSION, SNAPSHOT_FRAME_DIGEST_BYTES, SNAPSHOT_FRAME_HASH_SCOPE,
     SNAPSHOT_LAYOUT_VERSION, SNAPSHOT_MAGIC, SnapshotFormat, SnapshotFormatError, SnapshotLimit,
     SnapshotLimits, SnapshotManifest, SnapshotView,
+};
+pub use install::{
+    SnapshotInstallError, SnapshotInstallLimits, SnapshotInstallOwner, SnapshotInstallPolicy,
+    SnapshotInstallReceipt,
 };

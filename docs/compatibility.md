@@ -144,6 +144,16 @@ snapshot allocation. Callers must exclude every writer and raw/keyspace handle; 
 API does not enforce exclusion or enable online capture. Fjall provenance stays
 typed beside the result, never in the unchanged SWSS frame. Neither capture nor
 decoding proves authenticity, historical authority or installability.
+Offline typed-capture installation bounds and validates one complete old target
+image, then atomically deletes old records and puts the exact captured records
+without replay or metadata changes. Default provenance classes must match;
+cross-backend acceptance is explicit and keeps source/target evidence separate.
+Corrupt or populated unindexed targets refuse, and native Fjall inspection has no
+logical fallback. Caller exclusion includes all writers, raw/topology handles
+and previous domain/journal/replay owners. Apply errors or escaping original
+panics retire the non-Clone owner until reopen; receipts do not certify recovery,
+authentication or anti-rollback authority. Limits are post-snapshot logical
+acceptance bounds, not physical allocation/disk guarantees. Versions are unchanged.
 Token-exhausted receive, deferred receive and session acceptance discard every
 staged effect, including earlier TTL routing in the same command. Indexed refusals
 may initialize their private owner and advance only the `0xF1` checkpoint; domain

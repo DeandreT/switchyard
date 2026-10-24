@@ -49,9 +49,42 @@ before domain/owner decoding. Raw F1 presence selects only a provisional identit
 header width, not ownership or authority; encoding rechecks the verified manifest.
 The full read and validation allocate O(image bytes); caps do not bound backend
 snapshot allocation or semantic container overhead. Capture is not authentication,
-historical authority, an installation certificate or recovery. Offline
-installation, anchors and compaction remain separate work; all storage, journal,
-checkpoint and snapshot versions are unchanged.
+historical authority, an installation certificate or recovery.
+
+Offline `SnapshotInstallOwner` accepts only that typed capture, with records,
+manifest and source evidence still bound together. It inspects one immutable
+target image and validates the complete old domain/F0/F1 state on that same
+image before preparing replacement. Empty valid targets are eligible; populated
+unindexed or corrupt targets refuse rather than being repaired. Source and target
+provenance classes must match by default; cross-backend installation requires an
+explicit opt-in. Source evidence stays distinct from target evidence. A logical
+source does not acquire native source provenance by being installed into Fjall.
+Trust, authentication and historical authority remain caller responsibilities;
+an earlier valid applied frontier is not forbidden by an anti-rollback check.
+
+The non-Clone storage owner requires caller-enforced exclusion of every writer,
+raw clone, topology/keyspace mutator and preexisting domain/journal/indexed/replay
+owner for the complete operation. Fjall always inspects the original native
+handles, exact inventory and current marker, with no logical fallback. Target
+metadata is preserved byte-for-byte; no marker migration or rewrite is performed.
+After snapshot materialization, incoming and old record/key/value caps, combined
+delete-plus-put count and logical mutation bytes are checked before batch
+allocation. Overlapping keys count twice; mutation bytes count old deletion keys
+plus incoming keys and values. Native nonempty/u16 key, u32 value and combined
+u32 mutation-count bounds also apply. These are not backend snapshot-allocation,
+allocator-overhead or physical disk-space guarantees.
+
+A target-bound single-use preparation deletes all old logical records, then puts
+all incoming records in one atomic apply. Clock, checkpoint, committed frontier
+and opaque uncommitted tails remain byte-exact; no replay or promotion occurs.
+The owner retires immediately before external apply and restores usability only
+on success with its prebuilt result. A returned apply error or escaping original
+panic leaves all I/O and release APIs unusable until all handles close and the
+store is reopened. There is no retry, rollback, compensation or production panic
+catching. Receipts are operational results, not installation/recovery certificates.
+Live installation, runtime activation, anchors, compaction and power-cut/fsync
+qualification remain separate work. Storage, journal, checkpoint and snapshot
+versions are unchanged.
 
 Peek-lock commits ownership before transfer and deletes only on settlement;
 receive-delete deletes first. Renewal preserves

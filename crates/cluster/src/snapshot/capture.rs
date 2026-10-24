@@ -88,31 +88,42 @@ impl SnapshotCapture {
         limits: SnapshotLimits,
     ) -> Result<Self, SnapshotCaptureError> {
         let image = Arc::new(image);
-        let records = image.snapshot().entries();
-        // Every valid image with F1 rows has a nonzero checkpoint and digest.
-        // Raw tag presence is only an untrusted header-width hint: it neither
-        // decodes private ownership bytes nor establishes an applied identity.
-        let has_applied_identity = records.iter().any(|(key, _)| key.first() == Some(&0xf1));
-        // Check caps/order before allocating semantic facts or using binary lookup.
-        // The validated manifest will determine the encoder's final header width.
-        SnapshotFormat::preflight(has_applied_identity, records, limits)?;
-        // The report cannot be supplied by a caller or borrowed from another image.
-        validate_records(records)?;
-        let replay = CommittedReplay::open(FrozenImage(Arc::clone(&image)))?;
-        let manifest = SnapshotManifest::new(
-            SNAPSHOT_LAYOUT_VERSION,
-            replay.applied_index()?,
-            replay.committed_index()?,
-            replay.last_appended_index()?,
-            replay.latest_applied_digest()?,
-        )?;
-        let encoded = SnapshotFormat::encode(&manifest, records, limits)?;
+        let manifest = validate_image(Arc::clone(&image), limits)?;
+        let encoded = SnapshotFormat::encode(&manifest, image.snapshot().entries(), limits)?;
         Ok(Self {
             image,
             manifest,
             encoded,
         })
     }
+}
+
+/// Validate precisely this immutable image without allocating an encoded frame.
+/// Shared only by capture and the offline install adapter; not a public report
+/// that a caller can transfer to unrelated records or provenance.
+pub(super) fn validate_image(
+    image: Arc<SnapshotWithProvenance>,
+    limits: SnapshotLimits,
+) -> Result<SnapshotManifest, SnapshotCaptureError> {
+    let records = image.snapshot().entries();
+    // Every valid image with F1 rows has a nonzero checkpoint and digest.
+    // Raw tag presence is only an untrusted header-width hint: it neither
+    // decodes private ownership bytes nor establishes an applied identity.
+    let has_applied_identity = records.iter().any(|(key, _)| key.first() == Some(&0xf1));
+    // Check caps/order before allocating semantic facts or using binary lookup.
+    // The validated manifest will determine the encoder's final header width.
+    SnapshotFormat::preflight(has_applied_identity, records, limits)?;
+    // The report cannot be supplied by a caller or borrowed from another image.
+    validate_records(records)?;
+    let replay = CommittedReplay::open(FrozenImage(Arc::clone(&image)))?;
+    let manifest = SnapshotManifest::new(
+        SNAPSHOT_LAYOUT_VERSION,
+        replay.applied_index()?,
+        replay.committed_index()?,
+        replay.last_appended_index()?,
+        replay.latest_applied_digest()?,
+    )?;
+    Ok(manifest)
 }
 
 fn validate_records(records: &[(Key, Value)]) -> Result<(), SnapshotCaptureError> {
