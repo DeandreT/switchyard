@@ -30,8 +30,9 @@ frontiers and a byte digest; decoding alone does not establish domain/F0/F1
 health, backend provenance or authenticity. Opt-in offline `SnapshotCapture`
 takes one immutable storage image, validates complete domain state and every
 F0/F1 row on that same image, and encodes those exact records without applying,
-sweeping or repairing anything. It validates A <= C <= L, all committed proposal
-schemas (including applied history) and the indexed proposal digest at A.
+sweeping or repairing anything. It validates current P <= C <= L, all retained
+committed proposal schemas (including applied history) and the indexed proposal
+digest at P. In unanchored images every entry from 1 is retained.
 Structurally valid uncommitted payloads remain opaque. Missing F1 is accepted
 only without any domain rows, including Clock; a valid nonzero checkpoint may
 accompany an empty domain after an indexed refusal. Foreign F0 namespaces refuse
@@ -82,9 +83,57 @@ on success with its prebuilt result. A returned apply error or escaping original
 panic leaves all I/O and release APIs unusable until all handles close and the
 store is reopened. There is no retry, rollback, compensation or production panic
 catching. Receipts are operational results, not installation/recovery certificates.
-Live installation, runtime activation, anchors, compaction and power-cut/fsync
-qualification remain separate work. Storage, journal, checkpoint and snapshot
-versions are unchanged.
+Live installation, runtime activation, compaction and power-cut/fsync qualification
+remain separate work. Replacement itself does not migrate any format.
+
+### Snapshot Anchor Attachment
+
+`SnapshotAnchorOwner` is a separate offline operation after installation. It
+inspects the actual sealed backend once (native Fjall metadata has no logical
+fallback), validates that immutable target and requires every record to equal
+the supplied typed capture. A later or conflicting suffix is not reconciled.
+An empty/unapplied capture refuses without writes. All prior owners, raw clones,
+writers and topology/keyspace mutators remain subject to caller-enforced exclusion.
+
+Let A be the source snapshot's applied index, B the removed-through floor, P the
+current applied checkpoint, C committed and L last appended. Anchored readers
+require `0 <= B <= A <= P <= C <= L`. The initial attachment requires A > 0 and
+leaves B=0, P/C/L and all original entries unchanged. The single-use preparation
+is bound to its target and publishes exactly three puts in one atomic apply:
+journal-container V2, indexed-owner V2, and a bounded checksummed anchor V1.
+There are no entry deletes or checkpoint advances. Mutation-byte and exact
+resulting-frame caps are checked over a borrowed three-put merge before cloning
+or encoding the anchor or staging the batch; sizing does not copy the result image.
+The complete batch and its receipt precede apply; the owner retires before calling
+storage and remains retired on a returned error or escaping original panic. No
+retry, compensation or panic replacement occurs. Installation's neutral replacement
+primitive is not used for this put-only boundary because it stages deletions.
+
+The anchor retains A's exact original V1 journal envelope, indexed proposal digest,
+source snapshot format/layout/manifest and immutable pre-attachment frame digest.
+Journal, indexed-proposal, anchor and frame digests have separate domains. A
+recapture containing the anchor is not the source frame and never replaces its
+identity. Original time and authority decode unchanged; checksums do not establish
+authenticated historical authority or prevent whole-image rollback.
+
+Physical entries must be exactly B+1 through L, with no entries at/below B. Every
+retained committed proposal and the anchor original are decoded; a B=0 anchor
+does not skip already applied history. When B<A, physical A must equal the retained
+original byte-for-byte. With P=A, replay can verify the checkpoint using that
+original after entry A is absent. With P>A, entry P must still verify the latest
+checkpoint. Replay applies only (P,C]; the structurally valid (C,L] tail remains
+opaque. Anchored reads at/below B return an explicit unavailable-prefix error.
+Unknown/malformed anchor rows, unsupported or incomplete owner fences, gaps and
+frontiers regressing behind the source are refused, never repaired.
+
+Legacy unanchored V1 owners open and continue writing V1 without migration. Existing
+entry/frontier/checkpoint encodings, proposal hashes, store format and SWSS framing
+are unchanged. Old journal readers refuse container V2 and old indexed writers
+refuse owner V2, but old unindexed APIs are not fenced globally. Attachment refuses
+to replace an existing anchor; it offers neither pruning nor a history-rebinding
+API. Prefix-removed controls are synthetic fixtures for a later compaction operation.
+Receipts and controlled before/after apply faults are not process-crash, power-cut,
+quorum, runtime activation or recovered-outcome certification.
 
 Peek-lock commits ownership before transfer and deletes only on settlement;
 receive-delete deletes first. Renewal preserves
