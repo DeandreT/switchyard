@@ -827,7 +827,7 @@ fn owner_roles_and_pending<P: StoreProvider>(provider: P) {
         relation(
             f.reject(&broken),
             row(&broken, &lookup),
-            "duplicate history endpoint is not an enabled ordinary queue",
+            "duplicate history endpoint is not an enabled ordinary queue or topic",
         );
         let mut orphan = image.clone();
         let expiry = keys::duplicate_expiry(&f.namespace, endpoint, clock, "injected");
@@ -835,7 +835,7 @@ fn owner_roles_and_pending<P: StoreProvider>(provider: P) {
         relation(
             f.reject(&orphan),
             row(&orphan, &expiry),
-            "duplicate history endpoint is not an enabled ordinary queue",
+            "duplicate history endpoint is not an enabled ordinary queue or topic",
         );
     }
     let mut anonymous = image.clone();
@@ -864,7 +864,7 @@ fn owner_roles_and_pending<P: StoreProvider>(provider: P) {
     relation(
         f.reject(&disabled),
         row(&disabled, &lookup),
-        "duplicate history endpoint is not an enabled ordinary queue",
+        "duplicate history endpoint is not an enabled ordinary queue or topic",
     );
     // These canonical relation corruptions belong to other pending facets.
     let mut pending = image.clone();

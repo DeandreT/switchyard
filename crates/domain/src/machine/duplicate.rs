@@ -1,12 +1,12 @@
 //! Duplicate-detection history and bounded expiry.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use storage::{StateStore, WriteBatch};
 
 use crate::{
-    BrokerError, Command, CommandOutcome, EntityPath, NamespaceName, QueueConfig, Timestamp, codec,
-    keys,
+    BrokerError, Command, CommandOutcome, EntityPath, NamespaceName, QueueConfig, Timestamp,
+    TopicConfig, codec, keys,
 };
 
 use super::{StateMachine, TIMER_SCAN_LIMIT};
@@ -25,12 +25,48 @@ impl<S: StateStore> StateMachine<S> {
         message_ids: impl IntoIterator<Item = &'a str>,
         batch: &mut WriteBatch,
     ) -> Result<Vec<bool>, BrokerError> {
+        self.stage_history(
+            command,
+            config.requires_duplicate_detection,
+            config.duplicate_detection_history_millis,
+            message_ids,
+            true,
+            batch,
+        )
+    }
+
+    pub(super) fn stage_topic_duplicate_history<'a>(
+        &self,
+        command: &Command,
+        config: &TopicConfig,
+        message_ids: impl IntoIterator<Item = &'a str>,
+        batch: &mut WriteBatch,
+    ) -> Result<Vec<bool>, BrokerError> {
+        self.stage_history(
+            command,
+            config.requires_duplicate_detection,
+            config.duplicate_detection_history_millis,
+            message_ids,
+            false,
+            batch,
+        )
+    }
+
+    fn stage_history<'a>(
+        &self,
+        command: &Command,
+        enabled: bool,
+        window_millis: u64,
+        message_ids: impl IntoIterator<Item = &'a str>,
+        queue_batch_semantics: bool,
+        batch: &mut WriteBatch,
+    ) -> Result<Vec<bool>, BrokerError> {
         let message_ids = message_ids.into_iter().collect::<Vec<_>>();
-        if !config.requires_duplicate_detection {
+        if !enabled {
             return Ok(vec![true; message_ids.len()]);
         }
 
-        let mut accepted_in_batch = HashSet::with_capacity(message_ids.len());
+        let mut accepted_in_batch = HashMap::with_capacity(message_ids.len());
         let mut stored = Vec::with_capacity(message_ids.len());
         for message_id in message_ids {
             // An absent raw AMQP identifier acts like a broker-assigned unique
@@ -40,14 +76,20 @@ impl<S: StateStore> StateMachine<S> {
                 stored.push(true);
                 continue;
             }
-            if !accepted_in_batch.insert(message_id) {
-                stored.push(false);
-                continue;
-            }
-
             let lookup = keys::duplicate_id(&command.namespace, &command.entity, message_id);
-            let previous: Option<Timestamp> = self.read(&lookup)?;
-            if previous.is_some_and(|deadline| deadline > command.issued_at) {
+            let previous = if let Some(&deadline) = accepted_in_batch.get(message_id) {
+                // Keep established queue same-batch semantics. Topic history is
+                // strictly deadline-based, even at saturated timestamp MAX.
+                if queue_batch_semantics {
+                    stored.push(false);
+                    continue;
+                }
+                Some(deadline)
+            } else {
+                self.read::<Timestamp>(&lookup)?
+            };
+            if let Some(deadline) = previous.filter(|deadline| *deadline > command.issued_at) {
+                accepted_in_batch.insert(message_id, deadline);
                 stored.push(false);
                 continue;
             }
@@ -62,9 +104,8 @@ impl<S: StateStore> StateMachine<S> {
                     message_id,
                 ));
             }
-            let deadline = command
-                .issued_at
-                .saturating_add_millis(config.duplicate_detection_history_millis);
+            let deadline = command.issued_at.saturating_add_millis(window_millis);
+            accepted_in_batch.insert(message_id, deadline);
             batch.push_put(lookup, codec::encode(&deadline)?);
             batch.push_put(
                 keys::duplicate_expiry(&command.namespace, &command.entity, deadline, message_id),
@@ -80,7 +121,9 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
-        self.load_config(command)?;
+        if !self.topic_exists(command)? {
+            self.load_config(command)?;
+        }
         let prefix = keys::duplicate_expiry_prefix(&command.namespace, &command.entity);
         let expiring = self.store().scan_prefix(&prefix, TIMER_SCAN_LIMIT)?;
 

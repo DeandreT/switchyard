@@ -1033,7 +1033,7 @@ fn priorities<P: StoreProvider>(provider: P) -> TestResult {
     let config_raw = f.machine.store().inner.get(&config_key)?.unwrap();
     f.raw(
         config_key.clone(),
-        Some(codec::encode(&TopicConfig {
+        Some(codec::topic::encode(&TopicConfig {
             max_message_bytes: 0,
             ..TopicConfig::default()
         })?),

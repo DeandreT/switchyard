@@ -52,6 +52,7 @@ fn variants() -> Vec<CommandKind> {
             config: TopicConfig {
                 default_time_to_live_millis: Some(3),
                 max_message_bytes: 4,
+                ..TopicConfig::default()
             },
         },
         CommandKind::CreateSubscription {
@@ -337,10 +338,10 @@ fn v2_framing_canonical_tags_lengths_and_resource_bounds_are_strict() {
         Err(DurableProposalError::Malformed)
     );
     let mut unknown = original.clone();
-    unknown[7] = 3;
+    unknown[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
     assert_eq!(
         DurableProposal::decode(&unknown),
-        Err(DurableProposalError::UnsupportedVersion(3))
+        Err(DurableProposalError::UnsupportedVersion(u32::MAX))
     );
     let mut trailing = original.clone();
     trailing.push(0);
@@ -829,10 +830,10 @@ fn framing_versions_tags_lengths_and_trailing_data_are_strict() {
         );
     }
     let mut changed = original.clone();
-    changed[7] = 3;
+    changed[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
     assert_eq!(
         DurableProposal::decode(&changed),
-        Err(DurableProposalError::UnsupportedVersion(3))
+        Err(DurableProposalError::UnsupportedVersion(u32::MAX))
     );
     for index in [8, 9, 10, 11] {
         let mut changed = original.clone();

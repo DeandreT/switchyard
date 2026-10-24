@@ -1,6 +1,6 @@
 //! A frozen persistence envelope, not a client authentication or grant format.
 //!
-//! V1 and V2 carry command intent, including intent the state machine may refuse.
+//! V1, V2 and V3 carry intent, including intent the state machine may refuse.
 //! Decoding does not consult the catalog, acquire authority, or apply a command.
 //! The byte ceiling bounds encoded input/output and copied variable data, not
 //! total heap usage: owned DTO/container and domain-object overhead is extra.
@@ -11,6 +11,7 @@ use crate::{BoundCommand, Command, CommandKind, EntityBinding};
 
 mod v1;
 mod v2;
+mod v3;
 
 pub const MAX_DURABLE_PROPOSAL_BYTES: usize = 1024 * 1024;
 const HEADER_BYTES: usize = 12;
@@ -65,10 +66,12 @@ impl DurableProposal {
         }
     }
 
-    /// Keeps existing commands byte-for-byte V1; only topic profile updates use V2.
-    /// Neither format uses the ordinary Command serde shape.
+    /// Existing intent stays byte-for-byte V1/V2. Only nonlegacy topic creation
+    /// uses V3. No proposal format uses the ordinary Command serde shape.
     pub fn encode(&self) -> Result<Vec<u8>, DurableProposalError> {
-        if uses_v2(&self.command.kind) {
+        if uses_v3(&self.command.kind) {
+            encode_version(&v3::Proposal::capture(self)?, 3)
+        } else if uses_v2(&self.command.kind) {
             encode_version(&v2::Proposal::capture(self)?, 2)
         } else {
             encode_v1(&v1::Proposal::capture(self)?)
@@ -85,7 +88,7 @@ impl DurableProposal {
             return Err(DurableProposalError::Malformed);
         }
         let version = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        if !matches!(version, 1 | 2) {
+        if !matches!(version, 1..=3) {
             return Err(DurableProposalError::UnsupportedVersion(version));
         }
         let length = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
@@ -94,8 +97,10 @@ impl DurableProposal {
         }
         if version == 1 {
             decode_version::<v1::Proposal>(bytes, version)?.restore()
-        } else {
+        } else if version == 2 {
             decode_version::<v2::Proposal>(bytes, version)?.restore()
+        } else {
+            decode_version::<v3::Proposal>(bytes, version)?.restore()
         }
     }
 }
@@ -105,6 +110,10 @@ fn uses_v2(kind: &CommandKind) -> bool {
         kind,
         CommandKind::UpdateTopic { .. } | CommandKind::UpdateSubscription { .. }
     )
+}
+
+fn uses_v3(kind: &CommandKind) -> bool {
+    matches!(kind, CommandKind::CreateTopic { config } if !config.is_legacy_representable())
 }
 
 fn encode_v1(value: &v1::Proposal) -> Result<Vec<u8>, DurableProposalError> {

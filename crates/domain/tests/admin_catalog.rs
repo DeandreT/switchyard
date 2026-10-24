@@ -57,6 +57,7 @@ fn topic<S: StateStore>(machine: &StateMachine<S>, namespace: &NamespaceName, en
             config: TopicConfig {
                 max_message_bytes: 17_000,
                 default_time_to_live_millis: Some(900),
+                ..TopicConfig::default()
             },
         },
     );
@@ -812,7 +813,7 @@ fn damaged_gets<P: StoreProvider>(provider: P) {
             ),
             Damage::QueueTopic => (
                 keys::topic_config(&namespace, &q),
-                Some(codec::encode(&TopicConfig::default()).expect("topic")),
+                Some(codec::topic::encode(&TopicConfig::default()).expect("topic")),
             ),
             Damage::QueueMembership => (
                 keys::topic_subscription(&namespace, &q, &n),
@@ -822,7 +823,7 @@ fn damaged_gets<P: StoreProvider>(provider: P) {
             Damage::TopicValue => (
                 tkey,
                 Some(
-                    codec::encode(&TopicConfig {
+                    codec::topic::encode(&TopicConfig {
                         max_message_bytes: 0,
                         ..TopicConfig::default()
                     })
@@ -837,7 +838,7 @@ fn damaged_gets<P: StoreProvider>(provider: P) {
             ),
             Damage::TopicShadowTopic => (
                 keys::topic_config(&namespace, &ts),
-                Some(codec::encode(&TopicConfig::default()).expect("t")),
+                Some(codec::topic::encode(&TopicConfig::default()).expect("t")),
             ),
             Damage::TopicQueue => (
                 keys::queue_config(&namespace, &t),
@@ -876,11 +877,11 @@ fn damaged_gets<P: StoreProvider>(provider: P) {
             }
             Damage::SubscriptionTopic => (
                 keys::topic_config(&namespace, &s),
-                Some(codec::encode(&TopicConfig::default()).expect("t")),
+                Some(codec::topic::encode(&TopicConfig::default()).expect("t")),
             ),
             Damage::SubscriptionShadowTopic => (
                 keys::topic_config(&namespace, &ss),
-                Some(codec::encode(&TopicConfig::default()).expect("t")),
+                Some(codec::topic::encode(&TopicConfig::default()).expect("t")),
             ),
         };
         if let Some(value) = value {

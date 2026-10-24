@@ -412,7 +412,7 @@ fn creates_one_owner_head_and_shared_shadows_atomically<P: StoreProvider>(
         ),
         (
             keys::topic_config(&fixture.namespace, &topic),
-            codec::encode(&TopicConfig::default())?,
+            codec::topic::encode(&TopicConfig::default())?,
         ),
         (keys::clock(), codec::encode(&Timestamp::from_millis(2))?),
     ]);
@@ -671,7 +671,7 @@ fn absence_and_structural_topology_errors_keep_priority_over_heads<P: StoreProvi
             .delete(keys::entity_metadata(&fixture.namespace, &topic))
             .put(
                 keys::topic_config(&fixture.namespace, &topic),
-                codec::encode(&TopicConfig {
+                codec::topic::encode(&TopicConfig {
                     max_message_bytes: 0,
                     ..TopicConfig::default()
                 })?,

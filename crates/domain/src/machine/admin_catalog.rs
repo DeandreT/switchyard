@@ -521,7 +521,7 @@ impl<S: StateStore> StateMachine<S> {
         path: &EntityPath,
         raw: &[u8],
     ) -> Result<AdminTopic, AdminCatalogError> {
-        let config: TopicConfig = exact(raw)?;
+        let config = codec::topic::decode(raw).map_err(|_| AdminCatalogError::CorruptCatalog)?;
         config
             .validate()
             .map_err(|_| AdminCatalogError::CorruptCatalog)?;

@@ -40,7 +40,7 @@ collections require refusal until truthful combined runtime data is available.
 | Envelope | Durable AMQP body/forms, identifiers, properties, annotations, application properties/footer; broker-authoritative delivery overlays. |
 | Management | Renew, abandon, defer/retrieve, ordered peek, schedule/cancel, custom dead-letter and DLQ receive/complete. Unsupported requests reject with compatible conditions/retry hints. |
 | Sessions | Named/next-available attach echoes identifier/deadline; exclusive locks, opaque state, release on close. Renewal/state use `$management`, not automatic renewal. |
-| Duplicates | Exact non-empty message IDs across immediate/batch/scheduled sends; bounded history expiry. |
+| Duplicates | Exact non-empty message IDs across immediate/batch/scheduled offers on enabled ordinary queues and topics; bounded history expiry. Topic enablement/window are creation-only (default off/10 minutes, inclusive 20 seconds–7 days). |
 | Profiles | Domain-only partial ordinary-queue updates atomically validate/change parent and exact DLQ profiles plus Clock. No-op patches write nothing; owner, records/deadlines remain. Session/duplicate modes are immutable; lock/TTL/message-size/history changes govern future work. |
 | Topic profiles | Domain-only parent-topic size/TTL and named-subscription lock/delivery-count/TTL patches prove all listed children before changing profiles. Size propagates to backing queues/DLQs; topic TTL does not overwrite child TTL. No-op direct calls preserve Clock; no administration or protocol activation. |
 | Topics/rules | Non-session immediate/scheduled singular/batch fanout; placeholder peek/cancel; independent subscription queues. Durable `$Default`, actionless true/false/correlation, typed equality; create/delete/paginated AMQP rules. |
@@ -159,11 +159,21 @@ before returning prefixes or copies; corruption refuses atomically. This is not
 global catalogue health, live-incarnation or retained-runtime proof.
 See [topic integrity](lifecycle.md#topic-integrity) for exact bounds and exclusions.
 
-Durable proposals preserve every existing command's private V1 encoding and
-checkpoint identity. Only topic/subscription profile updates use private V2 DTOs;
-new readers accept V1 and V2, while V1-only binaries refuse V2. Stored configuration,
-journal and indexed-checkpoint formats do not change. Rollback requires a reader
-supporting every retained committed proposal; downgrading cannot replay V2 entries.
+Durable proposals preserve legacy-representable commands' private V1 bytes and
+checkpoint identities. Topic/subscription profile updates use unchanged private V2
+DTOs. Only nonlegacy topic creation uses private V3, including invalid new settings
+that must survive for deterministic refusal. New readers accept V1/V2/V3; older
+readers refuse unsupported proposal versions.
+
+Store format 2, journal and indexed-checkpoint formats remain unchanged. Canonical
+topic values alone use V2 when duplicate detection is enabled or its window differs
+from 600,000ms; disabled/default-window topics retain exact legacy V1 bytes. The
+topic codec rejects unknown, truncated, trailing, noncanonical and redundant V2
+values. Old readers reject these V2 topic records, but can still open the store and
+operate unrelated endpoints: this is not a whole-store downgrade barrier. Rollback
+requires readers compatible with every retained topic/proposal, or a coherent
+pre-feature state/journal/checkpoint backup. Never strip markers, rewrite profiles
+or delete history as a downgrade procedure.
 See [profile lifecycle](lifecycle.md#profile-updates).
 
 ### Storage And Runtime Limits
@@ -191,7 +201,7 @@ namespace/server; no quotas, fair multi-tenancy or production durability.
 
 | Scope | Missing |
 | --- | --- |
-| Semantics | General SQL/actions, session subscriptions/session-ID predicates, topic duplicates, configurable TTL, DLQ forwarding/resubmit, same-group transactions. |
+| Semantics | General SQL/actions, session subscriptions/session-ID predicates, configurable TTL, DLQ forwarding/resubmit, same-group transactions. |
 | Administration | Atom/XML entities/rules; native gRPC/CLI transport (contract only). |
 | Security | JWT consumers/wire, network OIDC, mTLS, policy/full RBAC, namespace KMS/encryption, tamper-evident audit. |
 | Production | Raft/placement, quotas/fairness, encrypted backup/restore, readiness/observability, release/performance evidence. |

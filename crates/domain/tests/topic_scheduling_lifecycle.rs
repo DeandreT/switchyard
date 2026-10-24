@@ -490,6 +490,7 @@ fn mixed_batches_validate_atomically_and_ttl_rebases_on_activation<P: StoreProvi
         TopicConfig {
             default_time_to_live_millis: Some(90),
             max_message_bytes: 5,
+            ..TopicConfig::default()
         },
     )?;
     let long = fixture.subscribe(

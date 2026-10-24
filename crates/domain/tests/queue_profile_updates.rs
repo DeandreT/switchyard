@@ -782,11 +782,11 @@ fn corrupt_metadata<P: StoreProvider>(provider: P) -> Result<(), Box<dyn Error>>
         ),
         (
             keys::topic_config(&fixture.namespace, &fixture.queue),
-            Some(codec::encode(&TopicConfig::default())?),
+            Some(codec::topic::encode(&TopicConfig::default())?),
         ),
         (
             keys::topic_config(&fixture.namespace, &dlq),
-            Some(codec::encode(&TopicConfig::default())?),
+            Some(codec::topic::encode(&TopicConfig::default())?),
         ),
     ];
     for (key, value) in cases {

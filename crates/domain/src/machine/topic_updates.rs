@@ -22,7 +22,7 @@ impl<S: StateStore> StateMachine<S> {
         if updated != current {
             batch.push_put(
                 keys::topic_config(&command.namespace, &command.entity),
-                codec::encode(&updated)?,
+                codec::topic::encode(&updated)?,
             );
         }
         // Only size is inherited. Independent child TTLs and recorded message

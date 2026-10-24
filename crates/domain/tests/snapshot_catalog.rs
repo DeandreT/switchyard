@@ -358,7 +358,7 @@ fn companions<P: StoreProvider>(provider: P) {
     put(
         &mut collision,
         keys::topic_config(&f.namespace, &f.queue),
-        codec::encode(&TopicConfig::default()).unwrap(),
+        codec::topic::encode(&TopicConfig::default()).unwrap(),
     );
     assert!(matches!(
         f.reject(&collision),
@@ -505,7 +505,7 @@ fn canonical_rows<P: StoreProvider>(provider: P) {
     put(
         &mut invalid_topic,
         keys::topic_config(&f.namespace, &f.topic),
-        codec::encode(&TopicConfig {
+        codec::topic::encode(&TopicConfig {
             max_message_bytes: 0,
             ..TopicConfig::default()
         })

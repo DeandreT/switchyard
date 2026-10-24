@@ -108,6 +108,12 @@ fn put<T: serde::Serialize>(key: Key, value: &T) -> Mutation {
         value: codec::encode(value).unwrap(),
     }
 }
+fn put_topic(key: Key, value: &TopicConfig) -> Mutation {
+    Mutation::Put {
+        key,
+        value: codec::topic::encode(value).unwrap(),
+    }
+}
 fn remaining(snapshot: &StoreSnapshot, changed: &[Key]) -> Vec<(Key, Value)> {
     snapshot
         .entries()
@@ -296,6 +302,7 @@ fn retention_and_exact_mutations<P: StoreProvider>(provider: P) -> TestResult {
     let topic_config = TopicConfig {
         max_message_bytes: 8,
         default_time_to_live_millis: Some(500),
+        ..TopicConfig::default()
     };
     let alpha_config = QueueConfig {
         max_message_bytes: 8,
@@ -306,7 +313,7 @@ fn retention_and_exact_mutations<P: StoreProvider>(provider: P) -> TestResult {
         ..original_beta
     };
     let expected = [
-        put(keys::topic_config(&ns(), &topic()), &topic_config),
+        put_topic(keys::topic_config(&ns(), &topic()), &topic_config),
         put(keys::queue_config(&ns(), &alpha), &alpha_config),
         put(
             keys::queue_config(&ns(), &alpha.dead_letter_queue()?),
@@ -417,7 +424,7 @@ fn retention_and_exact_mutations<P: StoreProvider>(provider: P) -> TestResult {
     assert_eq!(
         fixture.trace().batches[0].mutations(),
         &[
-            put(
+            put_topic(
                 keys::topic_config(&ns(), &topic()),
                 &TopicConfig {
                     default_time_to_live_millis: None,
@@ -811,7 +818,7 @@ fn indexed_priority<P: StoreProvider>(provider: P) -> TestResult {
     for (key, bad_value) in [
         (
             keys::topic_config(&ns(), &topic()),
-            codec::encode(&TopicConfig {
+            codec::topic::encode(&TopicConfig {
                 max_message_bytes: 0,
                 ..TopicConfig::default()
             })?,
