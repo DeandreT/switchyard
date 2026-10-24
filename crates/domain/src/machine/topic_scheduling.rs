@@ -117,7 +117,10 @@ impl<S: StateStore> StateMachine<S> {
         let activated = u32::try_from(prepared.len()).unwrap_or(u32::MAX);
         for (index_key, placeholder_sequence, mut record, properties, topic_lifetime) in prepared {
             let active_sequence = SequenceNumber::new(counters.next_sequence);
-            counters.next_sequence = counters.next_sequence.saturating_add(1);
+            counters.next_sequence = counters
+                .next_sequence
+                .checked_add(1)
+                .ok_or(BrokerError::SequenceNumberExhausted)?;
             batch.push_delete(index_key);
             batch.push_delete(keys::message(namespace, topic, placeholder_sequence));
 
