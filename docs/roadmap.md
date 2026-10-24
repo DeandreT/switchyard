@@ -47,7 +47,11 @@ flowchart TD
 - [ ] #210 Selection/compaction.
 
 #250 API/#253 metadata handoffs are sealed.
-#232 Blocked/unassigned: verify #239/#240; #227/#228/#238 and partials verified; #207-#210 blocked.
+#227/#228/#238 and partials are verified, as are #239
+([PR264](https://github.com/DeandreT/switchyard/pull/264)) and #240
+([PR263](https://github.com/DeandreT/switchyard/pull/263)). #232 still owes the
+one-image allocation/graph composition; #205 needs its separate completion audit
+before #207-#210 can advance. Allocator publication is not full-state health.
 
 ```mermaid
 flowchart LR
@@ -80,7 +84,7 @@ PRs in dependency order ([workflow](../CONTRIBUTING.md)). Ready is not evidence.
 | Domain | [#14](https://github.com/DeandreT/switchyard/issues/14)/[#16](https://github.com/DeandreT/switchyard/issues/16)/[#23](https://github.com/DeandreT/switchyard/issues/23) Ready/unassigned; serialize command/codec/keys. |
 | Atom | [#10](https://github.com/DeandreT/switchyard/issues/10) Ready/unassigned. |
 | Admin | #18 Blocked coordinator; [#243](https://github.com/DeandreT/switchyard/issues/243) Ready/unassigned -> #244 Blocked/unassigned. |
-| Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228) and #238 ([PR258](https://github.com/DeandreT/switchyard/pull/258)) verified; #239 Ready/unassigned; #240 assigned; controls unexecuted. |
+| Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228), #238 ([PR258](https://github.com/DeandreT/switchyard/pull/258)), #239 ([PR264](https://github.com/DeandreT/switchyard/pull/264)) and #240 ([PR263](https://github.com/DeandreT/switchyard/pull/263)) verified; allocation/graph composition remains #232. |
 | SDK/security | #71/#101 blocked on #7. |
 
 Shared: #243 keys.rs (released by #229); machine.rs overlaps #240. #244 serializes broker
