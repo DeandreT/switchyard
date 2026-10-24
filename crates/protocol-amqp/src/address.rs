@@ -5,7 +5,11 @@
 //! broker names both explicitly, so the edge resolves one into the other before
 //! any command is proposed.
 
+use std::borrow::Cow;
+
+use auth::ResourceScope;
 use domain::{EntityPath, NamespaceName, SessionId, SubscriptionName};
+use percent_encoding::percent_decode_str;
 
 use crate::ProtocolError;
 
@@ -49,12 +53,19 @@ pub fn namespace_from_hostname(hostname: &str) -> Result<NamespaceName, Protocol
 }
 
 /// Resolves a link's source or target address to the entity it attaches to.
+/// Absolute URIs must first pass `normalize_link_address` with a trusted authority.
 ///
 /// Service Bus entity identity is case-insensitive. Caller-controlled entity
 /// and subscription components are resolved through canonical domain
 /// identifiers, while well-known path segments are matched without regard to
 /// case, so every spelling reaches one canonical storage identity.
 pub fn parse_attachment(address: &str) -> Result<Attachment, ProtocolError> {
+    if address.contains("://") || address.starts_with("//") {
+        return Err(invalid_address(
+            address,
+            "absolute link address needs a trusted namespace authority",
+        ));
+    }
     let trimmed = address.trim_start_matches('/');
     if trimmed.is_empty() {
         return Err(ProtocolError::InvalidAddress {
@@ -97,6 +108,71 @@ pub fn parse_attachment(address: &str) -> Result<Attachment, ProtocolError> {
     } else {
         Attachment::Queue(entity)
     })
+}
+
+/// Resolves an absolute AMQP link URI only within a configured service authority.
+///
+/// Relative addresses are unchanged. An absolute URI requires the exact trusted
+/// host from listener configuration, never the peer's Open hostname. Ports,
+/// credentials, queries, fragments, controls, and dot-segment rewrites are
+/// refused. URI escapes follow the same decoding rules as SAS resource scopes.
+pub fn normalize_link_address<'a>(
+    address: &'a str,
+    expected_host: Option<&str>,
+) -> Result<Cow<'a, str>, ProtocolError> {
+    if address.starts_with("//") || address.chars().any(char::is_control) {
+        return Err(invalid_address(
+            address,
+            "ambiguous or invalid link address",
+        ));
+    }
+    let Some((_, authority_and_path)) = address.split_once("://") else {
+        return Ok(Cow::Borrowed(address));
+    };
+    let expected_host = expected_host.ok_or_else(|| {
+        invalid_address(
+            address,
+            "absolute link address needs a trusted namespace authority",
+        )
+    })?;
+    let raw_authority = authority_and_path.split('/').next().unwrap_or_default();
+    if !raw_authority.eq_ignore_ascii_case(expected_host) {
+        return Err(invalid_address(
+            address,
+            "absolute link address needs the exact configured authority",
+        ));
+    }
+    // URL parsers normalize dot segments. Refuse those spellings before parsing
+    // rather than changing the entity that the peer actually supplied.
+    if let Some((_, raw_path)) = authority_and_path.split_once('/') {
+        for part in raw_path.split('/') {
+            let decoded = percent_decode_str(part)
+                .decode_utf8()
+                .map_err(|_| invalid_address(address, "invalid URI path"))?;
+            if matches!(decoded.as_ref(), "." | "..") {
+                return Err(invalid_address(
+                    address,
+                    "dot segments are not entity identities",
+                ));
+            }
+        }
+    }
+    let scope = ResourceScope::parse(address)
+        .map_err(|_| invalid_address(address, "invalid absolute AMQP address"))?;
+    if !scope.host().eq_ignore_ascii_case(expected_host) {
+        return Err(invalid_address(
+            address,
+            "absolute link address names another service authority",
+        ));
+    }
+    Ok(Cow::Owned(scope.path().collect::<Vec<_>>().join("/")))
+}
+
+fn invalid_address(address: &str, detail: &str) -> ProtocolError {
+    ProtocolError::InvalidAddress {
+        address: address.to_owned(),
+        detail: detail.to_owned(),
+    }
 }
 
 /// Reads a session identifier a client asked for, rejecting one the broker
@@ -241,5 +317,61 @@ mod tests {
             parse_session_id("cart\u{0}1"),
             Err(ProtocolError::InvalidSessionId { .. })
         ));
+    }
+
+    #[test]
+    fn absolute_addresses_need_the_configured_authority() {
+        for path in [
+            "Orders",
+            "Orders/$DeadLetterQueue",
+            "Events/Subscriptions/Audit",
+            "Events/Subscriptions/Audit/$DeadLetterQueue",
+        ] {
+            let uri = format!("amqps://TENANT.example/{path}");
+            let normalized = normalize_link_address(&uri, Some("tenant.example")).unwrap();
+            assert_eq!(
+                parse_attachment(&normalized).unwrap(),
+                parse_attachment(path).unwrap()
+            );
+            assert!(parse_attachment(&uri).is_err());
+            assert!(normalize_link_address(&uri, None).is_err());
+        }
+        assert_eq!(normalize_link_address("/Orders", None).unwrap(), "/Orders");
+        assert_eq!(
+            normalize_link_address(
+                "amqps://tenant.example/%6frders/$management",
+                Some("tenant.example")
+            )
+            .unwrap(),
+            "orders/$management"
+        );
+    }
+
+    #[test]
+    fn foreign_ambiguous_and_rewritten_addresses_are_refused() {
+        for address in [
+            "amqps://foreign.example/orders",
+            "amqps://tenant.example.evil/orders",
+            "amqps://user@tenant.example/orders",
+            "amqps://tenant.example:5671/orders",
+            "amqps://@tenant.example/orders",
+            "amqps://tenant.example:/orders",
+            "amqps://tenant.example/orders?query",
+            "amqps://tenant.example/orders#fragment",
+            "amqp://tenant.example/orders",
+            "https://tenant.example/orders",
+            "//tenant.example/orders",
+            "amqps://tenant.example/a/../orders",
+            "amqps://tenant.example/a/%2e%2e/orders",
+            "amqps://tenant.example/a/./orders",
+            "amqps://tenant.example/orders%2fother",
+            "amqps://tenant.example/%ZZ",
+            "amqps://tenant.example/ord\ners",
+        ] {
+            assert!(
+                normalize_link_address(address, Some("tenant.example")).is_err(),
+                "{address:?}"
+            );
+        }
     }
 }

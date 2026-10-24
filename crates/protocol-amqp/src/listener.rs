@@ -396,9 +396,17 @@ async fn serve_session_pump<B: Broker>(
             .unwrap_or_default();
 
         let address = address_for_role(&attach.role, &source_address, &target_address);
+        let normalized = crate::normalize_link_address(
+            address,
+            authorization
+                .as_ref()
+                .map(|authorization| authorization.audience_host()),
+        );
         if (authorization.is_some()
             && (target_address == crate::CBS_NODE || source_address == crate::CBS_NODE))
-            || management_entity(address).is_some()
+            || normalized
+                .as_ref()
+                .is_ok_and(|address| management_entity(address).is_some())
         {
             let (session, pending_admitted, retirement) = custody.admission_parts();
             let context = control_attachment_custody::ControlContext {

@@ -54,6 +54,28 @@ profile propagation, administration setters/capacity, JWT consumers [#71](https:
 and activation [#17](https://github.com/DeandreT/switchyard/issues/17), typed content
 #16 and rule integration #20/#21 remain pending.
 
+### Absolute link addresses
+
+Data and entity-management links accept relative entity paths or absolute
+`amqps://<configured-host>/<entity>` addresses. Absolute addresses are normalized
+against the listener's configured shared-access audience, not a peer-supplied
+Open or SASL hostname. Queue, subscription, dead-letter, and management paths then
+use the same canonical entity identities and authorization checks as relative
+links. Without a configured audience, only relative addresses are accepted.
+
+Foreign authorities, user information, explicit ports, queries, fragments,
+control characters, dot-segment rewriting, and escaped path separators are
+refused. Valid URI escapes are decoded once, consistently with SAS scopes. The
+low-level `parse_attachment` API accepts relative paths; callers with absolute
+input must first use `normalize_link_address` with a trusted authority.
+
+Session receiver filters accept the legacy raw string/null form and recognized
+described forms of `com.microsoft:session-filter`. Symbolic descriptors, the
+historical Service Bus numeric descriptor, and the vendor/descriptor numeric
+encoding are recognized; other descriptors and invalid enclosed values are
+refused. The granted session ID preserves a recognized described wrapper in
+the attach response.
+
 ## Known Differences And Bounds
 
 | Behavior | Current contract |

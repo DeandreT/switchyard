@@ -33,6 +33,7 @@ roxmltree = "=0.21.1"
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_amqp.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 testkit.workspace = true

@@ -23,7 +23,7 @@ use thiserror::Error;
 pub use crate::{
     address::{
         Attachment, DEAD_LETTER_SUFFIX, SUBSCRIPTION_SEGMENT, namespace_from_hostname,
-        parse_attachment, parse_session_id,
+        normalize_link_address, parse_attachment, parse_session_id,
     },
     authorization::SharedAccessAuthentication,
     broker::{Broker, BrokerRejection},
