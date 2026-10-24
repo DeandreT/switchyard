@@ -7,6 +7,7 @@ members = [
     "crates/cluster",
     "crates/conformance",
     "crates/domain",
+    "crates/message-content",
     "crates/protocol-amqp",
     "crates/server",
     "crates/storage",
@@ -27,6 +28,7 @@ amqp = { path = "crates/amqp" }
 auth = { path = "crates/auth" }
 cluster = { path = "crates/cluster" }
 domain = { path = "crates/domain" }
+message-content = { path = "crates/message-content" }
 protocol-amqp = { path = "crates/protocol-amqp" }
 server = { path = "crates/server" }
 storage = { path = "crates/storage" }
