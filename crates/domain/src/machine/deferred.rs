@@ -99,7 +99,10 @@ impl<S: StateStore> StateMachine<S> {
             let lock = match mode {
                 ReceiveMode::PeekLock => {
                     let token = LockToken::new(counters.next_lock_token);
-                    counters.next_lock_token = counters.next_lock_token.saturating_add(1);
+                    counters.next_lock_token = counters
+                        .next_lock_token
+                        .checked_add(1)
+                        .ok_or(BrokerError::LockTokenExhausted)?;
                     used_lock_token = true;
                     let lock_duration_millis =
                         lock_duration_millis.unwrap_or(config.lock_duration_millis);
