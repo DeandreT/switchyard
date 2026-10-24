@@ -13,9 +13,9 @@ use crate::Timestamp;
 
 pub use catalog::validate_catalog;
 pub use state::{
-    DuplicateRowsValidation, MessageRowsValidation, SessionRowsValidation, SnapshotDuplicateError,
-    SnapshotSessionError, SnapshotStateError, validate_duplicate_rows, validate_message_rows,
-    validate_session_rows,
+    CompleteStateValidation, DuplicateRowsValidation, MessageRowsValidation, SessionRowsValidation,
+    SnapshotCompleteStateError, SnapshotDuplicateError, SnapshotSessionError, SnapshotStateError,
+    validate_complete_state, validate_duplicate_rows, validate_message_rows, validate_session_rows,
 };
 
 /// Catalog-only observations; pending row counts are not health evidence.

@@ -14,6 +14,7 @@ use crate::{
 
 use super::{CatalogValidation, SnapshotCatalogError, validate_catalog};
 
+mod allocation;
 mod duplicates;
 mod messages;
 mod sessions;
@@ -75,6 +76,104 @@ pub enum SnapshotStateError {
     InconsistentMessage { row: usize, detail: &'static str },
 }
 
+/// Observations of all domain catalog and state relationships in one image.
+/// This is not a health certificate: external F0/F1, storage provenance,
+/// retained authority and installation remain unchecked, including for empty
+/// images. It establishes neither historical uniqueness nor reachability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompleteStateValidation {
+    catalog: CatalogValidation,
+    message_rows: usize,
+    message_index_rows: usize,
+    session_rows: usize,
+    session_lock_rows: usize,
+    session_ready_rows: usize,
+    lookup_rows: usize,
+    expiry_rows: usize,
+    stale_compatibility_rows: usize,
+    counter_rows: usize,
+}
+
+impl CompleteStateValidation {
+    /// Catalog-only observations retain their original partial meaning.
+    /// Counter rows are included in catalog_rows, not additional state rows.
+    pub fn catalog(&self) -> CatalogValidation {
+        self.catalog
+    }
+    pub fn message_rows(&self) -> usize {
+        self.message_rows
+    }
+    /// Includes 09 routing rows, also counted by session_ready_rows.
+    pub fn message_index_rows(&self) -> usize {
+        self.message_index_rows
+    }
+    pub fn session_rows(&self) -> usize {
+        self.session_rows
+    }
+    pub fn session_lock_rows(&self) -> usize {
+        self.session_lock_rows
+    }
+    /// Overlaps message_index_rows; do not sum these two observations.
+    pub fn session_ready_rows(&self) -> usize {
+        self.session_ready_rows
+    }
+    pub fn lookup_rows(&self) -> usize {
+        self.lookup_rows
+    }
+    pub fn expiry_rows(&self) -> usize {
+        self.expiry_rows
+    }
+    /// Elapsed older duplicate expiries accepted only by the compatibility rule,
+    /// not evidence that ordinary transitions emitted these rows.
+    pub fn stale_compatibility_rows(&self) -> usize {
+        self.stale_compatibility_rows
+    }
+    /// Present counters, already included in catalog().catalog_rows().
+    /// Absent counters use the lazy default frontier of one.
+    pub fn counter_rows(&self) -> usize {
+        self.counter_rows
+    }
+    pub fn session_relations_checked(&self) -> bool {
+        true
+    }
+    pub fn duplicate_relations_checked(&self) -> bool {
+        true
+    }
+    pub fn allocation_relations_checked(&self) -> bool {
+        true
+    }
+    pub fn pending_external_rows(&self) -> usize {
+        self.catalog.unvalidated_external_rows()
+    }
+    /// F0/F1 relationships remain unchecked even when none were observed.
+    pub fn external_relations_checked(&self) -> bool {
+        false
+    }
+    pub fn storage_provenance_checked(&self) -> bool {
+        false
+    }
+    pub fn retained_authority_checked(&self) -> bool {
+        false
+    }
+    pub fn installation_checked(&self) -> bool {
+        false
+    }
+}
+
+/// Phase priority is catalog/canonical, messages, sessions, duplicates, then
+/// allocation. Every offending ordinal belongs to the original ordered slice.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum SnapshotCompleteStateError {
+    #[error(transparent)]
+    State(#[from] SnapshotStateError),
+    #[error(transparent)]
+    Sessions(#[from] SnapshotSessionError),
+    #[error(transparent)]
+    Duplicate(#[from] SnapshotDuplicateError),
+    #[error("snapshot row {row} has an inconsistent allocation relation: {detail}")]
+    InconsistentAllocation { row: usize, detail: &'static str },
+}
+
 pub(super) struct Located<'a, T> {
     pub(super) ordinal: usize,
     pub(super) key: &'a [u8],
@@ -99,7 +198,6 @@ pub(super) enum Profile {
 pub(super) struct OwnerFacts {
     pub(super) profile: Profile,
     /// Subscription sequences come from the topic; DLQ sequences from its parent.
-    #[allow(dead_code, reason = "Allocation relations are deliberately pending.")]
     pub(super) sequence_owner: Scope,
     pub(super) shadow: bool,
     pub(super) subscription: bool,
@@ -144,6 +242,54 @@ pub fn validate_message_rows(
     let facts = Facts::read(records)?;
     messages::validate(&facts)?;
     Ok(facts.report())
+}
+
+/// Reads private facts once from the original immutable image, then checks
+/// messages, sessions, duplicate generations and allocation in that order.
+/// Retained sequences use their original queue/topic frontier; retained message
+/// and session tokens share the exact endpoint frontier, including elapsed
+/// locks. MAX is an exhausted next value, never an allocated identifier.
+///
+/// No Clock clamp, sweep, repair, opaque-byte interpretation, StateStore access,
+/// capture or installation occurs. Legal allocation gaps and independently
+/// evolving subscription copies are permitted. Temporary facts and claim maps
+/// are proportional to input, not a hostile-heap bound.
+pub fn validate_complete_state(
+    records: &[(Key, Value)],
+) -> Result<CompleteStateValidation, SnapshotCompleteStateError> {
+    let facts = Facts::read(records)?;
+    messages::validate(&facts)?;
+    sessions::validate(&facts)?;
+    let stale_compatibility_rows = duplicates::validate(&facts)?;
+    allocation::validate(&facts)?;
+    let mut report = CompleteStateValidation {
+        catalog: facts.catalog,
+        message_rows: 0,
+        message_index_rows: 0,
+        session_rows: 0,
+        session_lock_rows: 0,
+        session_ready_rows: 0,
+        lookup_rows: 0,
+        expiry_rows: 0,
+        stale_compatibility_rows,
+        counter_rows: facts.counters.len(),
+    };
+    // Count checked facts directly, never sum the overlapping facet reports.
+    for row in &facts.rows {
+        match &row.value.key {
+            StateKey::Message(..) => report.message_rows += 1,
+            StateKey::Session(..) => report.session_rows += 1,
+            StateKey::SessionLock(..) => report.session_lock_rows += 1,
+            StateKey::SessionReady(..) => {
+                report.message_index_rows += 1;
+                report.session_ready_rows += 1;
+            }
+            StateKey::DuplicateId(..) => report.lookup_rows += 1,
+            StateKey::DuplicateExpiry(..) => report.expiry_rows += 1,
+            _ => report.message_index_rows += 1,
+        }
+    }
+    Ok(report)
 }
 
 impl<'a> Facts<'a> {
