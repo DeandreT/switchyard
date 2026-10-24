@@ -25,10 +25,33 @@ preserves recorded time/authority. Its frontier is captured at open; tail payloa
 remain opaque under structural validation. Fatal batch errors/unwinds retire the
 owner until reopen. No refresh, outcomes, startup wiring or quorum is provided.
 
-Snapshot recovery is split into #203-#210 under #37. The pure-format increment
-defines caller-capped canonical raw records, declared frontiers and a byte digest;
-it does not certify domain/F0/F1 health, backend provenance or authenticity.
-Capture, offline installation, anchors and compaction remain separate work.
+The snapshot format defines caller-capped canonical raw records, declared
+frontiers and a byte digest; decoding alone does not establish domain/F0/F1
+health, backend provenance or authenticity. Opt-in offline `SnapshotCapture`
+takes one immutable storage image, validates complete domain state and every
+F0/F1 row on that same image, and encodes those exact records without applying,
+sweeping or repairing anything. It validates A <= C <= L, all committed proposal
+schemas (including applied history) and the indexed proposal digest at A.
+Structurally valid uncommitted payloads remain opaque. Missing F1 is accepted
+only without any domain rows, including Clock; a valid nonzero checkpoint may
+accompany an empty domain after an indexed refusal. Foreign F0 namespaces refuse
+capture without changing ordinary journal-open namespace policy.
+
+The caller must exclude every writer, including raw/cloned stores and all
+keyspace/topology handles, for the complete capture call. The APIs do not enforce
+this precondition or activate online capture. Logical capture preserves only
+logical provenance; the explicit Fjall entry point uses the existing metadata
+bridge. Typed provenance stays beside the result because the SWSS frame does not
+encode it. Capture failures propagate without retries or source writes, under
+the storage bridge's exclusivity contract. After the backend read, shared frame
+preflight checks record/key/value/exact encoded-size caps and canonical order
+before domain/owner decoding. Raw F1 presence selects only a provisional identity
+header width, not ownership or authority; encoding rechecks the verified manifest.
+The full read and validation allocate O(image bytes); caps do not bound backend
+snapshot allocation or semantic container overhead. Capture is not authentication,
+historical authority, an installation certificate or recovery. Offline
+installation, anchors and compaction remain separate work; all storage, journal,
+checkpoint and snapshot versions are unchanged.
 
 Peek-lock commits ownership before transfer and deletes only on settlement;
 receive-delete deletes first. Renewal preserves
