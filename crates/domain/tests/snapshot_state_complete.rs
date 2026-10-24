@@ -1076,6 +1076,38 @@ fn phase_priority<P: StoreProvider>(provider: P) {
 
 paired!(memory_phase_priority, fjall_phase_priority, phase_priority);
 
+fn counter_only_zero_frontiers<P: StoreProvider>(provider: P) {
+    let f = Fixture::new(provider);
+    let queue = f.queue("empty", QueueConfig::default());
+    let base = f.image();
+    assert!(clock_row(&base).is_some());
+    assert!(!base.iter().any(|(key, _)| matches!(key[0], 0x03..=0x0D)));
+    f.check(&base);
+    let key = keys::queue_counters(&f.namespace, &queue);
+    for (sequence, token) in [(0, 1), (1, 0)] {
+        let mut image = base.clone();
+        counters(&mut image, &f.namespace, &queue, sequence, token);
+        // Catalog rejects present zero frontiers even without retained claims.
+        // The shared refusal helper checks every input/store byte and Clock.
+        assert_eq!(
+            f.reject(&image),
+            SnapshotCompleteStateError::State(SnapshotStateError::Catalog(
+                SnapshotCatalogError::InvalidValue {
+                    row: row(&image, &key),
+                    detail: "allocation counters must be nonzero",
+                }
+            ))
+        );
+    }
+    f.reopen(&base);
+}
+
+paired!(
+    memory_counter_only_zero_frontiers,
+    fjall_counter_only_zero_frontiers,
+    counter_only_zero_frontiers
+);
+
 fn empty_and_external<P: StoreProvider>(provider: P) {
     let f = Fixture::new(provider);
     let empty = f.image();
