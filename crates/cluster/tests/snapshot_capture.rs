@@ -533,7 +533,7 @@ fn committed_schemas(durable: bool) {
 }
 
 fn domain_and_limit_refusals(durable: bool) {
-    for case in 0..8 {
+    for case in 0..7 {
         let fixture = Fixture::new(durable);
         let first = create(1);
         fixture.log(&[first.encode().unwrap()], 1);
@@ -546,8 +546,7 @@ fn domain_and_limit_refusals(durable: bool) {
             4 => {
                 WriteBatch::default().put(keys::entity_metadata(&ns(), &path("orders")), vec![0xff])
             }
-            5 => WriteBatch::default().put(Vec::new(), vec![]),
-            6 => WriteBatch::default().put(vec![0xf2], vec![]),
+            5 => WriteBatch::default().put(vec![0xf2], vec![]),
             _ => WriteBatch::default().put(b"format_version".to_vec(), vec![0, 0, 0, 2]),
         };
         fixture.raw(batch);
@@ -565,6 +564,18 @@ fn domain_and_limit_refusals(durable: bool) {
         }
         shared_limit_boundaries(&fixture);
     }
+}
+
+#[test]
+fn logical_empty_key_is_rejected_without_writes() {
+    // Fjall cannot store an empty key; exercise this malformed logical image
+    // through the Memory backend instead of panicking in native fixture setup.
+    let fixture = Fixture::new(false);
+    let first = create(1);
+    fixture.log(&[first.encode().unwrap()], 1);
+    fixture.seed(&[first]);
+    fixture.raw(WriteBatch::default().put(Vec::new(), vec![]));
+    assert!(matches!(fixture.reject(), SnapshotCaptureError::State(_)));
 }
 
 fn shared_limit_boundaries(fixture: &Fixture) {
