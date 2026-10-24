@@ -94,131 +94,196 @@ async fn start_worker<B: Broker>(
     (id, wire_id, registration)
 }
 
+#[derive(Clone, Copy)]
+struct NativeFaultCase {
+    durable: bool,
+    fault_kind: u8,
+}
+
+impl NativeFaultCase {
+    fn label(self, phase: &str) -> String {
+        let backend = if self.durable { "fjall" } else { "memory" };
+        let fault = match self.fault_kind {
+            0 => "raw-join-panic",
+            1 => "typed-protocol-error",
+            _ => "typed-engine-error",
+        };
+        format!(
+            "new_worker_fault_is_cached_before_notice_and_held_actual_native_drain \
+             backend={backend} fault_kind={} fault={fault} phase={phase}",
+            self.fault_kind
+        )
+    }
+
+    fn phase(self, phase: &str) {
+        eprintln!("{}", self.label(phase));
+    }
+
+    async fn wait<F: Future>(self, phase: &str, future: F) -> F::Output {
+        self.phase(phase);
+        native_wait_until(Instant::now() + WAIT, &self.label(phase), future).await
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn new_worker_fault_is_cached_before_notice_and_held_actual_native_drain() {
     for durable in [false, true] {
         for fault_kind in 0..3 {
-            let mut actor = Actor::new(durable, false);
-            actor.send("native-opposite", None);
-            let delivery = actor.receive();
-            let snapshot = actor.store().snapshot().unwrap();
-            let mut wire = Wire::new(ReceiverSettleMode::Second).await;
-            let _barrier = wire.session_barrier(2).await;
-            let _release = wire.writes.release_on_drop();
-            let notice = ConnectionRetirementRequest::capture(&wire.connection);
-            let sender = wire.sender.take().unwrap();
-            let mut workers = SettlementWorkers::new();
-            let fault = Arc::new(Notify::new());
-            let payload: Arc<str> = Arc::from("new original worker panic");
-            let task_fault = Arc::clone(&fault);
-            let task_payload = Arc::clone(&payload);
-            let first = workers.spawn(None, async move {
-                task_fault.notified().await;
-                // The panic is an actual raw JoinError. The other two rows are
-                // qualified typed-completion classification doubles, not codec IO.
-                match fault_kind {
-                    0 => std::panic::panic_any(task_payload),
-                    1 => Err(SettlementFailure::Protocol(
-                        crate::ProtocolError::InvalidEnvelope {
-                            detail: "worker classification double".to_owned(),
-                        },
-                    )),
-                    _ => Err(SettlementFailure::Engine(amqp::EngineError::InvalidState(
-                        "worker classification double".to_owned(),
-                    ))),
-                }
-            });
-            wire.writes.block();
-            let returned = Arc::new(Notify::new());
-            let retained = Arc::new(Notify::new());
-            let task_returned = Arc::clone(&returned);
-            let task_retained = Arc::clone(&retained);
-            let message = crate::message::write_delivery_from(&delivery, None).unwrap();
-            let token = delivery.lock.unwrap().token;
-            // Qualified composition: after the actual native future returns, this
-            // original task deliberately retains that result behind a second gate.
-            let second = workers.spawn(None, async move {
-                let raw = sender.send_pending(message, lock_delivery_tag(token)).await;
-                task_returned.notify_one();
-                task_retained.notified().await;
-                match raw {
-                    Ok(_) => panic!("writer was never released"),
-                    Err(error) => Err(SettlementFailure::Engine(error)),
-                }
-            });
-            wire.writes.reached().await;
-            assert!(!notice.is_requested());
-            fault.notify_one();
-            let mut borrowed = Box::pin(workers.finish_with_retirement(Some(&notice)));
-            timeout(WAIT, async {
-                tokio::select! {
-                    _ = borrowed.as_mut() => panic!("opposite original is still retained"),
-                    () = notice.observer() => {},
-                }
-            })
-            .await
-            .unwrap();
-            drop(borrowed);
-            assert_eq!(workers.finished().len(), 1);
-            assert_eq!(workers.finished()[0].id, first);
-            if fault_kind == 0 {
-                let Err(error) = &workers.finished()[0].result else {
-                    panic!("raw original join failure")
-                };
-                assert!(error.is_panic());
-            } else {
-                let raw = &workers.finished()[0]
-                    .result
-                    .as_ref()
-                    .expect("typed original completion")
-                    .result;
-                if fault_kind == 1 {
-                    assert!(matches!(raw, Err(SettlementFailure::Protocol(_))));
-                } else {
-                    assert!(matches!(
-                        raw,
-                        Err(SettlementFailure::Engine(amqp::EngineError::InvalidState(
-                            _
-                        )))
-                    ));
-                }
-            }
-            assert!(
-                workers.failures().is_empty(),
-                "no next() synthetic Stopped path"
-            );
-            notice.request();
-            notice.request();
-            timeout(WAIT, returned.notified()).await.unwrap();
-            timeout(WAIT, wire.connection.shutdown())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(wire.writes.state.lock().unwrap().blocked);
-            let mut retry = Box::pin(workers.finish_with_retirement(Some(&notice)));
-            pending_once(retry.as_mut()).await;
-            drop(retry);
-            assert_eq!(workers.finished()[0].id, first);
-            retained.notify_one();
-            timeout(WAIT, workers.finish_with_retirement(Some(&notice)))
-                .await
-                .unwrap();
-            assert_eq!(workers.finished().len(), 2);
-            assert_eq!(workers.finished()[1].id, second);
-            timeout(WAIT, workers.finish_with_retirement(Some(&notice)))
-                .await
-                .unwrap();
-            let error = workers.into_join_error();
-            if fault_kind == 0 {
-                assert_payload(error.unwrap().into_panic().as_ref(), &payload);
-            } else {
-                assert!(error.is_none());
-            }
-            assert_eq!(actor.store().snapshot().unwrap(), snapshot);
-            actor.reopen();
-            assert_eq!(actor.store().snapshot().unwrap(), snapshot);
+            let case = NativeFaultCase {
+                durable,
+                fault_kind,
+            };
+            new_worker_fault_case(case).await;
+            case.phase("case complete");
         }
     }
+}
+
+// Only the async waits have Tokio deadlines. Actor setup/intent, snapshots,
+// reopen and implicit fixture destruction remain synchronous; these markers
+// identify their phase under --nocapture for the external process watchdog.
+async fn new_worker_fault_case(case: NativeFaultCase) {
+    case.phase("Actor::new (blocking)");
+    let mut actor = Actor::new(case.durable, false);
+    case.phase("Actor::send intent (blocking)");
+    actor.send("native-opposite", None);
+    case.phase("Actor::receive intent (blocking)");
+    let delivery = actor.receive();
+    case.phase("initial snapshot (blocking)");
+    let snapshot = actor.store().snapshot().unwrap();
+    case.phase("Wire setup (async deadline)");
+    let mut wire = Wire::new(ReceiverSettleMode::Second).await;
+    case.phase("Wire session barrier (async deadline)");
+    let _barrier = wire.session_barrier(2).await;
+    let _release = wire.writes.release_on_drop();
+    let notice = ConnectionRetirementRequest::capture(&wire.connection);
+    let sender = wire.sender.take().unwrap();
+    let mut workers = SettlementWorkers::new();
+    let fault = Arc::new(Notify::new());
+    let payload: Arc<str> = Arc::from("new original worker panic");
+    let task_fault = Arc::clone(&fault);
+    let task_payload = Arc::clone(&payload);
+    let first = workers.spawn(None, async move {
+        case.phase("fault worker: waiting for release");
+        task_fault.notified().await;
+        case.phase("fault worker: released");
+        // The panic is an actual raw JoinError. The other two rows are
+        // qualified typed-completion classification doubles, not codec IO.
+        match case.fault_kind {
+            0 => std::panic::panic_any(task_payload),
+            1 => Err(SettlementFailure::Protocol(
+                crate::ProtocolError::InvalidEnvelope {
+                    detail: "worker classification double".to_owned(),
+                },
+            )),
+            _ => Err(SettlementFailure::Engine(amqp::EngineError::InvalidState(
+                "worker classification double".to_owned(),
+            ))),
+        }
+    });
+    wire.writes.block();
+    let returned = Arc::new(Notify::new());
+    let retained = Arc::new(Notify::new());
+    let task_returned = Arc::clone(&returned);
+    let task_retained = Arc::clone(&retained);
+    let message = crate::message::write_delivery_from(&delivery, None).unwrap();
+    let token = delivery.lock.unwrap().token;
+    // Qualified composition: after the actual native future returns, this
+    // original task deliberately retains that result behind a second gate.
+    let second = workers.spawn(None, async move {
+        case.phase("native worker: original send");
+        let raw = sender.send_pending(message, lock_delivery_tag(token)).await;
+        case.phase("native worker: raw result retained");
+        task_returned.notify_one();
+        task_retained.notified().await;
+        case.phase("native worker: retained result released");
+        match raw {
+            Ok(_) => panic!("writer was never released"),
+            Err(error) => Err(SettlementFailure::Engine(error)),
+        }
+    });
+    case.wait("native write reached gate", wire.writes.reached())
+        .await;
+    assert!(!notice.is_requested());
+    fault.notify_one();
+    let mut borrowed = Box::pin(workers.finish_with_retirement(Some(&notice)));
+    case.wait("first finish observes retirement notice", async {
+        tokio::select! {
+            _ = borrowed.as_mut() => panic!("opposite original is still retained"),
+            () = notice.observer() => {},
+        }
+    })
+    .await;
+    drop(borrowed);
+    case.phase("verify first original cached before opposite drain");
+    assert_eq!(workers.finished().len(), 1);
+    assert_eq!(workers.finished()[0].id, first);
+    if case.fault_kind == 0 {
+        let Err(error) = &workers.finished()[0].result else {
+            panic!("raw original join failure")
+        };
+        assert!(error.is_panic());
+    } else {
+        let raw = &workers.finished()[0]
+            .result
+            .as_ref()
+            .expect("typed original completion")
+            .result;
+        if case.fault_kind == 1 {
+            assert!(matches!(raw, Err(SettlementFailure::Protocol(_))));
+        } else {
+            assert!(matches!(
+                raw,
+                Err(SettlementFailure::Engine(amqp::EngineError::InvalidState(
+                    _
+                )))
+            ));
+        }
+    }
+    assert!(
+        workers.failures().is_empty(),
+        "no next() synthetic Stopped path"
+    );
+    notice.request();
+    notice.request();
+    case.wait("native original returned", returned.notified())
+        .await;
+    case.wait("native connection shutdown", wire.connection.shutdown())
+        .await
+        .unwrap();
+    case.phase("verify retained original still blocks finish");
+    assert!(wire.writes.state.lock().unwrap().blocked);
+    let mut retry = Box::pin(workers.finish_with_retirement(Some(&notice)));
+    pending_once(retry.as_mut()).await;
+    drop(retry);
+    assert_eq!(workers.finished()[0].id, first);
+    retained.notify_one();
+    case.wait(
+        "finish after retained original release",
+        workers.finish_with_retirement(Some(&notice)),
+    )
+    .await;
+    assert_eq!(workers.finished().len(), 2);
+    assert_eq!(workers.finished()[1].id, second);
+    case.wait(
+        "repeat finished drain",
+        workers.finish_with_retirement(Some(&notice)),
+    )
+    .await;
+    case.phase("verify original fault payload");
+    let error = workers.into_join_error();
+    if case.fault_kind == 0 {
+        assert_payload(error.unwrap().into_panic().as_ref(), &payload);
+    } else {
+        assert!(error.is_none());
+    }
+    case.phase("snapshot before reopen (blocking)");
+    assert_eq!(actor.store().snapshot().unwrap(), snapshot);
+    case.phase("Actor::reopen (blocking; no Tokio deadline)");
+    actor.reopen();
+    case.phase("snapshot after reopen (blocking)");
+    assert_eq!(actor.store().snapshot().unwrap(), snapshot);
+    case.phase("fixture destruction including Actor::drop (blocking; no Tokio deadline)");
 }
 
 #[tokio::test(flavor = "current_thread")]
