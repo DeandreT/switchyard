@@ -9,6 +9,7 @@
 //! Nothing here reads a clock, generates a random value, or performs I/O beyond
 //! the injected store.
 
+mod admin_catalog;
 mod catalog;
 mod deferred;
 mod duplicate;
@@ -36,6 +37,10 @@ use self::deferred::replace_envelope;
 use self::incarnations::Kind;
 use self::send::SendInput;
 
+pub use self::admin_catalog::{
+    AdminCatalogCursor, AdminCatalogEntry, AdminCatalogError, AdminCatalogKind, AdminCatalogPage,
+    AdminQueue, AdminSubscription, AdminTopic, MAX_ADMIN_CATALOG_PAGE, MAX_ADMIN_CATALOG_SCAN,
+};
 pub(crate) use self::incarnations::decode_catalog_owner;
 pub use self::peek::{MAX_PEEK_BATCH, MAX_PEEK_SCAN};
 

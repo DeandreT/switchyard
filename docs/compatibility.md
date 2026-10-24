@@ -41,6 +41,15 @@ or whole-test task-tree shutdown. See [selectors/limits](sdk-gates.md),
 | Local APIs | [Offline RS256 JWT](offline-jwt.md): pinned keys, injected time/local rights, issuer-qualified grants; SAS/PLAIN retain verified namespace-host qualification. [SQL kernel](sql-predicates.md): bounded ephemeral local grammar/errors, IN/LIKE/scalar arithmetic. No JWT wire activation or persisted SQL rules/fanout/actions. |
 | Storage | Paired Memory/Fjall semantics; Fjall journal fsync before applied outcomes; exclusive directory ownership. |
 
+Library-only administration Get/page reads select one namespace and validate
+canonical public queue/topic/subscription rows, live owners and required profiles.
+Internal queues are excluded; selected corruption, including lookahead, rejects
+the whole page. Pages return at most 100 entries and consume at most 256 raw rows
+plus one lookahead, in queue/topic/subscription key order. Namespace/kind-bound
+opaque cursors can continue an empty page through internal rows. Callers must
+exclude all writers during each complete read; there is no cross-page snapshot,
+runtime-statistics estimate, global health proof or network administration API.
+
 Selected operational queue-profile reads validate after decode/owner proof,
 including backing queues/DLQs; invalid limits are corruption. Unread rows/raw
 catalogues are not certified; profile-free legacy operations remain unchanged. Topic/subscription
