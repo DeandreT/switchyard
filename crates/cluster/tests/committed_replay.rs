@@ -99,8 +99,8 @@ fn structure_and_identity(durable: bool) -> TestResult {
             5 => WriteBatch::default().put(b"\xF1other".to_vec(), vec![0]),
             6 => WriteBatch::default().put(key(F1, 1), checkpoint(2, &originals[1])),
             7 => WriteBatch::default().put(key(F1, 1), checkpoint(1, &noop(10))),
-            8 => WriteBatch::default().put(key(F0, 0), 2_u32.to_be_bytes().to_vec()),
-            _ => WriteBatch::default().put(key(F1, 0), owner_record(2)),
+            8 => WriteBatch::default().put(key(F0, 0), 3_u32.to_be_bytes().to_vec()),
+            _ => WriteBatch::default().put(key(F1, 0), owner_record(3)),
         };
         fixture.raw(batch);
         let before = fixture.snapshot();
@@ -127,14 +127,14 @@ fn structure_and_identity(durable: bool) -> TestResult {
             8 => assert!(matches!(
                 result,
                 Err(ReplayError::Journal(JournalError::UnsupportedVersion {
-                    found: 2,
+                    found: 3,
                     ..
                 }))
             )),
             _ => assert!(matches!(
                 result,
                 Err(ReplayError::Indexed(
-                    IndexedApplyError::UnsupportedVersion { found: 2, .. }
+                    IndexedApplyError::UnsupportedVersion { found: 3, .. }
                 ))
             )),
         }

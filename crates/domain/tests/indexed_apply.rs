@@ -569,13 +569,13 @@ fn malformed_ownership<P: StoreProvider>(provider: P) -> TestResult {
     }
     fixture.raw(
         WriteBatch::default()
-            .put(key(0), owner(2))
+            .put(key(0), owner(3))
             .put(key(1), good_checkpoint),
     );
     assert!(matches!(
         IndexedWriter::open(fixture.store().clone()),
         Err(IndexedApplyError::UnsupportedVersion {
-            found: 2,
+            found: 3,
             expected: 1
         })
     ));

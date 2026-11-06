@@ -8,16 +8,18 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use journal::{
-    JOURNAL_FORMAT_VERSION, JOURNAL_VALIDATION_PAGE_ENTRIES, Journal, JournalEntry, JournalError,
-    MAX_JOURNAL_PAYLOAD_BYTES, MAX_JOURNAL_READ_ENTRIES,
+    JOURNAL_ANCHORED_CONTAINER_VERSION, JOURNAL_FORMAT_VERSION, JOURNAL_VALIDATION_PAGE_ENTRIES,
+    Journal, JournalEntry, JournalError, MAX_JOURNAL_PAYLOAD_BYTES, MAX_JOURNAL_READ_ENTRIES,
 };
 pub use replay::{CommittedReplay, ReplayError, ReplayProgress};
 pub use snapshot::{
+    PreparedSnapshotAnchor, SNAPSHOT_ANCHOR_HASH_SCOPE, SNAPSHOT_ANCHOR_VERSION,
     SNAPSHOT_FORMAT_VERSION, SNAPSHOT_FRAME_DIGEST_BYTES, SNAPSHOT_FRAME_HASH_SCOPE,
-    SNAPSHOT_LAYOUT_VERSION, SNAPSHOT_MAGIC, SnapshotCapture, SnapshotCaptureError, SnapshotFormat,
-    SnapshotFormatError, SnapshotInstallError, SnapshotInstallLimits, SnapshotInstallOwner,
-    SnapshotInstallPolicy, SnapshotInstallReceipt, SnapshotLimit, SnapshotLimits, SnapshotManifest,
-    SnapshotView,
+    SNAPSHOT_LAYOUT_VERSION, SNAPSHOT_MAGIC, SnapshotAnchor, SnapshotAnchorError,
+    SnapshotAnchorLimits, SnapshotAnchorOwner, SnapshotAnchorReceipt, SnapshotCapture,
+    SnapshotCaptureError, SnapshotFormat, SnapshotFormatError, SnapshotInstallError,
+    SnapshotInstallLimits, SnapshotInstallOwner, SnapshotInstallPolicy, SnapshotInstallReceipt,
+    SnapshotLimit, SnapshotLimits, SnapshotManifest, SnapshotView,
 };
 
 pub const PRODUCTION_MINIMUM_VOTERS: u16 = 3;

@@ -14,7 +14,10 @@ use sha2::{Digest, Sha256};
 use storage::{StateStore, StorageError, WriteBatch};
 use thiserror::Error;
 
+use crate::snapshot::anchor::SnapshotAnchor;
+
 pub const JOURNAL_FORMAT_VERSION: u32 = 1;
+pub const JOURNAL_ANCHORED_CONTAINER_VERSION: u32 = 2;
 pub const MAX_JOURNAL_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub const MAX_JOURNAL_READ_ENTRIES: usize = 64;
 pub const JOURNAL_VALIDATION_PAGE_ENTRIES: usize = 32;
@@ -23,6 +26,7 @@ const PREFIX: &[u8] = b"\xF0switchyard/journal\0";
 const ROOT_TAG: u8 = 0;
 const FRONTIER_TAG: u8 = 1;
 const ENTRY_TAG: u8 = 2;
+const ANCHOR_TAG: u8 = 3;
 const ENTRY_HEADER_BYTES: usize = 48;
 const FRONTIER_BYTES: usize = 44;
 const ENTRY_HASH_SCOPE: &[u8] = b"switchyard journal entry v1\0";
@@ -48,6 +52,8 @@ impl JournalEntry {
 pub enum JournalError {
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    Indexed(#[from] domain::IndexedApplyError),
     #[error("the journal must be reopened after an ambiguous failed write")]
     Unusable,
     #[error("journal format {found} is unsupported; expected {expected}")]
@@ -68,6 +74,11 @@ pub enum JournalError {
     },
     #[error("journal read must start at a nonzero index")]
     InvalidReadStart,
+    #[error("journal prefix through {removed_through} is unavailable (requested {requested})")]
+    UnavailablePrefix {
+        requested: u64,
+        removed_through: u64,
+    },
     #[error("journal read limit {requested} is outside 1..={maximum}")]
     InvalidReadLimit { requested: usize, maximum: usize },
 }
@@ -87,6 +98,7 @@ pub struct Journal<S> {
     initialized: bool,
     committed: u64,
     last_appended: u64,
+    anchor: Option<SnapshotAnchor>,
     usable: bool,
 }
 
@@ -102,11 +114,18 @@ impl<S: StateStore> Journal<S> {
     /// deleted. A malformed tail refuses open, just like a corrupt committed
     /// prefix. Missing metadata with existing rows is never adopted.
     pub fn open(store: S) -> Result<Self, JournalError> {
+        let anchor = store
+            .get(&anchor_key())?
+            .map(|bytes| SnapshotAnchor::decode(&bytes))
+            .transpose()?;
+        let floor = anchor.as_ref().map_or(0, SnapshotAnchor::removed_through);
         let mut cursor = PREFIX.to_vec();
         let mut previous: Option<Vec<u8>> = None;
         let mut initialized = false;
         let mut committed = None;
-        let mut last_appended = 0;
+        let mut last_appended = floor;
+        let mut container_version = JOURNAL_FORMAT_VERSION;
+        let mut saw_anchor = false;
         loop {
             let page = store.scan_from(PREFIX, &cursor, JOURNAL_VALIDATION_PAGE_ENTRIES)?;
             if page.len() > JOURNAL_VALIDATION_PAGE_ENTRIES {
@@ -127,7 +146,12 @@ impl<S: StateStore> Journal<S> {
                 let suffix = &key[PREFIX.len()..];
                 match suffix {
                     [ROOT_TAG] => {
-                        require_version(&value)?;
+                        container_version = container_version_of(&value)?;
+                        if (container_version == JOURNAL_ANCHORED_CONTAINER_VERSION)
+                            != anchor.is_some()
+                        {
+                            return Err(corrupt("journal root and anchor are incomplete"));
+                        }
                         initialized = true;
                     }
                     [FRONTIER_TAG] => {
@@ -144,7 +168,24 @@ impl<S: StateStore> Journal<S> {
                         if entry.index != next_index(last_appended)? {
                             return Err(corrupt("journal entries contain a gap or regression"));
                         }
+                        if let Some(anchor) = &anchor
+                            && entry.index == anchor.applied_index()
+                            && value != anchor.original_entry()
+                        {
+                            return Err(corrupt("retained original entry differs from anchor"));
+                        }
                         last_appended = entry.index;
+                    }
+                    [ANCHOR_TAG] => {
+                        if !initialized || committed.is_none() || anchor.is_none() {
+                            return Err(corrupt("anchor has incomplete journal metadata"));
+                        }
+                        if SnapshotAnchor::decode(&value)?
+                            != *anchor.as_ref().expect("checked anchor")
+                        {
+                            return Err(corrupt("anchor changed during validation"));
+                        }
+                        saw_anchor = true;
                     }
                     _ => return Err(corrupt("journal key is not canonical")),
                 }
@@ -164,11 +205,48 @@ impl<S: StateStore> Journal<S> {
         if committed > last_appended {
             return Err(corrupt("frontier exceeds the appended prefix"));
         }
+        if anchor.is_some() != saw_anchor {
+            return Err(corrupt("anchor disappeared during validation"));
+        }
+        // Legacy journal ownership does not adopt or validate unrelated F1
+        // namespaces. A valid V2 owner is nevertheless a required pair fence.
+        let owner_version = match domain::IndexedWriter::<S>::persisted_owner_version(&store) {
+            Ok(version) => version,
+            Err(error) if container_version == JOURNAL_ANCHORED_CONTAINER_VERSION => {
+                return Err(error.into());
+            }
+            Err(domain::IndexedApplyError::Storage(error)) => return Err(error.into()),
+            Err(_) => None,
+        };
+        if (container_version == JOURNAL_ANCHORED_CONTAINER_VERSION) != (owner_version == Some(2)) {
+            return Err(corrupt("journal and indexed owner versions are incomplete"));
+        }
+        if let Some(anchor) = &anchor {
+            if committed < anchor.source_manifest().committed_index()
+                || last_appended < anchor.source_manifest().last_appended_index()
+            {
+                return Err(corrupt(
+                    "journal frontiers regress behind the anchor source",
+                ));
+            }
+            let (applied, digest) = domain::IndexedWriter::<S>::snapshot_anchor_checkpoint(&store)?;
+            if applied < anchor.applied_index() || applied > committed {
+                return Err(corrupt("anchored applied checkpoint is outside A..=C"));
+            }
+            if applied == anchor.applied_index()
+                && Some(digest) != anchor.source_manifest().latest_applied_digest()
+            {
+                return Err(corrupt(
+                    "anchored latest checkpoint and original identity differ",
+                ));
+            }
+        }
         Ok(Self {
             store,
             initialized,
             committed,
             last_appended,
+            anchor,
             usable: true,
         })
     }
@@ -181,6 +259,19 @@ impl<S: StateStore> Journal<S> {
     pub fn last_appended_index(&self) -> Result<u64, JournalError> {
         self.require_usable()?;
         Ok(self.last_appended)
+    }
+
+    pub fn snapshot_anchor(&self) -> Result<Option<&SnapshotAnchor>, JournalError> {
+        self.require_usable()?;
+        Ok(self.anchor.as_ref())
+    }
+
+    pub fn removed_through(&self) -> Result<u64, JournalError> {
+        self.require_usable()?;
+        Ok(self
+            .anchor
+            .as_ref()
+            .map_or(0, SnapshotAnchor::removed_through))
     }
 
     /// Durably appends exactly the next index, without advancing the frontier.
@@ -256,6 +347,13 @@ impl<S: StateStore> Journal<S> {
         limit: usize,
     ) -> Result<Vec<JournalEntry>, JournalError> {
         self.require_usable()?;
+        let removed_through = self.removed_through()?;
+        if self.anchor.is_some() && from <= removed_through {
+            return Err(JournalError::UnavailablePrefix {
+                requested: from,
+                removed_through,
+            });
+        }
         if from == 0 {
             return Err(JournalError::InvalidReadStart);
         }
@@ -330,10 +428,35 @@ fn metadata_key(tag: u8) -> Vec<u8> {
     key
 }
 
-fn entry_key(index: u64) -> Vec<u8> {
+pub(crate) fn entry_key(index: u64) -> Vec<u8> {
     let mut key = metadata_key(ENTRY_TAG);
     key.extend_from_slice(&index.to_be_bytes());
     key
+}
+
+pub(crate) fn anchor_key() -> Vec<u8> {
+    metadata_key(ANCHOR_TAG)
+}
+
+pub(crate) fn anchored_root() -> (Vec<u8>, [u8; 4]) {
+    (
+        metadata_key(ROOT_TAG),
+        JOURNAL_ANCHORED_CONTAINER_VERSION.to_be_bytes(),
+    )
+}
+
+fn container_version_of(bytes: &[u8]) -> Result<u32, JournalError> {
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| corrupt("version has the wrong length"))?;
+    let found = u32::from_be_bytes(bytes);
+    if found != JOURNAL_FORMAT_VERSION && found != JOURNAL_ANCHORED_CONTAINER_VERSION {
+        return Err(JournalError::UnsupportedVersion {
+            found,
+            expected: JOURNAL_ANCHORED_CONTAINER_VERSION,
+        });
+    }
+    Ok(found)
 }
 
 fn require_version(bytes: &[u8]) -> Result<(), JournalError> {
@@ -369,7 +492,7 @@ fn encode_entry(index: u64, payload: &[u8]) -> Vec<u8> {
     value
 }
 
-fn decode_entry(key: &[u8], value: &[u8]) -> Result<JournalEntry, JournalError> {
+pub(crate) fn decode_entry(key: &[u8], value: &[u8]) -> Result<JournalEntry, JournalError> {
     let prefix = metadata_key(ENTRY_TAG);
     let suffix = key
         .strip_prefix(prefix.as_slice())
@@ -466,5 +589,22 @@ mod tests {
         let decoded = decode_entry(&entry_key(u64::MAX), &encode_entry(u64::MAX, payload)).unwrap();
         assert_eq!(decoded.index(), u64::MAX);
         assert_eq!(decoded.payload(), payload);
+    }
+
+    #[test]
+    fn container_v2_does_not_change_v1_entry_frontier_or_old_root_gate() {
+        let (key, root) = anchored_root();
+        assert_eq!(key, metadata_key(ROOT_TAG));
+        assert_eq!(root, [0, 0, 0, 2]);
+        assert_eq!(container_version_of(&root), Ok(2));
+        assert_eq!(
+            require_version(&root),
+            Err(JournalError::UnsupportedVersion {
+                found: 2,
+                expected: 1
+            })
+        );
+        assert_eq!(&encode_entry(1, b"opaque")[..4], &[0, 0, 0, 1]);
+        assert_eq!(&encode_frontier(1)[..4], &[0, 0, 0, 1]);
     }
 }

@@ -5,10 +5,15 @@
 //! one image with separately retained provenance; it does not certify authority
 //! or installation and requires caller-enforced exclusion of every writer.
 
+pub(crate) mod anchor;
 mod capture;
 mod format;
 mod install;
 
+pub use anchor::{
+    PreparedSnapshotAnchor, SNAPSHOT_ANCHOR_HASH_SCOPE, SNAPSHOT_ANCHOR_VERSION, SnapshotAnchor,
+    SnapshotAnchorError, SnapshotAnchorLimits, SnapshotAnchorOwner, SnapshotAnchorReceipt,
+};
 pub use capture::{SnapshotCapture, SnapshotCaptureError};
 pub use format::{
     SNAPSHOT_FORMAT_VERSION, SNAPSHOT_FRAME_DIGEST_BYTES, SNAPSHOT_FRAME_HASH_SCOPE,

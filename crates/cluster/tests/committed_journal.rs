@@ -393,7 +393,10 @@ fn pages(durable: bool) {
             |(prefix, _, limit)| prefix == PREFIX && *limit == JOURNAL_VALIDATION_PAGE_ENTRIES
         ));
         assert!(trace.scans.windows(2).all(|pages| pages[0].1 < pages[1].1));
-        assert!(trace.gets.is_empty());
+        assert_eq!(
+            trace.gets,
+            vec![key(3), b"\xF1switchyard/replay\0\0".to_vec()]
+        );
     }
     let first = reopened
         .read_committed(1, MAX_JOURNAL_READ_ENTRIES)
@@ -483,7 +486,7 @@ fn corruption(durable: bool) {
         let batch = match variant {
             0 => WriteBatch::default().delete(key(0)),
             1 => WriteBatch::default().put(key(0), vec![1]),
-            2 => WriteBatch::default().put(key(0), 2_u32.to_be_bytes().to_vec()),
+            2 => WriteBatch::default().put(key(0), 3_u32.to_be_bytes().to_vec()),
             3 => WriteBatch::default().delete(key(1)),
             4 => WriteBatch::default().put(key(1), vec![0]),
             5 => {
@@ -548,9 +551,9 @@ fn corruption(durable: bool) {
                 matches!(
                     opened,
                     Err(JournalError::UnsupportedVersion {
-                        found: 2,
-                        expected: JOURNAL_FORMAT_VERSION
-                    })
+                        found,
+                        ..
+                    }) if found == if variant == 2 { 3 } else { 2 }
                 ),
                 "variant {variant}"
             );
@@ -669,7 +672,10 @@ fn footprint(durable: bool) {
     assert_eq!(entries.len(), 2);
     {
         let trace = observed.trace.lock().unwrap();
-        assert!(trace.gets.is_empty());
+        assert_eq!(
+            trace.gets,
+            vec![key(3), b"\xF1switchyard/replay\0\0".to_vec()]
+        );
         assert_eq!(
             trace.scans,
             vec![

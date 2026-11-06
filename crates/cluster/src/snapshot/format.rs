@@ -172,6 +172,13 @@ pub(crate) struct FrameSize {
     encoded_bytes: usize,
 }
 
+/// A borrowed key and its value's length, without staging the value itself.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecordShape<'a> {
+    pub key: &'a [u8],
+    pub value_bytes: usize,
+}
+
 impl SnapshotFormat {
     /// Preflights the whole frame before one fallible output reservation.
     pub fn encode(
@@ -225,11 +232,31 @@ impl SnapshotFormat {
         records: &[(Key, Value)],
         limits: SnapshotLimits,
     ) -> Result<FrameSize, SnapshotFormatError> {
-        let count = wire_length(records.len())?;
+        Self::preflight_shapes(
+            has_applied_identity,
+            records.iter().map(|(key, value)| RecordShape {
+                key,
+                value_bytes: value.len(),
+            }),
+            limits,
+        )
+    }
+
+    /// The same checks for an immutable virtual image. Counting a clone first
+    /// preserves count-limit precedence without an O(image) shape allocation.
+    pub(crate) fn preflight_shapes<'a>(
+        has_applied_identity: bool,
+        records: impl Iterator<Item = RecordShape<'a>> + Clone,
+        limits: SnapshotLimits,
+    ) -> Result<FrameSize, SnapshotFormatError> {
+        let count = records
+            .clone()
+            .try_fold(0usize, |count, _| checked_add(count, 1))?;
+        let count = wire_length(count)?;
         check_limit(SnapshotLimit::Records, count, limits.max_records)?;
         let mut section_bytes = 0;
         let mut previous: Option<&[u8]> = None;
-        for (key, value) in records {
+        for RecordShape { key, value_bytes } in records {
             check_limit(
                 SnapshotLimit::KeyBytes,
                 wire_length(key.len())?,
@@ -237,15 +264,15 @@ impl SnapshotFormat {
             )?;
             check_limit(
                 SnapshotLimit::ValueBytes,
-                wire_length(value.len())?,
+                wire_length(value_bytes)?,
                 limits.max_value_bytes,
             )?;
-            if previous.is_some_and(|previous| previous >= key.as_slice()) {
+            if previous.is_some_and(|previous| previous >= key) {
                 return Err(SnapshotFormatError::NonCanonicalRecords);
             }
             section_bytes = checked_add(section_bytes, RECORD_LENGTH_BYTES)?;
             section_bytes = checked_add(section_bytes, key.len())?;
-            section_bytes = checked_add(section_bytes, value.len())?;
+            section_bytes = checked_add(section_bytes, value_bytes)?;
             previous = Some(key);
         }
         let section_length = wire_length(section_bytes)?;
@@ -477,6 +504,16 @@ mod tests {
             let manifest =
                 SnapshotManifest::new(SNAPSHOT_LAYOUT_VERSION, applied, 1, 1, identity).unwrap();
             let size = SnapshotFormat::preflight(identity.is_some(), &records, UNBOUNDED).unwrap();
+            let shapes = records.iter().map(|(key, value)| RecordShape {
+                key,
+                value_bytes: value.len(),
+            });
+            let borrowed =
+                SnapshotFormat::preflight_shapes(identity.is_some(), shapes.clone(), UNBOUNDED)
+                    .unwrap();
+            assert_eq!(borrowed.count, size.count);
+            assert_eq!(borrowed.section_length, size.section_length);
+            assert_eq!(borrowed.encoded_bytes, size.encoded_bytes);
             assert_eq!(size.count, 2);
             assert_eq!(size.section_length, 37);
             assert_eq!(
@@ -526,10 +563,53 @@ mod tests {
                     expected
                 );
                 assert_eq!(
+                    SnapshotFormat::preflight_shapes(identity.is_some(), shapes.clone(), smaller)
+                        .unwrap_err(),
+                    expected
+                );
+                assert_eq!(
                     SnapshotFormat::encode(&manifest, &records, smaller).unwrap_err(),
                     expected
                 );
             }
+        }
+    }
+
+    #[test]
+    fn borrowed_shapes_check_overflow_without_materializing_values() {
+        let shapes = [RecordShape {
+            key: &[1],
+            value_bytes: usize::MAX,
+        }];
+        assert_eq!(
+            SnapshotFormat::preflight_shapes(false, shapes.into_iter(), UNBOUNDED).unwrap_err(),
+            SnapshotFormatError::SizeOverflow
+        );
+        assert_eq!(
+            SnapshotFormat::preflight_shapes(
+                false,
+                shapes.into_iter(),
+                SnapshotLimits {
+                    max_records: 0,
+                    ..UNBOUNDED
+                }
+            )
+            .unwrap_err(),
+            SnapshotFormatError::LimitExceeded {
+                kind: SnapshotLimit::Records,
+                requested: 1,
+                maximum: 0,
+            }
+        );
+        for keys in [[1, 1], [2, 1]] {
+            let shapes = keys.iter().map(|key| RecordShape {
+                key: std::slice::from_ref(key),
+                value_bytes: 0,
+            });
+            assert_eq!(
+                SnapshotFormat::preflight_shapes(false, shapes, UNBOUNDED).unwrap_err(),
+                SnapshotFormatError::NonCanonicalRecords
+            );
         }
     }
 

@@ -153,7 +153,19 @@ logical fallback. Caller exclusion includes all writers, raw/topology handles
 and previous domain/journal/replay owners. Apply errors or escaping original
 panics retire the non-Clone owner until reopen; receipts do not certify recovery,
 authentication or anti-rollback authority. Limits are post-snapshot logical
-acceptance bounds, not physical allocation/disk guarantees. Versions are unchanged.
+acceptance bounds, not physical allocation/disk guarantees.
+
+Separate offline `SnapshotAnchorOwner` attachment accepts only the exact installed
+capture, including every opaque tail record, and requires a nonzero applied index.
+It atomically puts an anchor, journal-container V2 and indexed-owner V2 without
+deleting entries or changing domain rows, Clock, frontier or checkpoint bytes.
+The anchor retains the original applied proposal envelope, source manifest and
+pre-attachment frame identity. A later recapture has its own different frame hash.
+Legacy unanchored stores remain V1 on open and write. Entry/frontier/checkpoint V1
+bytes and indexed proposal hashes do not change. Old journal and indexed-owner
+readers respectively refuse the V2 fences; this is not a global barrier for old
+unindexed APIs or Fjall. Rollback requires a coherent compatible image, not marker
+stripping. There is no pruning API or suffix reconciliation in attachment.
 Token-exhausted receive, deferred receive and session acceptance discard every
 staged effect, including earlier TTL routing in the same command. Indexed refusals
 may initialize their private owner and advance only the `0xF1` checkpoint; domain
@@ -175,7 +187,8 @@ DTOs. Only nonlegacy topic creation uses private V3, including invalid new setti
 that must survive for deterministic refusal. New readers accept V1/V2/V3; older
 readers refuse unsupported proposal versions.
 
-Store format 2, journal and indexed-checkpoint formats remain unchanged. Canonical
+Store format 2 and journal-entry/frontier/indexed-checkpoint formats remain unchanged;
+snapshot anchors use the separate owner/container fences described above. Canonical
 topic values alone use V2 when duplicate detection is enabled or its window differs
 from 600,000ms; disabled/default-window topics retain exact legacy V1 bytes. The
 topic codec rejects unknown, truncated, trailing, noncanonical and redundant V2
