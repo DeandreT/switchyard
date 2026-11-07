@@ -30,7 +30,7 @@ mod topic;
 
 pub use codec::CodecError;
 pub use command::{Command, CommandKind, CommandOutcome, MessageContent, MessageInput, RawMessage};
-pub use content::{CONTENT_LIMITS, MessageContentError};
+pub use content::{CONTENT_LIMITS, MessageContentError, PROPERTY_PATCH_HEADROOM_BYTES};
 pub use durable_proposal::{
     DurableProposal, DurableProposalAuthority, DurableProposalError, MAX_DURABLE_PROPOSAL_BYTES,
 };

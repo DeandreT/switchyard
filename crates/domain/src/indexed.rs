@@ -351,6 +351,9 @@ fn ordinary_deterministic_refusal(kind: &CommandKind, error: &BrokerError) -> bo
                 | C::Abandon { .. }
                 | C::Defer { .. }
                 | C::DeadLetter { .. }
+                | C::AbandonWithPatch { .. }
+                | C::DeferWithPatch { .. }
+                | C::DeadLetterWithPatch { .. }
                 | C::RenewLock { .. }
         ),
         E::MessageNotScheduled { .. } => matches!(kind, C::CancelScheduled { .. }),
