@@ -45,8 +45,10 @@ The [server arguments](crates/server/src/main.rs) expose TLS certificate/key
 files, shared-access policy files, namespace, and transport selection. TLS
 defaults to port 5671; `--transport amqp-websockets` requires TLS and defaults to
 443. `--max-connections <count>` bounds live listener sockets, handshakes
-included; omitted, admission is unbounded. Plaintext is development-only. These
-checks do not provide replication.
+included; omitted, admission is unbounded. `--admission-timeout-secs <seconds>`
+(default 60) is one budget per accepted socket for TLS, any WebSocket upgrade,
+SASL and AMQP Open together; a socket still handshaking at the deadline is
+closed. Plaintext is development-only. These checks do not provide replication.
 
 ## Workspace
 

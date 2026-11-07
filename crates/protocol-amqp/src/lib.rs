@@ -36,7 +36,7 @@ pub use crate::{
         TIMEOUT, condition_for, is_retryable,
     },
     listener::{
-        AmqpListener,
+        AmqpListener, DEFAULT_ADMISSION_TIMEOUT,
         service::{
             AmqpListenerExit, AmqpListenerFailure, AmqpListenerRetirement, AmqpListenerService,
         },

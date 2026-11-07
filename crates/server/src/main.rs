@@ -3,7 +3,7 @@
 use std::{
     fs,
     net::SocketAddr,
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
@@ -14,7 +14,8 @@ use std::{
 use clap::{Parser, ValueEnum};
 use cluster::{ClusterConfig, DeploymentMode};
 use protocol_amqp::{
-    AmqpListener, SharedAccessAuthentication, namespace_from_hostname, tls_server_config,
+    AmqpListener, DEFAULT_ADMISSION_TIMEOUT, SharedAccessAuthentication, namespace_from_hostname,
+    tls_server_config,
 };
 use rustls::ServerConfig;
 use server::{
@@ -79,6 +80,16 @@ struct Arguments {
     /// Unbounded when omitted.
     #[arg(long, value_name = "COUNT")]
     max_connections: Option<NonZeroUsize>,
+
+    /// Seconds an accepted socket has to finish TLS, any WebSocket upgrade,
+    /// SASL and AMQP Open, as one budget that is not reset between stages.
+    /// A connection still handshaking at the deadline is closed.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = default_admission_timeout_secs()
+    )]
+    admission_timeout_secs: NonZeroU64,
 
     /// The namespace this node serves. A hostname is accepted and its first
     /// label taken, so a deployment can name namespaces in DNS.
@@ -234,6 +245,11 @@ fn main() -> ExitCode {
     }
 }
 
+fn default_admission_timeout_secs() -> NonZeroU64 {
+    NonZeroU64::new(DEFAULT_ADMISSION_TIMEOUT.as_secs())
+        .expect("the default budget is whole nonzero seconds")
+}
+
 fn run() -> Result<(), StartupError> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -301,8 +317,10 @@ fn run() -> Result<(), StartupError> {
                 address: listen.to_string(),
                 detail: error.to_string(),
             })?;
-        info!(address = %listen, namespace = %namespace, tls = tls.is_some(), transport = ?arguments.transport, max_connections = ?arguments.max_connections, "accepting AMQP connections");
-        let amqp = AmqpListener::new(broker.handle(), namespace);
+        info!(address = %listen, namespace = %namespace, tls = tls.is_some(), transport = ?arguments.transport, max_connections = ?arguments.max_connections, admission_timeout_secs = arguments.admission_timeout_secs, "accepting AMQP connections");
+        let amqp = AmqpListener::new(broker.handle(), namespace).with_admission_timeout(
+            Duration::from_secs(arguments.admission_timeout_secs.get()),
+        );
         let amqp = match arguments.max_connections {
             Some(limit) => amqp.with_max_connections(limit),
             None => amqp,
@@ -381,6 +399,26 @@ mod tests {
         for invalid in ["0", "-1", "many", ""] {
             assert!(
                 parse(&["--max-connections", invalid]).is_err(),
+                "{invalid:?} is refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_admission_timeout_defaults_to_sixty_seconds_and_refuses_zero() {
+        let parse = |extra: &[&str]| {
+            Arguments::try_parse_from(["switchyard"].iter().chain(extra))
+                .map(|arguments| arguments.admission_timeout_secs.get())
+        };
+        assert_eq!(parse(&[]).unwrap(), 60);
+        assert_eq!(
+            Duration::from_secs(parse(&[]).unwrap()),
+            DEFAULT_ADMISSION_TIMEOUT
+        );
+        assert_eq!(parse(&["--admission-timeout-secs", "5"]).unwrap(), 5);
+        for invalid in ["0", "-1", "soon", "1.5", ""] {
+            assert!(
+                parse(&["--admission-timeout-secs", invalid]).is_err(),
                 "{invalid:?} is refused"
             );
         }

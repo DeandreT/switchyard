@@ -9,6 +9,7 @@ use std::{
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::Arc,
+    time::Duration,
 };
 
 #[cfg(test)]
@@ -59,6 +60,9 @@ const LOCKED_UNTIL_UTC_PROPERTY: &str = "com.microsoft:locked-until-utc";
 const DOTNET_UNIX_EPOCH_TICKS: u64 = 621_355_968_000_000_000;
 const DOTNET_TICKS_PER_MILLISECOND: u64 = 10_000;
 
+/// The aggregate admission budget a listener applies unless configured.
+pub const DEFAULT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub struct AmqpListener<B> {
     broker: B,
     namespace: NamespaceName,
@@ -66,10 +70,13 @@ pub struct AmqpListener<B> {
     tls_acceptor: Option<TlsAcceptor>,
     shared_access_authentication: Option<SharedAccessAuthentication>,
     max_connections: Option<NonZeroUsize>,
+    admission_timeout: Duration,
 }
 
 impl<B: Broker> AmqpListener<B> {
-    /// A listener with no live-socket limit; see `with_max_connections`.
+    /// A listener with no live-socket limit; see `with_max_connections`. Its
+    /// admission budget is `DEFAULT_ADMISSION_TIMEOUT`; see
+    /// `with_admission_timeout`.
     pub fn new(broker: B, namespace: NamespaceName) -> Self {
         Self {
             broker,
@@ -78,6 +85,7 @@ impl<B: Broker> AmqpListener<B> {
             tls_acceptor: None,
             shared_access_authentication: None,
             max_connections: None,
+            admission_timeout: DEFAULT_ADMISSION_TIMEOUT,
         }
     }
 
@@ -90,6 +98,25 @@ impl<B: Broker> AmqpListener<B> {
     /// accepted and closed. Without this call the listener is unbounded.
     pub fn with_max_connections(mut self, limit: NonZeroUsize) -> Self {
         self.max_connections = Some(limit);
+        self
+    }
+
+    /// Bounds the time an accepted socket may take to become an open AMQP
+    /// connection.
+    ///
+    /// One monotonic budget starts at accept and spans any TLS handshake,
+    /// WebSocket upgrade, SASL exchange and AMQP Open; it is not reset between
+    /// stages. On expiry the handshake is dropped, closing the socket, and the
+    /// original connection task ends with a `TimedOut` error; any connection
+    /// slot is released when that task is joined. No broker work starts before
+    /// Open, and the budget no longer applies once Open completes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `timeout` is zero.
+    pub fn with_admission_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "the admission timeout is nonzero");
+        self.admission_timeout = timeout;
         self
     }
 
