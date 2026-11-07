@@ -165,7 +165,13 @@ Legacy unanchored stores remain V1 on open and write. Entry/frontier/checkpoint 
 bytes and indexed proposal hashes do not change. Old journal and indexed-owner
 readers respectively refuse the V2 fences; this is not a global barrier for old
 unindexed APIs or Fjall. Rollback requires a coherent compatible image, not marker
-stripping. There is no pruning API or suffix reconciliation in attachment.
+stripping. Attachment neither prunes nor reconciles suffixes.
+Separate offline `SnapshotCompactionOwner` compaction requires a valid anchor with
+B<A and atomically deletes entries B+1..=A while rewriting only the anchor's B to
+A; every other record stays byte-exact. Unanchored, already compacted, divergent
+or invalid images refuse without writes. Anchor V1 and container/owner V2 are
+unchanged, so compacted images open under the same readers. Read-only
+`select_recovery` classifies a validated image as legacy, anchored or compacted.
 Token-exhausted receive, deferred receive and session acceptance discard every
 staged effect, including earlier TTL routing in the same command. Indexed refusals
 may initialize their private owner and advance only the `0xF1` checkpoint; domain

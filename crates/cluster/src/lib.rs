@@ -13,13 +13,15 @@ pub use journal::{
 };
 pub use replay::{CommittedReplay, ReplayError, ReplayProgress};
 pub use snapshot::{
-    PreparedSnapshotAnchor, SNAPSHOT_ANCHOR_HASH_SCOPE, SNAPSHOT_ANCHOR_VERSION,
-    SNAPSHOT_FORMAT_VERSION, SNAPSHOT_FRAME_DIGEST_BYTES, SNAPSHOT_FRAME_HASH_SCOPE,
-    SNAPSHOT_LAYOUT_VERSION, SNAPSHOT_MAGIC, SnapshotAnchor, SnapshotAnchorError,
-    SnapshotAnchorLimits, SnapshotAnchorOwner, SnapshotAnchorReceipt, SnapshotCapture,
-    SnapshotCaptureError, SnapshotFormat, SnapshotFormatError, SnapshotInstallError,
-    SnapshotInstallLimits, SnapshotInstallOwner, SnapshotInstallPolicy, SnapshotInstallReceipt,
-    SnapshotLimit, SnapshotLimits, SnapshotManifest, SnapshotView,
+    PreparedSnapshotAnchor, PreparedSnapshotCompaction, SNAPSHOT_ANCHOR_HASH_SCOPE,
+    SNAPSHOT_ANCHOR_VERSION, SNAPSHOT_FORMAT_VERSION, SNAPSHOT_FRAME_DIGEST_BYTES,
+    SNAPSHOT_FRAME_HASH_SCOPE, SNAPSHOT_LAYOUT_VERSION, SNAPSHOT_MAGIC, SnapshotAnchor,
+    SnapshotAnchorError, SnapshotAnchorLimits, SnapshotAnchorOwner, SnapshotAnchorReceipt,
+    SnapshotCapture, SnapshotCaptureError, SnapshotCompactionError, SnapshotCompactionLimits,
+    SnapshotCompactionOwner, SnapshotCompactionReceipt, SnapshotFormat, SnapshotFormatError,
+    SnapshotInstallError, SnapshotInstallLimits, SnapshotInstallOwner, SnapshotInstallPolicy,
+    SnapshotInstallReceipt, SnapshotLimit, SnapshotLimits, SnapshotManifest, SnapshotRecoveryClass,
+    SnapshotRecoverySelection, SnapshotView, select_recovery,
 };
 
 pub const PRODUCTION_MINIMUM_VOTERS: u16 = 3;

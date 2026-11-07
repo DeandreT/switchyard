@@ -83,7 +83,7 @@ on success with its prebuilt result. A returned apply error or escaping original
 panic leaves all I/O and release APIs unusable until all handles close and the
 store is reopened. There is no retry, rollback, compensation or production panic
 catching. Receipts are operational results, not installation/recovery certificates.
-Live installation, runtime activation, compaction and power-cut/fsync qualification
+Live installation, runtime activation, online compaction and power-cut/fsync qualification
 remain separate work. Replacement itself does not migrate any format.
 
 ### Snapshot Anchor Attachment
@@ -130,10 +130,36 @@ Legacy unanchored V1 owners open and continue writing V1 without migration. Exis
 entry/frontier/checkpoint encodings, proposal hashes, store format and SWSS framing
 are unchanged. Old journal readers refuse container V2 and old indexed writers
 refuse owner V2, but old unindexed APIs are not fenced globally. Attachment refuses
-to replace an existing anchor; it offers neither pruning nor a history-rebinding
-API. Prefix-removed controls are synthetic fixtures for a later compaction operation.
+to replace an existing anchor and offers no history-rebinding API.
 Receipts and controlled before/after apply faults are not process-crash, power-cut,
 quorum, runtime activation or recovered-outcome certification.
+
+### Snapshot Compaction And Recovery Selection
+
+`SnapshotCompactionOwner` is a separate, explicit offline operation with the same
+lifecycle as attachment: one sealed backend inspection, complete validation of
+that immutable image (domain, F0/F1, anchor and replay frontier), then a
+target-bound single-use preparation. It requires an anchor with B<A; an
+unanchored image refuses (attach first) and B=A refuses as already compacted,
+both without writes. Divergent physical A, gaps, corrupt anchors or invalid
+domain state refuse; nothing is repaired.
+
+One atomic batch deletes exactly entries B+1 through A, taken from the validated
+image, and rewrites the anchor with B=A. Root and owner fences, the frontier, the
+checkpoint, committed-unapplied (A,C], the opaque (C,L] tail, domain rows and
+Clock stay byte-exact. The deletion count, logical mutation bytes (deleted keys
+plus the anchor key and value) and exact resulting-frame caps are checked over a
+borrowed virtual result before the batch is staged; native Fjall also bounds the
+combined u32 mutation count. The owner retires before apply and stays retired on
+a returned error or escaping original panic, without retry or compensation. With
+P=A the anchor original verifies the checkpoint; with P>A entry P is retained.
+Replay still applies only (P,C]. A compacted capture installs like any other.
+
+Read-only `select_recovery` validates one inspected image exactly as capture does
+and reports its class (legacy unanchored, anchored B<A or compacted B=A) with A,
+B, P, C and L, or refuses. It performs no repair, replay or writes. Neither its
+selection nor a compaction receipt is a recovery or authenticity certificate.
+There is no live, background or retention-driven compaction.
 
 Peek-lock commits ownership before transfer and deletes only on settlement;
 receive-delete deletes first. Renewal preserves
