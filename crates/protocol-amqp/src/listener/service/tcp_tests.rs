@@ -749,10 +749,16 @@ async fn actual_child_error_and_reached_reporter_panic_do_not_stop_healthy_admis
     let (mut service, address) = owner(broker.clone()).await;
     let observer = Arc::new(Observer::default());
     let reached = Arc::new(AtomicUsize::new(0));
+    // A second live dispatcher keeps interest rebuilds on the registered list;
+    // alone, the reporter loses to the default of whichever thread rebuilds.
+    let other = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let dispatch = tracing::Dispatch::new(Reporter {
         reached: Arc::clone(&reached),
         payload: marker("reached narrow listener reporter"),
     });
+    std::thread::spawn(tracing::callsite::rebuild_interest_cache)
+        .join()
+        .unwrap();
     let mut bad = TcpStream::connect(address).await.unwrap();
     drive(&mut service, Arc::clone(&observer), async {
         write_protocol_header(&mut bad, ProtocolHeader::SASL)
@@ -763,6 +769,7 @@ async fn actual_child_error_and_reached_reporter_panic_do_not_stop_healthy_admis
     .with_subscriber(dispatch)
     .await;
     assert_eq!(reached.load(Ordering::SeqCst), 1);
+    drop(other);
     assert!(service.family.is_empty());
     let mut healthy = TcpStream::connect(address).await.unwrap();
     drive(&mut service, Arc::clone(&observer), async {
