@@ -45,7 +45,7 @@ async fn send_fault_notice_precedes_original_commit_drain_on_both_backends() {
                         let log = actor.log.lock().unwrap();
                         assert_eq!(log.len(), 1, "the original command is still held");
                         assert!(!log[0].returned);
-                        assert_eq!(matches!(log[0].kind, CommandKind::SendBatch { .. }), batch);
+                        assert_eq!(matches!(log[0].kind, CommandKind::SendContentBatch { .. }), batch);
                     }
                     actor.gate.release_all();
                     assert_outer(timeout(WAIT, original.as_mut()).await.unwrap(), &fault);

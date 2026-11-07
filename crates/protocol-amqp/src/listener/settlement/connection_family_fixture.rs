@@ -277,19 +277,15 @@ pub(super) fn invocations(actor: &Actor) -> usize {
         .lock()
         .unwrap()
         .iter()
-        .filter(|entry| !entry.returned && matches!(entry.kind, CommandKind::Send { .. }))
+        .filter(|entry| !entry.returned && matches!(entry.kind, CommandKind::SendContent { .. }))
         .count()
 }
 pub(super) async fn returned(actor: &Actor) {
     timeout(WAIT, async {
         loop {
-            if actor
-                .log
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|entry| entry.returned && matches!(entry.kind, CommandKind::Send { .. }))
-            {
+            if actor.log.lock().unwrap().iter().any(|entry| {
+                entry.returned && matches!(entry.kind, CommandKind::SendContent { .. })
+            }) {
                 return;
             }
             tokio::task::yield_now().await;

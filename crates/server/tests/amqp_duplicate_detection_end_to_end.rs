@@ -5,7 +5,7 @@ use std::{error::Error, io, time::Duration};
 use amqp::{
     AmqpError, Body, ClientConnection as Connection, ClientReceiver as Receiver,
     ClientSender as Sender, ClientSession as Session, ErrorCondition, Message, MessageAnnotations,
-    Outcome, Properties, Value, encode_message,
+    Outcome, Properties, Value, decode_stored_message, encode_message,
 };
 use domain::{
     CommandKind, CommandOutcome, Delivery, DeliveryOrigin, MAX_MESSAGE_ID_CHARACTERS, QueueConfig,
@@ -132,6 +132,17 @@ fn text_of(message: &Message) -> String {
     }
 }
 
+/// The body text of a peeked record. Ingress sends original content, so the
+/// stored V2 record keeps it once, in the envelope.
+fn stored_text(delivery: &Delivery) -> String {
+    assert!(delivery.body.is_empty(), "the envelope is the only copy");
+    let envelope = delivery
+        .envelope
+        .as_ref()
+        .expect("content sends keep an envelope");
+    text_of(&decode_stored_message(envelope.as_bytes()).expect("the envelope decodes"))
+}
+
 async fn receive_texts(
     receiver: &mut Receiver,
     count: usize,
@@ -171,11 +182,8 @@ async fn a_singular_duplicate_is_accepted_but_only_the_first_copy_is_visible()
         Outcome::Accepted(_)
     ));
     assert_eq!(
-        node.peek()?
-            .iter()
-            .map(|delivery| delivery.body.as_slice())
-            .collect::<Vec<_>>(),
-        vec![b"first-body".as_slice()]
+        node.peek()?.iter().map(stored_text).collect::<Vec<_>>(),
+        ["first-body"]
     );
 
     let mut receiver = Receiver::attach(&mut session, "dedupe-receiver", "orders").await?;
@@ -210,10 +218,7 @@ async fn a_mixed_duplicate_batch_is_accepted_and_stores_only_first_copies()
         Outcome::Accepted(_)
     ));
     assert_eq!(
-        node.peek()?
-            .iter()
-            .map(|delivery| String::from_utf8_lossy(&delivery.body).into_owned())
-            .collect::<Vec<_>>(),
+        node.peek()?.iter().map(stored_text).collect::<Vec<_>>(),
         ["batch-a-first", "batch-b-first"]
     );
 
@@ -247,7 +252,7 @@ async fn scheduled_and_immediate_sends_suppress_each_other_in_acceptance_order()
     }
     let scheduled = node.peek()?;
     assert_eq!(scheduled.len(), 1);
-    assert_eq!(scheduled[0].body, b"scheduled-winner");
+    assert_eq!(stored_text(&scheduled[0]), "scheduled-winner");
     assert_eq!(scheduled[0].origin, DeliveryOrigin::Scheduled);
     node.cancel_scheduled(scheduled[0].sequence)?;
 
@@ -262,7 +267,7 @@ async fn scheduled_and_immediate_sends_suppress_each_other_in_acceptance_order()
     }
     let immediate = node.peek()?;
     assert_eq!(immediate.len(), 1);
-    assert_eq!(immediate[0].body, b"immediate-winner");
+    assert_eq!(stored_text(&immediate[0]), "immediate-winner");
     assert_eq!(immediate[0].origin, DeliveryOrigin::Ready);
 
     let mut receiver = Receiver::attach(&mut session, "cross-dedupe-receiver", "orders").await?;

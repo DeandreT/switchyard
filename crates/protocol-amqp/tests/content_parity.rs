@@ -352,3 +352,89 @@ fn a_string_array_with_a_non_ascii_element_refuses_at_derive() {
         Err(MessageContentError::UnsupportedArrayElement)
     );
 }
+
+/// A message sent before the switch to content sends, as a V1 command built
+/// from what ingress read, and the same bytes sent again as proposal V4 content
+/// share one duplicate-detection identity for every identifier type.
+#[test]
+fn duplicate_detection_spans_legacy_and_content_sends() {
+    use domain::{
+        Command, CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueConfig, StateMachine,
+        Timestamp as DomainTimestamp,
+    };
+    use storage::MemoryStore;
+
+    let namespace = NamespaceName::new("tenant").expect("namespace");
+    let entity = EntityPath::new("orders").expect("entity");
+    let machine = StateMachine::new(MemoryStore::default());
+    let command = |millis, kind| {
+        Command::new(
+            namespace.clone(),
+            entity.clone(),
+            DomainTimestamp::from_millis(millis),
+            kind,
+        )
+    };
+    machine
+        .apply(&command(
+            1,
+            CommandKind::CreateQueue {
+                config: QueueConfig {
+                    requires_duplicate_detection: true,
+                    duplicate_detection_history_millis: 60_000,
+                    ..QueueConfig::default()
+                },
+            },
+        ))
+        .expect("the queue is created");
+
+    let identifiers = [
+        MessageId::String("order-7".into()),
+        MessageId::Ulong(42),
+        MessageId::Uuid(uuid(0xab)),
+        MessageId::Binary(Binary::from(vec![0x00, 0x7f, 0xff])),
+    ];
+    for (index, identifier) in identifiers.into_iter().enumerate() {
+        let encoded = encode_message(&Message {
+            properties: Some(Properties {
+                message_id: Some(identifier),
+                ..Properties::default()
+            }),
+            body: Body::Data(vec![Binary::from(vec![1, 2, 3])]),
+            ..Message::default()
+        })
+        .expect("the test message encodes");
+        let decoded = decode_message(&encoded).expect("ingress accepts the message");
+        let legacy =
+            MessageInput::from(read_incoming(&decoded, &encoded).expect("ingress reads it"));
+        let at = 10 + u64::try_from(index).expect("small index");
+        let first = machine
+            .apply(&command(
+                at,
+                CommandKind::Send {
+                    message_id: legacy.message_id,
+                    body: legacy.body,
+                    time_to_live_millis: legacy.time_to_live_millis,
+                    session_id: legacy.session_id,
+                    scheduled_enqueue_at: legacy.scheduled_enqueue_at,
+                    envelope: legacy.envelope,
+                },
+            ))
+            .expect("the legacy send applies");
+        let CommandOutcome::Sent { sequence } = first else {
+            panic!("the first send is stored: {first:?}")
+        };
+        let second = machine
+            .apply(&command(
+                at,
+                CommandKind::SendContent {
+                    content: MessageContent::Amqp(encoded),
+                },
+            ))
+            .expect("the content send applies");
+        assert!(
+            matches!(second, CommandOutcome::DuplicateSuppressed { .. }),
+            "identifier {index} was not recognized across the switch: {second:?} after {sequence:?}"
+        );
+    }
+}
