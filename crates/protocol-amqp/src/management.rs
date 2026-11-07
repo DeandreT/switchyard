@@ -210,6 +210,8 @@ impl Eq for SessionRegistration {}
 #[derive(Debug, Default)]
 struct ReplyRoutes {
     senders: HashMap<String, mpsc::Sender<ManagementResponse>>,
+    /// Each reply link's binding `max-message-size`; absent is unlimited.
+    limits: HashMap<String, u64>,
 }
 
 /// Protocol-only state shared by every session on one AMQP connection.
@@ -539,6 +541,7 @@ impl ConnectionManagement {
             .map(|session| (session.entity, session.hold))
     }
 
+    #[cfg(test)]
     pub(crate) async fn register_reply_route(
         &self,
         address: String,
@@ -546,14 +549,60 @@ impl ConnectionManagement {
         mpsc::Sender<ManagementResponse>,
         mpsc::Receiver<ManagementResponse>,
     ) {
+        self.register_limited_reply_route(address, None).await
+    }
+
+    /// Registers a reply route whose link accepts messages of at most
+    /// `max_message_size` encoded bytes; `None` is unlimited.
+    pub(crate) async fn register_limited_reply_route(
+        &self,
+        address: String,
+        max_message_size: Option<u64>,
+    ) -> (
+        mpsc::Sender<ManagementResponse>,
+        mpsc::Receiver<ManagementResponse>,
+    ) {
         let (sender, receiver) = mpsc::channel(REPLY_BUFFER);
-        self.routes
-            .lock()
-            .await
-            .senders
-            .insert(address, sender.clone());
+        {
+            let mut routes = self.routes.lock().await;
+            match max_message_size {
+                Some(limit) => routes.limits.insert(address.clone(), limit),
+                None => routes.limits.remove(&address),
+            };
+            routes.senders.insert(address, sender.clone());
+        }
         self.route_changed.notify_waiters();
         (sender, receiver)
+    }
+
+    /// The reply link currently registered for `address`, if any.
+    async fn reply_route(&self, address: &str) -> ReplyRoute {
+        let routes = self.routes.lock().await;
+        if routes.senders.contains_key(address) {
+            ReplyRoute::Attached {
+                limit: routes.limits.get(address).copied(),
+            }
+        } else {
+            ReplyRoute::Pending {
+                address: address.to_owned(),
+            }
+        }
+    }
+
+    /// Waits, as long as a response would wait to be routed, for a reply link
+    /// to `address`, returning its limit. `None` when none attached in time.
+    ///
+    /// The route registers just after the link's attach is answered, so a fast
+    /// client's request can arrive first.
+    async fn await_reply_limit(&self, address: &str) -> Option<Option<u64>> {
+        let deadline = tokio::time::Instant::now() + REPLY_ROUTE_TIMEOUT;
+        loop {
+            let changed = self.route_changed.notified();
+            if let ReplyRoute::Attached { limit } = self.reply_route(address).await {
+                return Some(limit);
+            }
+            tokio::time::timeout_at(deadline, changed).await.ok()?;
+        }
     }
 
     pub(crate) async fn unregister_reply_route(
@@ -568,6 +617,7 @@ impl ConnectionManagement {
             .is_some_and(|current| current.same_channel(sender))
         {
             routes.senders.remove(address);
+            routes.limits.remove(address);
         }
     }
 
@@ -808,8 +858,10 @@ async fn management_request_pump<'a, B: Broker>(
         }
         return Ok(None);
     };
+    // A reply link attached after this lookup is still bounded when sent.
+    let reply_route = management.reply_route(&reply_to).await;
     custody.request = Some(PendingOperation::new(
-        process_request(
+        process_bounded_request(
             delivery.message(),
             message_id,
             namespace,
@@ -817,6 +869,7 @@ async fn management_request_pump<'a, B: Broker>(
             request_broker,
             management,
             authorization,
+            reply_route,
         ),
         request_broker.control(),
     ));
@@ -947,6 +1000,7 @@ async fn guarded_close(
     consume_native_result(&mut original, Ok(()))
 }
 
+#[cfg(test)]
 async fn process_request<B: Broker>(
     message: &Message,
     message_id: MessageId,
@@ -955,6 +1009,49 @@ async fn process_request<B: Broker>(
     broker: &B,
     management: &ConnectionManagement,
     authorization: Option<&ManagementAuthorization>,
+) -> ManagementResponse {
+    process_bounded_request(
+        message,
+        message_id,
+        namespace,
+        entity,
+        broker,
+        management,
+        authorization,
+        ReplyRoute::Attached { limit: None },
+    )
+    .await
+}
+
+/// What a request knows of its reply link when it is processed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReplyRoute {
+    /// Attached, accepting at most `limit` encoded bytes; `None` is unlimited.
+    Attached { limit: Option<u64> },
+    /// Not attached yet. The reply waits for it and is bounded when sent.
+    Pending { address: String },
+}
+
+impl ReplyRoute {
+    fn limit(&self) -> Option<u64> {
+        match self {
+            Self::Attached { limit } => *limit,
+            Self::Pending { .. } => None,
+        }
+    }
+}
+
+/// Processes one request whose reply goes over `reply_route`.
+#[allow(clippy::too_many_arguments)]
+async fn process_bounded_request<B: Broker>(
+    message: &Message,
+    message_id: MessageId,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    broker: &B,
+    management: &ConnectionManagement,
+    authorization: Option<&ManagementAuthorization>,
+    reply_route: ReplyRoute,
 ) -> ManagementResponse {
     let tracking_id = message
         .application_properties
@@ -1039,6 +1136,7 @@ async fn process_request<B: Broker>(
                 entity,
                 broker,
                 management,
+                reply_route,
             )
             .await
         }
@@ -1063,6 +1161,7 @@ async fn process_request<B: Broker>(
                 entity,
                 broker,
                 management,
+                reply_route.limit(),
             )
             .await
         }
@@ -1397,6 +1496,62 @@ fn string_map_value<'a>(body: &'a Body, name: &str) -> Option<&'a str> {
     }
 }
 
+/// The encoded size of `response` on the reply link.
+fn response_size(response: &ManagementResponse) -> u64 {
+    amqp::encode_message(&response.clone().into_message())
+        .map_or(u64::MAX, |encoded| encoded.len() as u64)
+}
+
+/// The `messages` response with the longest prefix of `entries` that fits the
+/// reply link's `limit`, and how many entries it kept. Keeping none answers
+/// with a message-size-exceeded error, never an empty success that would read
+/// as "no more messages".
+fn fitting_messages_response(
+    message_id: MessageId,
+    tracking_id: Option<String>,
+    name: &str,
+    entries: Vec<Value>,
+    limit: Option<u64>,
+) -> (ManagementResponse, usize) {
+    let accepted = |entries: Vec<Value>| {
+        ManagementResponse::accepted(
+            message_id.clone(),
+            tracking_id.clone(),
+            map_body(name, Value::List(entries)),
+        )
+    };
+    let response = |entries: &[Value]| accepted(entries.to_vec());
+    let count = entries.len();
+    let Some(limit) = limit else {
+        return (accepted(entries), count);
+    };
+    if count == 0 {
+        return (accepted(entries), 0);
+    }
+    let full = response(&entries);
+    if response_size(&full) <= limit {
+        return (full, count);
+    }
+    // Fitting is monotone in the prefix length: find the longest that fits.
+    let (mut fits, mut exceeds) = (0, entries.len());
+    while exceeds - fits > 1 {
+        let middle = fits + (exceeds - fits) / 2;
+        if response_size(&response(&entries[..middle])) <= limit {
+            fits = middle;
+        } else {
+            exceeds = middle;
+        }
+    }
+    if fits == 0 {
+        let size = response_size(&response(&entries[..1]));
+        return (
+            ManagementResponse::message_size_exceeded(message_id, tracking_id, size, limit),
+            0,
+        );
+    }
+    (response(&entries[..fits]), fits)
+}
+
 fn map_body(name: &str, value: Value) -> Value {
     let mut map = OrderedMap::new();
     map.insert(Value::String(name.to_owned()), value);
@@ -1593,7 +1748,21 @@ async fn send_management_response(
         return Err(EngineError::Stopped);
     }
     let tag = response_delivery_tag(&response.correlation_id);
-    let pending = sender.send_pending(response.into_message(), tag).await?;
+    let (correlation_id, tracking_id) = (
+        response.correlation_id.clone(),
+        response.tracking_id.clone(),
+    );
+    let mut message = response.into_message();
+    if let Err(EngineError::MessageSizeExceeded { size, maximum }) =
+        sender.check_message_size(&message)
+    {
+        // Peek and receive-by-sequence bound themselves before any lock or
+        // deletion; this covers a reply link that attached after that check.
+        message =
+            ManagementResponse::message_size_exceeded(correlation_id, tracking_id, size, maximum)
+                .into_message();
+    }
+    let pending = sender.send_pending(message, tag).await?;
     let observed = pending.await?;
     let (_, outcome, confirmation) = observed.into_parts();
     if let Some(confirmation) = confirmation

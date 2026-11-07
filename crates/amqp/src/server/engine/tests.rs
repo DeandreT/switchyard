@@ -7,6 +7,7 @@ mod capacity;
 mod confirmation;
 mod credit;
 mod incarnation;
+mod message_size;
 mod session_incarnation;
 
 async fn test_handle_command<W: tokio::io::AsyncWrite + Unpin>(
@@ -66,6 +67,7 @@ fn sending_session(
         credit: test_link_credit(),
         credit_reservations: HashSet::new(),
         next_credit_reservation: 0,
+        max_message_size: None,
     };
     let session = SessionState {
         incarnation: 0,
@@ -178,6 +180,7 @@ fn queued_sending_session(
         credit: test_link_credit(),
         credit_reservations: HashSet::new(),
         next_credit_reservation: 0,
+        max_message_size: None,
     };
     let session = SessionState {
         incarnation: 0,
@@ -600,6 +603,7 @@ async fn drain_acknowledgement_is_generation_bound_and_returns_unused_credit() {
         credit: test_link_credit(),
         credit_reservations: HashSet::new(),
         next_credit_reservation: 0,
+        max_message_size: None,
     };
     let session = SessionState {
         incarnation: 0,
@@ -833,6 +837,7 @@ async fn sender_drain_notification_is_sticky_and_detach_aware() {
         credits: watch::channel(false).1,
         send_capacity: Arc::new(Semaphore::new(1)),
         pending_confirmation: None,
+        max_message_size: None,
     };
 
     assert_eq!(sender.on_drain().await.expect("drain is observed"), request);
@@ -990,6 +995,7 @@ async fn a_range_disposition_completes_only_matching_deliveries() {
         credit: test_link_credit(),
         credit_reservations: HashSet::new(),
         next_credit_reservation: 0,
+        max_message_size: None,
     };
     let session = SessionState {
         incarnation: 0,
@@ -1047,6 +1053,7 @@ async fn detach_fails_queued_and_unsettled_sends_and_releases_capacity() {
         credit: test_link_credit(),
         credit_reservations: HashSet::new(),
         next_credit_reservation: 0,
+        max_message_size: None,
     });
 
     stop_link(&mut link);

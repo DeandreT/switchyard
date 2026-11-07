@@ -12,7 +12,7 @@ use serde_amqp::{
 use crate::Broker;
 
 use super::{
-    ConnectionManagement, ManagementResponse, SESSION_ID, map_body, map_value, requested_session,
+    ConnectionManagement, ManagementResponse, SESSION_ID, map_value, requested_session,
     session_lookup_response,
 };
 
@@ -32,6 +32,7 @@ pub(super) async fn peek<B: Broker>(
     entity: &EntityPath,
     broker: &B,
     management: &ConnectionManagement,
+    reply_limit: Option<u64>,
 ) -> ManagementResponse {
     let (from_sequence, max_messages) = match peek_request(&message.body) {
         Ok(request) => request,
@@ -90,11 +91,9 @@ pub(super) async fn peek<B: Broker>(
             );
         }
     };
-    ManagementResponse::accepted(
-        message_id,
-        tracking_id,
-        map_body(MESSAGES, Value::List(entries)),
-    )
+    // Peek is non-destructive, so a reply link's size limit returns the
+    // longest prefix that fits; the client continues from its last sequence.
+    super::fitting_messages_response(message_id, tracking_id, MESSAGES, entries, reply_limit).0
 }
 
 fn peek_request(body: &Body) -> Result<(SequenceNumber, u32), &'static str> {
@@ -374,6 +373,7 @@ mod tests {
             &entity,
             &broker,
             &management,
+            None,
         )
         .await;
         assert_eq!(response.status_code, 204);
@@ -395,6 +395,7 @@ mod tests {
             &entity,
             &broker,
             &management,
+            None,
         )
         .await;
         assert_eq!(rejected.status_code, 400);
@@ -436,6 +437,7 @@ mod tests {
             &entity,
             &broker,
             &management,
+            None,
         )
         .await;
         assert_eq!(response.status_code, 410);
@@ -489,6 +491,7 @@ mod tests {
             &dead_letter,
             &broker,
             &management,
+            None,
         )
         .await;
         assert_eq!(response.status_code, 200);

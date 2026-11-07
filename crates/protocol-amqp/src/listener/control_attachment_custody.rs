@@ -269,12 +269,15 @@ impl<'a> ControlAttachmentCustody<'a> {
         &mut self,
         registry: Arc<ConnectionManagement>,
         address: String,
+        max_message_size: Option<u64>,
     ) -> bool {
         if self.is_retired() || self.route.is_some() {
             return false;
         }
         self.route = Some(Original::new(async move {
-            let (route, responses) = registry.register_reply_route(address.clone()).await;
+            let (route, responses) = registry
+                .register_limited_reply_route(address.clone(), max_message_size)
+                .await;
             RoutePacket::Management {
                 registry,
                 address,
@@ -732,8 +735,9 @@ pub(crate) async fn serve_control_attachment<B: Broker>(
                     }));
                 }
             }
-            Some(LinkEndpoint::Sender(_)) if source == address && !target.is_empty() => {
-                if !custody.begin_management_route(Arc::clone(context.management), target) || !custody.observe_route().await {
+            Some(LinkEndpoint::Sender(sender)) if source == address && !target.is_empty() => {
+                let max_message_size = sender.max_message_size();
+                if !custody.begin_management_route(Arc::clone(context.management), target, max_message_size) || !custody.observe_route().await {
                     return Ok(());
                 }
                 pump_checkpoint(PumpPoint::RoutePacket).await;
