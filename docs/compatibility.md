@@ -43,9 +43,9 @@ collections require refusal until truthful combined runtime data is available.
 | Duplicates | Exact non-empty message IDs across immediate/batch/scheduled offers on enabled ordinary queues and topics; bounded history expiry. Topic enablement/window are creation-only (default off/10 minutes, inclusive 20 seconds–7 days). |
 | Profiles | Domain-only partial ordinary-queue updates atomically validate/change parent and exact DLQ profiles plus Clock. No-op patches write nothing; owner, records/deadlines remain. Session/duplicate modes are immutable; lock/TTL/message-size/history/expiry-policy changes govern future work. |
 | Topic profiles | Domain-only parent-topic size/TTL and named-subscription lock/delivery-count/TTL/expiry-policy patches prove all listed children before changing profiles. Size propagates to backing queues/DLQs; topic TTL does not overwrite child TTL. No-op direct calls preserve Clock; no administration or protocol activation. |
-| Topics/rules | Non-session immediate/scheduled singular/batch fanout; placeholder peek/cancel; independent subscription queues. Durable `$Default`, actionless true/false/correlation, typed equality; create/delete/paginated AMQP rules. |
+| Topics/rules | Non-session immediate/scheduled singular/batch fanout; placeholder peek/cancel; independent subscription queues. Durable `$Default`, actionless true/false/correlation, typed equality; create/delete/paginated AMQP rules. Domain-only bounded [SQL](sql-predicates.md) filters over the stored typed projection; AMQP rule management still accepts only `1=1`/`1=0` and refuses to enumerate stored SQL rules. |
 | Time/identity | Bounded activation/lock/TTL/session-lock/history expiry. ASCII-folded namespace/entity/subscription addresses and SAS scope; session/placement IDs retain case. |
-| Local APIs | [Offline RS256 JWT](offline-jwt.md): pinned keys, injected time/local rights, issuer-qualified grants; SAS/PLAIN retain verified namespace-host qualification. [SQL kernel](sql-predicates.md): bounded ephemeral local grammar/errors, IN/LIKE/scalar arithmetic. No JWT wire activation or persisted SQL rules/fanout/actions. |
+| Local APIs | [Offline RS256 JWT](offline-jwt.md): pinned keys, injected time/local rights, issuer-qualified grants; SAS/PLAIN retain verified namespace-host qualification. [SQL kernel](sql-predicates.md): bounded local grammar/errors, IN/LIKE/scalar arithmetic. No JWT wire activation or SQL actions. |
 | Storage | Paired Memory/Fjall semantics; Fjall journal fsync before applied outcomes; exclusive directory ownership. |
 
 Library-only administration Get/page reads select one namespace and validate
@@ -94,7 +94,7 @@ including backing queues/DLQs; invalid limits are corruption. Unread rows/raw
 catalogues are not certified; profile-free legacy operations remain unchanged.
 Administration setters/capacity, JWT consumers [#71](https://github.com/DeandreT/switchyard/issues/71)
 and activation [#17](https://github.com/DeandreT/switchyard/issues/17), typed content
-#16 and rule integration #20/#21 remain pending.
+#16 is complete; SQL rule wire management (#20) and #21 remain pending.
 
 ### Absolute link addresses
 
@@ -129,6 +129,9 @@ the attach response.
 | TTL | Queues and subscriptions carry `dead_lettering_on_message_expiration`, defaulting on (Azure defaults off). On, expiry dead-letters as `TTLExpiredException`; off, it deletes the message and its indexes with no DLQ copy. Either applies on sweep, receive, abandon, lock expiry, deferred retrieval and activated schedules; delivery-count and application dead-lettering are unaffected. The setting is domain-only: administration and AMQP still create entities with the default. Expiry outcomes count deletions separately from DLQ copies, and the timer treats both as work for its paging and idle checks. Live locks remain settleable until expiry. |
 | Duplicate gaps/history | Suppression consumes acknowledgement sequence slots, stores no message. History starts at command time; hits do not extend it, nor settlement/cancellation/expiry/DLQ erase it. Missing raw-AMQP IDs bypass it. |
 | Scheduled topics | Children/rules snapshot at activation: later subscriptions may receive older publications. All-scheduled sends do not prove topology early. |
+| SQL filter errors | Azure dead-letters a message whose subscription filter throws by default; Switchyard's specific behavior is its own choice, not verified against Azure. When no rule of a subscription matches and a SQL rule fails to evaluate (type mismatch, unsupported or ambiguous property, overflow, budget), the subscription gets one dead-lettered copy with reason `FilterException` and description `rule <name>: <fixed error text>` for the first failing rule in name order. Any matching rule still delivers despite a failing sibling. Azure's per-subscription opt-out that discards instead is not configurable yet. |
+| SQL identifiers | `sys.MessageId`/`sys.CorrelationId` use the stored projection's text form for non-string AMQP identifiers: ulong as decimal, binary as lowercase hex, UUID as `Uuid([..])` byte-list text. SQL comparisons against Azure's GUID text form therefore do not match UUID identifiers. |
+| SQL rule quota | At most 2,000 SQL rules across all subscriptions of a topic (Azure's quota); the next SQL rule refuses with `SqlRuleLimitExceeded`. True/false/correlation rules keep only the per-subscription limit. |
 | Topic sequences | Each offered publication and selected due placeholder consumes one topic-owned slot, even with no matching subscriptions; fanout copies consume none. MAX-1 is the last fresh slot and MAX refuses with nonretryable `SequenceNumberExhausted`. Crossing batches or bounded activation sets retain every original record, counter and Clock without partial fanout. Idle activation and cancellation need no slot. |
 | Browse/deferred | Positive signed peek count, reply cap 250, scan to cap/end; deferred retrieval atomically accepts at most 32 sequences in caller order. |
 | Outbound message size | A receiving peer's nonzero link `max-message-size` bounds each rendered transfer; absent, zero or the maximum value is unlimited. An oversized delivery is never sent: the link detaches with `amqp:link:message-size-exceeded` and the message lock is left to expire, not dead-lettered at once. Each refused lock counts a delivery, so a message whose lock expires at the queue's max delivery count dead-letters with `MaxDeliveryCountExceeded`, including staged receive-and-delete and receive-by-sequence locks. Receive-and-delete on a bounded link locks, measures, then deletes, so a refusal loses nothing; it costs an extra command per message. Peek returns the longest prefix that fits the reply link; receive-by-sequence is all or nothing. Either answers 403 `amqp:link:message-size-exceeded` when nothing fits, leaving any locks to expire. A reply link attached after its request was processed gets that error instead of an oversized reply. Receive-and-delete by sequence waits up to the reply-routing timeout for its reply link and otherwise answers 400 without deleting anything; peek-lock and peek need no attached reply link. |
@@ -219,8 +222,10 @@ each message's original AMQP bytes once, or raw bytes with explicit normalized f
 decoding never parses or polices that content. Abandon, defer and dead-letter with a
 sparse property patch also use V4; their legacy replacement-envelope forms keep exact
 V1 bytes. Queue/subscription creation that disables expiry dead-lettering, and
-queue/subscription updates naming that setting, use private V5; all other forms keep
-their V1/V2 bytes. New readers accept V1 through V5; older readers refuse unsupported
+queue/subscription updates naming that setting, use private V5. SQL rule creation uses
+private V6, retaining the expression text uncompiled so an invalid predicate survives for
+deterministic refusal; true/false/correlation rule creation keeps V1. All other forms keep
+their V1/V2 bytes. New readers accept V1 through V6; older readers refuse unsupported
 proposal versions. AMQP ingress sends every message as V4: a transfer as `SendContent`, and a
 Service Bus batch or scheduled-message request as `SendContentBatch` with each child's
 original bytes. Nothing new emits V1 sends; historical V1 sends still decode and replay
@@ -242,6 +247,16 @@ or delete history as a downgrade procedure.
 Queue profiles, including subscription backings, likewise use a queue-specific V2 only
 when expiry dead-lettering is disabled; enabled profiles and every DLQ shadow keep exact
 legacy V1 bytes, and the same refusals and rollback requirements apply.
+Rule records follow the same pattern: SQL
+rules alone use a V2 rule value (display name, exact expression text, creation time)
+that old readers refuse as an unsupported version, while true/false/correlation rules
+keep exact V1 bytes. Every reader recompiles stored SQL text under the current limits;
+text that no longer compiles is corruption, refused by rule reads, fanout and snapshot
+validation. The SQL grammar, value semantics and limits are therefore frozen for V2 rule
+records: a change that could accept, refuse or evaluate stored text differently needs a
+new rule-record version. Fanout compiles each distinct expression once per command, in
+memory only. Filter-error copies use the existing application dead-letter reason
+encoding, so their message records are unchanged.
 See [profile lifecycle](lifecycle.md#profile-updates).
 
 Message records use a dedicated frozen codec. Legacy sends write V1, byte for byte
@@ -371,7 +386,7 @@ namespace/server; no quotas, fair multi-tenancy or production durability.
 
 | Scope | Missing |
 | --- | --- |
-| Semantics | General SQL/actions, session subscriptions/session-ID predicates, administrable TTL expiry policy, DLQ forwarding/resubmit, same-group transactions. |
+| Semantics | SQL actions/parameters/functions beyond the kernel, session subscriptions/session-ID predicates, administrable TTL expiry policy, DLQ forwarding/resubmit, same-group transactions. |
 | Administration | Atom/XML entities/rules; native gRPC/CLI transport (contract only). |
 | Security | JWT consumers/wire, network OIDC, mTLS, policy/full RBAC, namespace KMS/encryption, tamper-evident audit. |
 | Production | Raft/placement, quotas/fairness, encrypted backup/restore, readiness/observability, release/performance evidence. |

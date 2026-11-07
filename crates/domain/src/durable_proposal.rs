@@ -1,6 +1,6 @@
 //! A frozen persistence envelope, not a client authentication or grant format.
 //!
-//! V1 through V5 carry intent, including intent the state machine may refuse.
+//! V1 through V6 carry intent, including intent the state machine may refuse.
 //! Decoding does not consult the catalog, acquire authority, apply a command, or
 //! parse message content.
 //! The byte ceiling bounds encoded input/output and copied variable data, not
@@ -15,6 +15,7 @@ mod v2;
 mod v3;
 mod v4;
 mod v5;
+mod v6;
 
 pub const MAX_DURABLE_PROPOSAL_BYTES: usize = 1024 * 1024;
 const HEADER_BYTES: usize = 12;
@@ -72,10 +73,12 @@ impl DurableProposal {
     /// Existing intent stays byte-for-byte V1/V2. Only nonlegacy topic creation
     /// uses V3, and only content sends and property-patch dispositions use V4.
     /// Only queue/subscription creation that disables expiry dead-lettering and
-    /// updates naming that setting use V5. No proposal format uses the ordinary
-    /// Command serde shape.
+    /// updates naming that setting use V5, and only SQL rule creation uses V6.
+    /// No proposal format uses the ordinary Command serde shape.
     pub fn encode(&self) -> Result<Vec<u8>, DurableProposalError> {
-        if v5::carries(&self.command.kind) {
+        if uses_v6(&self.command.kind) {
+            encode_version(&v6::Proposal::capture(self)?, 6)
+        } else if v5::carries(&self.command.kind) {
             encode_version(&v5::Proposal::capture(self)?, 5)
         } else if uses_v4(&self.command.kind) {
             encode_version(&v4::Proposal::capture(self)?, 4)
@@ -98,7 +101,7 @@ impl DurableProposal {
             return Err(DurableProposalError::Malformed);
         }
         let version = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        if !matches!(version, 1..=5) {
+        if !matches!(version, 1..=6) {
             return Err(DurableProposalError::UnsupportedVersion(version));
         }
         let length = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
@@ -113,8 +116,10 @@ impl DurableProposal {
             decode_version::<v3::Proposal>(bytes, version)?.restore()
         } else if version == 4 {
             decode_version::<v4::Proposal>(bytes, version)?.restore()
-        } else {
+        } else if version == 5 {
             decode_version::<v5::Proposal>(bytes, version)?.restore()
+        } else {
+            decode_version::<v6::Proposal>(bytes, version)?.restore()
         }
     }
 }
@@ -139,6 +144,11 @@ fn uses_v4(kind: &CommandKind) -> bool {
             | CommandKind::DeferWithPatch { .. }
             | CommandKind::DeadLetterWithPatch { .. }
     )
+}
+
+// Disjoint from V5, which carries only queue/subscription creation and updates.
+fn uses_v6(kind: &CommandKind) -> bool {
+    matches!(kind, CommandKind::CreateRule { filter, .. } if !filter.is_legacy_representable())
 }
 
 fn encode_v1(value: &v1::Proposal) -> Result<Vec<u8>, DurableProposalError> {

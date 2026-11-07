@@ -9,8 +9,8 @@ use domain::{
     CorrelationValue, DeadLetterReason, Delivery, EntityPath, FilterProperties, MessageContent,
     MessageContentError, MessageEnvelope, MessageRecord, MessageRecordFormat, MessageState,
     NamespaceName, OverlayProperty, PROPERTY_PATCH_HEADROOM_BYTES, QueueConfig, RawMessage,
-    ReceiveMode, RuleFilter, SequenceNumber, StateMachine, SubscriptionConfig, SubscriptionName,
-    Timestamp, TopicConfig, keys,
+    ReceiveMode, SequenceNumber, StateMachine, SubscriptionConfig, SubscriptionName, Timestamp,
+    TopicConfig, keys,
     legacy_content::{LegacyContentError, LegacyContentField, validate_legacy_content},
     snapshot_validation::validate_complete_state,
 };
@@ -150,14 +150,14 @@ const RECEIVE: CommandKind = CommandKind::Receive {
     session: None,
 };
 
-fn region(value: &str) -> RuleFilter {
-    RuleFilter::Correlation(CorrelationFilter {
+fn region(value: &str) -> CorrelationFilter {
+    CorrelationFilter {
         application_properties: BTreeMap::from([(
             "region".to_owned(),
             CorrelationValue::new(encoded(&string(value))).unwrap(),
         )]),
         ..CorrelationFilter::default()
-    })
+    }
 }
 
 fn lifecycle<P: StoreProvider>(provider: P) -> TestResult {

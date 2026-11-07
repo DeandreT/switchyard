@@ -374,6 +374,11 @@ fn filter_value(filter: &RuleFilter) -> Result<Value, String> {
     match filter {
         RuleFilter::True => Ok(described(TRUE_FILTER_CODE, Value::List(Vec::new()))),
         RuleFilter::False => Ok(described(FALSE_FILTER_CODE, Value::List(Vec::new()))),
+        // The SQL filter description is not projected on this wire yet; an
+        // honest refusal is preferred to a filter the client would misread.
+        RuleFilter::Sql(_) => Err(String::from(
+            "stored SQL rule filters cannot be enumerated over AMQP yet",
+        )),
         RuleFilter::Correlation(filter) => {
             let mut properties = OrderedMap::new();
             for (name, encoded) in &filter.application_properties {
@@ -868,5 +873,11 @@ mod tests {
             ..CorrelationFilter::default()
         });
         assert!(filter_value(&malformed).is_err());
+    }
+
+    #[test]
+    fn stored_sql_filters_are_not_projected_as_another_filter() {
+        let sql = RuleFilter::Sql(domain::SqlRuleFilter::new("Region = 'west'"));
+        assert!(filter_value(&sql).is_err());
     }
 }

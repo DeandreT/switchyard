@@ -62,11 +62,45 @@ pub(super) fn compile(
         nodes: builder.nodes.len(),
         depth: builder.depth,
     };
+    let literal_patterns = literal_patterns(&builder.nodes);
     Ok(SqlProgram {
         nodes: builder.nodes,
         root,
         metrics,
+        literal_patterns,
     })
+}
+
+/// Builds each fully literal LIKE pattern once. Evaluation still charges the
+/// same budget and reports the same build result at the same point.
+fn literal_patterns(
+    nodes: &[Node],
+) -> Vec<(u16, Result<super::pattern::LikeRegex, SqlEvaluationError>)> {
+    let literal = |index: u16| match &nodes[usize::from(index)] {
+        Node::Literal(Literal::String(text)) => Some(text.as_str()),
+        _ => None,
+    };
+    nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            let Node::Like {
+                pattern, escape, ..
+            } = node
+            else {
+                return None;
+            };
+            let pattern = literal(*pattern)?;
+            let escape = match escape {
+                None => None,
+                Some(escape) => Some(super::pattern::escape(literal(*escape)?)?),
+            };
+            Some((
+                u16::try_from(index).ok()?,
+                super::pattern::compile(pattern, escape),
+            ))
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -481,6 +515,58 @@ fn system_property(name: &str) -> Result<SqlSystemProperty, SqlCompileError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_like_patterns_are_built_once_and_evaluate_like_dynamic_ones() {
+        let literal = compile(
+            "name LIKE 'a!%%' ESCAPE '!'",
+            &mut SqlCompileBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(literal.literal_patterns.len(), 1);
+        assert!(literal.literal_patterns[0].1.is_ok());
+        for expression in ["name LIKE pattern ESCAPE '!'", "name LIKE 'a%' ESCAPE e"] {
+            let dynamic = compile(expression, &mut SqlCompileBudget::default()).unwrap();
+            assert!(dynamic.literal_patterns.is_empty(), "{expression}");
+        }
+        // The same program without its prebuilt regex builds it per call.
+        let mut unbuilt = literal.clone();
+        unbuilt.literal_patterns.clear();
+        for name in ["a%", "a%x", "ab", ""] {
+            let properties = [SqlProperty {
+                name: "name",
+                value: SqlValue::String(name),
+            }];
+            let message = SqlMessageContext {
+                application_properties: &properties,
+                system_properties: &[],
+            };
+            let mut prebuilt_budget = SqlEvaluationBudget::default();
+            let mut unbuilt_budget = SqlEvaluationBudget::default();
+            assert_eq!(
+                literal.evaluate(message, &mut prebuilt_budget),
+                unbuilt.evaluate(message, &mut unbuilt_budget),
+                "{name}"
+            );
+            // Prebuilding changes no charge, so limits trip identically.
+            assert_eq!(prebuilt_budget.used(), unbuilt_budget.used());
+        }
+        let mut budget = SqlEvaluationBudget::default();
+        let properties = [SqlProperty {
+            name: "name",
+            value: SqlValue::String("a%x"),
+        }];
+        assert_eq!(
+            literal.evaluate(
+                SqlMessageContext {
+                    application_properties: &properties,
+                    system_properties: &[],
+                },
+                &mut budget,
+            ),
+            Ok(SqlTruth::True)
+        );
+    }
 
     #[test]
     fn private_arena_node_and_depth_boundaries_are_checked_before_push() {

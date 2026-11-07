@@ -1,20 +1,23 @@
-//! Durable match-all topics and atomic subscription fanout.
+//! Durable topics and atomic, rule-routed subscription fanout.
 
 use storage::{StateStore, WriteBatch};
 
 use crate::{
     BrokerError, Command, CommandOutcome, EntityPath, FilterProperties, MAX_MESSAGE_ID_CHARACTERS,
-    MAX_TOPIC_SUBSCRIPTIONS, MessageEnvelope, QueueConfig, RuleDefinition, SequenceNumber,
-    SubscriptionConfig, SubscriptionName, TopicConfig, codec, keys,
+    MAX_TOPIC_SUBSCRIPTIONS, MessageEnvelope, QueueConfig, SequenceNumber, SubscriptionConfig,
+    SubscriptionName, TopicConfig, codec, keys,
 };
 
 use super::{
     PreparationFailure, StateMachine,
     incarnations::Kind,
     send::{SendInput, effective_time_to_live, message_record},
+    topic_routing::{
+        CompiledRules, ProgramCache, Route, TypedProperties, stage_filter_dead_letter,
+    },
 };
 
-type SubscriptionFanoutState = (QueueConfig, Vec<RuleDefinition>);
+type SubscriptionFanoutState = (QueueConfig, CompiledRules);
 type TopicFanoutState = (Vec<EntityPath>, Vec<SubscriptionFanoutState>);
 
 /// Captured by the complete bounded topology proof, before any update is staged.
@@ -316,6 +319,8 @@ impl<S: StateStore> StateMachine<S> {
         let mut counters = self.load_counters(command)?;
         let mut sequences = Vec::with_capacity(inputs.len());
         let mut populated = vec![false; subscriptions.len()];
+        let mut dead_lettered = vec![false; subscriptions.len()];
+        let uses_sql = uses_sql(&subscription_state);
         for ((input, properties), stored) in inputs.iter().zip(&properties).zip(stored) {
             let sequence = SequenceNumber::new(counters.next_sequence);
             counters.next_sequence = counters
@@ -344,11 +349,26 @@ impl<S: StateStore> StateMachine<S> {
                 continue;
             }
 
+            let typed = TypedProperties::new(properties, uses_sql)?;
+            let routing = typed.input();
             for (index, (subscription, (config, rules))) in
                 subscriptions.iter().zip(&subscription_state).enumerate()
             {
-                if !matches_any(rules, properties) {
-                    continue;
+                match rules.route(&routing) {
+                    Route::Deliver => {}
+                    Route::Skip => continue,
+                    Route::DeadLetter(description) => {
+                        dead_lettered[index] = true;
+                        stage_filter_dead_letter(
+                            &command.namespace,
+                            subscription,
+                            message_record(command, *input, sequence, None),
+                            description,
+                            command.issued_at,
+                            batch,
+                        )?;
+                        continue;
+                    }
                 }
                 populated[index] = true;
                 let lifetime =
@@ -380,11 +400,7 @@ impl<S: StateStore> StateMachine<S> {
         );
         Ok(CommandOutcome::Published {
             sequences,
-            subscriptions: subscriptions
-                .into_iter()
-                .zip(populated)
-                .filter_map(|(subscription, populated)| populated.then_some(subscription))
-                .collect(),
+            subscriptions: populated_entities(&subscriptions, &populated, &dead_lettered)?,
         })
     }
 
@@ -406,8 +422,13 @@ impl<S: StateStore> StateMachine<S> {
         let topology = self.subscription_topology(&command.namespace, &command.entity)?;
         let mut subscriptions = Vec::with_capacity(topology.len());
         let mut state = Vec::with_capacity(topology.len());
+        let mut cache = ProgramCache::default();
         for profile in topology {
-            let rules = self.all_rules(&command.namespace, &profile.entity)?;
+            let rules = CompiledRules::new(self.checked_rules(
+                &command.namespace,
+                &profile.entity,
+                &mut cache,
+            )?)?;
             subscriptions.push(profile.entity);
             state.push((profile.backing, rules));
         }
@@ -429,10 +450,29 @@ pub(super) fn filter_properties(input: &SendInput<'_>) -> Result<FilterPropertie
     Ok(properties.canonicalized()?)
 }
 
-pub(super) fn matches_any(rules: &[RuleDefinition], properties: &FilterProperties) -> bool {
-    rules
+pub(super) fn uses_sql(state: &[SubscriptionFanoutState]) -> bool {
+    state.iter().any(|(_, rules)| rules.uses_sql())
+}
+
+/// Delivered subscriptions in topology order, then the dead-letter queues that
+/// received filter-error copies, each reported once.
+pub(super) fn populated_entities(
+    subscriptions: &[EntityPath],
+    populated: &[bool],
+    dead_lettered: &[bool],
+) -> Result<Vec<EntityPath>, BrokerError> {
+    let mut entities = subscriptions
         .iter()
-        .any(|definition| definition.filter.matches(properties))
+        .zip(populated)
+        .filter(|(_, populated)| **populated)
+        .map(|(subscription, _)| subscription.clone())
+        .collect::<Vec<_>>();
+    for (subscription, dead_lettered) in subscriptions.iter().zip(dead_lettered) {
+        if *dead_lettered {
+            entities.push(subscription.dead_letter_queue()?);
+        }
+    }
+    Ok(entities)
 }
 
 fn validate_topic_input(config: &TopicConfig, input: &SendInput<'_>) -> Result<(), BrokerError> {

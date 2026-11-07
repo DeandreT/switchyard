@@ -41,6 +41,8 @@ pub enum BrokerError {
     RuleNotFound { name: RuleName },
     #[error("a subscription cannot have more than {maximum} rules")]
     RuleLimitExceeded { maximum: usize },
+    #[error("a topic cannot have more than {maximum} SQL rules across its subscriptions")]
+    SqlRuleLimitExceeded { maximum: usize },
     #[error("a rule listing must request at least one rule")]
     EmptyRulePage,
     #[error("a rule listing requested {requested} rules, exceeding the page limit of {maximum}")]

@@ -105,6 +105,10 @@ pub struct SqlProgram {
     nodes: Vec<Node>,
     root: u16,
     metrics: SqlProgramMetrics,
+    /// LIKE nodes whose pattern and escape are literals, by node index in
+    /// ascending order, with the regex built once. A failed build is retained
+    /// and reported at the same evaluation point as an unbuilt pattern.
+    literal_patterns: Vec<(u16, Result<pattern::LikeRegex, SqlEvaluationError>)>,
 }
 
 impl SqlProgram {

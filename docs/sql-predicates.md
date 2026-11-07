@@ -1,8 +1,14 @@
 # SQL Predicates
 
-Ephemeral predicates, not persisted rules/routing. `SqlProgram::compile` /
-`compile_with_budget` -> program; `evaluate(SqlMessageContext,
-&mut SqlEvaluationBudget)` -> `SqlTruth` or error. Only True matches, not Unknown.
+Programs are ephemeral: `SqlProgram::compile` / `compile_with_budget` -> program;
+`evaluate(SqlMessageContext, &mut SqlEvaluationBudget)` -> `SqlTruth` or error. Only
+True matches, not Unknown. SQL subscription rules persist only their expression text,
+compile it when created (refusing without mutation) and again, with a fresh default
+budget per rule, in each fanout command. Each rule evaluates with a fresh default
+evaluation budget against the message's stored filter projection: application values
+decode from their canonical AMQP bytes (symbols, chars, timestamps, UUIDs, decimals,
+binary and compound values are `Unsupported`), and all eight system properties are
+supplied, absent ones as explicit null.
 
 ```mermaid
 flowchart LR

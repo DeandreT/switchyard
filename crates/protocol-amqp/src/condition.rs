@@ -76,6 +76,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
 
         BrokerError::SubscriptionLimitExceeded { .. }
         | BrokerError::RuleLimitExceeded { .. }
+        | BrokerError::SqlRuleLimitExceeded { .. }
         | BrokerError::SequenceNumberExhausted
         | BrokerError::LockTokenExhausted => RESOURCE_LIMIT_EXCEEDED,
 
