@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use cluster::{ClusterConfig, DeploymentMode};
 use domain::StateMachine;
-use storage::{FjallStore, MemoryStore, StorageError};
+use storage::{FjallStore, MemoryStore, STORE_FORMAT_V2, StorageError};
 use thiserror::Error;
 
 pub use crate::{
@@ -67,9 +67,15 @@ pub fn open(cluster: ClusterConfig, storage: StorageChoice) -> Result<NodeState,
         (_, StorageChoice::Memory) => {
             Ok(NodeState::Memory(StateMachine::new(MemoryStore::default())))
         }
-        (_, StorageChoice::Durable { directory }) => Ok(NodeState::Durable(StateMachine::new(
-            FjallStore::open(directory)?,
-        ))),
+        (_, StorageChoice::Durable { directory }) => match FjallStore::open(&directory) {
+            Ok(store) => Ok(NodeState::Durable(StateMachine::new(store))),
+            // Ordinary opening never upgrades; name the explicit offline path.
+            Err(StorageError::UnsupportedStoreFormat {
+                found: STORE_FORMAT_V2,
+                ..
+            }) => Err(StartupError::StoreUpgradeRequired { directory }),
+            Err(error) => Err(error.into()),
+        },
     }
 }
 
@@ -115,6 +121,12 @@ pub enum StartupError {
     Cluster(#[from] cluster::ClusterConfigError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(
+        "store directory {} holds format 2; stop every writer, then run `switchyardctl store upgrade --data-dir {}`",
+        directory.display(),
+        directory.display()
+    )]
+    StoreUpgradeRequired { directory: PathBuf },
 }
 
 #[cfg(test)]

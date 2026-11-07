@@ -595,7 +595,8 @@ fn corruptions<S: ImageInstallBackend>(store: S, capture: &SnapshotCapture) -> S
                 WriteBatch::default().put(key(F0, 3), anchor)
             }
             16 => {
-                anchor[20..24].copy_from_slice(&3_u32.to_be_bytes());
+                // An unknown recorded source layout (2 and 3 are readable).
+                anchor[20..24].copy_from_slice(&4_u32.to_be_bytes());
                 resign_anchor(&mut anchor);
                 WriteBatch::default().put(key(F0, 3), anchor)
             }

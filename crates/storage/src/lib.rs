@@ -7,17 +7,23 @@
 //!
 //! [`capture_logical_snapshot`] records logical evidence only. Durable metadata
 //! inspection is an opt-in [`FjallStore::snapshot_with_provenance`] operation.
+//! [`StoreFormatUpgradeOwner`] is the only path from format 2 to 3.
 
 #![forbid(unsafe_code)]
 
 mod durable;
+mod format_upgrade;
 mod image_install;
 mod memory;
 
 use thiserror::Error;
 
 pub use crate::{
-    durable::{ACTIVE_STORE_FORMAT, FjallStore, STORE_FORMAT_V1, STORE_FORMAT_V2},
+    durable::{ACTIVE_STORE_FORMAT, FjallStore, STORE_FORMAT_V1, STORE_FORMAT_V2, STORE_FORMAT_V3},
+    format_upgrade::{
+        PreparedStoreFormatUpgrade, StoreFormatCommitError, StoreFormatInspection,
+        StoreFormatUpgradeError, StoreFormatUpgradeOwner,
+    },
     image_install::{
         ImageInstallBackend, ImageInstallError, ImageInstallInspection, ImageInstallLimit,
         ImageInstallLimits, ImageInstallReceipt, OfflineImageOwner, PreparedImageInstall,

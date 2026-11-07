@@ -4,14 +4,14 @@
 use std::sync::Arc;
 
 use storage::{
-    ImageInstallBackend, ImageInstallError, ImageInstallLimits, ImageInstallReceipt,
-    OfflineImageOwner, SnapshotProvenance, SnapshotWithProvenance,
+    ACTIVE_STORE_FORMAT, ImageInstallBackend, ImageInstallError, ImageInstallLimits,
+    ImageInstallReceipt, OfflineImageOwner, SnapshotProvenance, SnapshotWithProvenance,
 };
 use thiserror::Error;
 
 use super::{
-    SnapshotCapture, SnapshotCaptureError, SnapshotFormat, SnapshotLimits, SnapshotManifest,
-    capture::validate_image,
+    SNAPSHOT_LAYOUT_VERSION, SnapshotCapture, SnapshotCaptureError, SnapshotFormat, SnapshotLimits,
+    SnapshotManifest, capture::validate_image,
 };
 
 /// Cross-backend acceptance is a deliberate caller policy, never a fallback
@@ -39,6 +39,13 @@ pub enum SnapshotInstallError {
     Incoming(super::SnapshotFormatError),
     #[error("source and target provenance classes differ; explicit opt-in required")]
     ProvenanceMismatch,
+    #[error(
+        "source layout {layout} or store format {store_format:?} is unsupported; upgrade the source store and recapture"
+    )]
+    UnsupportedSource {
+        layout: u32,
+        store_format: Option<u32>,
+    },
 }
 
 /// Operational receipt, not a recovery/authentication/physical durability
@@ -88,10 +95,24 @@ impl<S: ImageInstallBackend> SnapshotInstallOwner<S> {
         limits: SnapshotInstallLimits,
         policy: SnapshotInstallPolicy,
     ) -> Result<SnapshotInstallReceipt, SnapshotInstallError> {
+        // Version fences precede target reads and are never bypassed by policy.
+        let source = *capture.provenance();
+        let store_format = match source {
+            SnapshotProvenance::Fjall(metadata) => Some(metadata.format_version()),
+            SnapshotProvenance::LogicalOnly => None,
+        };
+        let layout = capture.manifest().layout_version();
+        if layout != SNAPSHOT_LAYOUT_VERSION
+            || store_format.is_some_and(|format| format != ACTIVE_STORE_FORMAT)
+        {
+            return Err(SnapshotInstallError::UnsupportedSource {
+                layout,
+                store_format,
+            });
+        }
         let inspection = self
             .target
             .inspect(capture.image().snapshot(), limits.replacement)?;
-        let source = *capture.provenance();
         let target = *inspection.image().provenance();
         let same_class = matches!(
             (source, target),

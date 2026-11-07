@@ -14,4 +14,5 @@ storage.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+fjall.workspace = true
 tempfile.workspace = true

@@ -153,6 +153,14 @@ snapshot allocation. Callers must exclude every writer and raw/keyspace handle; 
 API does not enforce exclusion or enable online capture. Fjall provenance stays
 typed beside the result, never in the unchanged SWSS frame. Neither capture nor
 decoding proves authenticity, historical authority or installability.
+Capture and frames use layout 3, which also requires every retained envelope and
+filter/rule AMQP value to satisfy the fixed content profile. Ordinary writes do
+not enforce it until #16's typed-content admission, so capture, and install's
+complete old-target validation, refuse a format 3 store holding later
+out-of-profile content. Layout 2 frames and
+native format 2 sources refuse decoding, capture and installation, including with
+cross-backend opt-in; conversion is an explicit store upgrade and recapture, never
+relabeling. Anchors keep their recorded source layout, so layout 2 anchors stay readable.
 Offline typed-capture installation bounds and validates one complete old target
 image, then atomically deletes old records and puts the exact captured records
 without replay or metadata changes. Default provenance classes must match;
@@ -181,6 +189,11 @@ A; every other record stays byte-exact. Unanchored, already compacted, divergent
 or invalid images refuse without writes. Anchor V1 and container/owner V2 are
 unchanged, so compacted images open under the same readers. Read-only
 `select_recovery` classifies a validated image as legacy, anchored or compacted.
+Attachment, compaction and selection validate images as capture does, including
+format 3 provenance and the content profile. Until #16's admission work enforces
+the profile on writes, out-of-profile content retained after upgrade blocks
+capture, installation, attachment, compaction and recovery selection, without
+writes, until it is consumed.
 Token-exhausted receive, deferred receive and session acceptance discard every
 staged effect, including earlier TTL routing in the same command. Indexed refusals
 may initialize their private owner and advance only the `0xF1` checkpoint; domain
@@ -202,8 +215,9 @@ DTOs. Only nonlegacy topic creation uses private V3, including invalid new setti
 that must survive for deterministic refusal. New readers accept V1/V2/V3; older
 readers refuse unsupported proposal versions.
 
-Store format 2 and journal-entry/frontier/indexed-checkpoint formats remain unchanged;
-snapshot anchors use the separate owner/container fences described above. Canonical
+Store format 3 adds no record encoding: journal-entry/frontier/indexed-checkpoint
+formats remain unchanged, and snapshot anchors use the separate owner/container
+fences described above. Canonical
 topic values alone use V2 when duplicate detection is enabled or its window differs
 from 600,000ms; disabled/default-window topics retain exact legacy V1 bytes. The
 topic codec rejects unknown, truncated, trailing, noncanonical and redundant V2
@@ -228,6 +242,15 @@ snapshot validation requires canonical rows of either version.
 Memory is volatile; neither backend is replicated. Production durable startup
 returns static replication-unavailable before storage/listeners; production Memory
 refuses too. Fjall restart is not node-loss recovery; development is single-node.
+
+Fjall stores use format 3. Ordinary opening never upgrades format 2; development
+startup refuses it before listening and names the offline
+`switchyardctl store upgrade --data-dir <path>` command. The upgrade preflights
+retained AMQP content with fixed per-content parser bounds (16 MiB, depth 128,
+4,194,304 nodes, 268,435,456 work units), which are not queue limits or quotas,
+and validates journal/indexed owners only where present. It then changes only the
+marker, so older builds refuse the upgraded store; rollback requires a pre-upgrade
+copy, never marker stripping. See [store upgrade](lifecycle.md#store-format-upgrade).
 
 Custody is owner-scoped, not whole-task-tree shielding. Borrowed cancellation/retry
 requires a surviving owner; retirement requests prove neither joins nor peer answers.

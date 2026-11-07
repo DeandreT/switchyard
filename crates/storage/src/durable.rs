@@ -22,12 +22,18 @@ use crate::{
 pub const STORE_FORMAT_V1: u32 = 1;
 /// Layout requiring live owner identities for domain entity records.
 pub const STORE_FORMAT_V2: u32 = 2;
+/// Version 2 record encodings, fenced for the fixed bounded AMQP content
+/// profile. The profile is checked by the explicit offline upgrade and by
+/// snapshot capture, not yet by ordinary writes: write-path enforcement arrives
+/// with #16's typed-content admission, so a format 3 store can hold content
+/// written after upgrade that capture then refuses.
+pub const STORE_FORMAT_V3: u32 = 3;
 /// The only layout this build reads and writes.
-pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V2;
+pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V3;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
-const FORMAT_VERSION_KEY: &[u8] = b"format_version";
+pub(crate) const FORMAT_VERSION_KEY: &[u8] = b"format_version";
 
 pub struct FjallStore {
     database: Database,
@@ -113,68 +119,117 @@ impl FjallStore {
     /// bound allocations from hostile stored values. Provenance is neither
     /// authentication nor semantic validation of the logical records.
     pub fn snapshot_with_provenance(&self) -> Result<SnapshotWithProvenance, StorageError> {
-        let keyspaces = self.database.list_keyspace_names();
-        if keyspaces.len() != 2
-            || !keyspaces
-                .iter()
-                .any(|name| name.as_bytes() == META_KEYSPACE.as_bytes())
-            || !keyspaces
-                .iter()
-                .any(|name| name.as_bytes() == RECORDS_KEYSPACE.as_bytes())
-        {
-            return Err(StorageError::CorruptMetadata {
-                detail: String::from(
-                    "snapshot provenance requires exactly the meta and records keyspaces",
-                ),
-            });
-        }
-
-        // Exclusive topology and the exact inventory keep both lookups noncreating.
-        let current_meta = self
-            .database
-            .keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)
-            .map_err(|error| StorageError::backend("inspect the metadata keyspace", &error))?;
-        let current_records = self
-            .database
-            .keyspace(RECORDS_KEYSPACE, KeyspaceCreateOptions::default)
-            .map_err(|error| StorageError::backend("inspect the record keyspace", &error))?;
-        if current_meta.id() != self.meta.id() || current_records.id() != self.records.id() {
-            return Err(StorageError::CorruptMetadata {
-                detail: String::from(
-                    "snapshot provenance requires the original meta and records keyspace handles",
-                ),
-            });
-        }
-
-        let snapshot = self.database.snapshot();
-        let mut metadata = snapshot.iter(&self.meta);
-        let (key, recorded) = metadata
-            .next()
-            .map(read_entry)
-            .transpose()?
-            .ok_or_else(|| StorageError::CorruptMetadata {
-                detail: String::from("snapshot provenance requires the format version marker"),
-            })?;
-        if key.as_slice() != FORMAT_VERSION_KEY
-            || metadata.next().map(read_entry).transpose()?.is_some()
-        {
-            return Err(StorageError::CorruptMetadata {
-                detail: String::from("snapshot provenance requires only the format version marker"),
-            });
-        }
-        require_readable_format(&recorded)?;
-        let mut format_marker = [0; 4];
-        format_marker.copy_from_slice(&recorded);
-
-        let mut entries = Vec::new();
-        for guard in snapshot.iter(&self.records) {
-            entries.push(read_entry(guard)?);
-        }
-        Ok(SnapshotWithProvenance {
-            snapshot: StoreSnapshot { entries },
-            provenance: SnapshotProvenance::Fjall(FjallSnapshotMetadata { format_marker }),
+        inspect_native(&self.database, &self.meta, &self.records, |recorded| {
+            require_readable_format(recorded).map(|()| true)
         })
+        .map(|image| image.expect("an accepted marker reads every record"))
     }
+}
+
+/// Opens an existing store directory without creating a database or keyspace.
+///
+/// Native recovery still performs its own journal and lock-file I/O. The
+/// keyspace inventory is read before any create-or-open lookup, so a missing or
+/// extra keyspace refuses rather than being created. No marker is checked here.
+pub(crate) fn recover_existing(
+    directory: &Path,
+) -> Result<(Database, Keyspace, Keyspace), StorageError> {
+    // `Database::recover` is doc-hidden in fjall: unlike the builder's `open`,
+    // it never creates a database. The workspace pins fjall exactly so an
+    // upgrade cannot silently change this noncreating behavior.
+    let database = Database::recover(Database::builder(directory).into_config())
+        .map_err(|error| StorageError::backend("recover an existing store directory", &error))?;
+    require_known_inventory(&database)?;
+    // The exact inventory makes both lookups noncreating under exclusion.
+    let meta = database
+        .keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)
+        .map_err(|error| StorageError::backend("open the metadata keyspace", &error))?;
+    let records = database
+        .keyspace(RECORDS_KEYSPACE, KeyspaceCreateOptions::default)
+        .map_err(|error| StorageError::backend("open the record keyspace", &error))?;
+    Ok((database, meta, records))
+}
+
+fn require_known_inventory(database: &Database) -> Result<(), StorageError> {
+    let keyspaces = database.list_keyspace_names();
+    if keyspaces.len() != 2
+        || !keyspaces
+            .iter()
+            .any(|name| name.as_bytes() == META_KEYSPACE.as_bytes())
+        || !keyspaces
+            .iter()
+            .any(|name| name.as_bytes() == RECORDS_KEYSPACE.as_bytes())
+    {
+        return Err(StorageError::CorruptMetadata {
+            detail: String::from(
+                "snapshot provenance requires exactly the meta and records keyspaces",
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Exact inventory, original handle identity and one marker row, then the
+/// marker and all records through one cross-keyspace snapshot. `accept` sees
+/// the checked four-byte marker before any record is copied; returning false
+/// stops without materializing records.
+pub(crate) fn inspect_native(
+    database: &Database,
+    meta: &Keyspace,
+    records: &Keyspace,
+    accept: impl FnOnce(&[u8]) -> Result<bool, StorageError>,
+) -> Result<Option<SnapshotWithProvenance>, StorageError> {
+    require_known_inventory(database)?;
+    // Exclusive topology and the exact inventory keep both lookups noncreating.
+    let current_meta = database
+        .keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)
+        .map_err(|error| StorageError::backend("inspect the metadata keyspace", &error))?;
+    let current_records = database
+        .keyspace(RECORDS_KEYSPACE, KeyspaceCreateOptions::default)
+        .map_err(|error| StorageError::backend("inspect the record keyspace", &error))?;
+    if current_meta.id() != meta.id() || current_records.id() != records.id() {
+        return Err(StorageError::CorruptMetadata {
+            detail: String::from(
+                "snapshot provenance requires the original meta and records keyspace handles",
+            ),
+        });
+    }
+
+    let snapshot = database.snapshot();
+    let mut metadata = snapshot.iter(meta);
+    let (key, recorded) = metadata
+        .next()
+        .map(read_entry)
+        .transpose()?
+        .ok_or_else(|| StorageError::CorruptMetadata {
+            detail: String::from("snapshot provenance requires the format version marker"),
+        })?;
+    if key.as_slice() != FORMAT_VERSION_KEY
+        || metadata.next().map(read_entry).transpose()?.is_some()
+    {
+        return Err(StorageError::CorruptMetadata {
+            detail: String::from("snapshot provenance requires only the format version marker"),
+        });
+    }
+    let format_marker =
+        <[u8; 4]>::try_from(recorded.as_slice()).map_err(|_| StorageError::CorruptMetadata {
+            detail: format!(
+                "format version record is {} bytes, expected 4",
+                recorded.len()
+            ),
+        })?;
+    if !accept(&recorded)? {
+        return Ok(None);
+    }
+
+    let mut entries = Vec::new();
+    for guard in snapshot.iter(records) {
+        entries.push(read_entry(guard)?);
+    }
+    Ok(Some(SnapshotWithProvenance {
+        snapshot: StoreSnapshot { entries },
+        provenance: SnapshotProvenance::Fjall(FjallSnapshotMetadata { format_marker }),
+    }))
 }
 
 /// Cloning shares one open database, so every clone reads what any other wrote.
@@ -273,7 +328,7 @@ fn require_readable_format(recorded: &[u8]) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn read_entry(guard: fjall::Guard) -> Result<(Key, Value), StorageError> {
+pub(crate) fn read_entry(guard: fjall::Guard) -> Result<(Key, Value), StorageError> {
     let (key, value) = guard
         .into_inner()
         .map_err(|error| StorageError::backend("read a scanned record", &error))?;
@@ -309,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn stamps_version_two_when_it_creates_a_store() -> Result<(), StorageError> {
+    fn stamps_version_three_when_it_creates_a_store() -> Result<(), StorageError> {
         let directory = TempDir::new().expect("a temporary directory");
         let store = FjallStore::open(directory.path())?;
         assert_eq!(store.directory(), directory.path());
@@ -325,7 +380,7 @@ mod tests {
             KnownRows {
                 meta: vec![(
                     FORMAT_VERSION_KEY.to_vec(),
-                    STORE_FORMAT_V2.to_be_bytes().to_vec(),
+                    STORE_FORMAT_V3.to_be_bytes().to_vec(),
                 )],
                 records: Vec::new(),
             }
@@ -551,14 +606,14 @@ mod tests {
     }
 
     #[test]
-    fn marked_version_two_accepts_populated_known_keyspaces() -> Result<(), StorageError> {
+    fn marked_version_three_accepts_populated_known_keyspaces() -> Result<(), StorageError> {
         let directory = TempDir::new().expect("a temporary directory");
         let mut metadata = unversioned_meta_rows();
         metadata.insert(
             1,
             (
                 FORMAT_VERSION_KEY.to_vec(),
-                STORE_FORMAT_V2.to_be_bytes().to_vec(),
+                STORE_FORMAT_V3.to_be_bytes().to_vec(),
             ),
         );
         let rows = KnownRows {
@@ -577,6 +632,35 @@ mod tests {
         assert_eq!(reopened.snapshot()?.entries(), rows.records.as_slice());
         drop(reopened);
         assert_eq!(read_known_rows(directory.path())?, rows);
+        Ok(())
+    }
+
+    /// Ordinary open never upgrades version 2; only the explicit offline
+    /// upgrade moves its marker.
+    #[test]
+    fn marked_version_two_refuses_empty_and_populated_known_keyspaces_without_changing_rows()
+    -> Result<(), StorageError> {
+        for records in [Vec::new(), unversioned_record_rows()] {
+            let directory = TempDir::new().expect("a temporary directory");
+            let rows = KnownRows {
+                meta: vec![(
+                    FORMAT_VERSION_KEY.to_vec(),
+                    STORE_FORMAT_V2.to_be_bytes().to_vec(),
+                )],
+                records,
+            };
+            seed_known_rows(directory.path(), &rows)?;
+            for _ in 0..2 {
+                assert_eq!(
+                    FjallStore::open(directory.path()).err(),
+                    Some(StorageError::UnsupportedStoreFormat {
+                        found: STORE_FORMAT_V2,
+                        expected: ACTIVE_STORE_FORMAT,
+                    })
+                );
+                assert_eq!(read_known_rows(directory.path())?, rows);
+            }
+        }
         Ok(())
     }
 

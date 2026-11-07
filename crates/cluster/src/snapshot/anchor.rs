@@ -135,7 +135,8 @@ impl SnapshotAnchor {
         if bytes[end..] != checksum(&bytes[..end]) {
             return Err(corrupt("anchor checksum differs"));
         }
-        let source_manifest = SnapshotManifest::new(
+        // A recorded layout 2 source survives the store upgrade as identity.
+        let source_manifest = SnapshotManifest::historical(
             u32_at(bytes, 20),
             u64_at(bytes, 24),
             u64_at(bytes, 32),

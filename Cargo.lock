@@ -223,6 +223,7 @@ name = "cluster"
 version = "0.1.0"
 dependencies = [
  "domain",
+ "fjall",
  "serde",
  "sha2",
  "storage",
@@ -360,6 +361,7 @@ dependencies = [
 name = "domain"
 version = "0.1.0"
 dependencies = [
+ "message-content",
  "postcard",
  "regex-automata",
  "serde",
@@ -1325,6 +1327,7 @@ dependencies = [
  "clap",
  "cluster",
  "domain",
+ "fjall",
  "flume",
  "hmac",
  "protocol-amqp",
@@ -1469,6 +1472,11 @@ version = "0.1.0"
 dependencies = [
  "admin-api",
  "clap",
+ "cluster",
+ "domain",
+ "fjall",
+ "storage",
+ "tempfile",
 ]
 
 [[package]]

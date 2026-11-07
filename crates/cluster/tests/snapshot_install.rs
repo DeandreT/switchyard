@@ -99,7 +99,7 @@ impl<S: StateStore> History<S> {
                 time_to_live_millis: Some(100_000),
                 session_id: session,
                 scheduled_enqueue_at: scheduled.then(|| Timestamp::from_millis(50_000)),
-                envelope: Some(MessageEnvelope::new(vec![0, 0xff, 7])),
+                envelope: Some(MessageEnvelope::new(vec![0x00, 0x53, 0x75, 0xa0, 1, 7])),
             },
         );
     }
