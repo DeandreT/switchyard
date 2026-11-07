@@ -135,6 +135,15 @@ the attach response.
 
 ### Atomicity And Lifecycle
 
+Second-mode delivery confirmations retain their original link incarnation. If
+native Detach or End retires that owner before confirmation, the native API returns
+`RemoteDetached` without writing a disposition, even after channel/handle reuse.
+The receiving owner treats this as clean link retirement rather than faulting the
+shared session. Live wrong-role commands and transport write failures remain
+errors. Broker settlement still commits before confirmation; retirement does not
+undo or fabricate its outcome. Stored formats and live-link wire encodings are
+unchanged, with no storage migration required.
+
 Commands commit one batch; domain refusals preserve messages, counters, history
 and Clock. Indexed apply, journal and replay have separate checkpoint/retire/reopen
 rules, not panic recovery or quorum guarantees. Snapshot format is structural;

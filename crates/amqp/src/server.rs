@@ -320,6 +320,10 @@ impl DeliveryConfirmation {
         self.identity
     }
 
+    /// Confirms the durable outcome only on this delivery's original link incarnation.
+    /// A retired session or link returns `RemoteDetached` without emitting a
+    /// disposition, including when its channel or handle has been reused. This
+    /// transport result does not undo or acknowledge the broker operation itself.
     pub async fn confirm(self, state: DeliveryState) -> Result<(), EngineError> {
         self.confirm_ref(state).await
     }
