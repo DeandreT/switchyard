@@ -29,9 +29,9 @@ use storage::{StateStore, WriteBatch};
 use crate::{
     AcceptedSession, BrokerError, Command, CommandKind, CommandOutcome, DeadLetterInfo,
     DeadLetterReason, Delivery, DeliveryLock, DeliveryOrigin, EntityPath, LockToken,
-    MessageEnvelope, MessageRecord, MessageState, NamespaceName, QueueConfig, QueueConfigUpdate,
-    QueueCounters, ReceiveMode, SequenceNumber, SessionHold, SessionId, SessionLock, SessionRecord,
-    Timestamp, codec, keys,
+    MessageContent, MessageEnvelope, MessageRecord, MessageRecordFormat, MessageState,
+    NamespaceName, QueueConfig, QueueConfigUpdate, QueueCounters, ReceiveMode, SequenceNumber,
+    SessionHold, SessionId, SessionLock, SessionRecord, Timestamp, codec, keys,
 };
 
 use self::deferred::replace_envelope;
@@ -167,6 +167,7 @@ impl<S: StateStore> StateMachine<S> {
                     session_id: session_id.as_ref(),
                     scheduled_enqueue_at: *scheduled_enqueue_at,
                     envelope: envelope.as_ref(),
+                    format: MessageRecordFormat::V1,
                 };
                 if self
                     .topic_config(&command.namespace, &command.entity)?
@@ -178,15 +179,28 @@ impl<S: StateStore> StateMachine<S> {
                 }
             }
             CommandKind::SendBatch { messages } => {
+                let inputs = messages.iter().map(SendInput::from).collect::<Vec<_>>();
+                self.send_inputs(command, &inputs, &mut batch)?
+            }
+            CommandKind::SendContent { content } => {
+                let input = content.derive().map_err(BrokerError::from)?;
+                let input = SendInput::content(&input);
                 if self
                     .topic_config(&command.namespace, &command.entity)?
                     .is_some()
                 {
-                    let inputs = messages.iter().map(SendInput::from).collect::<Vec<_>>();
-                    self.publish(command, &inputs, &mut batch)?
+                    self.publish(command, &[input], &mut batch)?
                 } else {
-                    self.send_batch(command, messages, &mut batch)?
+                    self.send(command, input, &mut batch)?
                 }
+            }
+            CommandKind::SendContentBatch { messages } => {
+                // Every child derives before any state is read, against one
+                // shared command-wide projection budget, so one invalid or
+                // over-budget child refuses the whole batch with no effects.
+                let derived = MessageContent::derive_batch(messages).map_err(BrokerError::from)?;
+                let inputs = derived.iter().map(SendInput::content).collect::<Vec<_>>();
+                self.send_inputs(command, &inputs, &mut batch)?
             }
             CommandKind::CancelScheduled { sequences } => {
                 if self.topic_exists(command)? {

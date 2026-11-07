@@ -17,6 +17,8 @@ pub(super) struct SendInput<'a> {
     pub(super) session_id: Option<&'a crate::SessionId>,
     pub(super) scheduled_enqueue_at: Option<crate::Timestamp>,
     pub(super) envelope: Option<&'a MessageEnvelope>,
+    /// Legacy sends write V1 records; content sends write V2.
+    pub(super) format: MessageRecordFormat,
 }
 
 impl<'a> From<&'a MessageInput> for SendInput<'a> {
@@ -28,6 +30,17 @@ impl<'a> From<&'a MessageInput> for SendInput<'a> {
             session_id: input.session_id.as_ref(),
             scheduled_enqueue_at: input.scheduled_enqueue_at,
             envelope: input.envelope.as_ref(),
+            format: MessageRecordFormat::V1,
+        }
+    }
+}
+
+impl<'a> SendInput<'a> {
+    /// A send derived from original content, stored as a V2 record.
+    pub(super) fn content(input: &'a MessageInput) -> Self {
+        Self {
+            format: MessageRecordFormat::V2,
+            ..Self::from(input)
         }
     }
 }
@@ -61,18 +74,34 @@ impl<S: StateStore> StateMachine<S> {
     pub(super) fn send_batch(
         &self,
         command: &Command,
-        messages: &[MessageInput],
+        inputs: &[SendInput<'_>],
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
-        if messages.is_empty() {
+        if inputs.is_empty() {
             return Err(BrokerError::EmptyMessageBatch);
         }
-        let inputs = messages.iter().map(SendInput::from).collect::<Vec<_>>();
-        let persisted = self.persist_messages(command, &inputs, batch)?;
+        let persisted = self.persist_messages(command, inputs, batch)?;
         Ok(CommandOutcome::BatchSent {
             sequences: persisted.sequences,
             stored: persisted.stored,
         })
+    }
+
+    /// A batch publishes to a topic and is stored directly on a queue.
+    pub(super) fn send_inputs(
+        &self,
+        command: &Command,
+        inputs: &[SendInput<'_>],
+        batch: &mut WriteBatch,
+    ) -> Result<CommandOutcome, BrokerError> {
+        if self
+            .topic_config(&command.namespace, &command.entity)?
+            .is_some()
+        {
+            self.publish(command, inputs, batch)
+        } else {
+            self.send_batch(command, inputs, batch)
+        }
     }
 
     /// Validates and encodes every child before adding any storage mutation.
@@ -212,7 +241,7 @@ pub(super) fn message_record(
         session_id: input.session_id.cloned(),
         dead_letter: None,
         envelope: input.envelope.cloned(),
-        format: MessageRecordFormat::V1,
+        format: input.format,
     }
 }
 

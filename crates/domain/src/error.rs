@@ -2,8 +2,9 @@ use storage::StorageError;
 use thiserror::Error;
 
 use crate::{
-    CodecError, EntityPath, IdentifierError, QueueConfigError, RuleConfigError, RuleName,
-    SequenceNumber, SessionId, SubscriptionConfigError, Timestamp, TopicConfigError,
+    CodecError, EntityPath, IdentifierError, MessageContentError, QueueConfigError,
+    RuleConfigError, RuleName, SequenceNumber, SessionId, SubscriptionConfigError, Timestamp,
+    TopicConfigError,
 };
 
 /// Every rejection the state machine can produce.
@@ -121,6 +122,8 @@ pub enum BrokerError {
     SubscriptionConfig(#[from] SubscriptionConfigError),
     #[error("invalid rule configuration: {0}")]
     RuleConfig(#[from] RuleConfigError),
+    #[error("invalid message content: {0}")]
+    MessageContent(#[from] MessageContentError),
     #[error("a dead-letter queue exists only as the shadow of its parent")]
     DeadLetterQueueIsReserved,
     #[error("queue requires a session and the command named none")]

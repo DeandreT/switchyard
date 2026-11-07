@@ -1,7 +1,7 @@
 //! Frozen message records. V1 reproduces exactly the bytes the generic value
 //! codec wrote for `MessageRecord`. V2 stores either raw bytes or the original
 //! AMQP message with a copy-local property overlay, without a duplicated body.
-//! No command produces V2 yet; every rewrite keeps the record's source format.
+//! Content sends produce V2; every rewrite keeps the record's source format.
 
 use std::{borrow::Cow, collections::BTreeSet};
 
