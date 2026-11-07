@@ -454,8 +454,8 @@ async fn outer_request_panic_drains_actual_deferred_receive_registration_after_r
                 .request_response_delivery(&actor.entity, delivery.lock.unwrap().token)
                 .await
                 .unwrap()
-                .delivery,
-            Some(delivery.clone())
+                .sequence,
+            delivery.sequence
         );
         actor.assert_one(
             CommandKind::ReceiveDeferred {

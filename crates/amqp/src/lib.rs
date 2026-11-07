@@ -11,8 +11,8 @@ mod types;
 pub use crate::{
     codec::{
         AMQP_HEADER, AMQP_PROTOCOL_ID, Frame, ProtocolHeader, SASL_HEADER, SASL_PROTOCOL_ID,
-        decode_message, decode_stored_message, encode_frame, encode_message, read_frame,
-        read_protocol_header, write_frame, write_protocol_header,
+        decode_message, decode_stored_message, decode_stored_value, decode_value, encode_frame,
+        encode_message, read_frame, read_protocol_header, write_frame, write_protocol_header,
     },
     server::{
         ConnectionShutdownError, ConnectionStop, CreditReservation, Delivery, DeliveryConfirmation,

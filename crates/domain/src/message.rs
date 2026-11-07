@@ -213,7 +213,8 @@ impl MessageEnvelope {
         self
     }
 
-    /// Data only: nothing renders the overlay over the original bytes yet.
+    /// Data only here: the protocol edge renders the overlay over the
+    /// original bytes on every read of the copy.
     pub fn with_overlay(mut self, overlay: Vec<OverlayProperty>) -> Self {
         self.metadata.overlay = overlay;
         self

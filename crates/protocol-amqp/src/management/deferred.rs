@@ -187,12 +187,14 @@ pub(super) async fn update_disposition<B: Broker>(
         message,
         delivery.managed.sequence,
         lock_token,
-        delivery.managed.delivery.as_ref(),
         properties.as_ref(),
     ) {
         Ok(disposition) => disposition,
-        Err(description) => {
+        Err(DispositionError::Request(description)) => {
             return ManagementResponse::bad_request(message_id, tracking_id, description);
+        }
+        Err(DispositionError::Patch(error)) => {
+            return ManagementResponse::invalid_field(message_id, tracking_id, error.to_string());
         }
     };
 
@@ -308,73 +310,110 @@ fn properties_to_modify(body: &Body) -> Result<Option<Fields>, &'static str> {
     Ok(Some(fields))
 }
 
+/// Why a disposition request cannot become a broker command.
+#[derive(Debug)]
+enum DispositionError {
+    /// The request itself is malformed.
+    Request(&'static str),
+    /// A property change no peer could send.
+    Patch(crate::ProtocolError),
+}
+
 fn disposition_command(
     status: &str,
     message: &Message,
     sequence: SequenceNumber,
     lock_token: LockToken,
-    delivery: Option<&Delivery>,
     properties: Option<&Fields>,
-) -> Result<(CommandKind, ExpectedDisposition), &'static str> {
+) -> Result<(CommandKind, ExpectedDisposition), DispositionError> {
     let has_properties = properties.is_some_and(|properties| !properties.is_empty());
-    match status {
-        "completed" if !has_properties => Ok((
-            CommandKind::Complete {
+    if status == "completed" {
+        return if has_properties {
+            Err(DispositionError::Request(
+                "properties-to-modify is not supported for completion",
+            ))
+        } else {
+            Ok((
+                CommandKind::Complete {
+                    sequence,
+                    lock_token,
+                },
+                ExpectedDisposition::Completed,
+            ))
+        };
+    }
+    if !matches!(status, "defered" | "abandoned" | "suspended") {
+        return Err(DispositionError::Request(
+            "disposition-status must be completed, abandoned, defered, or suspended",
+        ));
+    }
+    // The broker applies a patch to the locked copy wherever its lock came
+    // from, so a link-received lock can change properties too. Without a
+    // property change the legacy command leaves the copy's bytes unchanged.
+    let patch = properties
+        .map(crate::message::property_patch)
+        .transpose()
+        .map_err(DispositionError::Patch)?
+        .filter(|patch| !patch.is_empty());
+    Ok(match (status, patch) {
+        ("defered", Some(patch)) => (
+            CommandKind::DeferWithPatch {
                 sequence,
                 lock_token,
+                patch,
             },
-            ExpectedDisposition::Completed,
-        )),
-        "defered" => Ok((
+            ExpectedDisposition::Deferred,
+        ),
+        ("defered", None) => (
             CommandKind::Defer {
                 sequence,
                 lock_token,
-                replacement_envelope: disposition_replacement(delivery, properties)?,
+                replacement_envelope: None,
             },
             ExpectedDisposition::Deferred,
-        )),
-        "abandoned" => Ok((
+        ),
+        ("abandoned", Some(patch)) => (
+            CommandKind::AbandonWithPatch {
+                sequence,
+                lock_token,
+                patch,
+            },
+            ExpectedDisposition::Abandoned,
+        ),
+        ("abandoned", None) => (
             CommandKind::Abandon {
                 sequence,
                 lock_token,
-                replacement_envelope: disposition_replacement(delivery, properties)?,
+                replacement_envelope: None,
             },
             ExpectedDisposition::Abandoned,
-        )),
-        "suspended" => Ok((
-            CommandKind::DeadLetter {
-                sequence,
-                lock_token,
-                reason: optional_string(message, DEAD_LETTER_REASON)
-                    .unwrap_or("RejectedByReceiver")
-                    .to_owned(),
-                description: optional_string(message, DEAD_LETTER_DESCRIPTION)
-                    .unwrap_or("the receiver rejected the message")
-                    .to_owned(),
-                replacement_envelope: disposition_replacement(delivery, properties)?,
-            },
-            ExpectedDisposition::DeadLettered,
-        )),
-        "completed" => Err("properties-to-modify is not supported for completion"),
-        _ => Err("disposition-status must be completed, abandoned, defered, or suspended"),
-    }
-}
-
-fn disposition_replacement(
-    delivery: Option<&Delivery>,
-    properties: Option<&Fields>,
-) -> Result<Option<domain::MessageEnvelope>, &'static str> {
-    match (properties, delivery) {
-        (Some(properties), Some(delivery)) if !properties.is_empty() => {
-            crate::message::replacement_envelope(delivery, properties)
-                .map(Some)
-                .map_err(|_| "the stored message envelope could not be updated")
+        ),
+        (_, patch) => {
+            let reason = optional_string(message, DEAD_LETTER_REASON)
+                .unwrap_or("RejectedByReceiver")
+                .to_owned();
+            let description = optional_string(message, DEAD_LETTER_DESCRIPTION)
+                .unwrap_or("the receiver rejected the message")
+                .to_owned();
+            let kind = match patch {
+                Some(patch) => CommandKind::DeadLetterWithPatch {
+                    sequence,
+                    lock_token,
+                    reason,
+                    description,
+                    patch,
+                },
+                None => CommandKind::DeadLetter {
+                    sequence,
+                    lock_token,
+                    reason,
+                    description,
+                    replacement_envelope: None,
+                },
+            };
+            (kind, ExpectedDisposition::DeadLettered)
         }
-        (Some(properties), None) if !properties.is_empty() => {
-            Err("properties cannot be changed without a managed delivery envelope")
-        }
-        _ => Ok(None),
-    }
+    })
 }
 
 fn optional_string<'a>(message: &'a Message, name: &str) -> Option<&'a str> {
@@ -449,11 +488,17 @@ mod tests {
                 }
                 let outcome = match &kind {
                     CommandKind::Complete { .. } => CommandOutcome::Completed,
-                    CommandKind::Defer { .. } => CommandOutcome::Deferred,
-                    CommandKind::Abandon { .. } => CommandOutcome::Abandoned {
-                        dead_lettered: false,
-                    },
-                    CommandKind::DeadLetter { .. } => CommandOutcome::DeadLettered,
+                    CommandKind::Defer { .. } | CommandKind::DeferWithPatch { .. } => {
+                        CommandOutcome::Deferred
+                    }
+                    CommandKind::Abandon { .. } | CommandKind::AbandonWithPatch { .. } => {
+                        CommandOutcome::Abandoned {
+                            dead_lettered: false,
+                        }
+                    }
+                    CommandKind::DeadLetter { .. } | CommandKind::DeadLetterWithPatch { .. } => {
+                        CommandOutcome::DeadLettered
+                    }
                     _ => panic!("unexpected test command: {kind:?}"),
                 };
                 Ok(outcome)
@@ -522,7 +567,6 @@ mod tests {
             SequenceNumber::new(7),
             LockToken::new(9),
             None,
-            None,
         )
         .expect("defered is the wire spelling");
         assert_eq!(
@@ -541,58 +585,68 @@ mod tests {
                 SequenceNumber::new(7),
                 LockToken::new(9),
                 None,
-                None,
             )
             .is_err()
         );
     }
 
+    fn patch_entry(name: &str, value: Value) -> domain::OverlayProperty {
+        domain::OverlayProperty {
+            name: name.to_owned(),
+            value: serde_amqp::to_vec(&value).expect("the patch value encodes"),
+        }
+    }
+
     #[test]
-    fn management_abandon_and_dead_letter_preserve_property_changes() {
-        let mut original = Message::data(b"body".to_vec());
-        original.application_properties = Some(
-            amqp::ApplicationProperties::builder()
-                .insert("existing", "kept")
-                .build(),
-        );
-        let delivery = Delivery {
-            sequence: SequenceNumber::new(7),
-            message_id: String::from("deferred"),
-            body: b"body".to_vec(),
-            enqueued_at: domain::Timestamp::from_millis(10),
-            scheduled_enqueue_at: None,
-            expires_at: None,
-            delivery_count: 1,
-            lock: None,
-            session_id: None,
-            dead_letter: None,
-            envelope: Some(domain::MessageEnvelope::new(
-                amqp::encode_message(&original).expect("the original message encodes"),
-            )),
-            origin: domain::DeliveryOrigin::Deferred,
-        };
+    fn management_dispositions_send_property_changes_as_patches() {
+        let sequence = SequenceNumber::new(7);
+        let lock_token = LockToken::new(9);
         let mut properties = Fields::new();
         properties.insert(Symbol::from("reviewed-by"), Value::String("sdk".into()));
+        // Broker-owned dead-letter names never become patch entries.
+        properties.insert(
+            Symbol::from(crate::DEAD_LETTER_DESCRIPTION_PROPERTY),
+            Value::String("forged".into()),
+        );
+        let patch = vec![patch_entry("reviewed-by", Value::String("sdk".into()))];
 
         let (abandon, abandon_outcome) = disposition_command(
             "abandoned",
             &Message::default(),
-            delivery.sequence,
-            LockToken::new(9),
-            Some(&delivery),
+            sequence,
+            lock_token,
             Some(&properties),
         )
         .expect("abandon supports properties-to-modify");
-        let CommandKind::Abandon {
-            replacement_envelope: Some(abandon_envelope),
-            ..
-        } = abandon
-        else {
-            panic!("abandon must carry the updated envelope")
-        };
+        assert_eq!(
+            abandon,
+            CommandKind::AbandonWithPatch {
+                sequence,
+                lock_token,
+                patch: patch.clone(),
+            }
+        );
         assert!(abandon_outcome.matches(&CommandOutcome::Abandoned {
             dead_lettered: false,
         }));
+
+        let (defer, defer_outcome) = disposition_command(
+            "defered",
+            &Message::default(),
+            sequence,
+            lock_token,
+            Some(&properties),
+        )
+        .expect("defer supports properties-to-modify");
+        assert_eq!(
+            defer,
+            CommandKind::DeferWithPatch {
+                sequence,
+                lock_token,
+                patch: patch.clone(),
+            }
+        );
+        assert!(defer_outcome.matches(&CommandOutcome::Deferred));
 
         let dead_letter_request = Message {
             body: body([
@@ -607,40 +661,64 @@ mod tests {
         let (dead_letter, dead_letter_outcome) = disposition_command(
             "suspended",
             &dead_letter_request,
-            delivery.sequence,
-            LockToken::new(9),
-            Some(&delivery),
+            sequence,
+            lock_token,
             Some(&properties),
         )
         .expect("dead-letter supports properties-to-modify");
-        let CommandKind::DeadLetter {
-            reason,
-            description,
-            replacement_envelope: Some(dead_letter_envelope),
-            ..
-        } = dead_letter
-        else {
-            panic!("dead-letter must carry the updated envelope")
-        };
-        assert_eq!(reason, "InvalidOrder");
-        assert_eq!(description, "the order is incomplete");
+        assert_eq!(
+            dead_letter,
+            CommandKind::DeadLetterWithPatch {
+                sequence,
+                lock_token,
+                reason: String::from("InvalidOrder"),
+                description: String::from("the order is incomplete"),
+                patch,
+            }
+        );
         assert!(dead_letter_outcome.matches(&CommandOutcome::DeadLettered));
+    }
 
-        for envelope in [abandon_envelope, dead_letter_envelope] {
-            let message = amqp::decode_message(envelope.as_bytes())
-                .expect("the replacement envelope decodes");
-            let properties = message
-                .application_properties
-                .expect("application properties exist");
+    #[test]
+    fn management_dispositions_without_property_changes_keep_legacy_commands() {
+        let sequence = SequenceNumber::new(7);
+        let lock_token = LockToken::new(9);
+        let empty = Fields::new();
+        let mut reserved_only = Fields::new();
+        reserved_only.insert(
+            Symbol::from(crate::DEAD_LETTER_REASON_PROPERTY),
+            Value::String("forged".into()),
+        );
+        for properties in [None, Some(&empty), Some(&reserved_only)] {
+            let (abandon, _) = disposition_command(
+                "abandoned",
+                &Message::default(),
+                sequence,
+                lock_token,
+                properties,
+            )
+            .expect("abandon is valid");
             assert_eq!(
-                properties.get("existing"),
-                Some(&Value::String("kept".into()))
-            );
-            assert_eq!(
-                properties.get("reviewed-by"),
-                Some(&Value::String("sdk".into()))
+                abandon,
+                CommandKind::Abandon {
+                    sequence,
+                    lock_token,
+                    replacement_envelope: None,
+                }
             );
         }
+        let mut properties = Fields::new();
+        properties.insert(Symbol::from("reviewed-by"), Value::String("sdk".into()));
+        assert!(matches!(
+            disposition_command(
+                "completed",
+                &Message::default(),
+                sequence,
+                lock_token,
+                Some(&properties),
+            ),
+            Err(DispositionError::Request(_))
+        ));
     }
 
     fn locked_delivery(sequence: u64, token: u64, lock_duration_millis: u64) -> Delivery {
@@ -739,7 +817,6 @@ mod tests {
         management
             .refresh_request_response_delivery_at(
                 Some(&registration),
-                domain::Timestamp::from_millis(2_000),
                 2_000,
                 started + std::time::Duration::from_millis(900),
             )
@@ -753,14 +830,7 @@ mod tests {
             )
             .await
             .expect("the renewed registry entry remains live");
-        assert_eq!(
-            renewed.delivery.and_then(|delivery| delivery.lock),
-            Some(domain::DeliveryLock {
-                token: LockToken::new(9),
-                locked_until: domain::Timestamp::from_millis(2_000),
-                lock_duration_millis: 2_000,
-            })
-        );
+        assert_eq!(renewed.sequence, SequenceNumber::new(7));
         assert_eq!(
             management
                 .request_response_delivery_at(
@@ -943,6 +1013,253 @@ mod tests {
                 .managed_delivery(&entity, None, LockToken::new(9))
                 .await,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_link_received_lock_can_modify_properties_through_management() {
+        let management = ConnectionManagement::new();
+        let entity = EntityPath::new("orders").expect("valid entity");
+        let namespace = NamespaceName::new("tenant").expect("valid namespace");
+        let link = "receiver-link";
+        management
+            .register_delivery(
+                link,
+                entity.clone(),
+                SequenceNumber::new(7),
+                LockToken::new(9),
+            )
+            .await;
+        let mut properties = OrderedMap::new();
+        properties.insert(
+            Value::String(String::from("reviewed-by")),
+            Value::String(String::from("sdk")),
+        );
+        let request = Message {
+            application_properties: Some(
+                amqp::ApplicationProperties::builder()
+                    .insert(ASSOCIATED_LINK_NAME_PROPERTY, link)
+                    .build(),
+            ),
+            body: body([
+                (
+                    crate::LOCK_TOKENS,
+                    Value::Array(Array::from(vec![Value::Uuid(lock_uuid(LockToken::new(9)))])),
+                ),
+                (DISPOSITION_STATUS, Value::String(String::from("abandoned"))),
+                (PROPERTIES_TO_MODIFY, Value::Map(properties)),
+            ]),
+            ..Message::default()
+        };
+        let broker = RecordingBroker::default();
+
+        let response = update_disposition(
+            &request,
+            MessageId::Ulong(1),
+            None,
+            &namespace,
+            &entity,
+            &broker,
+            &management,
+        )
+        .await;
+
+        assert_eq!(response.status_code, 200, "{}", response.status_description);
+        assert_eq!(
+            broker
+                .commands
+                .lock()
+                .expect("the command recorder is not poisoned")
+                .as_slice(),
+            &[CommandKind::AbandonWithPatch {
+                sequence: SequenceNumber::new(7),
+                lock_token: LockToken::new(9),
+                patch: vec![patch_entry("reviewed-by", Value::String("sdk".into()))],
+            }]
+        );
+    }
+
+    /// The real broker behind the management handler, as the listener runs it.
+    #[derive(Clone)]
+    struct RealBroker(server::BrokerHandle);
+
+    impl Broker for RealBroker {
+        fn submit(
+            &self,
+            namespace: NamespaceName,
+            entity: EntityPath,
+            kind: CommandKind,
+        ) -> impl std::future::Future<Output = Result<CommandOutcome, crate::BrokerRejection>> + Send
+        {
+            let handle = self.0.clone();
+            async move {
+                handle
+                    .submit(namespace, entity, kind)
+                    .await
+                    .map_err(|error| match error {
+                        server::SubmitError::Propose(server::ProposeError::Broker(error)) => {
+                            crate::BrokerRejection::Refused(error)
+                        }
+                        other => crate::BrokerRejection::Unavailable(other.to_string()),
+                    })
+            }
+        }
+
+        fn deliverable(
+            &self,
+            _namespace: &NamespaceName,
+            _entity: &EntityPath,
+        ) -> impl std::future::Future<Output = ()> + Send {
+            std::future::pending()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_patch_value_is_invalid_field_and_leaves_the_copy_and_lock() {
+        let owner = server::Broker::spawn(server::LocalProposer::new(
+            domain::StateMachine::new(storage::MemoryStore::default()),
+            server::ManualClock::at(1_000),
+        ));
+        let broker = RealBroker(owner.handle());
+        let namespace = NamespaceName::new("tenant").expect("valid namespace");
+        let entity = EntityPath::new("orders").expect("valid entity");
+        let submit = |kind| {
+            owner
+                .handle()
+                .submit_blocking(namespace.clone(), entity.clone(), kind)
+                .expect("the setup command commits")
+        };
+        submit(CommandKind::CreateQueue {
+            config: domain::QueueConfig::default(),
+        });
+        let original = amqp::Message::builder()
+            .application_properties(
+                amqp::ApplicationProperties::builder()
+                    .insert("stage", "received")
+                    .build(),
+            )
+            .body(Body::Data(vec![b"kept".to_vec().into()]))
+            .build();
+        submit(CommandKind::SendContent {
+            content: domain::MessageContent::Amqp(
+                amqp::encode_message(&original).expect("the original encodes"),
+            ),
+        });
+        let CommandOutcome::Received(Some(delivery)) = submit(CommandKind::Receive {
+            mode: ReceiveMode::PeekLock,
+            lock_duration_millis: None,
+            session: None,
+        }) else {
+            panic!("the message was locked")
+        };
+        let token = delivery.lock.expect("a peek lock").token;
+        let link = "receiver-link";
+        let management = ConnectionManagement::new();
+        management
+            .register_delivery(link, entity.clone(), delivery.sequence, token)
+            .await;
+        let peek = || {
+            submit(CommandKind::Peek {
+                from_sequence: delivery.sequence,
+                max_messages: 1,
+                session: None,
+            })
+        };
+        let before = peek();
+        let request = |properties: OrderedMap<Value, Value>| Message {
+            application_properties: Some(
+                amqp::ApplicationProperties::builder()
+                    .insert(ASSOCIATED_LINK_NAME_PROPERTY, link)
+                    .build(),
+            ),
+            body: body([
+                (
+                    crate::LOCK_TOKENS,
+                    Value::Array(Array::from(vec![Value::Uuid(lock_uuid(token))])),
+                ),
+                (DISPOSITION_STATUS, Value::String(String::from("abandoned"))),
+                (PROPERTIES_TO_MODIFY, Value::Map(properties)),
+            ]),
+            ..Message::default()
+        };
+        let one = |value: Value| {
+            let mut properties = OrderedMap::new();
+            properties.insert(
+                Value::String(String::from("stage")),
+                Value::String(String::from("patched")),
+            );
+            properties.insert(Value::String(String::from("refused")), value);
+            properties
+        };
+
+        for (refused, why) in [
+            // Inside the size headroom, but larger than any filterable property
+            // value may be: the broker's content checks refuse it.
+            (
+                Value::Binary(vec![0_u8; 300 * 1024].into()),
+                "domain content refusal",
+            ),
+            // A shape the AMQP codec cannot encode as one received value.
+            (
+                Value::Array(Array::from(vec![Value::String(String::from("café"))])),
+                "protocol patch refusal",
+            ),
+        ] {
+            let response = update_disposition(
+                &request(one(refused)),
+                MessageId::Ulong(1),
+                None,
+                &namespace,
+                &entity,
+                &broker,
+                &management,
+            )
+            .await;
+            assert_eq!(
+                response.status_code, 400,
+                "{why}: {}",
+                response.status_description
+            );
+            assert_eq!(
+                response.error_condition,
+                Some(crate::INVALID_FIELD),
+                "{why}"
+            );
+            assert_eq!(peek(), before, "{why}: the copy and its lock are unchanged");
+            assert!(
+                management
+                    .managed_delivery(&entity, Some(link), token)
+                    .await
+                    .is_some(),
+                "{why}: the lock stays registered"
+            );
+        }
+
+        // The lock is still live: an unpatched abandon settles it.
+        let response = update_disposition(
+            &request(OrderedMap::new()),
+            MessageId::Ulong(2),
+            None,
+            &namespace,
+            &entity,
+            &broker,
+            &management,
+        )
+        .await;
+        assert_eq!(response.status_code, 200, "{}", response.status_description);
+        let CommandOutcome::Received(Some(redelivered)) = submit(CommandKind::Receive {
+            mode: ReceiveMode::PeekLock,
+            lock_duration_millis: None,
+            session: None,
+        }) else {
+            panic!("the abandoned message comes round again")
+        };
+        assert_eq!(
+            redelivered
+                .envelope
+                .map(|envelope| envelope.overlay().to_vec()),
+            Some(Vec::new()),
+            "no refused patch reached the copy"
         );
     }
 }

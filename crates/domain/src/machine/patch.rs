@@ -1,8 +1,8 @@
 //! Copy-local content rewrites carried by abandon, defer and dead-letter.
 
 use crate::{
-    BrokerError, MessageContentError, MessageEnvelope, MessageRecord, MessageRecordFormat,
-    OverlayProperty, PROPERTY_PATCH_HEADROOM_BYTES, QueueConfig, content,
+    BrokerError, CONTENT_LIMITS, MessageContentError, MessageEnvelope, MessageRecord,
+    MessageRecordFormat, OverlayProperty, PROPERTY_PATCH_HEADROOM_BYTES, QueueConfig, content,
 };
 
 use super::deferred::replace_envelope;
@@ -50,9 +50,12 @@ fn patch_properties(
     };
     let overlay = content::patch_overlay(envelope.overlay(), patch)?;
     let effective_bytes = content::effective_len(envelope.as_bytes(), &overlay);
+    // The content-safety ceiling caps the allowance for entities with large
+    // limits, so every copy a patch leaves can still be rendered and read.
     let maximum_bytes = config
         .max_message_bytes
-        .saturating_add(PROPERTY_PATCH_HEADROOM_BYTES);
+        .saturating_add(PROPERTY_PATCH_HEADROOM_BYTES)
+        .min(CONTENT_LIMITS.max_bytes);
     if effective_bytes > maximum_bytes {
         return Err(BrokerError::MessageTooLarge {
             body_bytes: effective_bytes,

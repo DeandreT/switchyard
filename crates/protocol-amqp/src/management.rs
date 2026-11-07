@@ -83,10 +83,6 @@ struct RequestResponseDeliveryKey {
 pub(crate) struct ManagedDelivery {
     entity: EntityPath,
     sequence: SequenceNumber,
-    /// Present for deliveries returned inside a management response. It is the
-    /// sender envelope before broker overlays, needed if a later request asks
-    /// to change application properties while settling the lock.
-    delivery: Option<Delivery>,
 }
 
 #[derive(Clone, Debug)]
@@ -248,11 +244,7 @@ impl ConnectionManagement {
                 link_name: link_name.to_owned(),
                 lock_token,
             },
-            managed: ManagedDelivery {
-                entity,
-                sequence,
-                delivery: None,
-            },
+            managed: ManagedDelivery { entity, sequence },
             identity: Arc::new(()),
         };
         self.deliveries
@@ -324,11 +316,7 @@ impl ConnectionManagement {
         deliveries.insert(
             registration.key.clone(),
             RequestResponseDelivery {
-                managed: ManagedDelivery {
-                    entity,
-                    sequence,
-                    delivery: Some(delivery),
-                },
+                managed: ManagedDelivery { entity, sequence },
                 registration: registration.clone(),
                 expires_at: request_response_deadline(now, lock.lock_duration_millis),
             },
@@ -366,12 +354,10 @@ impl ConnectionManagement {
     async fn refresh_request_response_delivery(
         &self,
         registration: Option<&RequestResponseDeliveryRegistration>,
-        locked_until: domain::Timestamp,
         lock_duration_millis: u64,
     ) {
         self.refresh_request_response_delivery_at(
             registration,
-            locked_until,
             lock_duration_millis,
             Instant::now(),
         )
@@ -381,7 +367,6 @@ impl ConnectionManagement {
     async fn refresh_request_response_delivery_at(
         &self,
         registration: Option<&RequestResponseDeliveryRegistration>,
-        locked_until: domain::Timestamp,
         lock_duration_millis: u64,
         now: Instant,
     ) {
@@ -391,13 +376,6 @@ impl ConnectionManagement {
             && registered.registration == *registration
         {
             registered.expires_at = request_response_deadline(now, lock_duration_millis);
-            if let Some(delivery) = registered.managed.delivery.as_mut() {
-                delivery.lock = Some(domain::DeliveryLock {
-                    token: registration.key.lock_token,
-                    locked_until,
-                    lock_duration_millis,
-                });
-            }
         }
         // Update the successfully renewed target before purging: the broker is
         // authoritative even if its old local deadline elapsed in flight.
@@ -1182,7 +1160,6 @@ async fn renew_message_lock<B: Broker>(
             management
                 .refresh_request_response_delivery(
                     delivery.request_response.as_ref(),
-                    locked_until,
                     lock_duration_millis,
                 )
                 .await;

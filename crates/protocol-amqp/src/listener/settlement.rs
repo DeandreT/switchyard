@@ -662,13 +662,15 @@ async fn settle_started_delivery<B: Broker>(
         .await;
     };
     let sequence = delivery.sequence;
-    let (kind, expected) = match settlement_command(outcome, &delivery, lock.token) {
+    let (kind, expected) = match settlement_command(outcome, sequence, lock.token) {
         Ok(settlement) => settlement,
         Err(error) => {
+            // Only a property change no peer could send fails here. The
+            // message keeps its lock until it expires, unchanged.
             confirm_if_needed(
                 confirmation,
                 DeliveryState::Rejected(amqp::Rejected {
-                    error: Some(error_for(AmqpError::InternalError, error.to_string())),
+                    error: Some(error_for(AmqpError::InvalidField, error.to_string())),
                 }),
                 &mut retirement,
             )
@@ -745,10 +747,9 @@ async fn wait_for_retirement(retirement: &mut watch::Receiver<bool>) {
 
 fn settlement_command(
     outcome: Outcome,
-    delivery: &Delivery,
+    sequence: domain::SequenceNumber,
     lock_token: LockToken,
 ) -> Result<(CommandKind, SettlementOutcome), crate::ProtocolError> {
-    let sequence = delivery.sequence;
     match outcome {
         Outcome::Accepted(_) => Ok((
             CommandKind::Complete {
@@ -765,38 +766,41 @@ fn settlement_command(
                 description,
                 properties,
             } = dead_letter_disposition(rejected);
-            let replacement_envelope = properties
-                .as_ref()
-                .map(|properties| crate::message::replacement_envelope(delivery, properties))
-                .transpose()?;
-            Ok((
-                CommandKind::DeadLetter {
+            let kind = match disposition_patch(properties.as_ref())? {
+                Some(patch) => CommandKind::DeadLetterWithPatch {
                     sequence,
                     lock_token,
                     reason,
                     description,
-                    replacement_envelope,
+                    patch,
                 },
-                SettlementOutcome::DeadLettered,
-            ))
+                None => CommandKind::DeadLetter {
+                    sequence,
+                    lock_token,
+                    reason,
+                    description,
+                    replacement_envelope: None,
+                },
+            };
+            Ok((kind, SettlementOutcome::DeadLettered))
         }
         // Service Bus uses this Modified outcome for deferral. Property
         // changes ride in its message-annotations map even though the service
         // applies them to application properties.
         Outcome::Modified(modified) if modified.undeliverable_here == Some(true) => {
-            let replacement_envelope = modified
-                .message_annotations
-                .as_ref()
-                .map(|properties| crate::message::replacement_envelope(delivery, properties))
-                .transpose()?;
-            Ok((
-                CommandKind::Defer {
+            let kind = match disposition_patch(modified.message_annotations.as_ref())? {
+                Some(patch) => CommandKind::DeferWithPatch {
                     sequence,
                     lock_token,
-                    replacement_envelope,
+                    patch,
                 },
-                SettlementOutcome::Deferred,
-            ))
+                None => CommandKind::Defer {
+                    sequence,
+                    lock_token,
+                    replacement_envelope: None,
+                },
+            };
+            Ok((kind, SettlementOutcome::Deferred))
         }
         // Released means "not now": back to the queue, with the delivery
         // count already incremented by receive.
@@ -811,22 +815,33 @@ fn settlement_command(
         // The official .NET client carries Abandon properties-to-modify in the
         // Modified outcome's message-annotations field.
         Outcome::Modified(modified) => {
-            let replacement_envelope = modified
-                .message_annotations
-                .as_ref()
-                .filter(|properties| !properties.is_empty())
-                .map(|properties| crate::message::replacement_envelope(delivery, properties))
-                .transpose()?;
-            Ok((
-                CommandKind::Abandon {
+            let kind = match disposition_patch(modified.message_annotations.as_ref())? {
+                Some(patch) => CommandKind::AbandonWithPatch {
                     sequence,
                     lock_token,
-                    replacement_envelope,
+                    patch,
                 },
-                SettlementOutcome::Abandoned,
-            ))
+                None => CommandKind::Abandon {
+                    sequence,
+                    lock_token,
+                    replacement_envelope: None,
+                },
+            };
+            Ok((kind, SettlementOutcome::Abandoned))
         }
     }
+}
+
+/// The copy-local patch a disposition carries, or `None` when it changes no
+/// property, which keeps the legacy command and the copy's bytes unchanged.
+fn disposition_patch(
+    properties: Option<&Fields>,
+) -> Result<Option<Vec<domain::OverlayProperty>>, crate::ProtocolError> {
+    let Some(properties) = properties else {
+        return Ok(None);
+    };
+    let patch = crate::message::property_patch(properties)?;
+    Ok((!patch.is_empty()).then_some(patch))
 }
 
 fn delivery_state_for_outcome(outcome: &Outcome) -> DeliveryState {
@@ -934,24 +949,14 @@ fn string_field(fields: &Fields, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use amqp::{Error as AmqpProtocolError, ErrorCondition, Modified, Released};
-    use domain::{DeliveryOrigin, MessageEnvelope, Timestamp};
+    use domain::OverlayProperty;
 
     use super::*;
 
-    fn delivery(sequence: domain::SequenceNumber) -> Delivery {
-        Delivery {
-            sequence,
-            message_id: String::from("message-7"),
-            body: b"body".to_vec(),
-            enqueued_at: Timestamp::from_millis(10),
-            scheduled_enqueue_at: None,
-            expires_at: None,
-            delivery_count: 1,
-            lock: None,
-            session_id: None,
-            dead_letter: None,
-            envelope: None,
-            origin: DeliveryOrigin::Ready,
+    fn patch_entry(name: &str, value: Value) -> OverlayProperty {
+        OverlayProperty {
+            name: name.to_owned(),
+            value: serde_amqp::to_vec(&value).expect("the patch value encodes"),
         }
     }
 
@@ -963,19 +968,9 @@ mod tests {
     }
 
     #[test]
-    fn a_service_bus_rejection_keeps_details_and_property_changes() {
+    fn a_service_bus_rejection_keeps_details_and_patches_property_changes() {
         let sequence = domain::SequenceNumber::new(7);
         let token = LockToken::new(9);
-        let mut original = amqp::Message::data(b"body".to_vec());
-        original.application_properties = Some(
-            amqp::ApplicationProperties::builder()
-                .insert("existing", "kept")
-                .build(),
-        );
-        let mut delivery = delivery(sequence);
-        delivery.envelope = Some(MessageEnvelope::new(
-            amqp::encode_message(&original).expect("the original message encodes"),
-        ));
         let mut info = Fields::default();
         info.insert(
             Symbol::from(crate::DEAD_LETTER_REASON_PROPERTY),
@@ -997,36 +992,52 @@ mod tests {
             )),
         };
 
-        let (command, expected) = settlement_command(Outcome::Rejected(rejected), &delivery, token)
-            .expect("the dead-letter envelope update is valid");
-        let CommandKind::DeadLetter {
-            sequence: dead_lettered_sequence,
-            lock_token,
-            reason,
-            description,
-            replacement_envelope: Some(replacement),
-        } = command
-        else {
-            panic!("a Service Bus rejection must carry its property changes")
-        };
-        assert_eq!(dead_lettered_sequence, sequence);
-        assert_eq!(lock_token, token);
-        assert_eq!(reason, "InvalidOrder");
-        assert_eq!(description, "the order has no customer");
-        assert!(expected.matches(&CommandOutcome::DeadLettered));
-
-        let replacement =
-            amqp::decode_message(replacement.as_bytes()).expect("the replacement envelope decodes");
-        let properties = replacement
-            .application_properties
-            .expect("application properties exist");
+        let (command, expected) = settlement_command(Outcome::Rejected(rejected), sequence, token)
+            .expect("the dead-letter patch is valid");
         assert_eq!(
-            properties.get("existing"),
-            Some(&Value::String("kept".into()))
+            command,
+            CommandKind::DeadLetterWithPatch {
+                sequence,
+                lock_token: token,
+                reason: String::from("InvalidOrder"),
+                description: String::from("the order has no customer"),
+                patch: vec![patch_entry(
+                    "reviewed-by",
+                    Value::String(String::from("fraud-team"))
+                )],
+            },
+            "reason and description stay broker-owned, never patch entries"
         );
+        assert!(expected.matches(&CommandOutcome::DeadLettered));
+    }
+
+    #[test]
+    fn a_rejection_without_property_changes_keeps_the_legacy_command() {
+        let sequence = domain::SequenceNumber::new(7);
+        let token = LockToken::new(9);
+        let mut info = Fields::default();
+        info.insert(
+            Symbol::from(crate::DEAD_LETTER_REASON_PROPERTY),
+            Value::String(String::from("InvalidOrder")),
+        );
+        let rejected = amqp::Rejected {
+            error: Some(AmqpProtocolError::new(
+                ErrorCondition::Custom(Symbol::from("com.microsoft:dead-letter")),
+                "described",
+                Some(info),
+            )),
+        };
+        let (command, _) = settlement_command(Outcome::Rejected(rejected), sequence, token)
+            .expect("the rejection is valid");
         assert_eq!(
-            properties.get("reviewed-by"),
-            Some(&Value::String("fraud-team".into()))
+            command,
+            CommandKind::DeadLetter {
+                sequence,
+                lock_token: token,
+                reason: String::from("InvalidOrder"),
+                description: String::from("described"),
+                replacement_envelope: None,
+            }
         );
     }
 
@@ -1046,10 +1057,9 @@ mod tests {
     fn independent_outcomes_map_to_their_own_broker_commands() {
         let sequence = domain::SequenceNumber::new(7);
         let token = LockToken::new(9);
-        let delivery = delivery(sequence);
 
         let (complete, expected) =
-            settlement_command(Outcome::Accepted(amqp::Accepted), &delivery, token)
+            settlement_command(Outcome::Accepted(amqp::Accepted), sequence, token)
                 .expect("accepted maps to complete");
         assert_eq!(
             complete,
@@ -1063,8 +1073,12 @@ mod tests {
         for outcome in [
             Outcome::Released(Released),
             Outcome::Modified(Modified::default()),
+            Outcome::Modified(Modified {
+                message_annotations: Some(Fields::new()),
+                ..Modified::default()
+            }),
         ] {
-            let (abandon, expected) = settlement_command(outcome, &delivery, token)
+            let (abandon, expected) = settlement_command(outcome, sequence, token)
                 .expect("released outcomes map to abandon");
             assert_eq!(
                 abandon,
@@ -1081,65 +1095,51 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_modified_abandon_persists_property_changes() {
+    fn ordinary_modified_abandon_patches_property_changes() {
         let sequence = domain::SequenceNumber::new(7);
         let token = LockToken::new(9);
-        let mut delivery = delivery(sequence);
-        delivery.envelope = Some(MessageEnvelope::new(
-            amqp::encode_message(&amqp::Message::data(b"body".to_vec()))
-                .expect("the original message encodes"),
-        ));
         let mut properties = Fields::new();
         properties.insert(Symbol::from("attempt"), Value::Int(2));
+        properties.insert(Symbol::from("cleared"), Value::Null);
 
         let (command, expected) = settlement_command(
             Outcome::Modified(Modified {
                 message_annotations: Some(properties),
                 ..Modified::default()
             }),
-            &delivery,
+            sequence,
             token,
         )
-        .expect("the abandon envelope update is valid");
-        let CommandKind::Abandon {
-            replacement_envelope: Some(replacement),
-            ..
-        } = command
-        else {
-            panic!("Modified abandon must carry a replacement envelope")
-        };
+        .expect("the abandon patch is valid");
+        assert_eq!(
+            command,
+            CommandKind::AbandonWithPatch {
+                sequence,
+                lock_token: token,
+                patch: vec![
+                    patch_entry("attempt", Value::Int(2)),
+                    patch_entry("cleared", Value::Null),
+                ],
+            }
+        );
         assert!(expected.matches(&CommandOutcome::Abandoned {
             dead_lettered: false
         }));
-        let replacement =
-            amqp::decode_message(replacement.as_bytes()).expect("the replacement envelope decodes");
-        assert_eq!(
-            replacement
-                .application_properties
-                .expect("application properties exist")
-                .get("attempt"),
-            Some(&Value::Int(2))
-        );
     }
 
     #[test]
-    fn service_bus_modified_defers_and_persists_property_changes() {
+    fn service_bus_modified_defers_and_patches_property_changes() {
         let sequence = domain::SequenceNumber::new(7);
         let token = LockToken::new(9);
-        let mut original = amqp::Message::data(b"body".to_vec());
-        original.application_properties = Some(
-            amqp::ApplicationProperties::builder()
-                .insert("existing", "kept")
-                .build(),
-        );
-        let mut delivery = delivery(sequence);
-        delivery.envelope = Some(MessageEnvelope::new(
-            amqp::encode_message(&original).expect("the original message encodes"),
-        ));
         let mut properties = Fields::new();
         properties.insert(
             Symbol::from("deferred-by"),
             Value::String(String::from("dotnet")),
+        );
+        // The reserved dead-letter names are broker-owned on every path.
+        properties.insert(
+            Symbol::from(crate::DEAD_LETTER_REASON_PROPERTY),
+            Value::String(String::from("forged")),
         );
 
         let (command, expected) = settlement_command(
@@ -1148,34 +1148,39 @@ mod tests {
                 message_annotations: Some(properties),
                 ..Modified::default()
             }),
-            &delivery,
+            sequence,
             token,
         )
-        .expect("the envelope update is valid");
-        let CommandKind::Defer {
-            sequence: deferred_sequence,
-            lock_token,
-            replacement_envelope: Some(replacement),
-        } = command
-        else {
-            panic!("Modified with undeliverable-here must defer")
-        };
-        assert_eq!(deferred_sequence, sequence);
-        assert_eq!(lock_token, token);
+        .expect("the defer patch is valid");
+        assert_eq!(
+            command,
+            CommandKind::DeferWithPatch {
+                sequence,
+                lock_token: token,
+                patch: vec![patch_entry(
+                    "deferred-by",
+                    Value::String(String::from("dotnet"))
+                )],
+            }
+        );
         assert!(expected.matches(&CommandOutcome::Deferred));
 
-        let replacement =
-            amqp::decode_message(replacement.as_bytes()).expect("the replacement envelope decodes");
-        let properties = replacement
-            .application_properties
-            .expect("application properties exist");
+        let (command, _) = settlement_command(
+            Outcome::Modified(Modified {
+                undeliverable_here: Some(true),
+                ..Modified::default()
+            }),
+            sequence,
+            token,
+        )
+        .expect("a plain deferral is valid");
         assert_eq!(
-            properties.get("existing"),
-            Some(&Value::String("kept".into()))
-        );
-        assert_eq!(
-            properties.get("deferred-by"),
-            Some(&Value::String("dotnet".into()))
+            command,
+            CommandKind::Defer {
+                sequence,
+                lock_token: token,
+                replacement_envelope: None,
+            }
         );
     }
 
