@@ -199,6 +199,11 @@ impl ConnectionFamily {
         self.pending.is_empty()
     }
 
+    /// Adopted originals whose `JoinHandle` has not been reaped yet.
+    pub(super) fn len(&self) -> usize {
+        self.pending.len()
+    }
+
     pub(super) fn adopt(&mut self, receipt: AdmittedConnectionTask) {
         assert!(!self.extracted, "resolved family cannot adopt originals");
         assert_eq!(receipt.id, receipt.task.id(), "same original connection Id");
