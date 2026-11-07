@@ -7,14 +7,20 @@
 
 pub(crate) mod anchor;
 mod capture;
+mod compaction;
 mod format;
 mod install;
+mod recovery;
 
 pub use anchor::{
     PreparedSnapshotAnchor, SNAPSHOT_ANCHOR_HASH_SCOPE, SNAPSHOT_ANCHOR_VERSION, SnapshotAnchor,
     SnapshotAnchorError, SnapshotAnchorLimits, SnapshotAnchorOwner, SnapshotAnchorReceipt,
 };
 pub use capture::{SnapshotCapture, SnapshotCaptureError};
+pub use compaction::{
+    PreparedSnapshotCompaction, SnapshotCompactionError, SnapshotCompactionLimits,
+    SnapshotCompactionOwner, SnapshotCompactionReceipt,
+};
 pub use format::{
     SNAPSHOT_FORMAT_VERSION, SNAPSHOT_FRAME_DIGEST_BYTES, SNAPSHOT_FRAME_HASH_SCOPE,
     SNAPSHOT_LAYOUT_VERSION, SNAPSHOT_MAGIC, SnapshotFormat, SnapshotFormatError, SnapshotLimit,
@@ -24,3 +30,4 @@ pub use install::{
     SnapshotInstallError, SnapshotInstallLimits, SnapshotInstallOwner, SnapshotInstallPolicy,
     SnapshotInstallReceipt,
 };
+pub use recovery::{SnapshotRecoveryClass, SnapshotRecoverySelection, select_recovery};

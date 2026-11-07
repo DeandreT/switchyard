@@ -1,4 +1,5 @@
-//! Offline, exact-image, non-destructive anchor attachment. No pruning API.
+//! Offline, exact-image, non-destructive anchor attachment. Prefix removal is
+//! the separate compaction owner's operation.
 //!
 //! Installation and attachment are separate atomic operations. All writers,
 //! raw clones, keyspaces and prior indexed/replay owners must be excluded by
@@ -32,7 +33,7 @@ const CHECKSUM_BYTES: usize = 32;
 const MAX_ORIGINAL_BYTES: usize = MAX_JOURNAL_PAYLOAD_BYTES + 48;
 
 /// Immutable source identity and exact original journal envelope. B is distinct
-/// from A and initially zero; only synthetic fixtures can remove a prefix here.
+/// from A and initially zero; only offline compaction advances it, to A.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotAnchor {
     removed_through: u64,
@@ -78,7 +79,7 @@ impl SnapshotAnchor {
         .map(|_| ())
     }
 
-    fn encoded_size(original_entry: &[u8]) -> Result<usize, SnapshotAnchorError> {
+    pub(super) fn encoded_size(original_entry: &[u8]) -> Result<usize, SnapshotAnchorError> {
         u32::try_from(original_entry.len()).map_err(|_| SnapshotAnchorError::SizeOverflow)?;
         HEADER_BYTES
             .checked_add(original_entry.len())
@@ -86,7 +87,15 @@ impl SnapshotAnchor {
             .ok_or(SnapshotAnchorError::SizeOverflow)
     }
 
-    fn encode(&self) -> Result<Vec<u8>, SnapshotAnchorError> {
+    /// The same source identity and original with its whole prefix removed.
+    pub(super) fn compacted(&self) -> Self {
+        Self {
+            removed_through: self.applied_index(),
+            ..self.clone()
+        }
+    }
+
+    pub(super) fn encode(&self) -> Result<Vec<u8>, SnapshotAnchorError> {
         let mut bytes = Vec::with_capacity(Self::encoded_size(&self.original_entry)?);
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&SNAPSHOT_ANCHOR_VERSION.to_be_bytes());
