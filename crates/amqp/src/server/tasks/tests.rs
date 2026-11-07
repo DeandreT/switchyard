@@ -982,3 +982,80 @@ async fn canceled_shutdown_primitive_preserves_first_cached_join_and_second_orig
         original
     );
 }
+
+fn pressure_transfer(id: u32, payload: Vec<u8>) -> Frame {
+    Frame::Amqp {
+        channel: 1,
+        performative: Some(Performative::Transfer(crate::Transfer {
+            handle: 1,
+            delivery_id: Some(id),
+            delivery_tag: Some(crate::Binary::from(vec![id as u8])),
+            message_format: Some(0),
+            settled: Some(false),
+            more: false,
+            rcv_settle_mode: None,
+            state: None,
+            resume: false,
+            aborted: false,
+            batchable: false,
+        })),
+        payload,
+    }
+}
+
+/// Delivers one valid message, then the given malformed one, and returns how
+/// the receiving link and the original tasks end.
+async fn malformed_transfer_outcome(malformed: Vec<u8>) -> (crate::EngineError, bool) {
+    let (mut connection, mut peer, _probe) = opened().await;
+    let mut session = pressure_session(&mut connection, &mut peer).await;
+    let mut receiver = pressure_receiver(&mut session, &mut peer).await;
+    let valid =
+        crate::encode_message(&crate::Message::data(b"valid".to_vec())).expect("valid delivery");
+    write_pressure_frames(
+        &mut peer,
+        vec![pressure_transfer(0, valid), pressure_transfer(1, malformed)],
+    )
+    .await;
+    let first = timeout(WAIT, receiver.recv())
+        .await
+        .expect("first delivery arrives")
+        .expect("the valid delivery precedes the malformed one");
+    assert_eq!(first.id, 0);
+    let ended = timeout(WAIT, receiver.recv())
+        .await
+        .expect("the malformed delivery ends the link")
+        .expect_err("the malformed delivery is never offered");
+    connection.stop();
+    let joined = timeout(WAIT, connection.shutdown())
+        .await
+        .expect("original tasks join")
+        .is_ok();
+    (ended, joined)
+}
+
+#[tokio::test]
+async fn odd_count_application_properties_fail_like_any_malformed_transfer() {
+    let mut odd = crate::encode_message(&crate::Message::data(b"body".to_vec()))
+        .expect("message body encodes");
+    // An application-properties map8 counting one element: a key and no value.
+    odd.splice(0..0, [0x00, 0x53, 0x74, 0xc1, 0x03, 0x01, 0x54, 0x01]);
+    // An array of maps, which serde_amqp misreads through its shared constructor.
+    let array_of_maps = vec![
+        0x00, 0x53, 0x77, 0xe0, 0x08, 0x01, 0xc1, 0x05, 0x02, 0x54, 0x01, 0x54, 0x02,
+    ];
+    let unknown_format_code = vec![0xff];
+
+    let control = malformed_transfer_outcome(unknown_format_code).await;
+    assert!(matches!(
+        control,
+        (crate::EngineError::RemoteDetached, true)
+    ));
+    for malformed in [odd, array_of_maps] {
+        let outcome = malformed_transfer_outcome(malformed).await;
+        assert!(
+            matches!(outcome, (crate::EngineError::RemoteDetached, true)),
+            "a refused map shape ends the connection as any malformed transfer does, \
+             without a driver panic: {outcome:?}"
+        );
+    }
+}

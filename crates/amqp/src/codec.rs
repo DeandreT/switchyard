@@ -12,7 +12,7 @@ use crate::types::*;
 
 mod message;
 
-pub use message::{decode_message, encode_message};
+pub use message::{decode_message, decode_stored_message, encode_message};
 
 pub const AMQP_PROTOCOL_ID: u8 = 0;
 pub const SASL_PROTOCOL_ID: u8 = 3;
@@ -212,7 +212,7 @@ fn decode_frame(frame: &[u8]) -> io::Result<Frame> {
             payload: Vec::new(),
         }),
         AMQP_FRAME_TYPE => {
-            let performative_len = encoded_value_len(body)?;
+            let performative_len = encoded_value_len(body, ValueChecks::Received)?;
             let value =
                 serde_amqp::from_slice(&body[..performative_len]).map_err(amqp_codec_error)?;
             Ok(Frame::Amqp {
@@ -222,7 +222,7 @@ fn decode_frame(frame: &[u8]) -> io::Result<Frame> {
             })
         }
         SASL_FRAME_TYPE if channel == 0 && !body.is_empty() => {
-            let performative_len = encoded_value_len(body)?;
+            let performative_len = encoded_value_len(body, ValueChecks::Received)?;
             if performative_len != body.len() {
                 return Err(invalid_data("SASL frame carries trailing payload"));
             }
@@ -1057,69 +1057,203 @@ fn append_value(buffer: &mut Vec<u8>, value: Value) -> io::Result<()> {
     Ok(())
 }
 
-fn encoded_value_len(bytes: &[u8]) -> io::Result<usize> {
-    let Some(code) = bytes.first().copied() else {
-        return Err(invalid_data("missing AMQP value"));
-    };
-    let len = match code {
-        0x00 => {
-            let descriptor = encoded_value_len(
-                bytes
-                    .get(1..)
-                    .ok_or_else(|| invalid_data("missing AMQP descriptor"))?,
-            )?;
-            let value_start = 1 + descriptor;
-            value_start
-                + encoded_value_len(
-                    bytes
-                        .get(value_start..)
-                        .ok_or_else(|| invalid_data("missing described AMQP value"))?,
-                )?
+/// Nested compound and described values one encoded value may open. This
+/// bounds the walk below and keeps serde_amqp's recursive decoder well inside
+/// a task stack.
+const MAX_NESTED_VALUES: usize = 64;
+
+/// How strictly the structural walk checks an encoded value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ValueChecks {
+    /// Bytes arriving from a peer: every shape serde_amqp 0.14.1 mishandles
+    /// is refused, including padded compounds and arrays it misreads.
+    Received,
+    /// Bytes this broker accepted and stored before the received checks
+    /// existed. Their safety rests on serde_amqp having decoded these exact
+    /// bytes once at ingress; the walk adds its crash guards (odd map counts,
+    /// arrays of maps, sizes shorter than their count fields, contents past a
+    /// declared size and the nesting cap) outside skipped arrays. Padding is
+    /// skipped, as the earlier length measurement did, and arrays of other
+    /// compound or described elements are skipped by their size unchecked.
+    Stored,
+}
+
+/// Values a compound or described value still owes the structural walk.
+struct PendingValues {
+    end: Option<usize>,
+    remaining: usize,
+    /// The constructor an array shares across its elements.
+    element: Option<u8>,
+}
+
+/// Measures the first encoded AMQP value and checks its structure, so every
+/// decode refuses shapes serde_amqp 0.14.1 mishandles before it sees them:
+/// odd map counts and compound sizes shorter than their count fields
+/// underflow, and arrays of compound or described elements misread the shared
+/// constructor. Received compounds must contain exactly their counted values.
+fn encoded_value_len(bytes: &[u8], checks: ValueChecks) -> io::Result<usize> {
+    let received = checks == ValueChecks::Received;
+    let mut pending = vec![PendingValues {
+        end: None,
+        remaining: 1,
+        element: None,
+    }];
+    let mut offset = 0;
+    // serde_amqp leaves an empty array's element constructor unread, which is
+    // harmless only when no value follows it.
+    let mut unread_constructor = false;
+    while let Some(values) = pending.last_mut() {
+        if values.remaining == 0 {
+            if let Some(end) = values.end {
+                if offset > end || (received && offset != end) {
+                    return Err(invalid_data(
+                        "AMQP compound size does not match its contents",
+                    ));
+                }
+                offset = end;
+            }
+            pending.pop();
+            continue;
         }
-        0x40..=0x45 => 1,
-        0x50..=0x56 => 2,
-        0x60..=0x61 => 3,
-        0x70..=0x74 => 5,
-        0x80..=0x84 => 9,
-        0x94 | 0x98 => 17,
-        0xa0 | 0xa1 | 0xa3 => {
-            2 + usize::from(
-                *bytes
-                    .get(1)
-                    .ok_or_else(|| invalid_data("missing AMQP value length"))?,
-            )
+        if unread_constructor {
+            return Err(invalid_data(
+                "an empty AMQP array with an element constructor must be the last value",
+            ));
         }
-        0xb0 | 0xb1 | 0xb3 => {
-            5 + u32::from_be_bytes(
-                bytes
-                    .get(1..5)
-                    .ok_or_else(|| invalid_data("missing AMQP value length"))?
-                    .try_into()
-                    .map_err(|_| invalid_data("invalid AMQP value length"))?,
-            ) as usize
+        values.remaining -= 1;
+        let code = match values.element {
+            Some(code) => code,
+            None => {
+                let code = encoded_byte(bytes, offset)?;
+                offset += 1;
+                code
+            }
+        };
+        let nested = match code {
+            0x00 => PendingValues {
+                end: None,
+                remaining: 2,
+                element: None,
+            },
+            0xc0 | 0xc1 | 0xd0 | 0xd1 | 0xe0 | 0xf0 => {
+                let width = if matches!(code, 0xc0 | 0xc1 | 0xe0) {
+                    1
+                } else {
+                    4
+                };
+                let array = matches!(code, 0xe0 | 0xf0);
+                let size = encoded_width(bytes, offset, width)?;
+                let start = offset + width;
+                let end = start
+                    .checked_add(size)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| invalid_data("AMQP value is truncated"))?;
+                if size < width {
+                    return Err(invalid_data("AMQP compound size is shorter than its count"));
+                }
+                let count = encoded_width(bytes, start, width)?;
+                offset = start + width;
+                if matches!(code, 0xc1 | 0xd1) && count % 2 != 0 {
+                    return Err(invalid_data("AMQP map has an odd element count"));
+                }
+                if array && count > 0 && size <= width {
+                    return Err(invalid_data(
+                        "AMQP array size is shorter than its count and constructor",
+                    ));
+                }
+                let mut nested = PendingValues {
+                    end: Some(end),
+                    remaining: count,
+                    element: None,
+                };
+                if array && count > 0 {
+                    let element = encoded_byte(bytes, offset)?;
+                    offset += 1;
+                    if matches!(element, 0xc1 | 0xd1)
+                        || (received && matches!(element, 0x00 | 0xc0 | 0xd0 | 0xe0 | 0xf0))
+                    {
+                        return Err(invalid_data(
+                            "AMQP arrays of compound or described values are unsupported",
+                        ));
+                    }
+                    if matches!(element, 0x00 | 0xc0 | 0xd0 | 0xe0 | 0xf0) {
+                        // Stored only: serde_amqp decoded these once already.
+                        offset = end;
+                        nested.remaining = 0;
+                    } else if let Some(width) = fixed_value_width(element) {
+                        offset = count
+                            .checked_mul(width)
+                            .and_then(|len| offset.checked_add(len))
+                            .ok_or_else(|| invalid_data("AMQP value is truncated"))?;
+                        nested.remaining = 0;
+                    }
+                    nested.element = Some(element);
+                } else if received && array && end == offset + 1 {
+                    offset = end;
+                    unread_constructor = true;
+                }
+                nested
+            }
+            code => {
+                let len = match fixed_value_width(code) {
+                    Some(width) => Some(width),
+                    None => match code {
+                        0xa0 | 0xa1 | 0xa3 => encoded_width(bytes, offset, 1)?.checked_add(1),
+                        0xb0 | 0xb1 | 0xb3 => encoded_width(bytes, offset, 4)?.checked_add(4),
+                        _ => {
+                            return Err(invalid_data(format!(
+                                "unknown AMQP format code {code:#x}"
+                            )));
+                        }
+                    },
+                };
+                offset = len
+                    .and_then(|len| offset.checked_add(len))
+                    .filter(|offset| *offset <= bytes.len())
+                    .ok_or_else(|| invalid_data("AMQP value is truncated"))?;
+                continue;
+            }
+        };
+        if offset > bytes.len() {
+            return Err(invalid_data("AMQP value is truncated"));
         }
-        0xc0 | 0xc1 | 0xe0 => {
-            2 + usize::from(
-                *bytes
-                    .get(1)
-                    .ok_or_else(|| invalid_data("missing AMQP compound length"))?,
-            )
+        if pending.len() > MAX_NESTED_VALUES {
+            return Err(invalid_data("AMQP value nests too deeply"));
         }
-        0xd0 | 0xd1 | 0xf0 => {
-            5 + u32::from_be_bytes(
-                bytes
-                    .get(1..5)
-                    .ok_or_else(|| invalid_data("missing AMQP compound length"))?
-                    .try_into()
-                    .map_err(|_| invalid_data("invalid AMQP compound length"))?,
-            ) as usize
-        }
-        _ => return Err(invalid_data(format!("unknown AMQP format code {code:#x}"))),
-    };
-    if len > bytes.len() {
-        return Err(invalid_data("AMQP value is truncated"));
+        pending.push(nested);
     }
-    Ok(len)
+    Ok(offset)
+}
+
+/// The bytes after the constructor of a fixed-width primitive.
+fn fixed_value_width(code: u8) -> Option<usize> {
+    Some(match code {
+        0x40..=0x45 => 0,
+        0x50..=0x56 => 1,
+        0x60..=0x61 => 2,
+        0x70..=0x74 => 4,
+        0x80..=0x84 => 8,
+        0x94 | 0x98 => 16,
+        _ => return None,
+    })
+}
+
+fn encoded_byte(bytes: &[u8], offset: usize) -> io::Result<u8> {
+    bytes
+        .get(offset)
+        .copied()
+        .ok_or_else(|| invalid_data("AMQP value is truncated"))
+}
+
+/// Reads a one- or four-byte big-endian size or count.
+fn encoded_width(bytes: &[u8], offset: usize, width: usize) -> io::Result<usize> {
+    let field = offset
+        .checked_add(width)
+        .and_then(|end| bytes.get(offset..end))
+        .ok_or_else(|| invalid_data("AMQP value is truncated"))?;
+    Ok(field
+        .iter()
+        .fold(0_usize, |value, byte| (value << 8) | usize::from(*byte)))
 }
 
 fn amqp_codec_error(error: serde_amqp::Error) -> io::Error {

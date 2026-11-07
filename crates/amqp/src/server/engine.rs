@@ -824,6 +824,7 @@ pub(super) async fn receive_transfer(
         return Ok(());
     }
 
+    // A peer's transfer: decode with every received-message check.
     let message = decode_message(&partial.bytes)?;
     link.deliveries
         .send(Delivery {
