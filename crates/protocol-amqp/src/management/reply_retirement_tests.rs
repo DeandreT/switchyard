@@ -6,7 +6,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
     task::{Context, Poll, Waker},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use amqp::{
@@ -28,7 +28,7 @@ use tokio::{
 use super::*;
 use crate::SharedAccessAuthentication;
 
-const WAIT: Duration = Duration::from_secs(8);
+use crate::test_deadline::WAIT;
 const ADDRESS: &str = "management-replies";
 const CHANNEL: u16 = 1;
 const HANDLE: u32 = 1;

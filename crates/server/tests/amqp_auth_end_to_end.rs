@@ -3,7 +3,7 @@
 use std::{
     error::Error,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use amqp::{
@@ -28,6 +28,11 @@ use storage::MemoryStore;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
 use url::form_urlencoded::byte_serialize;
+
+#[path = "../src/test_deadline.rs"]
+mod test_deadline;
+
+use test_deadline::WAIT;
 
 const HOST: &str = "tenant.servicebus.windows.net";
 const AUDIENCE: &str = "amqps://tenant.servicebus.windows.net/orders";
@@ -284,7 +289,7 @@ async fn management_request(
         Outcome::Accepted(_)
     ));
 
-    let response = tokio::time::timeout(Duration::from_secs(2), responses.recv()).await??;
+    let response = tokio::time::timeout(WAIT, responses.recv()).await??;
     let message = response.message().clone();
     responses.accept(&response).await?;
     Ok(message)
@@ -479,7 +484,7 @@ async fn cbs_grants_send_but_not_listen() -> Result<(), Box<dyn Error>> {
     assert_management_status(&cancel_response, 200);
 
     let mut receiver = Receiver::attach(&mut session, "forbidden-receiver", "orders").await?;
-    let refused = tokio::time::timeout(Duration::from_secs(2), receiver.recv()).await?;
+    let refused = tokio::time::timeout(WAIT, receiver.recv()).await?;
     assert!(refused.is_err(), "a Send grant also granted Listen");
     connection.close().await?;
     Ok(())
@@ -554,8 +559,7 @@ async fn cbs_grants_listen_but_not_send() -> Result<(), Box<dyn Error>> {
         management_requests.send(request).await?,
         Outcome::Accepted(_)
     ));
-    let management_response =
-        tokio::time::timeout(Duration::from_secs(2), management_responses.recv()).await??;
+    let management_response = tokio::time::timeout(WAIT, management_responses.recv()).await??;
     assert_eq!(
         management_response
             .message()
@@ -621,7 +625,13 @@ async fn a_grant_expires_under_an_open_link() -> Result<(), Box<dyn Error>> {
 async fn a_connection_without_cbs_is_closed_on_its_deadline() -> Result<(), Box<dyn Error>> {
     let node = AuthNode::start(PermissionSet::SEND, Duration::from_millis(100)).await?;
     let mut connection = node.connect().await?;
+    let started = Instant::now();
 
-    tokio::time::timeout(Duration::from_secs(2), connection.on_close()).await?;
+    tokio::time::timeout(WAIT, connection.on_close()).await?;
+    // The 100 ms deadline, not the 20 s default, must close the connection.
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the configured authorization deadline was not used"
+    );
     Ok(())
 }

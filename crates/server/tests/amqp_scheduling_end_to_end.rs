@@ -12,6 +12,11 @@ use server::{Broker, LocalProposer, ManualClock};
 use storage::MemoryStore;
 use tokio::net::TcpListener;
 
+#[path = "../src/test_deadline.rs"]
+mod test_deadline;
+
+use test_deadline::WAIT;
+
 struct Node {
     broker: Broker,
     clock: ManualClock,
@@ -197,7 +202,7 @@ async fn management_request(
         Outcome::Accepted(_)
     ));
 
-    let response = tokio::time::timeout(Duration::from_secs(2), responses.recv()).await??;
+    let response = tokio::time::timeout(WAIT, responses.recv()).await??;
     assert_eq!(
         response
             .message()

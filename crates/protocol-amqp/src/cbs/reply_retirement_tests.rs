@@ -12,7 +12,6 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
     task::{Context, Poll, Waker},
-    time::Duration,
 };
 
 use amqp::{
@@ -31,7 +30,7 @@ use super::custody::{PUMP_FAULT, PumpFault};
 use super::request_retirement_tests::{assert_outer_panic, authorization};
 use super::*;
 
-pub(super) const WAIT: Duration = Duration::from_secs(8);
+pub(super) use crate::test_deadline::WAIT;
 pub(super) const ADDRESS: &str = "cbs-replies";
 const CHANNEL: u16 = 1;
 const HANDLE: u32 = 1;

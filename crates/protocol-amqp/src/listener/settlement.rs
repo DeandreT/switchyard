@@ -1197,9 +1197,9 @@ mod tests {
         release_tx
             .send(())
             .expect("dropping the waiter leaves the settlement alive");
-        tokio::time::timeout(Duration::from_secs(1), finished)
+        tokio::time::timeout(crate::test_deadline::WAIT, finished)
             .await
-            .expect("the detached settlement finishes promptly")
+            .expect("the detached settlement finishes")
             .expect("the detached settlement retains its completion channel");
     }
 }

@@ -9,7 +9,6 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
 };
 
 use amqp::{
@@ -24,7 +23,10 @@ use tokio::{
     time::timeout,
 };
 
-const LIMIT: Duration = Duration::from_secs(3);
+#[path = "../src/test_deadline.rs"]
+mod test_deadline;
+
+use test_deadline::WAIT;
 
 #[derive(Default)]
 struct Probe {
@@ -43,7 +45,7 @@ struct Probe {
 
 impl Probe {
     async fn wait(&self, ready: impl Fn() -> bool) {
-        timeout(LIMIT, async {
+        timeout(WAIT, async {
             loop {
                 let changed = self.changed.notified();
                 tokio::pin!(changed);
@@ -181,7 +183,7 @@ async fn opened() -> (ServerConnection, DuplexStream, Arc<Probe>) {
         probe: Arc::clone(&probe),
         buffered: Vec::new(),
     };
-    let (connection, peer_result) = timeout(LIMIT, async {
+    let (connection, peer_result) = timeout(WAIT, async {
         tokio::join!(
             ServerConnection::accept(stream, "custody-server", None),
             handshake(&mut peer)
@@ -205,7 +207,7 @@ async fn opened() -> (ServerConnection, DuplexStream, Arc<Probe>) {
 }
 
 async fn joined(connection: &mut ServerConnection, probe: &Probe) {
-    timeout(LIMIT, connection.shutdown())
+    timeout(WAIT, connection.shutdown())
         .await
         .expect("shutdown must finish")
         .expect("tasks must join");
@@ -213,7 +215,7 @@ async fn joined(connection: &mut ServerConnection, probe: &Probe) {
         probe.dropped.load(Ordering::SeqCst),
         "owned IO must be dropped before joined shutdown returns"
     );
-    timeout(LIMIT, connection.shutdown())
+    timeout(WAIT, connection.shutdown())
         .await
         .expect("repeat shutdown must finish")
         .expect("cached successful joins");
@@ -221,7 +223,7 @@ async fn joined(connection: &mut ServerConnection, probe: &Probe) {
 
 async fn read_close(peer: &mut DuplexStream) {
     assert!(matches!(
-        timeout(LIMIT, read_frame(peer))
+        timeout(WAIT, read_frame(peer))
             .await
             .expect("Close must arrive")
             .expect("valid Close"),
@@ -237,11 +239,11 @@ async fn attached_sender(connection: &mut ServerConnection, peer: &mut DuplexStr
     write_frame(peer, &frame(1, Performative::Begin(Begin::default())))
         .await
         .expect("peer Begin");
-    let incoming = timeout(LIMIT, connection.next_incoming_session())
+    let incoming = timeout(WAIT, connection.next_incoming_session())
         .await
         .expect("incoming session")
         .expect("Begin offered");
-    let mut session = timeout(LIMIT, connection.accept_session(incoming))
+    let mut session = timeout(WAIT, connection.accept_session(incoming))
         .await
         .expect("accept session")
         .expect("session accepted");
@@ -271,11 +273,11 @@ async fn attached_sender(connection: &mut ServerConnection, peer: &mut DuplexStr
     write_frame(peer, &frame(1, Performative::Attach(Box::new(attach))))
         .await
         .expect("peer Attach");
-    let incoming = timeout(LIMIT, session.next_incoming_attach())
+    let incoming = timeout(WAIT, session.next_incoming_attach())
         .await
         .expect("incoming attach")
         .expect("Attach offered");
-    let endpoint = timeout(LIMIT, session.accept_attach(incoming, 1024 * 1024))
+    let endpoint = timeout(WAIT, session.accept_attach(incoming, 1024 * 1024))
         .await
         .expect("accept link")
         .expect("link accepted");
@@ -327,7 +329,7 @@ async fn stop_joins_a_reader_suspended_inside_a_partial_frame() {
 #[tokio::test]
 async fn stop_cancels_the_whole_driver_operation_when_close_write_is_blocked() {
     let (mut connection, mut peer, probe) = opened().await;
-    let sender = timeout(LIMIT, attached_sender(&mut connection, &mut peer))
+    let sender = timeout(WAIT, attached_sender(&mut connection, &mut peer))
         .await
         .expect("native link handshake");
     let mut queued_send =
@@ -352,19 +354,19 @@ async fn stop_cancels_the_whole_driver_operation_when_close_write_is_blocked() {
     connection.stop();
     joined(&mut connection, &probe).await;
     assert!(matches!(
-        timeout(LIMIT, queued_send)
+        timeout(WAIT, queued_send)
             .await
             .expect("queued send cleanup"),
         Err(EngineError::RemoteDetached)
     ));
     assert!(matches!(
-        timeout(LIMIT, sender.on_credit())
+        timeout(WAIT, sender.on_credit())
             .await
             .expect("credit waiter cleanup"),
         Err(EngineError::RemoteDetached)
     ));
     assert!(matches!(
-        timeout(LIMIT, sender.on_drain())
+        timeout(WAIT, sender.on_drain())
             .await
             .expect("drain waiter cleanup"),
         Err(EngineError::RemoteDetached)
@@ -374,7 +376,7 @@ async fn stop_cancels_the_whole_driver_operation_when_close_write_is_blocked() {
 #[tokio::test]
 async fn stop_keeps_link_cleanup_when_a_local_detach_write_is_blocked() {
     let (mut connection, mut peer, probe) = opened().await;
-    let sender = timeout(LIMIT, attached_sender(&mut connection, &mut peer))
+    let sender = timeout(WAIT, attached_sender(&mut connection, &mut peer))
         .await
         .expect("native link handshake");
     let mut queued_send =
@@ -399,19 +401,19 @@ async fn stop_keeps_link_cleanup_when_a_local_detach_write_is_blocked() {
     connection.stop();
     joined(&mut connection, &probe).await;
     assert!(matches!(
-        timeout(LIMIT, queued_send)
+        timeout(WAIT, queued_send)
             .await
             .expect("queued send cleanup"),
         Err(EngineError::RemoteDetached)
     ));
     assert!(matches!(
-        timeout(LIMIT, sender.on_credit())
+        timeout(WAIT, sender.on_credit())
             .await
             .expect("credit cleanup"),
         Err(EngineError::RemoteDetached)
     ));
     assert!(matches!(
-        timeout(LIMIT, sender.on_drain())
+        timeout(WAIT, sender.on_drain())
             .await
             .expect("drain cleanup"),
         Err(EngineError::RemoteDetached)
@@ -452,7 +454,7 @@ async fn natural_eof_is_joinable_but_does_not_report_graceful_close_success() {
     peer.shutdown().await.expect("peer write EOF");
     probe.wait_drop().await;
     assert!(matches!(
-        timeout(LIMIT, connection.close())
+        timeout(WAIT, connection.close())
             .await
             .expect("closed command queue"),
         Err(EngineError::Stopped)
@@ -463,7 +465,7 @@ async fn natural_eof_is_joinable_but_does_not_report_graceful_close_success() {
 #[tokio::test]
 async fn graceful_close_keeps_its_peer_acknowledgement_contract() {
     let (mut connection, mut peer, probe) = opened().await;
-    let (result, ()) = timeout(LIMIT, async {
+    let (result, ()) = timeout(WAIT, async {
         tokio::join!(connection.close(), async {
             read_close(&mut peer).await;
             write_frame(&mut peer, &frame(0, Performative::Close(Close::default())))
@@ -492,7 +494,7 @@ async fn peer_close_reply_is_flushed_before_native_io_is_dropped() {
 async fn local_close_request_is_flushed_before_waiting_for_peer_ack() {
     let (mut connection, mut peer, probe) = opened().await;
     probe.buffer_writes.store(true, Ordering::SeqCst);
-    let (result, ()) = timeout(LIMIT, async {
+    let (result, ()) = timeout(WAIT, async {
         tokio::join!(connection.close(), async {
             read_close(&mut peer).await;
             write_frame(&mut peer, &frame(0, Performative::Close(Close::default())))
@@ -528,7 +530,7 @@ async fn stop_cancels_a_terminal_close_flush_that_is_blocked() {
 #[tokio::test]
 async fn eof_before_close_acknowledgement_is_not_fake_success() {
     let (mut connection, mut peer, probe) = opened().await;
-    let (result, ()) = timeout(LIMIT, async {
+    let (result, ()) = timeout(WAIT, async {
         tokio::join!(connection.close(), async {
             read_close(&mut peer).await;
             peer.shutdown().await.expect("EOF instead of Close reply");
@@ -551,7 +553,7 @@ async fn queued_begin_and_close_are_processed_before_reader_eof() {
         .expect("peer Close");
     peer.shutdown().await.expect("EOF behind queued frames");
     read_close(&mut peer).await;
-    let incoming = timeout(LIMIT, connection.next_incoming_session())
+    let incoming = timeout(WAIT, connection.next_incoming_session())
         .await
         .expect("queued Begin must be preserved");
     assert!(incoming.is_some());
@@ -569,14 +571,14 @@ async fn reader_panic_requests_stop_and_is_cached_after_both_tasks_join() {
         .await
         .expect("wake the actual reader");
     probe.wait_drop().await;
-    let first = timeout(LIMIT, connection.shutdown())
+    let first = timeout(WAIT, connection.shutdown())
         .await
         .expect("join after reader panic")
         .expect_err("reader panic is not success");
     assert!(
         matches!(&first, ConnectionShutdownError::ReaderFailed(detail) if detail.contains("reader custody witness panic"))
     );
-    let second = timeout(LIMIT, connection.shutdown())
+    let second = timeout(WAIT, connection.shutdown())
         .await
         .expect("repeat failed join")
         .expect_err("cached reader failure");
@@ -589,19 +591,19 @@ async fn driver_panic_is_cached_and_shutdown_still_joins_the_reader() {
     let (mut connection, _peer, probe) = opened().await;
     probe.panic_write.store(true, Ordering::SeqCst);
     assert!(matches!(
-        timeout(LIMIT, connection.close())
+        timeout(WAIT, connection.close())
             .await
             .expect("driver command must resolve"),
         Err(EngineError::Stopped)
     ));
-    let first = timeout(LIMIT, connection.shutdown())
+    let first = timeout(WAIT, connection.shutdown())
         .await
         .expect("join after driver panic")
         .expect_err("driver panic is not success");
     assert!(
         matches!(&first, ConnectionShutdownError::DriverFailed(detail) if detail.contains("driver custody witness panic"))
     );
-    let second = timeout(LIMIT, connection.shutdown())
+    let second = timeout(WAIT, connection.shutdown())
         .await
         .expect("repeat failed join")
         .expect_err("cached driver failure");

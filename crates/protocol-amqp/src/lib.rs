@@ -15,6 +15,8 @@ mod listener;
 mod management;
 mod message;
 mod session_filter;
+#[cfg(test)]
+mod test_deadline;
 mod tls;
 mod websocket;
 

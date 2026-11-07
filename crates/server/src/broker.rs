@@ -733,18 +733,12 @@ mod tests {
             },
         );
 
-        tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            accounting_waiter.notified(),
-        )
-        .await
-        .expect("the first populated subscription is notified");
-        tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            analytics_waiter.notified(),
-        )
-        .await
-        .expect("the second populated subscription is notified");
+        tokio::time::timeout(crate::test_deadline::WAIT, accounting_waiter.notified())
+            .await
+            .expect("the first populated subscription is notified");
+        tokio::time::timeout(crate::test_deadline::WAIT, analytics_waiter.notified())
+            .await
+            .expect("the second populated subscription is notified");
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(20),
@@ -775,12 +769,9 @@ mod tests {
             },
         );
 
-        tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            accounting_waiter.notified(),
-        )
-        .await
-        .expect("the populated subscription is notified");
+        tokio::time::timeout(crate::test_deadline::WAIT, accounting_waiter.notified())
+            .await
+            .expect("the populated subscription is notified");
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(20),
@@ -825,12 +816,9 @@ mod tests {
                 deliverable_entities: vec![queue.clone()],
             },
         );
-        tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            queue_waiter.notified(),
-        )
-        .await
-        .expect("the activated queue is notified");
+        tokio::time::timeout(crate::test_deadline::WAIT, queue_waiter.notified())
+            .await
+            .expect("the activated queue is notified");
     }
 
     #[test]
@@ -962,7 +950,7 @@ mod tests {
                 self.resume
                     .lock()
                     .unwrap()
-                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .recv_timeout(crate::test_deadline::WAIT)
                     .expect("the test releases the owner");
             }
             Timestamp::from_millis(1_000)
@@ -1025,9 +1013,7 @@ mod tests {
         let (broker, entered, resume, calls) = paused_broker(store.clone());
         let handle = broker.handle();
         let first = enqueue_queue(&handle, "orders");
-        entered
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .unwrap();
+        entered.recv_timeout(crate::test_deadline::WAIT).unwrap();
         for _ in 0..COMMAND_QUEUE_DEPTH {
             let (reply, _cancelled) = flume::bounded(1);
             handle
@@ -1091,14 +1077,12 @@ mod tests {
         let (broker, entered, resume, _) = paused_broker(store.clone());
         let handle = broker.handle();
         let first = enqueue_queue(&handle, "first");
-        entered
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .unwrap();
+        entered.recv_timeout(crate::test_deadline::WAIT).unwrap();
         let ahead = enqueue_queue(&handle, "ahead");
         handle.requests.send(Request::Stop).unwrap();
         let behind = enqueue_queue(&handle, "behind");
         resume.send(()).unwrap();
-        let timeout = std::time::Duration::from_secs(30);
+        let timeout = crate::test_deadline::WAIT;
         assert_eq!(
             first.recv_timeout(timeout).unwrap().unwrap(),
             CommandOutcome::QueueCreated

@@ -1,6 +1,6 @@
 //! Public bound-actor controls on both stores, not protocol endpoint migration.
 
-use std::{error::Error, time::Duration};
+use std::error::Error;
 
 use domain::{
     CommandKind, CommandOutcome, DeadLetterInfo, DeadLetterReason, Delivery, EntityBinding,
@@ -10,7 +10,11 @@ use domain::{
 use server::{Broker, BrokerHandle, LocalProposer, ManualClock, SubmitError};
 use testkit::StoreProvider;
 
-const WAIT: Duration = Duration::from_secs(5);
+#[path = "../src/test_deadline.rs"]
+mod test_deadline;
+
+use test_deadline::WAIT;
+
 const QUEUE: usize = 0;
 const TOPIC: usize = 1;
 const SUBSCRIPTION: usize = 2;

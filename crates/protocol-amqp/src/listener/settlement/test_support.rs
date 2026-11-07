@@ -52,7 +52,7 @@ use crate::listener::settlement::{SettlementContext, lock_delivery_tag};
 use crate::management::ConnectionManagement;
 use crate::{Broker, BrokerRejection};
 
-pub(super) const WAIT: Duration = Duration::from_secs(5);
+pub(super) use crate::test_deadline::WAIT;
 pub(super) const CHANNEL: u16 = 1;
 pub(super) const HANDLE: u32 = 1;
 pub(super) const LINK: &str = "owned-settlement";

@@ -13,7 +13,10 @@ use std::{
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use tempfile::TempDir;
 
-const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
+#[path = "../src/test_deadline.rs"]
+mod test_deadline;
+
+use test_deadline::WAIT;
 
 struct StartupChild(Option<Child>);
 
@@ -28,7 +31,7 @@ impl Drop for StartupChild {
 
 fn bounded_output(command: &mut Command) -> io::Result<Output> {
     let mut process = StartupChild(Some(command.spawn()?));
-    let deadline = Instant::now() + STARTUP_DEADLINE;
+    let deadline = Instant::now() + WAIT;
     loop {
         if process
             .0

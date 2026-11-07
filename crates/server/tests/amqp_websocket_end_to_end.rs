@@ -26,6 +26,11 @@ use tokio_tungstenite::{
     },
 };
 
+#[path = "../src/test_deadline.rs"]
+mod test_deadline;
+
+use test_deadline::WAIT;
+
 struct WebSocketNode {
     _broker: Broker,
     address: String,
@@ -164,11 +169,7 @@ async fn plaintext_http_cannot_upgrade_the_wss_listener() -> Result<(), Box<dyn 
         SEC_WEBSOCKET_PROTOCOL,
         HeaderValue::from_static(protocol_amqp::AMQP_WEBSOCKET_SUBPROTOCOL),
     );
-    let upgraded = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        client_async(request, tcp),
-    )
-    .await?;
+    let upgraded = tokio::time::timeout(WAIT, client_async(request, tcp)).await?;
     assert!(upgraded.is_err(), "plaintext upgraded a WSS listener");
     Ok(())
 }

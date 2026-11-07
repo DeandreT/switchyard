@@ -1,6 +1,6 @@
 //! Absolute SDK addresses retain authority validation before entity authorization.
 
-use std::{error::Error, time::Duration};
+use std::error::Error;
 
 use amqp::{
     ApplicationProperties, Body, ClientConnection as Connection, ClientReceiver as Receiver,
@@ -16,6 +16,11 @@ use serde_amqp::{described::Described, descriptor::Descriptor};
 use server::{Broker, LocalProposer, ManualClock};
 use storage::{FjallStore, MemoryStore, StateStore};
 use tokio::{net::TcpListener, task::JoinHandle};
+
+#[path = "../src/test_deadline.rs"]
+mod test_deadline;
+
+use test_deadline::WAIT;
 
 const HOST: &str = "tenant.servicebus.windows.net";
 const KEY: &str = "public-absolute-address-fixture";
@@ -141,7 +146,7 @@ async fn peek(session: &mut Session, path: &str, index: usize) -> TestResult {
         requests.send(request).await?,
         Outcome::Accepted(_)
     ));
-    let response = tokio::time::timeout(Duration::from_secs(5), replies.recv()).await??;
+    let response = tokio::time::timeout(WAIT, replies.recv()).await??;
     let status = response
         .message()
         .application_properties
@@ -180,14 +185,14 @@ async fn round_trip(node: Node) -> TestResult {
                 sender.send(message()).await?,
                 Outcome::Accepted(_)
             ));
-            let delivery = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await??;
+            let delivery = tokio::time::timeout(WAIT, receiver.recv()).await??;
             receiver.reject(&delivery, None).await?;
             receiver.close().await?;
             let dead_path = format!("{receive_path}/$DeadLetterQueue");
             let mut dead =
                 Receiver::attach(&mut session, format!("dead-{index}"), address(&dead_path))
                     .await?;
-            let delivery = tokio::time::timeout(Duration::from_secs(5), dead.recv()).await??;
+            let delivery = tokio::time::timeout(WAIT, dead.recv()).await??;
             dead.accept(&delivery).await?;
             dead.close().await?;
             sender.close().await?;
@@ -246,7 +251,7 @@ async fn absolute_addresses_cannot_expand_entity_or_namespace_authority() -> Tes
                 Sender::attach(&mut session, format!("denied-{index}"), target).await
             {
                 assert!(
-                    tokio::time::timeout(Duration::from_secs(5), sender.send(message()))
+                    tokio::time::timeout(WAIT, sender.send(message()))
                         .await?
                         .is_err()
                 );
@@ -355,7 +360,7 @@ async fn described_session_filters_hold_the_grant_for_management_and_settlement(
                 requests.send(request).await?,
                 Outcome::Accepted(_)
             ));
-            let reply = tokio::time::timeout(Duration::from_secs(5), replies.recv()).await??;
+            let reply = tokio::time::timeout(WAIT, replies.recv()).await??;
             assert_eq!(
                 reply
                     .message()
@@ -365,7 +370,7 @@ async fn described_session_filters_hold_the_grant_for_management_and_settlement(
                 Some(&Value::Int(200))
             );
             replies.accept(&reply).await?;
-            let delivery = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await??;
+            let delivery = tokio::time::timeout(WAIT, receiver.recv()).await??;
             receiver.accept(&delivery).await?;
             receiver.close().await?;
             replies.close().await?;

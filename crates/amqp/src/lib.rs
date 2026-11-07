@@ -4,6 +4,8 @@
 
 mod codec;
 mod server;
+#[cfg(test)]
+mod test_deadline;
 mod types;
 
 pub use crate::{

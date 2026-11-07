@@ -29,7 +29,7 @@ use crate::{
     Broker, BrokerRejection, SharedAccessAuthentication, authorization::ConnectionAuthorization,
 };
 
-const LIMIT: Duration = Duration::from_secs(5);
+use crate::test_deadline::WAIT;
 
 #[derive(Default)]
 struct WriteState {
@@ -58,7 +58,7 @@ impl WriteGate {
         }
     }
     async fn reached(&self) {
-        timeout(LIMIT, async {
+        timeout(WAIT, async {
             loop {
                 let changed = self.changed.notified();
                 tokio::pin!(changed);
@@ -128,7 +128,7 @@ fn frame(channel: u16, performative: Performative) -> Frame {
 async fn opened() -> (ServerConnection, DuplexStream, Arc<WriteGate>) {
     let (inner, mut peer) = duplex(64 * 1024);
     let writes = Arc::new(WriteGate::default());
-    let (connection, ()) = timeout(LIMIT, async {
+    let (connection, ()) = timeout(WAIT, async {
         tokio::join!(
             ServerConnection::accept(
                 NativeIo {
@@ -187,7 +187,7 @@ async fn buffered_begin(peer: &mut DuplexStream) {
         .await
         .unwrap();
     assert!(matches!(
-        timeout(LIMIT, read_frame(peer)).await.unwrap().unwrap(),
+        timeout(WAIT, read_frame(peer)).await.unwrap().unwrap(),
         Frame::Amqp {
             channel: 900,
             performative: Some(Performative::End(_)),
@@ -283,7 +283,7 @@ async fn outer_connection_panic_stops_held_writer_and_full_native_queue_before_c
             ),
         );
         pending_once(pump.as_mut()).await;
-        timeout(LIMIT, async {
+        timeout(WAIT, async {
             tokio::select! {
                 result = pump.as_mut() => panic!("original pump finished before its fault checkpoint: {result:?}"),
                 () = fault.reached() => {},
@@ -292,7 +292,7 @@ async fn outer_connection_panic_stops_held_writer_and_full_native_queue_before_c
         .await
         .unwrap();
         fault.request();
-        let result = timeout(LIMIT, pump.as_mut()).await.unwrap();
+        let result = timeout(WAIT, pump.as_mut()).await.unwrap();
         drop(pump);
         custody.record_primary(result);
     }
@@ -310,7 +310,7 @@ async fn outer_connection_panic_stops_held_writer_and_full_native_queue_before_c
         "the test never releases native IO"
     );
     assert!(!custody.finished && custody.primary.is_some());
-    timeout(LIMIT, custody.finish()).await.unwrap();
+    timeout(WAIT, custody.finish()).await.unwrap();
     assert!(matches!(custody.shutdown.as_ref(), Some(Ok(()))));
     assert_primary(
         std::panic::catch_unwind(AssertUnwindSafe(|| custody.finish_result())),
@@ -353,14 +353,14 @@ async fn outer_connection_panic_drains_begun_acceptance_or_timeout_close_without
             () = writes.reached() => {},
         }
         fault.request();
-        let result = timeout(LIMIT, pump.as_mut()).await.unwrap();
+        let result = timeout(WAIT, pump.as_mut()).await.unwrap();
         drop(pump);
         custody.record_primary(result);
         assert!(custody.original.as_ref().unwrap().started);
         assert!(custody.original.as_ref().unwrap().packet.is_none());
         pending_once(Box::pin(custody.finish()).as_mut()).await;
         assert!(custody.original.as_ref().unwrap().retired);
-        timeout(LIMIT, custody.finish()).await.unwrap();
+        timeout(WAIT, custody.finish()).await.unwrap();
         assert!(matches!(
             custody.native_error.as_ref(),
             Some(EngineError::Stopped | EngineError::RemoteClosed)
@@ -400,10 +400,7 @@ async fn outer_connection_panic_retains_ready_session_or_terminal_close_packet_b
         );
         pending_once(pump.as_mut()).await;
         assert!(matches!(
-            timeout(LIMIT, read_frame(&mut peer))
-                .await
-                .unwrap()
-                .unwrap(),
+            timeout(WAIT, read_frame(&mut peer)).await.unwrap().unwrap(),
             Frame::Amqp {
                 performative: Some(Performative::Begin(_) | Performative::Close(_)),
                 ..
@@ -418,10 +415,10 @@ async fn outer_connection_panic_retains_ready_session_or_terminal_close_packet_b
                 Poll::Pending
             }
         }));
-        timeout(LIMIT, advancing.as_mut()).await.unwrap();
+        timeout(WAIT, advancing.as_mut()).await.unwrap();
         drop(advancing);
         fault.request();
-        let result = timeout(LIMIT, pump.as_mut()).await.unwrap();
+        let result = timeout(WAIT, pump.as_mut()).await.unwrap();
         drop(pump);
         custody.record_primary(result);
         assert!(custody.original.as_ref().unwrap().actual.is_none());
@@ -438,7 +435,7 @@ async fn outer_connection_panic_retains_ready_session_or_terminal_close_packet_b
                 )))
             ));
         }
-        timeout(LIMIT, custody.finish()).await.unwrap();
+        timeout(WAIT, custody.finish()).await.unwrap();
         if accept {
             assert!(matches!(
                 custody.original.as_ref().unwrap().packet,
@@ -461,7 +458,8 @@ async fn connection_retirement_keeps_held_grants_and_buffered_begin_preparation_
                 if before_poll {
                     Duration::ZERO
                 } else {
-                    Duration::from_secs(20)
+                    // Outlasts the test so expiry cannot preempt retirement.
+                    WAIT
                 },
                 before_poll,
             );
@@ -483,13 +481,7 @@ async fn connection_retirement_keeps_held_grants_and_buffered_begin_preparation_
             }
             buffered_begin(&mut peer).await;
             request.request();
-            assert!(
-                timeout(LIMIT, pump.as_mut())
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .is_ok()
-            );
+            assert!(timeout(WAIT, pump.as_mut()).await.unwrap().unwrap().is_ok());
             drop(pump);
             assert!(
                 custody.original.is_none(),
@@ -502,7 +494,7 @@ async fn connection_retirement_keeps_held_grants_and_buffered_begin_preparation_
                 "the actual grants row remains held and unchanged"
             );
             custody.record_primary(Ok(Ok(())));
-            timeout(LIMIT, custody.finish()).await.unwrap();
+            timeout(WAIT, custody.finish()).await.unwrap();
             custody.finish_result().unwrap();
             drop(row);
         }
@@ -527,20 +519,17 @@ async fn healthy_peer_close_is_answered_before_original_native_shutdown() {
         .await
         .unwrap();
     assert!(matches!(
-        timeout(LIMIT, read_frame(&mut peer))
-            .await
-            .unwrap()
-            .unwrap(),
+        timeout(WAIT, read_frame(&mut peer)).await.unwrap().unwrap(),
         Frame::Amqp {
             performative: Some(Performative::Close(_)),
             ..
         }
     ));
-    let result = timeout(LIMIT, pump.as_mut()).await.unwrap();
+    let result = timeout(WAIT, pump.as_mut()).await.unwrap();
     drop(pump);
     assert!(result.as_ref().unwrap().is_ok());
     custody.record_primary(result);
-    timeout(LIMIT, custody.finish()).await.unwrap();
+    timeout(WAIT, custody.finish()).await.unwrap();
     assert!(matches!(custody.shutdown.as_ref(), Some(Ok(()))));
     custody.finish_result().unwrap();
 }
@@ -568,8 +557,8 @@ async fn connection_cleanup_retains_poison_and_primary_precedence_without_repoll
     pending_once(Box::pin(custody.finish()).as_mut()).await;
     assert!(custody.original.as_ref().unwrap().poisoned);
     assert!(custody.original.as_ref().unwrap().packet.is_none());
-    timeout(LIMIT, custody.finish()).await.unwrap();
-    timeout(LIMIT, custody.finish()).await.unwrap();
+    timeout(WAIT, custody.finish()).await.unwrap();
+    timeout(WAIT, custody.finish()).await.unwrap();
     assert_eq!(
         polls.load(Ordering::SeqCst),
         2,
@@ -587,7 +576,7 @@ async fn closed_connection_retirement_watch_is_terminal() {
     let mut observer = Box::pin(wait_for_retirement(receiver));
     pending_once(observer.as_mut()).await;
     drop(sender);
-    timeout(LIMIT, observer).await.unwrap();
+    timeout(WAIT, observer).await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -608,7 +597,7 @@ async fn connection_cleanup_keeps_primary_and_original_native_errors_before_seco
         }));
         custody.secondary_panic = Some(Box::new("secondary cleanup panic primitive"));
         pending_once(Box::pin(custody.finish()).as_mut()).await;
-        timeout(LIMIT, custody.finish()).await.unwrap();
+        timeout(WAIT, custody.finish()).await.unwrap();
         assert!(matches!(
             custody.native_error.as_ref(),
             Some(EngineError::Stopped | EngineError::RemoteClosed)
@@ -656,19 +645,16 @@ async fn connection_primary_fault_precedes_actual_original_driver_panic_shutdown
         }
         writes.panic_held_write();
         assert!(
-            timeout(LIMIT, read_frame(&mut peer))
-                .await
-                .unwrap()
-                .is_err(),
+            timeout(WAIT, read_frame(&mut peer)).await.unwrap().is_err(),
             "actual native IO is dropped after the driver panic"
         );
         if primary_panic {
             fault.request();
         }
-        let result = timeout(LIMIT, pump.as_mut()).await.unwrap();
+        let result = timeout(WAIT, pump.as_mut()).await.unwrap();
         drop(pump);
         custody.record_primary(result);
-        timeout(LIMIT, custody.finish()).await.unwrap();
+        timeout(WAIT, custody.finish()).await.unwrap();
         assert!(
             matches!(custody.shutdown.as_ref(), Some(Err(ConnectionShutdownError::DriverFailed(value))) if value.contains("controlled connection native driver panic"))
         );

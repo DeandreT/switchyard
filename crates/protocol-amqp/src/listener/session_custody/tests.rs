@@ -13,11 +13,10 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
 };
 use tokio::{sync::oneshot, time::timeout};
 
-const WAIT: Duration = Duration::from_secs(5);
+use crate::test_deadline::WAIT;
 
 #[derive(Debug)]
 struct RawError(Arc<str>);

@@ -15,6 +15,11 @@ use server::{Broker, LocalProposer, ManualClock};
 use storage::MemoryStore;
 use tokio::net::TcpListener;
 
+#[path = "../src/test_deadline.rs"]
+mod test_deadline;
+
+use test_deadline::WAIT;
+
 const TOPIC: &str = "events";
 const ACCOUNTING: &str = "events/Subscriptions/accounting";
 const ANALYTICS: &str = "events/Subscriptions/analytics";
@@ -383,7 +388,7 @@ async fn topic_link_roles_are_enforced() -> Result<(), Box<dyn Error>> {
     let mut receive_session = Session::begin(&mut receive_connection).await?;
     let mut topic_receiver =
         Receiver::attach(&mut receive_session, "topic-receiver", TOPIC).await?;
-    let refused = tokio::time::timeout(Duration::from_secs(2), topic_receiver.recv()).await?;
+    let refused = tokio::time::timeout(WAIT, topic_receiver.recv()).await?;
     assert!(
         refused.is_err(),
         "a receiver consumed directly from a topic"

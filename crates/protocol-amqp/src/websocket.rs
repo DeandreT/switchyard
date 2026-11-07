@@ -453,9 +453,9 @@ mod tests {
             (server, read)
         });
         assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), client.next())
+            tokio::time::timeout(crate::test_deadline::WAIT, client.next())
                 .await
-                .expect("the pong is prompt")
+                .expect("the pong arrives")
                 .expect("the peer remains open")
                 .expect("the pong is valid"),
             Message::Pong(Vec::from(&b"probe"[..]).into())

@@ -8,7 +8,7 @@ async fn leaf_notice_latches_on_original_parent_observer_and_keeps_connection_id
     let (independent, mut peer, _independent_writes) = opened().await;
     writes.hold();
     let mut original_close = Box::pin(old.close_owned());
-    timeout(LIMIT, async {
+    timeout(WAIT, async {
         tokio::select! {
             result = original_close.as_mut() => panic!("original native write held: {result:?}"),
             () = writes.reached() => {},
@@ -35,10 +35,10 @@ async fn leaf_notice_latches_on_original_parent_observer_and_keeps_connection_id
     request.clone().request();
     // Dropping an already-completed observer cannot consume the watch latch.
     for _ in 0..2 {
-        timeout(LIMIT, parent.retirement_observer()).await.unwrap();
+        timeout(WAIT, parent.retirement_observer()).await.unwrap();
     }
     assert!(parent.is_retired() && request.is_requested());
-    timeout(LIMIT, original_close.as_mut())
+    timeout(WAIT, original_close.as_mut())
         .await
         .unwrap()
         .unwrap_err();
@@ -48,28 +48,25 @@ async fn leaf_notice_latches_on_original_parent_observer_and_keeps_connection_id
     assert!(overflow.await.is_err());
     assert!(writes.state.lock().unwrap().held);
     parent.record_primary(Ok(Ok(())));
-    timeout(LIMIT, parent.finish()).await.unwrap();
+    timeout(WAIT, parent.finish()).await.unwrap();
     let shutdown = parent.shutdown.clone();
-    timeout(LIMIT, parent.finish()).await.unwrap();
+    timeout(WAIT, parent.finish()).await.unwrap();
     assert_eq!(parent.shutdown, shutdown);
     parent.finish_result().unwrap();
     request.request();
     // Same container/session numbers on a distinct connection remain usable.
     let mut independent = ConnectionCustody::new(independent);
     begin(&mut peer, 1).await;
-    let incoming = timeout(LIMIT, independent.connection.next_incoming_session())
+    let incoming = timeout(WAIT, independent.connection.next_incoming_session())
         .await
         .unwrap()
         .unwrap();
-    let session = timeout(LIMIT, independent.connection.accept_session(incoming))
+    let session = timeout(WAIT, independent.connection.accept_session(incoming))
         .await
         .unwrap()
         .unwrap();
     assert!(matches!(
-        timeout(LIMIT, read_frame(&mut peer))
-            .await
-            .unwrap()
-            .unwrap(),
+        timeout(WAIT, read_frame(&mut peer)).await.unwrap().unwrap(),
         Frame::Amqp {
             channel: 1,
             performative: Some(Performative::Begin(_)),
@@ -79,7 +76,7 @@ async fn leaf_notice_latches_on_original_parent_observer_and_keeps_connection_id
     assert!(!independent.is_retired());
     assert!(!session.is_ended());
     independent.record_primary(Ok(Ok(())));
-    timeout(LIMIT, independent.finish()).await.unwrap();
+    timeout(WAIT, independent.finish()).await.unwrap();
     independent.finish_result().unwrap();
 }
 
@@ -113,7 +110,7 @@ async fn while_parent<F: Future + ?Sized>(
     parent: Pin<&mut F>,
     peer: &mut DuplexStream,
 ) -> Performative {
-    timeout(LIMIT, async {
+    timeout(WAIT, async {
         tokio::select! {
             _ = parent => panic!("parent remains active during admission"),
             frame = read_frame(peer) => match frame.unwrap() {
@@ -228,13 +225,13 @@ async fn adopted_data_leaf_faults_publish_the_original_connection_request() {
             .await
             .unwrap();
         }
-        let primary = timeout(LIMIT, original.as_mut()).await.unwrap();
+        let primary = timeout(WAIT, original.as_mut()).await.unwrap();
         drop(original);
         assert!(request.is_requested());
         assert_eq!(broker.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         parent.record_primary(primary);
-        timeout(LIMIT, parent.retirement_observer()).await.unwrap();
-        timeout(LIMIT, parent.finish()).await.unwrap();
+        timeout(WAIT, parent.retirement_observer()).await.unwrap();
+        timeout(WAIT, parent.finish()).await.unwrap();
         let returned = parent
             .family()
             .finished()

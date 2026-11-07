@@ -11,7 +11,6 @@ use std::{
     },
     task::{Context, Poll, Waker},
     thread::{self, ThreadId},
-    time::Duration,
 };
 
 use admin_api::{
@@ -31,6 +30,11 @@ use server::{
 };
 use storage::{Key, StateStore, StorageError, StoreSnapshot, Value, WriteBatch};
 use testkit::{DurableProvider, MemoryProvider, StoreProvider};
+
+#[path = "../src/test_deadline.rs"]
+mod test_deadline;
+
+use test_deadline::WAIT;
 
 fn ns(value: &str) -> NamespaceName {
     NamespaceName::new(value).unwrap()
@@ -134,7 +138,7 @@ impl Control {
         if let Some(gate) = gate {
             gate.entered.send(()).unwrap();
             gate.resume
-                .recv_timeout(Duration::from_secs(30))
+                .recv_timeout(WAIT)
                 .expect("test releases owner gate");
         }
     }
@@ -1284,7 +1288,7 @@ async fn serialized_reads_and_cancel<P: StoreProvider>(provider: P) {
                 read_service.get(get(address("topic"))).await.map(|_| ())
             }
         });
-        entered.recv_timeout(Duration::from_secs(30)).unwrap();
+        entered.recv_timeout(WAIT).unwrap();
         let mut mutation = Box::pin(service.create(create(
             address(if page { "after-list" } else { "after-get" }),
             EntityKind::Queue,
@@ -1335,7 +1339,7 @@ async fn serialized_reads_and_cancel<P: StoreProvider>(provider: P) {
     let (entered, resume) = control.arm(keys::queue_config(&ns("tenant"), &path("topic")));
     let read_service = service.clone();
     let reader = tokio::spawn(async move { read_service.get(get(address("topic"))).await });
-    entered.recv_timeout(Duration::from_secs(30)).unwrap();
+    entered.recv_timeout(WAIT).unwrap();
     let mut accepted = Box::pin(service.create(create(
         address("cancelled-reply"),
         EntityKind::Queue,
