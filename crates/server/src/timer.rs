@@ -79,6 +79,11 @@ pub struct SweepReport {
     pub duplicate_history_removed: u32,
     pub locks_returned_to_ready: u32,
     pub messages_dead_lettered: u32,
+    /// Expired messages deleted under a disabled expiry policy.
+    pub messages_deleted: u32,
+    /// Due expiry entries of locked, deferred or scheduled messages removed
+    /// while the message itself was kept.
+    pub expiry_entries_retired: u32,
     pub sessions_released: u32,
     /// At least one bounded index round filled every attempt. The run loop
     /// immediately follows up instead of adding timer-interval latency.
@@ -95,6 +100,8 @@ impl SweepReport {
             && self.duplicate_history_removed == 0
             && self.locks_returned_to_ready == 0
             && self.messages_dead_lettered == 0
+            && self.messages_deleted == 0
+            && self.expiry_entries_retired == 0
             && self.sessions_released == 0
             && !self.work_remaining
             && self.commands_failed == 0
@@ -324,14 +331,17 @@ impl<'a> TimerWorker<'a> {
             let CommandOutcome::LocksExpired {
                 returned_to_ready,
                 dead_lettered,
+                deleted,
             } = outcome
             else {
                 return Err(unexpected(outcome));
             };
             report.locks_returned_to_ready += returned_to_ready;
             report.messages_dead_lettered += dead_lettered;
+            report.messages_deleted += deleted;
 
-            if ((returned_to_ready + dead_lettered) as usize) < TIMER_SCAN_LIMIT {
+            // Every handled lock counts toward a full page, however it ended.
+            if ((returned_to_ready + dead_lettered + deleted) as usize) < TIMER_SCAN_LIMIT {
                 return Ok(());
             }
             if round + 1 == MAX_ROUNDS_PER_INDEX {
@@ -353,12 +363,21 @@ impl<'a> TimerWorker<'a> {
                 entity.clone(),
                 CommandKind::ExpireMessages,
             )?;
-            let CommandOutcome::MessagesExpired { dead_lettered } = outcome else {
+            let CommandOutcome::MessagesExpired {
+                dead_lettered,
+                deleted,
+                index_entries_retired,
+            } = outcome
+            else {
                 return Err(unexpected(outcome));
             };
             report.messages_dead_lettered += dead_lettered;
+            report.messages_deleted += deleted;
+            report.expiry_entries_retired += index_entries_retired;
 
-            if (dead_lettered as usize) < TIMER_SCAN_LIMIT {
+            // Every handled due entry counts toward a full page, including
+            // deletions and retired entries that wrote no dead-letter copy.
+            if ((dead_lettered + deleted + index_entries_retired) as usize) < TIMER_SCAN_LIMIT {
                 return Ok(());
             }
             if round + 1 == MAX_ROUNDS_PER_INDEX {
@@ -420,6 +439,8 @@ impl<'a> TimerWorker<'a> {
                         duplicate_history_removed = report.duplicate_history_removed,
                         locks_returned_to_ready = report.locks_returned_to_ready,
                         messages_dead_lettered = report.messages_dead_lettered,
+                        messages_deleted = report.messages_deleted,
+                        expiry_entries_retired = report.expiry_entries_retired,
                         sessions_released = report.sessions_released,
                         commands_failed = report.commands_failed,
                         work_remaining = report.work_remaining,
@@ -981,6 +1002,135 @@ mod tests {
         assert_eq!(fourth.topics_swept, 1);
         assert_eq!(fourth.scheduled_activated, 1);
         assert!(!fourth.work_remaining, "the backlog is now fully drained");
+        Ok(())
+    }
+
+    fn deleting_queue(broker: &Broker) -> (NamespaceName, EntityPath) {
+        let namespace = NamespaceName::new("tenant").expect("a valid namespace");
+        let queue = EntityPath::new("deleting").expect("a valid queue path");
+        broker
+            .handle()
+            .submit_blocking(
+                namespace.clone(),
+                queue.clone(),
+                CommandKind::CreateQueue {
+                    config: QueueConfig {
+                        dead_lettering_on_message_expiration: false,
+                        ..QueueConfig::default()
+                    },
+                },
+            )
+            .expect("the queue is created");
+        (namespace, queue)
+    }
+
+    fn send_expiring(
+        broker: &Broker,
+        namespace: &NamespaceName,
+        queue: &EntityPath,
+        count: usize,
+        time_to_live_millis: u64,
+    ) -> Result<(), SubmitError> {
+        for index in 0..count {
+            assert!(matches!(
+                broker.handle().submit_blocking(
+                    namespace.clone(),
+                    queue.clone(),
+                    CommandKind::Send {
+                        message_id: format!("expiring-{index}"),
+                        body: Vec::new(),
+                        time_to_live_millis: Some(time_to_live_millis),
+                        session_id: None,
+                        scheduled_enqueue_at: None,
+                        envelope: None,
+                    },
+                )?,
+                CommandOutcome::Sent { .. }
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_expiries_saturate_rounds_and_request_a_follow_up() -> Result<(), SubmitError> {
+        let broker = Broker::spawn(LocalProposer::new(
+            StateMachine::new(MemoryStore::default()),
+            ManualClock::at(10_000),
+        ));
+        let (namespace, queue) = deleting_queue(&broker);
+        let full = TIMER_SCAN_LIMIT * MAX_ROUNDS_PER_INDEX;
+        send_expiring(&broker, &namespace, &queue, full + 1, 0)?;
+
+        let worker_handle = broker.handle();
+        let worker = TimerWorker::new(&worker_handle);
+        let first = worker.sweep_once()?;
+        assert_eq!(first.messages_deleted as usize, full);
+        assert_eq!(first.messages_dead_lettered, 0);
+        assert!(
+            first.work_remaining,
+            "every round was a full page of deletions"
+        );
+        assert!(!first.is_idle());
+
+        let second = worker.sweep_once()?;
+        assert_eq!(second.messages_deleted, 1);
+        assert!(!second.work_remaining, "the backlog is now fully drained");
+        assert!(!second.is_idle());
+        assert!(worker.sweep_once()?.is_idle());
+
+        let outcome = broker.handle().submit_blocking(
+            namespace,
+            queue
+                .dead_letter_queue()
+                .expect("the queue has a valid dead-letter shadow"),
+            CommandKind::Receive {
+                mode: ReceiveMode::ReceiveAndDelete,
+                lock_duration_millis: None,
+                session: None,
+            },
+        )?;
+        assert_eq!(outcome, CommandOutcome::Received(None));
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_lock_expiries_saturate_rounds_and_request_a_follow_up() -> Result<(), SubmitError> {
+        let clock = ManualClock::at(10_000);
+        let broker = Broker::spawn(LocalProposer::new(
+            StateMachine::new(MemoryStore::default()),
+            clock.clone(),
+        ));
+        let (namespace, queue) = deleting_queue(&broker);
+        let full = TIMER_SCAN_LIMIT * MAX_ROUNDS_PER_INDEX;
+        send_expiring(&broker, &namespace, &queue, full + 1, 1_000)?;
+        for _ in 0..=full {
+            assert!(matches!(
+                broker.handle().submit_blocking(
+                    namespace.clone(),
+                    queue.clone(),
+                    CommandKind::Receive {
+                        mode: ReceiveMode::PeekLock,
+                        lock_duration_millis: Some(1),
+                        session: None,
+                    },
+                )?,
+                CommandOutcome::Received(Some(_))
+            ));
+        }
+        clock.set(20_000);
+
+        let worker_handle = broker.handle();
+        let worker = TimerWorker::new(&worker_handle);
+        let first = worker.sweep_once()?;
+        assert_eq!(first.messages_deleted as usize, full);
+        assert_eq!(first.locks_returned_to_ready, 0);
+        assert_eq!(first.messages_dead_lettered, 0);
+        assert!(first.work_remaining);
+
+        let second = worker.sweep_once()?;
+        assert_eq!(second.messages_deleted, 1);
+        assert!(!second.work_remaining);
+        assert!(worker.sweep_once()?.is_idle());
         Ok(())
     }
 }

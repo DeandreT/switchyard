@@ -235,7 +235,8 @@ fn terminal_receive<P: StoreProvider>(provider: P) -> TestResult {
                     f.at(lock.locked_until.as_millis(), CommandKind::ExpireLocks)?,
                     CommandOutcome::LocksExpired {
                         returned_to_ready: 1,
-                        dead_lettered: 0
+                        dead_lettered: 0,
+                        deleted: 0,
                     }
                 );
                 lock.locked_until.as_millis() + 1

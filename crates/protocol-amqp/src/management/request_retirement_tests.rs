@@ -678,7 +678,8 @@ async fn actual_management_results_preserve_replaced_owners_after_success_and_de
                             actor.intent(CommandKind::ExpireLocks),
                             CommandOutcome::LocksExpired {
                                 returned_to_ready: 1,
-                                dead_lettered: 0
+                                dead_lettered: 0,
+                                deleted: 0,
                             }
                         );
                     } else {
@@ -1480,7 +1481,8 @@ async fn retired_actual_lock_loss_retains_the_refusal_and_drains_both_registry_r
             actor.intent(CommandKind::ExpireLocks),
             CommandOutcome::LocksExpired {
                 returned_to_ready: 1,
-                dead_lettered: 0
+                dead_lettered: 0,
+                deleted: 0,
             },
         );
         let before = actor.snapshot();

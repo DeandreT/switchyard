@@ -143,7 +143,11 @@ fn future_messages_are_browseable_but_not_ready_or_expiring<P: StoreProvider>(
     assert_eq!(receive(&fixture, 99)?, None);
     assert_eq!(
         fixture.at(99, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            deleted: 0,
+            index_entries_retired: 0,
+        }
     );
 
     let browsed = peek(&fixture, 99)?;
@@ -327,11 +331,19 @@ fn time_to_live_starts_at_actual_activation<P: StoreProvider>(
     assert_eq!(record.expires_at, Some(Timestamp::from_millis(170)));
     assert_eq!(
         fixture.at(169, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            deleted: 0,
+            index_entries_retired: 0,
+        }
     );
     assert_eq!(
         fixture.at(170, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            deleted: 0,
+            index_entries_retired: 0,
+        }
     );
     assert_eq!(receive(&fixture, 171)?, None);
     Ok(())

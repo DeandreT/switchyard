@@ -366,6 +366,7 @@ fn abandon_and_lock_expiry_return_to_the_deferred_set<P: StoreProvider>(
         CommandOutcome::LocksExpired {
             returned_to_ready: 1,
             dead_lettered: 0,
+            deleted: 0,
         }
     );
     assert_eq!(
@@ -477,7 +478,11 @@ fn ttl_does_not_invalidate_a_live_lock<P: StoreProvider>(
 
     assert_eq!(
         fixture.at(110, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            deleted: 0,
+            index_entries_retired: 0,
+        }
     );
     assert_eq!(
         complete(&fixture, 111, &delivery)?,
@@ -526,7 +531,11 @@ fn deferred_ttl_is_checked_only_on_explicit_retrieval<P: StoreProvider>(
 
     assert_eq!(
         fixture.at(110, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            deleted: 0,
+            index_entries_retired: 0,
+        }
     );
     assert_eq!(
         fixture

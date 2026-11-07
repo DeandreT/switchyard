@@ -334,7 +334,7 @@ fn corrupt_catalog<P: StoreProvider>(
                         &mut fault,
                         &mut undo,
                         keys::queue_config(&namespace(), &subscription()),
-                        codec::encode(&QueueConfig {
+                        codec::queue::encode(&QueueConfig {
                             lock_duration_millis: 0,
                             ..QueueConfig::default()
                         })?,

@@ -611,10 +611,10 @@ impl<S: StateStore> StateMachine<S> {
             return Err(BrokerError::EntityMetadataCorrupt);
         }
         self.stage_new_owner(&command.namespace, &command.entity, Kind::Queue, batch)?;
-        batch.push_put(key, codec::encode(&config)?);
+        batch.push_put(key, codec::queue::encode(&config)?);
         batch.push_put(
             keys::queue_config(&command.namespace, &dead_letter_queue),
-            codec::encode(&shadow)?,
+            codec::queue::encode(&shadow)?,
         );
         Ok(CommandOutcome::QueueCreated)
     }
@@ -648,18 +648,17 @@ impl<S: StateStore> StateMachine<S> {
             };
         };
         self.require_queue_owner(&command.namespace, &command.entity)?;
-        let current: QueueConfig =
-            codec::decode(&raw).map_err(|_| BrokerError::EntityMetadataCorrupt)?;
+        let current = codec::queue::decode(&raw).map_err(|_| BrokerError::EntityMetadataCorrupt)?;
         current
             .validate()
             .map_err(|_| BrokerError::EntityMetadataCorrupt)?;
-        if codec::encode(&current)? != raw {
+        if codec::queue::encode(&current)? != raw {
             return Err(BrokerError::EntityMetadataCorrupt);
         }
         let shadow_key =
             keys::queue_config(&command.namespace, &command.entity.dead_letter_queue()?);
         let shadow = current.dead_letter_shadow();
-        if self.store.get(&shadow_key)? != Some(codec::encode(&shadow)?) {
+        if self.store.get(&shadow_key)? != Some(codec::queue::encode(&shadow)?) {
             return Err(BrokerError::EntityMetadataCorrupt);
         }
         let updated = update.apply(current)?;
@@ -667,10 +666,10 @@ impl<S: StateStore> StateMachine<S> {
         // Validate the complete patch and both existing profiles before staging
         // anything; owner heads and every data/index key remain untouched.
         if updated != current {
-            batch.push_put(parent_key, codec::encode(&updated)?);
+            batch.push_put(parent_key, codec::queue::encode(&updated)?);
         }
         if updated_shadow != shadow {
-            batch.push_put(shadow_key, codec::encode(&updated_shadow)?);
+            batch.push_put(shadow_key, codec::queue::encode(&updated_shadow)?);
         }
         Ok(CommandOutcome::QueueUpdated)
     }
@@ -708,13 +707,7 @@ impl<S: StateStore> StateMachine<S> {
             // A timer sweep normally reaps these, but a receive must never hand
             // out a message whose lifetime has already elapsed.
             if record.is_expired_at(command.issued_at) {
-                self.move_to_dead_letter(
-                    command,
-                    record,
-                    DeadLetterReason::TimeToLiveExpired,
-                    String::from("the message exceeded its time to live"),
-                    batch,
-                )?;
+                self.expire_message(command, &config, record, EXPIRED_DESCRIPTION, batch)?;
                 continue;
             }
 
@@ -832,16 +825,9 @@ impl<S: StateStore> StateMachine<S> {
         // Expiration is suspended while a receiver owns the lock. Once that
         // receiver gives it up, TTL takes precedence over redelivery.
         if record.is_expired_at(command.issued_at) {
-            self.move_to_dead_letter(
-                command,
-                record,
-                DeadLetterReason::TimeToLiveExpired,
-                String::from("the message exceeded its time to live"),
-                batch,
-            )?;
-            return Ok(CommandOutcome::Abandoned {
-                dead_lettered: true,
-            });
+            let dead_lettered =
+                self.expire_message(command, &config, record, EXPIRED_DESCRIPTION, batch)?;
+            return Ok(CommandOutcome::Abandoned { dead_lettered });
         }
 
         if exceeded_delivery_limit(command, &config, &record) {
@@ -1253,31 +1239,10 @@ impl<S: StateStore> StateMachine<S> {
         description: String,
         batch: &mut WriteBatch,
     ) -> Result<(), BrokerError> {
+        self.remove_message(command, &record, batch)?;
         let namespace = &command.namespace;
         let entity = &command.entity;
         let sequence = record.sequence;
-
-        match record.state {
-            MessageState::Ready => {
-                batch.push_delete(self.ready_key(command, &record));
-            }
-            MessageState::Deferred => {
-                batch.push_delete(keys::deferred(namespace, entity, sequence));
-            }
-            MessageState::Locked { locked_until, .. } => {
-                batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
-            }
-            MessageState::Scheduled => {
-                let enqueue_at = record
-                    .scheduled_enqueue_at
-                    .ok_or(BrokerError::ScheduledEnqueueTimeMissing { sequence })?;
-                batch.push_delete(keys::scheduled(namespace, entity, enqueue_at, sequence));
-            }
-        }
-        batch.push_delete(keys::message(namespace, entity, sequence));
-        if let Some(expires_at) = record.expires_at {
-            batch.push_delete(keys::expiry(namespace, entity, expires_at, sequence));
-        }
 
         // Into the shadow queue as an ordinary ready message under its original
         // sequence — the same receive and settlement machinery drains it.
@@ -1302,7 +1267,72 @@ impl<S: StateStore> StateMachine<S> {
         );
         Ok(())
     }
+
+    /// Applies the entity's `dead_lettering_on_message_expiration` policy to a
+    /// message whose time to live has elapsed, and reports whether a
+    /// dead-letter copy was staged. When disabled the message is deleted with
+    /// every index entry its state owns, exactly as dead-lettering would
+    /// remove it from the source, and nothing is written to the shadow.
+    fn expire_message(
+        &self,
+        command: &Command,
+        config: &QueueConfig,
+        record: MessageRecord,
+        description: &str,
+        batch: &mut WriteBatch,
+    ) -> Result<bool, BrokerError> {
+        if config.dead_lettering_on_message_expiration {
+            self.move_to_dead_letter(
+                command,
+                record,
+                DeadLetterReason::TimeToLiveExpired,
+                description.to_owned(),
+                batch,
+            )?;
+            Ok(true)
+        } else {
+            self.remove_message(command, &record, batch)?;
+            Ok(false)
+        }
+    }
+
+    /// Deletes a message and the state and expiry index entries it owns.
+    fn remove_message(
+        &self,
+        command: &Command,
+        record: &MessageRecord,
+        batch: &mut WriteBatch,
+    ) -> Result<(), BrokerError> {
+        let namespace = &command.namespace;
+        let entity = &command.entity;
+        let sequence = record.sequence;
+
+        match record.state {
+            MessageState::Ready => {
+                batch.push_delete(self.ready_key(command, record));
+            }
+            MessageState::Deferred => {
+                batch.push_delete(keys::deferred(namespace, entity, sequence));
+            }
+            MessageState::Locked { locked_until, .. } => {
+                batch.push_delete(keys::lock(namespace, entity, locked_until, sequence));
+            }
+            MessageState::Scheduled => {
+                let enqueue_at = record
+                    .scheduled_enqueue_at
+                    .ok_or(BrokerError::ScheduledEnqueueTimeMissing { sequence })?;
+                batch.push_delete(keys::scheduled(namespace, entity, enqueue_at, sequence));
+            }
+        }
+        batch.push_delete(keys::message(namespace, entity, sequence));
+        if let Some(expires_at) = record.expires_at {
+            batch.push_delete(keys::expiry(namespace, entity, expires_at, sequence));
+        }
+        Ok(())
+    }
 }
+
+const EXPIRED_DESCRIPTION: &str = "the message exceeded its time to live";
 
 /// Whether abandoning or lock expiry should dead-letter rather than return the
 /// message.

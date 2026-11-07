@@ -394,11 +394,11 @@ fn creates_one_owner_head_and_shared_shadows_atomically<P: StoreProvider>(
         ),
         (
             keys::queue_config(&fixture.namespace, &queue),
-            codec::encode(&queue_config)?,
+            codec::queue::encode(&queue_config)?,
         ),
         (
             keys::queue_config(&fixture.namespace, &queue_shadow),
-            codec::encode(&shadow(queue_config))?,
+            codec::queue::encode(&shadow(queue_config))?,
         ),
         (keys::clock(), codec::encode(&Timestamp::from_millis(1))?),
     ]);
@@ -437,11 +437,11 @@ fn creates_one_owner_head_and_shared_shadows_atomically<P: StoreProvider>(
         ),
         (
             keys::queue_config(&fixture.namespace, &child),
-            codec::encode(&child_config)?,
+            codec::queue::encode(&child_config)?,
         ),
         (
             keys::queue_config(&fixture.namespace, &child_shadow),
-            codec::encode(&shadow(child_config))?,
+            codec::queue::encode(&shadow(child_config))?,
         ),
         (
             keys::subscription_rule(&fixture.namespace, &child, &rule.name),
@@ -691,7 +691,7 @@ fn absence_and_structural_topology_errors_keep_priority_over_heads<P: StoreProvi
             .delete(keys::entity_metadata(&fixture.namespace, &child))
             .put(
                 keys::queue_config(&fixture.namespace, &child.dead_letter_queue()?),
-                codec::encode(&QueueConfig::default())?,
+                codec::queue::encode(&QueueConfig::default())?,
             ),
     )?;
     fixture.reject_read(

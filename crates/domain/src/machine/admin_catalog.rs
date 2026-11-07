@@ -4,7 +4,6 @@
 //! cloned/raw store handles. These reads neither acquire a snapshot nor prove
 //! whole-store health, and continuation does not preserve a cross-page snapshot.
 
-use serde::{Serialize, de::DeserializeOwned};
 use storage::{StateStore, StorageError};
 use thiserror::Error;
 
@@ -261,14 +260,6 @@ fn cursor(kind: AdminCatalogKind, key: &[u8]) -> AdminCatalogCursor {
     AdminCatalogCursor(bytes)
 }
 
-fn exact<T: DeserializeOwned + Serialize>(raw: &[u8]) -> Result<T, AdminCatalogError> {
-    let value = codec::decode(raw).map_err(|_| AdminCatalogError::CorruptCatalog)?;
-    if codec::encode(&value).map_err(|_| AdminCatalogError::CorruptCatalog)? != raw {
-        return Err(AdminCatalogError::CorruptCatalog);
-    }
-    Ok(value)
-}
-
 impl<S: StateStore> StateMachine<S> {
     /// Gets one ordinary queue without reading or advancing Clock.
     ///
@@ -297,7 +288,7 @@ impl<S: StateStore> StateMachine<S> {
         if topic.is_some() {
             return Err(AdminCatalogError::CorruptCatalog);
         }
-        let config: QueueConfig = exact(&raw)?;
+        let config = codec::queue::decode(&raw).map_err(|_| AdminCatalogError::CorruptCatalog)?;
         config
             .validate()
             .map_err(|_| AdminCatalogError::CorruptCatalog)?;
@@ -376,12 +367,8 @@ impl<S: StateStore> StateMachine<S> {
             .store()
             .get(&keys::queue_config(namespace, &path))?
             .ok_or(AdminCatalogError::CorruptCatalog)?;
-        let backing: QueueConfig = exact(&raw)?;
-        let config = SubscriptionConfig {
-            lock_duration_millis: backing.lock_duration_millis,
-            max_delivery_count: backing.max_delivery_count,
-            default_time_to_live_millis: backing.default_time_to_live_millis,
-        };
+        let backing = codec::queue::decode(&raw).map_err(|_| AdminCatalogError::CorruptCatalog)?;
+        let config = SubscriptionConfig::from_backing(backing);
         config
             .validate()
             .map_err(|_| AdminCatalogError::CorruptCatalog)?;
@@ -568,13 +555,9 @@ impl<S: StateStore> StateMachine<S> {
         Ok(())
     }
 
-    fn admin_expected<T: Serialize>(
-        &self,
-        key: &[u8],
-        expected: &T,
-    ) -> Result<(), AdminCatalogError> {
+    fn admin_expected(&self, key: &[u8], expected: &QueueConfig) -> Result<(), AdminCatalogError> {
         if self.store().get(key)?
-            != Some(codec::encode(expected).map_err(|_| AdminCatalogError::CorruptCatalog)?)
+            != Some(codec::queue::encode(expected).map_err(|_| AdminCatalogError::CorruptCatalog)?)
         {
             return Err(AdminCatalogError::CorruptCatalog);
         }

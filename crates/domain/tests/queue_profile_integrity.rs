@@ -155,7 +155,7 @@ impl<P: StoreProvider> Fixture<P> {
     fn profile(&self, entity: &EntityPath, config: QueueConfig) -> Result<(), Box<dyn Error>> {
         self.put(
             keys::queue_config(&self.namespace, entity),
-            codec::encode(&config)?,
+            codec::queue::encode(&config)?,
         )?;
         Ok(())
     }

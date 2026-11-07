@@ -46,6 +46,7 @@ fn variants() -> Vec<CommandKind> {
                 requires_session: true,
                 requires_duplicate_detection: false,
                 duplicate_detection_history_millis: 5,
+                dead_lettering_on_message_expiration: true,
             },
         },
         CommandKind::CreateTopic {
@@ -61,6 +62,7 @@ fn variants() -> Vec<CommandKind> {
                 lock_duration_millis: 1,
                 max_delivery_count: 2,
                 default_time_to_live_millis: Some(3),
+                dead_lettering_on_message_expiration: true,
             },
         },
         CommandKind::CreateRule {
@@ -158,6 +160,7 @@ fn variants() -> Vec<CommandKind> {
                 requires_session: Some(false),
                 requires_duplicate_detection: Some(false),
                 duplicate_detection_history_millis: Some(0),
+                dead_lettering_on_message_expiration: None,
             },
         },
     ]
@@ -182,6 +185,7 @@ fn topic_profile_commands_have_separate_v2_goldens_and_retain_invalid_intent() {
                     lock_duration_millis: Some(0),
                     max_delivery_count: Some(0),
                     default_time_to_live_millis: Some(QueueTimeToLiveUpdate::Finite { millis: 0 }),
+                    dead_lettering_on_message_expiration: None,
                 },
             },
             "53574450000000020000001000016e01710701017301000100010000",
@@ -224,6 +228,7 @@ fn topic_profile_commands_have_separate_v2_goldens_and_retain_invalid_intent() {
                 lock_duration_millis: Some(u64::MAX),
                 max_delivery_count: Some(u32::MAX),
                 default_time_to_live_millis: Some(QueueTimeToLiveUpdate::Unlimited),
+                dead_lettering_on_message_expiration: None,
             },
         },
         CommandKind::UpdateSubscription {
@@ -920,6 +925,7 @@ fn original_timestamp_extremes_and_semantically_invalid_config_are_preserved() {
                 requires_session: true,
                 requires_duplicate_detection: true,
                 duplicate_detection_history_millis: 0,
+                dead_lettering_on_message_expiration: true,
             },
         });
         original.issued_at = issued_at;

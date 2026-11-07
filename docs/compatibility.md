@@ -41,8 +41,8 @@ collections require refusal until truthful combined runtime data is available.
 | Management | Renew, abandon, defer/retrieve, ordered peek, schedule/cancel, custom dead-letter and DLQ receive/complete. Unsupported requests reject with compatible conditions/retry hints. |
 | Sessions | Named/next-available attach echoes identifier/deadline; exclusive locks, opaque state, release on close. Renewal/state use `$management`, not automatic renewal. |
 | Duplicates | Exact non-empty message IDs across immediate/batch/scheduled offers on enabled ordinary queues and topics; bounded history expiry. Topic enablement/window are creation-only (default off/10 minutes, inclusive 20 seconds–7 days). |
-| Profiles | Domain-only partial ordinary-queue updates atomically validate/change parent and exact DLQ profiles plus Clock. No-op patches write nothing; owner, records/deadlines remain. Session/duplicate modes are immutable; lock/TTL/message-size/history changes govern future work. |
-| Topic profiles | Domain-only parent-topic size/TTL and named-subscription lock/delivery-count/TTL patches prove all listed children before changing profiles. Size propagates to backing queues/DLQs; topic TTL does not overwrite child TTL. No-op direct calls preserve Clock; no administration or protocol activation. |
+| Profiles | Domain-only partial ordinary-queue updates atomically validate/change parent and exact DLQ profiles plus Clock. No-op patches write nothing; owner, records/deadlines remain. Session/duplicate modes are immutable; lock/TTL/message-size/history/expiry-policy changes govern future work. |
+| Topic profiles | Domain-only parent-topic size/TTL and named-subscription lock/delivery-count/TTL/expiry-policy patches prove all listed children before changing profiles. Size propagates to backing queues/DLQs; topic TTL does not overwrite child TTL. No-op direct calls preserve Clock; no administration or protocol activation. |
 | Topics/rules | Non-session immediate/scheduled singular/batch fanout; placeholder peek/cancel; independent subscription queues. Durable `$Default`, actionless true/false/correlation, typed equality; create/delete/paginated AMQP rules. |
 | Time/identity | Bounded activation/lock/TTL/session-lock/history expiry. ASCII-folded namespace/entity/subscription addresses and SAS scope; session/placement IDs retain case. |
 | Local APIs | [Offline RS256 JWT](offline-jwt.md): pinned keys, injected time/local rights, issuer-qualified grants; SAS/PLAIN retain verified namespace-host qualification. [SQL kernel](sql-predicates.md): bounded ephemeral local grammar/errors, IN/LIKE/scalar arithmetic. No JWT wire activation or persisted SQL rules/fanout/actions. |
@@ -126,7 +126,7 @@ the attach response.
 | Session settlement | Live message token/deadline suffice after session-lock loss; Azure also requires session ownership. |
 | Next session | At most 32 candidates; all held returns unavailable/retry, not a full walk. |
 | Lock tokens | Message and session holds share the selected queue's token counter. MAX-1 is the last fresh token; MAX refuses new holds with nonretryable `LockTokenExhausted` (`amqp:resource-limit-exceeded`, management 403). Empty/no-selection and receive-delete operations need no token; named empty session acquisition does. Existing holds and expiry remain usable. |
-| TTL | Always DLQs as `TTLExpiredException`; Azure's configurable expiration policy defaults off. Live locks remain settleable until expiry. |
+| TTL | Queues and subscriptions carry `dead_lettering_on_message_expiration`, defaulting on (Azure defaults off). On, expiry dead-letters as `TTLExpiredException`; off, it deletes the message and its indexes with no DLQ copy. Either applies on sweep, receive, abandon, lock expiry, deferred retrieval and activated schedules; delivery-count and application dead-lettering are unaffected. The setting is domain-only: administration and AMQP still create entities with the default. Expiry outcomes count deletions separately from DLQ copies, and the timer treats both as work for its paging and idle checks. Live locks remain settleable until expiry. |
 | Duplicate gaps/history | Suppression consumes acknowledgement sequence slots, stores no message. History starts at command time; hits do not extend it, nor settlement/cancellation/expiry/DLQ erase it. Missing raw-AMQP IDs bypass it. |
 | Scheduled topics | Children/rules snapshot at activation: later subscriptions may receive older publications. All-scheduled sends do not prove topology early. |
 | Topic sequences | Each offered publication and selected due placeholder consumes one topic-owned slot, even with no matching subscriptions; fanout copies consume none. MAX-1 is the last fresh slot and MAX refuses with nonretryable `SequenceNumberExhausted`. Crossing batches or bounded activation sets retain every original record, counter and Clock without partial fanout. Idle activation and cancellation need no slot. |
@@ -218,8 +218,10 @@ that must survive for deterministic refusal. Content sends use private V4, carry
 each message's original AMQP bytes once, or raw bytes with explicit normalized fields;
 decoding never parses or polices that content. Abandon, defer and dead-letter with a
 sparse property patch also use V4; their legacy replacement-envelope forms keep exact
-V1 bytes. New readers accept V1 through V4; older readers refuse unsupported proposal
-versions. AMQP ingress sends every message as V4: a transfer as `SendContent`, and a
+V1 bytes. Queue/subscription creation that disables expiry dead-lettering, and
+queue/subscription updates naming that setting, use private V5; all other forms keep
+their V1/V2 bytes. New readers accept V1 through V5; older readers refuse unsupported
+proposal versions. AMQP ingress sends every message as V4: a transfer as `SendContent`, and a
 Service Bus batch or scheduled-message request as `SendContentBatch` with each child's
 original bytes. Nothing new emits V1 sends; historical V1 sends still decode and replay
 unchanged. Link and management dispositions that change properties emit the V4 patch
@@ -237,6 +239,9 @@ operate unrelated endpoints: this is not a whole-store downgrade barrier. Rollba
 requires readers compatible with every retained topic/proposal, or a coherent
 pre-feature state/journal/checkpoint backup. Never strip markers, rewrite profiles
 or delete history as a downgrade procedure.
+Queue profiles, including subscription backings, likewise use a queue-specific V2 only
+when expiry dead-lettering is disabled; enabled profiles and every DLQ shadow keep exact
+legacy V1 bytes, and the same refusals and rollback requirements apply.
 See [profile lifecycle](lifecycle.md#profile-updates).
 
 Message records use a dedicated frozen codec. Legacy sends write V1, byte for byte
@@ -360,7 +365,7 @@ namespace/server; no quotas, fair multi-tenancy or production durability.
 
 | Scope | Missing |
 | --- | --- |
-| Semantics | General SQL/actions, session subscriptions/session-ID predicates, configurable TTL, DLQ forwarding/resubmit, same-group transactions. |
+| Semantics | General SQL/actions, session subscriptions/session-ID predicates, administrable TTL expiry policy, DLQ forwarding/resubmit, same-group transactions. |
 | Administration | Atom/XML entities/rules; native gRPC/CLI transport (contract only). |
 | Security | JWT consumers/wire, network OIDC, mTLS, policy/full RBAC, namespace KMS/encryption, tamper-evident audit. |
 | Production | Raft/placement, quotas/fairness, encrypted backup/restore, readiness/observability, release/performance evidence. |

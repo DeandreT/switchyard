@@ -79,6 +79,7 @@ fn subscription<S: StateStore>(
                 lock_duration_millis: 5_000,
                 max_delivery_count: 3,
                 default_time_to_live_millis: Some(700),
+                dead_lettering_on_message_expiration: true,
             },
         },
     );
@@ -783,7 +784,7 @@ fn damaged_gets<P: StoreProvider>(provider: P) {
             Damage::QueueValue => (
                 qkey,
                 Some(
-                    codec::encode(&QueueConfig {
+                    codec::queue::encode(&QueueConfig {
                         max_message_bytes: 0,
                         ..QueueConfig::default()
                     })
@@ -809,7 +810,7 @@ fn damaged_gets<P: StoreProvider>(provider: P) {
             Damage::QueueShadowMissing => (keys::queue_config(&namespace, &qs), None),
             Damage::QueueShadowWrong => (
                 keys::queue_config(&namespace, &qs),
-                Some(codec::encode(&QueueConfig::default()).expect("wrong shadow")),
+                Some(codec::queue::encode(&QueueConfig::default()).expect("wrong shadow")),
             ),
             Damage::QueueTopic => (
                 keys::topic_config(&namespace, &q),
@@ -834,7 +835,7 @@ fn damaged_gets<P: StoreProvider>(provider: P) {
             Damage::TopicOwnerWrongKind => (keys::entity_metadata(&namespace, &t), Some(qowner)),
             Damage::TopicShadowQueue => (
                 keys::queue_config(&namespace, &ts),
-                Some(codec::encode(&QueueConfig::default()).expect("q")),
+                Some(codec::queue::encode(&QueueConfig::default()).expect("q")),
             ),
             Damage::TopicShadowTopic => (
                 keys::topic_config(&namespace, &ts),
@@ -842,7 +843,7 @@ fn damaged_gets<P: StoreProvider>(provider: P) {
             ),
             Damage::TopicQueue => (
                 keys::queue_config(&namespace, &t),
-                Some(codec::encode(&QueueConfig::default()).expect("q")),
+                Some(codec::queue::encode(&QueueConfig::default()).expect("q")),
             ),
             Damage::TopicPrimaryMissing => (tkey, None),
             Damage::SubscriptionMembership => {
@@ -856,7 +857,9 @@ fn damaged_gets<P: StoreProvider>(provider: P) {
             Damage::SubscriptionBackingMissing => (skey, None),
             Damage::SubscriptionBackingWrong => (
                 skey,
-                Some(codec::encode(&QueueConfig::default()).expect("wrong inherited profile")),
+                Some(
+                    codec::queue::encode(&QueueConfig::default()).expect("wrong inherited profile"),
+                ),
             ),
             Damage::SubscriptionBackingNoncanonical => {
                 let mut value = machine.store().get(&skey).expect("read").expect("backing");
@@ -866,7 +869,7 @@ fn damaged_gets<P: StoreProvider>(provider: P) {
             Damage::SubscriptionShadowMissing => (keys::queue_config(&namespace, &ss), None),
             Damage::SubscriptionShadowWrong => (
                 keys::queue_config(&namespace, &ss),
-                Some(codec::encode(&QueueConfig::default()).expect("wrong shadow")),
+                Some(codec::queue::encode(&QueueConfig::default()).expect("wrong shadow")),
             ),
             Damage::SubscriptionOwnerMissing => (keys::entity_metadata(&namespace, &s), None),
             Damage::SubscriptionOwnerWrongKind => {

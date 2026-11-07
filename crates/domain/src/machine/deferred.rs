@@ -5,9 +5,9 @@ use std::collections::HashSet;
 use storage::{StateStore, WriteBatch};
 
 use crate::{
-    BrokerError, Command, CommandOutcome, DeadLetterReason, Delivery, DeliveryLock, DeliveryOrigin,
-    LockToken, MessageContentError, MessageEnvelope, MessageRecord, MessageRecordFormat,
-    MessageState, QueueConfig, ReceiveMode, SequenceNumber, SessionHold, codec, keys,
+    BrokerError, Command, CommandOutcome, Delivery, DeliveryLock, DeliveryOrigin, LockToken,
+    MessageContentError, MessageEnvelope, MessageRecord, MessageRecordFormat, MessageState,
+    QueueConfig, ReceiveMode, SequenceNumber, SessionHold, codec, keys,
 };
 
 use super::{
@@ -86,11 +86,11 @@ impl<S: StateStore> StateMachine<S> {
         for mut record in records {
             let sequence = record.sequence;
             if record.is_expired_at(command.issued_at) {
-                self.move_to_dead_letter(
+                self.expire_message(
                     command,
+                    &config,
                     record,
-                    DeadLetterReason::TimeToLiveExpired,
-                    String::from("the deferred message exceeded its time to live"),
+                    "the deferred message exceeded its time to live",
                     batch,
                 )?;
                 continue;

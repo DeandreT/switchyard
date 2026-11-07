@@ -340,6 +340,7 @@ async fn profiles_and_errors<P: StoreProvider>(provider: P) {
             default_time_to_live_millis: Some(500),
             lock_duration_millis: 100,
             max_delivery_count: 2,
+            dead_lettering_on_message_expiration: true,
         })
     );
     assert_eq!(
@@ -1145,7 +1146,7 @@ async fn pages_and_corruption<P: StoreProvider>(provider: P) {
         (
             keys::queue_config(&ns("tenant"), &child_path),
             Some(
-                codec::encode(&QueueConfig {
+                codec::queue::encode(&QueueConfig {
                     requires_session: true,
                     ..QueueConfig::default()
                 })

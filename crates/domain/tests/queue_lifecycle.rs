@@ -225,6 +225,7 @@ fn renewing_a_lock_moves_its_deadline_without_changing_its_token<P: StoreProvide
         CommandOutcome::LocksExpired {
             returned_to_ready: 0,
             dead_lettered: 0,
+            deleted: 0,
         }
     );
     assert_eq!(
@@ -498,7 +499,8 @@ fn an_elapsed_lock_returns_the_message_to_the_queue<P: StoreProvider>(
         fixture.at(locked_until.as_millis() - 1, CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 0,
-            dead_lettered: 0
+            dead_lettered: 0,
+            deleted: 0,
         }
     );
     assert_eq!(receive(&fixture, locked_until.as_millis() - 1)?, None);
@@ -507,7 +509,8 @@ fn an_elapsed_lock_returns_the_message_to_the_queue<P: StoreProvider>(
         fixture.at(locked_until.as_millis(), CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 1,
-            dead_lettered: 0
+            dead_lettered: 0,
+            deleted: 0,
         }
     );
     let redelivered = receive(&fixture, locked_until.as_millis() + 1)?
@@ -535,7 +538,8 @@ fn an_elapsed_lock_dead_letters_at_the_delivery_limit<P: StoreProvider>(
         fixture.at(second_deadline, CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 0,
-            dead_lettered: 1
+            dead_lettered: 1,
+            deleted: 0,
         }
     );
     assert_eq!(
@@ -600,11 +604,19 @@ fn the_time_to_live_sweep_dead_letters_expired_messages<P: StoreProvider>(
 
     assert_eq!(
         fixture.at(109, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            deleted: 0,
+            index_entries_retired: 0,
+        }
     );
     assert_eq!(
         fixture.at(110, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            deleted: 0,
+            index_entries_retired: 0,
+        }
     );
 
     let dead = fixture

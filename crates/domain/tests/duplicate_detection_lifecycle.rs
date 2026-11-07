@@ -380,7 +380,11 @@ fn history_outlives_completion_dead_lettering_and_ttl<P: StoreProvider>(
     )?;
     assert_eq!(
         fixture.at(121, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            deleted: 0,
+            index_entries_retired: 0,
+        }
     );
     assert!(matches!(
         send(&fixture, 122, input("expired", Vec::new()))?,

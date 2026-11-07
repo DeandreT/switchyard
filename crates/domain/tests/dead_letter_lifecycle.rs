@@ -193,7 +193,8 @@ fn an_elapsed_lock_in_the_dead_letter_queue_returns_the_message<P: StoreProvider
         at_dlq(&fixture, deadline, CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 1,
-            dead_lettered: 0
+            dead_lettered: 0,
+            deleted: 0,
         }
     );
     assert!(receive_dlq(&fixture, deadline + 1)?.is_some());
@@ -220,11 +221,19 @@ fn the_dead_letter_queue_ignores_time_to_live<P: StoreProvider>(
     // however far time runs on.
     assert_eq!(
         fixture.at(110, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            deleted: 0,
+            index_entries_retired: 0,
+        }
     );
     assert_eq!(
         at_dlq(&fixture, u64::MAX / 2, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            deleted: 0,
+            index_entries_retired: 0,
+        }
     );
     let delivery = receive_dlq(&fixture, u64::MAX / 2 + 1)?.expect("still deliverable");
     assert_eq!(

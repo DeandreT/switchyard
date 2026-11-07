@@ -857,9 +857,13 @@ fn owner_roles_and_pending<P: StoreProvider>(provider: P) {
     );
     let mut disabled = image.clone();
     let config_key = keys::queue_config(&f.namespace, &f.queue);
-    let mut config: QueueConfig = codec::decode(&value(&image, &config_key)).unwrap();
+    let mut config: QueueConfig = codec::queue::decode(&value(&image, &config_key)).unwrap();
     config.requires_duplicate_detection = false; // Qualified impossible-update image, not history.
-    put(&mut disabled, config_key, codec::encode(&config).unwrap());
+    put(
+        &mut disabled,
+        config_key,
+        codec::queue::encode(&config).unwrap(),
+    );
     let lookup = keys::duplicate_id(&f.namespace, &f.queue, "real");
     relation(
         f.reject(&disabled),

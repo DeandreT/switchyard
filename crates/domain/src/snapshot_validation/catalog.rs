@@ -97,7 +97,7 @@ impl<'a> Catalog<'a> {
                 }
                 0x01 => {
                     let scope = entity_parts(key, row)?;
-                    let config = decode::<QueueConfig>(value, row)?;
+                    let config = decode_queue(value, row)?;
                     config
                         .validate()
                         .map_err(|_| invalid_value(row, "queue profile violates current policy"))?;
@@ -241,11 +241,7 @@ impl<'a> Catalog<'a> {
                     .topics
                     .get(&membership.value)
                     .ok_or_else(|| inconsistent(queue.row, "subscription has no parent topic"))?;
-                let config = SubscriptionConfig {
-                    lock_duration_millis: queue.value.lock_duration_millis,
-                    max_delivery_count: queue.value.max_delivery_count,
-                    default_time_to_live_millis: queue.value.default_time_to_live_millis,
-                };
+                let config = SubscriptionConfig::from_backing(queue.value);
                 config.validate().map_err(|_| {
                     invalid_value(queue.row, "subscription profile violates current policy")
                 })?;
@@ -356,6 +352,20 @@ impl<'a> Catalog<'a> {
             Err(inconsistent(row, "catalog owner has no live head"))
         }
     }
+}
+
+/// Same refusal details as [`decode`], through the queue-profile fence.
+fn decode_queue(raw: &[u8], row: usize) -> Result<QueueConfig, SnapshotCatalogError> {
+    codec::queue::decode(raw).map_err(|_| {
+        invalid_value(
+            row,
+            if codec::queue::is_noncanonical(raw) {
+                "catalog value is not canonical"
+            } else {
+                "catalog value cannot be decoded"
+            },
+        )
+    })
 }
 
 fn decode<T: DeserializeOwned + Serialize>(

@@ -988,7 +988,11 @@ fn survival<P: StoreProvider>(provider: P) -> TestResult {
     );
     assert_eq!(
         fixture.at(100, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            deleted: 0,
+            index_entries_retired: 0,
+        }
     );
 
     let fixture = fixture.restart()?;

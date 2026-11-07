@@ -50,16 +50,13 @@ impl<S: StateStore> StateMachine<S> {
             .into_iter()
             .find(|profile| profile.entity == entity)
             .ok_or(BrokerError::SubscriptionNotFound)?;
-        let current = SubscriptionConfig {
-            lock_duration_millis: profile.backing.lock_duration_millis,
-            max_delivery_count: profile.backing.max_delivery_count,
-            default_time_to_live_millis: profile.backing.default_time_to_live_millis,
-        };
+        let current = SubscriptionConfig::from_backing(profile.backing);
         let updated = update.apply(current)?;
         let backing = crate::QueueConfig {
             lock_duration_millis: updated.lock_duration_millis,
             max_delivery_count: updated.max_delivery_count,
             default_time_to_live_millis: updated.default_time_to_live_millis,
+            dead_lettering_on_message_expiration: updated.dead_lettering_on_message_expiration,
             ..profile.backing
         };
         stage_profile(command, profile, backing, batch)?;
@@ -77,13 +74,13 @@ fn stage_profile(
     if backing != profile.backing {
         batch.push_put(
             keys::queue_config(&command.namespace, &profile.entity),
-            codec::encode(&backing)?,
+            codec::queue::encode(&backing)?,
         );
     }
     if shadow != profile.shadow {
         batch.push_put(
             keys::queue_config(&command.namespace, &profile.entity.dead_letter_queue()?),
-            codec::encode(&shadow)?,
+            codec::queue::encode(&shadow)?,
         );
     }
     Ok(())

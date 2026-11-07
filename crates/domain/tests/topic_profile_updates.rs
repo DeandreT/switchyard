@@ -108,6 +108,12 @@ fn put<T: serde::Serialize>(key: Key, value: &T) -> Mutation {
         value: codec::encode(value).unwrap(),
     }
 }
+fn put_queue(key: Key, value: &QueueConfig) -> Mutation {
+    Mutation::Put {
+        key,
+        value: codec::queue::encode(value).unwrap(),
+    }
+}
 fn put_topic(key: Key, value: &TopicConfig) -> Mutation {
     Mutation::Put {
         key,
@@ -314,13 +320,13 @@ fn retention_and_exact_mutations<P: StoreProvider>(provider: P) -> TestResult {
     };
     let expected = [
         put_topic(keys::topic_config(&ns(), &topic()), &topic_config),
-        put(keys::queue_config(&ns(), &alpha), &alpha_config),
-        put(
+        put_queue(keys::queue_config(&ns(), &alpha), &alpha_config),
+        put_queue(
             keys::queue_config(&ns(), &alpha.dead_letter_queue()?),
             &shadow(alpha_config),
         ),
-        put(keys::queue_config(&ns(), &beta), &beta_config),
-        put(
+        put_queue(keys::queue_config(&ns(), &beta), &beta_config),
+        put_queue(
             keys::queue_config(&ns(), &beta.dead_letter_queue()?),
             &shadow(beta_config),
         ),
@@ -351,6 +357,7 @@ fn retention_and_exact_mutations<P: StoreProvider>(provider: P) -> TestResult {
         lock_duration_millis: Some(40),
         max_delivery_count: Some(3),
         default_time_to_live_millis: Some(QueueTimeToLiveUpdate::Finite { millis: 200 }),
+        dead_lettering_on_message_expiration: None,
     };
     assert_eq!(
         fixture.machine.apply_bound(&BoundCommand::new(
@@ -369,8 +376,8 @@ fn retention_and_exact_mutations<P: StoreProvider>(provider: P) -> TestResult {
     assert_eq!(
         fixture.trace().batches[0].mutations(),
         &[
-            put(keys::queue_config(&ns(), &alpha), &updated),
-            put(
+            put_queue(keys::queue_config(&ns(), &alpha), &updated),
+            put_queue(
                 keys::queue_config(&ns(), &alpha.dead_letter_queue()?),
                 &shadow(updated)
             ),
@@ -449,7 +456,7 @@ fn retention_and_exact_mutations<P: StoreProvider>(provider: P) -> TestResult {
     assert_eq!(
         fixture.trace().batches[0].mutations(),
         &[
-            put(
+            put_queue(
                 keys::queue_config(&ns(), &alpha),
                 &QueueConfig {
                     max_delivery_count: 4,
@@ -619,6 +626,7 @@ fn input_refusals<P: StoreProvider>(provider: P) -> TestResult {
                 default_time_to_live_millis: Some(QueueTimeToLiveUpdate::Finite {
                     millis: u64::MAX,
                 }),
+                dead_lettering_on_message_expiration: None,
             },
         ),
     )?;
@@ -702,7 +710,7 @@ fn proof_boundaries<P: StoreProvider>(provider: P) -> TestResult {
     let healthy = fixture.raw().get(&key)?.unwrap();
     fixture.raw().apply(WriteBatch::default().put(
         key.clone(),
-        codec::encode(&QueueConfig {
+        codec::queue::encode(&QueueConfig {
             max_message_bytes: 129,
             ..fixture.config(&last.dead_letter_queue()?)
         })?,
@@ -825,7 +833,7 @@ fn indexed_priority<P: StoreProvider>(provider: P) -> TestResult {
         ),
         (
             keys::queue_config(&ns(), &child("zlast")),
-            codec::encode(&QueueConfig {
+            codec::queue::encode(&QueueConfig {
                 lock_duration_millis: 0,
                 ..QueueConfig::default()
             })?,

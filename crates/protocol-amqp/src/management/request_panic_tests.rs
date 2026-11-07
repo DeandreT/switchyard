@@ -143,7 +143,8 @@ async fn outer_request_panic_drains_actual_registry_refresh_and_removals_without
                     actor.intent(CommandKind::ExpireLocks),
                     CommandOutcome::LocksExpired {
                         returned_to_ready: 1,
-                        dead_lettered: 0
+                        dead_lettered: 0,
+                        deleted: 0,
                     }
                 );
             }

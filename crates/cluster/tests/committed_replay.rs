@@ -39,6 +39,8 @@ mod fixtures;
 mod patched_dispositions;
 #[path = "committed_replay/topic_duplicates.rs"]
 mod topic_duplicates;
+#[path = "committed_replay/ttl_dead_letter.rs"]
+mod ttl_dead_letter;
 use fixtures::*;
 
 fn adoption_and_adapter(durable: bool) -> TestResult {
@@ -211,6 +213,7 @@ fn mixed_profile_versions(durable: bool) -> TestResult {
                     default_time_to_live_millis: Some(QueueTimeToLiveUpdate::Finite {
                         millis: 100,
                     }),
+                    dead_lettering_on_message_expiration: None,
                 },
             },
         ),
