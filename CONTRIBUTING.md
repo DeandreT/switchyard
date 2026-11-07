@@ -72,6 +72,19 @@ Cargo lock probes are advisory and released before Cargo; they cannot exclude
 non-cooperating writers. Exit zero is not corpus/coverage certification.
 External include/build-script inputs and unrelated environment variables must
 remain frozen; the helper does not fingerprint them.
+A `build.rustc-wrapper` or `build.rustc-workspace-wrapper` (such as sccache) in
+the Cargo home config is neutralized: guarded Cargo runs with the matching
+`RUSTC_*WRAPPER` and `CARGO_BUILD_RUSTC_*WRAPPER` variables set empty, and the
+receipt names the config file. That file may also hold `[target.<triple>]`
+tables with only `rustflags` and/or `linker` (such as a mold linker flag); they
+stay in effect and are recorded in the receipt and configuration fingerprint.
+A linker is recorded by name and flags only, so upgrading the linker binary
+does not invalidate the target; like other external inputs, keep it frozen.
+Any other unsupported key there (runners, `cfg()` tables, `rustdocflags`), a
+wrapper or `target` table in repository or ancestor config, or a non-empty
+wrapper variable still refuses. An empty `CARGO_HOME` means `~/.cargo`, as in
+Cargo; a relative one, or one naming the repository's or an ancestor's
+`.cargo` directory other than `~/.cargo`, refuses.
 
 Run [the tiny fixture](tools/tests/cargo_handoff_fixture.py) on two CPUs with a new
 external directory. Its dependency-free library/consumer probes cover older-mtime
@@ -79,6 +92,7 @@ A-to-B-to-A and same-root content reversions, with guarded runs and isolated
 references. It retains every phase's original output, exact test ID/value and
 linked-library/executable proof; only disposable fixture timestamps change.
 Raw probes may be fresh, and arbitrary failures are not stale-cache evidence.
+Raw phases model plain Cargo and keep the user's configured rustc wrapper.
 An identical Cargo fingerprint is not a content proof. A non-reproduction does
 not prove universal cache correctness; review source-bound expected test
 identities/statuses separately for real workspace gates. Keep real workspace

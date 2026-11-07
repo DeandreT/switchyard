@@ -37,6 +37,159 @@ class HandoffTests(unittest.TestCase):
         (self.root / "Cargo.lock").write_text("version = 4\n" + "".join(f'\n[[package]]\nname="{name}"\nversion="0.1.0"\n' for name in ("api", "consumer", "independent")))
         self.target = self.base / "owned" / "target"
         self.target.parent.mkdir()
+        # Never read the host's real Cargo home or inherit a caller wrapper.
+        self.cargo_home = self.base / "cargo-home"
+        environment = {key: value for key, value in os.environ.items() if key not in {variable for variables in guard.WRAPPERS.values() for variable in variables}}
+        environment["CARGO_HOME"] = str(self.cargo_home)
+        isolated = patch.dict(os.environ, environment, clear=True)
+        isolated.start()
+        self.addCleanup(isolated.stop)
+
+    def guarded_run(self, receipt, original):
+        with patch.object(guard, "target_path", return_value=self.target), patch.object(guard.os, "sched_getaffinity", return_value={14, 15}), patch.object(guard.subprocess, "check_output", side_effect=lambda command, **kwargs: command[0] + " 1.97.1 (pinned)\n"), patch.object(guard, "original_process", side_effect=original):
+            guard.run(self.root, self.target, ["cargo", "test", "--workspace"], receipt, 0, 10)
+
+    def user_config(self, body):
+        self.cargo_home.mkdir(exist_ok=True)
+        path = self.cargo_home / "config.toml"
+        path.write_text(body)
+        return path
+
+    def test_user_level_wrappers_are_neutralized_in_child_and_recorded(self):
+        config = self.user_config('[build]\nrustc-wrapper="/opt/sccache"\nrustc-workspace-wrapper="/opt/workspace-wrapper"\nrustflags=["-C", "debuginfo=1"]\n')
+        variables = {"RUSTC_WRAPPER": "", "CARGO_BUILD_RUSTC_WRAPPER": "", "RUSTC_WORKSPACE_WRAPPER": "", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER": ""}
+        with patch.object(guard, "target_path", return_value=self.target):
+            guard.initialize(self.root, self.target)
+        environments = []
+
+        def original(command, root, environment, directory, name, timeout):
+            environments.append({key: environment.get(key) for key in variables})
+            self.target.mkdir(exist_ok=True)
+            (self.target / "CACHEDIR.TAG").write_text("test double of Cargo's own cache tag\n")
+            return {"command": command, "exit_code": 0}
+
+        self.guarded_run(self.base / "first", original)
+        (self.root / "api/src/lib.rs").write_text("pub fn value()->u32 { 2 }\n")
+        self.guarded_run(self.base / "second", original)
+        self.assertEqual(len(environments), 4)
+        self.assertTrue(all(environment == variables for environment in environments))
+        for phase in ("first", "second"):
+            report = guard.read_json(self.base / phase / "receipt.json")
+            self.assertTrue(report["accepted"])
+            self.assertEqual(report["neutralized_wrappers"], {"files": {str(config): ["rustc-workspace-wrapper", "rustc-wrapper"]}, "environment": variables})
+        self.assertEqual(guard.read_json(self.base / "second/receipt.json")["invalidated"], ["api", "consumer"])
+        with self.assertRaisesRegex(guard.Refused, "not neutralized"):
+            guard.configuration(self.root, {"CARGO_HOME": str(self.cargo_home)})
+        self.user_config('[build]\nrustc-wrapper="/opt/sccache"\n')
+        files, neutralized, targets = guard.scan_configuration(self.root, {"CARGO_HOME": str(self.cargo_home)})
+        self.assertEqual(neutralized, {"files": {str(config): ["rustc-wrapper"]}, "environment": {"CARGO_BUILD_RUSTC_WRAPPER": "", "RUSTC_WRAPPER": ""}})
+        self.assertEqual(list(files), [str(config)])
+        self.assertEqual(targets, {})
+
+    def test_user_level_target_rustflags_and_linker_stay_in_effect_recorded_and_fingerprinted(self):
+        environment = {"CARGO_HOME": str(self.cargo_home)}
+        rustflags = '[target.x86_64-unknown-linux-gnu]\nrustflags=["-C", "link-arg=-fuse-ld=mold"]\n'
+        config = self.user_config('[build]\nrustc-wrapper="/opt/sccache"\n\n' + rustflags)
+        with patch.object(guard, "target_path", return_value=self.target):
+            guard.initialize(self.root, self.target)
+        environments = []
+
+        def original(command, root, environment, directory, name, timeout):
+            environments.append(dict(environment))
+            self.target.mkdir(exist_ok=True)
+            (self.target / "CACHEDIR.TAG").write_text("test double of Cargo's own cache tag\n")
+            return {"command": command, "exit_code": 0}
+
+        self.guarded_run(self.base / "rustflags", original)
+        report = guard.read_json(self.base / "rustflags/receipt.json")
+        self.assertTrue(report["accepted"])
+        self.assertEqual(report["user_target_settings"], {str(config): {"x86_64-unknown-linux-gnu": {"rustflags": ["-C", "link-arg=-fuse-ld=mold"]}}})
+        self.assertEqual(report["neutralized_wrappers"]["files"], {str(config): ["rustc-wrapper"]})
+        self.assertFalse(any(key.startswith("CARGO_TARGET_X86") or key == "RUSTFLAGS" for key in environments[0]))
+        recorded = guard.configuration(self.root, dict(environment, RUSTC_WRAPPER="", CARGO_BUILD_RUSTC_WRAPPER=""))
+        self.assertEqual(recorded["user_target_settings"], report["user_target_settings"])
+        before = self.snapshot_with(environment, rustflags)
+        for changed in (rustflags.replace("mold", "lld"), '[target.x86_64-unknown-linux-gnu]\nlinker="/usr/bin/clang"\n', '[target.aarch64-unknown-linux-gnu]\nlinker="aarch64-linux-gnu-gcc"\nrustflags="-C target-cpu=native"\n'):
+            after = self.snapshot_with(environment, changed)
+            self.assertNotEqual(before["global"], after["global"])
+            self.assertEqual(guard.invalidated(before, after), ["api", "consumer", "independent"])
+        self.user_config('[target.x86_64-unknown-linux-gnu]\nlinker="/usr/bin/clang"\n')
+        self.guarded_run(self.base / "linker", original)
+        report = guard.read_json(self.base / "linker/receipt.json")
+        self.assertTrue(report["accepted"])
+        self.assertEqual(report["invalidated"], ["api", "consumer", "independent"])
+        self.assertEqual(report["user_target_settings"], {str(config): {"x86_64-unknown-linux-gnu": {"linker": "/usr/bin/clang"}}})
+        self.assertEqual(report["neutralized_wrappers"], {"files": {}, "environment": {}})
+
+    def test_cargo_home_resolution_matches_cargo_and_refuses_repository_homes(self):
+        user_home = self.base / "user"
+        with patch.object(guard.Path, "home", return_value=user_home):
+            self.assertEqual(guard.cargo_home(self.root, {"CARGO_HOME": ""}), user_home / ".cargo")
+            self.assertEqual(guard.cargo_home(self.root, {}), user_home / ".cargo")
+            (user_home / ".cargo").mkdir(parents=True)
+            (user_home / ".cargo/config.toml").write_text('[build]\nrustc-wrapper="/opt/sccache"\n')
+            self.assertEqual(list(guard.scan_configuration(self.root, {"CARGO_HOME": ""})[1]["files"]), [str(user_home / ".cargo/config.toml")])
+            for relative in ("cargo-home", "./.cargo", "../cargo-home"):
+                with self.assertRaisesRegex(guard.Refused, "relative CARGO_HOME"):
+                    guard.configuration(self.root, {"CARGO_HOME": relative})
+            for directory in (self.root / ".cargo", self.base / ".cargo", self.root / "api/../.cargo"):
+                with self.assertRaisesRegex(guard.Refused, "repository or ancestor"):
+                    guard.configuration(self.root, {"CARGO_HOME": str(directory)})
+            # The default user home stays valid for a checkout inside the user's home directory.
+            checkout = user_home / "projects/worktree"
+            shutil.copytree(self.root, checkout)
+            self.assertEqual(guard.cargo_home(checkout, {}), user_home / ".cargo")
+            self.assertEqual(guard.cargo_home(checkout, {"CARGO_HOME": str(user_home / ".cargo")}), user_home / ".cargo")
+            with self.assertRaisesRegex(guard.Refused, "repository or ancestor"):
+                guard.cargo_home(checkout, {"CARGO_HOME": str(user_home / "projects/.cargo")})
+        repository = self.root / ".cargo"
+        repository.mkdir()
+        (repository / "config.toml").write_text('[target.x86_64-unknown-linux-gnu]\nrustflags=["-C", "link-arg=-fuse-ld=mold"]\n')
+        with self.assertRaisesRegex(guard.Refused, "repository or ancestor"):
+            guard.configuration(self.root, {"CARGO_HOME": str(repository)})
+
+    def snapshot_with(self, environment, body):
+        self.user_config(body)
+        return guard.snapshot(self.root, ["cargo", "test", "--workspace"], environment, {"cargo": "pinned", "rustc": "pinned"})
+
+    def test_unsupported_or_repository_target_tables_still_refuse(self):
+        environment = {"CARGO_HOME": str(self.cargo_home)}
+        for body, reason in (('[target.x86_64-unknown-linux-gnu]\nrunner="qemu"\n', "target settings"), ('[target.x86_64-unknown-linux-gnu]\nrustflags=["-C", "debuginfo=1"]\nrustdocflags=["--cfg", "docs"]\n', "target settings"), ('[target."cfg(unix)"]\nrustflags=["-C", "debuginfo=1"]\n', "target table"), ('[target.x86_64-unknown-linux-gnu]\nrustflags=["-C", "debuginfo=1"]\nextra="value"\n', "target settings"), ('[target.x86_64-unknown-linux-gnu]\n', "target settings"), ('[target.x86_64-unknown-linux-gnu]\nlinker=["cc"]\n', "linker"), ('[target.x86_64-unknown-linux-gnu]\nrustflags=[1]\n', "rustflags"), ('[target.x86_64-unknown-linux-gnu.mold]\nrustflags=["-C", "debuginfo=1"]\n', "target settings"), ('target="x86_64-unknown-linux-gnu"\n', "target configuration")):
+            self.user_config(body)
+            with self.assertRaisesRegex(guard.Refused, reason):
+                guard.configuration(self.root, environment)
+        (self.cargo_home / "config.toml").unlink()
+        repository = self.root / ".cargo"
+        repository.mkdir()
+        (repository / "config.toml").write_text('[target.x86_64-unknown-linux-gnu]\nrustflags=["-C", "link-arg=-fuse-ld=mold"]\n')
+        with self.assertRaisesRegex(guard.Refused, "unsupported Cargo configuration"):
+            guard.configuration(self.root, environment)
+        flags = guard.configuration(self.base, dict(environment, RUSTFLAGS="-C debuginfo=1", CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="clang"))
+        self.assertEqual(flags["environment"]["RUSTFLAGS"], "-C debuginfo=1")
+        self.assertEqual(flags["environment"]["CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"], "clang")
+
+    def test_wrapper_with_other_unsupported_settings_or_outside_cargo_home_still_refuses(self):
+        def original(command, root, environment, directory, name, timeout):
+            self.fail("refused configuration reached Cargo")
+
+        with patch.object(guard, "target_path", return_value=self.target):
+            guard.initialize(self.root, self.target)
+        wrapper = '[build]\nrustc-wrapper="/opt/sccache"\n'
+        for body, reason in ((wrapper + 'target-dir="/elsewhere"\n', "layout/tool"), (wrapper + 'rustc="/opt/rustc"\n', "layout/tool"), (wrapper + '\n[target.x86_64-unknown-linux-gnu]\nrustflags=["-C", "link-arg=-fuse-ld=mold"]\nrunner="qemu"\n', "target settings"), (wrapper + '\n[env]\nVALUE="1"\n', "unsupported Cargo configuration")):
+            self.user_config(body)
+            with self.assertRaisesRegex(guard.Refused, reason):
+                self.guarded_run(self.base / ("refused-" + guard.digest(body)[:8]), original)
+        self.user_config(wrapper)
+        with patch.dict(os.environ, {"RUSTC_WRAPPER": "/opt/sccache"}):
+            with self.assertRaisesRegex(guard.Refused, "wrappers"):
+                self.guarded_run(self.base / "caller-wrapper", original)
+        (self.cargo_home / "config.toml").unlink()
+        repository = self.root / ".cargo"
+        repository.mkdir()
+        (repository / "config.toml").write_text(wrapper)
+        with self.assertRaisesRegex(guard.Refused, "layout/tool"):
+            self.guarded_run(self.base / "repository-wrapper", original)
+        self.assertFalse(guard.read_json(self.target.parent / guard.MARKER)["pending"])
 
     def snapshot(self, command=None):
         with patch.object(guard, "configuration", return_value={}):
