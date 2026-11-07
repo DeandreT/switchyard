@@ -11,6 +11,8 @@ Pre-alpha: only verified, merged `main` is complete.
 - [x] Memory/Fjall format-2 and opt-in journal/indexed apply/local replay.
 - [x] Local authority, JWT/SQL kernels and native/link/session/connection custody.
 - [x] Source-bound builds and pinned Memory SDK TCP/WSS gates.
+- [x] Typed retained content: store format 3, proposal V4 sends and copy-local patches.
+- [x] Offline snapshot capture, install, anchors and journal compaction.
 - [ ] Remaining semantics, administration and conserved physical-byte capacity.
 - [ ] Full recovery, quorum, multi-tenant security and measured release.
 
@@ -35,7 +37,8 @@ flowchart TD
 
 ## Snapshot Recovery
 
-#36 local replay is merged; #37 full recovery is not.
+#36 local replay and #37 offline install, anchors and compaction are merged. Live
+recovery waits on quorum (#38) and runtime activation (#41).
 
 - [x] #203 Record format.
 - [x] #204 Catalog validation (partial).
@@ -44,7 +47,7 @@ flowchart TD
 - [x] #207 Coherent capture.
 - [x] #208 Offline atomic install.
 - [x] #209 Applied-safe anchor.
-- [ ] #210 Selection/compaction.
+- [x] #210 Selection/compaction.
 
 #250 API/#253 metadata handoffs are sealed. Allocator publication is not
 full-state health.
@@ -76,10 +79,9 @@ PRs in dependency order ([workflow](../CONTRIBUTING.md)). Ready is not evidence.
 
 | Lane | Pickup / overlap |
 | --- | --- |
-| Snapshots | #230 `validate_session_rows`; #231 `validate_duplicate_rows` ([PR260](https://github.com/DeandreT/switchyard/pull/260)): verified partials. Serialize state.rs/mod.rs. |
-| Domain | [#14](https://github.com/DeandreT/switchyard/issues/14)/[#16](https://github.com/DeandreT/switchyard/issues/16)/[#23](https://github.com/DeandreT/switchyard/issues/23) Ready/unassigned; serialize command/codec/keys. |
-| Atom | [#10](https://github.com/DeandreT/switchyard/issues/10) Ready/unassigned. |
-| Admin | #18 Blocked coordinator; [#243](https://github.com/DeandreT/switchyard/issues/243) Ready/unassigned -> #244 Blocked/unassigned. |
+| Snapshots | #37 offline children are complete; live recovery follows #38/#41. |
+| Domain | #14, #16 and #23 are complete. |
+| Admin | #18 coordinator open; #243 and #244 are complete. |
 | Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228), #238 ([PR258](https://github.com/DeandreT/switchyard/pull/258)), #239 ([PR264](https://github.com/DeandreT/switchyard/pull/264)) and #240 ([PR263](https://github.com/DeandreT/switchyard/pull/263)) and #232's allocation/graph composition verified. |
 | SDK/security | #71/#101 blocked on #7. |
 
