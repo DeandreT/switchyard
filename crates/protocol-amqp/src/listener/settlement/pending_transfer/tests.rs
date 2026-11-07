@@ -629,18 +629,14 @@ async fn actual_pump_adopts_cached_pending_with_ready_accepted_before_session_cl
     }).await.expect("original fixture observer joined");
 }
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use auth::{
     Permission, PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 
 use crate::SharedAccessAuthentication;
 use crate::authorization::ConnectionAuthorization;
 use crate::listener::LinkAuthorization;
+use crate::test_sas::add_short_lived_grant;
 
 fn native_start_authorization() -> LinkAuthorization {
     let rule = SharedAccessRule::new(
@@ -665,27 +661,10 @@ fn native_start_authorization() -> LinkAuthorization {
 
 async fn expire_native_start_authorization(authorization: &LinkAuthorization) {
     // Refresh only after the real original native write is positively held.
-    let encoded = "amqps%3A%2F%2Ftenant.servicebus.windows.net";
-    let expiry = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 2;
-    let mut mac = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
-    mac.update(format!("{encoded}\n{expiry}").as_bytes());
-    let signature = STANDARD
-        .encode(mac.finalize().into_bytes())
-        .replace('+', "%2B")
-        .replace('/', "%2F")
-        .replace('=', "%3D");
-    let token =
-        format!("SharedAccessSignature sr={encoded}&sig={signature}&se={expiry}&skn=listen");
-    authorization
-        .connection
-        .validate_and_add(&token, "amqps://tenant.servicebus.windows.net")
-        .await
-        .unwrap();
-    assert!(authorization.ensure().await.is_ok());
+    add_short_lived_grant(&authorization.connection, "listen", || async move {
+        authorization.ensure().await.is_ok()
+    })
+    .await;
     timeout(WAIT, authorization.wait_until_unauthorized())
         .await
         .expect("actual SAS expiry");

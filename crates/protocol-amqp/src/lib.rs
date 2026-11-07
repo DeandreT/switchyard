@@ -17,6 +17,8 @@ mod message;
 mod session_filter;
 #[cfg(test)]
 mod test_deadline;
+#[cfg(test)]
+mod test_sas;
 mod tls;
 mod websocket;
 

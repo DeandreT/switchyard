@@ -6,7 +6,6 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
     task::{Context, Poll, Waker},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use amqp::{
@@ -16,10 +15,7 @@ use amqp::{
     read_protocol_header, write_frame, write_protocol_header,
 };
 use auth::{PermissionSet, SharedAccessKey, SharedAccessPolicy, SharedAccessRule};
-use base64::{Engine, engine::general_purpose::STANDARD};
-use hmac::{Hmac, Mac};
 use serde_amqp::primitives::Binary;
-use sha2::Sha256;
 use tokio::{
     io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, duplex},
     time::timeout,
@@ -28,7 +24,7 @@ use tokio::{
 use super::*;
 use crate::SharedAccessAuthentication;
 
-use crate::test_deadline::WAIT;
+use crate::{test_deadline::WAIT, test_sas::add_short_lived_grant};
 const ADDRESS: &str = "management-replies";
 const CHANNEL: u16 = 1;
 const HANDLE: u32 = 1;
@@ -433,28 +429,10 @@ fn authorization_with(permissions: PermissionSet) -> ManagementAuthorization {
 }
 
 async fn expire(authorization: &ManagementAuthorization) {
-    let encoded = "amqps%3A%2F%2Ftenant.servicebus.windows.net";
-    let expiry = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 2;
-    let mut mac = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
-    mac.update(format!("{encoded}\n{expiry}").as_bytes());
-    let signature = STANDARD
-        .encode(mac.finalize().into_bytes())
-        .replace('+', "%2B")
-        .replace('/', "%2F")
-        .replace('=', "%3D");
-    authorization
-        .connection
-        .validate_and_add(
-            &format!("SharedAccessSignature sr={encoded}&sig={signature}&se={expiry}&skn=listen"),
-            "amqps://tenant.servicebus.windows.net",
-        )
-        .await
-        .unwrap();
-    assert!(authorization.ensure_any().await.is_ok());
+    add_short_lived_grant(&authorization.connection, "listen", || async move {
+        authorization.ensure_any().await.is_ok()
+    })
+    .await;
     timeout(WAIT, authorization.wait_until_unauthorized())
         .await
         .unwrap();
