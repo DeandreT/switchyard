@@ -215,9 +215,10 @@ checkpoint identities. Topic/subscription profile updates use unchanged private 
 DTOs. Only nonlegacy topic creation uses private V3, including invalid new settings
 that must survive for deterministic refusal. Content sends use private V4, carrying
 each message's original AMQP bytes once, or raw bytes with explicit normalized fields;
-decoding never parses or polices that content. New readers accept V1 through V4;
-older readers refuse unsupported proposal versions. The wire protocol still emits
-legacy V1 sends.
+decoding never parses or polices that content. Abandon, defer and dead-letter with a
+sparse property patch also use V4; their legacy replacement-envelope forms keep exact
+V1 bytes. New readers accept V1 through V4; older readers refuse unsupported proposal
+versions. The wire protocol still emits legacy V1 sends and dispositions.
 
 Store format 3 adds no record encoding: journal-entry/frontier/indexed-checkpoint
 formats remain unchanged, and snapshot anchors use the separate owner/container
@@ -237,8 +238,8 @@ the former generic encoding; content sends write V2: raw bytes, or original AMQP
 with a filter projection and a sparse property overlay (unique names in first-insertion
 order; each value one encoded AMQP value, where null is a value) and no duplicated body.
 Rewrites, topic copies, scheduled activation and dead-letter moves keep the version a
-record was read with. Overlays are stored data only, and durable proposals refuse
-envelopes carrying them. Runtime V1 reads keep tolerating trailing bytes; V2 framing
+record was read with; only a property patch converts V1 to V2. Overlays are not yet
+rendered on delivery, and durable proposals refuse envelopes carrying them. Runtime V1 reads keep tolerating trailing bytes; V2 framing
 is exact, and snapshot validation requires canonical rows of either version.
 
 A content send parses AMQP content when it applies, under the fixed content-safety
@@ -268,6 +269,20 @@ rendering for, and an array of strings or symbols containing non-ASCII text, who
 length would disagree with the text and not be decodable AMQP. Each derived value is
 additionally re-decoded under the profile as a safety net and refused if it does not
 round-trip.
+
+A V4 disposition patch maps property names to one encoded AMQP value each, checked
+under the content-safety profile when it applies. It rewrites only the locked copy
+it names: original bytes never change, names coalesce into their first position, an
+explicit null is a value rather than a deletion, and the filter projection is
+re-derived from the effective properties with the send derivation and its budget
+formula over the effective length. Patching a V1 record converts it to V2, with its
+envelope as the original and its body dropped; a V1 envelope that does not parse, a
+copy without AMQP content, or a value that is not bounded AMQP refuses. The original
+plus every overlay name and value must fit the entity's message-size limit plus a
+fixed 64 KiB headroom, the Service Bus header cap, so a message admitted at the limit
+can still be patched and dead-lettered. An empty patch changes no content. A legacy
+replacement envelope on a copy that already has an overlay refuses rather than drop
+the patch. Refusals leave the copy, its lock and delivery count unchanged.
 
 ### Storage And Runtime Limits
 

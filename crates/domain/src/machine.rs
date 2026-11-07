@@ -15,6 +15,7 @@ mod deferred;
 mod duplicate;
 mod expiry;
 mod incarnations;
+mod patch;
 mod peek;
 mod rules;
 mod scheduling;
@@ -29,13 +30,13 @@ use storage::{StateStore, WriteBatch};
 use crate::{
     AcceptedSession, BrokerError, Command, CommandKind, CommandOutcome, DeadLetterInfo,
     DeadLetterReason, Delivery, DeliveryLock, DeliveryOrigin, EntityPath, LockToken,
-    MessageContent, MessageEnvelope, MessageRecord, MessageRecordFormat, MessageState,
-    NamespaceName, QueueConfig, QueueConfigUpdate, QueueCounters, ReceiveMode, SequenceNumber,
-    SessionHold, SessionId, SessionLock, SessionRecord, Timestamp, codec, keys,
+    MessageContent, MessageRecord, MessageRecordFormat, MessageState, NamespaceName, QueueConfig,
+    QueueConfigUpdate, QueueCounters, ReceiveMode, SequenceNumber, SessionHold, SessionId,
+    SessionLock, SessionRecord, Timestamp, codec, keys,
 };
 
-use self::deferred::replace_envelope;
 use self::incarnations::Kind;
+use self::patch::ContentRewrite;
 use self::send::SendInput;
 
 pub use self::admin_catalog::{
@@ -237,7 +238,18 @@ impl<S: StateStore> StateMachine<S> {
                 command,
                 *sequence,
                 *lock_token,
-                replacement_envelope.as_ref(),
+                ContentRewrite::Replace(replacement_envelope.as_ref()),
+                &mut batch,
+            )?,
+            CommandKind::AbandonWithPatch {
+                sequence,
+                lock_token,
+                patch,
+            } => self.abandon(
+                command,
+                *sequence,
+                *lock_token,
+                ContentRewrite::Patch(patch),
                 &mut batch,
             )?,
             CommandKind::Defer {
@@ -248,7 +260,18 @@ impl<S: StateStore> StateMachine<S> {
                 command,
                 *sequence,
                 *lock_token,
-                replacement_envelope.as_ref(),
+                ContentRewrite::Replace(replacement_envelope.as_ref()),
+                &mut batch,
+            )?,
+            CommandKind::DeferWithPatch {
+                sequence,
+                lock_token,
+                patch,
+            } => self.defer(
+                command,
+                *sequence,
+                *lock_token,
+                ContentRewrite::Patch(patch),
                 &mut batch,
             )?,
             CommandKind::ReceiveDeferred {
@@ -276,7 +299,22 @@ impl<S: StateStore> StateMachine<S> {
                 *lock_token,
                 reason,
                 description,
-                replacement_envelope.as_ref(),
+                ContentRewrite::Replace(replacement_envelope.as_ref()),
+                &mut batch,
+            )?,
+            CommandKind::DeadLetterWithPatch {
+                sequence,
+                lock_token,
+                reason,
+                description,
+                patch,
+            } => self.dead_letter(
+                command,
+                *sequence,
+                *lock_token,
+                reason,
+                description,
+                ContentRewrite::Patch(patch),
                 &mut batch,
             )?,
             CommandKind::RenewLock {
@@ -784,12 +822,12 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         sequence: SequenceNumber,
         lock_token: LockToken,
-        replacement_envelope: Option<&MessageEnvelope>,
+        rewrite: ContentRewrite<'_>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
         let config = self.load_config(command)?;
         let (mut record, locked_until, origin) = self.held_lock(command, sequence, lock_token)?;
-        replace_envelope(&config, &mut record, replacement_envelope)?;
+        rewrite.apply(&config, &mut record)?;
 
         // Expiration is suspended while a receiver owns the lock. Once that
         // receiver gives it up, TTL takes precedence over redelivery.
@@ -833,7 +871,7 @@ impl<S: StateStore> StateMachine<S> {
         lock_token: LockToken,
         reason: &str,
         description: &str,
-        replacement_envelope: Option<&MessageEnvelope>,
+        rewrite: ContentRewrite<'_>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
         if command.entity.is_dead_letter_queue() {
@@ -841,7 +879,7 @@ impl<S: StateStore> StateMachine<S> {
         }
         let config = self.load_config(command)?;
         let (mut record, _, _) = self.held_lock(command, sequence, lock_token)?;
-        replace_envelope(&config, &mut record, replacement_envelope)?;
+        rewrite.apply(&config, &mut record)?;
         self.move_to_dead_letter(
             command,
             record,

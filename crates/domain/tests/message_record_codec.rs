@@ -5,11 +5,11 @@
 use std::{collections::BTreeMap, error::Error};
 
 use domain::{
-    CodecError, Command, CommandKind, CommandOutcome, CorrelationValue, DeadLetterInfo,
-    DeadLetterReason, Delivery, DeliveryOrigin, DurableProposal, DurableProposalError, EntityPath,
-    FilterProperties, LockToken, MessageEnvelope, MessageInput, MessageRecord, MessageRecordFormat,
-    MessageState, NamespaceName, OverlayProperty, QueueConfig, ReceiveMode, SequenceNumber,
-    SessionId, Timestamp, codec, keys,
+    BrokerError, CodecError, Command, CommandKind, CommandOutcome, CorrelationValue,
+    DeadLetterInfo, DeadLetterReason, Delivery, DeliveryOrigin, DurableProposal,
+    DurableProposalError, EntityPath, FilterProperties, LockToken, MessageContentError,
+    MessageEnvelope, MessageInput, MessageRecord, MessageRecordFormat, MessageState, NamespaceName,
+    OverlayProperty, QueueConfig, ReceiveMode, SequenceNumber, SessionId, Timestamp, codec, keys,
     snapshot_validation::{SnapshotStateError, validate_message_rows},
 };
 use serde::Serialize;
@@ -720,7 +720,7 @@ enum Disposition {
 }
 
 #[test]
-fn a_replacement_envelope_becomes_v2_content_and_leaves_v1_unchanged() -> TestResult {
+fn a_replacement_envelope_becomes_v2_content_unless_it_would_drop_an_overlay() -> TestResult {
     for disposition in [
         Disposition::Abandon,
         Disposition::Defer,
@@ -741,39 +741,53 @@ fn a_replacement_envelope_becomes_v2_content_and_leaves_v1_unchanged() -> TestRe
         for delivery in deliveries {
             let sequence = delivery.sequence;
             let lock_token = delivery.lock.unwrap().token;
-            let replacement_envelope = Some(replacement.clone());
-            fixture.at(
-                3,
-                match disposition {
-                    Disposition::Abandon => CommandKind::Abandon {
-                        sequence,
-                        lock_token,
-                        replacement_envelope,
-                    },
-                    Disposition::Defer => CommandKind::Defer {
-                        sequence,
-                        lock_token,
-                        replacement_envelope,
-                    },
-                    Disposition::DeadLetter => CommandKind::DeadLetter {
-                        sequence,
-                        lock_token,
-                        reason: String::from("Custom"),
-                        description: String::new(),
-                        replacement_envelope,
-                    },
+            let kind = |replacement_envelope: Option<MessageEnvelope>| match disposition {
+                Disposition::Abandon => CommandKind::Abandon {
+                    sequence,
+                    lock_token,
+                    replacement_envelope,
                 },
-            )?;
+                Disposition::Defer => CommandKind::Defer {
+                    sequence,
+                    lock_token,
+                    replacement_envelope,
+                },
+                Disposition::DeadLetter => CommandKind::DeadLetter {
+                    sequence,
+                    lock_token,
+                    reason: String::from("Custom"),
+                    description: String::new(),
+                    replacement_envelope,
+                },
+            };
+            if sequence.as_u64() == 3 {
+                // Replacing would drop the copy's overlay, so it refuses with
+                // no effects; the disposition without a replacement applies.
+                let before = fixture.machine.store().snapshot()?.entries().to_vec();
+                assert_eq!(
+                    fixture.at(3, kind(Some(replacement.clone()))),
+                    Err(BrokerError::MessageContent(
+                        MessageContentError::ReplacementWouldDropOverlay
+                    ))
+                );
+                assert_eq!(fixture.machine.store().snapshot()?.entries(), before);
+                fixture.at(3, kind(None))?;
+            } else {
+                fixture.at(3, kind(Some(replacement.clone())))?;
+            }
         }
         let dead_letter = matches!(disposition, Disposition::DeadLetter);
         for (index, sequence) in sequences.into_iter().enumerate() {
             let (version, record) = row(&fixture, dead_letter, sequence).unwrap();
-            assert_eq!(
-                record.envelope.as_ref(),
-                Some(&replacement),
-                "{disposition:?}"
-            );
-            assert!(record.envelope.as_ref().unwrap().overlay().is_empty());
+            let envelope = record.envelope.as_ref().unwrap();
+            if index == 2 {
+                assert_eq!(envelope.as_bytes(), AMQP, "{disposition:?}");
+                assert_eq!(envelope.overlay(), overlay(&[("z", &[0x40])]));
+                assert_eq!(version, 2, "{disposition:?}");
+                continue;
+            }
+            assert_eq!(envelope, &replacement, "{disposition:?}");
+            assert!(envelope.overlay().is_empty());
             if index == 0 {
                 assert_eq!(version, 1, "{disposition:?}");
                 assert_eq!(record.body, b"m-1", "V1 keeps its body beside the envelope");

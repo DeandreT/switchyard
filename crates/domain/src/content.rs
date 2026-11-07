@@ -10,14 +10,14 @@
 use std::collections::{BTreeMap, HashMap};
 
 use message_content::{
-    AnnotationKey, Constructor, Descriptor, Field, Limits, MessageId, PrimitiveConstructor, Value,
-    decode_content, decode_value,
+    AnnotationKey, Constructor, Content, Descriptor, Field, Limits, MessageId,
+    PrimitiveConstructor, Value, decode_content, decode_value,
 };
 use thiserror::Error;
 
 use crate::{
     CorrelationValue, FilterProperties, MAX_CORRELATION_VALUE_BYTES, MessageContent,
-    MessageEnvelope, MessageInput, SessionId, Timestamp,
+    MessageEnvelope, MessageInput, OverlayProperty, SessionId, Timestamp,
 };
 
 /// The fixed V3 content-safety profile every parse of original content uses.
@@ -51,6 +51,90 @@ pub enum MessageContentError {
     ProjectionValueUndecodable,
     #[error("an AMQP array of compound, described or non-ASCII-text elements is not sendable")]
     UnsupportedArrayElement,
+    #[error("a property patch value is not one bounded AMQP value: {0}")]
+    PatchValueInvalid(message_content::Error),
+    #[error("a property patch needs a copy with AMQP content to apply to")]
+    PatchWithoutAmqpContent,
+    #[error("a replacement envelope would drop the copy's property overlay")]
+    ReplacementWouldDropOverlay,
+}
+
+/// Fixed allowance a patched copy may exceed its entity's message-size limit by.
+///
+/// Service Bus caps a message's header (system and application properties) at
+/// 64 KiB on every tier, so a properties-to-modify patch on a message admitted
+/// exactly at the limit, including the one a dead-letter disposition carries,
+/// always fits. Being fixed, it still bounds cumulative overlay growth per copy
+/// at the entity limit plus 64 KiB, well inside the one-MiB proposal envelope.
+pub const PROPERTY_PATCH_HEADROOM_BYTES: usize = 64 * 1024;
+
+/// Applies a sparse patch to a copy's overlay. Each value must be one bounded
+/// AMQP value; an explicit null (`0x40`) is kept as a value, never a deletion.
+/// A name already present keeps its position and takes the new value, so the
+/// result stays unique by name in first-insertion order.
+pub(crate) fn patch_overlay(
+    overlay: &[OverlayProperty],
+    patch: &[OverlayProperty],
+) -> Result<Vec<OverlayProperty>, MessageContentError> {
+    let mut merged = overlay.to_vec();
+    let mut positions: HashMap<&str, usize> = overlay
+        .iter()
+        .enumerate()
+        .map(|(index, property)| (property.name.as_str(), index))
+        .collect();
+    for property in patch {
+        decode_value(&property.value, CONTENT_LIMITS)
+            .map_err(MessageContentError::PatchValueInvalid)?;
+        match positions.get(property.name.as_str()) {
+            Some(&index) => merged[index].value.clone_from(&property.value),
+            None => {
+                positions.insert(&property.name, merged.len());
+                merged.push(property.clone());
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// Bytes a copy's effective message is charged against its entity limit: the
+/// original plus every overlay name and value. Per-entry AMQP framing of a
+/// rendered message is not counted; the fixed headroom absorbs it.
+pub(crate) fn effective_len(original: &[u8], overlay: &[OverlayProperty]) -> usize {
+    overlay.iter().fold(original.len(), |total, property| {
+        total
+            .saturating_add(property.name.len())
+            .saturating_add(property.value.len())
+    })
+}
+
+/// The filter projection a send of the effective message would derive: the
+/// original's projection with the overlay applied over its application
+/// properties. It uses the send derivation's encoder and its budget formula,
+/// charging the effective length rather than the original alone. An original
+/// that is not bounded AMQP refuses, so a legacy V1 envelope that cannot be
+/// parsed is never patched.
+pub(crate) fn effective_projection(
+    original: &[u8],
+    overlay: &[OverlayProperty],
+) -> Result<FilterProperties, MessageContentError> {
+    let content = decode_content(original, CONTENT_LIMITS).map_err(MessageContentError::Amqp)?;
+    let values = overlay
+        .iter()
+        .map(|property| {
+            decode_value(&property.value, CONTENT_LIMITS)
+                .map_err(MessageContentError::PatchValueInvalid)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut budget = effective_len(original, overlay).saturating_add(MAX_CORRELATION_VALUE_BYTES);
+    project(
+        &content,
+        overlay
+            .iter()
+            .zip(&values)
+            .map(|(property, value)| (property.name.as_str(), value))
+            .collect(),
+        &mut budget,
+    )
 }
 
 /// Why canonical correlation encoding stopped. Mapped to a [`MessageContentError`].
@@ -130,12 +214,40 @@ fn derive_amqp(
         .transpose()
         .map_err(|_| MessageContentError::InvalidSessionId)?;
     let scheduled_enqueue_at = scheduled_enqueue_at(content.message_annotations.as_deref())?;
+    let projection = project(&content, Vec::new(), remaining_total)?;
 
+    Ok(MessageInput {
+        message_id: projection.message_id.clone().unwrap_or_default(),
+        body: Vec::new(),
+        time_to_live_millis: content
+            .header
+            .as_ref()
+            .and_then(|header| value(&header.ttl))
+            .map(|ttl| u64::from(*ttl)),
+        session_id,
+        scheduled_enqueue_at,
+        envelope: Some(MessageEnvelope::new(bytes.to_vec()).with_filter_properties(projection)),
+    })
+}
+
+/// The filter projection of decoded content whose application properties are
+/// followed by `overlay`, each overlay value replacing or adding the property of
+/// its name. A send passes no overlay; a copy-local patch passes its effective
+/// overlay, so the result is what a send of the effective message derives.
+fn project<'a>(
+    content: &'a Content,
+    overlay: Vec<(&'a str, &'a Value)>,
+    remaining_total: &mut usize,
+) -> Result<FilterProperties, MessageContentError> {
+    let properties = content.properties.as_ref();
     // Ingress collapses duplicate application properties to the last value
     // before encoding any of them.
     let mut application = BTreeMap::new();
     for (name, value) in content.application_properties.iter().flatten() {
-        application.insert(name.text.clone(), value);
+        application.insert(name.text.as_str(), value);
+    }
+    for (name, value) in overlay {
+        application.insert(name, value);
     }
     // The shared per-command budget spans every projected value of every child.
     // Each value is also capped at MAX_CORRELATION_VALUE_BYTES individually;
@@ -161,7 +273,7 @@ fn derive_amqp(
             decode_value(&bytes, CONTENT_LIMITS)
                 .map_err(|_| MessageContentError::ProjectionValueUndecodable)?;
             CorrelationValue::new(bytes)
-                .map(|value| (name, value))
+                .map(|value| (name.to_owned(), value))
                 .map_err(|_| MessageContentError::PropertyValueTooLarge {
                     maximum: MAX_CORRELATION_VALUE_BYTES,
                 })
@@ -170,7 +282,7 @@ fn derive_amqp(
     let text = |field: Option<&Field<message_content::Text>>| {
         field.and_then(value).map(|text| text.text.clone())
     };
-    let projection = FilterProperties {
+    Ok(FilterProperties {
         correlation_id: properties
             .and_then(|properties| value(&properties.correlation_id))
             .map(message_id_text),
@@ -186,19 +298,6 @@ fn derive_amqp(
             .and_then(|properties| value(&properties.content_type))
             .map(|symbol| symbol.text.clone()),
         application_properties,
-    };
-
-    Ok(MessageInput {
-        message_id: projection.message_id.clone().unwrap_or_default(),
-        body: Vec::new(),
-        time_to_live_millis: content
-            .header
-            .as_ref()
-            .and_then(|header| value(&header.ttl))
-            .map(|ttl| u64::from(*ttl)),
-        session_id,
-        scheduled_enqueue_at,
-        envelope: Some(MessageEnvelope::new(bytes.to_vec()).with_filter_properties(projection)),
     })
 }
 

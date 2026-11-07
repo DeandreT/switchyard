@@ -6,11 +6,13 @@ use storage::{StateStore, WriteBatch};
 
 use crate::{
     BrokerError, Command, CommandOutcome, DeadLetterReason, Delivery, DeliveryLock, DeliveryOrigin,
-    LockToken, MessageEnvelope, MessageRecord, MessageRecordFormat, MessageState, QueueConfig,
-    ReceiveMode, SequenceNumber, SessionHold, codec, keys,
+    LockToken, MessageContentError, MessageEnvelope, MessageRecord, MessageRecordFormat,
+    MessageState, QueueConfig, ReceiveMode, SequenceNumber, SessionHold, codec, keys,
 };
 
-use super::{MAX_DEFERRED_RECEIVE_BATCH, StateMachine, require_session_agreement};
+use super::{
+    MAX_DEFERRED_RECEIVE_BATCH, StateMachine, patch::ContentRewrite, require_session_agreement,
+};
 
 impl<S: StateStore> StateMachine<S> {
     pub(super) fn defer(
@@ -18,12 +20,12 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         sequence: SequenceNumber,
         lock_token: LockToken,
-        replacement_envelope: Option<&MessageEnvelope>,
+        rewrite: ContentRewrite<'_>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, BrokerError> {
         let config = self.load_config(command)?;
         let (mut record, locked_until, _) = self.held_lock(command, sequence, lock_token)?;
-        replace_envelope(&config, &mut record, replacement_envelope)?;
+        rewrite.apply(&config, &mut record)?;
 
         let namespace = &command.namespace;
         let entity = &command.entity;
@@ -223,6 +225,17 @@ pub(super) fn replace_envelope(
     let Some(envelope) = replacement else {
         return Ok(());
     };
+    // The replacement is rebuilt from the message as delivered, which does not
+    // render the copy's overlay yet, so accepting it would silently drop a
+    // patch. Wire activation switches every property-modifying disposition to
+    // V4 and renders overlays; until then a patched copy refuses replacement.
+    if record
+        .envelope
+        .as_ref()
+        .is_some_and(|current| !current.overlay().is_empty())
+    {
+        return Err(MessageContentError::ReplacementWouldDropOverlay.into());
+    }
     if envelope.len() > config.max_message_bytes {
         return Err(BrokerError::MessageTooLarge {
             body_bytes: envelope.len(),
@@ -231,8 +244,8 @@ pub(super) fn replace_envelope(
     }
     record.envelope = Some(envelope.clone());
     // A V2 record stores exactly one content form, so the replacement becomes
-    // its AMQP content. The replacement is rebuilt from original bytes and
-    // carries no overlay; copy-local overlays for dispositions come later.
+    // its AMQP content. Only a copy without an overlay reaches this point, and
+    // the replacement carries none either.
     if record.format == MessageRecordFormat::V2 {
         record.body.clear();
     }

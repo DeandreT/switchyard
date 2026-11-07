@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AcceptedSession, Delivery, EntityPath, LockToken, MessageEnvelope, NamespaceName, QueueConfig,
-    QueueConfigUpdate, ReceiveMode, RuleDefinition, RuleFilter, RuleName, SequenceNumber,
-    SessionHold, SessionId, SubscriptionConfig, SubscriptionConfigUpdate, SubscriptionName,
-    Timestamp, TopicConfig, TopicConfigUpdate,
+    AcceptedSession, Delivery, EntityPath, LockToken, MessageEnvelope, NamespaceName,
+    OverlayProperty, QueueConfig, QueueConfigUpdate, ReceiveMode, RuleDefinition, RuleFilter,
+    RuleName, SequenceNumber, SessionHold, SessionId, SubscriptionConfig, SubscriptionConfigUpdate,
+    SubscriptionName, Timestamp, TopicConfig, TopicConfigUpdate,
 };
 
 /// One message supplied to an atomic broker operation.
@@ -266,6 +266,28 @@ pub enum CommandKind {
     /// V4. One invalid child refuses the whole batch.
     SendContentBatch {
         messages: Vec<MessageContent>,
+    },
+    /// [`CommandKind::Abandon`] with a sparse application-property patch over
+    /// the stored copy instead of a replacement envelope; durable as proposal
+    /// V4. An empty patch leaves the copy's content untouched.
+    AbandonWithPatch {
+        sequence: SequenceNumber,
+        lock_token: LockToken,
+        patch: Vec<OverlayProperty>,
+    },
+    /// [`CommandKind::Defer`] with a sparse property patch; durable as V4.
+    DeferWithPatch {
+        sequence: SequenceNumber,
+        lock_token: LockToken,
+        patch: Vec<OverlayProperty>,
+    },
+    /// [`CommandKind::DeadLetter`] with a sparse property patch; durable as V4.
+    DeadLetterWithPatch {
+        sequence: SequenceNumber,
+        lock_token: LockToken,
+        reason: String,
+        description: String,
+        patch: Vec<OverlayProperty>,
     },
 }
 

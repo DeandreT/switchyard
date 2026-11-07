@@ -35,6 +35,8 @@ use tempfile::TempDir;
 mod content_sends;
 #[path = "committed_replay/fixtures.rs"]
 mod fixtures;
+#[path = "committed_replay/patched_dispositions.rs"]
+mod patched_dispositions;
 #[path = "committed_replay/topic_duplicates.rs"]
 mod topic_duplicates;
 use fixtures::*;
