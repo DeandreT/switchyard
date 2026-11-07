@@ -214,6 +214,15 @@ pre-feature state/journal/checkpoint backup. Never strip markers, rewrite profil
 or delete history as a downgrade procedure.
 See [profile lifecycle](lifecycle.md#profile-updates).
 
+Message records use a dedicated frozen codec. Every record is written as V1, byte
+for byte the former generic encoding, and rewrites keep the version a record was read
+with. Readers also accept V2: raw bytes, or original AMQP bytes with a filter projection
+and a sparse property overlay (unique names in first-insertion order; each value one
+encoded AMQP value, where null is a value) and no duplicated body. Nothing writes V2
+yet, overlays are stored data only, and durable proposals refuse envelopes carrying
+them. Runtime V1 reads keep tolerating trailing bytes; V2 framing is exact, and
+snapshot validation requires canonical rows of either version.
+
 ### Storage And Runtime Limits
 
 Memory is volatile; neither backend is replicated. Production durable startup

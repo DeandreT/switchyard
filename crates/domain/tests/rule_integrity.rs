@@ -1029,7 +1029,7 @@ fn priority<P: StoreProvider>(provider: P) -> Result<(), Box<dyn Error>> {
         &fixture.topic,
         100,
         CommandKind::ActivateScheduled,
-        BrokerError::from(codec::decode::<domain::MessageRecord>(&[]).unwrap_err()),
+        BrokerError::from(domain::MessageRecord::decode(&[]).unwrap_err()),
     )?;
     fixture.assert_rule_scan(&trace, 1);
     fixture.restore(&baseline)?;

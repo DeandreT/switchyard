@@ -482,7 +482,11 @@ fn priority<P: StoreProvider>(provider: P) -> TestResult {
         ),
         (wrong_deadline, BrokerError::MalformedIndexKey),
     ] {
-        raw(&fixture, key.clone(), Some(codec::encode(&record)?))?;
+        raw(
+            &fixture,
+            key.clone(),
+            Some(codec::message::encode(&record)?),
+        )?;
         unchanged_error(
             &fixture,
             &fixture.command(100, CommandKind::ActivateScheduled),
@@ -514,7 +518,11 @@ fn priority<P: StoreProvider>(provider: P) -> TestResult {
         .message(&fixture.namespace, &fixture.entity, second)?
         .unwrap();
     second_record.state = MessageState::Ready;
-    raw(&fixture, second_key, Some(codec::encode(&second_record)?))?;
+    raw(
+        &fixture,
+        second_key,
+        Some(codec::message::encode(&second_record)?),
+    )?;
     // The first valid due row reaches exhaustion before a later injected fault.
     refuse(&fixture, 100)?;
     let fixture = restart(fixture)?;
@@ -717,8 +725,7 @@ fn indexed<P: StoreProvider>(provider: P) -> TestResult {
     let first_key = keys::message(&namespace, &entity, SequenceNumber::new(1));
     let original_raw = store.get(&first_key)?.unwrap();
     let malformed = vec![0];
-    let error =
-        codec::decode::<domain::MessageRecord>(&malformed).expect_err("truncated V1 message");
+    let error = domain::MessageRecord::decode(&malformed).expect_err("truncated V1 message");
     store.apply(WriteBatch::default().put(first_key.clone(), malformed))?;
     let corrupt_before = store.snapshot()?;
     assert_eq!(

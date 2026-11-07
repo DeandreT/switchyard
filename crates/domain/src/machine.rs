@@ -699,7 +699,7 @@ impl<S: StateStore> StateMachine<S> {
                     }
                     batch.push_put(
                         keys::message(namespace, entity, sequence),
-                        codec::encode(&record)?,
+                        codec::message::encode(&record)?,
                     );
                     batch.push_put(
                         keys::lock(namespace, entity, locked_until, sequence),
@@ -1047,7 +1047,7 @@ impl<S: StateStore> StateMachine<S> {
         );
         batch.push_put(
             keys::message(&command.namespace, &command.entity, sequence),
-            codec::encode(&record)?,
+            codec::message::encode(&record)?,
         );
         Ok(CommandOutcome::LockRenewed {
             locked_until,
@@ -1242,7 +1242,7 @@ impl<S: StateStore> StateMachine<S> {
         });
         batch.push_put(
             keys::message(namespace, &dead_letter_queue, sequence),
-            codec::encode(&record)?,
+            codec::message::encode(&record)?,
         );
         batch.push_put(
             keys::ready(namespace, &dead_letter_queue, sequence),

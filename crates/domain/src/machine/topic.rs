@@ -348,7 +348,7 @@ impl<S: StateStore> StateMachine<S> {
                 let record = message_record(command, *input, sequence, topic_lifetime);
                 batch.push_put(
                     keys::message(&command.namespace, &command.entity, sequence),
-                    codec::encode(&record)?,
+                    codec::message::encode(&record)?,
                 );
                 batch.push_put(
                     keys::scheduled(&command.namespace, &command.entity, enqueue_at, sequence),
@@ -369,7 +369,7 @@ impl<S: StateStore> StateMachine<S> {
                 let record = message_record(command, *input, sequence, lifetime);
                 batch.push_put(
                     keys::message(&command.namespace, subscription, sequence),
-                    codec::encode(&record)?,
+                    codec::message::encode(&record)?,
                 );
                 batch.push_put(
                     keys::ready(&command.namespace, subscription, sequence),

@@ -4,7 +4,7 @@ use storage::{StateStore, WriteBatch};
 
 use crate::{
     BrokerError, Command, CommandOutcome, MAX_MESSAGE_ID_CHARACTERS, MessageEnvelope, MessageInput,
-    MessageRecord, MessageState, QueueConfig, SequenceNumber, codec, keys,
+    MessageRecord, MessageRecordFormat, MessageState, QueueConfig, SequenceNumber, codec, keys,
 };
 
 use super::{StateMachine, require_session_agreement};
@@ -117,7 +117,7 @@ impl<S: StateStore> StateMachine<S> {
                     config.default_time_to_live_millis,
                 );
                 let record = message_record(command, *input, sequence, lifetime_millis);
-                let encoded = codec::encode(&record)?;
+                let encoded = codec::message::encode(&record)?;
                 prepared.push(PreparedMessage { record, encoded });
             }
         }
@@ -212,6 +212,7 @@ pub(super) fn message_record(
         session_id: input.session_id.cloned(),
         dead_letter: None,
         envelope: input.envelope.cloned(),
+        format: MessageRecordFormat::V1,
     }
 }
 

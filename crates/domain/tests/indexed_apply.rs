@@ -819,7 +819,7 @@ fn lock_and_schedule_origins<P: StoreProvider>(provider: P) -> TestResult {
     record.scheduled_enqueue_at = None;
     fixture.raw(WriteBatch::default().put(
         keys::message(&namespace(), &queue(), record.sequence),
-        codec::encode(&record)?,
+        codec::message::encode(&record)?,
     ));
     uncheckpointed(
         &fixture,
@@ -920,7 +920,7 @@ fn rule_config_origin<P: StoreProvider>(provider: P) -> TestResult {
         Some(MessageEnvelope::new(vec![1]).with_filter_properties(duplicate_properties()));
     fixture.raw(WriteBatch::default().put(
         keys::message(&namespace(), &topic(), record.sequence),
-        codec::encode(&record)?,
+        codec::message::encode(&record)?,
     ));
     uncheckpointed(
         &fixture,

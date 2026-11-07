@@ -3,10 +3,11 @@
 
 use domain::{
     AcceptedSession, Command, CommandKind, CommandOutcome, DeadLetterInfo, DeadLetterReason,
-    Delivery, DeliveryOrigin, EntityPath, LockToken, MessageEnvelope, MessageRecord, MessageState,
-    NamespaceName, QueueConfig, QueueConfigUpdate, QueueCounters, QueueTimeToLiveUpdate,
-    ReceiveMode, SequenceNumber, SessionHold, SessionId, SessionLock, SessionRecord, StateMachine,
-    SubscriptionConfig, SubscriptionName, Timestamp, TopicConfig, codec, keys,
+    Delivery, DeliveryOrigin, EntityPath, LockToken, MessageEnvelope, MessageRecord,
+    MessageRecordFormat, MessageState, NamespaceName, QueueConfig, QueueConfigUpdate,
+    QueueCounters, QueueTimeToLiveUpdate, ReceiveMode, SequenceNumber, SessionHold, SessionId,
+    SessionLock, SessionRecord, StateMachine, SubscriptionConfig, SubscriptionName, Timestamp,
+    TopicConfig, codec, keys,
     snapshot_validation::{
         CompleteStateValidation, SnapshotCatalogError, SnapshotCompleteStateError,
         SnapshotStateError, validate_complete_state, validate_duplicate_rows,
@@ -302,6 +303,7 @@ fn record(entity: &EntityPath, sequence: u64) -> MessageRecord {
             dead_lettered_at: Timestamp::from_millis(1),
         }),
         envelope: Some(MessageEnvelope::new(vec![255, 1])),
+        format: MessageRecordFormat::V1,
     }
 }
 fn indexes(ns: &NamespaceName, entity: &EntityPath, record: &MessageRecord) -> Vec<Key> {
@@ -333,7 +335,7 @@ fn put_message(image: &mut Image, ns: &NamespaceName, entity: &EntityPath, recor
     put(
         image,
         keys::message(ns, entity, record.sequence),
-        codec::encode(record).unwrap(),
+        codec::message::encode(record).unwrap(),
     );
     for key in indexes(ns, entity, record) {
         put(image, key, vec![]);

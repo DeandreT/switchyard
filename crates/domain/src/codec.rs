@@ -1,6 +1,7 @@
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
+pub mod message;
 pub mod topic;
 
 /// Leading byte of every stored value.

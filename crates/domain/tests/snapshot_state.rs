@@ -638,7 +638,11 @@ fn graphs<P: StoreProvider>(provider: P) {
     let mut wrong = f.record(&image, &f.queue, one);
     wrong.sequence = SequenceNumber::new(9);
     let mut broken = image.clone();
-    put(&mut broken, primary.clone(), codec::encode(&wrong).unwrap());
+    put(
+        &mut broken,
+        primary.clone(),
+        codec::message::encode(&wrong).unwrap(),
+    );
     assert_eq!(error_row(f.reject(&broken)), row(&broken, &primary));
     let mut wrong = f.record(&image, &locked, one);
     if let MessageState::Locked { origin, .. } = &mut wrong.state {
