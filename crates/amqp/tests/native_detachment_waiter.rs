@@ -4,7 +4,6 @@ use std::{
     future::{Future, poll_fn},
     pin::Pin,
     task::Poll,
-    time::Duration,
 };
 
 use amqp::{
@@ -18,7 +17,11 @@ use tokio::{
     time::timeout,
 };
 
-const WAIT: Duration = Duration::from_secs(5);
+#[path = "../src/test_deadline.rs"]
+mod test_deadline;
+
+use test_deadline::WAIT;
+
 const CHANNEL: u16 = 1;
 const HANDLE: u32 = 1;
 

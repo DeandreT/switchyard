@@ -11,6 +11,8 @@ mod admin;
 mod broker;
 mod clock;
 mod proposer;
+#[cfg(test)]
+mod test_deadline;
 mod timer;
 
 use std::path::PathBuf;

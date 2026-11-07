@@ -18,6 +18,11 @@ use server::{Broker, LocalProposer, ManualClock};
 use storage::MemoryStore;
 use tokio::net::TcpListener;
 
+#[path = "../src/test_deadline.rs"]
+mod test_deadline;
+
+use test_deadline::WAIT;
+
 /// A listener on an ephemeral port, with the queue already created.
 struct Node {
     _broker: Broker,
@@ -203,8 +208,7 @@ async fn a_client_renews_a_live_message_lock_over_the_management_node() -> Resul
         Outcome::Accepted(_)
     ));
 
-    let response =
-        tokio::time::timeout(std::time::Duration::from_secs(2), responses.recv()).await??;
+    let response = tokio::time::timeout(WAIT, responses.recv()).await??;
     assert_eq!(
         response
             .message()
@@ -584,8 +588,7 @@ async fn session_management_request(
         Outcome::Accepted(_)
     ));
 
-    let response =
-        tokio::time::timeout(std::time::Duration::from_secs(2), responses.recv()).await??;
+    let response = tokio::time::timeout(WAIT, responses.recv()).await??;
     assert_eq!(
         response
             .message()
@@ -780,7 +783,7 @@ async fn a_held_session_is_refused_until_its_link_closes() -> Result<(), Box<dyn
         .source(session_source("orders", Some("cart-1")))
         .attach(&mut session)
         .await?;
-    let refused = tokio::time::timeout(std::time::Duration::from_secs(2), rival.recv()).await?;
+    let refused = tokio::time::timeout(WAIT, rival.recv()).await?;
     assert!(refused.is_err(), "a held session was granted twice");
 
     // Closing the holder releases the session rather than waiting out its lock.

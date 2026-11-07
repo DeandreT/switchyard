@@ -5,7 +5,6 @@ use std::{
     pin::Pin,
     sync::{Arc, Condvar, Mutex},
     task::{Context, Poll},
-    time::Duration,
 };
 
 use domain::{CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueConfig, StateMachine};
@@ -18,7 +17,7 @@ use tokio::{sync::Notify, task::Id, time::timeout};
 use super::{AmqpListener, AmqpListenerService, Stage};
 use crate::{Broker, BrokerRejection};
 
-pub(super) const WAIT: Duration = Duration::from_secs(5);
+pub(super) use crate::test_deadline::WAIT;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Point {

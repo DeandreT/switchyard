@@ -12,6 +12,11 @@ use server::{Broker, LocalProposer, ManualClock};
 use storage::MemoryStore;
 use tokio::net::TcpListener;
 
+#[path = "../src/test_deadline.rs"]
+mod test_deadline;
+
+use test_deadline::WAIT;
+
 const TOPIC: &str = "filtered-events";
 const SUBSCRIPTION: &str = "filtered-events/subscriptions/priority";
 const MANAGEMENT: &str = "filtered-events/subscriptions/priority/$management";
@@ -99,7 +104,7 @@ async fn request(
         requests.send(request).await?,
         Outcome::Accepted(_)
     ));
-    let response = tokio::time::timeout(Duration::from_secs(2), responses.recv()).await??;
+    let response = tokio::time::timeout(WAIT, responses.recv()).await??;
     let message = response.message().clone();
     responses.accept(&response).await?;
     Ok(message)

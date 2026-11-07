@@ -1,7 +1,8 @@
-use std::{task::Waker, time::Duration};
+use std::task::Waker;
 
 use super::super::link_flow::has_unreserved_credit;
 use super::*;
+use crate::test_deadline::WAIT;
 
 struct Admission {
     sender: Sender,
@@ -82,7 +83,7 @@ async fn closed_command_receiver_wakes_admission_without_releasing_held_capacity
     assert_pending(wait.as_mut());
     drop(admission.commands);
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(2), wait)
+        tokio::time::timeout(WAIT, wait)
             .await
             .expect("command closure wakes admission"),
         Err(EngineError::Stopped)
@@ -108,7 +109,7 @@ async fn closed_false_detach_watch_refuses_available_and_held_capacity() {
         }
         drop(admission.detached);
         assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(2), wait)
+            tokio::time::timeout(WAIT, wait)
                 .await
                 .expect("watch closure wakes admission"),
             Err(EngineError::Stopped)
@@ -187,14 +188,14 @@ async fn a_benign_watch_update_preserves_semaphore_waiter_fifo() {
         .expect("benign update is observed");
     assert_pending(first.as_mut());
     drop(held);
-    let first_permit = tokio::time::timeout(Duration::from_secs(2), first)
+    let first_permit = tokio::time::timeout(WAIT, first)
         .await
         .expect("first keeps its queue position")
         .expect("first acquires");
     assert_pending(second.as_mut());
     assert_eq!(capacity.available_permits(), 0);
     drop(first_permit);
-    let second_permit = tokio::time::timeout(Duration::from_secs(2), second)
+    let second_permit = tokio::time::timeout(WAIT, second)
         .await
         .expect("second waiter wakes")
         .expect("second acquires after first releases");
@@ -217,7 +218,7 @@ async fn cancelling_admission_removes_only_that_semaphore_waiter() {
     drop(first);
     assert_eq!(capacity.available_permits(), 0);
     drop(held);
-    let second_permit = tokio::time::timeout(Duration::from_secs(2), second)
+    let second_permit = tokio::time::timeout(WAIT, second)
         .await
         .expect("remaining waiter acquires")
         .expect("admission succeeds");
@@ -281,7 +282,7 @@ async fn reservation_cleanup_after_capacity_wait(cancel: bool) {
             .send(true)
             .expect("detach remains observed");
         assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(2), wait)
+            tokio::time::timeout(WAIT, wait)
                 .await
                 .expect("detach wakes reserved admission"),
             Err(EngineError::RemoteDetached)

@@ -9,7 +9,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
 };
 
 use amqp::{
@@ -24,7 +23,11 @@ use tokio::{
     time::timeout,
 };
 
-const LIMIT: Duration = Duration::from_secs(3);
+#[path = "../src/test_deadline.rs"]
+mod test_deadline;
+
+use test_deadline::WAIT;
+
 const CAPACITY: usize = 256;
 const CHANNEL: u16 = 1;
 const HANDLE: u32 = 1;
@@ -89,7 +92,7 @@ async fn control(peer: &mut DuplexStream) -> (u16, Performative) {
         channel,
         performative: Some(performative),
         payload,
-    } = timeout(LIMIT, read_frame(peer))
+    } = timeout(WAIT, read_frame(peer))
         .await
         .expect("control frame deadline")
         .expect("valid control frame")
@@ -132,11 +135,11 @@ async fn attach_on(
     )
     .await
     .expect("peer Attach");
-    let incoming = timeout(LIMIT, session.next_incoming_attach())
+    let incoming = timeout(WAIT, session.next_incoming_attach())
         .await
         .expect("incoming Attach deadline")
         .expect("Attach offered");
-    let endpoint = timeout(LIMIT, session.accept_attach(incoming, 1024 * 1024))
+    let endpoint = timeout(WAIT, session.accept_attach(incoming, 1024 * 1024))
         .await
         .expect("accept link deadline")
         .expect("link accepted");
@@ -186,7 +189,7 @@ impl Fixture {
             inner,
             dropped: Arc::clone(&dropped),
         };
-        let (connection, ()) = timeout(LIMIT, async {
+        let (connection, ()) = timeout(WAIT, async {
             tokio::join!(
                 ServerConnection::accept(stream, "capacity-server", None),
                 async {
@@ -221,11 +224,11 @@ impl Fixture {
         )
         .await
         .expect("peer Begin");
-        let incoming = timeout(LIMIT, connection.next_incoming_session())
+        let incoming = timeout(WAIT, connection.next_incoming_session())
             .await
             .expect("incoming Begin deadline")
             .expect("Begin offered");
-        let mut session = timeout(LIMIT, connection.accept_session(incoming))
+        let mut session = timeout(WAIT, connection.accept_session(incoming))
             .await
             .expect("accept session deadline")
             .expect("session accepted");
@@ -254,7 +257,7 @@ impl Fixture {
     }
 
     async fn shutdown(&mut self) {
-        timeout(LIMIT, self.connection.shutdown())
+        timeout(WAIT, self.connection.shutdown())
             .await
             .expect("joined stop deadline")
             .expect("both original tasks joined");
@@ -274,7 +277,7 @@ async fn transfer_on(peer: &mut DuplexStream, handle: u32, marker: u32) -> u32 {
         channel,
         performative: Some(Performative::Transfer(transfer)),
         payload,
-    } = timeout(LIMIT, read_frame(peer))
+    } = timeout(WAIT, read_frame(peer))
         .await
         .expect("Transfer deadline")
         .expect("valid Transfer")
@@ -294,7 +297,7 @@ async fn transfer_on(peer: &mut DuplexStream, handle: u32, marker: u32) -> u32 {
 }
 
 async fn sent(sender: &Sender, peer: &mut DuplexStream, marker: u32) -> PendingDelivery {
-    let (pending, identity) = timeout(LIMIT, async {
+    let (pending, identity) = timeout(WAIT, async {
         tokio::join!(
             sender.send_pending(message(marker), tag(marker)),
             transfer(peer, marker)
@@ -325,7 +328,7 @@ async fn retain(pending: PendingDelivery, peer: &mut DuplexStream) -> DeliveryCo
     )
     .await
     .expect("unsettled Second-mode outcome");
-    let outcome = timeout(LIMIT, pending)
+    let outcome = timeout(WAIT, pending)
         .await
         .expect("outcome deadline")
         .expect("remote Accepted");
@@ -351,7 +354,7 @@ async fn assert_capacity_waiting<F>(
         "256 external confirmations must block capacity, not just command start"
     );
     // This response proves that any Send submitted by the earlier poll ran first.
-    let reservation = timeout(LIMIT, sender.on_credit())
+    let reservation = timeout(WAIT, sender.on_credit())
         .await
         .expect("positive command FIFO barrier deadline")
         .expect("spare remote credit is reservable");
@@ -366,7 +369,7 @@ async fn assert_capacity_waiting<F>(
         "no earlier Send may have written an unexpected Transfer"
     );
     assert!(buffer.filled().is_empty());
-    timeout(LIMIT, reservation.release())
+    timeout(WAIT, reservation.release())
         .await
         .expect("reservation release deadline")
         .expect("actual release response restores the spare credit");
@@ -402,7 +405,7 @@ async fn saturated_sender_wakes_on_detach_and_replacement_has_independent_capaci
     ));
     assert_eq!(channel, CHANNEL);
     assert!(matches!(
-        timeout(LIMIT, waiting)
+        timeout(WAIT, waiting)
             .await
             .expect("capacity waiter must wake on Detach"),
         Err(EngineError::RemoteDetached)
@@ -417,7 +420,7 @@ async fn saturated_sender_wakes_on_detach_and_replacement_has_independent_capaci
     let pending = sent(&replacement, &mut fixture.peer, 1000).await;
     let replacement_confirmation = retain(pending, &mut fixture.peer).await;
     assert!(matches!(
-        timeout(LIMIT, fixture.sender.send_pending(message(257), tag(257)))
+        timeout(WAIT, fixture.sender.send_pending(message(257), tag(257)))
             .await
             .expect("old sender remains detached"),
         Err(EngineError::RemoteDetached)
@@ -446,7 +449,7 @@ async fn saturated_sender_wakes_on_peer_end_without_releasing_external_confirmat
         (CHANNEL, Performative::End(_))
     ));
     assert!(matches!(
-        timeout(LIMIT, waiting)
+        timeout(WAIT, waiting)
             .await
             .expect("capacity waiter must wake on End"),
         Err(EngineError::RemoteDetached)
@@ -463,7 +466,7 @@ async fn saturated_sender_wakes_after_joined_stop_while_confirmations_remain_own
     let mut waiting = Box::pin(fixture.sender.send_pending(message(256), tag(256)));
     assert_capacity_waiting(&fixture.sender, &mut fixture.peer, waiting.as_mut()).await;
     fixture.connection.stop();
-    timeout(LIMIT, fixture.connection.shutdown())
+    timeout(WAIT, fixture.connection.shutdown())
         .await
         .expect("joined stop deadline")
         .expect("both original tasks joined");
@@ -474,7 +477,7 @@ async fn saturated_sender_wakes_after_joined_stop_while_confirmations_remain_own
         "joining does not reclaim external confirmation permits"
     );
     assert!(matches!(
-        timeout(LIMIT, waiting)
+        timeout(WAIT, waiting)
             .await
             .expect("capacity waiter must wake after joined stop"),
         Err(EngineError::RemoteDetached)
@@ -492,7 +495,7 @@ async fn confirming_one_delivery_admits_one_waiter_and_preserves_the_capacity_bo
     assert_capacity_waiting(&fixture.sender, &mut fixture.peer, waiting.as_mut()).await;
     let confirmation = held.pop().expect("one real confirmation");
     let released = confirmation.identity();
-    let (confirmed, (channel, response)) = timeout(LIMIT, async {
+    let (confirmed, (channel, response)) = timeout(WAIT, async {
         tokio::join!(
             confirmation.confirm(DeliveryState::Accepted(Accepted)),
             control(&mut fixture.peer)
@@ -510,7 +513,7 @@ async fn confirming_one_delivery_admits_one_waiter_and_preserves_the_capacity_bo
     assert!(response.settled);
     assert_eq!(response.state, Some(DeliveryState::Accepted(Accepted)));
 
-    let (pending, transferred) = timeout(LIMIT, async {
+    let (pending, transferred) = timeout(WAIT, async {
         tokio::join!(waiting.as_mut(), transfer(&mut fixture.peer, 256))
     })
     .await
@@ -523,12 +526,12 @@ async fn confirming_one_delivery_admits_one_waiter_and_preserves_the_capacity_bo
     let mut next = Box::pin(fixture.sender.send_pending(message(257), tag(257)));
     assert_capacity_waiting(&fixture.sender, &mut fixture.peer, next.as_mut()).await;
     fixture.connection.stop();
-    timeout(LIMIT, fixture.connection.shutdown())
+    timeout(WAIT, fixture.connection.shutdown())
         .await
         .expect("joined stop deadline")
         .expect("both original tasks joined");
     assert!(matches!(
-        timeout(LIMIT, next).await.expect("last waiter cleanup"),
+        timeout(WAIT, next).await.expect("last waiter cleanup"),
         Err(EngineError::RemoteDetached)
     ));
     fixture.shutdown().await;
@@ -565,7 +568,7 @@ async fn detach_peer(peer: &mut DuplexStream) {
 
 async fn confirmed(confirmation: DeliveryConfirmation, peer: &mut DuplexStream) {
     let identity = confirmation.identity();
-    let (result, (channel, response)) = timeout(LIMIT, async {
+    let (result, (channel, response)) = timeout(WAIT, async {
         tokio::join!(
             confirmation.confirm(DeliveryState::Accepted(Accepted)),
             control(peer)
@@ -592,7 +595,7 @@ async fn late_confirmation_after_detach_is_link_scoped_and_preserves_reused_hand
     let pending = sent(&fixture.sender, &mut fixture.peer, 11).await;
     let removed = retain(pending, &mut fixture.peer).await;
     detach_peer(&mut fixture.peer).await;
-    let result = timeout(LIMIT, removed.confirm(DeliveryState::Accepted(Accepted)))
+    let result = timeout(WAIT, removed.confirm(DeliveryState::Accepted(Accepted)))
         .await
         .expect("removed-link confirmation reply deadline");
     assert!(
@@ -605,7 +608,7 @@ async fn late_confirmation_after_detach_is_link_scoped_and_preserves_reused_hand
     let other = attach_on(&mut fixture.session, &mut fixture.peer, 2, "unrelated-link").await;
 
     let result = timeout(
-        LIMIT,
+        WAIT,
         old.confirm(DeliveryState::Rejected(amqp::Rejected::default())),
     )
     .await
@@ -617,7 +620,7 @@ async fn late_confirmation_after_detach_is_link_scoped_and_preserves_reused_hand
     // A stale confirmation must not emit a Disposition, even with a new owner
     // at the same handle. The next frame belongs to the current confirmation.
     confirmed(current, &mut fixture.peer).await;
-    let (pending, _) = timeout(LIMIT, async {
+    let (pending, _) = timeout(WAIT, async {
         tokio::join!(
             other.send_pending(message(3), tag(3)),
             transfer_on(&mut fixture.peer, 2, 3)
@@ -651,11 +654,11 @@ async fn late_confirmation_after_end_cannot_settle_a_reused_channel_and_delivery
     )
     .await
     .expect("reuse channel");
-    let incoming = timeout(LIMIT, fixture.connection.next_incoming_session())
+    let incoming = timeout(WAIT, fixture.connection.next_incoming_session())
         .await
         .expect("replacement session deadline")
         .expect("replacement Begin");
-    fixture.session = timeout(LIMIT, fixture.connection.accept_session(incoming))
+    fixture.session = timeout(WAIT, fixture.connection.accept_session(incoming))
         .await
         .expect("replacement session acceptance deadline")
         .expect("replacement session");
@@ -673,7 +676,7 @@ async fn late_confirmation_after_end_cannot_settle_a_reused_channel_and_delivery
     );
 
     let result = timeout(
-        LIMIT,
+        WAIT,
         old.confirm(DeliveryState::Rejected(amqp::Rejected::default())),
     )
     .await

@@ -9,7 +9,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll, Waker},
-    time::Duration,
 };
 
 use amqp::{
@@ -23,7 +22,10 @@ use tokio::{
     time::timeout,
 };
 
-const WAIT: Duration = Duration::from_secs(5);
+#[path = "../src/test_deadline.rs"]
+mod test_deadline;
+
+use test_deadline::WAIT;
 
 #[derive(Default)]
 struct WriteState {

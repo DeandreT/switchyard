@@ -10,7 +10,6 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
 };
 
 use crate::server::engine::Command;
@@ -24,7 +23,7 @@ use tokio::{
     time::timeout,
 };
 
-const LIMIT: Duration = Duration::from_secs(3);
+use crate::test_deadline::WAIT;
 
 #[tokio::test]
 async fn owned_stop_reaches_original_tasks_during_mutable_intake_and_full_commands() {
@@ -64,15 +63,12 @@ async fn owned_stop_reaches_original_tasks_during_mutable_intake_and_full_comman
         );
         stop.clone().request();
         assert!(
-            timeout(LIMIT, intake.as_mut()).await.unwrap().is_none(),
+            timeout(WAIT, intake.as_mut()).await.unwrap().is_none(),
             "the same borrowed intake finishes after Stop"
         );
     }
     assert!(probe.block_write.load(Ordering::SeqCst));
-    timeout(LIMIT, connection.shutdown())
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(WAIT, connection.shutdown()).await.unwrap().unwrap();
     assert_eq!(task_ids(&connection), original);
     assert!(matches!(
         connection.tasks.driver_result.as_ref(),
@@ -95,7 +91,7 @@ async fn old_stop_and_close_captures_cannot_retire_same_named_replacement_connec
     let old_stop = old.stop_owned();
     let old_close = old.close_owned();
     old_stop.request();
-    timeout(LIMIT, old.shutdown()).await.unwrap().unwrap();
+    timeout(WAIT, old.shutdown()).await.unwrap().unwrap();
     let (mut replacement, mut peer, probe) = opened().await;
     let original = task_ids(&replacement);
     let unused = replacement.stop_owned();
@@ -117,10 +113,7 @@ async fn old_stop_and_close_captures_cannot_retire_same_named_replacement_connec
     .unwrap();
     assert!(
         matches!(
-            timeout(LIMIT, read_frame(&mut peer))
-                .await
-                .unwrap()
-                .unwrap(),
+            timeout(WAIT, read_frame(&mut peer)).await.unwrap().unwrap(),
             Frame::Amqp {
                 channel: 900,
                 performative: Some(Performative::End(_)),
@@ -131,7 +124,7 @@ async fn old_stop_and_close_captures_cannot_retire_same_named_replacement_connec
     );
     assert_eq!(task_ids(&replacement), original);
     assert!(!probe.dropped.load(Ordering::SeqCst));
-    timeout(LIMIT, replacement.shutdown())
+    timeout(WAIT, replacement.shutdown())
         .await
         .unwrap()
         .unwrap();
@@ -150,7 +143,7 @@ async fn owned_accept_and_close_captures_are_inert_and_keep_original_incarnation
     )
     .await
     .unwrap();
-    let incoming = timeout(LIMIT, connection.next_incoming_session())
+    let incoming = timeout(WAIT, connection.next_incoming_session())
         .await
         .unwrap()
         .unwrap();
@@ -171,10 +164,7 @@ async fn owned_accept_and_close_captures_are_inert_and_keep_original_incarnation
     .await
     .unwrap();
     assert!(matches!(
-        timeout(LIMIT, read_frame(&mut peer))
-            .await
-            .unwrap()
-            .unwrap(),
+        timeout(WAIT, read_frame(&mut peer)).await.unwrap().unwrap(),
         Frame::Amqp {
             channel: 1,
             performative: Some(Performative::End(_)),
@@ -191,15 +181,15 @@ async fn owned_accept_and_close_captures_are_inert_and_keep_original_incarnation
     )
     .await
     .unwrap();
-    let incoming = timeout(LIMIT, connection.next_incoming_session())
+    let incoming = timeout(WAIT, connection.next_incoming_session())
         .await
         .unwrap()
         .unwrap();
     assert!(matches!(
-        timeout(LIMIT, old).await.unwrap(),
+        timeout(WAIT, old).await.unwrap(),
         Err(crate::EngineError::RemoteDetached)
     ));
-    let (accepted, answer) = timeout(LIMIT, async {
+    let (accepted, answer) = timeout(WAIT, async {
         tokio::join!(
             connection.accept_session_owned(incoming),
             read_frame(&mut peer)
@@ -239,13 +229,10 @@ async fn owned_accept_and_close_captures_are_inert_and_keep_original_incarnation
     probe.wait_write().await;
     connection.stop_owned().request();
     assert!(matches!(
-        timeout(LIMIT, original).await.unwrap(),
+        timeout(WAIT, original).await.unwrap(),
         Err(crate::EngineError::Stopped | crate::EngineError::RemoteClosed)
     ));
-    timeout(LIMIT, connection.shutdown())
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(WAIT, connection.shutdown()).await.unwrap().unwrap();
 }
 
 #[derive(Default)]
@@ -259,7 +246,7 @@ struct Probe {
 
 impl Probe {
     async fn wait_write(&self) {
-        timeout(LIMIT, async {
+        timeout(WAIT, async {
             loop {
                 let changed = self.changed.notified();
                 tokio::pin!(changed);
@@ -334,7 +321,7 @@ async fn opened() -> (ServerConnection, DuplexStream, Arc<Probe>) {
         inner,
         probe: Arc::clone(&probe),
     };
-    let (connection, ()) = timeout(LIMIT, async {
+    let (connection, ()) = timeout(WAIT, async {
         tokio::join!(
             ServerConnection::accept(stream, "custody-server", None),
             async {
@@ -437,7 +424,7 @@ async fn canceled_shutdown_keeps_original_handles_and_stop_bypasses_full_command
     );
     assert!(connection.tasks.driver_result.is_none());
     assert!(connection.tasks.reader_result.is_none());
-    timeout(LIMIT, connection.shutdown())
+    timeout(WAIT, connection.shutdown())
         .await
         .expect("stop independent of full commands")
         .expect("both native joins");
@@ -454,7 +441,7 @@ async fn canceled_shutdown_keeps_original_handles_and_stop_bypasses_full_command
         probe.dropped.load(Ordering::SeqCst),
         "both split halves must release owned IO"
     );
-    timeout(LIMIT, connection.shutdown())
+    timeout(WAIT, connection.shutdown())
         .await
         .expect("repeat shutdown")
         .expect("cached joins");
@@ -477,7 +464,7 @@ async fn failure_of_both_original_tasks_is_joined_and_cached_without_replacement
         .as_ref()
         .expect("original reader")
         .abort();
-    let first = timeout(LIMIT, connection.shutdown())
+    let first = timeout(WAIT, connection.shutdown())
         .await
         .expect("both failed tasks must join")
         .expect_err("both failures are visible");
@@ -510,7 +497,7 @@ async fn failure_of_both_original_tasks_is_joined_and_cached_without_replacement
         probe.dropped.load(Ordering::SeqCst),
         "error summary must not skip either join"
     );
-    let second = timeout(LIMIT, connection.shutdown())
+    let second = timeout(WAIT, connection.shutdown())
         .await
         .expect("repeat failed shutdown")
         .expect_err("cached both failures");
@@ -519,7 +506,7 @@ async fn failure_of_both_original_tasks_is_joined_and_cached_without_replacement
 }
 
 async fn wait_read_bytes(probe: &Probe, expected: usize) {
-    timeout(LIMIT, async {
+    timeout(WAIT, async {
         loop {
             let changed = probe.changed.notified();
             tokio::pin!(changed);
@@ -549,7 +536,7 @@ async fn write_pressure_frames(peer: &mut DuplexStream, frames: Vec<Frame>) -> u
     for frame in frames {
         bytes.extend_from_slice(&crate::encode_frame(&frame).expect("valid pressure frame"));
     }
-    timeout(LIMIT, peer.write_all(&bytes))
+    timeout(WAIT, peer.write_all(&bytes))
         .await
         .expect("bounded wire write")
         .expect("pressure frames written");
@@ -593,7 +580,7 @@ async fn pressure_session(
     connection: &mut ServerConnection,
     peer: &mut DuplexStream,
 ) -> super::super::ServerSession {
-    timeout(LIMIT, async {
+    timeout(WAIT, async {
         write_frame(
             peer,
             &pressure_frame(1, Performative::Begin(crate::Begin::default())),
@@ -645,7 +632,7 @@ async fn pressure_receiver(
     session: &mut super::super::ServerSession,
     peer: &mut DuplexStream,
 ) -> super::super::Receiver {
-    timeout(LIMIT, async {
+    timeout(WAIT, async {
         write_frame(
             peer,
             &pressure_frame(
@@ -694,7 +681,7 @@ async fn pressure_joined(
     original: (tokio::task::Id, tokio::task::Id),
 ) {
     connection.stop();
-    timeout(LIMIT, connection.shutdown())
+    timeout(WAIT, connection.shutdown())
         .await
         .expect("stop must cancel full-channel waits")
         .expect("both original native tasks join");
@@ -711,7 +698,7 @@ async fn pressure_joined(
         probe.dropped.load(Ordering::SeqCst),
         "owned IO is released after both joins"
     );
-    timeout(LIMIT, connection.shutdown())
+    timeout(WAIT, connection.shutdown())
         .await
         .expect("repeat shutdown")
         .expect("cached original joins");
@@ -845,7 +832,7 @@ async fn stop_cancels_full_actual_incoming_delivery_channel() {
         Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
     ));
     assert!(matches!(
-        timeout(LIMIT, receiver.recv())
+        timeout(WAIT, receiver.recv())
             .await
             .expect("closed receiving link"),
         Err(crate::EngineError::RemoteDetached)
@@ -917,7 +904,7 @@ async fn canceled_shutdown_primitive_preserves_first_cached_join_and_second_orig
         driver_result: None,
         reader_result: None,
     };
-    timeout(LIMIT, driver_observed)
+    timeout(WAIT, driver_observed)
         .await
         .expect("original driver runs")
         .expect("driver witness");
@@ -963,7 +950,7 @@ async fn canceled_shutdown_primitive_preserves_first_cached_join_and_second_orig
     reader_release
         .send(())
         .expect("release the same original reader");
-    let first = timeout(LIMIT, tasks.shutdown())
+    let first = timeout(WAIT, tasks.shutdown())
         .await
         .expect("retry joins original reader")
         .expect_err("cached original driver failure");
@@ -982,7 +969,7 @@ async fn canceled_shutdown_primitive_preserves_first_cached_join_and_second_orig
             .to_string(),
         first_raw
     );
-    let repeated = timeout(LIMIT, tasks.shutdown())
+    let repeated = timeout(WAIT, tasks.shutdown())
         .await
         .expect("repeat completed primitive joins")
         .expect_err("same cached original failure");
