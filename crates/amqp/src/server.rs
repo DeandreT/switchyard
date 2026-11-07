@@ -369,6 +369,31 @@ impl DeliveryConfirmation {
 }
 
 impl ServerConnection {
+    /// Accepts like `accept`, but SASL and AMQP Open must finish by `deadline`.
+    ///
+    /// On expiry the handshake and its stream are dropped, closing the socket,
+    /// and this returns an `Io` error of kind `TimedOut`. No connection task
+    /// starts before Open completes, so nothing outlives the expired handshake.
+    /// The deadline does not apply once the connection is open.
+    pub async fn accept_before<Io>(
+        stream: Io,
+        container_id: impl Into<String>,
+        sasl: Option<Arc<dyn SaslAuthenticator>>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Self, EngineError>
+    where
+        Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        match tokio::time::timeout_at(deadline, Self::accept(stream, container_id, sasl)).await {
+            Ok(accepted) => accepted,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the admission deadline passed before AMQP Open completed",
+            )
+            .into()),
+        }
+    }
+
     pub async fn accept<Io>(
         mut stream: Io,
         container_id: impl Into<String>,

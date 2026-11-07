@@ -42,8 +42,12 @@ before normal link cleanup. `shutdown` joins both and caches results across
 canceled waiters; Drop requests stop without joining. Joined shutdown is not a
 peer Close acknowledgement. Sender-capacity waits observe Detach and command
 closure. An optional per-listener socket limit counts handshakes and open
-connections until their original task joins. Full task-family ownership,
-pre-open deadlines and process signals remain planned.
+connections until their original task joins. One monotonic admission deadline
+per accepted socket (60 s by default) spans TLS, WebSocket upgrade, SASL and
+Open without resetting per stage; the native accept takes the remaining
+deadline. Expiry drops the handshake, closing the socket, and the original task
+returns `TimedOut` before Open, so no broker work has begun. Full task-family
+ownership and process signals remain planned.
 See [native custody](crates/amqp/src/server/tasks.rs) and the
 [shutdown sequence](docs/roadmap.md#next-main-increments).
 

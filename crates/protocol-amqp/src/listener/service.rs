@@ -9,6 +9,7 @@ use std::{
     net::SocketAddr,
     panic::{AssertUnwindSafe, resume_unwind},
     sync::Arc,
+    time::Duration,
 };
 
 use amqp::ServerConnection;
@@ -18,6 +19,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
     task::{Id, JoinError},
+    time::{Instant, timeout_at},
 };
 use tracing::debug;
 
@@ -29,6 +31,8 @@ use super::{
 use crate::{Broker, authorization::SharedAccessSaslAcceptor, websocket::accept_amqp_websocket};
 
 mod connection_family;
+#[cfg(test)]
+mod deadline_tests;
 #[cfg(test)]
 mod tcp_tests;
 #[cfg(test)]
@@ -141,7 +145,7 @@ pub struct AmqpListenerService<B> {
     binding: Binding,
     listener: Option<TcpListener>,
     retirement: AmqpListenerRetirement,
-    accepted: Option<(TcpStream, SocketAddr)>,
+    accepted: Option<(TcpStream, SocketAddr, Instant)>,
     prepared: Option<PreparedConnection<B>>,
     receipt: Option<AdmittedConnectionTask>,
     family: ConnectionFamily,
@@ -219,6 +223,7 @@ impl<B: Broker> AmqpListenerService<B> {
                             .shared_access_authentication
                             .clone(),
                         max_connections: self.config.max_connections,
+                        admission_timeout: self.config.admission_timeout,
                     };
                     self.prepared = Some(PreparedConnection {
                         bridge: PreparedTask::new(),
@@ -230,7 +235,7 @@ impl<B: Broker> AmqpListenerService<B> {
                 if self.retirement.is_requested() {
                     return PumpExit::Retired;
                 }
-                let (stream, peer) = match self.accepted.take() {
+                let (stream, peer, deadline) = match self.accepted.take() {
                     Some(packet) => packet,
                     None => unreachable!("prepared accepted socket"),
                 };
@@ -241,7 +246,7 @@ impl<B: Broker> AmqpListenerService<B> {
                 let task_retirement = bridge.retirement();
                 self.receipt = Some(bridge.spawn(
                     peer,
-                    serve_binding_task(stream, config, task_retirement, self.binding),
+                    serve_binding_task(stream, config, task_retirement, self.binding, deadline),
                 ));
                 self.finished = false;
                 #[cfg(test)]
@@ -268,14 +273,17 @@ impl<B: Broker> AmqpListenerService<B> {
                         None => unreachable!("active listener is retained"),
                     }
                 }, if admits => {
+                    // The one admission budget starts here, at accept.
                     self.accepted = Some(match packet {
-                        Ok(packet) => packet,
+                        Ok((stream, peer)) => {
+                            (stream, peer, admission_deadline(self.config.admission_timeout))
+                        }
                         Err(error) => return PumpExit::Accept(error),
                     });
                     #[cfg(test)]
                     self.checkpoint(test_support::Point::Accepted).await;
                     let peer = match self.accepted.as_ref() {
-                        Some((_, peer)) => peer,
+                        Some((_, peer, _)) => peer,
                         None => unreachable!("accepted socket cached before diagnostics"),
                     };
                     debug!(%peer, "connection accepted");
@@ -387,15 +395,36 @@ pub(super) fn legacy_result(exit: AmqpListenerExit) -> io::Result<()> {
     }
 }
 
+/// The admission deadline `budget` after now; an unrepresentable instant
+/// saturates to a far one rather than panicking.
+fn admission_deadline(budget: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(budget)
+        .unwrap_or_else(|| now + Duration::from_secs(60 * 60 * 24 * 365 * 30))
+}
+
+/// Runs one pre-Open stage against the connection's remaining admission budget.
+async fn before_deadline<T, E: From<io::Error>>(
+    deadline: Instant,
+    stage: Stage,
+    future: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    match timeout_at(deadline, future).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, stage.expired()).into()),
+    }
+}
+
 async fn serve_binding_task<B: Broker>(
     stream: TcpStream,
     config: AmqpListener<B>,
     retirement: AmqpListenerRetirement,
     binding: Binding,
+    deadline: Instant,
 ) -> ConnectionTaskExit {
     match binding {
-        Binding::Tcp => serve_tcp_task(stream, config, retirement).await,
-        Binding::WebSocket => serve_wss_task(stream, config, retirement).await,
+        Binding::Tcp => serve_tcp_task(stream, config, retirement, deadline).await,
+        Binding::WebSocket => serve_wss_task(stream, config, retirement, deadline).await,
     }
 }
 
@@ -403,16 +432,18 @@ async fn serve_wss_task<B: Broker>(
     stream: TcpStream,
     config: AmqpListener<B>,
     retirement: AmqpListenerRetirement,
+    deadline: Instant,
 ) -> ConnectionTaskExit {
     match config.tls_acceptor.clone() {
         Some(acceptor) => {
-            match until_retired(&retirement, acceptor.accept(stream), Stage::Tls).await {
-                Some(Ok(stream)) => serve_wss_stream(stream, config, retirement).await,
+            let handshake = before_deadline(deadline, Stage::Tls, acceptor.accept(stream));
+            match until_retired(&retirement, handshake, Stage::Tls).await {
+                Some(Ok(stream)) => serve_wss_stream(stream, config, retirement, deadline).await,
                 Some(Err(error)) => ConnectionTaskExit::Complete(Err(error.into())),
                 None => ConnectionTaskExit::Complete(Ok(())),
             }
         }
-        None => serve_wss_stream(stream, config, retirement).await,
+        None => serve_wss_stream(stream, config, retirement, deadline).await,
     }
 }
 
@@ -420,13 +451,15 @@ async fn serve_wss_stream<Io, B>(
     stream: Io,
     config: AmqpListener<B>,
     retirement: AmqpListenerRetirement,
+    deadline: Instant,
 ) -> ConnectionTaskExit
 where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     B: Broker,
 {
-    match until_retired(&retirement, accept_amqp_websocket(stream), Stage::Upgrade).await {
-        Some(Ok(stream)) => serve_retained_connection(stream, config, retirement).await,
+    let upgrade = before_deadline(deadline, Stage::Upgrade, accept_amqp_websocket(stream));
+    match until_retired(&retirement, upgrade, Stage::Upgrade).await {
+        Some(Ok(stream)) => serve_retained_connection(stream, config, retirement, deadline).await,
         Some(Err(error)) => ConnectionTaskExit::Complete(Err(error.into())),
         None => ConnectionTaskExit::Complete(Ok(())),
     }
@@ -436,16 +469,20 @@ async fn serve_tcp_task<B: Broker>(
     stream: TcpStream,
     config: AmqpListener<B>,
     retirement: AmqpListenerRetirement,
+    deadline: Instant,
 ) -> ConnectionTaskExit {
     match config.tls_acceptor.clone() {
         Some(acceptor) => {
-            match until_retired(&retirement, acceptor.accept(stream), Stage::Tls).await {
-                Some(Ok(stream)) => serve_retained_connection(stream, config, retirement).await,
+            let handshake = before_deadline(deadline, Stage::Tls, acceptor.accept(stream));
+            match until_retired(&retirement, handshake, Stage::Tls).await {
+                Some(Ok(stream)) => {
+                    serve_retained_connection(stream, config, retirement, deadline).await
+                }
                 Some(Err(error)) => ConnectionTaskExit::Complete(Err(error.into())),
                 None => ConnectionTaskExit::Complete(Ok(())),
             }
         }
-        None => serve_retained_connection(stream, config, retirement).await,
+        None => serve_retained_connection(stream, config, retirement, deadline).await,
     }
 }
 
@@ -454,6 +491,16 @@ enum Stage {
     Tls,
     Upgrade,
     Protocol,
+}
+
+impl Stage {
+    fn expired(self) -> &'static str {
+        match self {
+            Self::Tls => "the admission deadline passed during the TLS handshake",
+            Self::Upgrade => "the admission deadline passed during the WebSocket upgrade",
+            Self::Protocol => "the admission deadline passed before AMQP Open completed",
+        }
+    }
 }
 
 async fn until_retired<F: Future>(
@@ -476,6 +523,7 @@ async fn serve_retained_connection<Io, B>(
     stream: Io,
     config: AmqpListener<B>,
     retirement: AmqpListenerRetirement,
+    deadline: Instant,
 ) -> ConnectionTaskExit
 where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -490,7 +538,8 @@ where
         .map(|sasl| Arc::new(sasl.clone()) as Arc<dyn amqp::SaslAuthenticator>);
     let accepted = until_retired(
         &retirement,
-        ServerConnection::accept(stream, config.container_id, authenticator),
+        // SASL and Open share the budget that TLS and any upgrade drew from.
+        ServerConnection::accept_before(stream, config.container_id, authenticator, deadline),
         Stage::Protocol,
     )
     .await;
