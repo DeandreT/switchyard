@@ -218,6 +218,7 @@ impl<B: Broker> AmqpListenerService<B> {
                             .config
                             .shared_access_authentication
                             .clone(),
+                        max_connections: self.config.max_connections,
                     };
                     self.prepared = Some(PreparedConnection {
                         bridge: PreparedTask::new(),
@@ -247,6 +248,11 @@ impl<B: Broker> AmqpListenerService<B> {
                 self.checkpoint(test_support::Point::ReceiptCached).await;
                 continue;
             }
+            let admits = self.admits();
+            #[cfg(test)]
+            if !admits {
+                self.checkpoint(test_support::Point::Saturated).await;
+            }
             tokio::select! {
                 biased;
                 () = &mut retired => return PumpExit::Retired,
@@ -254,12 +260,14 @@ impl<B: Broker> AmqpListenerService<B> {
                     #[cfg(test)]
                     self.checkpoint(test_support::Point::Reaped).await;
                 },
+                // At capacity the listener is not polled, so new peers wait in
+                // the OS backlog instead of being accepted and closed.
                 packet = async {
                     match self.listener.as_ref() {
                         Some(listener) => listener.accept().await,
                         None => unreachable!("active listener is retained"),
                     }
-                } => {
+                }, if admits => {
                     self.accepted = Some(match packet {
                         Ok(packet) => packet,
                         Err(error) => return PumpExit::Accept(error),
@@ -274,6 +282,20 @@ impl<B: Broker> AmqpListenerService<B> {
                 },
             }
         }
+    }
+
+    /// Live sockets this owner holds: a staged accepted socket, a cached
+    /// receipt, and adopted originals until their `JoinHandle` is reaped.
+    fn occupied(&self) -> usize {
+        self.family.len()
+            + usize::from(self.accepted.is_some())
+            + usize::from(self.receipt.is_some())
+    }
+
+    fn admits(&self) -> bool {
+        self.config
+            .max_connections
+            .is_none_or(|limit| self.occupied() < limit.get())
     }
 
     fn adopt_receipt(&mut self) {
@@ -324,6 +346,7 @@ impl<B: Broker> AmqpListenerService<B> {
     async fn checkpoint(&self, point: test_support::Point) {
         let facts = test_support::Facts {
             point,
+            occupied: self.occupied(),
             accepted: self.accepted.is_some(),
             receipt: self.receipt.as_ref().map(|receipt| receipt.id),
             pending: self.family.pending_ids(),

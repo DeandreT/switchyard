@@ -236,7 +236,7 @@ async fn actual_wss_cached_admission_retains_socket_receipt_and_original_id_acro
                 assert!(!facts.accepted && facts.receipt.is_none());
                 assert_eq!(facts.pending.len(), 1);
             }
-            Point::Reaped => unreachable!(),
+            Point::Reaped | Point::Saturated => unreachable!(),
         }
         observer.release();
         service.finish().await;
@@ -1011,4 +1011,195 @@ async fn actual_wss_memory_and_fjall_send_commit_keep_originals_across_two_cance
             assert_eq!(actor.store().snapshot().unwrap(), committed);
         }
     }
+}
+
+/// Checkpoints after `mark` up to the first reap; the pump may accept in the
+/// same poll right after it.
+fn before_reaped(observer: &Observer, mark: usize) -> Vec<Point> {
+    let points = observer.points();
+    points[mark..]
+        .iter()
+        .copied()
+        .take_while(|point| *point != Point::Reaped)
+        .collect()
+}
+
+fn accepted(observer: &Observer) -> usize {
+    observer
+        .points()
+        .iter()
+        .filter(|point| **point == Point::Accepted)
+        .count()
+}
+
+async fn tls_client(stream: TcpStream) -> tokio_rustls::client::TlsStream<TcpStream> {
+    wss_test_client_tls()
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            stream,
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_wss_limit_holds_tls_upgrade_protocol_and_active_sockets_until_original_join() {
+    for scenario in ["tls", "upgrade", "protocol", "active"] {
+        let broker = QuietBroker::default();
+        let (mut service, address) = wss_owner(broker.clone()).await;
+        service.config.max_connections = Some(std::num::NonZeroUsize::MIN);
+        if scenario == "tls" {
+            service.config.tls_acceptor = Some(tokio_rustls::TlsAcceptor::from(Arc::new(
+                wss_test_server_tls(),
+            )));
+        }
+        let observer = Arc::new(Observer::default());
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (held, held_id): (Box<dyn std::any::Any>, _) =
+            drive(&mut service, Arc::clone(&observer), async {
+                match scenario {
+                    "tls" | "upgrade" => {
+                        let stage = if scenario == "tls" {
+                            Stage::Tls
+                        } else {
+                            Stage::Upgrade
+                        };
+                        observer.stalled(stage).await;
+                        (
+                            Box::new(stream) as Box<dyn std::any::Any>,
+                            observer.stalled_id(stage),
+                        )
+                    }
+                    "protocol" => {
+                        let client = upgrade(stream, address, AMQP_WEBSOCKET_SUBPROTOCOL).await;
+                        observer.stalled(Stage::Protocol).await;
+                        (Box::new(client) as _, observer.stalled_id(Stage::Protocol))
+                    }
+                    _ => {
+                        let mut client = upgrade(stream, address, AMQP_WEBSOCKET_SUBPROTOCOL).await;
+                        open(&mut client).await;
+                        observer.native().await;
+                        (Box::new(client) as _, observer.native_ids()[0])
+                    }
+                }
+            })
+            .await;
+        let waiting = TcpStream::connect(address).await.unwrap();
+        let mark = observer.mark();
+        drive(
+            &mut service,
+            Arc::clone(&observer),
+            observer.reached_since(Point::Saturated, mark),
+        )
+        .await;
+        let facts = observer.facts(Point::Saturated);
+        assert_eq!(facts.occupied, 1);
+        assert_eq!(facts.pending, vec![held_id]);
+        assert_eq!(
+            accepted(&observer),
+            1,
+            "a connected peer stays in the backlog at the limit"
+        );
+        drop(held);
+        // Only a parked pump reaps the failed original before seeing the
+        // waiting peer, which has been in the backlog since saturation.
+        let parked = observer.mark();
+        drive(
+            &mut service,
+            Arc::clone(&observer),
+            observer.reached_since(Point::Reaped, parked),
+        )
+        .await;
+        assert!(
+            !before_reaped(&observer, parked).contains(&Point::Accepted),
+            "the waiting peer is not accepted while the slot is held"
+        );
+        assert_eq!(observer.facts(Point::Reaped).reaped, Some(held_id));
+        drive(&mut service, Arc::clone(&observer), async {
+            if scenario == "tls" {
+                let stream = tls_client(waiting).await;
+                let mut healthy = upgrade(stream, address, AMQP_WEBSOCKET_SUBPROTOCOL).await;
+                open(&mut healthy).await;
+            } else {
+                let mut healthy = upgrade(waiting, address, AMQP_WEBSOCKET_SUBPROTOCOL).await;
+                open(&mut healthy).await;
+            }
+        })
+        .await;
+        let facts = observer.facts(Point::Accepted);
+        assert_eq!(
+            facts.reaped,
+            Some(held_id),
+            "admitted only after the original join"
+        );
+        assert!(facts.pending.is_empty());
+        assert_eq!(accepted(&observer), 2);
+        service.finish().await;
+        assert_eq!(service.occupied(), 0);
+        assert!(matches!(
+            service.take_exit(),
+            Some(AmqpListenerExit::Complete(_))
+        ));
+        assert!(broker.calls.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_wss_rejected_upgrade_at_the_limit_releases_its_slot_to_a_healthy_peer() {
+    let broker = QuietBroker::default();
+    let (mut service, address) = wss_owner(broker.clone()).await;
+    service.config.max_connections = Some(std::num::NonZeroUsize::MIN);
+    let observer = Arc::new(Observer::default());
+    let bad = TcpStream::connect(address).await.unwrap();
+    drive(
+        &mut service,
+        Arc::clone(&observer),
+        observer.stalled(Stage::Upgrade),
+    )
+    .await;
+    let bad_id = observer.stalled_id(Stage::Upgrade);
+    let waiting = TcpStream::connect(address).await.unwrap();
+    let mark = observer.mark();
+    drive(
+        &mut service,
+        Arc::clone(&observer),
+        observer.reached_since(Point::Saturated, mark),
+    )
+    .await;
+    assert_eq!(accepted(&observer), 1);
+    drive(&mut service, Arc::clone(&observer), async {
+        let mut request = format!("ws://{address}/wrong-path")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            AMQP_WEBSOCKET_SUBPROTOCOL.parse().unwrap(),
+        );
+        let error = tokio_tungstenite::client_async(request, bad)
+            .await
+            .unwrap_err();
+        let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+            panic!("actual HTTP path refusal");
+        };
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let mut healthy = upgrade(waiting, address, AMQP_WEBSOCKET_STANDARD_SUBPROTOCOL).await;
+        open(&mut healthy).await;
+    })
+    .await;
+    let facts = observer.facts(Point::Accepted);
+    assert_eq!(facts.reaped, Some(bad_id));
+    assert!(facts.pending.is_empty());
+    service.finish().await;
+    assert_eq!(service.occupied(), 0);
+    let Some(AmqpListenerExit::Complete(Err(AmqpListenerFailure::Returned(error)))) =
+        service.take_exit()
+    else {
+        panic!("rejected upgrade error retained");
+    };
+    assert!(
+        matches!(error.downcast_ref::<tokio_tungstenite::tungstenite::Error>(),
+        Some(tokio_tungstenite::tungstenite::Error::Http(response))
+            if response.status() == StatusCode::NOT_FOUND)
+    );
+    assert!(broker.calls.lock().unwrap().is_empty());
 }

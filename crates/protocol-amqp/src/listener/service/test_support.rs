@@ -26,11 +26,13 @@ pub(super) enum Point {
     ReceiptCached,
     Adopted,
     Reaped,
+    Saturated,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct Facts {
     pub(super) point: Point,
+    pub(super) occupied: usize,
     pub(super) accepted: bool,
     pub(super) receipt: Option<Id>,
     pub(super) pending: Vec<Id>,
@@ -97,6 +99,29 @@ impl Observer {
     pub(super) async fn reached(&self, point: Point) {
         self.wait(|state| state.facts.iter().any(|facts| facts.point == point))
             .await;
+    }
+
+    /// The number of checkpoints recorded so far, for `reached_since`.
+    pub(super) fn mark(&self) -> usize {
+        self.state.lock().unwrap().facts.len()
+    }
+
+    /// Waits for `point` among the checkpoints recorded after `mark`.
+    pub(super) async fn reached_since(&self, point: Point, mark: usize) {
+        self.wait(|state| {
+            state
+                .facts
+                .iter()
+                .skip(mark)
+                .any(|facts| facts.point == point)
+        })
+        .await;
+    }
+
+    /// Every checkpoint reached so far, in order.
+    pub(super) fn points(&self) -> Vec<Point> {
+        let state = self.state.lock().unwrap();
+        state.facts.iter().map(|facts| facts.point).collect()
     }
 
     pub(super) async fn stalled(&self, stage: Stage) {

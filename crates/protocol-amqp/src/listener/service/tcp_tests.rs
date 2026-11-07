@@ -1,4 +1,7 @@
-use super::test_support::{Actor, OBSERVER, Observer, Point, QuietBroker, WAIT, drive, owner};
+use super::test_support::{
+    Actor, OBSERVER, Observer, Point, QuietBroker, WAIT, drive, owner, wss_owner,
+    wss_test_client_tls, wss_test_server_tls,
+};
 use super::*;
 use amqp::{
     Attach, Begin, Body, Frame, Message, MessageId, Open, Performative, Properties, ProtocolHeader,
@@ -7,13 +10,14 @@ use amqp::{
 };
 use std::{
     future::poll_fn,
+    num::NonZeroUsize,
     panic::{catch_unwind, panic_any},
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
     task::Poll,
 };
 use storage::StateStore;
-use tokio::{sync::oneshot, time::timeout};
+use tokio::{io::AsyncWriteExt, sync::oneshot, time::timeout};
 use tracing::instrument::WithSubscriber;
 
 #[derive(Debug)]
@@ -351,7 +355,7 @@ async fn actual_tcp_cached_admission_survives_cancelled_borrowers_before_spawn_a
                 assert!(facts.receipt.is_none());
                 assert_eq!(facts.pending.len(), 1);
             }
-            Point::Reaped => unreachable!(),
+            Point::Reaped | Point::Saturated => unreachable!(),
         }
         observer.release();
         service.finish().await;
@@ -530,10 +534,11 @@ fn frame(channel: u16, performative: Performative) -> Frame {
     }
 }
 
-async fn open(peer: &mut TcpStream) {
+async fn open<S: AsyncRead + AsyncWrite + Unpin>(peer: &mut S) {
     write_protocol_header(peer, ProtocolHeader::AMQP)
         .await
         .unwrap();
+    peer.flush().await.unwrap();
     assert_eq!(
         read_protocol_header(peer).await.unwrap(),
         ProtocolHeader::AMQP
@@ -544,6 +549,7 @@ async fn open(peer: &mut TcpStream) {
     )
     .await
     .unwrap();
+    peer.flush().await.unwrap();
     assert!(matches!(
         read_frame(peer).await.unwrap(),
         Frame::Amqp {
@@ -1031,4 +1037,355 @@ async fn qualified_legacy_adapter_keeps_accept_source_and_ignores_child_and_repo
         install(&mut primary, &mut failures, rank).await;
         assert!(legacy_result(resolve_terminal(primary, failures)).is_ok());
     }
+}
+
+/// Checkpoints after `mark` up to the first reap; the pump may accept in the
+/// same poll right after it.
+fn before_reaped(observer: &Observer, mark: usize) -> Vec<Point> {
+    let points = observer.points();
+    points[mark..]
+        .iter()
+        .copied()
+        .take_while(|point| *point != Point::Reaped)
+        .collect()
+}
+
+fn accepted(observer: &Observer) -> usize {
+    observer
+        .points()
+        .iter()
+        .filter(|point| **point == Point::Accepted)
+        .count()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_tcp_limit_holds_tls_protocol_and_active_sockets_until_original_join() {
+    for scenario in ["tls", "protocol", "active"] {
+        let broker = QuietBroker::default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut config = AmqpListener::new(
+            broker.clone(),
+            domain::NamespaceName::new("tenant").unwrap(),
+        )
+        .with_max_connections(NonZeroUsize::MIN);
+        if scenario == "tls" {
+            config = config.with_tls(wss_test_server_tls());
+        }
+        let mut service = config.into_tcp_service(listener);
+        let observer = Arc::new(Observer::default());
+        let mut held = TcpStream::connect(address).await.unwrap();
+        drive(&mut service, Arc::clone(&observer), async {
+            match scenario {
+                "tls" => observer.stalled(Stage::Tls).await,
+                "protocol" => observer.stalled(Stage::Protocol).await,
+                _ => {
+                    open(&mut held).await;
+                    observer.native().await;
+                }
+            }
+        })
+        .await;
+        let held_id = match scenario {
+            "tls" => observer.stalled_id(Stage::Tls),
+            "protocol" => observer.stalled_id(Stage::Protocol),
+            _ => observer.native_ids()[0],
+        };
+        let waiting = TcpStream::connect(address).await.unwrap();
+        let mark = observer.mark();
+        drive(
+            &mut service,
+            Arc::clone(&observer),
+            observer.reached_since(Point::Saturated, mark),
+        )
+        .await;
+        let facts = observer.facts(Point::Saturated);
+        assert_eq!(facts.occupied, 1);
+        assert_eq!(facts.pending, vec![held_id]);
+        assert_eq!(
+            accepted(&observer),
+            1,
+            "a connected peer stays in the backlog at the limit"
+        );
+        drop(held);
+        // Only a parked pump reaps the failed original before seeing the
+        // waiting peer, which has been in the backlog since saturation.
+        let parked = observer.mark();
+        drive(
+            &mut service,
+            Arc::clone(&observer),
+            observer.reached_since(Point::Reaped, parked),
+        )
+        .await;
+        assert!(
+            !before_reaped(&observer, parked).contains(&Point::Accepted),
+            "the waiting peer is not accepted while the slot is held"
+        );
+        assert_eq!(observer.facts(Point::Reaped).reaped, Some(held_id));
+        drive(&mut service, Arc::clone(&observer), async {
+            if scenario == "tls" {
+                let mut healthy = wss_test_client_tls()
+                    .connect(
+                        rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                        waiting,
+                    )
+                    .await
+                    .unwrap();
+                open(&mut healthy).await;
+            } else {
+                let mut healthy = waiting;
+                open(&mut healthy).await;
+            }
+        })
+        .await;
+        let facts = observer.facts(Point::Accepted);
+        assert_eq!(
+            facts.reaped,
+            Some(held_id),
+            "admitted only after the original join"
+        );
+        assert!(facts.pending.is_empty());
+        assert_eq!(facts.occupied, 1);
+        assert_eq!(accepted(&observer), 2);
+        service.finish().await;
+        assert_eq!(service.occupied(), 0);
+        assert!(matches!(
+            service.take_exit(),
+            Some(AmqpListenerExit::Complete(_))
+        ));
+        assert!(broker.calls.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_limit_counts_staged_sockets_across_cancelled_borrowers_and_cancelled_finish() {
+    for wss in [false, true] {
+        for point in [
+            Point::Accepted,
+            Point::Prepared,
+            Point::ReceiptCached,
+            Point::Adopted,
+        ] {
+            let broker = QuietBroker::default();
+            let (mut service, address) = if wss {
+                wss_owner(broker.clone()).await
+            } else {
+                owner(broker.clone()).await
+            };
+            service.config.max_connections = Some(NonZeroUsize::MIN);
+            let observer = Arc::new(Observer::default());
+            observer.hold(point);
+            let held = TcpStream::connect(address).await.unwrap();
+            drive(&mut service, Arc::clone(&observer), observer.reached(point)).await;
+            assert_eq!(observer.facts(point).occupied, 1);
+            assert!(!service.admits(), "a staged socket occupies the only slot");
+            let waiting = TcpStream::connect(address).await.unwrap();
+            observer.release();
+            let mark = observer.mark();
+            drive(
+                &mut service,
+                Arc::clone(&observer),
+                observer.reached_since(Point::Saturated, mark),
+            )
+            .await;
+            let [id] = service.family.pending_ids()[..] else {
+                panic!("the staged socket became one adopted original");
+            };
+            assert_eq!(observer.facts(Point::Saturated).occupied, 1);
+            assert_eq!(accepted(&observer), 1);
+            {
+                let drain = service.finish();
+                tokio::pin!(drain);
+                pending_once(drain.as_mut()).await;
+            }
+            assert_eq!(
+                service.occupied(),
+                1,
+                "a cancelled finish keeps the unjoined original counted"
+            );
+            service.finish().await;
+            assert_eq!(service.family.finished_ids(), vec![id]);
+            assert_eq!(service.occupied(), 0);
+            assert_eq!(accepted(&observer), 1);
+            assert!(broker.calls.lock().unwrap().is_empty());
+            assert!(matches!(
+                service.take_exit(),
+                Some(AmqpListenerExit::Complete(Ok(())))
+            ));
+            drop((held, waiting));
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn qualified_returned_handler_keeps_its_slot_until_the_original_join_is_reaped() {
+    let (mut service, address) = owner(QuietBroker::default()).await;
+    service.config.max_connections = Some(NonZeroUsize::MIN);
+    // Composed: the typed exit is delivered while the unit task is still held.
+    let (sender, exit) = oneshot::channel();
+    assert!(sender.send(ConnectionTaskExit::Complete(Ok(()))).is_ok());
+    let (release, held) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move { held.await.unwrap() });
+    let id = task.id();
+    service.family.adopt(AdmittedConnectionTask {
+        id,
+        peer: peer(),
+        task,
+        exit,
+        retirement: AmqpListenerRetirement::new(),
+    });
+    let observer = Arc::new(Observer::default());
+    let waiting = TcpStream::connect(address).await.unwrap();
+    drive(
+        &mut service,
+        Arc::clone(&observer),
+        observer.reached(Point::Saturated),
+    )
+    .await;
+    assert_eq!(observer.facts(Point::Saturated).pending, vec![id]);
+    assert_eq!(accepted(&observer), 0);
+    release.send(()).unwrap();
+    drive(
+        &mut service,
+        Arc::clone(&observer),
+        observer.reached(Point::Accepted),
+    )
+    .await;
+    let facts = observer.facts(Point::Accepted);
+    assert_eq!(facts.reaped, Some(id));
+    assert!(facts.pending.is_empty());
+    assert_eq!(facts.occupied, 1);
+    service.finish().await;
+    assert!(matches!(
+        service.take_exit(),
+        Some(AmqpListenerExit::Complete(Ok(())))
+    ));
+    drop(waiting);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_unbounded_default_accepts_past_any_held_handshake() {
+    let (mut service, address) = owner(QuietBroker::default()).await;
+    assert!(service.config.max_connections.is_none());
+    let observer = Arc::new(Observer::default());
+    let held = TcpStream::connect(address).await.unwrap();
+    drive(
+        &mut service,
+        Arc::clone(&observer),
+        observer.stalled(Stage::Protocol),
+    )
+    .await;
+    let mut healthy = TcpStream::connect(address).await.unwrap();
+    drive(&mut service, Arc::clone(&observer), open(&mut healthy)).await;
+    assert!(!observer.points().contains(&Point::Saturated));
+    assert_eq!(accepted(&observer), 2);
+    service.finish().await;
+    assert!(matches!(
+        service.take_exit(),
+        Some(AmqpListenerExit::Complete(Ok(())))
+    ));
+    drop((held, healthy));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_limit_two_holds_an_adopted_and_a_new_socket_until_one_is_reaped() {
+    let (mut service, address) = owner(QuietBroker::default()).await;
+    service.config.max_connections = NonZeroUsize::new(2);
+    let observer = Arc::new(Observer::default());
+    let first = TcpStream::connect(address).await.unwrap();
+    drive(
+        &mut service,
+        Arc::clone(&observer),
+        observer.stalled(Stage::Protocol),
+    )
+    .await;
+    let first_id = observer.stalled_id(Stage::Protocol);
+    assert!(service.admits(), "one adopted original leaves a slot");
+    let second = TcpStream::connect(address).await.unwrap();
+    let mark = observer.mark();
+    drive(
+        &mut service,
+        Arc::clone(&observer),
+        observer.reached_since(Point::Saturated, mark),
+    )
+    .await;
+    let facts = observer.facts(Point::Saturated);
+    assert_eq!(facts.occupied, 2);
+    assert_eq!(facts.pending.len(), 2);
+    assert!(facts.pending.contains(&first_id));
+    let second_id = *facts
+        .pending
+        .iter()
+        .find(|id| **id != first_id)
+        .expect("the second socket is a distinct original");
+    assert_eq!(accepted(&observer), 2);
+    let mut third = TcpStream::connect(address).await.unwrap();
+    drop(first);
+    let parked = observer.mark();
+    drive(
+        &mut service,
+        Arc::clone(&observer),
+        observer.reached_since(Point::Reaped, parked),
+    )
+    .await;
+    assert!(
+        !before_reaped(&observer, parked).contains(&Point::Accepted),
+        "the third peer waits while both slots are held"
+    );
+    assert_eq!(observer.facts(Point::Reaped).reaped, Some(first_id));
+    drive(&mut service, Arc::clone(&observer), open(&mut third)).await;
+    let facts = observer.facts(Point::Accepted);
+    assert_eq!(facts.reaped, Some(first_id));
+    assert_eq!(facts.pending, vec![second_id]);
+    assert_eq!(facts.occupied, 2);
+    assert_eq!(accepted(&observer), 3);
+    service.finish().await;
+    assert_eq!(service.occupied(), 0);
+    assert!(matches!(
+        service.take_exit(),
+        Some(AmqpListenerExit::Complete(_))
+    ));
+    drop((second, third));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn actual_retirement_while_parked_at_capacity_returns_from_serve() {
+    let broker = QuietBroker::default();
+    let (mut service, address) = owner(broker.clone()).await;
+    service.config.max_connections = Some(NonZeroUsize::MIN);
+    let observer = Arc::new(Observer::default());
+    let retirement = service.retirement_handle();
+    let held = TcpStream::connect(address).await.unwrap();
+    drive(
+        &mut service,
+        Arc::clone(&observer),
+        observer.stalled(Stage::Protocol),
+    )
+    .await;
+    let held_id = observer.stalled_id(Stage::Protocol);
+    let waiting = TcpStream::connect(address).await.unwrap();
+    let mark = observer.mark();
+    timeout(
+        WAIT,
+        OBSERVER.scope(Arc::clone(&observer), async {
+            tokio::join!(service.serve(), async {
+                observer.reached_since(Point::Saturated, mark).await;
+                retirement.request();
+            });
+        }),
+    )
+    .await
+    .expect("a pump parked at capacity observes requested retirement");
+    assert!(service.primary.is_none());
+    assert_eq!(accepted(&observer), 1);
+    assert_eq!(service.family.pending_ids(), vec![held_id]);
+    service.finish().await;
+    assert_eq!(service.family.finished_ids(), vec![held_id]);
+    assert_eq!(service.occupied(), 0);
+    assert!(broker.calls.lock().unwrap().is_empty());
+    assert!(matches!(
+        service.take_exit(),
+        Some(AmqpListenerExit::Complete(Ok(())))
+    ));
+    drop((held, waiting));
 }

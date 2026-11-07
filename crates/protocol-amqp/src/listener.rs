@@ -6,6 +6,7 @@
 //! what makes an abrupt disconnect safe.
 
 use std::{
+    num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::Arc,
 };
@@ -64,9 +65,11 @@ pub struct AmqpListener<B> {
     container_id: String,
     tls_acceptor: Option<TlsAcceptor>,
     shared_access_authentication: Option<SharedAccessAuthentication>,
+    max_connections: Option<NonZeroUsize>,
 }
 
 impl<B: Broker> AmqpListener<B> {
+    /// A listener with no live-socket limit; see `with_max_connections`.
     pub fn new(broker: B, namespace: NamespaceName) -> Self {
         Self {
             broker,
@@ -74,7 +77,20 @@ impl<B: Broker> AmqpListener<B> {
             container_id: String::from("switchyard"),
             tls_acceptor: None,
             shared_access_authentication: None,
+            max_connections: None,
         }
+    }
+
+    /// Bounds the live sockets this listener holds at once.
+    ///
+    /// A socket counts from accept, through any TLS, WebSocket upgrade and
+    /// AMQP/SASL handshake, until its original connection task is joined, not
+    /// merely until its handler returns. At the limit the listener stops
+    /// accepting, so new peers wait in the OS backlog rather than being
+    /// accepted and closed. Without this call the listener is unbounded.
+    pub fn with_max_connections(mut self, limit: NonZeroUsize) -> Self {
+        self.max_connections = Some(limit);
+        self
     }
 
     /// Secures accepted sockets before AMQP and SASL negotiation begin.

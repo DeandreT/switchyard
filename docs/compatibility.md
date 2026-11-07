@@ -342,8 +342,11 @@ Custody is owner-scoped, not whole-task-tree shielding. Borrowed cancellation/re
 requires a surviving owner; retirement requests prove neither joins nor peer answers.
 Raw priorities and cleanup notices differ by owner. Begun broker/cleanup drains
 remain unbounded; owner-drop and aborted-ancestor survival are excluded. TCP custody
-is included; WSS #225, admission #135, deadlines #136 and process shutdown #7 remain
-separate. See [storage limits](lifecycle.md#storage-and-runtime-limits) and the
+is included; WSS #225, deadlines #136 and process shutdown #7 remain separate.
+The optional listener socket limit (`--max-connections`, unbounded by default)
+counts TLS/upgrade/AMQP handshakes and open connections until their original task
+joins; at the limit the listener stops accepting and new peers wait in the OS
+backlog. See [storage limits](lifecycle.md#storage-and-runtime-limits) and the
 [eleven owner contracts](lifecycle.md#owner-custody).
 
 Sustained traffic beyond initial credit is uncertified: [#68](https://github.com/DeandreT/switchyard/issues/68)

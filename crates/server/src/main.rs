@@ -3,6 +3,7 @@
 use std::{
     fs,
     net::SocketAddr,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
@@ -71,6 +72,13 @@ struct Arguments {
     /// command-line value because process arguments are commonly observable.
     #[arg(long, value_name = "PATH")]
     shared_access_key_file: Option<PathBuf>,
+
+    /// Most live sockets the listener holds at once, counting TLS, WebSocket
+    /// upgrade and AMQP handshakes as well as open connections. At the limit
+    /// new peers wait in the OS backlog until a held connection ends.
+    /// Unbounded when omitted.
+    #[arg(long, value_name = "COUNT")]
+    max_connections: Option<NonZeroUsize>,
 
     /// The namespace this node serves. A hostname is accepted and its first
     /// label taken, so a deployment can name namespaces in DNS.
@@ -293,8 +301,12 @@ fn run() -> Result<(), StartupError> {
                 address: listen.to_string(),
                 detail: error.to_string(),
             })?;
-        info!(address = %listen, namespace = %namespace, tls = tls.is_some(), transport = ?arguments.transport, "accepting AMQP connections");
+        info!(address = %listen, namespace = %namespace, tls = tls.is_some(), transport = ?arguments.transport, max_connections = ?arguments.max_connections, "accepting AMQP connections");
         let amqp = AmqpListener::new(broker.handle(), namespace);
+        let amqp = match arguments.max_connections {
+            Some(limit) => amqp.with_max_connections(limit),
+            None => amqp,
+        };
         let amqp = match tls {
             Some(config) => amqp.with_tls(config),
             None => amqp,
@@ -353,6 +365,25 @@ mod tests {
             listen_address(None, TransportArgument::AmqpWebSockets, true).port(),
             protocol_amqp::AMQP_WEBSOCKET_PORT
         );
+    }
+
+    #[test]
+    fn the_connection_limit_is_unbounded_unless_a_positive_count_is_given() {
+        let parse = |extra: &[&str]| {
+            Arguments::try_parse_from(["switchyard"].iter().chain(extra))
+                .map(|arguments| arguments.max_connections)
+        };
+        assert_eq!(parse(&[]).unwrap(), None);
+        assert_eq!(
+            parse(&["--max-connections", "64"]).unwrap(),
+            NonZeroUsize::new(64)
+        );
+        for invalid in ["0", "-1", "many", ""] {
+            assert!(
+                parse(&["--max-connections", invalid]).is_err(),
+                "{invalid:?} is refused"
+            );
+        }
     }
 
     #[test]
