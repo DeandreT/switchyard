@@ -153,11 +153,49 @@ def source_files(root):
     return result
 
 
-def configuration(root, environment):
+# A Cargo-home (user-level) compiler wrapper such as sccache is neutralized in
+# the child environment instead of refused; an empty value disables the
+# configured wrapper. Caller environment and repository/ancestor wrappers refuse.
+WRAPPERS = {"rustc-wrapper": ("RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"), "rustc-workspace-wrapper": ("RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")}
+TRIPLE_CHARACTERS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.")
+
+
+def user_targets(path, table):
+    # Cargo-home [target.<triple>] tables may only set rustflags/linker; they stay
+    # in effect and are recorded. cfg() tables, runners and other keys refuse.
+    require(isinstance(table, dict) and table, f"unsupported Cargo target configuration: {path}")
+    settings = {}
+    for triple, entry in table.items():
+        require(triple and set(triple) <= TRIPLE_CHARACTERS, f"unsupported Cargo target table: {path}: {triple}")
+        require(isinstance(entry, dict) and entry and set(entry) <= {"rustflags", "linker"}, f"unsupported Cargo target settings: {path}: {triple}")
+        flags = entry.get("rustflags", "")
+        require(isinstance(flags, str) or isinstance(flags, list) and all(isinstance(flag, str) for flag in flags), f"invalid Cargo target rustflags: {path}: {triple}")
+        require(isinstance(entry.get("linker", ""), str), f"invalid Cargo target linker: {path}: {triple}")
+        settings[triple] = entry
+    return settings
+
+
+def cargo_home(root, environment):
+    # Like Cargo, an empty CARGO_HOME means unset. A relative one would resolve
+    # against whichever process's working directory reads it, so it refuses.
+    default = Path(os.path.abspath(Path.home() / ".cargo"))
+    value = environment.get("CARGO_HOME") or str(default)
+    require(os.path.isabs(value), "relative CARGO_HOME is unsupported")
+    home = Path(os.path.normpath(value))
+    # Repository/ancestor config must not gain Cargo-home permissions by being
+    # named as CARGO_HOME; the default user home stays valid for checkouts under it.
+    require(home == default or home not in [parent / ".cargo" for parent in (root, *root.parents)], f"CARGO_HOME is a repository or ancestor .cargo directory: {home}")
+    return home
+
+
+def scan_configuration(root, environment):
     require(not any(environment.get(key) for key in ("RUSTC", "RUSTDOC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET", "CARGO_BUILD_BUILD_DIR")), "wrappers or custom Cargo layouts are unsupported")
     files = {}
+    neutralized = {}
+    targets = {}
+    home = cargo_home(root, environment)
     directories = [parent / ".cargo" for parent in (root, *root.parents)]
-    directories.append(Path(environment.get("CARGO_HOME", str(Path.home() / ".cargo"))))
+    directories.append(home)
     for directory in dict.fromkeys(directories):
         for name in ("config", "config.toml"):
             path = directory / name
@@ -165,13 +203,28 @@ def configuration(root, environment):
                 continue
             body = read_file(path)
             data = tomllib.loads(body.decode())
-            require(not any(key in data for key in ("include", "unstable", "env", "target", "host")), f"unsupported Cargo configuration: {path}")
+            unsupported = ("include", "unstable", "env", "host") if directory == home else ("include", "unstable", "env", "target", "host")
+            require(not any(key in data for key in unsupported), f"unsupported Cargo configuration: {path}")
+            if "target" in data:
+                targets[str(canonical(path))] = user_targets(path, data["target"])
             build = data.get("build", {})
-            require(not any(key in build for key in ("target", "target-dir", "build-dir", "rustc", "rustc-wrapper", "rustc-workspace-wrapper")), f"custom Cargo layout/tool is unsupported: {path}")
+            require(isinstance(build, dict), f"unsupported Cargo configuration: {path}")
+            wrappers = sorted(key for key in WRAPPERS if key in build) if directory == home else []
+            require(not any(key in build and key not in wrappers for key in ("target", "target-dir", "build-dir", "rustc", "rustc-wrapper", "rustc-workspace-wrapper")), f"custom Cargo layout/tool is unsupported: {path}")
+            if wrappers:
+                neutralized[str(canonical(path))] = wrappers
             files[str(canonical(path))] = digest(body)
+    variables = sorted(variable for keys in neutralized.values() for key in keys for variable in WRAPPERS[key])
+    return files, {"files": neutralized, "environment": dict.fromkeys(variables, "")}, targets
+
+
+def configuration(root, environment):
+    files, neutralized, targets = scan_configuration(root, environment)
+    for variable in neutralized["environment"]:
+        require(environment.get(variable) == "", f"user-level Cargo wrapper is not neutralized: {variable}")
     flags = {key: value for key, value in environment.items() if key.startswith(("CARGO_", "RUST"))}
     flags.pop("CARGO_TARGET_DIR", None)
-    return {"files": files, "environment": flags}
+    return {"files": files, "environment": flags, "neutralized_wrappers": neutralized, "user_target_settings": targets}
 
 
 def snapshot(root, command, environment, toolchain):
@@ -321,6 +374,8 @@ def run(root, target, command, receipt, min_free, timeout):
     receipt.mkdir()
     command = validate_command(command)
     environment = dict(os.environ, CARGO_TARGET_DIR=str(target), CARGO_BUILD_JOBS="2", CARGO_INCREMENTAL="0", CARGO_TERM_COLOR="never")
+    _, neutralized, user_target_settings = scan_configuration(root, environment)
+    environment.update(neutralized["environment"])
     toolchain = {tool: subprocess.check_output([tool, "-Vv"], cwd=root, env=environment, text=True, timeout=10) for tool in ("cargo", "rustc")}
     require(toolchain["cargo"].startswith("cargo 1.97.1 ") and toolchain["rustc"].startswith("rustc 1.97.1 "), "only the pinned 1.97.1 toolchain layout is supported")
     marker = read_json(target.parent / MARKER)
@@ -339,7 +394,7 @@ def run(root, target, command, receipt, min_free, timeout):
         require(free >= min_free, "insufficient disk headroom")
         bootstrap = pristine_bootstrap(target, marker)
         dirty = [] if bootstrap else invalidated(marker["snapshot"], current, marker["pending"])
-        report = {"version": 1, "root": str(root), "target": str(target), "source_before": current, "pristine_bootstrap": bootstrap, "invalidated": dirty, "free_bytes_before": free, "target_bytes_before": target_size(target), "commands": [], "accepted": False}
+        report = {"version": 1, "root": str(root), "target": str(target), "source_before": current, "neutralized_wrappers": neutralized, "user_target_settings": user_target_settings, "pristine_bootstrap": bootstrap, "invalidated": dirty, "free_bytes_before": free, "target_bytes_before": target_size(target), "commands": [], "accepted": False}
         marker["pending"] = True
         write_json(target.parent / MARKER, marker)
         try:
