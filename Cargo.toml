@@ -36,7 +36,7 @@ testkit = { path = "crates/testkit" }
 
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
-fjall = "3.1.8"
+fjall = "=3.1.13"
 flume = "0.12"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 hmac = "0.12"
