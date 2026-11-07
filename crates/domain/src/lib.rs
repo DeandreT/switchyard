@@ -47,8 +47,8 @@ pub use machine::{
 };
 pub use message::{
     DeadLetterInfo, DeadLetterReason, Delivery, DeliveryGuarantee, DeliveryLock, DeliveryOrigin,
-    LockToken, MAX_MESSAGE_ID_CHARACTERS, MessageEnvelope, MessageRecord, MessageState,
-    ReceiveMode, SequenceNumber,
+    LockToken, MAX_MESSAGE_ID_CHARACTERS, MessageEnvelope, MessageRecord, MessageRecordFormat,
+    MessageState, OverlayProperty, ReceiveMode, SequenceNumber,
 };
 pub use queue::{
     DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS, DEFAULT_LOCK_DURATION_MILLIS,

@@ -13,6 +13,7 @@ use crate::{
 };
 
 use super::{CatalogValidation, SnapshotCatalogError, validate_catalog};
+use crate::codec::message::CanonicalError;
 
 mod allocation;
 mod duplicates;
@@ -389,9 +390,19 @@ impl<'a> Facts<'a> {
                 0x03..=0x0D => {
                     let parsed = keys::state_parts(key).ok_or_else(|| invalid_key(ordinal))?;
                     let value = match &parsed {
-                        StateKey::Message(..) => {
-                            StateValue::Message(Box::new(decode(raw, ordinal)?))
-                        }
+                        StateKey::Message(..) => StateValue::Message(Box::new(
+                            codec::message::decode_canonical(raw).map_err(|error| {
+                                invalid_value(
+                                    ordinal,
+                                    match error {
+                                        CanonicalError::Codec(_) => "state value cannot be decoded",
+                                        CanonicalError::NonCanonical => {
+                                            "state value is not canonical"
+                                        }
+                                    },
+                                )
+                            })?,
+                        )),
                         StateKey::Session(..) => StateValue::Session(decode(raw, ordinal)?),
                         StateKey::DuplicateId(..) => StateValue::Duplicate(decode(raw, ordinal)?),
                         _ if raw.is_empty() => StateValue::Empty,

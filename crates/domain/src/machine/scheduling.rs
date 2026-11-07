@@ -113,7 +113,7 @@ impl<S: StateStore> StateMachine<S> {
             record.state = MessageState::Ready;
             batch.push_put(
                 keys::message(namespace, entity, active_sequence),
-                codec::encode(&record)?,
+                codec::message::encode(&record)?,
             );
             batch.push_put(self.ready_key(command, &record), Vec::new());
             if let Some(expires_at) = record.expires_at {

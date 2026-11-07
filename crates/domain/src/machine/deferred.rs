@@ -6,8 +6,8 @@ use storage::{StateStore, WriteBatch};
 
 use crate::{
     BrokerError, Command, CommandOutcome, DeadLetterReason, Delivery, DeliveryLock, DeliveryOrigin,
-    LockToken, MessageEnvelope, MessageRecord, MessageState, QueueConfig, ReceiveMode,
-    SequenceNumber, SessionHold, codec, keys,
+    LockToken, MessageEnvelope, MessageRecord, MessageRecordFormat, MessageState, QueueConfig,
+    ReceiveMode, SequenceNumber, SessionHold, codec, keys,
 };
 
 use super::{MAX_DEFERRED_RECEIVE_BATCH, StateMachine, require_session_agreement};
@@ -36,7 +36,7 @@ impl<S: StateStore> StateMachine<S> {
         }
         batch.push_put(
             keys::message(namespace, entity, sequence),
-            codec::encode(&record)?,
+            codec::message::encode(&record)?,
         );
         batch.push_put(keys::deferred(namespace, entity, sequence), Vec::new());
         Ok(CommandOutcome::Deferred)
@@ -117,7 +117,7 @@ impl<S: StateStore> StateMachine<S> {
                     batch.push_delete(keys::deferred(namespace, entity, sequence));
                     batch.push_put(
                         keys::message(namespace, entity, sequence),
-                        codec::encode(&record)?,
+                        codec::message::encode(&record)?,
                     );
                     batch.push_put(
                         keys::lock(namespace, entity, locked_until, sequence),
@@ -209,7 +209,7 @@ impl<S: StateStore> StateMachine<S> {
         }
         batch.push_put(
             keys::message(namespace, entity, sequence),
-            codec::encode(&record)?,
+            codec::message::encode(&record)?,
         );
         Ok(())
     }
@@ -230,6 +230,12 @@ pub(super) fn replace_envelope(
         });
     }
     record.envelope = Some(envelope.clone());
+    // A V2 record stores exactly one content form, so the replacement becomes
+    // its AMQP content. The replacement is rebuilt from original bytes and
+    // carries no overlay; copy-local overlays for dispositions come later.
+    if record.format == MessageRecordFormat::V2 {
+        record.body.clear();
+    }
     Ok(())
 }
 

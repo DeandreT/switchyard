@@ -142,7 +142,7 @@ impl<S: StateStore> StateMachine<S> {
                     lifetime.map(|millis| command.issued_at.saturating_add_millis(millis));
                 batch.push_put(
                     keys::message(namespace, subscription, active_sequence),
-                    codec::encode(&copy)?,
+                    codec::message::encode(&copy)?,
                 );
                 batch.push_put(
                     keys::ready(namespace, subscription, active_sequence),

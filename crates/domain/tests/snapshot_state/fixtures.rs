@@ -177,7 +177,7 @@ impl<P: StoreProvider> Fixture<P> {
         put(
             image,
             keys::message(&self.namespace, entity, record.sequence),
-            codec::encode(record).unwrap(),
+            codec::message::encode(record).unwrap(),
         );
     }
 }

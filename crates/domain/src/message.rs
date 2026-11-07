@@ -152,24 +152,77 @@ pub struct MessageEnvelope {
     /// Protocol-neutral projection used only by subscription filters. Keeping
     /// it beside the opaque envelope lets the replicated state machine make the
     /// routing decision without learning how to decode AMQP.
-    filter_properties: Box<FilterProperties>,
+    #[serde(rename = "filter_properties", with = "projection_only")]
+    metadata: Box<EnvelopeMetadata>,
+}
+
+/// Boxed together so the overlay does not grow every envelope and delivery.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct EnvelopeMetadata {
+    filter_properties: FilterProperties,
+    /// Copy-local property values over the original bytes. Only V2 message
+    /// records carry them; commands never do, and durable proposals refuse
+    /// them, so the ordinary command serde shape omits them.
+    overlay: Vec<OverlayProperty>,
+}
+
+mod projection_only {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::EnvelopeMetadata;
+    use crate::FilterProperties;
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &EnvelopeMetadata,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.filter_properties.serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Box<EnvelopeMetadata>, D::Error> {
+        Ok(Box::new(EnvelopeMetadata {
+            filter_properties: FilterProperties::deserialize(deserializer)?,
+            overlay: Vec::new(),
+        }))
+    }
+}
+
+/// One copy-local application-property value. The value is one encoded AMQP
+/// value, so an explicit AMQP null is a value rather than a deletion. Names
+/// are unique within an overlay, which keeps first-insertion order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OverlayProperty {
+    pub name: String,
+    pub value: Vec<u8>,
 }
 
 impl MessageEnvelope {
     pub fn new(bytes: Vec<u8>) -> Self {
         Self {
             bytes,
-            filter_properties: Box::default(),
+            metadata: Box::default(),
         }
     }
 
     pub fn with_filter_properties(mut self, properties: FilterProperties) -> Self {
-        self.filter_properties = Box::new(properties);
+        self.metadata.filter_properties = properties;
+        self
+    }
+
+    /// Data only: nothing applies the overlay to the original bytes yet.
+    pub fn with_overlay(mut self, overlay: Vec<OverlayProperty>) -> Self {
+        self.metadata.overlay = overlay;
         self
     }
 
     pub fn filter_properties(&self) -> &FilterProperties {
-        self.filter_properties.as_ref()
+        &self.metadata.filter_properties
+    }
+
+    pub fn overlay(&self) -> &[OverlayProperty] {
+        &self.metadata.overlay
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -201,7 +254,19 @@ impl From<Vec<u8>> for MessageEnvelope {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Stored format of a message record; see [`codec::message`]. Every record
+/// written today is V1, and a rewrite keeps the format a record was read with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageRecordFormat {
+    /// Body and optional envelope are stored side by side.
+    V1,
+    /// Raw bytes, or AMQP content without a duplicated body: a V2 record with
+    /// an envelope keeps `body` empty and readers use the envelope instead.
+    V2,
+}
+
+/// Stored only through [`codec::message`], never the generic value codec.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MessageRecord {
     pub sequence: SequenceNumber,
     pub message_id: String,
@@ -229,12 +294,13 @@ pub struct MessageRecord {
     /// The lossless protocol-native message, when the ingress adapter supplied
     /// one. Non-protocol producers have no envelope.
     pub envelope: Option<MessageEnvelope>,
+    pub format: MessageRecordFormat,
 }
 
 impl MessageRecord {
-    /// Decodes a stored message from the V1 value format.
+    /// Decodes a stored message in any supported record format.
     pub fn decode(envelope: &[u8]) -> Result<Self, CodecError> {
-        codec::decode(envelope)
+        codec::message::decode(envelope)
     }
 
     /// A message with no configured lifetime never expires, which is the
@@ -297,6 +363,7 @@ mod tests {
             session_id: None,
             dead_letter: None,
             envelope: None,
+            format: MessageRecordFormat::V1,
         }
     }
 
@@ -318,7 +385,7 @@ mod tests {
             session_id: Some(SessionId::new("cart-1").expect("a valid session id")),
             ..record(None)
         };
-        let envelope = codec::encode(&original)?;
+        let envelope = codec::message::encode(&original)?;
         assert_eq!(envelope.first(), Some(&codec::VALUE_FORMAT_V1));
         assert_eq!(MessageRecord::decode(&envelope)?, original);
         Ok(())
@@ -332,7 +399,7 @@ mod tests {
             ])),
             ..record(None)
         };
-        let encoded = codec::encode(&original)?;
+        let encoded = codec::message::encode(&original)?;
 
         assert_eq!(encoded.first(), Some(&codec::VALUE_FORMAT_V1));
         assert_eq!(MessageRecord::decode(&encoded)?, original);
@@ -342,9 +409,9 @@ mod tests {
     #[test]
     fn a_newer_message_format_is_rejected() {
         assert_eq!(
-            MessageRecord::decode(&[codec::VALUE_FORMAT_V1 + 1, 0]),
+            MessageRecord::decode(&[codec::message::VALUE_FORMAT_V2 + 1, 0]),
             Err(CodecError::UnsupportedVersion {
-                version: codec::VALUE_FORMAT_V1 + 1,
+                version: codec::message::VALUE_FORMAT_V2 + 1,
             })
         );
     }

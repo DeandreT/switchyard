@@ -1051,8 +1051,8 @@ fn priorities<P: StoreProvider>(provider: P) -> TestResult {
     let second = SequenceNumber::new(2);
     let message_key = keys::message(&f.namespace, &f.topic, second);
     let message_raw = f.machine.store().inner.get(&message_key)?.unwrap();
-    let retained: MessageRecord = codec::decode(&message_raw)?;
-    let message_error = codec::decode::<MessageRecord>(&[0]).unwrap_err();
+    let retained = MessageRecord::decode(&message_raw)?;
+    let message_error = MessageRecord::decode(&[0]).unwrap_err();
     for counter_bytes in [counter_raw.clone(), vec![0]] {
         f.raw(counter_key.clone(), Some(counter_bytes))?;
         f.raw(message_key.clone(), None)?;
@@ -1099,7 +1099,7 @@ fn priorities<P: StoreProvider>(provider: P) -> TestResult {
                 BrokerError::RuleConfig(RuleConfigError::DuplicateApplicationProperty),
             ),
         ] {
-            f.raw(message_key.clone(), Some(codec::encode(&record)?))?;
+            f.raw(message_key.clone(), Some(codec::message::encode(&record)?))?;
             unchanged_error(&f, 300, CommandKind::ActivateScheduled, error)?;
         }
         f.raw(message_key.clone(), Some(message_raw.clone()))?;
@@ -1323,7 +1323,7 @@ fn indexed<P: StoreProvider>(provider: P) -> TestResult {
     probe.clear();
     let second_key = keys::message(&namespace, &topic, SequenceNumber::new(2));
     let second_raw = store.get(&second_key)?.unwrap();
-    let error = codec::decode::<MessageRecord>(&[0]).unwrap_err();
+    let error = MessageRecord::decode(&[0]).unwrap_err();
     store.apply(WriteBatch::default().put(second_key.clone(), vec![0]))?;
     let corrupt = store.snapshot()?;
     assert_eq!(

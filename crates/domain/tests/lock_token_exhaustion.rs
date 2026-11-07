@@ -855,7 +855,7 @@ fn priorities<P: StoreProvider>(provider: P) -> TestResult {
     let original = f.machine.store().get(&key)?.unwrap();
     let mut value = f.machine.message(&f.namespace, &f.entity, second)?.unwrap();
     value.session_id = Some(id());
-    raw(&f, key.clone(), Some(codec::encode(&value)?))?;
+    raw(&f, key.clone(), Some(codec::message::encode(&value)?))?;
     unchanged_error(
         &f,
         &f.command(

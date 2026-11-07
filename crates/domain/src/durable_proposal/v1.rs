@@ -393,6 +393,10 @@ impl CopyBudget {
         value
             .as_ref()
             .map(|value| {
+                // Overlays belong to stored V2 records, never to proposal intent.
+                if !value.overlay().is_empty() {
+                    return Err(Error::UnsupportedCommandVersion(1));
+                }
                 Ok(Box::new(Envelope {
                     bytes: self.bytes(value.as_bytes())?,
                     properties: self.filter_properties(value.filter_properties())?,

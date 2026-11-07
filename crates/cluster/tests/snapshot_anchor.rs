@@ -473,7 +473,10 @@ fn valid_domain_and_clock_mismatches<S: ImageInstallBackend>(
                 .unwrap();
             let mut message = domain::MessageRecord::decode(value).unwrap();
             message.body[0] ^= 0xff;
-            (key.clone(), domain::codec::encode(&message).unwrap())
+            (
+                key.clone(),
+                domain::codec::message::encode(&message).unwrap(),
+            )
         };
         store
             .apply(WriteBatch::default().put(changed_key.clone(), changed_value))
