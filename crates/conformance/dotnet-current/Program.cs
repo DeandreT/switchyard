@@ -592,10 +592,12 @@ if (await activatedScheduleReceiver.ReceiveMessageAsync(
 }
 
 const string settlementBody = "official-settlement-current";
-await sender.SendMessageAsync(new ServiceBusMessage(settlementBody)
+var settlementMessage = new ServiceBusMessage(settlementBody)
 {
     MessageId = "official-settlement-current",
-});
+};
+settlementMessage.ApplicationProperties["settlement-origin"] = "sender";
+await sender.SendMessageAsync(settlementMessage);
 ServiceBusReceivedMessage? abandoned =
     await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
 if (abandoned is null)
@@ -614,9 +616,18 @@ if (abandoned.DeliveryCount != 1)
     return 26;
 }
 
+Guid abandonId = Guid.Parse("4f1c2d3e-5a6b-4c7d-8e9f-0a1b2c3d4e5f");
 await receiver.AbandonMessageAsync(
     abandoned,
-    new Dictionary<string, object> { ["abandon-stage"] = "returned" });
+    new Dictionary<string, object>
+    {
+        ["abandon-stage"] = "returned",
+        ["abandon-attempt"] = 1,
+        ["abandon-total"] = 9_000_000_000L,
+        ["abandon-ratio"] = 0.5,
+        ["abandon-flag"] = true,
+        ["abandon-id"] = abandonId,
+    });
 ServiceBusReceivedMessage? redelivered =
     await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
 if (redelivered is null)
@@ -640,9 +651,21 @@ if (redelivered.DeliveryCount != 2)
     Console.Error.WriteLine($"unexpected redelivery count: {redelivered.DeliveryCount}");
     return 27;
 }
-if (!Equals(redelivered.ApplicationProperties["abandon-stage"], "returned"))
+// Modified properties keep their types and render over the original ones.
+bool CarriesAbandonPatch(IReadOnlyDictionary<string, object> properties) =>
+    Equals(properties.GetValueOrDefault("settlement-origin"), "sender") &&
+    Equals(properties.GetValueOrDefault("abandon-stage"), "returned") &&
+    properties.GetValueOrDefault("abandon-attempt") is int attempt && attempt == 1 &&
+    properties.GetValueOrDefault("abandon-total") is long total && total == 9_000_000_000L &&
+    properties.GetValueOrDefault("abandon-ratio") is double ratio && ratio == 0.5 &&
+    properties.GetValueOrDefault("abandon-flag") is bool flag && flag &&
+    properties.GetValueOrDefault("abandon-id") is Guid id && id == abandonId;
+if (!CarriesAbandonPatch(redelivered.ApplicationProperties))
 {
-    Console.Error.WriteLine("direct abandon property update was lost");
+    Console.Error.WriteLine(
+        "direct abandon property update was lost: " +
+        string.Join(", ", redelivered.ApplicationProperties.Select(
+            property => $"{property.Key}={property.Value} ({property.Value?.GetType().Name})")));
     return 43;
 }
 
@@ -677,6 +700,12 @@ if (peekedDeadLetter is null ||
         $"source={peekedDeadLetter?.DeadLetterSource}, " +
         $"delivery={peekedDeadLetter?.DeliveryCount}");
     return 50;
+}
+if (!Equals(peekedDeadLetter.ApplicationProperties["deadletter-stage"], "direct") ||
+    !CarriesAbandonPatch(peekedDeadLetter.ApplicationProperties))
+{
+    Console.Error.WriteLine("dead-letter peek lost a modified property");
+    return 99;
 }
 AmqpAnnotatedMessage peekedDeadLetterEnvelope = peekedDeadLetter.GetRawAmqpMessage();
 if (peekedDeadLetterEnvelope.MessageAnnotations.ContainsKey("x-opt-locked-until") ||
@@ -715,7 +744,8 @@ if (deadLettered.DeadLetterSource is not null)
         $"a direct DLQ delivery claimed an auto-forward source: {deadLettered.DeadLetterSource}");
     return 28;
 }
-if (!Equals(deadLettered.ApplicationProperties["deadletter-stage"], "direct"))
+if (!Equals(deadLettered.ApplicationProperties["deadletter-stage"], "direct") ||
+    !CarriesAbandonPatch(deadLettered.ApplicationProperties))
 {
     Console.Error.WriteLine("direct dead-letter property update was lost");
     return 44;
