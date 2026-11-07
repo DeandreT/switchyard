@@ -138,6 +138,7 @@ fn scheduled_message(entry: &Value, index: usize) -> Result<MessageInput, String
         _ => return Err(format!("messages[{index}].message must be AMQP binary")),
     };
     validate_standard_message_size(encoded.len()).map_err(|error| error.to_string())?;
+    // The message arrives in the client's management request: received checks.
     let decoded = decode_message(encoded).map_err(|error| {
         format!("messages[{index}].message is not a complete AMQP message: {error}")
     })?;

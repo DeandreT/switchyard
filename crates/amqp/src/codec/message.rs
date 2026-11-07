@@ -6,9 +6,9 @@ use serde_amqp::{
 };
 
 use super::{
-    amqp_codec_error, append_value, binary_field, bool_field, described, encoded_value_len, field,
-    invalid_data, list, optional_string, optional_u32, string_field, symbol_field, take_described,
-    take_list, timestamp_field, u8_field, u32_field,
+    ValueChecks, amqp_codec_error, append_value, binary_field, bool_field, described,
+    encoded_value_len, field, invalid_data, list, optional_string, optional_u32, string_field,
+    symbol_field, take_described, take_list, timestamp_field, u8_field, u32_field,
 };
 use crate::types::*;
 
@@ -79,12 +79,25 @@ pub fn encode_message(message: &Message) -> io::Result<Vec<u8>> {
     Ok(encoded)
 }
 
+/// Decodes a message received from a peer: a transfer, a batch child or a
+/// message embedded in a management request. Every structural check applies.
 pub fn decode_message(encoded: &[u8]) -> io::Result<Message> {
+    decode_checked_message(encoded, ValueChecks::Received)
+}
+
+/// Decodes message bytes this broker already accepted and stored. Messages
+/// stored before the received checks existed keep decoding; only the checks
+/// that keep serde_amqp from panicking or overflowing its stack apply.
+pub fn decode_stored_message(encoded: &[u8]) -> io::Result<Message> {
+    decode_checked_message(encoded, ValueChecks::Stored)
+}
+
+fn decode_checked_message(encoded: &[u8], checks: ValueChecks) -> io::Result<Message> {
     let mut message = Message::default();
     let mut offset = 0;
     let mut last_section_rank = 0;
     while offset < encoded.len() {
-        let len = encoded_value_len(&encoded[offset..])?;
+        let len = encoded_value_len(&encoded[offset..], checks)?;
         let value =
             serde_amqp::from_slice(&encoded[offset..offset + len]).map_err(amqp_codec_error)?;
         offset += len;
@@ -420,7 +433,8 @@ mod tests {
             })
             .build();
         let encoded = encode_message(&message).expect("message encodes");
-        let encoded_len = encoded_value_len(&encoded).expect("properties section has a length");
+        let encoded_len = encoded_value_len(&encoded, ValueChecks::Received)
+            .expect("properties section has a length");
         let value: Value =
             serde_amqp::from_slice(&encoded[..encoded_len]).expect("properties section decodes");
         let (descriptor, value) = take_described(value).expect("properties are described");

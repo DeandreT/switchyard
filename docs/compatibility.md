@@ -132,6 +132,7 @@ the attach response.
 | Topic sequences | Each offered publication and selected due placeholder consumes one topic-owned slot, even with no matching subscriptions; fanout copies consume none. MAX-1 is the last fresh slot and MAX refuses with nonretryable `SequenceNumberExhausted`. Crossing batches or bounded activation sets retain every original record, counter and Clock without partial fanout. Idle activation and cancellation need no slot. |
 | Browse/deferred | Positive signed peek count, reply cap 250, scan to cap/end; deferred retrieval atomically accepts at most 32 sequences in caller order. |
 | Service limits | 2,000 subscriptions/topic; separate topic/subscription name bounds; Standard default 256 KiB wire-message limit. Commercial namespace/operation quotas absent. |
+| AMQP value shapes | Received frames and messages refuse as malformed when a map has an odd element count, an array uses a compound or described element constructor, a compound's size does not exactly match its counted contents, or nesting exceeds 64 levels; an empty array's element constructor is accepted only as the last encoded bytes of a performative or message section. Stored messages keep decoding without the exact-size, constructor-position and non-map compound-array rules. |
 
 ### Atomicity And Lifecycle
 

@@ -6,7 +6,8 @@
 
 use amqp::{
     AnnotationKey, ApplicationProperties, Body, DeliveryAnnotations, Fields, Header, Message,
-    MessageAnnotations, MessageId, Properties, Uuid, Value, decode_message, encode_message,
+    MessageAnnotations, MessageId, Properties, Uuid, Value, decode_message, decode_stored_message,
+    encode_message,
 };
 use domain::{
     CorrelationValue, Delivery, DeliveryOrigin, FilterProperties, MessageEnvelope, MessageInput,
@@ -119,6 +120,7 @@ fn read_batch(message: &Message) -> Result<Vec<IncomingMessage>, ProtocolError> 
         .iter()
         .enumerate()
         .map(|(index, encoded)| {
+            // Children arrive inside the sender's transfer: received checks.
             let child = decode_message(encoded).map_err(|error| ProtocolError::InvalidBatch {
                 detail: format!("child message {index} is not a complete AMQP message: {error}"),
             })?;
@@ -218,11 +220,14 @@ fn overlay_dead_letter_properties(message: &mut Message, delivery: &Delivery) {
 
 fn stored_message(delivery: &Delivery) -> Result<Message, ProtocolError> {
     Ok(match &delivery.envelope {
-        Some(envelope) => {
-            decode_message(envelope.as_bytes()).map_err(|error| ProtocolError::InvalidEnvelope {
+        // Stored envelopes may predate the received-message checks; receive,
+        // peek, deferred retrieval and property updates must keep decoding
+        // what the broker already accepted.
+        Some(envelope) => decode_stored_message(envelope.as_bytes()).map_err(|error| {
+            ProtocolError::InvalidEnvelope {
                 detail: error.to_string(),
-            })?
-        }
+            }
+        })?,
         None => {
             let properties = Properties {
                 message_id: Some(delivery.message_id.clone().into()),
@@ -720,6 +725,23 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_child_with_an_odd_count_map_is_invalid() {
+        let mut odd =
+            amqp::encode_message(&sent(None, b"odd".to_vec())).expect("the child encodes");
+        // A footer map8 counting one element: a key and no value.
+        odd.extend_from_slice(&[0x00, 0x53, 0x78, 0xc1, 0x03, 0x01, 0xa3, 0x00]);
+        let outer = Message {
+            body: Body::Data(vec![odd.into()]),
+            ..Message::default()
+        };
+
+        assert!(matches!(
+            read_incoming_messages(SERVICE_BUS_BATCH_MESSAGE_FORMAT, &outer, &[]),
+            Err(ProtocolError::InvalidBatch { .. })
+        ));
+    }
+
+    #[test]
     fn an_unknown_message_format_is_rejected_without_reinterpreting_the_body() {
         let message = sent(None, b"ordinary".to_vec());
         assert_eq!(
@@ -776,6 +798,55 @@ mod tests {
             incoming.session_id.as_ref().map(SessionId::as_str),
             Some("cart-1")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_padded_stored_envelope_still_delivers_and_peeks() -> Result<(), ProtocolError> {
+        // The properties list declares one padding byte past its message id,
+        // which the earlier length-only measurement accepted and stored.
+        let mut padded = vec![0x00, 0x53, 0x73, 0xc0, 0x05, 0x01, 0xa1, 0x01, b'x', 0x40];
+        padded.extend(
+            amqp::encode_message(&Message::data(b"payload".to_vec())).expect("the body encodes"),
+        );
+        let delivery = Delivery {
+            sequence: SequenceNumber::new(7),
+            message_id: String::from("x"),
+            body: b"payload".to_vec(),
+            enqueued_at: Timestamp::from_millis(10),
+            scheduled_enqueue_at: None,
+            expires_at: None,
+            delivery_count: 1,
+            lock: None,
+            session_id: None,
+            dead_letter: None,
+            envelope: Some(MessageEnvelope::new(padded.clone())),
+            origin: DeliveryOrigin::Ready,
+        };
+
+        for message in [
+            write_delivery(&delivery)?,
+            write_peeked_delivery_from(&delivery, None)?,
+        ] {
+            assert_eq!(
+                message
+                    .properties
+                    .and_then(|properties| properties.message_id),
+                Some(MessageId::String(String::from("x")))
+            );
+            assert_eq!(message.body, Body::Data(vec![b"payload".to_vec().into()]));
+        }
+
+        // The same bytes arriving from a peer are refused.
+        assert!(decode_message(&padded).is_err());
+        let batch = Message {
+            body: Body::Data(vec![padded.into()]),
+            ..Message::default()
+        };
+        assert!(matches!(
+            read_incoming_messages(SERVICE_BUS_BATCH_MESSAGE_FORMAT, &batch, &[]),
+            Err(ProtocolError::InvalidBatch { .. })
+        ));
         Ok(())
     }
 
