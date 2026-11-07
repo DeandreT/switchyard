@@ -64,8 +64,11 @@ pub enum MessageContentError {
 /// Service Bus caps a message's header (system and application properties) at
 /// 64 KiB on every tier, so a properties-to-modify patch on a message admitted
 /// exactly at the limit, including the one a dead-letter disposition carries,
-/// always fits. Being fixed, it still bounds cumulative overlay growth per copy
-/// at the entity limit plus 64 KiB, well inside the one-MiB proposal envelope.
+/// always fits. Being fixed, it bounds cumulative overlay growth per copy at the
+/// entity limit plus 64 KiB, and never past the content-safety profile's
+/// `max_bytes`, which every rendered copy must fit. Each patch arrives in its
+/// own proposal, so the one-MiB proposal envelope bounds a single patch, not
+/// the accumulated overlay.
 pub const PROPERTY_PATCH_HEADROOM_BYTES: usize = 64 * 1024;
 
 /// Applies a sparse patch to a copy's overlay. Each value must be one bounded

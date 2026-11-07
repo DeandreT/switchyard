@@ -1256,6 +1256,27 @@ fn encoded_width(bytes: &[u8], offset: usize, width: usize) -> io::Result<usize>
         .fold(0_usize, |value, byte| (value << 8) | usize::from(*byte)))
 }
 
+/// Decodes one complete standalone AMQP value received from a peer or built
+/// for one, with every received structural check. Trailing bytes are refused.
+pub fn decode_value(encoded: &[u8]) -> io::Result<Value> {
+    decode_checked_value(encoded, ValueChecks::Received)
+}
+
+/// Decodes one complete standalone AMQP value this broker already stored,
+/// such as a copy-local property overlay value, with the stored checks that
+/// keep serde_amqp from panicking. Trailing bytes are refused.
+pub fn decode_stored_value(encoded: &[u8]) -> io::Result<Value> {
+    decode_checked_value(encoded, ValueChecks::Stored)
+}
+
+fn decode_checked_value(encoded: &[u8], checks: ValueChecks) -> io::Result<Value> {
+    let len = encoded_value_len(encoded, checks)?;
+    if len != encoded.len() {
+        return Err(invalid_data("bytes follow the encoded AMQP value"));
+    }
+    serde_amqp::from_slice(encoded).map_err(amqp_codec_error)
+}
+
 fn amqp_codec_error(error: serde_amqp::Error) -> io::Error {
     invalid_data(error.to_string())
 }

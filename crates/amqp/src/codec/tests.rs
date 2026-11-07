@@ -378,3 +378,27 @@ fn a_padded_stored_message_decodes_but_is_refused_on_receipt() {
         Some(MessageId::String(String::from("x")))
     );
 }
+
+#[test]
+fn a_standalone_value_must_be_complete_and_structurally_sound() {
+    let encoded = serde_amqp::to_vec(&Value::String(String::from("kept"))).expect("value encodes");
+    for decode in [decode_value, decode_stored_value] {
+        assert_eq!(
+            decode(&encoded).expect("one complete value decodes"),
+            Value::String(String::from("kept"))
+        );
+        assert_eq!(decode(&[0x40]).expect("null decodes"), Value::Null);
+        let mut trailing = encoded.clone();
+        trailing.push(0x40);
+        assert!(decode(&trailing).is_err(), "trailing bytes are refused");
+        assert!(decode(&ODD_MAP8).is_err(), "an odd map is refused");
+        assert!(decode(&[]).is_err(), "no value is refused");
+    }
+    // A padded list is a stored shape only.
+    let padded = [0xc0, 0x04, 0x01, 0x54, 0x01, 0x40];
+    assert!(decode_value(&padded).is_err());
+    assert_eq!(
+        decode_stored_value(&padded).expect("a padded stored value decodes"),
+        Value::List(vec![Value::Int(1)])
+    );
+}

@@ -225,10 +225,10 @@ pub(super) fn replace_envelope(
     let Some(envelope) = replacement else {
         return Ok(());
     };
-    // The replacement is rebuilt from the message as delivered, which does not
-    // render the copy's overlay yet, so accepting it would silently drop a
-    // patch. Wire activation switches every property-modifying disposition to
-    // V4 and renders overlays; until then a patched copy refuses replacement.
+    // A whole replacement carries no overlay, so accepting one over a patched
+    // copy would silently drop the patch. The AMQP edge sends property changes
+    // as V4 patches and never builds a replacement; a legacy V1 replacement
+    // that reaches a patched copy is refused.
     if record
         .envelope
         .as_ref()

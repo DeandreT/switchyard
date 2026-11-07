@@ -60,6 +60,23 @@ impl ManagementResponse {
         }
     }
 
+    /// A request field the broker refuses, such as a property value no peer
+    /// could send; reported as Service Bus reports an invalid field.
+    pub(super) fn invalid_field(
+        correlation_id: MessageId,
+        tracking_id: Option<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            correlation_id,
+            status_code: 400,
+            status_description: description.into(),
+            error_condition: Some(crate::INVALID_FIELD),
+            tracking_id,
+            body: Value::Null,
+        }
+    }
+
     pub(super) fn unauthorized(
         correlation_id: MessageId,
         tracking_id: Option<String>,

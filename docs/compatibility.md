@@ -37,7 +37,7 @@ collections require refusal until truthful combined runtime data is available.
 | Transport/auth | AMQP 1.0 TCP/TLS; binary WSS `/$servicebus/websocket` (`AMQPWSB10`/`amqp`); development-only plaintext. TLS precedes AMQP; SASL PLAIN or ANONYMOUS/`MSSBCBS`, then CBS SAS. |
 | Rights | Namespace/entity Send, Listen, Manage (includes both). Send for scheduling/cancellation; Listen for receive management. CBS grants are connection-wide, expire links, and allow 20s initial authorization. |
 | Delivery | Singular/atomic batch send; peek-lock (unsettled) or receive-delete (pre-settled); independent out-of-order settlement; bounded prefetch/drain. Credit is reserved before mutation, empty results release it, and consumption/release completes drain. |
-| Envelope | Durable AMQP body/forms, identifiers, properties, annotations, application properties/footer; broker-authoritative delivery overlays. |
+| Envelope | Durable AMQP body/forms, identifiers, properties, annotations, application properties/footer; copy-local property patches; broker-authoritative delivery overlays. |
 | Management | Renew, abandon, defer/retrieve, ordered peek, schedule/cancel, custom dead-letter and DLQ receive/complete. Unsupported requests reject with compatible conditions/retry hints. |
 | Sessions | Named/next-available attach echoes identifier/deadline; exclusive locks, opaque state, release on close. Renewal/state use `$management`, not automatic renewal. |
 | Duplicates | Exact non-empty message IDs across immediate/batch/scheduled offers on enabled ordinary queues and topics; bounded history expiry. Topic enablement/window are creation-only (default off/10 minutes, inclusive 20 seconds–7 days). |
@@ -221,7 +221,9 @@ V1 bytes. New readers accept V1 through V4; older readers refuse unsupported pro
 versions. AMQP ingress sends every message as V4: a transfer as `SendContent`, and a
 Service Bus batch or scheduled-message request as `SendContentBatch` with each child's
 original bytes. Nothing new emits V1 sends; historical V1 sends still decode and replay
-unchanged. Dispositions still emit their legacy V1 forms.
+unchanged. Link and management dispositions that change properties emit the V4 patch
+forms; dispositions without property changes keep their legacy V1 forms with no
+replacement envelope.
 
 Store format 3 adds no record encoding: journal-entry/frontier/indexed-checkpoint
 formats remain unchanged, and snapshot anchors use the separate owner/container
@@ -241,8 +243,8 @@ the former generic encoding; content sends write V2: raw bytes, or original AMQP
 with a filter projection and a sparse property overlay (unique names in first-insertion
 order; each value one encoded AMQP value, where null is a value) and no duplicated body.
 Rewrites, topic copies, scheduled activation and dead-letter moves keep the version a
-record was read with; only a property patch converts V1 to V2. Overlays are not yet
-rendered on delivery, and durable proposals refuse envelopes carrying them. Runtime V1 reads keep tolerating trailing bytes; V2 framing
+record was read with; only a property patch converts V1 to V2. Durable proposals
+refuse envelopes carrying overlays. Runtime V1 reads keep tolerating trailing bytes; V2 framing
 is exact, and snapshot validation requires canonical rows of either version.
 
 A content send parses AMQP content when it applies, under the fixed content-safety
@@ -275,9 +277,10 @@ an array of empty lists (`list0` elements), which the canonical encoder has no s
 rendering for, and an array of strings or symbols containing non-ASCII text, whose stored
 length would disagree with the text and not be decodable AMQP. Because ingress now sends
 V4, every AMQP send path refuses these shapes for new writes; projections that
-historical V1 sends already stored are unchanged. Property-modifying dispositions still
-re-encode a replacement envelope with the legacy encoder until they send patches. Each derived value is additionally
-re-decoded under the profile as a safety net and refused if it does not round-trip.
+historical V1 sends already stored are unchanged. Property-modifying dispositions send
+patches whose values are checked under the same profile. Each derived value is
+additionally re-decoded under the profile as a safety net and refused if it does not
+round-trip.
 
 A V4 disposition patch maps property names to one encoded AMQP value each, checked
 under the content-safety profile when it applies. It rewrites only the locked copy
@@ -289,9 +292,35 @@ envelope as the original and its body dropped; a V1 envelope that does not parse
 copy without AMQP content, or a value that is not bounded AMQP refuses. The original
 plus every overlay name and value must fit the entity's message-size limit plus a
 fixed 64 KiB headroom, the Service Bus header cap, so a message admitted at the limit
-can still be patched and dead-lettered. An empty patch changes no content. A legacy
+can still be patched and dead-lettered. The allowance never exceeds the 16 MiB
+content-safety ceiling, so every patched copy still renders; a patch past either bound
+refuses as `MessageTooLarge` with the effective maximum. An empty patch changes no content. A legacy
 replacement envelope on a copy that already has an overlay refuses rather than drop
 the patch. Refusals leave the copy, its lock and delivery count unchanged.
+
+AMQP builds each patch from the properties a disposition changes: the Modified
+outcome's message annotations (abandon, or defer with `undeliverable-here`), the
+`com.microsoft:dead-letter` rejection's info map, or management `properties-to-modify`
+on `abandoned`, `defered` or `suspended`. Each value is encoded on its own and must
+pass the received-message checks, and the reserved `DeadLetterReason` and
+`DeadLetterErrorDescription` names are dropped on every path, so a disposition that
+changes only those sends the legacy command. Management updates patch locks received
+on a link as well as by sequence number. A value the checks refuse is
+`amqp:invalid-field`; a patched copy over its size allowance is
+`amqp:link:message-size-exceeded`, and a domain content refusal is
+`amqp:invalid-field`.
+
+Receive, peek and receive-by-sequence render the stored original, then the overlay in
+stored order: a name already present keeps its position and takes the overlay value, a
+new name is appended, and an explicit null renders as an AMQP null. Broker-owned fields
+follow and always win: header delivery count and TTL, absolute expiry, sequence,
+enqueue, scheduling, lock and state annotations, and the dead-letter source. The
+dead-letter reason and description are removed wherever the sender or a patch put them
+and, on a dead-lettered copy, appended from broker state. A patch never touches an
+annotation section, and a sender's `x-opt-lock-token` delivery annotation is replaced by
+the broker's on a locked receive and removed otherwise. A copy at the ceiling renders;
+one whose original plus overlay names and values exceeds it, which the broker never
+writes, or whose stored overlay value does not decode, refuses to render.
 
 ### Storage And Runtime Limits
 

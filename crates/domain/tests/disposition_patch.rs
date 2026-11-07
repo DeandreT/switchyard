@@ -919,6 +919,84 @@ fn distinct_names_accumulate_until_the_headroom_refuses() -> TestResult {
 }
 
 #[test]
+fn a_large_entity_limit_still_caps_accumulation_at_the_content_ceiling() -> TestResult {
+    // Far above the content-safety ceiling, so the ceiling binds instead.
+    const LIMIT: usize = 100 * 1024 * 1024;
+    // Each value encodes to exactly the 256 KiB correlation-value ceiling.
+    const VALUE: usize = 256 * 1024 - 5;
+    let fixture = patched_queue(
+        MemoryProvider::new(),
+        QueueConfig {
+            max_message_bytes: LIMIT,
+            ..QueueConfig::default()
+        },
+    )?;
+    let original = message("m", &[], Vec::new());
+    send_amqp(&fixture, 1, &original)?;
+    let sequence = SequenceNumber::new(1);
+    let property = |index: usize| {
+        entry(
+            &format!("p{index:02}"),
+            &Value::Binary(Binary {
+                bytes: vec![7; VALUE],
+                width: Width::Four,
+            }),
+        )
+    };
+    // A three-byte name plus a five-byte binary header per entry.
+    let per_entry = 3 + 5 + VALUE;
+    let maximum_bytes = CONTENT_LIMITS.max_bytes;
+    assert!(maximum_bytes < LIMIT + PROPERTY_PATCH_HEADROOM_BYTES);
+    // 63 entries fit under 16 MiB and a 64th does not: two patches accumulate
+    // to the cap, and a third distinct name refuses.
+    let mut at = 2;
+    let mut overlay = Vec::new();
+    for range in [0..32, 32..63] {
+        let delivery = locked(fixture.at(at, RECEIVE)?);
+        let patch: Vec<_> = range.map(property).collect();
+        fixture.at(
+            at + 1,
+            CommandKind::AbandonWithPatch {
+                sequence,
+                lock_token: token(&delivery),
+                patch: patch.clone(),
+            },
+        )?;
+        overlay.extend(patch);
+        at += 2;
+    }
+    assert!(original.len() + per_entry * overlay.len() <= maximum_bytes);
+
+    let delivery = locked(fixture.at(at, RECEIVE)?);
+    let before = image(&fixture.machine);
+    assert_eq!(
+        fixture.at(
+            at + 1,
+            CommandKind::AbandonWithPatch {
+                sequence,
+                lock_token: token(&delivery),
+                patch: vec![property(63)],
+            },
+        ),
+        Err(BrokerError::MessageTooLarge {
+            body_bytes: original.len() + per_entry * 64,
+            maximum_bytes,
+        }),
+        "the refusal reports the capped maximum"
+    );
+    assert_eq!(image(&fixture.machine), before, "refusal has no effects");
+    let record = row(
+        &fixture.machine,
+        &fixture.namespace,
+        &fixture.entity,
+        sequence,
+    )
+    .1;
+    assert_eq!(record.envelope.expect("AMQP content").overlay(), overlay);
+    Ok(())
+}
+
+#[test]
 fn a_v1_record_without_an_envelope_refuses_a_patch() -> TestResult {
     let fixture = patched_queue(MemoryProvider::new(), QueueConfig::default())?;
     fixture.at(

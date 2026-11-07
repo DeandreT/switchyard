@@ -502,7 +502,8 @@ async fn actual_cross_entity_token_collision_excludes_the_unrelated_ordinary_ali
             .managed_delivery(&actor.entity, Some(LINK), token)
             .await
             .unwrap();
-        assert_eq!(selected.managed.delivery, Some(original));
+        assert_eq!(selected.managed.entity, actor.entity);
+        assert_eq!(selected.managed.sequence, original.sequence);
         assert!(selected.ordinary.is_none());
         assert_eq!(selected.request_response.as_ref(), Some(&request_response));
         let before = actor.snapshot();
@@ -565,7 +566,6 @@ async fn actual_equal_payload_registrations_have_distinct_owners_for_remove_and_
         management
             .refresh_request_response_delivery_at(
                 Some(&old_rr),
-                domain::Timestamp::from_millis(999_999),
                 120_000,
                 started + Duration::from_millis(1),
             )
@@ -612,13 +612,11 @@ async fn ordinary_authority_captures_an_expired_alias_and_renews_it_before_purge
             .managed_delivery(&actor.entity, Some(LINK), lock.token)
             .await
             .unwrap();
-        assert!(selected.managed.delivery.is_none());
+        assert!(selected.ordinary.is_some());
         assert_eq!(selected.request_response.as_ref(), Some(&registration));
-        let renewed_until = domain::Timestamp::from_millis(lock.locked_until.as_millis() + 1);
         management
             .refresh_request_response_delivery_at(
                 selected.request_response.as_ref(),
-                renewed_until,
                 lock.lock_duration_millis,
                 now,
             )
@@ -631,16 +629,6 @@ async fn ordinary_authority_captures_an_expired_alias_and_renews_it_before_purge
             .unwrap()
             .clone();
         assert!(row.expires_at > now);
-        assert_eq!(
-            row.managed
-                .delivery
-                .as_ref()
-                .unwrap()
-                .lock
-                .unwrap()
-                .locked_until,
-            renewed_until
-        );
         let expired = management
             .register_request_response_delivery_at(actor.entity.clone(), delivery.clone(), started)
             .await;
@@ -661,12 +649,7 @@ async fn ordinary_authority_captures_an_expired_alias_and_renews_it_before_purge
             .register_request_response_delivery_at(actor.entity.clone(), delivery, started)
             .await;
         management
-            .refresh_request_response_delivery_at(
-                None,
-                renewed_until,
-                lock.lock_duration_millis,
-                now,
-            )
+            .refresh_request_response_delivery_at(None, lock.lock_duration_millis, now)
             .await;
         assert!(
             !management
@@ -1303,7 +1286,6 @@ async fn retired_deferred_receive_drains_actual_post_result_delivery_registratio
             .unwrap();
         assert_eq!(registered.entity, actor.entity);
         assert_eq!(registered.sequence, delivery.sequence);
-        assert_eq!(registered.delivery, Some(delivery.clone()));
         actor.assert_one(
             CommandKind::ReceiveDeferred {
                 sequences: vec![original.sequence],
@@ -1359,16 +1341,7 @@ async fn retired_renewal_drains_actual_post_result_lock_refresh() {
         );
         let raw = paused_broker_result(&mut operation, &actor).await;
         let held = management.request_response_deliveries.write().await;
-        assert_eq!(
-            held.get(&key)
-                .unwrap()
-                .managed
-                .delivery
-                .as_ref()
-                .unwrap()
-                .lock,
-            Some(old_lock)
-        );
+        let deadline_before_renewal = held.get(&key).unwrap().expires_at;
         actor.result_gate.release();
         assert_eq!(returned_while_pending(&mut operation, &actor).await, raw);
         let Ok(CommandOutcome::LockRenewed {
@@ -1395,15 +1368,16 @@ async fn retired_renewal_drains_actual_post_result_lock_refresh() {
             Value::Array(Array::from(vec![timestamp_value(renewed.locked_until)])),
         );
         assert_accepted(&take_response(&mut operation).await, &expected_body);
-        assert_eq!(
+        assert!(
             management
-                .request_response_delivery(&actor.entity, old_lock.token)
+                .request_response_deliveries
+                .read()
                 .await
+                .get(&key)
                 .unwrap()
-                .delivery
-                .unwrap()
-                .lock,
-            Some(renewed)
+                .expires_at
+                > deadline_before_renewal,
+            "a committed renewal rearms the registry deadline"
         );
         actor.assert_one(
             CommandKind::RenewLock {

@@ -172,10 +172,11 @@ Peek-lock commits ownership before transfer and deletes only on settlement;
 receive-delete deletes first. Renewal preserves
 live tokens; abandon/expiry redeliver until `MaxDeliveryCountExceeded` DLQ.
 Deferral hides ordinary receive; deferred abandon/expiry restores deferral.
-Management/delivery property updates persist. V4 dispositions instead patch the
-locked copy's properties in place, leaving its original bytes and sibling copies
-unchanged and refreshing the projection later rule matching reads; see
-[compatibility](compatibility.md). Peek never locks/increments delivery;
+Link and management property updates are V4 dispositions that patch the locked
+copy's properties in place, leaving its original bytes and sibling copies unchanged
+and refreshing the projection later rule matching reads. Patches accumulate across
+dispositions and every later receive, peek, receive-by-sequence and DLQ read renders
+them; see [compatibility](compatibility.md). Peek never locks/increments delivery;
 ordinary receivers browse sessions, held-session receivers browse only their own.
 
 Scheduled placeholders are browseable, not receivable/session-available. Activation

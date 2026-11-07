@@ -7,11 +7,11 @@
 use amqp::{
     AnnotationKey, ApplicationProperties, Body, DeliveryAnnotations, Fields, Header, Message,
     MessageAnnotations, MessageId, Properties, Uuid, Value, decode_message, decode_stored_message,
-    encode_message,
+    decode_stored_value, decode_value,
 };
 use domain::{
-    CorrelationValue, Delivery, DeliveryOrigin, FilterProperties, MessageContent, MessageEnvelope,
-    MessageInput, SessionId, Timestamp,
+    CONTENT_LIMITS, CorrelationValue, Delivery, DeliveryOrigin, FilterProperties, MessageContent,
+    MessageEnvelope, MessageInput, OverlayProperty, SessionId, Timestamp,
 };
 use serde_amqp::primitives::Timestamp as AmqpTimestamp;
 
@@ -188,6 +188,9 @@ fn write_delivery_view(
 ) -> Result<Message, ProtocolError> {
     let mut message = stored_message(delivery)?;
 
+    // The copy's own property values come first, so every broker-owned field
+    // below overrides whatever the sender or a patch put in its place.
+    overlay_copy_properties(&mut message, delivery)?;
     overlay_delivery_header(&mut message, delivery, view);
     overlay_delivery_properties(&mut message, delivery);
     overlay_message_annotations(&mut message, delivery, dead_letter_source, view);
@@ -197,43 +200,100 @@ fn write_delivery_view(
     Ok(message)
 }
 
+/// Applies the copy-local overlay a property-modifying disposition left, in
+/// stored order: a name already present keeps its position and takes the
+/// overlay value, a new name is appended, and an explicit null renders as an
+/// AMQP null rather than removing the property. The broker's filter
+/// projection keys properties by name, so it does not depend on this order.
+fn overlay_copy_properties(
+    message: &mut Message,
+    delivery: &Delivery,
+) -> Result<(), ProtocolError> {
+    let Some(envelope) = delivery.envelope.as_ref() else {
+        return Ok(());
+    };
+    if envelope.overlay().is_empty() {
+        return Ok(());
+    }
+    let properties = message
+        .application_properties
+        .get_or_insert_with(ApplicationProperties::default);
+    for property in envelope.overlay() {
+        let value = decode_stored_value(&property.value).map_err(|error| {
+            ProtocolError::InvalidEnvelope {
+                detail: format!(
+                    "the stored value of property {:?} does not decode: {error}",
+                    property.name
+                ),
+            }
+        })?;
+        properties.insert(property.name.as_str(), value);
+    }
+    Ok(())
+}
+
+/// Bytes a rendered copy is bounded by before any of it is decoded: the
+/// stored original plus every overlay name and value. The broker charges a
+/// patched copy by the same measure and caps it at the same ceiling, so a
+/// copy over it is state the broker should never have accepted.
+fn check_render_ceiling(envelope: &MessageEnvelope) -> Result<(), ProtocolError> {
+    let rendered_bytes = envelope
+        .overlay()
+        .iter()
+        .fold(envelope.len(), |total, property| {
+            total
+                .saturating_add(property.name.len())
+                .saturating_add(property.value.len())
+        });
+    if rendered_bytes > CONTENT_LIMITS.max_bytes {
+        return Err(ProtocolError::InvalidEnvelope {
+            detail: format!(
+                "the stored copy needs {rendered_bytes} bytes to render, over the {}-byte ceiling",
+                CONTENT_LIMITS.max_bytes
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn overlay_dead_letter_properties(message: &mut Message, delivery: &Delivery) {
     // A message drained from a dead-letter queue says why it is there, in the
     // properties the Service Bus SDKs read. Custom application properties stay
-    // alongside the broker-owned reason and description.
-    match &delivery.dead_letter {
-        Some(dead_letter) => {
-            let properties = message
-                .application_properties
-                .get_or_insert_with(ApplicationProperties::default);
-            properties.insert(
-                DEAD_LETTER_REASON_PROPERTY,
-                dead_letter.reason.as_str().to_owned(),
-            );
-            properties.insert(
-                DEAD_LETTER_DESCRIPTION_PROPERTY,
-                dead_letter.description.clone(),
-            );
-        }
-        None => {
-            if let Some(properties) = message.application_properties.as_mut() {
-                properties.0.shift_remove(DEAD_LETTER_REASON_PROPERTY);
-                properties.0.shift_remove(DEAD_LETTER_DESCRIPTION_PROPERTY);
-            }
-        }
+    // alongside the broker-owned reason and description, which come last: a
+    // sender's or patch's value for either name never survives, nor keeps its
+    // place.
+    if let Some(properties) = message.application_properties.as_mut() {
+        properties.0.shift_remove(DEAD_LETTER_REASON_PROPERTY);
+        properties.0.shift_remove(DEAD_LETTER_DESCRIPTION_PROPERTY);
+    }
+    if let Some(dead_letter) = &delivery.dead_letter {
+        let properties = message
+            .application_properties
+            .get_or_insert_with(ApplicationProperties::default);
+        properties.insert(
+            DEAD_LETTER_REASON_PROPERTY,
+            dead_letter.reason.as_str().to_owned(),
+        );
+        properties.insert(
+            DEAD_LETTER_DESCRIPTION_PROPERTY,
+            dead_letter.description.clone(),
+        );
     }
 }
 
 fn stored_message(delivery: &Delivery) -> Result<Message, ProtocolError> {
     Ok(match &delivery.envelope {
         // Stored envelopes may predate the received-message checks; receive,
-        // peek, deferred retrieval and property updates must keep decoding
-        // what the broker already accepted.
-        Some(envelope) => decode_stored_message(envelope.as_bytes()).map_err(|error| {
-            ProtocolError::InvalidEnvelope {
-                detail: error.to_string(),
-            }
-        })?,
+        // peek and deferred retrieval must keep decoding what the broker
+        // already accepted.
+        Some(envelope) => {
+            check_render_ceiling(envelope)?;
+            decode_stored_message(envelope.as_bytes()).map_err(|error| {
+                ProtocolError::InvalidEnvelope {
+                    detail: error.to_string(),
+                }
+            })?
+        }
         None => {
             let properties = Properties {
                 message_id: Some(delivery.message_id.clone().into()),
@@ -250,29 +310,38 @@ fn stored_message(delivery: &Delivery) -> Result<Message, ProtocolError> {
     })
 }
 
-/// Applies Service Bus disposition property changes to the durable envelope.
+/// Reads Service Bus disposition property changes into a copy-local patch.
 ///
 /// Microsoft carries application-property updates in the `message-annotations`
-/// field of a Modified outcome and in a similarly shaped management map. They
-/// are applied to the sender's original envelope, before broker-owned delivery
-/// overlays are added, so sequence, lock, and enqueue annotations can never be
-/// persisted accidentally.
-pub(crate) fn replacement_envelope(
-    delivery: &Delivery,
-    properties: &Fields,
-) -> Result<MessageEnvelope, ProtocolError> {
-    let mut message = stored_message(delivery)?;
-    let application_properties = message
-        .application_properties
-        .get_or_insert_with(ApplicationProperties::default);
-    for (name, value) in properties {
-        application_properties.insert(name.as_str(), value.clone());
-    }
-    encode_message(&message)
-        .map(MessageEnvelope::new)
-        .map_err(|error| ProtocolError::InvalidEnvelope {
-            detail: error.to_string(),
+/// field of a Modified outcome, in the info map of a dead-letter rejection and
+/// in the management `properties-to-modify` map. Each value is encoded on its
+/// own and must pass the received-message checks, so the broker stores only
+/// values a peer could have sent. The dead-letter reason and description are
+/// broker-owned and never become patch entries; the broker merges the patch
+/// over the stored copy, never over the broker-owned delivery fields.
+pub(crate) fn property_patch(properties: &Fields) -> Result<Vec<OverlayProperty>, ProtocolError> {
+    properties
+        .iter()
+        .filter(|(name, _)| !is_reserved_dead_letter_property(name.as_str()))
+        .map(|(name, value)| {
+            let invalid = |error: &dyn std::fmt::Display| ProtocolError::InvalidEnvelope {
+                detail: format!(
+                    "property {:?} cannot be modified to this value: {error}",
+                    name.as_str()
+                ),
+            };
+            let encoded = serde_amqp::to_vec(value).map_err(|error| invalid(&error))?;
+            decode_value(&encoded).map_err(|error| invalid(&error))?;
+            Ok(OverlayProperty {
+                name: name.as_str().to_owned(),
+                value: encoded,
+            })
         })
+        .collect()
+}
+
+pub(crate) fn is_reserved_dead_letter_property(name: &str) -> bool {
+    name == DEAD_LETTER_REASON_PROPERTY || name == DEAD_LETTER_DESCRIPTION_PROPERTY
 }
 
 fn overlay_delivery_header(message: &mut Message, delivery: &Delivery, view: DeliveryView) {
@@ -504,8 +573,10 @@ pub(crate) fn correlation_value(value: &Value) -> Result<CorrelationValue, Proto
 
 #[cfg(test)]
 mod tests {
-    use amqp::Symbol;
-    use domain::{DeliveryLock, LockToken, SequenceNumber, Timestamp};
+    use amqp::{Symbol, encode_message};
+    use domain::{
+        DeadLetterInfo, DeadLetterReason, DeliveryLock, LockToken, SequenceNumber, Timestamp,
+    };
 
     use super::*;
 
@@ -956,6 +1027,412 @@ mod tests {
                         .0
                         .contains_key(&AnnotationKey::from(LOCK_TOKEN_ANNOTATION))
                 })
+        );
+        Ok(())
+    }
+
+    fn overlay_entry(name: &str, value: Value) -> OverlayProperty {
+        OverlayProperty {
+            name: name.to_owned(),
+            value: serde_amqp::to_vec(&value).expect("the overlay value encodes"),
+        }
+    }
+
+    fn patched_delivery(original: &Message, overlay: Vec<OverlayProperty>) -> Delivery {
+        Delivery {
+            sequence: SequenceNumber::new(7),
+            message_id: String::new(),
+            body: Vec::new(),
+            enqueued_at: Timestamp::from_millis(10),
+            scheduled_enqueue_at: None,
+            expires_at: None,
+            delivery_count: 2,
+            lock: Some(DeliveryLock {
+                token: LockToken::new(3),
+                locked_until: Timestamp::from_millis(100),
+                lock_duration_millis: 60_000,
+            }),
+            session_id: None,
+            dead_letter: None,
+            envelope: Some(
+                MessageEnvelope::new(encode_message(original).expect("the original encodes"))
+                    .with_overlay(overlay),
+            ),
+            origin: DeliveryOrigin::Ready,
+        }
+    }
+
+    fn rendered_properties(message: &Message) -> Vec<(String, Value)> {
+        message
+            .application_properties
+            .as_ref()
+            .map(|properties| {
+                properties
+                    .0
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn views(delivery: &Delivery) -> Result<[Message; 2], ProtocolError> {
+        Ok([
+            write_delivery(delivery)?,
+            write_peeked_delivery_from(delivery, None)?,
+        ])
+    }
+
+    #[test]
+    fn an_overlay_replaces_in_place_appends_new_names_and_keeps_null() -> Result<(), ProtocolError>
+    {
+        let original = Message::builder()
+            .application_properties(
+                ApplicationProperties::builder()
+                    .insert("first", "original")
+                    .insert("second", 2_i32)
+                    .insert("third", "untouched")
+                    .build(),
+            )
+            .body(Body::Data(vec![b"payload".to_vec().into()]))
+            .build();
+        let delivery = patched_delivery(
+            &original,
+            vec![
+                overlay_entry("second", Value::String(String::from("patched"))),
+                overlay_entry("added", Value::Long(9)),
+                overlay_entry("first", Value::Null),
+            ],
+        );
+
+        for message in views(&delivery)? {
+            assert_eq!(
+                rendered_properties(&message),
+                vec![
+                    (String::from("first"), Value::Null),
+                    (
+                        String::from("second"),
+                        Value::String(String::from("patched"))
+                    ),
+                    (
+                        String::from("third"),
+                        Value::String(String::from("untouched"))
+                    ),
+                    (String::from("added"), Value::Long(9)),
+                ]
+            );
+            assert_eq!(message.body, Body::Data(vec![b"payload".to_vec().into()]));
+        }
+
+        // A message sent without application properties gains them in order.
+        let bare = patched_delivery(
+            &Message::data(b"bare".to_vec()),
+            vec![
+                overlay_entry("b", Value::Int(1)),
+                overlay_entry("a", Value::Int(2)),
+            ],
+        );
+        for message in views(&bare)? {
+            assert_eq!(
+                rendered_properties(&message),
+                vec![
+                    (String::from("b"), Value::Int(1)),
+                    (String::from("a"), Value::Int(2)),
+                ]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn broker_dead_letter_details_win_over_content_and_overlay() -> Result<(), ProtocolError> {
+        let original = Message::builder()
+            .application_properties(
+                ApplicationProperties::builder()
+                    .insert(DEAD_LETTER_REASON_PROPERTY, "forged in content")
+                    .insert("kept", 1_i32)
+                    .build(),
+            )
+            .body(Body::Data(vec![b"payload".to_vec().into()]))
+            .build();
+        let overlay = vec![
+            overlay_entry(
+                DEAD_LETTER_DESCRIPTION_PROPERTY,
+                Value::String(String::from("forged in overlay")),
+            ),
+            overlay_entry("reviewed", Value::Bool(true)),
+        ];
+        let mut delivery = patched_delivery(&original, overlay);
+
+        // Active: neither forged value reaches the receiver.
+        for message in views(&delivery)? {
+            let properties = rendered_properties(&message);
+            assert_eq!(
+                properties,
+                vec![
+                    (String::from("kept"), Value::Int(1)),
+                    (String::from("reviewed"), Value::Bool(true)),
+                ]
+            );
+        }
+
+        // Dead-lettered: the broker's reason and description replace both.
+        delivery.dead_letter = Some(DeadLetterInfo {
+            reason: DeadLetterReason::Application(String::from("InvalidOrder")),
+            description: String::from("the order has no customer"),
+            dead_lettered_at: Timestamp::from_millis(20),
+        });
+        for message in views(&delivery)? {
+            assert_eq!(
+                rendered_properties(&message),
+                vec![
+                    (String::from("kept"), Value::Int(1)),
+                    (String::from("reviewed"), Value::Bool(true)),
+                    (
+                        String::from(DEAD_LETTER_REASON_PROPERTY),
+                        Value::String(String::from("InvalidOrder"))
+                    ),
+                    (
+                        String::from(DEAD_LETTER_DESCRIPTION_PROPERTY),
+                        Value::String(String::from("the order has no customer"))
+                    ),
+                ],
+                "broker details replace forged values and come last"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn forged_broker_annotations_are_overridden_or_stripped() -> Result<(), ProtocolError> {
+        let mut message_annotations = MessageAnnotations::default();
+        message_annotations.insert(SEQUENCE_NUMBER_ANNOTATION, Value::Long(999));
+        message_annotations.insert(ENQUEUE_SEQUENCE_NUMBER_ANNOTATION, Value::Long(999));
+        message_annotations.insert(
+            ENQUEUED_TIME_ANNOTATION,
+            Value::Timestamp(AmqpTimestamp::from_milliseconds(999)),
+        );
+        message_annotations.insert(
+            LOCKED_UNTIL_ANNOTATION,
+            Value::Timestamp(AmqpTimestamp::from_milliseconds(999)),
+        );
+        message_annotations.insert(DEAD_LETTER_SOURCE_ANNOTATION, "forged-source");
+        message_annotations.insert(MESSAGE_STATE_ANNOTATION, Value::Int(2));
+        message_annotations.insert(
+            SCHEDULED_ENQUEUE_TIME_ANNOTATION,
+            Value::Timestamp(AmqpTimestamp::from_milliseconds(999)),
+        );
+        message_annotations.insert("x-custom", "kept");
+        let mut delivery_annotations = DeliveryAnnotations::default();
+        delivery_annotations.insert(LOCK_TOKEN_ANNOTATION, Value::Uuid(Uuid::from([7_u8; 16])));
+        delivery_annotations.insert("x-hop", "sender only");
+        let original = Message {
+            header: Some(Header {
+                delivery_count: 50,
+                ..Header::default()
+            }),
+            delivery_annotations: Some(delivery_annotations),
+            message_annotations: Some(message_annotations),
+            ..Message::data(b"payload".to_vec())
+        };
+        let delivery = patched_delivery(&original, vec![overlay_entry("p", Value::Int(1))]);
+
+        let [received, peeked] = views(&delivery)?;
+        for (message, locked) in [(&received, true), (&peeked, false)] {
+            let annotations = message
+                .message_annotations
+                .as_ref()
+                .expect("broker annotations are present");
+            let get = |name: &str| annotations.get(&AnnotationKey::from(name));
+            assert_eq!(get(SEQUENCE_NUMBER_ANNOTATION), Some(&Value::Long(7)));
+            assert_eq!(
+                get(ENQUEUE_SEQUENCE_NUMBER_ANNOTATION),
+                Some(&Value::Long(7))
+            );
+            assert!(matches!(
+                get(ENQUEUED_TIME_ANNOTATION),
+                Some(Value::Timestamp(value)) if value.milliseconds() == 10
+            ));
+            assert_eq!(get(DEAD_LETTER_SOURCE_ANNOTATION), None);
+            assert_eq!(get(MESSAGE_STATE_ANNOTATION), None);
+            assert_eq!(get(SCHEDULED_ENQUEUE_TIME_ANNOTATION), None);
+            assert_eq!(get("x-custom"), Some(&Value::String(String::from("kept"))));
+            if locked {
+                assert!(matches!(
+                    get(LOCKED_UNTIL_ANNOTATION),
+                    Some(Value::Timestamp(value)) if value.milliseconds() == 100
+                ));
+                let delivery_annotations = message
+                    .delivery_annotations
+                    .as_ref()
+                    .expect("the broker lock token is present");
+                let mut token = [0_u8; 16];
+                token[8..].copy_from_slice(&3_u64.to_be_bytes());
+                assert_eq!(
+                    delivery_annotations.get(&AnnotationKey::from(LOCK_TOKEN_ANNOTATION)),
+                    Some(&Value::Uuid(Uuid::from(token)))
+                );
+            } else {
+                assert_eq!(get(LOCKED_UNTIL_ANNOTATION), None);
+                assert_eq!(
+                    message
+                        .delivery_annotations
+                        .as_ref()
+                        .and_then(|annotations| {
+                            annotations.get(&AnnotationKey::from(LOCK_TOKEN_ANNOTATION))
+                        }),
+                    None,
+                    "a peek never carries a lock token, forged or not"
+                );
+            }
+            assert_eq!(
+                message
+                    .delivery_annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.get(&AnnotationKey::from("x-hop"))),
+                Some(&Value::String(String::from("sender only"))),
+                "custom delivery annotations keep round-tripping"
+            );
+        }
+        assert_eq!(
+            received.header.as_ref().map(|header| header.delivery_count),
+            Some(1)
+        );
+        assert_eq!(
+            peeked.header.as_ref().map(|header| header.delivery_count),
+            Some(2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_overlay_value_that_does_not_decode_is_an_invalid_envelope() {
+        for value in [vec![], vec![0x40, 0x40], vec![0xc1, 0x03, 0x01, 0x54, 0x01]] {
+            let delivery = patched_delivery(
+                &Message::data(b"payload".to_vec()),
+                vec![OverlayProperty {
+                    name: String::from("broken"),
+                    value,
+                }],
+            );
+            assert!(matches!(
+                write_delivery(&delivery),
+                Err(ProtocolError::InvalidEnvelope { .. })
+            ));
+            assert!(matches!(
+                write_peeked_delivery_from(&delivery, None),
+                Err(ProtocolError::InvalidEnvelope { .. })
+            ));
+        }
+    }
+
+    /// A copy whose original plus one overlay name and binary value charge
+    /// exactly `charged` bytes, the measure the broker caps patches by.
+    fn charged_copy(charged: usize) -> (Delivery, usize) {
+        let original = Message::data(b"payload".to_vec());
+        let encoded_len = encode_message(&original)
+            .expect("the original encodes")
+            .len();
+        // One-byte name plus a five-byte binary header.
+        let payload = charged - encoded_len - 1 - 5;
+        let mut value = vec![0xb0];
+        value.extend_from_slice(&u32::try_from(payload).expect("fits").to_be_bytes());
+        value.resize(5 + payload, 0);
+        let delivery = patched_delivery(
+            &original,
+            vec![OverlayProperty {
+                name: String::from("x"),
+                value,
+            }],
+        );
+        (delivery, payload)
+    }
+
+    #[test]
+    fn a_copy_at_the_render_ceiling_renders_and_one_byte_over_refuses() -> Result<(), ProtocolError>
+    {
+        // The broker caps a patched copy at exactly this ceiling.
+        let (at_cap, payload) = charged_copy(CONTENT_LIMITS.max_bytes);
+        for message in views(&at_cap)? {
+            assert!(matches!(
+                message
+                    .application_properties
+                    .as_ref()
+                    .and_then(|properties| properties.get("x")),
+                Some(Value::Binary(value)) if value.len() == payload
+            ));
+        }
+
+        let (over, _) = charged_copy(CONTENT_LIMITS.max_bytes + 1);
+        assert!(matches!(
+            write_delivery(&over),
+            Err(ProtocolError::InvalidEnvelope { detail }) if detail.contains("ceiling")
+        ));
+        assert!(matches!(
+            write_peeked_delivery_from(&over, None),
+            Err(ProtocolError::InvalidEnvelope { detail }) if detail.contains("ceiling")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn every_patch_the_protocol_produces_renders_back() -> Result<(), ProtocolError> {
+        let mut map = amqp::OrderedMap::new();
+        map.insert(Value::String(String::from("k")), Value::Int(1));
+        let values = [
+            Value::Null,
+            Value::Bool(false),
+            Value::Ubyte(1),
+            Value::Ushort(2),
+            Value::Uint(3),
+            Value::Ulong(4),
+            Value::Byte(-1),
+            Value::Short(-2),
+            Value::Int(-3),
+            Value::Long(-4),
+            Value::Float(1.5.into()),
+            Value::Double(2.5.into()),
+            Value::Char('x'),
+            Value::Timestamp(AmqpTimestamp::from_milliseconds(1_234)),
+            Value::Uuid(Uuid::from([9_u8; 16])),
+            Value::Binary(vec![1_u8, 2, 3].into()),
+            Value::String(String::from("text")),
+            Value::Symbol(Symbol::from("symbol")),
+            Value::List(vec![Value::Int(1), Value::String(String::from("two"))]),
+            Value::Map(map),
+            Value::Array(amqp::Array::from(vec![Value::Int(1), Value::Int(2)])),
+        ];
+        let mut fields = Fields::new();
+        for (index, value) in values.iter().enumerate() {
+            fields.insert(Symbol::from(format!("p{index}")), value.clone());
+        }
+        let patch = property_patch(&fields)?;
+        assert_eq!(patch.len(), values.len());
+        let delivery = patched_delivery(&Message::data(b"payload".to_vec()), patch);
+        for message in views(&delivery)? {
+            let rendered = rendered_properties(&message);
+            assert_eq!(rendered.len(), values.len());
+            for ((name, rendered), (index, value)) in rendered.iter().zip(values.iter().enumerate())
+            {
+                assert_eq!(name, &format!("p{index}"));
+                assert_eq!(rendered, value, "{name}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_patch_never_carries_broker_owned_dead_letter_names() -> Result<(), ProtocolError> {
+        let mut fields = Fields::new();
+        fields.insert(Symbol::from(DEAD_LETTER_REASON_PROPERTY), Value::Int(1));
+        fields.insert(Symbol::from("kept"), Value::Int(2));
+        fields.insert(
+            Symbol::from(DEAD_LETTER_DESCRIPTION_PROPERTY),
+            Value::Int(3),
+        );
+        assert_eq!(
+            property_patch(&fields)?,
+            vec![overlay_entry("kept", Value::Int(2))]
         );
         Ok(())
     }
