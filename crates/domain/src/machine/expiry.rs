@@ -4,7 +4,7 @@ use storage::{StateStore, WriteBatch};
 
 use crate::{BrokerError, Command, CommandOutcome, DeadLetterReason, MessageState, keys};
 
-use super::{StateMachine, TIMER_SCAN_LIMIT, exceeded_delivery_limit};
+use super::{EXPIRED_DESCRIPTION, StateMachine, TIMER_SCAN_LIMIT, exceeded_delivery_limit};
 
 impl<S: StateStore> StateMachine<S> {
     pub(super) fn expire_locks(
@@ -21,6 +21,7 @@ impl<S: StateStore> StateMachine<S> {
 
         let mut returned_to_ready = 0;
         let mut dead_lettered = 0;
+        let mut deleted = 0;
         for (key, _) in locks {
             let (locked_until, sequence) =
                 keys::trailing_deadline(&key).ok_or(BrokerError::MalformedIndexKey)?;
@@ -36,15 +37,14 @@ impl<S: StateStore> StateMachine<S> {
                 _ => return Err(BrokerError::MessageNotLocked { sequence }),
             };
 
+            // TTL takes precedence over redelivery once the lock lapses; the
+            // entity's expiry policy decides between the shadow and deletion.
             if record.is_expired_at(command.issued_at) {
-                self.move_to_dead_letter(
-                    command,
-                    record,
-                    DeadLetterReason::TimeToLiveExpired,
-                    String::from("the message exceeded its time to live"),
-                    batch,
-                )?;
-                dead_lettered += 1;
+                if self.expire_message(command, &config, record, EXPIRED_DESCRIPTION, batch)? {
+                    dead_lettered += 1;
+                } else {
+                    deleted += 1;
+                }
             } else if exceeded_delivery_limit(command, &config, &record) {
                 self.move_to_dead_letter(
                     command,
@@ -63,6 +63,7 @@ impl<S: StateStore> StateMachine<S> {
         Ok(CommandOutcome::LocksExpired {
             returned_to_ready,
             dead_lettered,
+            deleted,
         })
     }
 
@@ -77,7 +78,12 @@ impl<S: StateStore> StateMachine<S> {
             .store()
             .scan_prefix(&keys::expiry_prefix(namespace, entity), TIMER_SCAN_LIMIT)?;
 
+        // Loaded only once a due message proves the entity exists, so a sweep of
+        // an empty index keeps its existing outcome.
+        let mut config = None;
         let mut dead_lettered = 0;
+        let mut deleted = 0;
+        let mut index_entries_retired = 0;
         for (key, _) in expiring {
             let (expires_at, sequence) =
                 keys::trailing_deadline(&key).ok_or(BrokerError::MalformedIndexKey)?;
@@ -90,14 +96,15 @@ impl<S: StateStore> StateMachine<S> {
                 .ok_or(BrokerError::DanglingIndexEntry { sequence })?;
             match record.state {
                 MessageState::Ready => {
-                    self.move_to_dead_letter(
-                        command,
-                        record,
-                        DeadLetterReason::TimeToLiveExpired,
-                        String::from("the message exceeded its time to live"),
-                        batch,
-                    )?;
-                    dead_lettered += 1;
+                    let config = match config {
+                        Some(config) => config,
+                        None => *config.insert(self.load_config(command)?),
+                    };
+                    if self.expire_message(command, &config, record, EXPIRED_DESCRIPTION, batch)? {
+                        dead_lettered += 1;
+                    } else {
+                        deleted += 1;
+                    }
                 }
                 // A lock protects a message from TTL until settlement, abandon,
                 // or lock expiry. Deferred messages are checked only when a
@@ -105,10 +112,15 @@ impl<S: StateStore> StateMachine<S> {
                 // messages never enter the expiry index before activation.
                 MessageState::Locked { .. } | MessageState::Deferred | MessageState::Scheduled => {
                     batch.push_delete(key);
+                    index_entries_retired += 1;
                 }
             }
         }
 
-        Ok(CommandOutcome::MessagesExpired { dead_lettered })
+        Ok(CommandOutcome::MessagesExpired {
+            dead_lettered,
+            deleted,
+            index_entries_retired,
+        })
     }
 }

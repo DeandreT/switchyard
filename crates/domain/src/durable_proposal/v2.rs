@@ -136,6 +136,9 @@ impl Proposal {
                     .transpose()
                     .map_err(|_| Error::IntegerOutOfRange)?,
             },
+            CommandKind::UpdateSubscription { update, .. } if !update.is_legacy_representable() => {
+                return Err(Error::UnsupportedCommandVersion(2));
+            }
             CommandKind::UpdateSubscription { name, update } => Kind::UpdateSubscription {
                 name: Text::capture(name.as_str())?,
                 lock_duration_millis: update.lock_duration_millis,
@@ -179,6 +182,7 @@ impl Proposal {
                     lock_duration_millis,
                     max_delivery_count,
                     default_time_to_live_millis: default_time_to_live_millis.map(Into::into),
+                    dead_lettering_on_message_expiration: None,
                 },
             },
         };

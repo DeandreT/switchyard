@@ -250,6 +250,7 @@ fn profile(config: QueueConfig) -> QueueConfigUpdate {
         requires_session: Some(config.requires_session),
         requires_duplicate_detection: Some(config.requires_duplicate_detection),
         duplicate_detection_history_millis: Some(config.duplicate_detection_history_millis),
+        dead_lettering_on_message_expiration: None,
     }
 }
 
@@ -320,11 +321,11 @@ fn updated_writes<P: StoreProvider>(provider: P) -> Result<(), Box<dyn Error>> {
         &[
             Mutation::Put {
                 key: keys::queue_config(&fixture.namespace, &fixture.queue),
-                value: codec::encode(&updated)?
+                value: codec::queue::encode(&updated)?
             },
             Mutation::Put {
                 key: keys::queue_config(&fixture.namespace, &dlq),
-                value: codec::encode(&shadow(updated))?
+                value: codec::queue::encode(&shadow(updated))?
             },
             Mutation::Put {
                 key: keys::clock(),
@@ -378,7 +379,7 @@ fn updated_writes<P: StoreProvider>(provider: P) -> Result<(), Box<dyn Error>> {
         &[
             Mutation::Put {
                 key: keys::queue_config(&fixture.namespace, &fixture.queue),
-                value: codec::encode(&parent_only)?
+                value: codec::queue::encode(&parent_only)?
             },
             Mutation::Put {
                 key: keys::clock(),
@@ -695,7 +696,7 @@ fn corrupt_metadata<P: StoreProvider>(provider: P) -> Result<(), Box<dyn Error>>
     let dlq = fixture.queue.dead_letter_queue()?;
     let shadow_key = keys::queue_config(&fixture.namespace, &dlq);
     let owner = keys::entity_metadata(&fixture.namespace, &fixture.queue);
-    let mut noncanonical = codec::encode(&QueueConfig::default())?;
+    let mut noncanonical = codec::queue::encode(&QueueConfig::default())?;
     noncanonical.push(0);
     let cases = vec![
         (owner.clone(), None),
@@ -745,7 +746,7 @@ fn corrupt_metadata<P: StoreProvider>(provider: P) -> Result<(), Box<dyn Error>>
         (parent.clone(), Some(noncanonical)),
         (
             parent,
-            Some(codec::encode(&QueueConfig {
+            Some(codec::queue::encode(&QueueConfig {
                 lock_duration_millis: 0,
                 ..QueueConfig::default()
             })?),
@@ -754,28 +755,28 @@ fn corrupt_metadata<P: StoreProvider>(provider: P) -> Result<(), Box<dyn Error>>
         (shadow_key.clone(), Some(vec![2, 0])),
         (
             shadow_key.clone(),
-            Some(codec::encode(&QueueConfig {
+            Some(codec::queue::encode(&QueueConfig {
                 lock_duration_millis: 1,
                 ..shadow(QueueConfig::default())
             })?),
         ),
         (
             shadow_key.clone(),
-            Some(codec::encode(&QueueConfig {
+            Some(codec::queue::encode(&QueueConfig {
                 requires_session: true,
                 ..shadow(QueueConfig::default())
             })?),
         ),
         (
             shadow_key.clone(),
-            Some(codec::encode(&QueueConfig {
+            Some(codec::queue::encode(&QueueConfig {
                 requires_duplicate_detection: true,
                 ..shadow(QueueConfig::default())
             })?),
         ),
         (
             shadow_key,
-            Some(codec::encode(&QueueConfig {
+            Some(codec::queue::encode(&QueueConfig {
                 default_time_to_live_millis: Some(1),
                 ..shadow(QueueConfig::default())
             })?),
@@ -1315,11 +1316,8 @@ fn existing_command_discriminants_and_queue_storage_shape_remain_unchanged()
         requires_duplicate_detection: config.requires_duplicate_detection,
         duplicate_detection_history_millis: config.duplicate_detection_history_millis,
     };
-    assert_eq!(codec::encode(&config)?, codec::encode(&original)?);
-    assert_eq!(
-        codec::decode::<QueueConfig>(&codec::encode(&original)?)?,
-        config
-    );
+    assert_eq!(codec::queue::encode(&config)?, codec::encode(&original)?);
+    assert_eq!(codec::queue::decode(&codec::encode(&original)?)?, config);
     Ok(())
 }
 

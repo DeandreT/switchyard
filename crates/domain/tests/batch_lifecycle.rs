@@ -223,11 +223,19 @@ fn a_batch_preserves_ttl_sessions_and_envelopes<P: StoreProvider>(
 
     assert_eq!(
         fixture.at(34, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 0 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 0,
+            deleted: 0,
+            index_entries_retired: 0,
+        }
     );
     assert_eq!(
         fixture.at(35, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            deleted: 0,
+            index_entries_retired: 0,
+        }
     );
     assert!(
         fixture

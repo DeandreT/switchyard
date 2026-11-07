@@ -403,6 +403,9 @@ impl EntityOptions {
                         .duplicate_detection_history_millis
                         .filter(|value| *value != 0)
                         .unwrap_or(defaults.duplicate_detection_history_millis),
+                    // Not an admin option yet; creation keeps the legacy default.
+                    dead_lettering_on_message_expiration: defaults
+                        .dead_lettering_on_message_expiration,
                 })
             }
             EntityKind::Topic => EntityProfile::Topic(TopicConfig {
@@ -422,6 +425,8 @@ impl EntityOptions {
                     max_delivery_count: self
                         .max_delivery_count
                         .unwrap_or(defaults.max_delivery_count),
+                    dead_lettering_on_message_expiration: defaults
+                        .dead_lettering_on_message_expiration,
                 })
             }
         })

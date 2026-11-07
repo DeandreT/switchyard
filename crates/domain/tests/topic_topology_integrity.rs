@@ -320,9 +320,10 @@ fn parent_backing_and_shadow_profiles_are_proved_before_routing<P: StoreProvider
     let parent_key = keys::topic_config(&fixture.namespace, &fixture.topic);
     let child_key = keys::queue_config(&fixture.namespace, &child);
     let shadow_key = keys::queue_config(&fixture.namespace, &shadow);
-    let backing: QueueConfig = codec::decode(&fixture.raw().get(&child_key)?.expect("backing"))?;
+    let backing: QueueConfig =
+        codec::queue::decode(&fixture.raw().get(&child_key)?.expect("backing"))?;
     let shadow_config: QueueConfig =
-        codec::decode(&fixture.raw().get(&shadow_key)?.expect("shadow"))?;
+        codec::queue::decode(&fixture.raw().get(&shadow_key)?.expect("shadow"))?;
     let healthy = fixture.raw().snapshot()?;
     fixture
         .raw()
@@ -364,7 +365,7 @@ fn parent_backing_and_shadow_profiles_are_proved_before_routing<P: StoreProvider
         ),
         WriteBatch::default().put(
             keys::queue_config(&fixture.namespace, &fixture.topic),
-            codec::encode(&backing)?,
+            codec::queue::encode(&backing)?,
         ),
         WriteBatch::default().delete(shadow_key.clone()),
         WriteBatch::default().put(
@@ -410,7 +411,8 @@ fn parent_backing_and_shadow_profiles_are_proved_before_routing<P: StoreProvider
             ..backing
         },
     ] {
-        faults.push(WriteBatch::default().put(child_key.clone(), codec::encode(&corrupted)?));
+        faults
+            .push(WriteBatch::default().put(child_key.clone(), codec::queue::encode(&corrupted)?));
     }
     for corrupted in [
         QueueConfig {
@@ -443,7 +445,8 @@ fn parent_backing_and_shadow_profiles_are_proved_before_routing<P: StoreProvider
             ..shadow_config
         },
     ] {
-        faults.push(WriteBatch::default().put(shadow_key.clone(), codec::encode(&corrupted)?));
+        faults
+            .push(WriteBatch::default().put(shadow_key.clone(), codec::queue::encode(&corrupted)?));
     }
     for fault in faults {
         fixture.raw().apply(fault)?;
@@ -507,10 +510,11 @@ fn late_bad_member_blocks_pages_publish_batches_and_activation_atomically<P: Sto
         }
     );
     let key = keys::queue_config(&fixture.namespace, &late);
-    let config: QueueConfig = codec::decode(&fixture.raw().get(&key)?.expect("late backing"))?;
+    let config: QueueConfig =
+        codec::queue::decode(&fixture.raw().get(&key)?.expect("late backing"))?;
     fixture.raw().apply(WriteBatch::default().put(
         key,
-        codec::encode(&QueueConfig {
+        codec::queue::encode(&QueueConfig {
             requires_session: true,
             ..config
         })?,
@@ -868,11 +872,11 @@ fn full_membership_lookahead_preserves_limit_and_admission_priority<P: StoreProv
         );
         batch.push_put(
             keys::queue_config(&fixture.namespace, &child),
-            codec::encode(&backing)?,
+            codec::queue::encode(&backing)?,
         );
         batch.push_put(
             keys::queue_config(&fixture.namespace, &child.dead_letter_queue()?),
-            codec::encode(&shadow_config)?,
+            codec::queue::encode(&shadow_config)?,
         );
         batch.push_put(
             keys::entity_metadata(&fixture.namespace, &child),
@@ -994,6 +998,7 @@ fn healthy_public_pages_and_maximum_composite_addresses_survive_reopen<P: StoreP
         lock_duration_millis: domain::MAX_LOCK_DURATION_MILLIS,
         max_delivery_count: 3,
         default_time_to_live_millis: Some(2_000),
+        dead_lettering_on_message_expiration: true,
     };
     assert_eq!(
         fixture.at_entity(&topic, 13, CommandKind::CreateTopic { config: parent })?,

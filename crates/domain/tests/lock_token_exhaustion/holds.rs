@@ -25,7 +25,8 @@ pub(super) fn existing_holds<P: StoreProvider>(provider: P) -> TestResult {
         f.at(lock.locked_until.as_millis(), CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 0,
-            dead_lettered: 0
+            dead_lettered: 0,
+            deleted: 0,
         }
     );
     assert_eq!(
@@ -83,7 +84,8 @@ pub(super) fn existing_holds<P: StoreProvider>(provider: P) -> TestResult {
         f.at(123, CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 0,
-            dead_lettered: 0
+            dead_lettered: 0,
+            deleted: 0,
         }
     );
     assert_eq!(
@@ -152,7 +154,8 @@ pub(super) fn existing_holds<P: StoreProvider>(provider: P) -> TestResult {
         f.at(lock.locked_until.as_millis(), CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 1,
-            dead_lettered: 0
+            dead_lettered: 0,
+            deleted: 0,
         }
     );
     unchanged_error(
@@ -188,7 +191,8 @@ pub(super) fn existing_holds<P: StoreProvider>(provider: P) -> TestResult {
         f.at(lock.locked_until.as_millis(), CommandKind::ExpireLocks)?,
         CommandOutcome::LocksExpired {
             returned_to_ready: 0,
-            dead_lettered: 0
+            dead_lettered: 0,
+            deleted: 0,
         }
     );
     assert_eq!(
@@ -231,7 +235,8 @@ pub(super) fn existing_holds<P: StoreProvider>(provider: P) -> TestResult {
             f.at(lock.locked_until.as_millis(), CommandKind::ExpireLocks)?,
             CommandOutcome::LocksExpired {
                 returned_to_ready: 0,
-                dead_lettered: 1
+                dead_lettered: 1,
+                deleted: 0,
             }
         );
         assert_eq!(

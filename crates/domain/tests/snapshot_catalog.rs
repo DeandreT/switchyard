@@ -338,18 +338,18 @@ fn companions<P: StoreProvider>(provider: P) {
     }
     let mut shadow = image.clone();
     let key = keys::queue_config(&f.namespace, &f.queue.dead_letter_queue().unwrap());
-    let mut config: QueueConfig = codec::decode(&value(&shadow, &key)).unwrap();
+    let mut config: QueueConfig = codec::queue::decode(&value(&shadow, &key)).unwrap();
     config.max_delivery_count = 10;
-    put(&mut shadow, key, codec::encode(&config).unwrap());
+    put(&mut shadow, key, codec::queue::encode(&config).unwrap());
     assert!(matches!(
         f.reject(&shadow),
         SnapshotCatalogError::InconsistentCatalog { .. }
     ));
     let mut backing = image.clone();
     let key = keys::queue_config(&f.namespace, &f.subscription);
-    let mut config: QueueConfig = codec::decode(&value(&backing, &key)).unwrap();
+    let mut config: QueueConfig = codec::queue::decode(&value(&backing, &key)).unwrap();
     config.max_message_bytes += 1;
-    put(&mut backing, key, codec::encode(&config).unwrap());
+    put(&mut backing, key, codec::queue::encode(&config).unwrap());
     assert!(matches!(
         f.reject(&backing),
         SnapshotCatalogError::InconsistentCatalog { .. }
@@ -491,7 +491,7 @@ fn canonical_rows<P: StoreProvider>(provider: P) {
     put(
         &mut invalid,
         queue_key,
-        codec::encode(&QueueConfig {
+        codec::queue::encode(&QueueConfig {
             lock_duration_millis: 0,
             ..QueueConfig::default()
         })

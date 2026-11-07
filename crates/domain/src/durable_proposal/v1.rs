@@ -479,6 +479,9 @@ impl Proposal {
 impl Kind {
     fn capture(value: &CommandKind, b: &mut CopyBudget) -> Result<Self, Error> {
         Ok(match value {
+            CommandKind::CreateQueue { config } if !config.is_legacy_representable() => {
+                return Err(Error::UnsupportedCommandVersion(1));
+            }
             CommandKind::CreateQueue { config } => Self::CreateQueue {
                 config: Queue::capture(*config)?,
             },
@@ -491,6 +494,9 @@ impl Kind {
                     max_message_bytes: size(config.max_message_bytes)?,
                 },
             },
+            CommandKind::CreateSubscription { config, .. } if !config.is_legacy_representable() => {
+                return Err(Error::UnsupportedCommandVersion(1));
+            }
             CommandKind::CreateSubscription { name, config } => Self::CreateSubscription {
                 name: b.string(name.as_str())?,
                 config: Subscription {
@@ -643,6 +649,9 @@ impl Kind {
             CommandKind::ExpireSessionLocks => Self::ExpireSessionLocks,
             CommandKind::ActivateScheduled => Self::ActivateScheduled,
             CommandKind::ExpireDuplicateHistory => Self::ExpireDuplicateHistory,
+            CommandKind::UpdateQueue { update } if !update.is_legacy_representable() => {
+                return Err(Error::UnsupportedCommandVersion(1));
+            }
             CommandKind::UpdateQueue { update } => Self::UpdateQueue {
                 update: QueueUpdate::capture(*update)?,
             },
@@ -678,6 +687,7 @@ impl Kind {
                     lock_duration_millis: config.lock_duration_millis,
                     max_delivery_count: config.max_delivery_count,
                     default_time_to_live_millis: config.default_time_to_live_millis,
+                    dead_lettering_on_message_expiration: true,
                 },
             },
             Self::CreateRule { name, filter } => CommandKind::CreateRule {
@@ -842,6 +852,7 @@ impl Queue {
             requires_session: self.requires_session,
             requires_duplicate_detection: self.requires_duplicate_detection,
             duplicate_detection_history_millis: self.duplicate_detection_history_millis,
+            dead_lettering_on_message_expiration: true,
         })
     }
 }
@@ -876,6 +887,7 @@ impl QueueUpdate {
             requires_session: self.requires_session,
             requires_duplicate_detection: self.requires_duplicate_detection,
             duplicate_detection_history_millis: self.duplicate_detection_history_millis,
+            dead_lettering_on_message_expiration: None,
         })
     }
 }

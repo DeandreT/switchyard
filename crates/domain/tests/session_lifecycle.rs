@@ -571,7 +571,11 @@ fn an_expired_session_message_is_dead_lettered_out_of_its_session<P: StoreProvid
 
     assert_eq!(
         fixture.at(110, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            deleted: 0,
+            index_entries_retired: 0,
+        }
     );
     // The sweep cleared the session's index entry, not the entity-wide one.
     assert_eq!(

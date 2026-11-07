@@ -513,6 +513,7 @@ async fn original_blocked_transfer_requires_native_stop_join_before_session_clea
                         CommandOutcome::LocksExpired {
                             returned_to_ready: 1,
                             dead_lettered: 0,
+                            deleted: 0,
                         }
                     );
                     assert!(matches!(

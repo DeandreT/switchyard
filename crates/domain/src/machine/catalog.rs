@@ -2,7 +2,7 @@
 
 use storage::StateStore;
 
-use crate::{BrokerError, EntityPath, NamespaceName, QueueConfig, keys};
+use crate::{BrokerError, EntityPath, NamespaceName, QueueConfig, codec, keys};
 
 use super::StateMachine;
 
@@ -28,7 +28,10 @@ impl<S: StateStore> StateMachine<S> {
         namespace: &NamespaceName,
         entity: &EntityPath,
     ) -> Result<Option<QueueConfig>, BrokerError> {
-        self.read(&keys::queue_config(namespace, entity))
+        self.store()
+            .get(&keys::queue_config(namespace, entity))?
+            .map(|raw| codec::queue::decode(&raw).map_err(BrokerError::from))
+            .transpose()
     }
 
     /// Every queue in the store, in key order, across every namespace. The timer

@@ -30,6 +30,11 @@ pub struct QueueConfig {
     pub requires_duplicate_detection: bool,
     /// How long an accepted message identifier remains a duplicate.
     pub duplicate_detection_history_millis: u64,
+    /// Service Bus `DeadLetteringOnMessageExpiration`. `true` moves a message
+    /// whose time to live elapses into the dead-letter queue; `false` deletes
+    /// it. Switchyard defaults to `true`, its long-standing behavior, rather
+    /// than the Service Bus default of `false`.
+    pub dead_lettering_on_message_expiration: bool,
 }
 
 /// Explicit replacement of a queue's default lifetime; an absent patch keeps it.
@@ -51,6 +56,7 @@ pub struct QueueConfigUpdate {
     pub requires_session: Option<bool>,
     pub requires_duplicate_detection: Option<bool>,
     pub duplicate_detection_history_millis: Option<u64>,
+    pub dead_lettering_on_message_expiration: Option<bool>,
 }
 
 impl QueueConfigUpdate {
@@ -84,9 +90,17 @@ impl QueueConfigUpdate {
             duplicate_detection_history_millis: self
                 .duplicate_detection_history_millis
                 .unwrap_or(current.duplicate_detection_history_millis),
+            dead_lettering_on_message_expiration: self
+                .dead_lettering_on_message_expiration
+                .unwrap_or(current.dead_lettering_on_message_expiration),
             ..current
         }
         .validate()
+    }
+
+    /// Whether the frozen V1 update DTO can carry this patch without loss.
+    pub(crate) fn is_legacy_representable(self) -> bool {
+        self.dead_lettering_on_message_expiration.is_none()
     }
 }
 
@@ -100,19 +114,29 @@ impl Default for QueueConfig {
             requires_session: false,
             requires_duplicate_detection: false,
             duplicate_detection_history_millis: DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS,
+            dead_lettering_on_message_expiration: true,
         }
     }
 }
 
 impl QueueConfig {
+    /// The shadow never expires messages, so its expiry policy is normalized
+    /// to the legacy value and the shadow profile keeps its legacy bytes.
     pub(crate) fn dead_letter_shadow(self) -> Self {
         Self {
             max_delivery_count: u32::MAX,
             default_time_to_live_millis: None,
             requires_session: false,
             requires_duplicate_detection: false,
+            dead_lettering_on_message_expiration: true,
             ..self
         }
+    }
+
+    /// Whether the legacy V1 profile record and proposal DTO represent this
+    /// configuration exactly.
+    pub(crate) fn is_legacy_representable(self) -> bool {
+        self.dead_lettering_on_message_expiration
     }
 
     pub fn validate(self) -> Result<Self, QueueConfigError> {

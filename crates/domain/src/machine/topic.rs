@@ -120,23 +120,13 @@ impl<S: StateStore> StateMachine<S> {
                 entity: entity.clone(),
             }
         })?;
-        let config = SubscriptionConfig {
-            lock_duration_millis: backing.lock_duration_millis,
-            max_delivery_count: backing.max_delivery_count,
-            default_time_to_live_millis: backing.default_time_to_live_millis,
-        };
+        let config = SubscriptionConfig::from_backing(backing);
         let expected = config
             .validate()
             .map_err(|_| BrokerError::TopicTopologyCorrupt)?
             .queue_config(parent);
         let shadow = entity.dead_letter_queue()?;
-        let expected_shadow = QueueConfig {
-            max_delivery_count: u32::MAX,
-            default_time_to_live_millis: None,
-            requires_session: false,
-            requires_duplicate_detection: false,
-            ..expected
-        };
+        let expected_shadow = expected.dead_letter_shadow();
         if backing != expected
             || self.raw_queue_config(namespace, &shadow)? != Some(expected_shadow)
             || self
@@ -250,13 +240,7 @@ impl<S: StateStore> StateMachine<S> {
             .queue_config(topic)
             .validate()
             .map_err(BrokerError::from)?;
-        let shadow = QueueConfig {
-            max_delivery_count: u32::MAX,
-            default_time_to_live_millis: None,
-            requires_session: false,
-            requires_duplicate_detection: false,
-            ..queue
-        };
+        let shadow = queue.dead_letter_shadow();
 
         if self
             .store()
@@ -277,10 +261,13 @@ impl<S: StateStore> StateMachine<S> {
             index_key,
             codec::encode(&entity).map_err(BrokerError::from)?,
         );
-        batch.push_put(queue_key, codec::encode(&queue).map_err(BrokerError::from)?);
+        batch.push_put(
+            queue_key,
+            codec::queue::encode(&queue).map_err(BrokerError::from)?,
+        );
         batch.push_put(
             keys::queue_config(&command.namespace, &dead_letter_queue),
-            codec::encode(&shadow).map_err(BrokerError::from)?,
+            codec::queue::encode(&shadow).map_err(BrokerError::from)?,
         );
         self.stage_default_rule(command, &entity, batch)?;
         Ok(CommandOutcome::SubscriptionCreated { entity })

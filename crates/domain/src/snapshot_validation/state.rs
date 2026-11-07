@@ -312,7 +312,16 @@ impl<'a> Facts<'a> {
                         keys::catalog_entity_parts(key).ok_or_else(|| invalid_key(ordinal))?;
                     let profile =
                         if key[0] == 0x01 {
-                            Profile::Queue(decode(raw, ordinal)?)
+                            Profile::Queue(codec::queue::decode(raw).map_err(|_| {
+                                invalid_value(
+                                    ordinal,
+                                    if codec::queue::is_noncanonical(raw) {
+                                        "state value is not canonical"
+                                    } else {
+                                        "state value cannot be decoded"
+                                    },
+                                )
+                            })?)
                         } else {
                             Profile::Topic(codec::topic::decode(raw).map_err(|_| {
                                 invalid_value(ordinal, "topic value is not canonical")

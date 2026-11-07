@@ -223,7 +223,8 @@ async fn started_receive_keeps_its_hidden_result_through_detach_end_and_stop() {
                                     actor.intent(CommandKind::ExpireLocks),
                                     CommandOutcome::LocksExpired {
                                         returned_to_ready: 1,
-                                        dead_lettered: 0
+                                        dead_lettered: 0,
+                                        deleted: 0,
                                     }
                                 );
                                 let recovered = actor.receive();

@@ -1035,7 +1035,7 @@ fn priority<P: StoreProvider>(provider: P) -> Result<(), Box<dyn Error>> {
     fixture.restore(&baseline)?;
     fixture.put(
         keys::queue_config(&fixture.namespace, &fixture.subscription),
-        codec::encode(&QueueConfig {
+        codec::queue::encode(&QueueConfig {
             lock_duration_millis: 0,
             ..QueueConfig::default()
         })?,
@@ -1054,7 +1054,7 @@ fn priority<P: StoreProvider>(provider: P) -> Result<(), Box<dyn Error>> {
         keys::queue_config(&fixture.namespace, &fixture.subscription),
         Vec::new(),
     )?;
-    let error = BrokerError::from(codec::decode::<QueueConfig>(&[]).unwrap_err());
+    let error = BrokerError::from(codec::queue::decode(&[]).unwrap_err());
     let trace = fixture.reject_list(0, 1, error.clone())?;
     fixture.assert_no_rules(&trace);
     let trace = fixture.reject(

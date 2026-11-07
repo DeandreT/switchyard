@@ -72,6 +72,9 @@ pub struct SubscriptionConfig {
     pub lock_duration_millis: u64,
     pub max_delivery_count: u32,
     pub default_time_to_live_millis: Option<u64>,
+    /// Same meaning and default as [`QueueConfig::dead_lettering_on_message_expiration`];
+    /// stored only in the backing queue profile.
+    pub dead_lettering_on_message_expiration: bool,
 }
 
 impl Default for SubscriptionConfig {
@@ -80,6 +83,7 @@ impl Default for SubscriptionConfig {
             lock_duration_millis: DEFAULT_LOCK_DURATION_MILLIS,
             max_delivery_count: DEFAULT_MAX_DELIVERY_COUNT,
             default_time_to_live_millis: None,
+            dead_lettering_on_message_expiration: true,
         }
     }
 }
@@ -111,8 +115,24 @@ impl SubscriptionConfig {
             max_message_bytes: topic.max_message_bytes,
             requires_session: false,
             requires_duplicate_detection: false,
+            dead_lettering_on_message_expiration: self.dead_lettering_on_message_expiration,
             ..QueueConfig::default()
         }
+    }
+
+    /// The subscription settings a backing queue profile records. Callers still
+    /// prove the backing equals `queue_config` of the result.
+    pub(crate) fn from_backing(backing: QueueConfig) -> Self {
+        Self {
+            lock_duration_millis: backing.lock_duration_millis,
+            max_delivery_count: backing.max_delivery_count,
+            default_time_to_live_millis: backing.default_time_to_live_millis,
+            dead_lettering_on_message_expiration: backing.dead_lettering_on_message_expiration,
+        }
+    }
+
+    pub(crate) fn is_legacy_representable(self) -> bool {
+        self.dead_lettering_on_message_expiration
     }
 }
 

@@ -268,6 +268,28 @@ and state facets share the canonical topic codec and permit history only for ena
 ordinary queues or topics. Original row ordinals, phase priority, partial meanings
 and legal ACK gaps remain unchanged; these checks are not recovery certification.
 
+### Expiry Policy
+
+`dead_lettering_on_message_expiration` belongs to each ordinary queue and each
+subscription backing; it defaults on, the long-standing behavior. Every TTL path
+applies the entity's current policy when it observes the elapsed lifetime: the sweep
+of ready messages, receive skipping, abandon and lock expiry after the lifetime
+(TTL still beats redelivery), deferred retrieval, and activated schedules (whose
+lifetime starts at activation). On, the message moves to the DLQ as
+`TTLExpiredException`. Off, the message record and its ready/session, lock, deferred
+and expiry entries are deleted in the same batch and no DLQ row is written.
+`MessagesExpired` and `LocksExpired` report such deletions in `deleted`, apart from
+`dead_lettered`; `MessagesExpired` also reports due entries of locked, deferred or
+scheduled messages retired from the expiry index as `index_entries_retired`. The
+timer counts every handled entry toward a full page, so deletion backlogs drain with
+immediate follow-ups and are never logged as idle. Locks still suspend TTL until
+settlement, abandon or lock expiry. Delivery-count and application dead-lettering
+ignore the policy.
+
+DLQ shadows never expire messages, so their profile always records the policy on and
+keeps legacy bytes. Queue and subscription profile updates may change the policy; it
+governs subsequent expiries only. Topic updates preserve each child's policy.
+
 Reserved `entity/$deadletterqueue` permits no direct create/send or shadow-of-shadow.
 Messages keep sequence/reason, lose lifetime/session, never DLQ again. Reasons use
 `DeadLetterReason`/`DeadLetterErrorDescription`; direct drain omits Azure's forwarded
@@ -277,7 +299,7 @@ Messages keep sequence/reason, lose lifetime/session, never DLQ again. Reasons u
 
 Routing/pages validate the full listed graph before prefixes or copies: each key/value
 names the exact canonical child, with valid parent-derived backing profiles and matching DLQs (`u32::MAX`
-delivery count, no TTL/session/dedup), no topic conflicts. The 2,001-entry scan
+delivery count, no TTL/session/dedup, expiry policy on), no topic conflicts. The 2,001-entry scan
 enforces 2,000; corruption refuses atomically, including beyond small pages.
 Creation refuses orphan membership/occupied DLQs. Unindexed backing queues,
 orphan rules/retained runtime, retained-message/rule deletion fences, live incarnations
@@ -299,7 +321,7 @@ overfull or corrupt stored profiles do not become indexed input refusals.
 
 Topic maximum message bytes propagates to every listed backing queue and DLQ.
 Topic TTL is independent of each child's TTL. Subscription lock duration, delivery
-count and TTL alter only the selected backing profile and its derived DLQ; the DLQ
+count, TTL and expiry policy alter only the selected backing profile and its derived DLQ; the DLQ
 keeps unlimited TTL and delivery count. TTL patches distinguish omission, finite
 milliseconds and explicit unlimited. Only changed profiles and their accompanying
 Clock are staged, in one atomic batch. Direct no-ops write nothing and do not advance
@@ -315,11 +337,15 @@ Existing commands retain byte-identical frozen durable V1 DTOs, including invali
 numeric intent. Only these two update commands use frozen private V2 DTOs with
 canonical framing, bounded identifiers and retained parent-topic authority checks.
 V1 cannot represent them and explicitly refuses capture; V1-only readers refuse the
-V2 envelope. Current readers accept V1 through V4, retaining invalid patch values
+V2 envelope. Current readers accept V1 through V5, retaining invalid patch values
 for domain refusal rather than silently repairing them. The one-MiB envelope limit
 still applies. Nonlegacy topic creation alone uses frozen V3 with V1 creation
 authority rules (not V2 update-only restrictions); V1 capture refuses lossy conversion
-and V1 restore supplies explicit disabled/600,000ms defaults. Journal/checkpoint
+and V1 restore supplies explicit disabled/600,000ms defaults. Queue/subscription
+creation with expiry dead-lettering off, and queue/subscription updates naming that
+setting, use frozen V5 with each family's existing authority rules (subscription
+updates stay parent-topic bound); V1/V2 capture refuses them, V1/V2 restore supplies
+the enabled default and an absent patch, and redundant V5 records are refused. Journal/checkpoint
 formats and legacy-command hashes remain identical. See the
 [topic-local storage fence and rollback requirements](compatibility.md#topic-integrity).
 
@@ -335,7 +361,7 @@ Missing markers are stamped only if known `meta`/`records` are empty; any row
 live owner heads; formats 1 and 2 refuse even empty. The fixed content profile is
 checked at explicit upgrade and capture, not by ordinary writes until #16's
 typed-content admission, so a format 3 store can hold later out-of-profile content. Generic value envelopes remain V1;
-nonlegacy topic profiles use their canonical topic-specific V2 fence. No
+nonlegacy topic and queue profiles use their canonical profile-specific V2 fences. No
 migration/foreign-keyspace proof/byte-invariance claim. See [opener](../crates/storage/src/durable.rs).
 
 Configurations/listed topic profiles require canonical live heads; DLQs share

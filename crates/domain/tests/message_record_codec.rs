@@ -882,7 +882,11 @@ fn v2_rows_keep_their_version_through_deferral_and_dead_lettering() -> TestResul
     );
     assert_eq!(
         fixture.at(100, CommandKind::ExpireMessages)?,
-        CommandOutcome::MessagesExpired { dead_lettered: 1 }
+        CommandOutcome::MessagesExpired {
+            dead_lettered: 1,
+            deleted: 0,
+            index_entries_retired: 0,
+        }
     );
 
     for (sequence, reason) in [

@@ -343,12 +343,14 @@ pub enum CommandOutcome {
     /// `None` when the queue held no deliverable message.
     Received(Option<Delivery>),
     Completed,
+    /// `dead_lettered` is false both when the message returned to ready and
+    /// when its elapsed lifetime deleted it under a disabled expiry policy.
     Abandoned {
         dead_lettered: bool,
     },
     Deferred,
     /// Live requested messages, in caller order. An expired deferred message
-    /// is moved to the dead-letter queue and omitted.
+    /// is omitted after the entity's expiry policy dead-letters or deletes it.
     DeferredReceived(Vec<Delivery>),
     DeadLettered,
     LockRenewed {
@@ -357,12 +359,22 @@ pub enum CommandOutcome {
         /// per-renewal override.
         lock_duration_millis: u64,
     },
+    /// Every elapsed lock handled is counted exactly once. In-memory reply only;
+    /// no outcome is persisted.
     LocksExpired {
         returned_to_ready: u32,
         dead_lettered: u32,
+        /// Expired messages deleted under a disabled expiry policy.
+        deleted: u32,
     },
+    /// Every due expiry entry handled is counted exactly once.
     MessagesExpired {
         dead_lettered: u32,
+        /// Expired messages deleted under a disabled expiry policy.
+        deleted: u32,
+        /// Due entries of locked, deferred or scheduled messages, removed from
+        /// the expiry index while the message itself is kept.
+        index_entries_retired: u32,
     },
     /// `None` when no session was available to accept.
     SessionAccepted(Option<AcceptedSession>),
