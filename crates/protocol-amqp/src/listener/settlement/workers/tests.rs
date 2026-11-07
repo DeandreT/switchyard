@@ -39,6 +39,140 @@ async fn start_worker(
     (id, wire_id, registration)
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn late_confirmation_after_native_detach_is_clean_and_preserves_committed_custody() {
+    for durable in [false, true] {
+        for dead_letter in [false, true] {
+            let mut actor = Actor::new(durable, false);
+            let first = actor.send("retired-confirmation", None);
+            let replacement = actor.send("replacement-delivery", None);
+            let delivery = actor.receive();
+            let replacement_delivery = actor.receive();
+            assert_eq!(delivery.sequence, first);
+            assert_eq!(replacement_delivery.sequence, replacement);
+            let key = actor.key(first);
+            actor.gate.arm(key.clone());
+            let management = ConnectionManagement::new();
+            let mut wire = Wire::new(ReceiverSettleMode::Second).await;
+            let mut workers = SettlementWorkers::new();
+            let (_, first_id, registration) = start_worker(
+                &mut workers,
+                &mut wire,
+                &actor,
+                delivery,
+                Arc::clone(&management),
+            )
+            .await;
+            let state = if dead_letter {
+                amqp::DeliveryState::Rejected(amqp::Rejected::default())
+            } else {
+                amqp::DeliveryState::Accepted(amqp::Accepted)
+            };
+            write_frame(
+                &mut wire.peer,
+                &frame(Performative::Disposition(amqp::Disposition {
+                    role: amqp::Role::Receiver,
+                    first: first_id,
+                    last: None,
+                    settled: false,
+                    state: Some(state),
+                    batchable: false,
+                })),
+            )
+            .await
+            .unwrap();
+            actor.gate.reached(false).await;
+            assert!(
+                actor.store().get(&key).unwrap().is_some(),
+                "no early deletion or confirmation"
+            );
+            wire.no_queued_frame().await;
+            actor.gate.release(false);
+            actor.gate.reached(true).await;
+            assert!(
+                actor.store().get(&key).unwrap().is_none(),
+                "settlement committed before confirmation"
+            );
+            if dead_letter {
+                assert!(
+                    domain::StateMachine::new(actor.store().clone())
+                        .dead_lettered_message(&actor.namespace, &actor.entity, first)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+
+            // Native Detach wins before the broker result reaches the protocol
+            // worker. Do not retire that worker: this is the real gap between
+            // native link retirement and the listener observing its notification.
+            wire.detach().await;
+            wire.sender = Some(wire.reattach(64).await);
+            let mut replacement_workers = SettlementWorkers::new();
+            let (_, replacement_id, replacement_registration) = start_worker(
+                &mut replacement_workers,
+                &mut wire,
+                &actor,
+                replacement_delivery,
+                Arc::clone(&management),
+            )
+            .await;
+            let mut registrations = vec![registration];
+            actor.gate.release(true);
+            let completion = timeout(WAIT, workers.next()).await.unwrap().unwrap();
+            assert!(
+                matches!(
+                    completion.result,
+                    Err(SettlementFailure::Engine(EngineError::RemoteDetached))
+                ),
+                "late confirmation must keep its typed link-retirement result"
+            );
+            assert!(
+                matches!(
+                    super::super::handle_completion(completion, &mut registrations),
+                    Some(super::super::PumpExit::Clean)
+                ),
+                "retired link must not fault its session family"
+            );
+            assert!(registrations.is_empty());
+            assert!(workers.is_empty());
+            wire.no_queued_frame().await;
+
+            wire.accepted(replacement_id).await;
+            wire.confirmed(replacement_id).await;
+            let completion = timeout(WAIT, replacement_workers.next())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                completion.result.is_ok(),
+                "replacement owner remains usable"
+            );
+            let mut replacement_registrations = vec![replacement_registration];
+            assert!(
+                super::super::handle_completion(completion, &mut replacement_registrations)
+                    .is_none()
+            );
+            assert!(replacement_registrations.is_empty());
+            assert!(replacement_workers.is_empty());
+            assert_eq!(
+                actor.gate.state.lock().unwrap().commits,
+                1,
+                "no repeated settlement of the retired delivery"
+            );
+            let committed = actor.store().snapshot().unwrap();
+            wire.stop().await;
+            drop(workers);
+            drop(replacement_workers);
+            actor.reopen();
+            assert_eq!(
+                actor.store().snapshot().unwrap(),
+                committed,
+                "the committed outcome survives reopen"
+            );
+        }
+    }
+}
+
 fn assert_original_finished(
     workers: &SettlementWorkers,
     id: Id,

@@ -647,17 +647,23 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             reply,
         } => {
             let Some(session) = sessions.get(&channel) else {
-                let _ = reply.send(Err(invalid_state(
-                    "settlement confirmation on an unknown session",
-                )));
+                let _ = reply.send(Err(EngineError::RemoteDetached));
                 return Ok(CommandAction::Continue);
             };
-            if !matches!(
-                session.links.get(&handle),
-                Some(LinkState::Sending(link)) if link.drain.incarnation == incarnation
-            ) {
+            let Some(link) = session.links.get(&handle) else {
+                let _ = reply.send(Err(EngineError::RemoteDetached));
+                return Ok(CommandAction::Continue);
+            };
+            // A durable result can reach its confirmation after native Detach or
+            // End. Its old owner is retired, not an active protocol fault; never
+            // write that disposition into a replacement at the same wire handle.
+            if link.incarnation() != incarnation {
+                let _ = reply.send(Err(EngineError::RemoteDetached));
+                return Ok(CommandAction::Continue);
+            }
+            if !matches!(link, LinkState::Sending(_)) {
                 let _ = reply.send(Err(invalid_state(
-                    "settlement confirmation on an unknown sending link",
+                    "settlement confirmation on a receiving link",
                 )));
                 return Ok(CommandAction::Continue);
             }

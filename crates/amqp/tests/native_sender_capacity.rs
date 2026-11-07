@@ -101,9 +101,18 @@ async fn control(peer: &mut DuplexStream) -> (u16, Performative) {
 }
 
 async fn attach(session: &mut ServerSession, peer: &mut DuplexStream) -> Sender {
+    attach_on(session, peer, HANDLE, "capacity-link").await
+}
+
+async fn attach_on(
+    session: &mut ServerSession,
+    peer: &mut DuplexStream,
+    handle: u32,
+    name: &str,
+) -> Sender {
     let attach = Attach {
-        name: String::from("capacity-link"),
-        handle: HANDLE,
+        name: name.to_owned(),
+        handle,
         role: Role::Receiver,
         snd_settle_mode: SenderSettleMode::Unsettled,
         rcv_settle_mode: ReceiverSettleMode::Second,
@@ -136,15 +145,15 @@ async fn attach(session: &mut ServerSession, peer: &mut DuplexStream) -> Sender 
         panic!("server must answer Attach")
     };
     assert_eq!(channel, CHANNEL);
-    assert_eq!(response.handle, HANDLE);
-    assert_eq!(response.name, "capacity-link");
+    assert_eq!(response.handle, handle);
+    assert_eq!(response.name, name);
     assert_eq!(response.rcv_settle_mode, ReceiverSettleMode::Second);
     write_frame(
         peer,
         &frame(
             CHANNEL,
             Performative::Flow(Flow {
-                handle: Some(HANDLE),
+                handle: Some(handle),
                 delivery_count: Some(0),
                 link_credit: Some(CAPACITY as u32 + 3),
                 incoming_window: 2048,
@@ -257,6 +266,10 @@ impl Fixture {
 }
 
 async fn transfer(peer: &mut DuplexStream, marker: u32) -> u32 {
+    transfer_on(peer, HANDLE, marker).await
+}
+
+async fn transfer_on(peer: &mut DuplexStream, handle: u32, marker: u32) -> u32 {
     let Frame::Amqp {
         channel,
         performative: Some(Performative::Transfer(transfer)),
@@ -269,7 +282,7 @@ async fn transfer(peer: &mut DuplexStream, marker: u32) -> u32 {
         panic!("expected the actual message Transfer")
     };
     assert_eq!(channel, CHANNEL);
-    assert_eq!(transfer.handle, HANDLE);
+    assert_eq!(transfer.handle, handle);
     assert_eq!(transfer.delivery_tag, Some(tag(marker)));
     assert_eq!(transfer.settled, Some(false));
     assert!(!transfer.more);
@@ -299,7 +312,7 @@ async fn retain(pending: PendingDelivery, peer: &mut DuplexStream) -> DeliveryCo
     write_frame(
         peer,
         &frame(
-            CHANNEL,
+            identity.channel(),
             Performative::Disposition(Disposition {
                 role: Role::Receiver,
                 first: identity.delivery_id(),
@@ -521,4 +534,154 @@ async fn confirming_one_delivery_admits_one_waiter_and_preserves_the_capacity_bo
     fixture.shutdown().await;
     assert_eq!(held.len(), CAPACITY);
     drop(held);
+}
+
+async fn detach_peer(peer: &mut DuplexStream) {
+    write_frame(
+        peer,
+        &frame(
+            CHANNEL,
+            Performative::Detach(Detach {
+                handle: HANDLE,
+                closed: true,
+                error: None,
+            }),
+        ),
+    )
+    .await
+    .expect("peer Detach");
+    assert!(matches!(
+        control(peer).await,
+        (
+            CHANNEL,
+            Performative::Detach(Detach {
+                handle: HANDLE,
+                closed: true,
+                ..
+            })
+        )
+    ));
+}
+
+async fn confirmed(confirmation: DeliveryConfirmation, peer: &mut DuplexStream) {
+    let identity = confirmation.identity();
+    let (result, (channel, response)) = timeout(LIMIT, async {
+        tokio::join!(
+            confirmation.confirm(DeliveryState::Accepted(Accepted)),
+            control(peer)
+        )
+    })
+    .await
+    .expect("current confirmation and response deadline");
+    result.expect("current confirmation succeeds");
+    let Performative::Disposition(disposition) = response else {
+        panic!("current delivery has a confirmation");
+    };
+    assert_eq!(channel, identity.channel());
+    assert_eq!(disposition.role, Role::Sender);
+    assert_eq!(disposition.first, identity.delivery_id());
+    assert!(disposition.settled);
+    assert_eq!(disposition.state, Some(DeliveryState::Accepted(Accepted)));
+}
+
+#[tokio::test]
+async fn late_confirmation_after_detach_is_link_scoped_and_preserves_reused_handle() {
+    let mut fixture = Fixture::new().await;
+    let pending = sent(&fixture.sender, &mut fixture.peer, 1).await;
+    let old = retain(pending, &mut fixture.peer).await;
+    let pending = sent(&fixture.sender, &mut fixture.peer, 11).await;
+    let removed = retain(pending, &mut fixture.peer).await;
+    detach_peer(&mut fixture.peer).await;
+    let result = timeout(LIMIT, removed.confirm(DeliveryState::Accepted(Accepted)))
+        .await
+        .expect("removed-link confirmation reply deadline");
+    assert!(
+        matches!(result, Err(EngineError::RemoteDetached)),
+        "retired confirmation must not become a session fault: {result:?}"
+    );
+    let replacement = attach(&mut fixture.session, &mut fixture.peer).await;
+    let pending = sent(&replacement, &mut fixture.peer, 2).await;
+    let current = retain(pending, &mut fixture.peer).await;
+    let other = attach_on(&mut fixture.session, &mut fixture.peer, 2, "unrelated-link").await;
+
+    let result = timeout(
+        LIMIT,
+        old.confirm(DeliveryState::Rejected(amqp::Rejected::default())),
+    )
+    .await
+    .expect("old confirmation gets an actual engine reply");
+    assert!(
+        matches!(result, Err(EngineError::RemoteDetached)),
+        "retired confirmation must not become a session fault: {result:?}"
+    );
+    // A stale confirmation must not emit a Disposition, even with a new owner
+    // at the same handle. The next frame belongs to the current confirmation.
+    confirmed(current, &mut fixture.peer).await;
+    let (pending, _) = timeout(LIMIT, async {
+        tokio::join!(
+            other.send_pending(message(3), tag(3)),
+            transfer_on(&mut fixture.peer, 2, 3)
+        )
+    })
+    .await
+    .expect("unrelated link still transfers on the same session");
+    let unrelated = retain(pending.expect("unrelated native send"), &mut fixture.peer).await;
+    confirmed(unrelated, &mut fixture.peer).await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn late_confirmation_after_end_cannot_settle_a_reused_channel_and_delivery_id() {
+    let mut fixture = Fixture::new().await;
+    let pending = sent(&fixture.sender, &mut fixture.peer, 1).await;
+    let old = retain(pending, &mut fixture.peer).await;
+    write_frame(
+        &mut fixture.peer,
+        &frame(CHANNEL, Performative::End(End::default())),
+    )
+    .await
+    .expect("peer End");
+    assert!(matches!(
+        control(&mut fixture.peer).await,
+        (CHANNEL, Performative::End(_))
+    ));
+    write_frame(
+        &mut fixture.peer,
+        &frame(CHANNEL, Performative::Begin(Begin::default())),
+    )
+    .await
+    .expect("reuse channel");
+    let incoming = timeout(LIMIT, fixture.connection.next_incoming_session())
+        .await
+        .expect("replacement session deadline")
+        .expect("replacement Begin");
+    fixture.session = timeout(LIMIT, fixture.connection.accept_session(incoming))
+        .await
+        .expect("replacement session acceptance deadline")
+        .expect("replacement session");
+    assert!(matches!(
+        control(&mut fixture.peer).await,
+        (CHANNEL, Performative::Begin(_))
+    ));
+    let replacement = attach(&mut fixture.session, &mut fixture.peer).await;
+    let pending = sent(&replacement, &mut fixture.peer, 2).await;
+    let current = retain(pending, &mut fixture.peer).await;
+    assert_eq!(
+        old.identity(),
+        current.identity(),
+        "wire identities deliberately collide across session incarnations"
+    );
+
+    let result = timeout(
+        LIMIT,
+        old.confirm(DeliveryState::Rejected(amqp::Rejected::default())),
+    )
+    .await
+    .expect("old confirmation reply deadline");
+    assert!(
+        matches!(result, Err(EngineError::RemoteDetached)),
+        "a retired session must not fault its replacement: {result:?}"
+    );
+    confirmed(current, &mut fixture.peer).await;
+    fixture.shutdown().await;
 }

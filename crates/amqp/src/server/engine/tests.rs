@@ -4,6 +4,7 @@ use super::*;
 use crate::{AmqpError, ErrorCondition, Rejected, Source, Target, Value};
 
 mod capacity;
+mod confirmation;
 mod credit;
 mod incarnation;
 mod session_incarnation;
