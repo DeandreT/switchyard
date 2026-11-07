@@ -9,6 +9,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     task::Poll,
+    time::Duration,
 };
 
 use amqp::{
@@ -55,6 +56,48 @@ fn frame(channel: u16, performative: Performative) -> Frame {
     }
 }
 
+/// A fixture wire wait that reached its deadline, named by its stage.
+#[derive(Debug, PartialEq, Eq)]
+struct Stalled(&'static str);
+
+/// Bounds one fixture wire wait, so a stuck peer fails at its own stage.
+///
+/// Owner drains and broker commit gates are not wire waits and keep their
+/// own witnesses; a later observer wait does not bound earlier I/O.
+async fn bounded<F: Future>(
+    deadline: Duration,
+    stage: &'static str,
+    io: F,
+) -> Result<F::Output, Stalled> {
+    timeout(deadline, io).await.map_err(|_| Stalled(stage))
+}
+
+/// Requires one fixture wire wait to finish within the shared test bound.
+async fn wire<F: Future>(stage: &'static str, io: F) -> F::Output {
+    match bounded(WAIT, stage, io).await {
+        Ok(output) => output,
+        Err(Stalled(stage)) => panic!("WSS fixture wire wait stalled: {stage}"),
+    }
+}
+
+async fn connect(address: SocketAddr) -> TcpStream {
+    wire("TCP connect", TcpStream::connect(address))
+        .await
+        .unwrap()
+}
+
+async fn tls(stream: TcpStream) -> tokio_rustls::client::TlsStream<TcpStream> {
+    wire(
+        "TLS handshake",
+        wss_test_client_tls().connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            stream,
+        ),
+    )
+    .await
+    .unwrap()
+}
+
 async fn upgrade<S>(stream: S, address: SocketAddr, subprotocol: &str) -> WebSocketIo<S>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -65,36 +108,50 @@ where
     request
         .headers_mut()
         .insert("sec-websocket-protocol", subprotocol.parse().unwrap());
-    let (socket, response) = timeout(WAIT, tokio_tungstenite::client_async(request, stream))
-        .await
-        .expect("actual HTTP upgrade response")
-        .unwrap();
+    let (socket, response) = wire(
+        "HTTP upgrade response",
+        tokio_tungstenite::client_async(request, stream),
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
     assert_eq!(response.headers()["sec-websocket-protocol"], subprotocol);
     WebSocketIo::new(socket)
 }
 
-async fn request_open<S: AsyncRead + AsyncWrite + Unpin>(peer: &mut S) {
-    write_protocol_header(peer, ProtocolHeader::AMQP)
+async fn header<S: AsyncRead + AsyncWrite + Unpin>(peer: &mut S, header: ProtocolHeader) {
+    let (write, read) = if header == ProtocolHeader::SASL {
+        ("SASL header write", "SASL header reply")
+    } else {
+        ("AMQP header write", "AMQP header reply")
+    };
+    wire(write, write_protocol_header(peer, header))
         .await
         .unwrap();
     assert_eq!(
-        read_protocol_header(peer).await.unwrap(),
-        ProtocolHeader::AMQP
+        wire(read, read_protocol_header(peer)).await.unwrap(),
+        header
     );
-    write_frame(
-        peer,
-        &frame(0, Performative::Open(Open::new("wss-owner-peer"))),
+}
+
+async fn request_open<S: AsyncRead + AsyncWrite + Unpin>(peer: &mut S) {
+    header(peer, ProtocolHeader::AMQP).await;
+    wire(
+        "Open write",
+        write_frame(
+            peer,
+            &frame(0, Performative::Open(Open::new("wss-owner-peer"))),
+        ),
     )
     .await
     .unwrap();
-    peer.flush().await.unwrap();
+    wire("Open flush", peer.flush()).await.unwrap();
 }
 
 async fn open<S: AsyncRead + AsyncWrite + Unpin>(peer: &mut S) {
     request_open(peer).await;
     assert!(matches!(
-        read_frame(peer).await.unwrap(),
+        wire("Open reply", read_frame(peer)).await.unwrap(),
         Frame::Amqp {
             channel: 0,
             performative: Some(Performative::Open(_)),
@@ -104,33 +161,30 @@ async fn open<S: AsyncRead + AsyncWrite + Unpin>(peer: &mut S) {
 }
 
 async fn mechanisms<S: AsyncRead + AsyncWrite + Unpin>(peer: &mut S) {
-    write_protocol_header(peer, ProtocolHeader::SASL)
-        .await
-        .unwrap();
-    assert_eq!(
-        read_protocol_header(peer).await.unwrap(),
-        ProtocolHeader::SASL
-    );
+    header(peer, ProtocolHeader::SASL).await;
     assert!(matches!(
-        read_frame(peer).await.unwrap(),
+        wire("SASL mechanisms", read_frame(peer)).await.unwrap(),
         Frame::Sasl(amqp::SaslPerformative::Mechanisms(_))
     ));
 }
 
 async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(peer: &mut S) {
     mechanisms(peer).await;
-    write_frame(
-        peer,
-        &Frame::Sasl(amqp::SaslPerformative::Init(amqp::SaslInit {
-            mechanism: amqp::Symbol::from("ANONYMOUS"),
-            initial_response: None,
-            hostname: None,
-        })),
+    wire(
+        "SASL init write",
+        write_frame(
+            peer,
+            &Frame::Sasl(amqp::SaslPerformative::Init(amqp::SaslInit {
+                mechanism: amqp::Symbol::from("ANONYMOUS"),
+                initial_response: None,
+                hostname: None,
+            })),
+        ),
     )
     .await
     .unwrap();
     assert!(matches!(
-        read_frame(peer).await.unwrap(),
+        wire("SASL outcome", read_frame(peer)).await.unwrap(),
         Frame::Sasl(amqp::SaslPerformative::Outcome(amqp::SaslOutcome {
             code: amqp::SaslCode::Ok,
             ..
@@ -167,7 +221,7 @@ async fn actual_wss_cached_admission_retains_socket_receipt_and_original_id_acro
         assert!(matches!(service.binding, Binding::WebSocket));
         let observer = Arc::new(Observer::default());
         observer.hold(point);
-        let client = TcpStream::connect(address).await.unwrap();
+        let client = connect(address).await;
         drive(&mut service, Arc::clone(&observer), observer.reached(point)).await;
         let facts = observer.facts(point);
         assert!(facts.finished.is_empty());
@@ -197,12 +251,52 @@ async fn actual_wss_cached_admission_retains_socket_receipt_and_original_id_acro
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn actual_wss_held_peer_times_out_named_upgrade_wait_then_drains_same_original() {
+    // Only this asserted stall keeps a short window; it proves the bound fires.
+    const HELD: Duration = Duration::from_millis(200);
+    let broker = QuietBroker::default();
+    let (mut service, address) = wss_owner(broker.clone()).await;
+    let observer = Arc::new(Observer::default());
+    observer.hold(Point::Prepared);
+    let stream = connect(address).await;
+    let client = drive(&mut service, Arc::clone(&observer), async {
+        observer.reached(Point::Prepared).await;
+        let pending = upgrade(stream, address, AMQP_WEBSOCKET_SUBPROTOCOL);
+        tokio::pin!(pending);
+        // The held owner has not spawned a task to answer the actual request.
+        assert_eq!(
+            bounded(HELD, "held HTTP upgrade response", pending.as_mut())
+                .await
+                .err(),
+            Some(Stalled("held HTTP upgrade response"))
+        );
+        assert!(observer.native_ids().is_empty());
+        observer.release();
+        // The same pending client wait resumes once the peer is released.
+        let mut client = pending.await;
+        open(&mut client).await;
+        observer.native().await;
+        client
+    })
+    .await;
+    let id = observer.native_ids()[0];
+    assert_eq!(observer.facts(Point::ReceiptCached).receipt, Some(id));
+    assert_eq!(observer.stalled_id(Stage::Protocol), id);
+    service.finish().await;
+    assert_eq!(service.family.finished_ids(), vec![id]);
+    assert!(service.family.finished()[0].joined.is_ok());
+    assert!(broker.calls.lock().unwrap().is_empty());
+    assert_success(&mut service);
+    drop(client);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn actual_wss_parent_fault_after_receipt_cache_drains_before_resuming_original_payload() {
     let (mut service, address) = wss_owner(QuietBroker::default()).await;
     let observer = Arc::new(Observer::default());
     let raw = Arc::new("WSS parent fault after original receipt".to_owned());
     observer.panic_at(Point::ReceiptCached, Arc::clone(&raw));
-    let client = TcpStream::connect(address).await.unwrap();
+    let client = connect(address).await;
     OBSERVER.scope(Arc::clone(&observer), service.serve()).await;
     let id = observer.facts(Point::ReceiptCached).receipt.unwrap();
     assert!(catch_unwind(AssertUnwindSafe(|| service.take_exit())).is_err());
@@ -227,7 +321,7 @@ async fn actual_wss_active_retirement_keeps_primary_absent_and_drains_same_upgra
     let (mut service, address) = wss_owner(broker.clone()).await;
     let observer = Arc::new(Observer::default());
     let retirement = service.retirement_handle();
-    let client = TcpStream::connect(address).await.unwrap();
+    let client = connect(address).await;
     timeout(
         WAIT,
         OBSERVER.scope(Arc::clone(&observer), async {
@@ -264,12 +358,14 @@ async fn actual_wss_unfinished_tls_and_http_upgrade_retire_without_native_or_bro
             )));
         }
         let observer = Arc::new(Observer::default());
-        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut client = connect(address).await;
         if scenario == "partial-http" {
-            client
-                .write_all(b"GET /$servicebus/websocket HTTP/1.1\r\nHost: localhost\r\n")
-                .await
-                .unwrap();
+            wire(
+                "partial HTTP request write",
+                client.write_all(b"GET /$servicebus/websocket HTTP/1.1\r\nHost: localhost\r\n"),
+            )
+            .await
+            .unwrap();
         }
         let stage = if scenario == "tls" {
             Stage::Tls
@@ -301,20 +397,14 @@ async fn actual_wss_http101_subprotocol_and_header_sasl_open_stalls_retire_same_
                 service.config.shared_access_authentication = Some(authentication());
             }
             let observer = Arc::new(Observer::default());
-            let stream = TcpStream::connect(address).await.unwrap();
+            let stream = connect(address).await;
             let client = drive(&mut service, Arc::clone(&observer), async {
                 let mut client = upgrade(stream, address, subprotocol).await;
                 observer.stalled(Stage::Protocol).await;
                 if phase == "sasl-init" {
                     mechanisms(&mut client).await;
                 } else if phase == "open" {
-                    write_protocol_header(&mut client, ProtocolHeader::AMQP)
-                        .await
-                        .unwrap();
-                    assert_eq!(
-                        read_protocol_header(&mut client).await.unwrap(),
-                        ProtocolHeader::AMQP
-                    );
+                    header(&mut client, ProtocolHeader::AMQP).await;
                 }
                 client
             })
@@ -340,15 +430,9 @@ async fn actual_wss_trusted_tls_http101_and_native_open_share_one_retained_origi
         wss_test_server_tls(),
     )));
     let observer = Arc::new(Observer::default());
-    let stream = TcpStream::connect(address).await.unwrap();
+    let stream = connect(address).await;
     let client = drive(&mut service, Arc::clone(&observer), async {
-        let stream = wss_test_client_tls()
-            .connect(
-                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
-                stream,
-            )
-            .await
-            .unwrap();
+        let stream = tls(stream).await;
         let mut client = upgrade(stream, address, AMQP_WEBSOCKET_SUBPROTOCOL).await;
         open(&mut client).await;
         observer.native().await;
@@ -374,25 +458,22 @@ async fn actual_wss_tls_error_reaps_original_then_admits_a_healthy_tls_websocket
         wss_test_server_tls(),
     )));
     let observer = Arc::new(Observer::default());
-    let mut bad = TcpStream::connect(address).await.unwrap();
+    let mut bad = connect(address).await;
     drive(&mut service, Arc::clone(&observer), async {
-        bad.write_all(b"GET /not-tls HTTP/1.1\r\n\r\n")
-            .await
-            .unwrap();
+        wire(
+            "plaintext request write",
+            bad.write_all(b"GET /not-tls HTTP/1.1\r\n\r\n"),
+        )
+        .await
+        .unwrap();
         observer.reached(Point::Reaped).await;
     })
     .await;
     let failed_id = observer.facts(Point::Reaped).reaped.unwrap();
     assert!(service.family.is_empty());
-    let stream = TcpStream::connect(address).await.unwrap();
+    let stream = connect(address).await;
     let healthy = drive(&mut service, Arc::clone(&observer), async {
-        let stream = wss_test_client_tls()
-            .connect(
-                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
-                stream,
-            )
-            .await
-            .unwrap();
+        let stream = tls(stream).await;
         let mut healthy = upgrade(stream, address, AMQP_WEBSOCKET_SUBPROTOCOL).await;
         open(&mut healthy).await;
         observer.native().await;
@@ -426,7 +507,7 @@ async fn actual_wss_native_custody_before_authorization_drains_same_original_aft
         let observer = Arc::new(Observer::default());
         let raw = Arc::new("WSS native custody installed before authorization".to_owned());
         observer.panic_after_native(Arc::clone(&raw));
-        let stream = TcpStream::connect(address).await.unwrap();
+        let stream = connect(address).await;
         let client = drive(&mut service, Arc::clone(&observer), async {
             let mut client = upgrade(stream, address, AMQP_WEBSOCKET_SUBPROTOCOL).await;
             if authenticated {
@@ -487,11 +568,17 @@ async fn actual_wss_rejected_upgrade_and_reached_reporter_panic_preserve_healthy
     let (mut service, address) = wss_owner(broker.clone()).await;
     let observer = Arc::new(Observer::default());
     let reached = Arc::new(AtomicUsize::new(0));
+    // A second live dispatcher keeps interest rebuilds on the registered list;
+    // alone, the reporter loses to the default of whichever thread rebuilds.
+    let other = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let dispatch = tracing::Dispatch::new(Reporter {
         reached: Arc::clone(&reached),
         payload: Arc::new("reached WSS family reporter".to_owned()),
     });
-    let bad = TcpStream::connect(address).await.unwrap();
+    std::thread::spawn(tracing::callsite::rebuild_interest_cache)
+        .join()
+        .unwrap();
+    let bad = connect(address).await;
     drive(&mut service, Arc::clone(&observer), async {
         let mut request = format!("ws://{address}/wrong-path")
             .into_client_request()
@@ -500,9 +587,12 @@ async fn actual_wss_rejected_upgrade_and_reached_reporter_panic_preserve_healthy
             "sec-websocket-protocol",
             AMQP_WEBSOCKET_SUBPROTOCOL.parse().unwrap(),
         );
-        let error = tokio_tungstenite::client_async(request, bad)
-            .await
-            .unwrap_err();
+        let error = wire(
+            "refused HTTP upgrade response",
+            tokio_tungstenite::client_async(request, bad),
+        )
+        .await
+        .unwrap_err();
         let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
             panic!("actual HTTP path refusal");
         };
@@ -512,9 +602,10 @@ async fn actual_wss_rejected_upgrade_and_reached_reporter_panic_preserve_healthy
     .with_subscriber(dispatch)
     .await;
     assert_eq!(reached.load(Ordering::SeqCst), 1);
+    drop(other);
     assert!(service.family.is_empty());
     let failed_id = observer.facts(Point::Reaped).reaped.unwrap();
-    let stream = TcpStream::connect(address).await.unwrap();
+    let stream = connect(address).await;
     let healthy = drive(&mut service, Arc::clone(&observer), async {
         let mut healthy = upgrade(stream, address, AMQP_WEBSOCKET_STANDARD_SUBPROTOCOL).await;
         open(&mut healthy).await;
@@ -545,7 +636,7 @@ async fn actual_wss_rejected_upgrade_and_reached_reporter_panic_preserve_healthy
 async fn actual_wss_healthy_live_join_is_pruned_while_another_http_upgrade_is_held() {
     let (mut service, address) = wss_owner(QuietBroker::default()).await;
     let observer = Arc::new(Observer::default());
-    let held = TcpStream::connect(address).await.unwrap();
+    let held = connect(address).await;
     drive(
         &mut service,
         Arc::clone(&observer),
@@ -553,18 +644,21 @@ async fn actual_wss_healthy_live_join_is_pruned_while_another_http_upgrade_is_he
     )
     .await;
     let held_id = observer.stalled_id(Stage::Upgrade);
-    let stream = TcpStream::connect(address).await.unwrap();
+    let stream = connect(address).await;
     let healthy = drive(&mut service, Arc::clone(&observer), async {
         let mut healthy = upgrade(stream, address, AMQP_WEBSOCKET_SUBPROTOCOL).await;
         open(&mut healthy).await;
-        write_frame(
-            &mut healthy,
-            &frame(0, Performative::Close(amqp::Close::default())),
+        wire(
+            "Close write",
+            write_frame(
+                &mut healthy,
+                &frame(0, Performative::Close(amqp::Close::default())),
+            ),
         )
         .await
         .unwrap();
         assert!(matches!(
-            read_frame(&mut healthy).await.unwrap(),
+            wire("Close reply", read_frame(&mut healthy)).await.unwrap(),
             Frame::Amqp {
                 performative: Some(Performative::Close(_)),
                 ..
@@ -726,64 +820,60 @@ async fn qualified_wss_fault_compositions_keep_raw_priority_and_packets_across_t
 }
 
 async fn sender<S: AsyncRead + AsyncWrite + Unpin>(peer: &mut S) {
-    write_frame(
-        peer,
-        &frame(
-            1,
-            Performative::Begin(Begin {
-                remote_channel: None,
-                next_outgoing_id: 0,
-                incoming_window: 10,
-                outgoing_window: 10,
-                handle_max: 10,
-                offered_capabilities: None,
-                desired_capabilities: None,
-                properties: None,
-            }),
-        ),
-    )
-    .await
-    .unwrap();
+    let begin = frame(
+        1,
+        Performative::Begin(Begin {
+            remote_channel: None,
+            next_outgoing_id: 0,
+            incoming_window: 10,
+            outgoing_window: 10,
+            handle_max: 10,
+            offered_capabilities: None,
+            desired_capabilities: None,
+            properties: None,
+        }),
+    );
+    wire("Begin write", write_frame(peer, &begin))
+        .await
+        .unwrap();
     assert!(matches!(
-        read_frame(peer).await.unwrap(),
+        wire("Begin reply", read_frame(peer)).await.unwrap(),
         Frame::Amqp {
             performative: Some(Performative::Begin(_)),
             ..
         }
     ));
-    write_frame(
-        peer,
-        &frame(
-            1,
-            Performative::Attach(Box::new(Attach {
-                name: "wss-held-send".to_owned(),
-                handle: 1,
-                role: Role::Sender,
-                snd_settle_mode: amqp::SenderSettleMode::Unsettled,
-                rcv_settle_mode: amqp::ReceiverSettleMode::First,
-                source: None,
-                target: Some(Target::new("orders")),
-                unsettled: None,
-                incomplete_unsettled: false,
-                initial_delivery_count: Some(0),
-                max_message_size: None,
-                offered_capabilities: None,
-                desired_capabilities: None,
-                properties: None,
-            })),
-        ),
-    )
-    .await
-    .unwrap();
+    let attach = frame(
+        1,
+        Performative::Attach(Box::new(Attach {
+            name: "wss-held-send".to_owned(),
+            handle: 1,
+            role: Role::Sender,
+            snd_settle_mode: amqp::SenderSettleMode::Unsettled,
+            rcv_settle_mode: amqp::ReceiverSettleMode::First,
+            source: None,
+            target: Some(Target::new("orders")),
+            unsettled: None,
+            incomplete_unsettled: false,
+            initial_delivery_count: Some(0),
+            max_message_size: None,
+            offered_capabilities: None,
+            desired_capabilities: None,
+            properties: None,
+        })),
+    );
+    wire("Attach write", write_frame(peer, &attach))
+        .await
+        .unwrap();
     assert!(matches!(
-        read_frame(peer).await.unwrap(),
+        wire("Attach reply", read_frame(peer)).await.unwrap(),
         Frame::Amqp {
             performative: Some(Performative::Attach(_)),
             ..
         }
     ));
     assert!(matches!(
-        read_frame(peer).await.unwrap(),
+        wire("Flow grant", read_frame(peer)).await.unwrap(),
         Frame::Amqp {
             performative: Some(Performative::Flow(_)),
             ..
@@ -801,29 +891,27 @@ async fn send<S: AsyncWrite + Unpin>(peer: &mut S) {
         ..Default::default()
     })
     .unwrap();
-    write_frame(
-        peer,
-        &Frame::Amqp {
-            channel: 1,
-            performative: Some(Performative::Transfer(Transfer {
-                handle: 1,
-                delivery_id: Some(0),
-                delivery_tag: Some(vec![0].into()),
-                message_format: Some(0),
-                settled: Some(false),
-                more: false,
-                rcv_settle_mode: None,
-                state: None,
-                resume: false,
-                aborted: false,
-                batchable: false,
-            })),
-            payload,
-        },
-    )
-    .await
-    .unwrap();
-    peer.flush().await.unwrap();
+    let transfer = Frame::Amqp {
+        channel: 1,
+        performative: Some(Performative::Transfer(Transfer {
+            handle: 1,
+            delivery_id: Some(0),
+            delivery_tag: Some(vec![0].into()),
+            message_format: Some(0),
+            settled: Some(false),
+            more: false,
+            rcv_settle_mode: None,
+            state: None,
+            resume: false,
+            aborted: false,
+            batchable: false,
+        })),
+        payload,
+    };
+    wire("Transfer write", write_frame(peer, &transfer))
+        .await
+        .unwrap();
+    wire("Transfer flush", peer.flush()).await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -835,7 +923,7 @@ async fn actual_wss_memory_and_fjall_send_commit_keep_originals_across_two_cance
             actor.gate.arm(actor.key());
             let (mut service, address) = wss_owner(actor.broker.as_ref().unwrap().clone()).await;
             let observer = Arc::new(Observer::default());
-            let stream = TcpStream::connect(address).await.unwrap();
+            let stream = connect(address).await;
             let quiet = drive(&mut service, Arc::clone(&observer), async {
                 let mut quiet = upgrade(stream, address, AMQP_WEBSOCKET_SUBPROTOCOL).await;
                 open(&mut quiet).await;
@@ -844,7 +932,7 @@ async fn actual_wss_memory_and_fjall_send_commit_keep_originals_across_two_cance
             })
             .await;
             let quiet_id = observer.native_ids()[0];
-            let stream = TcpStream::connect(address).await.unwrap();
+            let stream = connect(address).await;
             let sending = drive(&mut service, Arc::clone(&observer), async {
                 let mut sending =
                     upgrade(stream, address, AMQP_WEBSOCKET_STANDARD_SUBPROTOCOL).await;
