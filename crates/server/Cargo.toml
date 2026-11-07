@@ -28,6 +28,7 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 amqp = { workspace = true, features = ["test-client"] }
 base64.workspace = true
+fjall.workspace = true
 hmac.workspace = true
 rcgen.workspace = true
 roxmltree = "=0.21.1"

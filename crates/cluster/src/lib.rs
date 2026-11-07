@@ -3,6 +3,7 @@
 mod journal;
 mod replay;
 mod snapshot;
+mod store_upgrade;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -15,14 +16,15 @@ pub use replay::{CommittedReplay, ReplayError, ReplayProgress};
 pub use snapshot::{
     PreparedSnapshotAnchor, PreparedSnapshotCompaction, SNAPSHOT_ANCHOR_HASH_SCOPE,
     SNAPSHOT_ANCHOR_VERSION, SNAPSHOT_FORMAT_VERSION, SNAPSHOT_FRAME_DIGEST_BYTES,
-    SNAPSHOT_FRAME_HASH_SCOPE, SNAPSHOT_LAYOUT_VERSION, SNAPSHOT_MAGIC, SnapshotAnchor,
-    SnapshotAnchorError, SnapshotAnchorLimits, SnapshotAnchorOwner, SnapshotAnchorReceipt,
-    SnapshotCapture, SnapshotCaptureError, SnapshotCompactionError, SnapshotCompactionLimits,
-    SnapshotCompactionOwner, SnapshotCompactionReceipt, SnapshotFormat, SnapshotFormatError,
-    SnapshotInstallError, SnapshotInstallLimits, SnapshotInstallOwner, SnapshotInstallPolicy,
-    SnapshotInstallReceipt, SnapshotLimit, SnapshotLimits, SnapshotManifest, SnapshotRecoveryClass,
-    SnapshotRecoverySelection, SnapshotView, select_recovery,
+    SNAPSHOT_FRAME_HASH_SCOPE, SNAPSHOT_LAYOUT_V2, SNAPSHOT_LAYOUT_VERSION, SNAPSHOT_MAGIC,
+    SnapshotAnchor, SnapshotAnchorError, SnapshotAnchorLimits, SnapshotAnchorOwner,
+    SnapshotAnchorReceipt, SnapshotCapture, SnapshotCaptureError, SnapshotCompactionError,
+    SnapshotCompactionLimits, SnapshotCompactionOwner, SnapshotCompactionReceipt, SnapshotFormat,
+    SnapshotFormatError, SnapshotInstallError, SnapshotInstallLimits, SnapshotInstallOwner,
+    SnapshotInstallPolicy, SnapshotInstallReceipt, SnapshotLimit, SnapshotLimits, SnapshotManifest,
+    SnapshotRecoveryClass, SnapshotRecoverySelection, SnapshotView, select_recovery,
 };
+pub use store_upgrade::{StoreUpgradeError, StoreUpgradeOutcome, upgrade_store};
 
 pub const PRODUCTION_MINIMUM_VOTERS: u16 = 3;
 pub const PRODUCTION_REPLICATION_FACTOR: u16 = 3;

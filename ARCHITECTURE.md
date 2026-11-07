@@ -94,9 +94,12 @@ refuses larger ones, logged/retried but not wired to readiness. The state machin
 rejects regressing command time.
 
 The [storage contract](crates/storage/src/lib.rs) provides atomic memory/Fjall
-batches. [Fjall opening](crates/storage/src/durable.rs) accepts format 2. It refuses
-format 1 or a missing marker with any known-keyspace row; empty known stores may
-be stamped.
+batches. [Fjall opening](crates/storage/src/durable.rs) accepts format 3. It refuses
+formats 1 and 2 or a missing marker with any known-keyspace row; empty known stores
+may be stamped. Only the explicit offline
+[store upgrade](crates/cluster/src/store_upgrade.rs) (`switchyardctl store upgrade`)
+moves format 2 to 3, after the domain's bounded
+[legacy-content preflight](crates/domain/src/legacy_content.rs).
 A directory has one live owner. Domain keys are big-endian with V1 values;
 ordinary opening does not validate foreign keyspaces.
 
@@ -111,6 +114,11 @@ is not CAS.
 
 The [snapshot format](crates/cluster/src/snapshot/format.rs) checks framing,
 ordered records, declared frontiers and a digest, not domain/journal health.
+Layout 3 frames carry format 3 records; capture checks their retained AMQP content
+against the fixed profile, and layout 2 frames refuse. The profile is checked at
+explicit upgrade and capture only; write-path enforcement arrives with #16's
+typed-content admission, so a format 3 store can hold later out-of-profile content
+that capture refuses.
 [Fjall provenance](crates/storage/src/durable.rs) checks keyspace inventory and
 original handle identity, then reads metadata and records through one snapshot.
 Callers must exclude all writers and keyspace creation, deletion and configuration

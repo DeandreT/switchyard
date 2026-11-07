@@ -16,6 +16,7 @@ pub use anchor::{
     PreparedSnapshotAnchor, SNAPSHOT_ANCHOR_HASH_SCOPE, SNAPSHOT_ANCHOR_VERSION, SnapshotAnchor,
     SnapshotAnchorError, SnapshotAnchorLimits, SnapshotAnchorOwner, SnapshotAnchorReceipt,
 };
+pub(crate) use capture::FrozenImage;
 pub use capture::{SnapshotCapture, SnapshotCaptureError};
 pub use compaction::{
     PreparedSnapshotCompaction, SnapshotCompactionError, SnapshotCompactionLimits,
@@ -23,8 +24,8 @@ pub use compaction::{
 };
 pub use format::{
     SNAPSHOT_FORMAT_VERSION, SNAPSHOT_FRAME_DIGEST_BYTES, SNAPSHOT_FRAME_HASH_SCOPE,
-    SNAPSHOT_LAYOUT_VERSION, SNAPSHOT_MAGIC, SnapshotFormat, SnapshotFormatError, SnapshotLimit,
-    SnapshotLimits, SnapshotManifest, SnapshotView,
+    SNAPSHOT_LAYOUT_V2, SNAPSHOT_LAYOUT_VERSION, SNAPSHOT_MAGIC, SnapshotFormat,
+    SnapshotFormatError, SnapshotLimit, SnapshotLimits, SnapshotManifest, SnapshotView,
 };
 pub use install::{
     SnapshotInstallError, SnapshotInstallLimits, SnapshotInstallOwner, SnapshotInstallPolicy,

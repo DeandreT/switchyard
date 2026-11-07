@@ -149,3 +149,64 @@ fn production_memory_cli_keeps_its_existing_backend_refusal() -> Result<(), Box<
     }
     Ok(())
 }
+
+/// Rewrites only the marker, as an older build's store would hold it.
+fn stamp_store_format(directory: &std::path::Path, version: u32) -> Result<(), Box<dyn Error>> {
+    let database = fjall::Database::builder(directory).open()?;
+    let meta = database.keyspace("meta", fjall::KeyspaceCreateOptions::default)?;
+    let mut batch = database
+        .batch()
+        .durability(Some(fjall::PersistMode::SyncAll));
+    batch.insert(&meta, b"format_version", version.to_be_bytes());
+    batch.commit()?;
+    Ok(())
+}
+
+fn stored_format(directory: &std::path::Path) -> Result<Vec<u8>, Box<dyn Error>> {
+    use fjall::Readable;
+    let database = fjall::Database::builder(directory).open()?;
+    let meta = database.keyspace("meta", fjall::KeyspaceCreateOptions::default)?;
+    let marker = database.snapshot().get(&meta, b"format_version")?;
+    Ok(marker.map(|marker| marker.to_vec()).unwrap_or_default())
+}
+
+#[test]
+fn development_durable_cli_refuses_older_stores_before_listening() -> Result<(), Box<dyn Error>> {
+    let fixture = StartupFixture::new()?;
+    let directory = TempDir::new()?;
+    drop(storage::FjallStore::open(directory.path())?);
+    for (version, expected) in [
+        (
+            2_u32,
+            format!(
+                "store directory {0} holds format 2; stop every writer, then run `switchyardctl store upgrade --data-dir {0}`",
+                directory.path().display()
+            ),
+        ),
+        (
+            1,
+            String::from(
+                "store directory holds format version 1, but this build reads and writes version 3",
+            ),
+        ),
+    ] {
+        stamp_store_format(directory.path(), version)?;
+        // The occupied listener proves the storage refusal precedes listening.
+        let output = bounded_output(
+            Command::new(env!("CARGO_BIN_EXE_switchyard"))
+                .args(["--mode", "development", "--storage", "fjall"])
+                .arg("--data-dir")
+                .arg(directory.path())
+                .arg("--listen")
+                .arg(fixture.occupied_listener.local_addr()?.to_string())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )?;
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = String::from_utf8(output.stderr)?;
+        assert_eq!(stderr.trim(), format!("switchyard: {expected}"));
+        assert!(!String::from_utf8(output.stdout)?.contains("accepting AMQP connections"));
+        assert_eq!(stored_format(directory.path())?, version.to_be_bytes());
+    }
+    Ok(())
+}

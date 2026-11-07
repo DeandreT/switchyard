@@ -2,7 +2,8 @@
 //! Loop cases are scenarios within the annotated tests, not extra identities.
 
 use cluster::{
-    SnapshotFormat, SnapshotFormatError, SnapshotLimit, SnapshotLimits, SnapshotManifest,
+    SNAPSHOT_LAYOUT_V2, SNAPSHOT_LAYOUT_VERSION, SnapshotFormat, SnapshotFormatError,
+    SnapshotLimit, SnapshotLimits, SnapshotManifest,
 };
 use sha2::{Digest, Sha256};
 use storage::{Key, Value};
@@ -18,19 +19,19 @@ const IDENTITY: [u8; 32] = [
 const EMPTY_HEX: &str = concat!(
     "53575353",
     "00000001",
-    "00000002",
+    "00000003",
     "0000000000000000",
     "0000000000000000",
     "0000000000000000",
     "00",
     "0000000000000000",
     "0000000000000000",
-    "fdccefc15fb8a84b95e2774f93d74697aef1265927e3abf4d87ced937d388efa",
+    "e93ece7e04929e28f2c8e53fa0f3f97c1a6e771fa159bfe2946a5ddd0cd1eaf5",
 );
 const BINARY_HEX: &str = concat!(
     "53575353",
     "00000001",
-    "00000002",
+    "00000003",
     "0000000000000002",
     "0000000000000003",
     "0000000000000004",
@@ -48,12 +49,12 @@ const BINARY_HEX: &str = concat!(
     "0000000000000003",
     "80ff",
     "7f0001",
-    "92cc73e0ad086498015a57540cf81e924ac1211bc4b47bb0b1d5cb10b02199e7",
+    "332a69f78bc57c6c00c8158cd08dd7d99aee7624213fc61330289a38b81c036a",
 );
 const MAX_HEX: &str = concat!(
     "53575353",
     "00000001",
-    "00000002",
+    "00000003",
     "ffffffffffffffff",
     "ffffffffffffffff",
     "ffffffffffffffff",
@@ -61,7 +62,21 @@ const MAX_HEX: &str = concat!(
     "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
     "0000000000000000",
     "0000000000000000",
-    "7380f7cccdd93ebd9a63f54268a49238999a4033ce37cf8f88ae2f96c0450381",
+    "f2a25db16e493a302170904c50442225d10996430ecb752df9a29e49e09eac60",
+);
+
+// The pre-upgrade layout 2 empty frame, with its original valid digest.
+const LEGACY_LAYOUT_EMPTY_HEX: &str = concat!(
+    "53575353",
+    "00000001",
+    "00000002",
+    "0000000000000000",
+    "0000000000000000",
+    "0000000000000000",
+    "00",
+    "0000000000000000",
+    "0000000000000000",
+    "fdccefc15fb8a84b95e2774f93d74697aef1265927e3abf4d87ced937d388efa",
 );
 
 fn nibble(byte: u8) -> u8 {
@@ -99,7 +114,7 @@ fn exact_binary_limits() -> SnapshotLimits {
 }
 
 fn manifest(a: u64, c: u64, l: u64, identity: Option<[u8; 32]>) -> SnapshotManifest {
-    SnapshotManifest::new(2, a, c, l, identity).unwrap()
+    SnapshotManifest::new(SNAPSHOT_LAYOUT_VERSION, a, c, l, identity).unwrap()
 }
 
 fn binary_rows() -> Vec<(Key, Value)> {
@@ -260,7 +275,7 @@ fn snapshot_format_checked_manifest_has_only_structural_frontier_rules() {
     ] {
         let identity = if a == 0 { None } else { Some([0; 32]) };
         let header = manifest(a, c, l, identity);
-        assert_eq!(header.layout_version(), 2);
+        assert_eq!(header.layout_version(), SNAPSHOT_LAYOUT_VERSION);
         assert_eq!(header.applied_index(), a);
         assert_eq!(header.committed_index(), c);
         assert_eq!(header.last_appended_index(), l);
@@ -282,7 +297,7 @@ fn snapshot_format_checked_manifest_has_only_structural_frontier_rules() {
     ] {
         let identity = if a == 0 { None } else { Some([0; 32]) };
         assert_eq!(
-            SnapshotManifest::new(2, a, c, l, identity).unwrap_err(),
+            SnapshotManifest::new(SNAPSHOT_LAYOUT_VERSION, a, c, l, identity).unwrap_err(),
             SnapshotFormatError::InvalidFrontiers {
                 applied: a,
                 committed: c,
@@ -297,19 +312,19 @@ fn snapshot_format_checked_manifest_has_only_structural_frontier_rules() {
         (u64::MAX, None),
     ] {
         assert_eq!(
-            SnapshotManifest::new(2, a, a, a, identity).unwrap_err(),
+            SnapshotManifest::new(SNAPSHOT_LAYOUT_VERSION, a, a, a, identity).unwrap_err(),
             SnapshotFormatError::InvalidLatestIdentity {
                 applied: a,
                 has_digest: identity.is_some()
             },
         );
     }
-    for layout in [0, 1, 3, u32::MAX] {
+    for layout in [0, 1, SNAPSHOT_LAYOUT_V2, 4, u32::MAX] {
         assert_eq!(
             SnapshotManifest::new(layout, 0, 0, 0, None).unwrap_err(),
             SnapshotFormatError::UnsupportedLayoutVersion {
                 found: layout,
-                expected: 2
+                expected: SNAPSHOT_LAYOUT_VERSION
             },
         );
     }
@@ -450,7 +465,7 @@ fn snapshot_format_checksum_valid_header_and_manifest_violations_refuse() {
             }
         );
     }
-    for layout in [0, 1, 3, u32::MAX] {
+    for layout in [0, 1, SNAPSHOT_LAYOUT_V2, 4, u32::MAX] {
         let mut frame = hex(BINARY_HEX);
         put_u32(&mut frame, 8, layout);
         resign(&mut frame);
@@ -458,10 +473,20 @@ fn snapshot_format_checksum_valid_header_and_manifest_violations_refuse() {
             decode_error(&frame, limits()),
             SnapshotFormatError::UnsupportedLayoutVersion {
                 found: layout,
-                expected: 2
+                expected: SNAPSHOT_LAYOUT_VERSION
             }
         );
     }
+    // A genuine pre-upgrade frame is refused, not converted by relabeling.
+    let legacy = hex(LEGACY_LAYOUT_EMPTY_HEX);
+    assert_valid_digest(&legacy);
+    assert_eq!(
+        decode_error(&legacy, limits()),
+        SnapshotFormatError::UnsupportedLayoutVersion {
+            found: SNAPSHOT_LAYOUT_V2,
+            expected: SNAPSHOT_LAYOUT_VERSION
+        }
+    );
     for (a, c, l) in [(4, 3, 4), (2, 3, 2), (u64::MAX, 3, 4)] {
         let mut frame = hex(BINARY_HEX);
         put_u64(&mut frame, 12, a);

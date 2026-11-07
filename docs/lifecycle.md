@@ -126,9 +126,9 @@ opaque. Anchored reads at/below B return an explicit unavailable-prefix error.
 Unknown/malformed anchor rows, unsupported or incomplete owner fences, gaps and
 frontiers regressing behind the source are refused, never repaired.
 
-Legacy unanchored V1 owners open and continue writing V1 without migration. Existing
-entry/frontier/checkpoint encodings, proposal hashes, store format and SWSS framing
-are unchanged. Old journal readers refuse container V2 and old indexed writers
+Legacy unanchored V1 owners open and continue writing V1 without migration.
+Attachment itself changes neither the store format nor the SWSS frame layout, and
+existing entry/frontier/checkpoint encodings and proposal hashes are unchanged. Old journal readers refuse container V2 and old indexed writers
 refuse owner V2, but old unindexed APIs are not fenced globally. Attachment refuses
 to replace an existing anchor and offers no history-rebinding API.
 Receipts and controlled before/after apply faults are not process-crash, power-cut,
@@ -138,7 +138,8 @@ quorum, runtime activation or recovered-outcome certification.
 
 `SnapshotCompactionOwner` is a separate, explicit offline operation with the same
 lifecycle as attachment: one sealed backend inspection, complete validation of
-that immutable image (domain, F0/F1, anchor and replay frontier), then a
+that immutable image (domain, F0/F1, anchor, replay frontier, format 3 provenance
+and the fixed content profile), then a
 target-bound single-use preparation. It requires an anchor with B<A; an
 unanchored image refuses (attach first) and B=A refuses as already compacted,
 both without writes. Divergent physical A, gaps, corrupt anchors or invalid
@@ -155,8 +156,8 @@ a returned error or escaping original panic, without retry or compensation. With
 P=A the anchor original verifies the checkpoint; with P>A entry P is retained.
 Replay still applies only (P,C]. A compacted capture installs like any other.
 
-Read-only `select_recovery` validates one inspected image exactly as capture does
-and reports its class (legacy unanchored, anchored B<A or compacted B=A) with A,
+Read-only `select_recovery` validates one inspected image exactly as capture does,
+including format 3 provenance and the content profile, and reports its class (legacy unanchored, anchored B<A or compacted B=A) with A,
 B, P, C and L, or refuses. It performs no repair, replay or writes. Neither its
 selection nor a compaction receipt is a recovery or authenticity certificate.
 There is no live, background or retention-driven compaction.
@@ -173,6 +174,62 @@ retires them, allocates active sequence/enqueue time and starts TTL. Atomic topi
 ORs rules, ANDs populated exact-typed correlation fields, makes one copy despite
 multiple matches and succeeds without matches. Full copies settle/expire/defer/
 browse/DLQ independently.
+
+### Store Format Upgrade
+
+The explicit offline upgrade opens an existing Fjall directory only: a missing
+directory or native database refuses without creating one. Before any
+create-or-open keyspace lookup it requires exactly the `meta` and `records`
+keyspaces, then checks original handle identity and a sole marker row and reads
+the marker and every record through one native snapshot. Marker 3 returns
+already-current with no write and no fresh validation; it is not a health
+certificate. Marker 2 is eligible; every other marker, a missing marker or extra
+metadata refuses. The caller must exclude every writer, raw clone, topology
+mutator and other owner for the complete operation.
+
+The domain preflight checks every content-bearing row on that image. Message and
+rule keys and outer values must be canonical before recursive decoding. Message
+rows are read through the frozen message-record codec. Each record's retained AMQP
+message (the V1 envelope or V2 original; ready, scheduled, deferred, locked, topic
+placeholder and dead-letter alike) is decoded as a whole message, and each V2
+overlay value, filter-projection application-property value and retained
+correlation-rule value as a standalone value, under one fixed profile: 16 MiB encoded
+bytes, depth 128, 4,194,304 nodes and 268,435,456 work units per content item.
+These are parser safety bounds, not admission limits, quotas or a whole-image
+allocation bound; current entity limits are never reapplied. Raw bodies (V1 bodies and V2
+raw content) and session state are opaque. Other domain tags carry no content; unrecognized tags
+refuse. Refusals name a row ordinal and field, never payload bytes.
+
+F0 and F1 owners are validated only where present: journal structure, anchors
+and committed proposal schemas, and indexed owner/checkpoint rows, with the latest
+checkpoint identity when both exist. Populated unindexed stores remain eligible;
+indexed adoption and complete snapshot eligibility are not required. Historical
+proposals decode unchanged and are never executed, so intentionally refused or
+unsafe proposal input does not block the upgrade.
+
+Every refusal precedes the only mutation: one synchronous native batch replacing
+marker 2 with 3. All domain rows, Clock, F0 entries/frontier/anchor and F1
+owner/checkpoint bytes, including opaque uncommitted tails, stay byte-exact; no
+record is re-encoded, replayed or migrated. Native recovery may perform internal
+I/O, so database files are not byte-identical. The non-Clone owner retires before
+the commit; a returned error or escaping original panic leaves the marker at 2 or
+3, observable only after closing all handles and reopening. There is no retry,
+rollback or panic catching. Older builds refuse marker 3 immediately, before any
+new-format record is written.
+
+Ordinary writes do not yet enforce the profile; that arrives with #16's
+typed-content admission. A format 3 store can therefore hold out-of-profile
+content written after the upgrade. Snapshot capture stamps layout 3, requires
+native format 3 provenance and repeats the content preflight, so it refuses such
+an image. Every operation that validates an image as capture does is equally
+fail-closed: installation's complete old-target validation, anchor attachment,
+compaction and `select_recovery` all refuse an out-of-profile image without
+writes. Such retained content blocks them until it is consumed (settled, expired
+or otherwise removed by ordinary commands).
+Layout 2 frames refuse decoding; installation refuses a layout 2 or format 2
+source before reading the target, and cross-backend opt-in does not bypass it. An anchor keeps its recorded source layout as historical
+identity: layout 2 and 3 anchors remain readable after the upgrade, and a recapture
+uses layout 3 without relabeling the anchor.
 
 ### Topic Duplicate History
 
@@ -264,8 +321,10 @@ replication-unavailable before storage/listeners; production Memory refuses too.
 CLI TLS/auth/storage/cluster error precedence is unchanged.
 
 Missing markers are stamped only if known `meta`/`records` are empty; any row
-(even empty-valued) refuses without marker mutation. Format 2 requires private
-live owner heads; format 1 refuses even empty. Generic value envelopes remain V1;
+(even empty-valued) refuses without marker mutation. Format 3 requires private
+live owner heads; formats 1 and 2 refuse even empty. The fixed content profile is
+checked at explicit upgrade and capture, not by ordinary writes until #16's
+typed-content admission, so a format 3 store can hold later out-of-profile content. Generic value envelopes remain V1;
 nonlegacy topic profiles use their canonical topic-specific V2 fence. No
 migration/foreign-keyspace proof/byte-invariance claim. See [opener](../crates/storage/src/durable.rs).
 

@@ -4,7 +4,12 @@ use thiserror::Error;
 
 pub const SNAPSHOT_MAGIC: [u8; 4] = *b"SWSS";
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
-pub const SNAPSHOT_LAYOUT_VERSION: u32 = 2;
+/// Record layout over store format 3, whose retained AMQP content satisfies
+/// the fixed bounded-content profile. The only layout frames encode or decode.
+pub const SNAPSHOT_LAYOUT_VERSION: u32 = 3;
+/// Record layout over store format 2. Frames with it are refused; it remains
+/// readable only as an existing anchor's recorded source identity.
+pub const SNAPSHOT_LAYOUT_V2: u32 = 2;
 pub const SNAPSHOT_FRAME_HASH_SCOPE: &[u8] = b"switchyard snapshot frame v1\0";
 pub const SNAPSHOT_FRAME_DIGEST_BYTES: usize = 32;
 
@@ -95,6 +100,30 @@ impl SnapshotManifest {
         Ok(manifest)
     }
 
+    /// Historical source identity recorded by an anchor. Its layout is retained
+    /// exactly, never relabeled, and does not make that layout encodable.
+    pub(crate) fn historical(
+        layout_version: u32,
+        applied: u64,
+        committed: u64,
+        last_appended: u64,
+        latest_applied_digest: Option<[u8; 32]>,
+    ) -> Result<Self, SnapshotFormatError> {
+        let manifest = Self {
+            layout_version,
+            applied,
+            committed,
+            last_appended,
+            latest_applied_digest,
+        };
+        if layout_version == SNAPSHOT_LAYOUT_V2 {
+            manifest.validate_frontiers()?;
+        } else {
+            manifest.validate()?;
+        }
+        Ok(manifest)
+    }
+
     pub fn layout_version(&self) -> u32 {
         self.layout_version
     }
@@ -122,6 +151,10 @@ impl SnapshotManifest {
                 expected: SNAPSHOT_LAYOUT_VERSION,
             });
         }
+        self.validate_frontiers()
+    }
+
+    fn validate_frontiers(&self) -> Result<(), SnapshotFormatError> {
         if self.applied > self.committed || self.committed > self.last_appended {
             return Err(SnapshotFormatError::InvalidFrontiers {
                 applied: self.applied,
@@ -676,6 +709,52 @@ mod tests {
             SnapshotFormat::encode(&manifest, &duplicates, capped).unwrap_err(),
             expected
         );
+    }
+
+    #[test]
+    fn legacy_layout_frames_refuse_and_historical_identity_is_not_encodable() {
+        let current = SnapshotManifest::new(SNAPSHOT_LAYOUT_VERSION, 0, 0, 0, None).unwrap();
+        let mut frame = SnapshotFormat::encode(&current, &[], UNBOUNDED).unwrap();
+        frame[8..12].copy_from_slice(&SNAPSHOT_LAYOUT_V2.to_be_bytes());
+        let end = frame.len() - SNAPSHOT_FRAME_DIGEST_BYTES;
+        let digest = frame_digest(&frame[..end]);
+        frame[end..].copy_from_slice(&digest);
+        let expected = SnapshotFormatError::UnsupportedLayoutVersion {
+            found: SNAPSHOT_LAYOUT_V2,
+            expected: SNAPSHOT_LAYOUT_VERSION,
+        };
+        assert_eq!(
+            SnapshotFormat::decode(&frame, UNBOUNDED).unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            SnapshotManifest::new(SNAPSHOT_LAYOUT_V2, 0, 0, 0, None).unwrap_err(),
+            expected
+        );
+        let historical =
+            SnapshotManifest::historical(SNAPSHOT_LAYOUT_V2, 1, 1, 1, Some([1; 32])).unwrap();
+        assert_eq!(historical.layout_version(), SNAPSHOT_LAYOUT_V2);
+        assert_eq!(
+            SnapshotFormat::encode(&historical, &[], UNBOUNDED).unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            SnapshotManifest::historical(SNAPSHOT_LAYOUT_V2, 1, 0, 0, Some([1; 32])).unwrap_err(),
+            SnapshotFormatError::InvalidFrontiers {
+                applied: 1,
+                committed: 0,
+                last_appended: 0,
+            }
+        );
+        for unknown in [0, 1, SNAPSHOT_LAYOUT_VERSION + 1] {
+            assert_eq!(
+                SnapshotManifest::historical(unknown, 0, 0, 0, None).unwrap_err(),
+                SnapshotFormatError::UnsupportedLayoutVersion {
+                    found: unknown,
+                    expected: SNAPSHOT_LAYOUT_VERSION,
+                }
+            );
+        }
     }
 
     #[test]
