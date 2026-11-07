@@ -1,7 +1,8 @@
-//! Frozen send intent carrying each message's original content once. Decoding
-//! never parses AMQP or applies content policy: invalid content must survive
-//! replication for deterministic refusal. Do not reorder, extend or reuse these
-//! DTOs for a later proposal version.
+//! Frozen send intent carrying each message's original content once, and
+//! disposition intent carrying a sparse property patch. Decoding never parses
+//! AMQP or applies content policy: invalid content and patch values must
+//! survive replication for deterministic refusal. Do not reorder, extend or
+//! reuse these DTOs for a later proposal version.
 
 use std::{fmt, marker::PhantomData};
 
@@ -11,8 +12,8 @@ use serde::{
 };
 
 use crate::{
-    Command, CommandKind, EntityBinding, EntityBindingKind, EntityPath, MessageContent,
-    NamespaceName, RawMessage, SessionId, Timestamp,
+    Command, CommandKind, EntityBinding, EntityBindingKind, EntityPath, LockToken, MessageContent,
+    NamespaceName, OverlayProperty, RawMessage, SequenceNumber, SessionId, Timestamp,
 };
 
 use super::{DurableProposal, DurableProposalError as Error, MAX_DURABLE_PROPOSAL_BYTES};
@@ -49,6 +50,31 @@ enum OwnerKind {
 enum Kind {
     Send(Content),
     SendBatch(Items<Content>),
+    Abandon {
+        sequence: u64,
+        lock_token: u64,
+        patch: Items<Entry>,
+    },
+    Defer {
+        sequence: u64,
+        lock_token: u64,
+        patch: Items<Entry>,
+    },
+    DeadLetter {
+        sequence: u64,
+        lock_token: u64,
+        reason: Text,
+        description: Text,
+        patch: Items<Entry>,
+    },
+}
+
+/// One patch entry in caller order. Repeated names are retained as sent; the
+/// state machine coalesces them when it applies the patch.
+#[derive(Serialize, Deserialize)]
+struct Entry {
+    name: Text,
+    value: Bytes,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -166,6 +192,19 @@ impl CopyBudget {
         self.charge(value.len())?;
         Ok(Bytes(value.to_vec()))
     }
+    fn patch(&mut self, patch: &[OverlayProperty]) -> Result<Items<Entry>, Error> {
+        patch
+            .iter()
+            .map(|property| {
+                self.charge(1)?;
+                Ok(Entry {
+                    name: self.text(&property.name)?,
+                    value: self.bytes(&property.value)?,
+                })
+            })
+            .collect::<Result<_, _>>()
+            .map(Items)
+    }
     fn content(&mut self, value: &MessageContent) -> Result<Content, Error> {
         Ok(match value {
             MessageContent::Amqp(bytes) => Content::Amqp(self.bytes(bytes)?),
@@ -222,6 +261,17 @@ impl Content {
     }
 }
 
+fn restore_patch(patch: Items<Entry>) -> Vec<OverlayProperty> {
+    patch
+        .0
+        .into_iter()
+        .map(|entry| OverlayProperty {
+            name: entry.name.0,
+            value: entry.value.0,
+        })
+        .collect()
+}
+
 impl Proposal {
     pub(super) fn capture(value: &DurableProposal) -> Result<Self, Error> {
         let mut budget = CopyBudget(0);
@@ -236,12 +286,44 @@ impl Proposal {
                     })
                     .collect::<Result<_, _>>()?,
             )),
+            CommandKind::AbandonWithPatch {
+                sequence,
+                lock_token,
+                patch,
+            } => Kind::Abandon {
+                sequence: sequence.as_u64(),
+                lock_token: lock_token.as_u64(),
+                patch: budget.patch(patch)?,
+            },
+            CommandKind::DeferWithPatch {
+                sequence,
+                lock_token,
+                patch,
+            } => Kind::Defer {
+                sequence: sequence.as_u64(),
+                lock_token: lock_token.as_u64(),
+                patch: budget.patch(patch)?,
+            },
+            CommandKind::DeadLetterWithPatch {
+                sequence,
+                lock_token,
+                reason,
+                description,
+                patch,
+            } => Kind::DeadLetter {
+                sequence: sequence.as_u64(),
+                lock_token: lock_token.as_u64(),
+                reason: budget.text(reason)?,
+                description: budget.text(description)?,
+                patch: budget.patch(patch)?,
+            },
             _ => return Err(Error::UnsupportedCommandVersion(4)),
         };
         let authority = match value.binding.as_ref() {
             None => Authority::Unbound,
             Some(binding) => {
-                // Sends keep exactly V1's authority rules. No catalog lookup.
+                // Sends and dispositions keep exactly V1's authority rules. No
+                // catalog lookup.
                 super::v1::validate_binding(binding, &value.command)?;
                 Authority::Bound {
                     namespace: budget.text(binding.namespace().as_str())?,
@@ -276,6 +358,37 @@ impl Proposal {
                     .into_iter()
                     .map(Content::restore)
                     .collect::<Result<_, _>>()?,
+            },
+            Kind::Abandon {
+                sequence,
+                lock_token,
+                patch,
+            } => CommandKind::AbandonWithPatch {
+                sequence: SequenceNumber::new(sequence),
+                lock_token: LockToken::new(lock_token),
+                patch: restore_patch(patch),
+            },
+            Kind::Defer {
+                sequence,
+                lock_token,
+                patch,
+            } => CommandKind::DeferWithPatch {
+                sequence: SequenceNumber::new(sequence),
+                lock_token: LockToken::new(lock_token),
+                patch: restore_patch(patch),
+            },
+            Kind::DeadLetter {
+                sequence,
+                lock_token,
+                reason,
+                description,
+                patch,
+            } => CommandKind::DeadLetterWithPatch {
+                sequence: SequenceNumber::new(sequence),
+                lock_token: LockToken::new(lock_token),
+                reason: reason.0,
+                description: description.0,
+                patch: restore_patch(patch),
             },
         };
         let command = Command::new(

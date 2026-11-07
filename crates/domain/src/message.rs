@@ -191,8 +191,10 @@ mod projection_only {
 
 /// One copy-local application-property value. The value is one encoded AMQP
 /// value, so an explicit AMQP null is a value rather than a deletion. Names
-/// are unique within an overlay, which keeps first-insertion order.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// are unique within an overlay, which keeps first-insertion order. A
+/// disposition's property patch uses the same shape, where a repeated name
+/// coalesces into its first position.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OverlayProperty {
     pub name: String,
     pub value: Vec<u8>,
@@ -211,7 +213,7 @@ impl MessageEnvelope {
         self
     }
 
-    /// Data only: nothing applies the overlay to the original bytes yet.
+    /// Data only: nothing renders the overlay over the original bytes yet.
     pub fn with_overlay(mut self, overlay: Vec<OverlayProperty>) -> Self {
         self.metadata.overlay = overlay;
         self
@@ -256,7 +258,7 @@ impl From<Vec<u8>> for MessageEnvelope {
 
 /// Stored format of a message record; see [`codec::message`]. Legacy sends
 /// write V1 and content sends write V2; a rewrite keeps the format a record
-/// was read with.
+/// was read with, except that a property patch converts V1 to V2.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MessageRecordFormat {
     /// Body and optional envelope are stored side by side.

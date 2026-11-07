@@ -69,7 +69,7 @@ impl DurableProposal {
     }
 
     /// Existing intent stays byte-for-byte V1/V2. Only nonlegacy topic creation
-    /// uses V3, and only content sends use V4. No proposal format uses the
+    /// uses V3, and only content sends and property-patch dispositions use V4. No proposal format uses the
     /// ordinary Command serde shape.
     pub fn encode(&self) -> Result<Vec<u8>, DurableProposalError> {
         if uses_v4(&self.command.kind) {
@@ -126,7 +126,11 @@ fn uses_v3(kind: &CommandKind) -> bool {
 fn uses_v4(kind: &CommandKind) -> bool {
     matches!(
         kind,
-        CommandKind::SendContent { .. } | CommandKind::SendContentBatch { .. }
+        CommandKind::SendContent { .. }
+            | CommandKind::SendContentBatch { .. }
+            | CommandKind::AbandonWithPatch { .. }
+            | CommandKind::DeferWithPatch { .. }
+            | CommandKind::DeadLetterWithPatch { .. }
     )
 }
 

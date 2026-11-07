@@ -649,7 +649,10 @@ impl Kind {
             CommandKind::UpdateTopic { .. }
             | CommandKind::UpdateSubscription { .. }
             | CommandKind::SendContent { .. }
-            | CommandKind::SendContentBatch { .. } => {
+            | CommandKind::SendContentBatch { .. }
+            | CommandKind::AbandonWithPatch { .. }
+            | CommandKind::DeferWithPatch { .. }
+            | CommandKind::DeadLetterWithPatch { .. } => {
                 return Err(Error::UnsupportedCommandVersion(1));
             }
         })
