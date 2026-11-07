@@ -72,8 +72,11 @@ Success requires the exact created outcome, including the subscription path.
 Supported omitted settings select domain defaults (unlimited TTL, 60 s locks,
 10 deliveries, 256 KiB queue/topic message size); explicit zero limits refuse.
 Duplicate-history zero retains its 600000 ms default. Returned profiles are
-effective domain settings, not usage estimates. Placement, entity capacity and
-usage are absent and requests for them refuse. Message size is not entity capacity;
+effective domain settings, not usage estimates. Placement, usage and the top-level
+entity-size field are absent, and requests for them refuse. A queue profile carries
+its domain capacity mode, so a domain-created finite queue returns
+`capacity: finite` in its profile while the top-level size stays absent until
+[#28](https://github.com/DeandreT/switchyard/issues/28). Message size is not entity capacity;
 subscriptions inherit it from their topic. Topic sessions/duplicates and independent
 subscription message limits remain unsupported. Errors preserve typed catalog,
 domain, storage, clock, unexpected-outcome and stopped-owner information.
@@ -135,6 +138,7 @@ the attach response.
 | Topic sequences | Each offered publication and selected due placeholder consumes one topic-owned slot, even with no matching subscriptions; fanout copies consume none. MAX-1 is the last fresh slot and MAX refuses with nonretryable `SequenceNumberExhausted`. Crossing batches or bounded activation sets retain every original record, counter and Clock without partial fanout. Idle activation and cancellation need no slot. |
 | Browse/deferred | Positive signed peek count, reply cap 250, scan to cap/end; deferred retrieval atomically accepts at most 32 sequences in caller order. |
 | Outbound message size | A receiving peer's nonzero link `max-message-size` bounds each rendered transfer; absent, zero or the maximum value is unlimited. An oversized delivery is never sent: the link detaches with `amqp:link:message-size-exceeded` and the message lock is left to expire, not dead-lettered at once. Each refused lock counts a delivery, so a message whose lock expires at the queue's max delivery count dead-letters with `MaxDeliveryCountExceeded`, including staged receive-and-delete and receive-by-sequence locks. Receive-and-delete on a bounded link locks, measures, then deletes, so a refusal loses nothing; it costs an extra command per message. Peek returns the longest prefix that fits the reply link; receive-by-sequence is all or nothing. Either answers 403 `amqp:link:message-size-exceeded` when nothing fits, leaving any locks to expire. A reply link attached after its request was processed gets that error instead of an oversized reply. Receive-and-delete by sequence waits up to the reply-routing timeout for its reply link and otherwise answers 400 without deleting anything; peek-lock and peek need no attached reply link. |
+| Entity capacity | Every queue profile carries a mandatory `capacity`: `non_finite` (every existing queue, DLQ shadow and subscription backing) or `finite { max_size_bytes }`, a whole MiB from 1 MiB to 5,120 MiB (Azure Standard accepts only 1–5 GB). Finite is accepted only on ordinary queues without sessions or duplicate detection; other finite combinations refuse. The mode is creation-only; a finite size may change. Topics are non-finite only. Finite sizes are domain-only recorded state: no admission charges or refuses retained bytes. Administration refuses capacity requests and creates only non-finite queues; get/list return the recorded mode inside the queue profile, but the top-level `max_size_bytes` field stays absent. |
 | Service limits | 2,000 subscriptions/topic; separate topic/subscription name bounds; Standard default 256 KiB wire-message limit. Commercial namespace/operation quotas absent. |
 | AMQP value shapes | Received frames and messages refuse as malformed when a map has an odd element count, an array uses a compound or described element constructor, a compound's size does not exactly match its counted contents, or nesting exceeds 64 levels; an empty array's element constructor is accepted only as the last encoded bytes of a performative or message section. Stored messages keep decoding without the exact-size, constructor-position and non-map compound-array rules. |
 
@@ -224,8 +228,10 @@ sparse property patch also use V4; their legacy replacement-envelope forms keep 
 V1 bytes. Queue/subscription creation that disables expiry dead-lettering, and
 queue/subscription updates naming that setting, use private V5. SQL rule creation uses
 private V6, retaining the expression text uncompiled so an invalid predicate survives for
-deterministic refusal; true/false/correlation rule creation keeps V1. All other forms keep
-their V1/V2 bytes. New readers accept V1 through V6; older readers refuse unsupported
+deterministic refusal; true/false/correlation rule creation keeps V1. Finite queue
+creation and queue updates naming `capacity` use private V7; non-finite creation and
+updates that omit capacity keep their V1/V5 bytes. All other forms keep their V1/V2
+bytes. New readers accept V1 through V7; older readers refuse unsupported
 proposal versions. AMQP ingress sends every message as V4: a transfer as `SendContent`, and a
 Service Bus batch or scheduled-message request as `SendContentBatch` with each child's
 original bytes. Nothing new emits V1 sends; historical V1 sends still decode and replay
@@ -246,7 +252,9 @@ pre-feature state/journal/checkpoint backup. Never strip markers, rewrite profil
 or delete history as a downgrade procedure.
 Queue profiles, including subscription backings, likewise use a queue-specific V2 only
 when expiry dead-lettering is disabled; enabled profiles and every DLQ shadow keep exact
-legacy V1 bytes, and the same refusals and rollback requirements apply.
+legacy V1 bytes, and the same refusals and rollback requirements apply. Finite queue
+profiles alone use queue V3, whatever their expiry policy; V1 and V2 always mean
+non-finite. Readers before V3 refuse those records, and the same rollback rules apply.
 Rule records follow the same pattern: SQL
 rules alone use a V2 rule value (display name, exact expression text, creation time)
 that old readers refuse as an unsupported version, while true/false/correlation rules

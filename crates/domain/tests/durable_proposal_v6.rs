@@ -66,10 +66,10 @@ fn canonical_v6_golden_and_unchanged_legacy_rule_versions() {
         Err(DurableProposalError::Malformed)
     );
     let mut unknown = bytes.clone();
-    unknown[4..8].copy_from_slice(&7_u32.to_be_bytes());
+    unknown[4..8].copy_from_slice(&8_u32.to_be_bytes());
     assert_eq!(
         DurableProposal::decode(&unknown),
-        Err(DurableProposalError::UnsupportedVersion(7))
+        Err(DurableProposalError::UnsupportedVersion(8))
     );
     // Nonminimal varint for issued_at 7.
     let mut alias = bytes;

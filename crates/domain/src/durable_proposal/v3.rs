@@ -7,7 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
 
 use crate::{
     Command, CommandKind, EntityBinding, EntityBindingKind, EntityPath, NamespaceName, Timestamp,
-    TopicConfig,
+    TopicCapacity, TopicConfig,
 };
 
 use super::{DurableProposal, DurableProposalError as Error, MAX_DURABLE_PROPOSAL_BYTES};
@@ -149,6 +149,7 @@ impl Proposal {
                 .map_err(|_| Error::IntegerOutOfRange)?,
             requires_duplicate_detection,
             duplicate_detection_history_millis,
+            capacity: TopicCapacity::NonFinite,
         };
         if config.is_legacy_representable() {
             return Err(Error::NonCanonical);

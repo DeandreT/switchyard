@@ -9,9 +9,9 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
 
 use crate::{
-    Command, CommandKind, EntityBinding, EntityBindingKind, EntityPath, NamespaceName, QueueConfig,
-    QueueConfigUpdate, QueueTimeToLiveUpdate, SubscriptionConfig, SubscriptionConfigUpdate,
-    SubscriptionName, Timestamp,
+    Command, CommandKind, EntityBinding, EntityBindingKind, EntityPath, NamespaceName,
+    QueueCapacity, QueueConfig, QueueConfigUpdate, QueueTimeToLiveUpdate, SubscriptionConfig,
+    SubscriptionConfigUpdate, SubscriptionName, Timestamp,
 };
 
 use super::{DurableProposal, DurableProposalError as Error, MAX_DURABLE_PROPOSAL_BYTES};
@@ -137,11 +137,16 @@ impl Text {
     }
 }
 
-/// Whether V5 is the only version that represents this command.
+/// Whether V5 is the only version that represents this command. Queue
+/// capacity is never V5 intent: finite creation and capacity updates are V7.
 pub(super) fn carries(kind: &CommandKind) -> bool {
     match kind {
-        CommandKind::CreateQueue { config } => !config.is_legacy_representable(),
-        CommandKind::UpdateQueue { update } => !update.is_legacy_representable(),
+        CommandKind::CreateQueue { config } => {
+            !config.dead_lettering_on_message_expiration && !config.capacity.is_finite()
+        }
+        CommandKind::UpdateQueue { update } => {
+            update.dead_lettering_on_message_expiration.is_some() && update.capacity.is_none()
+        }
         CommandKind::CreateSubscription { config, .. } => !config.is_legacy_representable(),
         CommandKind::UpdateSubscription { update, .. } => !update.is_legacy_representable(),
         _ => false,
@@ -253,6 +258,7 @@ impl Kind {
                     requires_duplicate_detection,
                     duplicate_detection_history_millis,
                     dead_lettering_on_message_expiration,
+                    capacity: QueueCapacity::NonFinite,
                 },
             },
             Self::UpdateQueue {
@@ -276,6 +282,7 @@ impl Kind {
                     dead_lettering_on_message_expiration: Some(
                         dead_lettering_on_message_expiration,
                     ),
+                    capacity: None,
                 },
             },
             Self::CreateSubscription {

@@ -1,6 +1,6 @@
 use domain::{
     BoundCommand, Command, CommandKind, DurableProposal, DurableProposalError, EntityPath,
-    NamespaceName, QueueConfig, StateMachine, Timestamp, TopicConfig,
+    NamespaceName, QueueConfig, StateMachine, Timestamp, TopicCapacity, TopicConfig,
 };
 use storage::MemoryStore;
 
@@ -45,6 +45,7 @@ fn canonical_v3_golden_and_invalid_intent() {
                 default_time_to_live_millis: Some(0),
                 requires_duplicate_detection: enabled,
                 duplicate_detection_history_millis: window,
+                capacity: TopicCapacity::NonFinite,
             });
             let bytes = p.encode().unwrap();
             let version = if !enabled && window == 600_000 { 1 } else { 3 };

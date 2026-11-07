@@ -56,8 +56,9 @@ pub use message::{
 pub use queue::{
     DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS, DEFAULT_LOCK_DURATION_MILLIS,
     DEFAULT_MAX_DELIVERY_COUNT, DEFAULT_MAX_MESSAGE_BYTES, MAX_DUPLICATE_DETECTION_HISTORY_MILLIS,
-    MAX_LOCK_DURATION_MILLIS, MIN_DUPLICATE_DETECTION_HISTORY_MILLIS, QueueConfig,
-    QueueConfigError, QueueConfigUpdate, QueueCounters, QueueTimeToLiveUpdate,
+    MAX_LOCK_DURATION_MILLIS, MAX_QUEUE_CAPACITY_BYTES, MIN_DUPLICATE_DETECTION_HISTORY_MILLIS,
+    QUEUE_CAPACITY_GRANULARITY_BYTES, QueueCapacity, QueueConfig, QueueConfigError,
+    QueueConfigUpdate, QueueCounters, QueueTimeToLiveUpdate,
 };
 pub use rule::{
     CorrelationFilter, CorrelationValue, DEFAULT_RULE_NAME, FILTER_EVALUATION_DEAD_LETTER_REASON,
@@ -79,5 +80,5 @@ pub use sql_filter::{
 pub use time::Timestamp;
 pub use topic::{
     MAX_TOPIC_SUBSCRIPTIONS, SubscriptionConfig, SubscriptionConfigError, SubscriptionConfigUpdate,
-    TopicConfig, TopicConfigError, TopicConfigUpdate,
+    TopicCapacity, TopicConfig, TopicConfigError, TopicConfigUpdate,
 };

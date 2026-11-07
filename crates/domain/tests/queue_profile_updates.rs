@@ -251,6 +251,7 @@ fn profile(config: QueueConfig) -> QueueConfigUpdate {
         requires_duplicate_detection: Some(config.requires_duplicate_detection),
         duplicate_detection_history_millis: Some(config.duplicate_detection_history_millis),
         dead_lettering_on_message_expiration: None,
+        capacity: None,
     }
 }
 

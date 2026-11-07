@@ -406,6 +406,8 @@ impl EntityOptions {
                     // Not an admin option yet; creation keeps the legacy default.
                     dead_lettering_on_message_expiration: defaults
                         .dead_lettering_on_message_expiration,
+                    // Capacity requests refuse above; creation stays non-finite.
+                    capacity: defaults.capacity,
                 })
             }
             EntityKind::Topic => EntityProfile::Topic(TopicConfig {

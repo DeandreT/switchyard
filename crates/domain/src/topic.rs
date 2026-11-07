@@ -7,11 +7,23 @@ pub use updates::{SubscriptionConfigUpdate, TopicConfigUpdate};
 use crate::{
     DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS, DEFAULT_LOCK_DURATION_MILLIS,
     DEFAULT_MAX_DELIVERY_COUNT, DEFAULT_MAX_MESSAGE_BYTES, MAX_DUPLICATE_DETECTION_HISTORY_MILLIS,
-    MAX_LOCK_DURATION_MILLIS, MIN_DUPLICATE_DETECTION_HISTORY_MILLIS, QueueConfig,
+    MAX_LOCK_DURATION_MILLIS, MIN_DUPLICATE_DETECTION_HISTORY_MILLIS, QueueCapacity, QueueConfig,
 };
 
 /// Maximum durable subscriptions on one Standard-tier topic.
 pub const MAX_TOPIC_SUBSCRIPTIONS: usize = 2_000;
+
+/// Mandatory entity-capacity mode of one topic profile. Topics are non-finite
+/// only: a finite topic would bound every subscription copy and schedule under
+/// one parent usage ledger, which does not exist, so it is not representable.
+/// Subscription backing queues and their dead-letter shadows are therefore
+/// always [`QueueCapacity::NonFinite`](crate::QueueCapacity::NonFinite).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicCapacity {
+    #[default]
+    NonFinite,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TopicConfig {
@@ -22,6 +34,8 @@ pub struct TopicConfig {
     pub requires_duplicate_detection: bool,
     /// Creation-only history window; validated even when detection is disabled.
     pub duplicate_detection_history_millis: u64,
+    /// Entity capacity, distinct from `max_message_bytes`.
+    pub capacity: TopicCapacity,
 }
 
 impl Default for TopicConfig {
@@ -31,6 +45,7 @@ impl Default for TopicConfig {
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             requires_duplicate_detection: false,
             duplicate_detection_history_millis: DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS,
+            capacity: TopicCapacity::NonFinite,
         }
     }
 }
@@ -116,6 +131,7 @@ impl SubscriptionConfig {
             requires_session: false,
             requires_duplicate_detection: false,
             dead_lettering_on_message_expiration: self.dead_lettering_on_message_expiration,
+            capacity: QueueCapacity::NonFinite,
             ..QueueConfig::default()
         }
     }

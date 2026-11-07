@@ -12,6 +12,38 @@ pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 256 * 1024;
 pub const DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS: u64 = 10 * 60 * 1_000;
 pub const MIN_DUPLICATE_DETECTION_HISTORY_MILLIS: u64 = 20 * 1_000;
 pub const MAX_DUPLICATE_DETECTION_HISTORY_MILLIS: u64 = 7 * 24 * 60 * 60 * 1_000;
+/// Finite queue sizes are whole mebibytes, the unit of Service Bus
+/// `MaxSizeInMegabytes`.
+pub const QUEUE_CAPACITY_GRANULARITY_BYTES: u64 = 1024 * 1024;
+/// Largest finite queue: the Standard-tier 5,120 MB maximum.
+pub const MAX_QUEUE_CAPACITY_BYTES: u64 = 5 * 1024 * QUEUE_CAPACITY_GRANULARITY_BYTES;
+
+/// Mandatory entity-capacity mode of one queue profile. This is retained
+/// entity size, not the per-message `max_message_bytes` limit.
+///
+/// Every legacy profile, every dead-letter shadow and every subscription
+/// backing queue is [`QueueCapacity::NonFinite`]. Only an ordinary queue
+/// without sessions or duplicate detection may be finite, and the mode itself
+/// (finite or not) is fixed at creation; a finite size may change later.
+/// A finite size is recorded profile state only: admission does not yet charge
+/// or refuse retained bytes against it, and finite queues have no usage ledger.
+/// Introducing that ledger (#27) must either rebuild usage for finite queues
+/// created before it or explicitly fence them, and must define what an
+/// `UpdateQueue` that shrinks the size below the retained bytes does.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueCapacity {
+    #[default]
+    NonFinite,
+    /// Retained-size limit in bytes, kept verbatim until validation.
+    Finite { max_size_bytes: u64 },
+}
+
+impl QueueCapacity {
+    pub const fn is_finite(self) -> bool {
+        matches!(self, Self::Finite { .. })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct QueueConfig {
@@ -35,6 +67,8 @@ pub struct QueueConfig {
     /// it. Switchyard defaults to `true`, its long-standing behavior, rather
     /// than the Service Bus default of `false`.
     pub dead_lettering_on_message_expiration: bool,
+    /// Entity capacity; see [`QueueCapacity`] for the accepted combinations.
+    pub capacity: QueueCapacity,
 }
 
 /// Explicit replacement of a queue's default lifetime; an absent patch keeps it.
@@ -57,6 +91,8 @@ pub struct QueueConfigUpdate {
     pub requires_duplicate_detection: Option<bool>,
     pub duplicate_detection_history_millis: Option<u64>,
     pub dead_lettering_on_message_expiration: Option<bool>,
+    /// Replacement capacity of the same mode; changing the mode refuses.
+    pub capacity: Option<QueueCapacity>,
 }
 
 impl QueueConfigUpdate {
@@ -73,6 +109,12 @@ impl QueueConfigUpdate {
             .is_some_and(|value| value != current.requires_duplicate_detection)
         {
             return Err(QueueConfigError::RequiresDuplicateDetectionImmutable);
+        }
+        if self
+            .capacity
+            .is_some_and(|value| value.is_finite() != current.capacity.is_finite())
+        {
+            return Err(QueueConfigError::CapacityModeImmutable);
         }
         QueueConfig {
             lock_duration_millis: self
@@ -93,6 +135,7 @@ impl QueueConfigUpdate {
             dead_lettering_on_message_expiration: self
                 .dead_lettering_on_message_expiration
                 .unwrap_or(current.dead_lettering_on_message_expiration),
+            capacity: self.capacity.unwrap_or(current.capacity),
             ..current
         }
         .validate()
@@ -100,7 +143,7 @@ impl QueueConfigUpdate {
 
     /// Whether the frozen V1 update DTO can carry this patch without loss.
     pub(crate) fn is_legacy_representable(self) -> bool {
-        self.dead_lettering_on_message_expiration.is_none()
+        self.dead_lettering_on_message_expiration.is_none() && self.capacity.is_none()
     }
 }
 
@@ -115,13 +158,16 @@ impl Default for QueueConfig {
             requires_duplicate_detection: false,
             duplicate_detection_history_millis: DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS,
             dead_lettering_on_message_expiration: true,
+            capacity: QueueCapacity::NonFinite,
         }
     }
 }
 
 impl QueueConfig {
     /// The shadow never expires messages, so its expiry policy is normalized
-    /// to the legacy value and the shadow profile keeps its legacy bytes.
+    /// to the legacy value. Its capacity is non-finite: a finite parent's size
+    /// bounds the pair, never the shadow alone. The shadow profile therefore
+    /// keeps its legacy bytes.
     pub(crate) fn dead_letter_shadow(self) -> Self {
         Self {
             max_delivery_count: u32::MAX,
@@ -129,6 +175,7 @@ impl QueueConfig {
             requires_session: false,
             requires_duplicate_detection: false,
             dead_lettering_on_message_expiration: true,
+            capacity: QueueCapacity::NonFinite,
             ..self
         }
     }
@@ -136,7 +183,7 @@ impl QueueConfig {
     /// Whether the legacy V1 profile record and proposal DTO represent this
     /// configuration exactly.
     pub(crate) fn is_legacy_representable(self) -> bool {
-        self.dead_lettering_on_message_expiration
+        self.dead_lettering_on_message_expiration && !self.capacity.is_finite()
     }
 
     pub fn validate(self) -> Result<Self, QueueConfigError> {
@@ -166,6 +213,23 @@ impl QueueConfig {
             return Err(QueueConfigError::DuplicateDetectionHistoryTooLong {
                 maximum_millis: MAX_DUPLICATE_DETECTION_HISTORY_MILLIS,
             });
+        }
+        if let QueueCapacity::Finite { max_size_bytes } = self.capacity {
+            if max_size_bytes == 0
+                || max_size_bytes % QUEUE_CAPACITY_GRANULARITY_BYTES != 0
+                || max_size_bytes > MAX_QUEUE_CAPACITY_BYTES
+            {
+                return Err(QueueConfigError::CapacityOutOfRange {
+                    granularity_bytes: QUEUE_CAPACITY_GRANULARITY_BYTES,
+                    maximum_bytes: MAX_QUEUE_CAPACITY_BYTES,
+                });
+            }
+            if self.requires_session {
+                return Err(QueueConfigError::FiniteCapacityWithSessions);
+            }
+            if self.requires_duplicate_detection {
+                return Err(QueueConfigError::FiniteCapacityWithDuplicateDetection);
+            }
         }
         Ok(self)
     }
@@ -211,6 +275,20 @@ pub enum QueueConfigError {
     RequiresSessionImmutable,
     #[error("requires_duplicate_detection cannot be changed after queue creation")]
     RequiresDuplicateDetectionImmutable,
+    #[error(
+        "finite queue size must be a positive multiple of {granularity_bytes} bytes \
+         up to {maximum_bytes} bytes"
+    )]
+    CapacityOutOfRange {
+        granularity_bytes: u64,
+        maximum_bytes: u64,
+    },
+    #[error("finite queue capacity is not supported with sessions")]
+    FiniteCapacityWithSessions,
+    #[error("finite queue capacity is not supported with duplicate detection")]
+    FiniteCapacityWithDuplicateDetection,
+    #[error("a queue's finite or non-finite capacity mode cannot be changed after creation")]
+    CapacityModeImmutable,
 }
 
 #[cfg(test)]

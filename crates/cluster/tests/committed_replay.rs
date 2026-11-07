@@ -31,6 +31,8 @@ use storage::{
 };
 use tempfile::TempDir;
 
+#[path = "committed_replay/capacity_modes.rs"]
+mod capacity_modes;
 #[path = "committed_replay/content_sends.rs"]
 mod content_sends;
 #[path = "committed_replay/fixtures.rs"]
