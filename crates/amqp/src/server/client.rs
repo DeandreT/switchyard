@@ -34,7 +34,11 @@ pub struct ClientReceiver {
     commands: mpsc::Sender<ClientCommand>,
     deliveries: mpsc::Receiver<Delivery>,
     detached: watch::Receiver<bool>,
+    detach_error: DetachErrorSlot,
 }
+
+/// The error a peer's Detach carried, recorded before the link stops.
+type DetachErrorSlot = Arc<Mutex<Option<Error>>>;
 
 pub type ClientDelivery = Delivery;
 
@@ -48,6 +52,7 @@ pub struct ClientReceiverBuilder {
     source: Option<Source>,
     target: Option<Target>,
     sender_settle_mode: SenderSettleMode,
+    max_message_size: Option<u64>,
 }
 
 impl ClientConnection {
@@ -202,6 +207,8 @@ impl ClientSession {
                     receiver_settle_mode: ReceiverSettleMode::First,
                     source: None,
                     target: Some(target),
+                    max_message_size: Some(usize::MAX as u64),
+                    detach_error: None,
                 }),
                 deliveries_tx,
                 detached_tx,
@@ -242,11 +249,30 @@ impl ClientSession {
         target: Option<Target>,
         sender_settle_mode: SenderSettleMode,
     ) -> Result<ClientReceiver, EngineError> {
+        self.attach_receiver_limited(
+            name,
+            source,
+            target,
+            sender_settle_mode,
+            Some(usize::MAX as u64),
+        )
+        .await
+    }
+
+    async fn attach_receiver_limited(
+        &mut self,
+        name: impl Into<String>,
+        source: Source,
+        target: Option<Target>,
+        sender_settle_mode: SenderSettleMode,
+        max_message_size: Option<u64>,
+    ) -> Result<ClientReceiver, EngineError> {
         let name = name.into();
         let (deliveries_tx, deliveries) = mpsc::channel(32);
         let (detached_tx, detached) = watch::channel(false);
         let (drain_tx, _drains) = watch::channel(None);
         let (credit_tx, _credits) = watch::channel(false);
+        let detach_error = DetachErrorSlot::default();
         let (handle, incarnation, response) =
             client_request(&self.commands, |reply| ClientCommand::Attach {
                 channel: self.channel,
@@ -257,6 +283,8 @@ impl ClientSession {
                     receiver_settle_mode: ReceiverSettleMode::First,
                     source: Some(source),
                     target,
+                    max_message_size,
+                    detach_error: Some(Arc::clone(&detach_error)),
                 }),
                 deliveries_tx,
                 detached_tx,
@@ -273,6 +301,7 @@ impl ClientSession {
             commands: self.commands.clone(),
             deliveries,
             detached,
+            detach_error,
         })
     }
 
@@ -355,6 +384,7 @@ impl ClientReceiver {
             source: None,
             target: None,
             sender_settle_mode: SenderSettleMode::Unsettled,
+            max_message_size: Some(usize::MAX as u64),
         }
     }
 
@@ -368,6 +398,14 @@ impl ClientReceiver {
 
     pub fn source(&self) -> &Option<Source> {
         &self.source
+    }
+
+    /// The error the peer's Detach of this link carried, once it detached.
+    pub fn detach_error(&self) -> Option<Error> {
+        self.detach_error
+            .lock()
+            .expect("the detach error slot is not poisoned")
+            .clone()
     }
 
     pub async fn recv(&mut self) -> Result<ClientDelivery, EngineError> {
@@ -459,13 +497,20 @@ impl ClientReceiverBuilder {
         self
     }
 
+    /// The `max-message-size` this receiver advertises; `None` omits it.
+    pub fn max_message_size(mut self, max_message_size: Option<u64>) -> Self {
+        self.max_message_size = max_message_size;
+        self
+    }
+
     pub async fn attach(self, session: &mut ClientSession) -> Result<ClientReceiver, EngineError> {
         session
-            .attach_receiver_with(
+            .attach_receiver_limited(
                 self.name.unwrap_or_else(|| String::from("receiver")),
                 self.source.unwrap_or_default(),
                 self.target,
                 self.sender_settle_mode,
+                self.max_message_size,
             )
             .await
     }
@@ -490,6 +535,8 @@ struct AttachRequest {
     receiver_settle_mode: ReceiverSettleMode,
     source: Option<Source>,
     target: Option<Target>,
+    max_message_size: Option<u64>,
+    detach_error: Option<DetachErrorSlot>,
 }
 
 enum ClientCommand {
@@ -587,6 +634,7 @@ where
     let mut pending_detaches =
         HashMap::<(u16, u32), oneshot::Sender<Result<(), EngineError>>>::new();
     let mut closing: Option<oneshot::Sender<Result<(), EngineError>>> = None;
+    let mut detach_errors = HashMap::<(u16, u32), DetachErrorSlot>::new();
 
     loop {
         tokio::select! {
@@ -649,6 +697,11 @@ where
                     }
                     Performative::Detach(detach) => {
                         let locally_initiated = pending_detaches.remove(&(channel, detach.handle));
+                        // Record the reason before stopping the link wakes its owner.
+                        if let Some(slot) = detach_errors.remove(&(channel, detach.handle)) {
+                            *slot.lock().expect("the detach error slot is not poisoned") =
+                                detach.error.clone();
+                        }
                         if let Some(session) = sessions.get_mut(&channel)
                             && let Some(mut link) = session.links.remove(&detach.handle)
                         {
@@ -738,6 +791,9 @@ where
                             .ok_or_else(|| invalid_state("attach on an unknown session"))?;
                         let handle = *next_handle;
                         *next_handle = next_handle.wrapping_add(1);
+                        if let Some(slot) = request.detach_error.clone() {
+                            detach_errors.insert((channel, handle), slot);
+                        }
                         let attach = Attach {
                             name: request.name.clone(),
                             handle,
@@ -749,7 +805,7 @@ where
                             unsettled: None,
                             incomplete_unsettled: false,
                             initial_delivery_count: (request.role == Role::Sender).then_some(0),
-                            max_message_size: Some(usize::MAX as u64),
+                            max_message_size: request.max_message_size,
                             offered_capabilities: None,
                             desired_capabilities: None,
                             properties: None,
@@ -773,6 +829,7 @@ where
                                     credit: credit_tx,
                                     credit_reservations: HashSet::new(),
                                     next_credit_reservation: 0,
+                                    max_message_size: None,
                                 }));
                                 incarnation
                             }

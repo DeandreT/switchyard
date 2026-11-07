@@ -39,6 +39,7 @@ pub(super) async fn receive_by_sequence_number<B: Broker>(
     entity: &EntityPath,
     broker: &B,
     management: &ConnectionManagement,
+    reply_route: super::ReplyRoute,
 ) -> ManagementResponse {
     let Some(sequences) = sequence_numbers(&message.body) else {
         return ManagementResponse::bad_request(
@@ -67,19 +68,41 @@ pub(super) async fn receive_by_sequence_number<B: Broker>(
         Err(response) => return response,
     };
 
+    // A receive-and-delete is irreversible. Without a reply link its limit is
+    // unknown and a deleted message could never be answered, so it is refused
+    // before anything changes. Peek-lock needs no link: its locks expire.
+    let reply_limit = match reply_route {
+        super::ReplyRoute::Attached { limit } => limit,
+        super::ReplyRoute::Pending { address } if mode == ReceiveMode::ReceiveAndDelete => {
+            match management.await_reply_limit(&address).await {
+                Some(limit) => limit,
+                None => {
+                    return ManagementResponse::bad_request(
+                        message_id,
+                        tracking_id,
+                        "attach the management reply link before receive-and-delete",
+                    );
+                }
+            }
+        }
+        super::ReplyRoute::Pending { .. } => None,
+    };
+    // Against a bounded reply link it is staged: lock, measure the response,
+    // then delete.
+    let staged = mode == ReceiveMode::ReceiveAndDelete && reply_limit.is_some();
     let result = broker
         .submit(
             namespace.clone(),
             entity.clone(),
             CommandKind::ReceiveDeferred {
                 sequences,
-                mode,
+                mode: if staged { ReceiveMode::PeekLock } else { mode },
                 lock_duration_millis: None,
                 session,
             },
         )
         .await;
-    let deliveries = match result {
+    let mut deliveries = match result {
         Ok(CommandOutcome::DeferredReceived(deliveries)) => deliveries,
         Ok(other) => {
             return ManagementResponse::internal(
@@ -93,6 +116,15 @@ pub(super) async fn receive_by_sequence_number<B: Broker>(
         }
     };
 
+    // A staged receive-and-delete renders as the lock-free deliveries it becomes.
+    let staged_locks = if staged {
+        deliveries
+            .iter_mut()
+            .map(|delivery| delivery.lock.take())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let entries = match encode_deliveries(&deliveries) {
         Ok(entries) => entries,
         Err(error) => {
@@ -103,6 +135,35 @@ pub(super) async fn receive_by_sequence_number<B: Broker>(
             );
         }
     };
+    let response = ManagementResponse::accepted(
+        message_id.clone(),
+        tracking_id.clone(),
+        map_body(MESSAGES, Value::List(entries)),
+    );
+    if let Some(limit) = reply_limit {
+        let size = super::response_size(&response);
+        if size > limit {
+            // All or nothing: the client named these messages, and a partial
+            // answer would hide the rest behind locks it never received. The
+            // locks are not registered; nothing was deleted. Each lock still
+            // counted a delivery, so on expiry a message at the queue's
+            // max-delivery-count dead-letters instead of returning.
+            return ManagementResponse::message_size_exceeded(message_id, tracking_id, size, limit);
+        }
+    }
+    if staged {
+        return delete_staged(
+            message_id,
+            tracking_id,
+            namespace,
+            entity,
+            broker,
+            deliveries,
+            staged_locks,
+        )
+        .await
+        .unwrap_or(response);
+    }
     for delivery in deliveries {
         if delivery.lock.is_some() {
             management
@@ -111,11 +172,88 @@ pub(super) async fn receive_by_sequence_number<B: Broker>(
         }
     }
 
-    ManagementResponse::accepted(
-        message_id,
-        tracking_id,
-        map_body(MESSAGES, Value::List(entries)),
-    )
+    response
+}
+
+/// Deletes measured, locked deliveries of a staged receive-and-delete.
+///
+/// Returns `None` when all were deleted, so the measured response stands.
+/// Otherwise only deleted messages are returned; the others keep their locks,
+/// so none is lost or duplicated. Each lock counted a delivery: on expiry it
+/// returns to the deferred set, or dead-letters with MaxDeliveryCountExceeded
+/// once that count reaches the queue's limit.
+async fn delete_staged<B: Broker>(
+    message_id: MessageId,
+    tracking_id: Option<String>,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    broker: &B,
+    deliveries: Vec<Delivery>,
+    locks: Vec<Option<domain::DeliveryLock>>,
+) -> Option<ManagementResponse> {
+    let mut deleted = Vec::with_capacity(deliveries.len());
+    let mut failure = None;
+    for (delivery, lock) in deliveries.into_iter().zip(locks) {
+        let Some(lock) = lock else {
+            failure.get_or_insert_with(|| {
+                ManagementResponse::internal(
+                    message_id.clone(),
+                    tracking_id.clone(),
+                    "a staged deferred receive returned no lock",
+                )
+            });
+            continue;
+        };
+        let completed = broker
+            .submit(
+                namespace.clone(),
+                entity.clone(),
+                CommandKind::Complete {
+                    sequence: delivery.sequence,
+                    lock_token: lock.token,
+                },
+            )
+            .await;
+        match completed {
+            Ok(CommandOutcome::Completed) => deleted.push(delivery),
+            Ok(other) => {
+                failure.get_or_insert_with(|| {
+                    ManagementResponse::internal(
+                        message_id.clone(),
+                        tracking_id.clone(),
+                        format!(
+                            "deleting a deferred message produced an unexpected outcome: {other:?}"
+                        ),
+                    )
+                });
+            }
+            Err(rejection) => {
+                failure.get_or_insert_with(|| {
+                    ManagementResponse::from_rejection(
+                        message_id.clone(),
+                        tracking_id.clone(),
+                        &rejection,
+                    )
+                });
+            }
+        }
+    }
+    let failure = failure?;
+    if deleted.is_empty() {
+        return Some(failure);
+    }
+    Some(match encode_deliveries(&deleted) {
+        Ok(entries) => ManagementResponse::accepted(
+            message_id,
+            tracking_id,
+            map_body(MESSAGES, Value::List(entries)),
+        ),
+        Err(error) => ManagementResponse::internal(
+            message_id,
+            tracking_id,
+            format!("a deferred message could not be encoded: {error}"),
+        ),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -487,6 +625,9 @@ mod tests {
                     return Err(rejection);
                 }
                 let outcome = match &kind {
+                    CommandKind::ReceiveDeferred { .. } => {
+                        CommandOutcome::DeferredReceived(Vec::new())
+                    }
                     CommandKind::Complete { .. } => CommandOutcome::Completed,
                     CommandKind::Defer { .. } | CommandKind::DeferWithPatch { .. } => {
                         CommandOutcome::Deferred
@@ -537,6 +678,109 @@ mod tests {
             Some(vec![SequenceNumber::new(7), SequenceNumber::new(9)])
         );
         assert_eq!(receiver_settle_mode(&request), Some(ReceiveMode::PeekLock));
+    }
+
+    impl RecordingBroker {
+        fn commands(&self) -> Vec<CommandKind> {
+            self.commands
+                .lock()
+                .expect("the command recorder is not poisoned")
+                .clone()
+        }
+    }
+
+    fn receive_request(settle_mode: u32) -> Message {
+        Message {
+            body: body([
+                (
+                    SEQUENCE_NUMBERS,
+                    Value::Array(Array::from(vec![Value::Long(7)])),
+                ),
+                (RECEIVER_SETTLE_MODE, Value::Uint(settle_mode)),
+            ]),
+            ..Message::default()
+        }
+    }
+
+    async fn receive_with(
+        broker: &RecordingBroker,
+        management: &ConnectionManagement,
+        settle_mode: u32,
+        reply_route: super::super::ReplyRoute,
+    ) -> ManagementResponse {
+        receive_by_sequence_number(
+            &receive_request(settle_mode),
+            MessageId::Ulong(1),
+            None,
+            &NamespaceName::new("local").expect("a valid namespace"),
+            &EntityPath::new("orders").expect("a valid entity"),
+            broker,
+            management,
+            reply_route,
+        )
+        .await
+    }
+
+    fn received_mode(broker: &RecordingBroker) -> Vec<ReceiveMode> {
+        broker
+            .commands()
+            .into_iter()
+            .filter_map(|kind| match kind {
+                CommandKind::ReceiveDeferred { mode, .. } => Some(mode),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn pending() -> super::super::ReplyRoute {
+        super::super::ReplyRoute::Pending {
+            address: String::from("replies"),
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_delete_without_a_reply_link_is_refused_before_any_command() {
+        let broker = RecordingBroker::default();
+        let management = ConnectionManagement::new();
+
+        let response = receive_with(&broker, &management, 0, pending()).await;
+
+        assert_eq!(response.status_code, 400);
+        assert_eq!(
+            response.status_description,
+            "attach the management reply link before receive-and-delete"
+        );
+        assert!(broker.commands().is_empty(), "nothing may be deleted");
+    }
+
+    #[tokio::test]
+    async fn receive_delete_waits_for_a_reply_link_attaching_just_after_the_request() {
+        let broker = RecordingBroker::default();
+        let management = ConnectionManagement::new();
+        let late = std::sync::Arc::clone(&management);
+        let attach = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            late.register_limited_reply_route(String::from("replies"), Some(4096))
+                .await
+        });
+
+        let response = receive_with(&broker, &management, 0, pending()).await;
+        let _route = attach.await.expect("the reply link attaches");
+
+        assert_eq!(response.status_code, 200);
+        // The late link is bounded, so the delete is staged behind a lock.
+        assert_eq!(received_mode(&broker), vec![ReceiveMode::PeekLock]);
+    }
+
+    #[tokio::test]
+    async fn peek_lock_by_sequence_needs_no_attached_reply_link() {
+        let broker = RecordingBroker::default();
+        let management = ConnectionManagement::new();
+
+        let response = receive_with(&broker, &management, 1, pending()).await;
+
+        assert_eq!(response.status_code, 200);
+        assert_eq!(received_mode(&broker), vec![ReceiveMode::PeekLock]);
     }
 
     #[test]

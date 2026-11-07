@@ -324,8 +324,7 @@ impl<'a, B: Broker> ReceivingCustody<'a, B> {
                         .as_mut()
                         .and_then(PendingTransfer::take_packet);
                     fault |= matches!(self.transferred.as_ref().and_then(|packet| packet.result.as_ref()),
-                        Some(Err(error)) if !matches!(error,
-                            EngineError::RemoteClosed | EngineError::RemoteDetached | EngineError::Stopped));
+                        Some(Err(error)) if !super::ends_only_the_link(error));
                 }
             }
             if fault {

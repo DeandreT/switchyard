@@ -59,6 +59,31 @@ pub enum EngineError {
     InvalidState(String),
     #[error("SASL authentication failed with {0:?}")]
     SaslAuthentication(SaslCode),
+    #[error("encoded message size {size} exceeds the peer's {maximum}-byte link limit")]
+    MessageSizeExceeded { size: u64, maximum: u64 },
+}
+
+/// The link error a sender reports when a delivery exceeds the receiving
+/// peer's advertised `max-message-size`.
+pub(crate) const MESSAGE_SIZE_EXCEEDED_CONDITION: &str = "amqp:link:message-size-exceeded";
+
+/// The receiving peer's binding `max-message-size` from its attach.
+///
+/// AMQP treats an absent or zero limit as unlimited, and no encoded message can
+/// exceed `u64::MAX`, so all three bind nothing.
+fn peer_message_limit(attach: &Attach) -> Option<u64> {
+    attach
+        .max_message_size
+        .filter(|limit| *limit != 0 && *limit != u64::MAX)
+}
+
+/// The encoded size of `message` when it exceeds `maximum`.
+fn oversized(message: &Message, maximum: Option<u64>) -> Result<Option<u64>, EngineError> {
+    let Some(maximum) = maximum else {
+        return Ok(None);
+    };
+    let size = encode_message(message)?.len() as u64;
+    Ok((size > maximum).then_some(size))
 }
 
 pub struct ServerConnection {
@@ -113,6 +138,7 @@ pub struct Sender {
     credits: watch::Receiver<bool>,
     send_capacity: Arc<Semaphore>,
     pending_confirmation: Option<DeliveryConfirmation>,
+    max_message_size: Option<u64>,
 }
 
 pub struct Receiver {
@@ -589,6 +615,7 @@ impl ServerSession {
         let (credit_tx, credits) = watch::channel(false);
         let role = attach.role.clone();
         let name = attach.name.clone();
+        let peer_limit = peer_message_limit(&attach);
         let handle = attach.handle;
         request(&self.commands, |reply| Command::AcceptLink {
             channel: self.channel,
@@ -626,6 +653,7 @@ impl ServerSession {
                 credits,
                 send_capacity: Arc::new(Semaphore::new(OUTGOING_DELIVERY_LIMIT)),
                 pending_confirmation: None,
+                max_message_size: peer_limit,
             }),
         })
     }
@@ -634,6 +662,25 @@ impl ServerSession {
 impl Sender {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The receiving peer's binding `max-message-size`, or `None` when it
+    /// advertised no limit.
+    pub fn max_message_size(&self) -> Option<u64> {
+        self.max_message_size
+    }
+
+    /// Checks that `message` encodes within the peer's link limit without
+    /// sending it. The engine refuses an oversized delivery anyway, by
+    /// detaching the link; a caller that must not lose a delivery checks first.
+    pub fn check_message_size(&self, message: &Message) -> Result<(), EngineError> {
+        match oversized(message, self.max_message_size)? {
+            Some(size) => Err(EngineError::MessageSizeExceeded {
+                size,
+                maximum: self.max_message_size.unwrap_or(u64::MAX),
+            }),
+            None => Ok(()),
+        }
     }
 
     pub async fn send(

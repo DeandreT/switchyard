@@ -130,6 +130,8 @@ pub(super) struct SendingLink {
     pub(super) credit: watch::Sender<bool>,
     pub(super) credit_reservations: HashSet<u64>,
     pub(super) next_credit_reservation: u64,
+    /// The receiving peer's binding `max-message-size`; `None` is unlimited.
+    pub(super) max_message_size: Option<u64>,
 }
 
 pub(super) struct QueuedSend {
@@ -522,6 +524,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                     incarnation
                 }
                 Role::Receiver => {
+                    let max_message_size = super::peer_message_limit(&attach);
                     let drain = LinkDrain::with_incarnation(incarnation, drain_tx);
                     session.links.insert(
                         handle,
@@ -537,6 +540,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                             credit: credit_tx,
                             credit_reservations: HashSet::new(),
                             next_credit_reservation: 0,
+                            max_message_size,
                         }),
                     );
                     incarnation
@@ -878,6 +882,21 @@ pub(super) async fn flush_sends<W: AsyncWrite + Unpin>(
                 && link.credit_reservations.remove(&reservation.reservation_id);
             debug_assert!(removed, "queued sends retain their credit reservation");
         }
+        let payload = encode_message(&queued.message)?;
+        if let Some(maximum) = link.max_message_size
+            && payload.len() as u64 > maximum
+        {
+            // The peer must never see a transfer above its own limit. The
+            // delivery consumes no credit or delivery id; the link ends.
+            let size = payload.len() as u64;
+            let _ = queued
+                .started
+                .send(Err(EngineError::MessageSizeExceeded { size, maximum }));
+            let _ = queued
+                .reply
+                .send(Err(EngineError::MessageSizeExceeded { size, maximum }));
+            return detach_oversized(channel, handle, session, writer, size, maximum).await;
+        }
         let delivery_id = session.next_outgoing_id;
         session.next_outgoing_id = session.next_outgoing_id.wrapping_add(1);
         link.delivery_count = link.delivery_count.wrapping_add(1);
@@ -887,7 +906,6 @@ pub(super) async fn flush_sends<W: AsyncWrite + Unpin>(
             delivery_id,
         };
         let settled = link.settle_mode == SenderSettleMode::Settled;
-        let payload = encode_message(&queued.message)?;
         write_transfer(
             writer,
             channel,
@@ -917,6 +935,39 @@ pub(super) async fn flush_sends<W: AsyncWrite + Unpin>(
             let _ = queued.started.send(Ok(identity));
         }
     }
+}
+
+/// Ends a sending link whose next delivery exceeds the peer's limit, the same
+/// way a local close does: queued and unsettled sends fail as detached.
+async fn detach_oversized<W: AsyncWrite + Unpin>(
+    channel: u16,
+    handle: u32,
+    session: &mut SessionState,
+    writer: &mut W,
+    size: u64,
+    maximum: u64,
+) -> Result<(), EngineError> {
+    write_amqp(
+        writer,
+        channel,
+        Performative::Detach(Detach {
+            handle,
+            closed: true,
+            error: Some(Error::new(
+                crate::ErrorCondition::Custom(Symbol::from(super::MESSAGE_SIZE_EXCEEDED_CONDITION)),
+                format!(
+                    "the {size}-byte message exceeds the link's {maximum}-byte max-message-size"
+                ),
+                None,
+            )),
+        }),
+        Vec::new(),
+    )
+    .await?;
+    if let Some(mut link) = session.links.remove(&handle) {
+        stop_link(&mut link);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -80,6 +80,11 @@ enum PumpExit {
     Clean,
     Unauthorized,
     Broker(BrokerRejection),
+    /// The next delivery's rendered size exceeds the peer's link limit.
+    MessageSizeExceeded {
+        size: u64,
+        maximum: u64,
+    },
     Engine(EngineError),
     Protocol(crate::ProtocolError),
 }
@@ -190,6 +195,14 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
         custody,
         mut detached,
     } = entry;
+    // A receive-and-delete is irreversible, so against a peer with a size
+    // limit it is staged: lock, measure the rendered transfer, then delete.
+    let staged_mode = match mode {
+        ReceiveMode::ReceiveAndDelete if sender.max_message_size().is_some() => {
+            ReceiveMode::PeekLock
+        }
+        mode => mode,
+    };
     let mut custody = custody.into_borrowed().with_retirement(retirement.as_ref());
 
     // The pump borrows custody: unwinding it cannot drop admitted originals.
@@ -271,7 +284,7 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
                     namespace.clone(),
                     entity.clone(),
                     CommandKind::Receive {
-                        mode,
+                        mode: staged_mode,
                         lock_duration_millis: None,
                         session: session.clone(),
                     },
@@ -306,7 +319,7 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
         custody::pump_checkpoint(custody::PanicFrontier::ReceivePacket);
         let packet = received.as_ref().expect("the observed Receive owns a packet");
         let fetched = packet.result.as_ref().expect("active Receive was not retired").clone();
-        let delivery = match received_delivery(fetched) {
+        let mut delivery = match received_delivery(fetched) {
             Ok(Some(delivery)) => delivery,
             Ok(None) => {
                 let packet = received.take().expect("retained empty Receive packet");
@@ -354,12 +367,44 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
             }
         };
 
+        // A staged receive-and-delete renders as the lock-free delivery it becomes.
+        let staged_lock = if staged_mode == mode { None } else { delivery.lock.take() };
+        debug_assert_eq!(staged_lock.is_some(), staged_mode != mode);
         // Azure sets DeadLetterSource only after a DLQ message has been
         // auto-forwarded to another entity, not while it is drained directly.
         let message = match crate::message::write_delivery_from(&delivery, None) {
             Ok(message) => message,
             Err(error) => break 'pump PumpExit::Protocol(error),
         };
+        // Refuse before anything irreversible. The lock stays to expire: a
+        // dead-lettered copy would render just as large, and abandoning would
+        // redeliver at once to the same peer.
+        match sender.check_message_size(&message) {
+            Ok(()) => {}
+            Err(EngineError::MessageSizeExceeded { size, maximum }) => {
+                debug!(sequence = %delivery.sequence, size, maximum, "delivery exceeds the link's max-message-size");
+                break 'pump PumpExit::MessageSizeExceeded { size, maximum };
+            }
+            Err(error) => break 'pump PumpExit::Engine(error),
+        }
+        if let Some(lock) = staged_lock {
+            let completed = broker
+                .submit(
+                    namespace.clone(),
+                    entity.clone(),
+                    CommandKind::Complete { sequence: delivery.sequence, lock_token: lock.token },
+                )
+                .await;
+            match completed {
+                Ok(CommandOutcome::Completed) => {}
+                Ok(other) => {
+                    break 'pump PumpExit::Broker(BrokerRejection::Unavailable(format!(
+                        "deleting a measured receive-and-delete produced an unexpected outcome: {other:?}"
+                    )));
+                }
+                Err(rejection) => break 'pump PumpExit::Broker(rejection),
+            }
+        }
         let lock_token = delivery.lock.map(|lock| lock.token);
         *transfer_registration = if let Some(lock) = delivery.lock {
             let registration = management
@@ -455,8 +500,7 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
     let faulted = exit.is_none()
         || !custody.workers.failures().is_empty()
         || matches!(&exit, Some(PumpExit::Protocol(_)))
-        || matches!(&exit, Some(PumpExit::Engine(error))
-            if !matches!(error, EngineError::RemoteClosed | EngineError::RemoteDetached | EngineError::Stopped));
+        || matches!(&exit, Some(PumpExit::Engine(error)) if !ends_only_the_link(error));
     if faulted && let Some(retirement) = retirement.as_ref() {
         retirement.request();
     }
@@ -491,14 +535,31 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
             sender.close_with_error(rejection_error(&rejection)).await?;
             Ok(())
         }
+        PumpExit::MessageSizeExceeded { size, maximum } => {
+            sender
+                .close_with_error(amqp::Error::new(
+                    amqp::ErrorCondition::Custom(Symbol::from(crate::MESSAGE_SIZE_EXCEEDED)),
+                    format!(
+                        "the {size}-byte message exceeds the link's {maximum}-byte max-message-size"
+                    ),
+                    None,
+                ))
+                .await?;
+            Ok(())
+        }
         PumpExit::Protocol(error) => {
             let _ = sender
                 .close_with_error(error_for(AmqpError::InternalError, error.to_string()))
                 .await;
             Err(error.into())
         }
+        // The engine already detached a link whose delivery exceeded the peer's
+        // limit; like a remote Detach, closing again could hit a reused handle.
         PumpExit::Engine(
-            EngineError::RemoteClosed | EngineError::RemoteDetached | EngineError::Stopped,
+            EngineError::RemoteClosed
+            | EngineError::RemoteDetached
+            | EngineError::Stopped
+            | EngineError::MessageSizeExceeded { .. },
         ) => match join_error {
             Some(error) => Err(error.into()),
             None => Ok(()),
@@ -508,6 +569,17 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
             Err(error.into())
         }
     }
+}
+
+/// An engine error that retires this link alone, never its connection.
+fn ends_only_the_link(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::RemoteClosed
+            | EngineError::RemoteDetached
+            | EngineError::Stopped
+            | EngineError::MessageSizeExceeded { .. }
+    )
 }
 
 async fn observe_pump<F: std::future::Future>(pump: F) -> F::Output {
@@ -952,6 +1024,18 @@ mod tests {
     use domain::OverlayProperty;
 
     use super::*;
+
+    #[test]
+    fn an_engine_size_refusal_retires_only_its_link() {
+        assert!(ends_only_the_link(&EngineError::MessageSizeExceeded {
+            size: 2,
+            maximum: 1,
+        }));
+        assert!(ends_only_the_link(&EngineError::RemoteDetached));
+        assert!(!ends_only_the_link(&EngineError::InvalidState(
+            String::from("a protocol fault")
+        )));
+    }
 
     fn patch_entry(name: &str, value: Value) -> OverlayProperty {
         OverlayProperty {

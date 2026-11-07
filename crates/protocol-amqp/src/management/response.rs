@@ -147,6 +147,26 @@ impl ManagementResponse {
         }
     }
 
+    /// The response is larger than the reply link accepts. Service Bus reports
+    /// a size refusal as 403 with the AMQP link condition, as for a rejection.
+    pub(super) fn message_size_exceeded(
+        correlation_id: MessageId,
+        tracking_id: Option<String>,
+        size: u64,
+        maximum: u64,
+    ) -> Self {
+        Self {
+            correlation_id,
+            status_code: 403,
+            status_description: format!(
+                "the {size}-byte response exceeds the reply link's {maximum}-byte max-message-size"
+            ),
+            error_condition: Some(crate::MESSAGE_SIZE_EXCEEDED),
+            tracking_id,
+            body: Value::Null,
+        }
+    }
+
     pub(super) fn internal(
         correlation_id: MessageId,
         tracking_id: Option<String>,

@@ -28,6 +28,7 @@ fn admission() -> Admission {
             credits: watch::channel(false).1,
             send_capacity: Arc::new(Semaphore::new(1)),
             pending_confirmation: None,
+            max_message_size: None,
         },
         commands: command_rx,
         cleanup: cleanup_rx,
