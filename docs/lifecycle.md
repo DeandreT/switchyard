@@ -10,7 +10,8 @@ history or Clock; validation precedes allocation/history mutation. Session batch
 share one session. Deduplication suppresses sends, not lock redelivery.
 
 Content sends (proposal V4) derive their normalized fields from the original bytes
-at apply, before reading any state, and store V2 records. Invalid content refuses
+at apply, before reading any state, and store V2 records. AMQP ingress submits every
+send, batch and scheduled-message request this way. Invalid content refuses
 the command with no effects, including every other child of its batch; an indexed
 refusal still checkpoints, and replay refuses it identically.
 
@@ -225,11 +226,11 @@ the commit; a returned error or escaping original panic leaves the marker at 2 o
 rollback or panic catching. Older builds refuse marker 3 immediately, before any
 new-format record is written.
 
-Ordinary writes do not yet enforce the profile; that arrives with #16's
-typed-content admission. A format 3 store can therefore hold out-of-profile
-content written after the upgrade. Snapshot capture stamps layout 3, requires
-native format 3 provenance and repeats the content preflight, so it refuses such
-an image. Every operation that validates an image as capture does is equally
+AMQP ingress sends enforce the profile when their content derives at apply.
+Disposition property updates and replayed historical V1 sends do not yet, so a
+format 3 store can still hold out-of-profile content written after the upgrade.
+Snapshot capture stamps layout 3, requires native format 3 provenance and repeats
+the content preflight, so it refuses such an image. Every operation that validates an image as capture does is equally
 fail-closed: installation's complete old-target validation, anchor attachment,
 compaction and `select_recovery` all refuse an out-of-profile image without
 writes. Such retained content blocks them until it is consumed (settled, expired

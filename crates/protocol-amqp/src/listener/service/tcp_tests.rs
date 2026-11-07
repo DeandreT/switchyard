@@ -985,7 +985,7 @@ async fn actual_memory_and_fjall_send_drain_survives_two_cancellations_before_an
                 let submissions = actor.log.lock().unwrap();
                 let sends: Vec<_> = submissions
                     .iter()
-                    .filter(|entry| matches!(entry.kind, domain::CommandKind::Send { .. }))
+                    .filter(|entry| matches!(entry.kind, domain::CommandKind::SendContent { .. }))
                     .collect();
                 assert_eq!(sends.len(), 2, "one submission and one return");
                 assert!(!sends[0].returned && sends[1].returned);

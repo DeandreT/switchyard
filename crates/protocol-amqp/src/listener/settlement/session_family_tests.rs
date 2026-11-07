@@ -182,7 +182,7 @@ async fn actual_session_processed_end_keeps_send_and_batch_originals_through_can
                 assert_eq!(
                     invocations(&actor, |kind| matches!(
                         kind,
-                        CommandKind::Send { .. } | CommandKind::SendBatch { .. }
+                        CommandKind::SendContent { .. } | CommandKind::SendContentBatch { .. }
                     )),
                     1
                 );
@@ -547,7 +547,10 @@ async fn actual_session_parent_fault_interrupts_begun_native_children_without_wr
         }
         if matches!(role, Admission::DataSend) {
             assert_eq!(
-                invocations(&actor, |kind| matches!(kind, CommandKind::Send { .. })),
+                invocations(&actor, |kind| matches!(
+                    kind,
+                    CommandKind::SendContent { .. }
+                )),
                 1
             );
         }

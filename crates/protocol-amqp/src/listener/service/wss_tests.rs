@@ -907,7 +907,7 @@ async fn actual_wss_memory_and_fjall_send_commit_keep_originals_across_two_cance
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|entry| matches!(entry.kind, CommandKind::Send { .. }))
+                .filter(|entry| matches!(entry.kind, CommandKind::SendContent { .. }))
                 .cloned()
                 .collect::<Vec<_>>();
             assert_eq!(submissions.len(), 2);

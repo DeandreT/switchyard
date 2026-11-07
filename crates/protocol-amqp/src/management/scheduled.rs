@@ -2,11 +2,11 @@
 
 use amqp::{Body, Message, MessageId, decode_message};
 use domain::{
-    CommandKind, CommandOutcome, EntityPath, MessageInput, NamespaceName, SequenceNumber,
+    CommandKind, CommandOutcome, EntityPath, MessageContent, NamespaceName, SequenceNumber,
 };
 use serde_amqp::{Value, primitives::Array};
 
-use crate::{Broker, read_incoming, validate_standard_message_size};
+use crate::{Broker, validate_standard_message_size};
 
 use super::{ManagementResponse, map_body, map_value};
 
@@ -40,7 +40,7 @@ pub(super) async fn schedule<B: Broker>(
         .submit(
             namespace.clone(),
             entity.clone(),
-            CommandKind::SendBatch { messages },
+            CommandKind::SendContentBatch { messages },
         )
         .await
     {
@@ -110,7 +110,7 @@ pub(super) async fn cancel<B: Broker>(
     }
 }
 
-fn scheduled_messages(body: &Body) -> Result<Vec<MessageInput>, String> {
+fn scheduled_messages(body: &Body) -> Result<Vec<MessageContent>, String> {
     let Some(Value::List(entries)) = map_value(body, MESSAGES) else {
         return Err(String::from(
             "messages must be a nonempty AMQP value list of maps",
@@ -122,14 +122,19 @@ fn scheduled_messages(body: &Body) -> Result<Vec<MessageInput>, String> {
         ));
     }
 
-    entries
+    let contents = entries
         .iter()
         .enumerate()
         .map(|(index, entry)| scheduled_message(entry, index))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    // Apply derives the batch against one shared projection budget, so check
+    // it the same way before submission.
+    MessageContent::derive_batch(&contents)
+        .map_err(|error| format!("messages are invalid together: {error}"))?;
+    Ok(contents)
 }
 
-fn scheduled_message(entry: &Value, index: usize) -> Result<MessageInput, String> {
+fn scheduled_message(entry: &Value, index: usize) -> Result<MessageContent, String> {
     let Value::Map(entry) = entry else {
         return Err(format!("messages[{index}] must be an AMQP map"));
     };
@@ -139,10 +144,14 @@ fn scheduled_message(entry: &Value, index: usize) -> Result<MessageInput, String
     };
     validate_standard_message_size(encoded.len()).map_err(|error| error.to_string())?;
     // The message arrives in the client's management request: received checks.
-    let decoded = decode_message(encoded).map_err(|error| {
+    decode_message(encoded).map_err(|error| {
         format!("messages[{index}].message is not a complete AMQP message: {error}")
     })?;
-    let incoming = read_incoming(&decoded, encoded)
+    // The cross-checks use the derivation the state machine applies, so the
+    // request is checked against exactly the fields the stored record gets.
+    let content = MessageContent::Amqp(encoded.to_vec());
+    let incoming = content
+        .derive()
         .map_err(|error| format!("messages[{index}].message is invalid: {error}"))?;
     if incoming.scheduled_enqueue_at.is_none() {
         return Err(format!(
@@ -169,7 +178,7 @@ fn scheduled_message(entry: &Value, index: usize) -> Result<MessageInput, String
     let _ = string_entry(entry, PARTITION_KEY, index, false)?;
     let _ = string_entry(entry, VIA_PARTITION_KEY, index, false)?;
 
-    Ok(incoming.into())
+    Ok(content)
 }
 
 fn string_entry(
@@ -354,16 +363,139 @@ mod tests {
             ])))
         );
         let commands = broker.commands();
-        let [CommandKind::SendBatch { messages }] = commands.as_slice() else {
+        let [CommandKind::SendContentBatch { messages }] = commands.as_slice() else {
             panic!("expected one atomic scheduled batch")
         };
-        assert_eq!(messages.len(), 2);
         assert_eq!(
-            messages[0].scheduled_enqueue_at,
+            messages,
+            &[
+                MessageContent::Amqp(encoded("one", 12_000)),
+                MessageContent::Amqp(encoded("two", 13_000))
+            ]
+        );
+        let derived = MessageContent::derive_batch(messages).expect("the batch derives");
+        assert_eq!(
+            derived[0].scheduled_enqueue_at,
             Some(Timestamp::from_millis(12_000))
         );
-        assert_eq!(messages[1].message_id, "two");
-        assert!(messages[0].envelope.is_some());
+        assert_eq!(derived[1].message_id, "two");
+    }
+
+    fn status(response: &Message) -> Option<&Value> {
+        response
+            .application_properties
+            .as_ref()
+            .and_then(|properties| properties.get("statusCode"))
+    }
+
+    /// A scheduled message whose application property is the array
+    /// `["é", "x"]`, correctly encoded with byte lengths.
+    fn non_ascii_array(message_id: &str) -> Vec<u8> {
+        let mut message = Message {
+            body: Body::Empty,
+            ..Message::default()
+        };
+        message.properties = Some(Properties {
+            message_id: Some(message_id.to_owned().into()),
+            ..Properties::default()
+        });
+        let mut annotations = MessageAnnotations::default();
+        annotations.insert(
+            AnnotationKey::from("x-opt-scheduled-enqueue-time"),
+            Value::Timestamp(AmqpTimestamp::from_milliseconds(12_000)),
+        );
+        message.message_annotations = Some(annotations);
+        let mut bytes = encode_message(&message).expect("message encodes");
+        bytes.extend([
+            0x00, 0x53, 0x74, // application-properties
+            0xc1, 0x0d, 0x02, // map8, size 13, count 2
+            0xa1, 0x01, b'k', // key "k"
+            0xe0, 0x07, 0x02, 0xa1, 0x02, 0xc3, 0xa9, 0x01, 0x78, // ["é","x"]
+            0x00, 0x53, 0x75, 0xa0, 0x01, b'b', // data "b"
+        ]);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn a_non_ascii_string_array_refuses_the_whole_schedule_before_submission() {
+        let encoded_array = non_ascii_array("two");
+        // The client's bytes are valid AMQP; the refusal is the derivation's.
+        decode_message(&encoded_array).expect("the received checks accept it");
+        let broker = RecordingBroker::returning(CommandOutcome::BatchSent {
+            sequences: vec![],
+            stored: 0,
+        });
+        let (namespace, entity) = names();
+        let response = schedule(
+            &schedule_request(vec![
+                entry("one", encoded("one", 12_000)),
+                entry("two", encoded_array),
+            ]),
+            MessageId::Ulong(1),
+            None,
+            &namespace,
+            &entity,
+            &broker,
+        )
+        .await
+        .into_message();
+
+        assert_eq!(status(&response), Some(&Value::Int(400)));
+        assert!(broker.commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_request_identifiers_must_match_the_derived_fields() {
+        let mut grouped = Message::data(b"grouped".to_vec());
+        grouped.properties = Some(Properties {
+            message_id: Some(MessageId::Ulong(42)),
+            group_id: Some("cart".to_owned()),
+            ..Properties::default()
+        });
+        let mut annotations = MessageAnnotations::default();
+        annotations.insert(
+            AnnotationKey::from("x-opt-scheduled-enqueue-time"),
+            Value::Timestamp(AmqpTimestamp::from_milliseconds(12_000)),
+        );
+        grouped.message_annotations = Some(annotations);
+        let grouped = encode_message(&grouped).expect("message encodes");
+        let with_session = |message_id: &str, session: Option<&str>| {
+            let Value::Map(mut map) = entry(message_id, grouped.clone()) else {
+                unreachable!("entries are maps")
+            };
+            if let Some(session) = session {
+                map.insert(
+                    Value::String(SESSION_ID.into()),
+                    Value::String(session.into()),
+                );
+            }
+            Value::Map(map)
+        };
+        let (namespace, entity) = names();
+        for (request, accepted) in [
+            (with_session("42", Some("cart")), true),
+            (with_session("43", Some("cart")), false),
+            (with_session("42", Some("other")), false),
+            (with_session("42", None), false),
+        ] {
+            let broker = RecordingBroker::returning(CommandOutcome::BatchSent {
+                sequences: vec![SequenceNumber::new(1)],
+                stored: 1,
+            });
+            let response = schedule(
+                &schedule_request(vec![request]),
+                MessageId::Ulong(1),
+                None,
+                &namespace,
+                &entity,
+                &broker,
+            )
+            .await
+            .into_message();
+            let expected = if accepted { 200 } else { 400 };
+            assert_eq!(status(&response), Some(&Value::Int(expected)));
+            assert_eq!(broker.commands().len(), usize::from(accepted));
+        }
     }
 
     #[tokio::test]

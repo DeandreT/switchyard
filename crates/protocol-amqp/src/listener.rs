@@ -732,23 +732,13 @@ async fn send_delivery_pump<'a, B: Broker>(
     };
 
     let (command, expected) = match incoming {
-        IncomingMessages::Single(incoming) => (
-            CommandKind::Send {
-                message_id: incoming.message_id,
-                body: incoming.body,
-                time_to_live_millis: incoming.time_to_live_millis,
-                session_id: incoming.session_id,
-                scheduled_enqueue_at: incoming.scheduled_enqueue_at,
-                envelope: Some(incoming.envelope),
-            },
-            SendOutcome::Single,
-        ),
+        IncomingMessages::Single(content) => {
+            (CommandKind::SendContent { content }, SendOutcome::Single)
+        }
         IncomingMessages::Batch(messages) => {
             let count = messages.len();
             (
-                CommandKind::SendBatch {
-                    messages: messages.into_iter().map(Into::into).collect(),
-                },
+                CommandKind::SendContentBatch { messages },
                 SendOutcome::Batch(count),
             )
         }

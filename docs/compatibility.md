@@ -218,7 +218,10 @@ each message's original AMQP bytes once, or raw bytes with explicit normalized f
 decoding never parses or polices that content. Abandon, defer and dead-letter with a
 sparse property patch also use V4; their legacy replacement-envelope forms keep exact
 V1 bytes. New readers accept V1 through V4; older readers refuse unsupported proposal
-versions. The wire protocol still emits legacy V1 sends and dispositions.
+versions. AMQP ingress sends every message as V4: a transfer as `SendContent`, and a
+Service Bus batch or scheduled-message request as `SendContentBatch` with each child's
+original bytes. Nothing new emits V1 sends; historical V1 sends still decode and replay
+unchanged. Dispositions still emit their legacy V1 forms.
 
 Store format 3 adds no record encoding: journal-entry/frontier/indexed-checkpoint
 formats remain unchanged, and snapshot anchors use the separate owner/container
@@ -245,10 +248,14 @@ is exact, and snapshot validation requires canonical rows of either version.
 A content send parses AMQP content when it applies, under the fixed content-safety
 profile (16 MiB, depth 128, 4,194,304 nodes, 268,435,456 work units), and derives the
 message ID, session, TTL, scheduled enqueue time and filter projection exactly as AMQP
-ingress derives them for a legacy send, so rule matching is unchanged. Invalid content
-refuses deterministically, and one invalid child refuses its whole batch. The entity's
-message-size limit, the parser profile and the one-MiB proposal envelope are separate
-budgets.
+ingress derived them for a legacy send, so rule matching and duplicate-detection
+identities are unchanged across the switch. Ingress still applies the received-message
+decode to each message or batch child before sending. Invalid content refuses
+deterministically, and one invalid child refuses its whole batch: transfers reject with
+`amqp:invalid-field`. Scheduling requests check each message, including its message-id
+and session cross-checks, with the same derivation and the batch's shared projection
+budget, so one that fails it returns 400 before submission. The entity's message-size limit, the parser profile and the one-MiB
+proposal envelope are separate budgets.
 
 The derived projection must satisfy the same bounded-content contract that snapshot
 capture, compaction and store upgrade enforce, so a content send refuses at derive time
@@ -263,12 +270,14 @@ single `SendContent` uses the same formula over its one child.
 
 Some array shapes are refused because they are not sendable. Arrays whose elements are
 compound or described values are refused, which legacy AMQP ingress also refuses. Two
-further shapes are V4-only refusals, where legacy ingress still writes its old bytes: an
-array of empty lists (`list0` elements), which the canonical encoder has no spec
+further shapes are V4-only refusals, which historical V1 sends stored as their old bytes:
+an array of empty lists (`list0` elements), which the canonical encoder has no spec
 rendering for, and an array of strings or symbols containing non-ASCII text, whose stored
-length would disagree with the text and not be decodable AMQP. Each derived value is
-additionally re-decoded under the profile as a safety net and refused if it does not
-round-trip.
+length would disagree with the text and not be decodable AMQP. Because ingress now sends
+V4, every AMQP send path refuses these shapes for new writes; projections that
+historical V1 sends already stored are unchanged. Property-modifying dispositions still
+re-encode a replacement envelope with the legacy encoder until they send patches. Each derived value is additionally
+re-decoded under the profile as a safety net and refused if it does not round-trip.
 
 A V4 disposition patch maps property names to one encoded AMQP value each, checked
 under the content-safety profile when it applies. It rewrites only the locked copy

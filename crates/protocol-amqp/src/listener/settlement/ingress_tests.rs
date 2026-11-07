@@ -15,16 +15,16 @@ use std::{
 use amqp::{
     AmqpError, Attach, Begin, Body, DeliveryState, Detach, Disposition, Frame, LinkEndpoint,
     Message, Open, Performative, Properties, ProtocolHeader, Receiver, ReceiverSettleMode, Role,
-    SenderSettleMode, ServerConnection, ServerSession, Target, Transfer, encode_message,
-    read_frame, read_protocol_header, write_frame, write_protocol_header,
+    SenderSettleMode, ServerConnection, ServerSession, Target, Transfer, decode_stored_message,
+    encode_message, read_frame, read_protocol_header, write_frame, write_protocol_header,
 };
 use auth::{
     Permission, PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use domain::{
-    BrokerError, CommandKind, CommandOutcome, MessageState, QueueCounters, SequenceNumber,
-    StateMachine,
+    BrokerError, CommandKind, CommandOutcome, MessageRecordFormat, MessageState, QueueCounters,
+    SequenceNumber, StateMachine,
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -171,6 +171,11 @@ impl IngressWire {
     }
 
     async fn send(&mut self, id: u32, message: Message, message_format: u32) {
+        self.send_encoded(id, encode_message(&message).unwrap(), message_format)
+            .await;
+    }
+
+    async fn send_encoded(&mut self, id: u32, payload: Vec<u8>, message_format: u32) {
         write_frame(
             &mut self.peer,
             &frame(
@@ -188,7 +193,7 @@ impl IngressWire {
                     aborted: false,
                     batchable: false,
                 }),
-                encode_message(&message).unwrap(),
+                payload,
             ),
         )
         .await
@@ -315,7 +320,14 @@ fn assert_stored(actor: &Actor, count: u64) {
             .unwrap()
             .unwrap();
         assert_eq!(record.message_id, format!("ingress-{index}"));
-        assert_eq!(record.body, format!("ingress-{index}").as_bytes());
+        // Ingress sends original content: the V2 record keeps it only once.
+        assert_eq!(record.format, MessageRecordFormat::V2);
+        assert!(record.body.is_empty());
+        let stored = decode_stored_message(record.envelope.as_ref().unwrap().as_bytes()).unwrap();
+        assert_eq!(
+            stored.body,
+            Body::Data(vec![format!("ingress-{index}").into_bytes().into()])
+        );
         assert_eq!(record.state, MessageState::Ready);
         assert_eq!(record.enqueued_at, machine.last_applied_time().unwrap());
         assert_eq!(record.delivery_count, 0);
@@ -339,10 +351,13 @@ fn assert_one_submit(actor: &Actor, batch: bool) {
     assert_eq!(log.len(), 2, "one entry and one returned original result");
     assert!(!log[0].returned && log[1].returned);
     assert_eq!(log[0].kind, log[1].kind);
-    assert_eq!(matches!(log[0].kind, CommandKind::SendBatch { .. }), batch);
+    assert_eq!(
+        matches!(log[0].kind, CommandKind::SendContentBatch { .. }),
+        batch
+    );
     assert!(matches!(
         log[0].kind,
-        CommandKind::Send { .. } | CommandKind::SendBatch { .. }
+        CommandKind::SendContent { .. } | CommandKind::SendContentBatch { .. }
     ));
 }
 
@@ -507,26 +522,17 @@ fn submission(
     let broker = actor.broker.as_ref().unwrap().clone();
     let namespace = actor.namespace.clone();
     let entity = actor.entity.clone();
+    let content = domain::MessageContent::Raw(domain::RawMessage {
+        message_id: "owner".to_owned(),
+        body: vec![1],
+        ..domain::RawMessage::default()
+    });
     let command = if batch {
-        CommandKind::SendBatch {
-            messages: vec![domain::MessageInput {
-                message_id: "owner".to_owned(),
-                body: vec![1],
-                time_to_live_millis: None,
-                session_id: None,
-                scheduled_enqueue_at: None,
-                envelope: None,
-            }],
+        CommandKind::SendContentBatch {
+            messages: vec![content],
         }
     } else {
-        CommandKind::Send {
-            message_id: "owner".to_owned(),
-            body: vec![1],
-            time_to_live_millis: None,
-            session_id: None,
-            scheduled_enqueue_at: None,
-            envelope: None,
-        }
+        CommandKind::SendContent { content }
     };
     async move { broker.submit(namespace, entity, command).await }
 }
@@ -726,6 +732,110 @@ async fn healthy_refusal_and_conversion_paths_keep_wire_priority_and_link_usable
     .expect("test observer joined");
 }
 
+/// A message whose application property is the array `["é", "x"]`, correctly
+/// encoded with byte lengths: valid AMQP that content derivation refuses.
+fn non_ascii_array_message() -> Vec<u8> {
+    let bytes = vec![
+        0x00, 0x53, 0x74, // application-properties
+        0xc1, 0x0d, 0x02, // map8, size 13, count 2
+        0xa1, 0x01, b'k', // key "k"
+        0xe0, 0x07, 0x02, 0xa1, 0x02, 0xc3, 0xa9, 0x01, 0x78, // ["é","x"]
+        0x00, 0x53, 0x75, 0xa0, 0x01, b'b', // data "b"
+    ];
+    amqp::decode_message(&bytes).expect("the received checks accept it");
+    bytes
+}
+
+fn grouped(index: usize, session: &str) -> Message {
+    Message::builder()
+        .properties(Properties {
+            message_id: Some(format!("ingress-{index}").into()),
+            group_id: Some(session.to_owned()),
+            ..Properties::default()
+        })
+        .body(Body::Data(vec![
+            format!("ingress-{index}").into_bytes().into(),
+        ]))
+        .build()
+}
+
+fn batch_of(children: Vec<Vec<u8>>) -> Vec<u8> {
+    encode_message(
+        &Message::builder()
+            .body(Body::Data(children.into_iter().map(Into::into).collect()))
+            .build(),
+    )
+    .unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn content_refusals_reject_the_transfer_with_nothing_stored() {
+    tokio::spawn(async move {
+        // 0: single non-ASCII array; 1: batch with one; 2: session-mismatched batch.
+        for case in 0..3 {
+            let session = case == 2;
+            let actor = Actor::new(false, session);
+            let before = actor.store().snapshot().unwrap();
+            let mut wire = IngressWire::new().await;
+            let receiver = wire.receiver.take().unwrap();
+            let pump = tokio::spawn(serve_sending_client(
+                receiver,
+                actor.namespace.clone(),
+                actor.entity.clone(),
+                actor.broker.as_ref().unwrap().clone(),
+                None,
+            ));
+            let valid = encode_message(&messages(false).0).unwrap();
+            let (payload, format, expected) = match case {
+                0 => (non_ascii_array_message(), 0, AmqpError::InvalidField),
+                1 => (
+                    batch_of(vec![valid, non_ascii_array_message()]),
+                    SERVICE_BUS_BATCH_MESSAGE_FORMAT,
+                    AmqpError::InvalidField,
+                ),
+                _ => (
+                    batch_of(vec![
+                        encode_message(&grouped(0, "cart-1")).unwrap(),
+                        encode_message(&grouped(1, "cart-2")).unwrap(),
+                    ]),
+                    SERVICE_BUS_BATCH_MESSAGE_FORMAT,
+                    AmqpError::NotAllowed,
+                ),
+            };
+            wire.send_encoded(0, payload, format).await;
+            let Some(DeliveryState::Rejected(rejected)) = wire.disposition(0).await.state else {
+                panic!("the content send is refused");
+            };
+            assert_eq!(rejected.error.unwrap().condition, expected.into());
+            // The refusal is the state machine's, decided before any effect.
+            assert_one_submit(&actor, case != 0);
+            assert_eq!(actor.store().snapshot().unwrap(), before);
+            assert_stored(&actor, 0);
+
+            // The link stays usable for the next valid send.
+            actor.log.lock().unwrap().clear();
+            let next = if session {
+                grouped(0, "cart-1")
+            } else {
+                messages(false).0
+            };
+            wire.send(1, next, 0).await;
+            assert!(matches!(
+                wire.disposition(1).await.state,
+                Some(DeliveryState::Accepted(_))
+            ));
+            assert_one_submit(&actor, false);
+            assert_stored(&actor, 1);
+            wire.no_ack_barrier().await;
+            wire.detach().await;
+            timeout(WAIT, pump).await.unwrap().unwrap().unwrap();
+            wire.stop().await;
+        }
+    })
+    .await
+    .expect("test observer joined");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn observed_retirement_before_helper_poll_precedes_conversion_and_submission() {
     tokio::spawn(async move {
@@ -860,13 +970,12 @@ async fn eager_submit_invocation_is_distinct_from_poll_and_retired_work_invokes_
                     .submit(
                         actor.namespace.clone(),
                         actor.entity.clone(),
-                        CommandKind::Send {
-                            message_id: "unpolled".to_owned(),
-                            body: vec![1],
-                            time_to_live_millis: None,
-                            session_id: None,
-                            scheduled_enqueue_at: None,
-                            envelope: None,
+                        CommandKind::SendContent {
+                            content: domain::MessageContent::Raw(domain::RawMessage {
+                                message_id: "unpolled".to_owned(),
+                                body: vec![1],
+                                ..domain::RawMessage::default()
+                            }),
                         },
                     )
                     .await

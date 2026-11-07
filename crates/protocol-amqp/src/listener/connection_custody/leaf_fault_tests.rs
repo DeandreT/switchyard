@@ -94,7 +94,7 @@ impl Broker for FaultBroker {
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         assert!(if self.sends {
-            matches!(kind, CommandKind::Send { .. })
+            matches!(kind, CommandKind::SendContent { .. })
         } else {
             matches!(kind, CommandKind::Receive { .. })
         });
