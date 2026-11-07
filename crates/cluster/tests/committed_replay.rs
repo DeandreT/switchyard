@@ -18,10 +18,10 @@ use cluster::{
 use domain::{
     BoundCommand, BrokerError, Command, CommandKind, DurableProposal, DurableProposalError,
     EntityPath, IndexedApplyError, IndexedApplyOutcome, IndexedWriter, MAX_SUBSCRIPTION_RULES,
-    MAX_TOPIC_SUBSCRIPTIONS, NamespaceName, QueueConfig, QueueTimeToLiveUpdate, ReceiveMode,
-    RuleDefinition, RuleFilter, RuleName, StateMachine, SubscriptionConfig,
-    SubscriptionConfigUpdate, SubscriptionName, Timestamp, TopicConfig, TopicConfigUpdate, codec,
-    keys,
+    MAX_TOPIC_SUBSCRIPTIONS, MessageContent, NamespaceName, QueueConfig, QueueTimeToLiveUpdate,
+    RawMessage, ReceiveMode, RuleDefinition, RuleFilter, RuleName, StateMachine,
+    SubscriptionConfig, SubscriptionConfigUpdate, SubscriptionName, Timestamp, TopicConfig,
+    TopicConfigUpdate, codec, keys,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -31,6 +31,8 @@ use storage::{
 };
 use tempfile::TempDir;
 
+#[path = "committed_replay/content_sends.rs"]
+mod content_sends;
 #[path = "committed_replay/fixtures.rs"]
 mod fixtures;
 #[path = "committed_replay/topic_duplicates.rs"]

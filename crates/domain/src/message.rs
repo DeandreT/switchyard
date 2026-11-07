@@ -254,8 +254,9 @@ impl From<Vec<u8>> for MessageEnvelope {
     }
 }
 
-/// Stored format of a message record; see [`codec::message`]. Every record
-/// written today is V1, and a rewrite keeps the format a record was read with.
+/// Stored format of a message record; see [`codec::message`]. Legacy sends
+/// write V1 and content sends write V2; a rewrite keeps the format a record
+/// was read with.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MessageRecordFormat {
     /// Body and optional envelope are stored side by side.

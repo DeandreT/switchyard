@@ -9,6 +9,11 @@ Commands carry time and commit one batch. Rejection changes no messages, counter
 history or Clock; validation precedes allocation/history mutation. Session batches
 share one session. Deduplication suppresses sends, not lock redelivery.
 
+Content sends (proposal V4) derive their normalized fields from the original bytes
+at apply, before reading any state, and store V2 records. Invalid content refuses
+the command with no effects, including every other child of its batch; an indexed
+refusal still checkpoints, and replay refuses it identically.
+
 Opt-in indexed apply atomically commits effects/Clock/checkpoint. Both it and the
 opt-in journal retire before storage apply; only success and cache updates restore
 usability. Returned storage-apply errors or explicitly caught storage-apply unwinds
@@ -305,7 +310,7 @@ Existing commands retain byte-identical frozen durable V1 DTOs, including invali
 numeric intent. Only these two update commands use frozen private V2 DTOs with
 canonical framing, bounded identifiers and retained parent-topic authority checks.
 V1 cannot represent them and explicitly refuses capture; V1-only readers refuse the
-V2 envelope. Current readers accept V1/V2/V3, retaining invalid patch values
+V2 envelope. Current readers accept V1 through V4, retaining invalid patch values
 for domain refusal rather than silently repairing them. The one-MiB envelope limit
 still applies. Nonlegacy topic creation alone uses frozen V3 with V1 creation
 authority rules (not V2 update-only restrictions); V1 capture refuses lossy conversion

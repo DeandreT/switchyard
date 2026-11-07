@@ -84,7 +84,8 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::InvalidEntityBinding
         | BrokerError::EmptyRulePage
         | BrokerError::RulePageTooLarge { .. }
-        | BrokerError::RuleConfig(_) => INVALID_FIELD,
+        | BrokerError::RuleConfig(_)
+        | BrokerError::MessageContent(_) => INVALID_FIELD,
         BrokerError::QueueConfig(_)
         | BrokerError::TopicConfig(_)
         | BrokerError::SubscriptionConfig(_) => PRECONDITION_FAILED,

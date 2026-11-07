@@ -326,7 +326,8 @@ fn ordinary_deterministic_refusal(kind: &CommandKind, error: &BrokerError) -> bo
         | E::SessionNotSupported
         | E::SessionAlreadyLocked { .. }
         | E::SessionLockNotHeld { .. }
-        | E::SessionLockExpired { .. } => true,
+        | E::SessionLockExpired { .. }
+        | E::MessageContent(_) => true,
         E::QueueConfig(_) => matches!(
             kind,
             C::CreateQueue { .. } | C::UpdateQueue { .. } | C::CreateSubscription { .. }
@@ -338,7 +339,11 @@ fn ordinary_deterministic_refusal(kind: &CommandKind, error: &BrokerError) -> bo
         ),
         E::RuleConfig(_) => matches!(
             kind,
-            C::CreateRule { .. } | C::Send { .. } | C::SendBatch { .. }
+            C::CreateRule { .. }
+                | C::Send { .. }
+                | C::SendBatch { .. }
+                | C::SendContent { .. }
+                | C::SendContentBatch { .. }
         ),
         E::MessageNotLocked { .. } => matches!(
             kind,
@@ -351,7 +356,11 @@ fn ordinary_deterministic_refusal(kind: &CommandKind, error: &BrokerError) -> bo
         E::MessageNotScheduled { .. } => matches!(kind, C::CancelScheduled { .. }),
         E::SequenceNumberExhausted => matches!(
             kind,
-            C::Send { .. } | C::SendBatch { .. } | C::ActivateScheduled
+            C::Send { .. }
+                | C::SendBatch { .. }
+                | C::SendContent { .. }
+                | C::SendContentBatch { .. }
+                | C::ActivateScheduled
         ),
         E::LockTokenExhausted => matches!(
             kind,

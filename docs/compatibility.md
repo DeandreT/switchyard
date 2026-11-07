@@ -213,8 +213,11 @@ See [topic integrity](lifecycle.md#topic-integrity) for exact bounds and exclusi
 Durable proposals preserve legacy-representable commands' private V1 bytes and
 checkpoint identities. Topic/subscription profile updates use unchanged private V2
 DTOs. Only nonlegacy topic creation uses private V3, including invalid new settings
-that must survive for deterministic refusal. New readers accept V1/V2/V3; older
-readers refuse unsupported proposal versions.
+that must survive for deterministic refusal. Content sends use private V4, carrying
+each message's original AMQP bytes once, or raw bytes with explicit normalized fields;
+decoding never parses or polices that content. New readers accept V1 through V4;
+older readers refuse unsupported proposal versions. The wire protocol still emits
+legacy V1 sends.
 
 Store format 3 adds no record encoding: journal-entry/frontier/indexed-checkpoint
 formats remain unchanged, and snapshot anchors use the separate owner/container
@@ -229,14 +232,42 @@ pre-feature state/journal/checkpoint backup. Never strip markers, rewrite profil
 or delete history as a downgrade procedure.
 See [profile lifecycle](lifecycle.md#profile-updates).
 
-Message records use a dedicated frozen codec. Every record is written as V1, byte
-for byte the former generic encoding, and rewrites keep the version a record was read
-with. Readers also accept V2: raw bytes, or original AMQP bytes with a filter projection
-and a sparse property overlay (unique names in first-insertion order; each value one
-encoded AMQP value, where null is a value) and no duplicated body. Nothing writes V2
-yet, overlays are stored data only, and durable proposals refuse envelopes carrying
-them. Runtime V1 reads keep tolerating trailing bytes; V2 framing is exact, and
-snapshot validation requires canonical rows of either version.
+Message records use a dedicated frozen codec. Legacy sends write V1, byte for byte
+the former generic encoding; content sends write V2: raw bytes, or original AMQP bytes
+with a filter projection and a sparse property overlay (unique names in first-insertion
+order; each value one encoded AMQP value, where null is a value) and no duplicated body.
+Rewrites, topic copies, scheduled activation and dead-letter moves keep the version a
+record was read with. Overlays are stored data only, and durable proposals refuse
+envelopes carrying them. Runtime V1 reads keep tolerating trailing bytes; V2 framing
+is exact, and snapshot validation requires canonical rows of either version.
+
+A content send parses AMQP content when it applies, under the fixed content-safety
+profile (16 MiB, depth 128, 4,194,304 nodes, 268,435,456 work units), and derives the
+message ID, session, TTL, scheduled enqueue time and filter projection exactly as AMQP
+ingress derives them for a legacy send, so rule matching is unchanged. Invalid content
+refuses deterministically, and one invalid child refuses its whole batch. The entity's
+message-size limit, the parser profile and the one-MiB proposal envelope are separate
+budgets.
+
+The derived projection must satisfy the same bounded-content contract that snapshot
+capture, compaction and store upgrade enforce, so a content send refuses at derive time
+in several cases. Two bound size: a single filterable property value whose canonical
+encoding exceeds the correlation-value ceiling, and a projection larger than its budget.
+That budget is per command, not per message: the combined original length of all of a
+command's children plus one correlation-value ceiling. A batch therefore shares one
+allowance rather than multiplying it by its child count, which bounds how much a single
+`SendContentBatch` can expand (for example many small children that are each a
+wide-re-encoding zero-width array) into one write batch, copied once per subscription. A
+single `SendContent` uses the same formula over its one child.
+
+Some array shapes are refused because they are not sendable. Arrays whose elements are
+compound or described values are refused, which legacy AMQP ingress also refuses. Two
+further shapes are V4-only refusals, where legacy ingress still writes its old bytes: an
+array of empty lists (`list0` elements), which the canonical encoder has no spec
+rendering for, and an array of strings or symbols containing non-ASCII text, whose stored
+length would disagree with the text and not be decodable AMQP. Each derived value is
+additionally re-decoded under the profile as a safety net and refused if it does not
+round-trip.
 
 ### Storage And Runtime Limits
 

@@ -208,5 +208,6 @@ fn record_input(record: &MessageRecord) -> SendInput<'_> {
         session_id: record.session_id.as_ref(),
         scheduled_enqueue_at: record.scheduled_enqueue_at,
         envelope: record.envelope.as_ref(),
+        format: record.format,
     }
 }

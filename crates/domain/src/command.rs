@@ -29,6 +29,32 @@ pub struct MessageInput {
     pub envelope: Option<MessageEnvelope>,
 }
 
+/// One message's original content, carried once by a content send.
+///
+/// The state machine derives every normalized field of AMQP content when it
+/// applies the send, and stores the result as a V2 message record. Content is
+/// not validated when it is built or decoded from a durable proposal, so
+/// invalid content survives replication and is refused deterministically.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageContent {
+    /// One complete encoded AMQP message.
+    Amqp(Vec<u8>),
+    /// Bytes from a producer without a protocol envelope.
+    Raw(RawMessage),
+}
+
+/// A message without a protocol envelope, with its normalized fields stated
+/// explicitly because there is nothing to derive them from.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RawMessage {
+    pub message_id: String,
+    pub body: Vec<u8>,
+    pub time_to_live_millis: Option<u64>,
+    pub session_id: Option<SessionId>,
+    pub scheduled_enqueue_at: Option<Timestamp>,
+}
+
 /// One replicated instruction for the broker state machine.
 ///
 /// The leader stamps `issued_at` before proposing. Followers apply the same
@@ -231,6 +257,15 @@ pub enum CommandKind {
     UpdateSubscription {
         name: SubscriptionName,
         update: SubscriptionConfigUpdate,
+    },
+    /// [`CommandKind::Send`] from original content; durable as proposal V4.
+    SendContent {
+        content: MessageContent,
+    },
+    /// [`CommandKind::SendBatch`] from original content; durable as proposal
+    /// V4. One invalid child refuses the whole batch.
+    SendContentBatch {
+        messages: Vec<MessageContent>,
     },
 }
 

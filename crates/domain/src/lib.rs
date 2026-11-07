@@ -13,6 +13,7 @@ pub mod legacy_content;
 pub mod snapshot_validation;
 
 mod command;
+mod content;
 mod durable_proposal;
 mod entity_binding;
 mod error;
@@ -28,7 +29,8 @@ mod time;
 mod topic;
 
 pub use codec::CodecError;
-pub use command::{Command, CommandKind, CommandOutcome, MessageInput};
+pub use command::{Command, CommandKind, CommandOutcome, MessageContent, MessageInput, RawMessage};
+pub use content::{CONTENT_LIMITS, MessageContentError};
 pub use durable_proposal::{
     DurableProposal, DurableProposalAuthority, DurableProposalError, MAX_DURABLE_PROPOSAL_BYTES,
 };

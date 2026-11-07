@@ -34,13 +34,9 @@ use crate::{
     keys::{self, StateKey},
 };
 
-/// The fixed V3 profile, applied independently to each content item.
-pub const LEGACY_CONTENT_LIMITS: ContentLimits = ContentLimits {
-    max_bytes: 16 * 1024 * 1024,
-    max_depth: 128,
-    max_nodes: 4_194_304,
-    max_work: 268_435_456,
-};
+/// The fixed V3 profile, applied independently to each content item. It is the
+/// same profile new sends parse with.
+pub const LEGACY_CONTENT_LIMITS: ContentLimits = crate::content::CONTENT_LIMITS;
 
 const TAG_MESSAGE: u8 = 0x03;
 const TAG_SUBSCRIPTION_RULE: u8 = 0x10;
