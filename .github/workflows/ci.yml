@@ -19,7 +19,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE: '1'
         run: |
           python3 --version
-          python3 -m unittest -v test_cargo_handoff
+          python3 -m unittest -v test_cargo_handoff test_bounded_test
       - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: clippy, rustfmt
@@ -31,7 +31,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace --locked
+        run: |
+          cargo test -p server --test amqp_durable_content_end_to_end --locked --no-run --message-format=json > "$RUNNER_TEMP/durable-content-artifact.json"
+          python3 tools/bounded_test.py --timeout 180 --stacks --cargo-artifacts "$RUNNER_TEMP/durable-content-artifact.json" --test-target amqp_durable_content_end_to_end -- --nocapture
+          cargo test --workspace --locked -- --skip malformed_and_oversized_content_refuses_and_leaves_the_store_unchanged
       - name: Build
         run: cargo build --workspace --locked
       - name: Validate protobuf
