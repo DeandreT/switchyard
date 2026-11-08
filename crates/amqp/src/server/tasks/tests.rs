@@ -775,18 +775,18 @@ async fn stop_cancels_full_actual_incoming_attach_channel() {
 }
 
 #[tokio::test]
-async fn stop_cancels_full_actual_incoming_delivery_channel() {
+async fn stop_joins_original_tasks_with_full_bounded_incoming_handoff() {
     let (mut connection, mut peer, probe) = opened().await;
     let original = task_ids(&connection);
     let mut session = pressure_session(&mut connection, &mut peer).await;
     let mut receiver = pressure_receiver(&mut session, &mut peer).await;
-    let frames = (0..34)
+    let mut frames = (0..2048)
         .map(|id| Frame::Amqp {
             channel: 1,
             performative: Some(Performative::Transfer(crate::Transfer {
                 handle: 1,
                 delivery_id: Some(id),
-                delivery_tag: Some(crate::Binary::from(vec![id as u8])),
+                delivery_tag: Some(crate::Binary::from(id.to_be_bytes().to_vec())),
                 message_format: Some(0),
                 settled: Some(false),
                 more: false,
@@ -799,27 +799,30 @@ async fn stop_cancels_full_actual_incoming_delivery_channel() {
             payload: crate::encode_message(&crate::Message::data(vec![id as u8]))
                 .expect("valid delivery"),
         })
-        .collect();
-    let last_heartbeat = write_full_driver_channel_pressure(&mut peer, &probe, frames).await;
-    assert_eq!(receiver.deliveries.len(), 32);
-    let first = receiver
-        .deliveries
-        .try_recv()
-        .expect("first of 32 offered deliveries");
+        .collect::<Vec<_>>();
+    frames.push(pressure_frame(
+        1,
+        Performative::Attach(Box::new(pressure_attach(2, crate::Role::Receiver))),
+    ));
+    write_pressure_frames(&mut peer, frames).await;
+    // This offer can only be dispatched after every preceding Transfer. The
+    // full handoff must not block it as the old awaited mpsc(32) send did.
+    let barrier = timeout(WAIT, session.next_incoming_attach())
+        .await
+        .expect("driver dispatches after full delivery handoff")
+        .expect("barrier Attach");
+    assert_eq!(barrier.handle, 2);
+    assert_eq!(receiver.deliveries.len(), 2048);
+    let first = receiver.recv().await.expect("first retained delivery");
     assert_eq!(first.id, 0);
-    wait_read_bytes(&probe, last_heartbeat).await;
-    assert_eq!(probe.read_bytes.load(Ordering::SeqCst), last_heartbeat);
-    assert_eq!(receiver.deliveries.len(), 32);
+    assert_eq!(receiver.deliveries.len(), 2047);
     pressure_joined(&mut connection, &probe, original).await;
     assert!(
         *receiver.detached.borrow(),
-        "full-channel receiving link is notified during cleanup"
+        "full-handoff receiving link is notified during cleanup"
     );
-    for id in 1..=32 {
-        let delivery = receiver
-            .deliveries
-            .try_recv()
-            .expect("retained offered delivery");
+    for id in 1..2048 {
+        let delivery = receiver.recv().await.expect("retained offered delivery");
         assert_eq!(delivery.id, id);
         assert_eq!(
             delivery.encoded_message,
@@ -827,10 +830,7 @@ async fn stop_cancels_full_actual_incoming_delivery_channel() {
                 .expect("expected typed body")
         );
     }
-    assert!(matches!(
-        receiver.deliveries.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
-    ));
+    assert_eq!(receiver.deliveries.len(), 0);
     assert!(matches!(
         timeout(WAIT, receiver.recv())
             .await

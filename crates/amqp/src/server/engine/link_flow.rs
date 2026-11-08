@@ -136,6 +136,7 @@ pub(super) async fn acknowledge_drain<W: AsyncWrite + Unpin>(
         return Ok(());
     };
     let next_outgoing_id = session.outgoing.next_id();
+    let incoming_flow = incoming::session_flow(session);
     let Some(LinkState::Sending(link)) = session.links.get_mut(&request.handle) else {
         let _ = reply.send(Err(EngineError::RemoteDetached));
         return Ok(());
@@ -180,6 +181,7 @@ pub(super) async fn acknowledge_drain<W: AsyncWrite + Unpin>(
             request.handle,
             delivery_count,
             next_outgoing_id,
+            incoming_flow,
         )),
         Vec::new(),
     )
@@ -303,6 +305,7 @@ pub(super) async fn complete_zero_credit_drain<W: AsyncWrite + Unpin>(
     writer: &mut W,
 ) -> Result<(), EngineError> {
     let next_outgoing_id = session.outgoing.next_id();
+    let incoming_flow = incoming::session_flow(session);
     let Some(LinkState::Sending(link)) = session.links.get_mut(&handle) else {
         return Ok(());
     };
@@ -317,7 +320,12 @@ pub(super) async fn complete_zero_credit_drain<W: AsyncWrite + Unpin>(
     write_amqp(
         writer,
         channel,
-        Performative::Flow(drained_flow(handle, delivery_count, next_outgoing_id)),
+        Performative::Flow(drained_flow(
+            handle,
+            delivery_count,
+            next_outgoing_id,
+            incoming_flow,
+        )),
         Vec::new(),
     )
     .await?;
@@ -328,10 +336,15 @@ pub(super) async fn complete_zero_credit_drain<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-fn drained_flow(handle: u32, delivery_count: u32, next_outgoing_id: u32) -> Flow {
+fn drained_flow(
+    handle: u32,
+    delivery_count: u32,
+    next_outgoing_id: u32,
+    incoming_flow: Flow,
+) -> Flow {
     Flow {
-        next_incoming_id: Some(0),
-        incoming_window: SESSION_WINDOW,
+        next_incoming_id: incoming_flow.next_incoming_id,
+        incoming_window: incoming_flow.incoming_window,
         next_outgoing_id,
         outgoing_window: SESSION_WINDOW,
         handle: Some(handle),

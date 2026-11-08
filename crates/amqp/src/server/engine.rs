@@ -1,8 +1,12 @@
 use super::*;
 use tokio::io::AsyncWriteExt;
 
+pub(super) mod incoming;
 mod link_flow;
 mod session_flow;
+pub(super) use incoming::IncomingWindow;
+#[cfg(test)]
+use incoming::receive_transfer;
 
 pub(super) use link_flow::{LinkDrain, apply_flow};
 use link_flow::{
@@ -25,7 +29,7 @@ pub(super) enum Command {
         attach: Box<Attach>,
         max_message_size: u64,
         properties: Option<Fields>,
-        deliveries_tx: mpsc::Sender<Delivery>,
+        deliveries_tx: incoming::DeliverySender,
         detached_tx: watch::Sender<bool>,
         drain_tx: watch::Sender<Option<DrainRequest>>,
         credit_tx: watch::Sender<bool>,
@@ -106,12 +110,14 @@ pub(super) struct SessionState {
     /// Delivery IDs remain independent from the per-frame sequence in Flow.
     pub(super) next_delivery_id: u32,
     pub(super) outgoing: OutgoingWindow,
+    pub(super) incoming: IncomingWindow,
 }
 
 #[derive(Debug)]
 pub(super) struct PendingSession {
     incarnation: u64,
     incoming_window: u32,
+    next_outgoing_id: u32,
 }
 
 pub(super) enum LinkState {
@@ -195,7 +201,7 @@ pub(super) struct PendingConfirmation {
 pub(super) struct ReceivingLink {
     pub(super) incarnation: u64,
     pub(super) max_message_size: u64,
-    pub(super) deliveries: mpsc::Sender<Delivery>,
+    pub(super) deliveries: incoming::DeliverySender,
     pub(super) partial: Option<PartialDelivery>,
     pub(super) detached: watch::Sender<bool>,
 }
@@ -205,6 +211,7 @@ pub(super) struct PartialDelivery {
     settled: bool,
     message_format: u32,
     bytes: Vec<u8>,
+    custody: incoming::Custody,
 }
 
 pub(super) async fn run_connection<W>(
@@ -220,8 +227,10 @@ pub(super) async fn run_connection<W>(
 {
     let mut sessions = HashMap::<u16, SessionState>::new();
     let mut pending_sessions = HashMap::<u16, PendingSession>::new();
+    let mut ending_sessions = HashSet::new();
     let mut closing_reply: Option<oneshot::Sender<Result<(), EngineError>>> = None;
     let mut cleanup_open = true;
+    let receive_wake = Arc::new(incoming::Resources::default());
     // Cancellation must reach nested writes and channel sends before link cleanup.
     tokio::select! {
         biased;
@@ -230,6 +239,13 @@ pub(super) async fn run_connection<W>(
             loop {
                 tokio::select! {
                     biased;
+                    () = receive_wake.notified() => {
+                        for (&channel, session) in &mut sessions {
+                            if incoming::replenish(channel, session, &mut writer).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
                     cleanup_command = cleanup.recv(), if cleanup_open => {
                         match cleanup_command {
                             Some(cleanup_command) => {
@@ -250,6 +266,7 @@ pub(super) async fn run_connection<W>(
                             &mut pending_sessions,
                             &mut sessions,
                             remote_max_frame_size,
+                            &mut ending_sessions,
                         ).await {
                             Ok(FrameAction::Continue) => {}
                             Ok(FrameAction::Closed) => {
@@ -269,6 +286,7 @@ pub(super) async fn run_connection<W>(
                             &mut pending_sessions,
                             &mut sessions,
                             remote_max_frame_size,
+                            &receive_wake,
                         ).await {
                             Ok(CommandAction::Continue) => {}
                             Ok(CommandAction::Closing(reply)) => closing_reply = Some(reply),
@@ -314,6 +332,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
     pending_sessions: &mut HashMap<u16, PendingSession>,
     sessions: &mut HashMap<u16, SessionState>,
     remote_max_frame_size: u32,
+    ending_sessions: &mut HashSet<u16>,
 ) -> Result<FrameAction, EngineError> {
     let Frame::Amqp {
         channel,
@@ -326,6 +345,9 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
     let Some(performative) = performative else {
         return Ok(FrameAction::Continue);
     };
+    if incoming::discard_ending_frame(channel, &performative, ending_sessions) {
+        return Ok(FrameAction::Continue);
+    }
 
     match performative {
         Performative::Begin(begin) => {
@@ -338,6 +360,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                 PendingSession {
                     incarnation,
                     incoming_window: begin.incoming_window,
+                    next_outgoing_id: begin.next_outgoing_id,
                 },
             );
             incoming_sessions
@@ -377,7 +400,16 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
             apply_session_flow(channel, flow, writer, sessions, remote_max_frame_size).await?;
         }
         Performative::Transfer(transfer) => {
-            receive_transfer(channel, transfer, payload, sessions).await?;
+            incoming::receive(
+                channel,
+                transfer,
+                payload,
+                sessions,
+                ending_sessions,
+                writer,
+                || {},
+            )
+            .await?;
         }
         Performative::Disposition(disposition) => {
             apply_disposition(channel, disposition, sessions);
@@ -474,6 +506,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
     pending_sessions: &mut HashMap<u16, PendingSession>,
     sessions: &mut HashMap<u16, SessionState>,
     remote_max_frame_size: u32,
+    receive_wake: &Arc<incoming::Resources>,
 ) -> Result<CommandAction, EngineError> {
     match command {
         Command::AcceptSession {
@@ -515,6 +548,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                     pending_flows: HashMap::new(),
                     next_delivery_id: 0,
                     outgoing: OutgoingWindow::new(0, pending.incoming_window),
+                    incoming: IncomingWindow::new(pending.next_outgoing_id, receive_wake.clone()),
                 },
             );
             let _ = reply.send(Ok(()));
@@ -551,6 +585,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 let _ = reply.send(Err(invalid_state("link handle is already attached")));
                 return Ok(CommandAction::Continue);
             }
+            let max_message_size = max_message_size.min(incoming::MAX_MESSAGE);
             let mut response = attach.response(attach.source.clone(), attach.target.clone());
             response.max_message_size =
                 (response.role == Role::Receiver).then_some(max_message_size);
@@ -578,14 +613,10 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                         writer,
                         channel,
                         Performative::Flow(Flow {
-                            next_incoming_id: Some(0),
-                            incoming_window: SESSION_WINDOW,
-                            next_outgoing_id: session.outgoing.next_id(),
-                            outgoing_window: SESSION_WINDOW,
                             handle: Some(handle),
                             delivery_count: Some(0),
                             link_credit: Some(LINK_CREDIT),
-                            ..Flow::default()
+                            ..incoming::session_flow(session)
                         }),
                         Vec::new(),
                     )
@@ -840,76 +871,6 @@ async fn handle_command<W: AsyncWrite + Unpin>(
         }
     }
     Ok(CommandAction::Continue)
-}
-
-pub(super) async fn receive_transfer(
-    channel: u16,
-    transfer: Transfer,
-    payload: Vec<u8>,
-    sessions: &mut HashMap<u16, SessionState>,
-) -> Result<(), EngineError> {
-    let session = sessions
-        .get_mut(&channel)
-        .ok_or_else(|| invalid_state("transfer on an unknown session"))?;
-    let Some(link) = session.links.get_mut(&transfer.handle) else {
-        // A transfer can cross a link-scoped refusal on the wire. The detach is
-        // authoritative; a late transfer must not escalate it to the connection.
-        return Ok(());
-    };
-    let LinkState::Receiving(link) = link else {
-        return Err(invalid_state("transfer sent to a sending link"));
-    };
-
-    let message_format = match &link.partial {
-        Some(partial) => transfer.message_format.unwrap_or(partial.message_format),
-        None => transfer.message_format.unwrap_or(0),
-    };
-    if let Some(partial) = &link.partial
-        && message_format != partial.message_format
-    {
-        return Err(invalid_state(
-            "message format changed across transfer continuations",
-        ));
-    }
-
-    if transfer.aborted {
-        link.partial = None;
-        return Ok(());
-    }
-    let partial = match link.partial.take() {
-        Some(mut partial) => {
-            partial.bytes.extend_from_slice(&payload);
-            partial
-        }
-        None => PartialDelivery {
-            id: transfer
-                .delivery_id
-                .ok_or_else(|| invalid_state("first transfer has no delivery id"))?,
-            settled: transfer.settled.unwrap_or(false),
-            message_format,
-            bytes: payload,
-        },
-    };
-    if partial.bytes.len() as u64 > link.max_message_size {
-        return Err(invalid_state("message exceeds the link's maximum size"));
-    }
-    if transfer.more {
-        link.partial = Some(partial);
-        return Ok(());
-    }
-
-    // A peer's transfer: decode with every received-message check.
-    let message = decode_message(&partial.bytes)?;
-    link.deliveries
-        .send(Delivery {
-            id: partial.id,
-            settled: partial.settled,
-            message_format: partial.message_format,
-            message,
-            encoded_message: partial.bytes,
-        })
-        .await
-        .map_err(|_| EngineError::Stopped)
 }
 
 pub(super) async fn flush_sends<W: AsyncWrite + Unpin>(

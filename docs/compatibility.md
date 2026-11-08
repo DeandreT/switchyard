@@ -146,6 +146,62 @@ the attach response.
 
 ## Known Differences And Bounds
 
+### Native session receive capacity
+
+Native sessions grant 2,048 incoming Transfer-frame slots, independently of link
+credit and delivery IDs. Peer Begin seeds incoming frame IDs; continuations,
+aborts and late transfers on retired links each advance that sequence modulo
+2^32. Every outgoing Flow reports the current incoming progress and unspent
+grant. Exceeding it ends only the affected session with
+`amqp:session:window-violation`.
+
+The retired channel remains End-sent until the peer acknowledges End. Crossed
+session traffic is discarded during that handshake; the acknowledgement is not
+answered with another End. Other sessions remain live, and channel reuse begins
+only after the acknowledgement.
+
+Assembly and completed native handoff storage share a per-connection budget of
+64 MiB of encoded bytes and 2,048 deliveries, including zero-byte deliveries.
+The native accepted encoded-message ceiling is 16 MiB, further limited by the
+accepting application's link maximum; Attach advertises that effective ceiling.
+The feature test client also advertises and enforces this effective receive
+limit: absent or zero requests select the native ceiling, larger requests clamp
+to it, and smaller nonzero limits remain binding.
+Retiring a test-client session completes its pending Begin, Attach and Detach
+replies with `RemoteDetached`, including closes already awaiting a Detach reply.
+Other channels' pending operations and connection-wide Close remain independent.
+Before accepting a new message, the connection reserves its entire link ceiling.
+Thus four 16 MiB partials can coexist, and each retains enough headroom to finish;
+smaller link ceilings permit more simultaneous partials within both budgets.
+A new start without reservation room detaches that link with
+`amqp:resource-limit-exceeded`; an oversized message gets
+`amqp:link:message-size-exceeded`. Previously completed deliveries remain owned
+by their original handoff. This policy does not promise unlimited message sizes
+or that every credited new start can reserve assembly storage.
+
+Copying a continuation into reserved assembly releases its frame slot, so a
+message may span more than 2,048 frames. On completion the byte reservation
+shrinks to the retained encoded length, while the final frame slot and delivery
+count stay charged until actual `Receiver::recv` dequeue or consumer drop.
+Replenishment advertises only released slots, batched at 1,024 slots or when the
+current grant is exhausted. The owned handoff never awaits a full delivery queue;
+Flow, End and stop dispatch remain available while consumers stall. Accepted
+deliveries can still be drained after their session retires. Dequeue is transport
+buffer consumption, not broker completion or settlement. Original queue/storage
+ownership fences frame release across session and link reuse; retired queues
+still charge the shared byte/count budget. Returned Delivery clones do not carry
+a refund capability.
+
+These are native encoded-retention and count bounds, not a process RSS quota:
+decoded values, allocator overhead, the separately bounded reader frame queue,
+outgoing queues, link/session metadata and application-owned dequeued messages
+are additional storage.
+They make no hardware, throughput or latency claim. Receiving-link credit refill
+and Flow echo response remain separate work. No persisted formats change; an
+older native implementation does not enforce these receive-storage bounds.
+
+### Other differences
+
 | Behavior | Current contract |
 | --- | --- |
 | Session ID on ordinary queue | Refused (Azure ignores it); only session queues promise FIFO. |
