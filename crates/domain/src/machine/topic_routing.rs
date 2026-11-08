@@ -8,7 +8,9 @@
 //! receives one dead-lettered copy instead. This mirrors Service Bus's default
 //! of dead-lettering on filter evaluation exceptions; the reason, description
 //! and the rule that a match still delivers are Switchyard's chosen behavior.
-//! Otherwise the subscription is not offered the message.
+//! A subscription whose `dead_lettering_on_filter_evaluation_exceptions` is
+//! false discards that copy instead. Otherwise the subscription is not offered
+//! the message.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -43,8 +45,12 @@ impl ProgramCache {
     }
 }
 
-/// One subscription's rules, ready to evaluate. Never stored.
-pub(super) struct CompiledRules(Vec<CompiledRule>);
+/// One subscription's rules and filter-error setting, ready to evaluate.
+/// Never stored.
+pub(super) struct CompiledRules {
+    rules: Vec<CompiledRule>,
+    dead_letter_on_failure: bool,
+}
 
 enum CompiledRule {
     True,
@@ -58,9 +64,13 @@ enum CompiledRule {
 
 impl CompiledRules {
     /// Takes rows from the bounded canonical rule reader, which compiled
-    /// every SQL filter once.
-    pub(super) fn new(rules: Vec<CheckedRule>) -> Result<Self, BrokerError> {
-        rules
+    /// every SQL filter once, and the subscription's
+    /// `dead_lettering_on_filter_evaluation_exceptions` setting.
+    pub(super) fn new(
+        rules: Vec<CheckedRule>,
+        dead_letter_on_failure: bool,
+    ) -> Result<Self, BrokerError> {
+        let rules = rules
             .into_iter()
             .map(|(definition, program)| match (definition.filter, program) {
                 (RuleFilter::True, None) => Ok(CompiledRule::True),
@@ -72,19 +82,22 @@ impl CompiledRules {
                 }),
                 _ => Err(BrokerError::EntityMetadataCorrupt),
             })
-            .collect::<Result<_, _>>()
-            .map(Self)
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            rules,
+            dead_letter_on_failure,
+        })
     }
 
     pub(super) fn uses_sql(&self) -> bool {
-        self.0
+        self.rules
             .iter()
             .any(|rule| matches!(rule, CompiledRule::Sql { .. }))
     }
 
     pub(super) fn route(&self, message: &RoutingInput<'_>) -> Route {
         let mut failure = None;
-        for rule in &self.0 {
+        for rule in &self.rules {
             match rule {
                 CompiledRule::True => return Route::Deliver,
                 CompiledRule::False => {}
@@ -99,7 +112,10 @@ impl CompiledRules {
                         Ok(SqlTruth::True) => return Route::Deliver,
                         Ok(SqlTruth::False | SqlTruth::Unknown) => {}
                         // The first failure in canonical rule-name order is
-                        // reported; a later match still delivers.
+                        // reported; a later match still delivers. A
+                        // subscription that discards filter-error copies is
+                        // skipped exactly as when no rule matched.
+                        Err(_) if !self.dead_letter_on_failure => {}
                         Err(error) => {
                             failure.get_or_insert_with(|| {
                                 format!(

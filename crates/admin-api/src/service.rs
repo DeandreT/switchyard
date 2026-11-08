@@ -429,6 +429,9 @@ impl EntityOptions {
                         .unwrap_or(defaults.max_delivery_count),
                     dead_lettering_on_message_expiration: defaults
                         .dead_lettering_on_message_expiration,
+                    // Not an admin option yet; creation keeps the default.
+                    dead_lettering_on_filter_evaluation_exceptions: defaults
+                        .dead_lettering_on_filter_evaluation_exceptions,
                 })
             }
         })

@@ -999,6 +999,7 @@ fn healthy_public_pages_and_maximum_composite_addresses_survive_reopen<P: StoreP
         max_delivery_count: 3,
         default_time_to_live_millis: Some(2_000),
         dead_lettering_on_message_expiration: true,
+        dead_lettering_on_filter_evaluation_exceptions: true,
     };
     assert_eq!(
         fixture.at_entity(&topic, 13, CommandKind::CreateTopic { config: parent })?,

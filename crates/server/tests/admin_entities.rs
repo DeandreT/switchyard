@@ -341,6 +341,7 @@ async fn profiles_and_errors<P: StoreProvider>(provider: P) {
             lock_duration_millis: 100,
             max_delivery_count: 2,
             dead_lettering_on_message_expiration: true,
+            dead_lettering_on_filter_evaluation_exceptions: true,
         })
     );
     assert_eq!(

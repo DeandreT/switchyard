@@ -35,6 +35,8 @@ use tempfile::TempDir;
 mod capacity_modes;
 #[path = "committed_replay/content_sends.rs"]
 mod content_sends;
+#[path = "committed_replay/filter_discard.rs"]
+mod filter_discard;
 #[path = "committed_replay/fixtures.rs"]
 mod fixtures;
 #[path = "committed_replay/patched_dispositions.rs"]
@@ -218,6 +220,7 @@ fn mixed_profile_versions(durable: bool) -> TestResult {
                         millis: 100,
                     }),
                     dead_lettering_on_message_expiration: None,
+                    dead_lettering_on_filter_evaluation_exceptions: None,
                 },
             },
         ),

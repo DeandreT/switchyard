@@ -50,7 +50,10 @@ impl<S: StateStore> StateMachine<S> {
             .into_iter()
             .find(|profile| profile.entity == entity)
             .ok_or(BrokerError::SubscriptionNotFound)?;
-        let current = SubscriptionConfig::from_backing(profile.backing);
+        let current = SubscriptionConfig::from_profile(
+            profile.backing,
+            profile.dead_lettering_on_filter_evaluation_exceptions,
+        );
         let updated = update.apply(current)?;
         let backing = crate::QueueConfig {
             lock_duration_millis: updated.lock_duration_millis,
@@ -59,6 +62,18 @@ impl<S: StateStore> StateMachine<S> {
             dead_lettering_on_message_expiration: updated.dead_lettering_on_message_expiration,
             ..profile.backing
         };
+        // Only a changed filter-error setting rewrites the membership record.
+        if updated.dead_lettering_on_filter_evaluation_exceptions
+            != current.dead_lettering_on_filter_evaluation_exceptions
+        {
+            batch.push_put(
+                keys::topic_subscription(&command.namespace, &command.entity, name),
+                codec::membership::encode(
+                    &entity,
+                    updated.dead_lettering_on_filter_evaluation_exceptions,
+                )?,
+            );
+        }
         stage_profile(command, profile, backing, batch)?;
         Ok(CommandOutcome::SubscriptionUpdated)
     }

@@ -34,7 +34,7 @@ fn rule(at: u64, name: &str, expression: &str) -> DurableProposal {
     )
 }
 
-fn publish(at: u64, id: &str, region: &[u8]) -> DurableProposal {
+pub(super) fn publish(at: u64, id: &str, region: &[u8]) -> DurableProposal {
     proposal(
         &topic(),
         at,

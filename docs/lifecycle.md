@@ -339,7 +339,7 @@ Existing commands retain byte-identical frozen durable V1 DTOs, including invali
 numeric intent. Only these two update commands use frozen private V2 DTOs with
 canonical framing, bounded identifiers and retained parent-topic authority checks.
 V1 cannot represent them and explicitly refuses capture; V1-only readers refuse the
-V2 envelope. Current readers accept V1 through V7, retaining invalid patch values
+V2 envelope. Current readers accept V1 through V8, retaining invalid patch values
 for domain refusal rather than silently repairing them. The one-MiB envelope limit
 still applies. Nonlegacy topic creation alone uses frozen V3 with V1 creation
 authority rules (not V2 update-only restrictions); V1 capture refuses lossy conversion
@@ -350,7 +350,10 @@ updates stay parent-topic bound); V1/V2 capture refuses them, V1/V2 restore supp
 the enabled default and an absent patch, and redundant V5 records are refused. Finite
 queue creation and queue updates naming capacity use frozen V7 with V1 queue authority
 rules; V1/V5 capture refuses them and their restores supply non-finite capacity and an
-absent capacity patch. Ordinary-queue updates refuse a finite/non-finite mode change
+absent capacity patch. Subscription creation that discards filter-error copies, and
+subscription updates naming that setting, use frozen V8 with the same family authority
+rules as V5; V1/V2/V5 capture refuses them and their restores supply the enabled default
+and an absent patch. Ordinary-queue updates refuse a finite/non-finite mode change
 before staging; a finite size change rewrites only the parent profile, since every DLQ
 shadow is non-finite. Journal/checkpoint
 formats and legacy-command hashes remain identical. See the

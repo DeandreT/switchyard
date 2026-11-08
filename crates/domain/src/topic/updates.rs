@@ -36,12 +36,16 @@ pub struct SubscriptionConfigUpdate {
     pub max_delivery_count: Option<u32>,
     pub default_time_to_live_millis: Option<QueueTimeToLiveUpdate>,
     pub dead_lettering_on_message_expiration: Option<bool>,
+    pub dead_lettering_on_filter_evaluation_exceptions: Option<bool>,
 }
 
 impl SubscriptionConfigUpdate {
     /// Whether the frozen V2 update DTO can carry this patch without loss.
     pub(crate) fn is_legacy_representable(self) -> bool {
         self.dead_lettering_on_message_expiration.is_none()
+            && self
+                .dead_lettering_on_filter_evaluation_exceptions
+                .is_none()
     }
 
     pub fn apply(
@@ -63,6 +67,9 @@ impl SubscriptionConfigUpdate {
             dead_lettering_on_message_expiration: self
                 .dead_lettering_on_message_expiration
                 .unwrap_or(current.dead_lettering_on_message_expiration),
+            dead_lettering_on_filter_evaluation_exceptions: self
+                .dead_lettering_on_filter_evaluation_exceptions
+                .unwrap_or(current.dead_lettering_on_filter_evaluation_exceptions),
         }
         .validate()
     }

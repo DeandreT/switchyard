@@ -692,6 +692,7 @@ impl Kind {
                     max_delivery_count: config.max_delivery_count,
                     default_time_to_live_millis: config.default_time_to_live_millis,
                     dead_lettering_on_message_expiration: true,
+                    dead_lettering_on_filter_evaluation_exceptions: true,
                 },
             },
             Self::CreateRule { name, filter } => CommandKind::CreateRule {

@@ -25,6 +25,8 @@ pub(super) struct SubscriptionProfile {
     pub entity: EntityPath,
     pub backing: QueueConfig,
     pub shadow: QueueConfig,
+    /// Recorded by the membership, never by the backing queue profile.
+    pub dead_lettering_on_filter_evaluation_exceptions: bool,
 }
 
 impl<S: StateStore> StateMachine<S> {
@@ -97,16 +99,16 @@ impl<S: StateStore> StateMachine<S> {
                 return Err(BrokerError::MalformedIndexKey);
             }
             let entity = topic.subscription(&name)?;
-            // Deserialization folds ASCII case, so decoded equality is not a
-            // proof that the stored membership names this canonical child.
-            if value != codec::encode(&entity)? {
-                return Err(BrokerError::TopicTopologyCorrupt);
-            }
+            // Only the exact canonical record of this child is a membership.
+            let dead_lettering_on_filter_evaluation_exceptions =
+                codec::membership::decode(&entity, &value)
+                    .map_err(|_| BrokerError::TopicTopologyCorrupt)?;
             let config = self.validate_subscription_topology(namespace, &entity, parent)?;
             subscriptions.push(SubscriptionProfile {
                 entity,
                 backing: config,
                 shadow: config.dead_letter_shadow(),
+                dead_lettering_on_filter_evaluation_exceptions,
             });
         }
         Ok(subscriptions)
@@ -123,7 +125,8 @@ impl<S: StateStore> StateMachine<S> {
                 entity: entity.clone(),
             }
         })?;
-        let config = SubscriptionConfig::from_backing(backing);
+        // The membership's filter-error setting never shapes the backing.
+        let config = SubscriptionConfig::from_profile(backing, true);
         let expected = config
             .validate()
             .map_err(|_| BrokerError::TopicTopologyCorrupt)?
@@ -262,7 +265,11 @@ impl<S: StateStore> StateMachine<S> {
         self.stage_new_owner(&command.namespace, &entity, Kind::Subscription, batch)?;
         batch.push_put(
             index_key,
-            codec::encode(&entity).map_err(BrokerError::from)?,
+            codec::membership::encode(
+                &entity,
+                config.dead_lettering_on_filter_evaluation_exceptions,
+            )
+            .map_err(BrokerError::from)?,
         );
         batch.push_put(
             queue_key,
@@ -424,11 +431,10 @@ impl<S: StateStore> StateMachine<S> {
         let mut state = Vec::with_capacity(topology.len());
         let mut cache = ProgramCache::default();
         for profile in topology {
-            let rules = CompiledRules::new(self.checked_rules(
-                &command.namespace,
-                &profile.entity,
-                &mut cache,
-            )?)?;
+            let rules = CompiledRules::new(
+                self.checked_rules(&command.namespace, &profile.entity, &mut cache)?,
+                profile.dead_lettering_on_filter_evaluation_exceptions,
+            )?;
             subscriptions.push(profile.entity);
             state.push((profile.backing, rules));
         }

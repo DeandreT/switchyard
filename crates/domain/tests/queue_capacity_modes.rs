@@ -364,14 +364,14 @@ fn v7_goldens_round_trip_and_older_readers_refuse() {
             DurableProposal::decode(&trailing),
             Err(DurableProposalError::Malformed)
         );
-        // Relabelled as V6 (SQL rules) it is not that format; 8 is unknown.
+        // Relabelled as V6 (SQL rules) it is not that format; 9 is unknown.
         let mut other = bytes.clone();
         other[4..8].copy_from_slice(&6_u32.to_be_bytes());
         assert!(DurableProposal::decode(&other).is_err());
-        other[4..8].copy_from_slice(&8_u32.to_be_bytes());
+        other[4..8].copy_from_slice(&9_u32.to_be_bytes());
         assert_eq!(
             DurableProposal::decode(&other),
-            Err(DurableProposalError::UnsupportedVersion(8))
+            Err(DurableProposalError::UnsupportedVersion(9))
         );
     }
 }
