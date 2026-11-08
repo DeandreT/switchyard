@@ -129,7 +129,9 @@ impl<B: Broker> AmqpListener<B> {
     }
 
     /// Requires SASL MSSBCBS/ANONYMOUS plus CBS, or valid SASL PLAIN
-    /// credentials, before entity links are accepted.
+    /// credentials, before entity links are accepted. A configured offline JWT
+    /// policy is used only for this library's successfully TLS-admitted sockets;
+    /// plaintext TCP and WebSocket connections continue to refuse JWT.
     pub fn with_shared_access_authentication(
         mut self,
         authentication: SharedAccessAuthentication,

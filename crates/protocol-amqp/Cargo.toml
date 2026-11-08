@@ -22,8 +22,11 @@ tokio-tungstenite.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+amqp = { workspace = true, features = ["test-client"] }
 base64.workspace = true
 hmac.workspace = true
+ring.workspace = true
+serde_json.workspace = true
 server.workspace = true
 sha2.workspace = true
 storage.workspace = true

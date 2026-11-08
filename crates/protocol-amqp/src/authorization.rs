@@ -5,7 +5,9 @@ use std::{
 };
 
 use amqp::{SaslAuthenticator, SaslCode, SaslInit};
-use auth::{AccessGrant, Permission, ResourceScope, ResourceScopeError, SharedAccessPolicy};
+use auth::{
+    AccessGrant, JwtPolicy, Permission, ResourceScope, ResourceScopeError, SharedAccessPolicy,
+};
 use serde_amqp::primitives::Symbol;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 
@@ -24,6 +26,7 @@ pub struct SharedAccessAuthentication {
     policy: SharedAccessPolicy,
     audience_host: String,
     authorization_timeout: Duration,
+    jwt_policy: Option<JwtPolicy>,
 }
 
 impl SharedAccessAuthentication {
@@ -36,11 +39,21 @@ impl SharedAccessAuthentication {
             policy,
             audience_host: namespace.host().to_owned(),
             authorization_timeout: DEFAULT_CBS_AUTHORIZATION_TIMEOUT,
+            jwt_policy: None,
         })
     }
 
     pub fn with_authorization_timeout(mut self, timeout: Duration) -> Self {
         self.authorization_timeout = timeout;
+        self
+    }
+
+    /// Accepts the local offline JWT profile alongside SAS on connections that
+    /// this library actually admits through TLS. Plain TCP/WebSocket connections
+    /// still refuse JWT, even when this policy is configured. Rights come only
+    /// from the policy's verified local bindings, never from token role claims.
+    pub fn with_jwt_policy(mut self, policy: JwtPolicy) -> Self {
+        self.jwt_policy = Some(policy);
         self
     }
 }
@@ -53,6 +66,7 @@ struct ReplyRoutes {
 #[derive(Debug)]
 pub(crate) struct ConnectionAuthorization {
     policy: SharedAccessPolicy,
+    jwt_policy: Option<JwtPolicy>,
     audience_host: String,
     authorization_timeout: Duration,
     grants: RwLock<Vec<AccessGrant>>,
@@ -62,12 +76,22 @@ pub(crate) struct ConnectionAuthorization {
 }
 
 impl ConnectionAuthorization {
+    #[cfg(test)]
     pub(crate) fn new(
         config: SharedAccessAuthentication,
         initial_grant: Option<AccessGrant>,
     ) -> Arc<Self> {
+        Self::new_for_transport(config, initial_grant, None)
+    }
+
+    pub(crate) fn new_for_transport(
+        config: SharedAccessAuthentication,
+        initial_grant: Option<AccessGrant>,
+        tls: Option<crate::listener::service::TlsAdmission>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             policy: config.policy,
+            jwt_policy: tls.and(config.jwt_policy),
             audience_host: config.audience_host,
             authorization_timeout: config.authorization_timeout,
             grants: RwLock::new(initial_grant.into_iter().collect()),
@@ -109,6 +133,7 @@ impl ConnectionAuthorization {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn validate_and_add(
         &self,
         token: &str,
@@ -117,6 +142,40 @@ impl ConnectionAuthorization {
         let grant = self.policy.validate_sas(token, audience, epoch_seconds())?;
         self.add_verified_grant(grant).await;
         Ok(())
+    }
+
+    pub(crate) async fn validate_token_and_add(
+        &self,
+        token_type: &str,
+        token: &str,
+        resource: &str,
+    ) -> Result<(), AuthorizationError> {
+        let grant = self.verify_token(token_type, token, resource, epoch_seconds())?;
+        self.add_verified_grant(grant).await;
+        Ok(())
+    }
+
+    fn verify_token(
+        &self,
+        token_type: &str,
+        token: &str,
+        resource: &str,
+        now: u64,
+    ) -> Result<AccessGrant, AuthorizationError> {
+        match token_type {
+            crate::cbs::SAS_TOKEN_TYPE => self
+                .policy
+                .validate_sas(token, resource, now)
+                .map_err(|_| AuthorizationError),
+            crate::cbs::JWT_TOKEN_TYPE => {
+                let policy = self.jwt_policy.as_ref().ok_or(AuthorizationError)?;
+                let resource = ResourceScope::parse(resource).map_err(|_| AuthorizationError)?;
+                policy
+                    .validate(token, &resource, now)
+                    .map_err(|_| AuthorizationError)
+            }
+            _ => Err(AuthorizationError),
+        }
     }
 
     // Accept only grants produced by an authentication policy's verification path.
