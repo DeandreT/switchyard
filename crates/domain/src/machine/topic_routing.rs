@@ -160,9 +160,10 @@ impl CompiledRules {
                     dead_letter_on_failure: self.dead_letter_on_failure,
                 }),
                 (Ok(true), None) => matched = true,
-                (Err(description), Some(_)) if self.dead_letter_on_failure => {
-                    routes.push(Route::ActionFilterError(description))
-                }
+                (Err(description), Some(_)) => routes.push(Route::ActionFilterError {
+                    description,
+                    dead_letter_on_failure: self.dead_letter_on_failure,
+                }),
                 (Err(description), None) if self.dead_letter_on_failure => {
                     failure.get_or_insert(description);
                 }
@@ -187,7 +188,10 @@ pub(super) enum Route {
         program: Arc<crate::SqlActionProgram>,
         dead_letter_on_failure: bool,
     },
-    ActionFilterError(String),
+    ActionFilterError {
+        description: String,
+        dead_letter_on_failure: bool,
+    },
 }
 
 /// Application-property values decoded from the stored filter projection.

@@ -122,8 +122,9 @@ Selected operational queue-profile reads validate after decode/owner proof,
 including backing queues/DLQs; invalid limits are corruption. Unread rows/raw
 catalogues are not certified; profile-free legacy operations remain unchanged.
 Typed content (#16) and actionless SQL filters (#20) are complete. Administration
-setters/capacity and durable SQL actions/fanout (#21) remain pending. Grant consumers preserve verified
-principal identity and both validity bounds for SAS and explicitly configured TLS JWT CBS.
+setters/capacity and SQL action wire management (#337) remain pending. Grant consumers
+preserve verified principal identity and both validity bounds for SAS and explicitly
+configured TLS JWT CBS.
 Native admin RPCs use the configured offline JWT policy.
 
 ### Absolute link addresses

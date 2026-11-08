@@ -34,6 +34,9 @@ mod panic_apply_tests;
 #[path = "indexed_apply/healthy_capacity_tests.rs"]
 mod healthy_capacity_tests;
 
+#[path = "indexed_apply/healthy_sql_capacity_tests.rs"]
+mod healthy_sql_capacity_tests;
+
 #[derive(Clone, Debug, Default)]
 struct Trace {
     gets: Vec<Key>,

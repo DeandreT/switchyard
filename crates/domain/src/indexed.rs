@@ -284,6 +284,14 @@ fn deterministic_refusal(kind: &CommandKind, failure: &PreparationFailure) -> bo
         PreparationFailure::HealthySubscriptionCapacity => {
             matches!(kind, CommandKind::CreateSubscription { .. })
         }
+        PreparationFailure::HealthySqlRuleCapacity => matches!(
+            kind,
+            CommandKind::CreateRuleWithAction { .. }
+                | CommandKind::CreateRule {
+                    filter: crate::RuleFilter::Sql(_),
+                    ..
+                }
+        ),
         PreparationFailure::Ordinary(error) => ordinary_deterministic_refusal(kind, error),
     }
 }

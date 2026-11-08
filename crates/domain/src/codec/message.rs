@@ -139,19 +139,25 @@ struct Entry<'a> {
 /// duplicate overlay names and empty overlay values.
 pub fn encode(record: &MessageRecord) -> Result<Vec<u8>, CodecError> {
     let removals = record.envelope.as_ref().map_or(&[][..], |e| e.removals());
+    if removals.len() > crate::MAX_SQL_ACTION_PATCH_PROPERTIES {
+        return Err(CodecError::Encode);
+    }
     if !removals.is_empty() && !matches!(record.format, MessageRecordFormat::V4 { .. }) {
         return Err(CodecError::Encode);
     }
     let mut names = BTreeSet::new();
     for name in removals {
-        if !names.insert(name)
-            || record
-                .envelope
-                .as_ref()
-                .is_some_and(|e| e.overlay().iter().any(|p| &p.name == name))
-        {
+        if !names.insert(name.as_str()) {
             return Err(CodecError::Encode);
         }
+    }
+    if !names.is_empty()
+        && record
+            .envelope
+            .as_ref()
+            .is_some_and(|e| e.overlay().iter().any(|p| names.contains(p.name.as_str())))
+    {
+        return Err(CodecError::Encode);
     }
     match record.format {
         MessageRecordFormat::V1 => super::encode(&RecordV1 {
@@ -294,15 +300,27 @@ fn read(bytes: &[u8]) -> Result<(MessageRecord, &[u8]), CodecError> {
             let (stored, text_ids, removals, unused) = if version == VALUE_FORMAT_V4 {
                 let (stored, unused) = postcard::take_from_bytes::<RecordV4>(payload)
                     .map_err(|_| CodecError::Decode)?;
+                // Enforce the action profile before owning or intersecting
+                // names; hostile vectors must never create a Cartesian scan.
+                if stored.removals.len() > crate::MAX_SQL_ACTION_PATCH_PROPERTIES {
+                    return Err(CodecError::Decode);
+                }
                 let removals = stored
                     .removals
                     .into_iter()
                     .map(Cow::into_owned)
                     .collect::<Vec<_>>();
                 let mut names = BTreeSet::new();
-                if removals.iter().any(|n| !names.insert(n)) {
+                if removals.iter().any(|n| !names.insert(n.as_str())) {
                     return Err(CodecError::Decode);
                 }
+                if !names.is_empty()
+                    && matches!(&stored.record.content,
+                    Content::Amqp { overlay, .. } if overlay.iter().any(|p| names.contains(p.name.as_ref())))
+                {
+                    return Err(CodecError::Decode);
+                }
+                drop(names);
                 (stored.record, stored.text_ids, removals, unused)
             } else {
                 let (stored, unused) = postcard::take_from_bytes::<RecordV2>(payload)
@@ -350,13 +368,6 @@ fn read(bytes: &[u8]) -> Result<(MessageRecord, &[u8]), CodecError> {
                     MessageRecordFormat::V2
                 },
             };
-            if record.envelope.as_ref().is_some_and(|e| {
-                e.removals()
-                    .iter()
-                    .any(|n| e.overlay().iter().any(|p| &p.name == n))
-            }) {
-                return Err(CodecError::Decode);
-            }
             Ok((record, unused))
         }
         version => Err(CodecError::UnsupportedVersion { version }),
@@ -595,6 +606,68 @@ mod tests {
         }
         for end in 0..bytes.len() {
             assert!(decode_canonical(&bytes[..end]).is_err());
+        }
+    }
+
+    fn removal_fixture(removals: usize, overlays: usize) -> Vec<u8> {
+        // Serialize the frozen DTO directly so malformed vectors do not pass
+        // through encoder validation (or the old encoder's quadratic scan).
+        let bytes = unhex("0401036d2d31000000000000000100000000000000000000000001036f6c64");
+        let mut stored: RecordV4<'static> = postcard::from_bytes(&bytes[1..]).unwrap();
+        stored.removals = (0..removals)
+            .map(|index| Cow::Owned(format!("remove-{index}")))
+            .collect();
+        let Content::Amqp { overlay, .. } = &mut stored.record.content else {
+            unreachable!()
+        };
+        *overlay = (0..overlays)
+            .map(|index| Entry {
+                name: Cow::Owned(format!("set-{index}")),
+                value: Cow::Borrowed(&[0x41]),
+            })
+            .collect();
+        let mut bytes = vec![VALUE_FORMAT_V4];
+        bytes.extend(postcard::to_stdvec(&stored).unwrap());
+        bytes
+    }
+
+    #[test]
+    fn v4_removal_count_is_bounded_before_cross_checks() {
+        let at_cap = removal_fixture(crate::MAX_SQL_ACTION_PATCH_PROPERTIES, 2);
+        let record = decode(&at_cap).unwrap();
+        assert_eq!(encode(&record).unwrap(), at_cap);
+        let over_cap = removal_fixture(crate::MAX_SQL_ACTION_PATCH_PROPERTIES + 1, 2);
+        assert_eq!(decode(&over_cap), Err(CodecError::Decode));
+        let mut invalid = record;
+        invalid.envelope = Some(
+            invalid.envelope.unwrap().with_removals(
+                (0..=crate::MAX_SQL_ACTION_PATCH_PROPERTIES)
+                    .map(|i| format!("remove-{i}"))
+                    .collect(),
+            ),
+        );
+        assert_eq!(encode(&invalid), Err(CodecError::Encode));
+    }
+
+    #[test]
+    fn v4_large_malformed_disjoint_vectors_refuse_without_quadratic_intersection() {
+        let bytes = removal_fixture(100_000, 100_000);
+        assert_eq!(decode(&bytes), Err(CodecError::Decode));
+    }
+
+    #[test]
+    fn v4_bounded_removal_duplicates_and_set_collisions_refuse() {
+        let bytes = removal_fixture(2, 2);
+        for collision in [false, true] {
+            let mut stored: RecordV4<'static> = postcard::from_bytes(&bytes[1..]).unwrap();
+            stored.removals[1] = Cow::Owned(if collision {
+                "set-1".to_owned()
+            } else {
+                "remove-0".to_owned()
+            });
+            let mut corrupt = vec![VALUE_FORMAT_V4];
+            corrupt.extend(postcard::to_stdvec(&stored).unwrap());
+            assert_eq!(decode(&corrupt), Err(CodecError::Decode));
         }
     }
 

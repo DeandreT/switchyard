@@ -127,9 +127,23 @@ pub(super) fn plan_copies(
     let mut plan = Vec::new();
     for (index, (config, rules)) in state.iter().enumerate() {
         for route in rules.route(&routing) {
-            let action = matches!(route, Route::Action { .. } | Route::ActionFilterError(_));
+            let action = matches!(
+                route,
+                Route::Action { .. } | Route::ActionFilterError { .. }
+            );
             if action {
                 budget.charge(record, action_properties.as_ref())?;
+            }
+            if matches!(
+                route,
+                Route::ActionFilterError {
+                    dead_letter_on_failure: false,
+                    ..
+                }
+            ) {
+                // Discards still consume work/byte allowance, but never clone
+                // an envelope or reserve an extra parent sequence slot.
+                continue;
             }
             let mut envelope = if action {
                 record.envelope.as_ref().map(|e| {
@@ -145,7 +159,7 @@ pub(super) fn plan_copies(
             };
             let failure = match route {
                 Route::Deliver => None,
-                Route::DeadLetter(description) | Route::ActionFilterError(description) => {
+                Route::DeadLetter(description) | Route::ActionFilterError { description, .. } => {
                     Some((description, crate::FILTER_EVALUATION_DEAD_LETTER_REASON))
                 }
                 Route::Action {

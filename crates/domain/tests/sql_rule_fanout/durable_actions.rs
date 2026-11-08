@@ -4,6 +4,9 @@ use domain::{
     SqlRuleAction,
 };
 
+#[path = "review_fixes.rs"]
+mod review_fixes;
+
 fn action<S: StateStore>(
     t: &Topology,
     machine: &StateMachine<S>,

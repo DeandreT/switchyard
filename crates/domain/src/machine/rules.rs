@@ -65,13 +65,31 @@ impl<S: StateStore> StateMachine<S> {
             // The bounded reader already rejected overfull or invalid touched rows.
             return Err(PreparationFailure::HealthyRuleCapacity);
         }
-        if (action.is_some() || !filter.is_legacy_representable())
-            && self.topic_sql_rules(&command.namespace, &command.entity)? >= MAX_TOPIC_SQL_RULES
-        {
-            return Err(BrokerError::SqlRuleLimitExceeded {
-                maximum: MAX_TOPIC_SQL_RULES,
+        if action.is_some() || !filter.is_legacy_representable() {
+            let count = self.topic_sql_rules(&command.namespace, &command.entity)?;
+            if count > MAX_TOPIC_SQL_RULES {
+                // Overfull is already established without compiling stored
+                // sources. It is an ordinary fail-stop, never a healthy origin.
+                return Err(BrokerError::SqlRuleLimitExceeded {
+                    maximum: MAX_TOPIC_SQL_RULES,
+                }
+                .into());
             }
-            .into());
+            if count == MAX_TOPIC_SQL_RULES {
+                // Version counting alone is not a health proof. Only a complete
+                // canonical/compiled exact-full catalog can checkpoint a refusal.
+                // Keep below-quota creation's existing unselected-reader boundary.
+                return Err(
+                    match self.checked_topic_sql_rules(&command.namespace, &command.entity)? {
+                        MAX_TOPIC_SQL_RULES => PreparationFailure::HealthySqlRuleCapacity,
+                        count if count > MAX_TOPIC_SQL_RULES => BrokerError::SqlRuleLimitExceeded {
+                            maximum: MAX_TOPIC_SQL_RULES,
+                        }
+                        .into(),
+                        _ => BrokerError::EntityMetadataCorrupt.into(),
+                    },
+                );
+            }
         }
 
         let definition = RuleDefinition {
@@ -165,6 +183,45 @@ impl<S: StateStore> StateMachine<S> {
                     .filter(|(_, value)| matches!(value.first(), Some(2 | 3)))
                     .count(),
             );
+            if count > MAX_TOPIC_SQL_RULES {
+                // No later sibling can make an overfull catalog healthy.
+                return Ok(count);
+            }
+        }
+        Ok(count)
+    }
+
+    /// Proves every bounded sibling rule row before the healthy quota origin
+    /// can be minted. Overfull or malformed catalogs never become client refusals.
+    fn checked_topic_sql_rules(
+        &self,
+        namespace: &NamespaceName,
+        subscription: &EntityPath,
+    ) -> Result<usize, BrokerError> {
+        let (topic, _) = subscription
+            .as_str()
+            .split_once(SUBSCRIPTION_PATH_SEGMENT)
+            .ok_or(BrokerError::SubscriptionNotFound)?;
+        let topic = EntityPath::from_internal(topic.to_owned())?;
+        let mut cache = ProgramCache::default();
+        let mut count = 0usize;
+        for sibling in self.subscriptions(namespace, &topic, usize::MAX)? {
+            count = count.saturating_add(
+                self.checked_rules(namespace, &sibling, &mut cache)?
+                    .iter()
+                    .filter(|(definition, _, _)| {
+                        definition.action.is_some()
+                            || matches!(definition.filter, RuleFilter::Sql(_))
+                    })
+                    .count(),
+            );
+            if count > MAX_TOPIC_SQL_RULES {
+                // Defensive bound even if the raw count and canonical proof
+                // disagree: never retain programs for further siblings.
+                return Err(BrokerError::SqlRuleLimitExceeded {
+                    maximum: MAX_TOPIC_SQL_RULES,
+                });
+            }
         }
         Ok(count)
     }

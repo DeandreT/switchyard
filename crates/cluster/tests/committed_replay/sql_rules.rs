@@ -278,3 +278,143 @@ fn v10_action_rules_and_v4_copies_replay_exactly_across_backends() -> TestResult
     assert_eq!(replay_actions(false)?, replay_actions(true)?);
     Ok(())
 }
+
+fn quota_replay_controls(durable: bool) -> TestResult {
+    for corrupt in [false, true] {
+        let mut fixture = Fixture::new(durable)?;
+        let other = topic().subscription(&SubscriptionName::new("other")?)?;
+        let originals = vec![
+            proposal(
+                &topic(),
+                1,
+                CommandKind::CreateTopic {
+                    config: TopicConfig::default(),
+                },
+            ),
+            proposal(
+                &topic(),
+                2,
+                CommandKind::CreateSubscription {
+                    name: SubscriptionName::new("worker")?,
+                    config: SubscriptionConfig::default(),
+                },
+            ),
+            proposal(
+                &topic(),
+                3,
+                CommandKind::CreateSubscription {
+                    name: SubscriptionName::new("other")?,
+                    config: SubscriptionConfig::default(),
+                },
+            ),
+            proposal(
+                &subscription(),
+                10,
+                CommandKind::CreateRuleWithAction {
+                    name: RuleName::new("over-quota")?,
+                    filter: RuleFilter::True,
+                    action: domain::SqlRuleAction::new("REMOVE user.old"),
+                },
+            ),
+            proposal(
+                &subscription(),
+                11,
+                CommandKind::CreateRule {
+                    name: RuleName::new("later-valid")?,
+                    filter: RuleFilter::False,
+                },
+            ),
+        ];
+        fixture.proposals(&originals, 5);
+        fixture.seed(&originals[..3]);
+        // Capacity rows are controlled fixture setup, not unjournaled runtime
+        // writers or a claim that the entire historical journal was reconstructed.
+        let mut batch = WriteBatch::default();
+        for (entity, actions) in [(subscription(), false), (other, true)] {
+            for index in 0..domain::MAX_TOPIC_SQL_RULES / 2 {
+                let definition = domain::RuleDefinition {
+                    name: RuleName::new(format!("q{index:04}"))?,
+                    filter: if actions {
+                        RuleFilter::True
+                    } else {
+                        RuleFilter::Sql(SqlRuleFilter::new("1 = 1"))
+                    },
+                    action: actions.then(|| {
+                        domain::SqlRuleAction::new(if corrupt && index == 0 {
+                            "SET sys.Label = 'unsupported'"
+                        } else {
+                            "REMOVE user.old"
+                        })
+                    }),
+                    created_at: Timestamp::from_millis(3),
+                };
+                batch.push_put(
+                    keys::subscription_rule(&ns(), &entity, &definition.name),
+                    codec::rule::encode(&definition)?,
+                );
+            }
+        }
+        fixture.store().apply(batch)?;
+        let before = fixture.snapshot();
+        let mut owner = fixture.open()?;
+        if corrupt {
+            assert!(matches!(
+                owner.replay_batch(1),
+                Err(ReplayError::Indexed(IndexedApplyError::Domain(_)))
+            ));
+            assert_eq!(
+                fixture.snapshot(),
+                before,
+                "corrupt sibling must not advance the quota checkpoint"
+            );
+            drop(owner);
+            fixture.reopen()?;
+            let mut owner = fixture.open()?;
+            assert_eq!(owner.applied_index()?, 3);
+            assert!(matches!(
+                owner.replay_batch(1),
+                Err(ReplayError::Indexed(IndexedApplyError::Domain(_)))
+            ));
+            assert_eq!(fixture.snapshot(), before);
+        } else {
+            assert_eq!(owner.replay_batch(1)?, progress(4, 5, 1));
+            let domain_rows = |rows: Vec<(Key, Value)>| {
+                rows.into_iter()
+                    .filter(|(key, _)| key[0] < 0xF0)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(domain_rows(fixture.snapshot()), domain_rows(before));
+            let checkpointed = fixture.snapshot();
+            drop(owner);
+            fixture.reopen()?;
+            assert_eq!(fixture.snapshot(), checkpointed);
+            let mut owner = fixture.open()?;
+            assert_eq!(owner.applied_index()?, 4);
+            assert_eq!(owner.replay_batch(1)?, progress(5, 5, 1));
+            let machine = StateMachine::new(fixture.store().clone());
+            assert!(
+                machine
+                    .rules(&ns(), &subscription(), 0, 100)?
+                    .iter()
+                    .any(|r| r.name.as_str() == "later-valid")
+            );
+            assert_eq!(machine.last_applied_time()?, Timestamp::from_millis(11));
+            domain::snapshot_validation::validate_complete_state(&fixture.snapshot())?;
+            drop(machine);
+            drop(owner);
+            fixture.reopen()?;
+            let mut owner = fixture.open()?;
+            caught_up(&mut owner, &fixture, 5, 5);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn healthy_and_corrupt_sql_quota_replay_memory() -> TestResult {
+    quota_replay_controls(false)
+}
+#[test]
+fn healthy_and_corrupt_sql_quota_replay_fjall() -> TestResult {
+    quota_replay_controls(true)
+}

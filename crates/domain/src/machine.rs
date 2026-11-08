@@ -77,6 +77,7 @@ pub struct StateMachine<S> {
 pub(crate) enum PreparationFailure {
     Ordinary(BrokerError),
     HealthyRuleCapacity,
+    HealthySqlRuleCapacity,
     HealthySubscriptionCapacity,
 }
 
@@ -86,6 +87,9 @@ impl PreparationFailure {
             Self::Ordinary(error) => error,
             Self::HealthyRuleCapacity => BrokerError::RuleLimitExceeded {
                 maximum: crate::MAX_SUBSCRIPTION_RULES,
+            },
+            Self::HealthySqlRuleCapacity => BrokerError::SqlRuleLimitExceeded {
+                maximum: crate::MAX_TOPIC_SQL_RULES,
             },
             Self::HealthySubscriptionCapacity => BrokerError::SubscriptionLimitExceeded {
                 maximum: crate::MAX_TOPIC_SUBSCRIPTIONS,

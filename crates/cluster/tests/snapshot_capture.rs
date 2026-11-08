@@ -265,6 +265,22 @@ fn action_rules_and_deletions_capture_but_uncompilable_action_refuses() {
         ));
         fixture.reject();
         fixture.raw(WriteBatch::default().put(message_key.clone(), message_value.clone()));
+        // Forge the final frozen V4 removal vector without using the encoder,
+        // which now refuses overcount intent before doing any intersection.
+        assert!(message_value.ends_with(&[1, 3, b'o', b'l', b'd']));
+        let mut overcount = message_value[..message_value.len() - 5].to_vec();
+        overcount.push(33);
+        for index in 0..33 {
+            let name = format!("removed-{index}");
+            overcount.push(name.len() as u8);
+            overcount.extend(name.as_bytes());
+        }
+        fixture.raw(WriteBatch::default().put(message_key.clone(), overcount));
+        fixture.reject();
+        fixture.reopen();
+        fixture.reject();
+        fixture.raw(WriteBatch::default().put(message_key.clone(), message_value.clone()));
+        fixture.check();
         let name = RuleName::new("remove").unwrap();
         let bad = domain::RuleDefinition {
             name: name.clone(),

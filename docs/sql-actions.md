@@ -130,6 +130,12 @@ profile. Programs are never deserialized. Action-bearing rules count toward both
 the 2,000-rule subscription limit and the 2,000 SQL/action-rule topic limit,
 regardless of their filter kind. An actionless true/false/correlation rule does
 not consume the topic SQL quota.
+An exact-full quota refusal is checkpointed only after a complete bounded
+canonical/compiled proof of the topic's rule rows. Corrupt or overfull catalogs
+remain fail-stop errors; they cannot be treated as healthy client refusals.
+Raw counting stops once overfull quota is established, before compiling a global
+proof. A canonical proof also stops on overfull count rather than retaining
+programs for later siblings.
 
 For each subscription, matching actionless rules produce one deduplicated copy.
 Each matching action rule produces its own independent copy in canonical rule
@@ -178,6 +184,9 @@ subscription message limit plus 64 KiB, capped at 16 MiB. Native parser limits
 are unchanged. Later disposition patches preserve removals of unrelated names;
 setting a removed name (including to AMQP null) explicitly restores it. Whole
 replacement envelopes refuse copies with either SETs or removals.
+On a V4 copy without changes, replacement content is validated and its projection
+is derived in the copy's retained legacy or Azure-text ID mode. The record codec
+checks the 32-removal bound before testing SET/removal name intersection.
 
 Action-bearing intent uses proposal V10 (an exact V1/V6 creation envelope plus
 UTF-8 source; nesting is nonrecursive), rule V3 (name, filter, creation time,

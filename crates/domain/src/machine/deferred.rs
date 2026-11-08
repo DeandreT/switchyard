@@ -242,14 +242,22 @@ pub(super) fn replace_envelope(
             maximum_bytes: config.max_message_bytes,
         });
     }
-    record.envelope = Some(envelope.clone());
-    if record.format.uses_text_ids() {
+    let replacement = if record.format.uses_text_ids()
+        || matches!(record.format, MessageRecordFormat::V4 { .. })
+    {
         // A legacy whole-envelope replacement may reach a current record
-        // through the domain API. Derive V3 projection text from its typed
-        // content, never accept a caller's legacy system-ID projection as V3.
-        let input = crate::MessageContent::AmqpTextIds(envelope.as_bytes().to_vec()).derive()?;
-        record.envelope = input.envelope;
-    }
+        // through the domain API. Every V4 copy validates/re-derives content in
+        // its retained ID mode; V3 keeps its existing Azure-text derivation.
+        let content = if record.format.uses_text_ids() {
+            crate::MessageContent::AmqpTextIds(envelope.as_bytes().to_vec())
+        } else {
+            crate::MessageContent::Amqp(envelope.as_bytes().to_vec())
+        };
+        content.derive()?.envelope
+    } else {
+        Some(envelope.clone())
+    };
+    record.envelope = replacement;
     // A V2 record stores exactly one content form, so the replacement becomes
     // its AMQP content. Only a copy without an overlay reaches this point, and
     // the replacement carries none either.
