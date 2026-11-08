@@ -9,7 +9,6 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use amqp::{
@@ -21,13 +20,10 @@ use amqp::{
 use auth::{
     Permission, PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use domain::{
     BrokerError, CommandKind, CommandOutcome, MessageRecordFormat, MessageState, QueueCounters,
     SequenceNumber, StateMachine,
 };
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
 use storage::StateStore;
 use tokio::{
     io::{DuplexStream, duplex},
@@ -40,6 +36,7 @@ use crate::authorization::ConnectionAuthorization;
 use crate::listener::{
     LinkAuthorization, SEND_INTAKE_RETIREMENT, ingress::SendIntake, serve_sending_client,
 };
+use crate::test_sas::add_short_lived_grant;
 use crate::{
     Broker, BrokerRejection, SERVICE_BUS_BATCH_MESSAGE_FORMAT, SharedAccessAuthentication,
 };
@@ -383,28 +380,10 @@ fn authorization() -> LinkAuthorization {
 }
 
 async fn expire(authorization: &LinkAuthorization) {
-    let resource = "amqps%3A%2F%2Ftenant.servicebus.windows.net";
-    let expiry = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 2;
-    let mut mac = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
-    mac.update(format!("{resource}\n{expiry}").as_bytes());
-    let signature = STANDARD
-        .encode(mac.finalize().into_bytes())
-        .replace('+', "%2B")
-        .replace('/', "%2F")
-        .replace('=', "%3D");
-    authorization
-        .connection
-        .validate_and_add(
-            &format!("SharedAccessSignature sr={resource}&sig={signature}&se={expiry}&skn=send"),
-            "amqps://tenant.servicebus.windows.net",
-        )
-        .await
-        .unwrap();
-    assert!(authorization.ensure().await.is_ok());
+    add_short_lived_grant(&authorization.connection, "send", || async move {
+        authorization.ensure().await.is_ok()
+    })
+    .await;
     timeout(WAIT, authorization.wait_until_unauthorized())
         .await
         .expect("positive actual authorization expiry");
