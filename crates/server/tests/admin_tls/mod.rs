@@ -69,9 +69,16 @@ pub fn claims(subject: &str) -> Value {
 }
 
 pub fn sign(claims: Value) -> String {
+    sign_with_header(
+        json!({"alg":"RS256","kid":"key-1","typ":"switchyard+jwt"}),
+        claims,
+    )
+}
+
+pub fn sign_with_header(header: Value, claims: Value) -> String {
     let input = format!(
         "{}.{}",
-        URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","kid":"key-1","typ":"switchyard+jwt"}"#),
+        URL_SAFE_NO_PAD.encode(header.to_string()),
         URL_SAFE_NO_PAD.encode(claims.to_string())
     );
     let key = RsaKeyPair::from_der(&STANDARD.decode(PRIVATE_DER).unwrap()).unwrap();

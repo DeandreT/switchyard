@@ -83,6 +83,11 @@ struct Arguments {
     #[arg(long, value_name = "PATH")]
     shared_access_key_file: Option<PathBuf>,
 
+    /// Offline AMQP JWT policy with pinned public keys and locally bound rights.
+    /// Requires TLS; independent of the native administration policy.
+    #[arg(long, value_name = "PATH")]
+    jwt_policy_file: Option<PathBuf>,
+
     /// Most live sockets the listener holds at once, counting TLS, WebSocket
     /// upgrade and AMQP handshakes as well as open connections. At the limit
     /// new peers wait in the OS backlog until a held connection ends.
@@ -308,6 +313,52 @@ fn load_shared_access_authentication(
     )?))
 }
 
+fn load_amqp_authentication(
+    arguments: &Arguments,
+    mode: DeploymentMode,
+    tls: bool,
+) -> Result<Option<SharedAccessAuthentication>, StartupError> {
+    let Some(path) = arguments.jwt_policy_file.as_deref() else {
+        return load_shared_access_authentication(
+            mode,
+            tls,
+            &arguments.namespace,
+            arguments.shared_access_key_name.as_deref(),
+            arguments.shared_access_key_file.as_deref(),
+        );
+    };
+    if !tls {
+        return Err(StartupError::JwtConfiguration("requires a TLS listener"));
+    }
+    // JWT can be configured without a SAS rule. Explicitly supplied partial SAS
+    // configuration still refuses; a JWT policy never hides a broken SAS rule.
+    let sas = load_shared_access_authentication(
+        DeploymentMode::Development,
+        tls,
+        &arguments.namespace,
+        arguments.shared_access_key_name.as_deref(),
+        arguments.shared_access_key_file.as_deref(),
+    )?;
+    let mut json = String::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(64 * 1024 + 1).read_to_string(&mut json))
+        .map_err(|_| StartupError::JwtConfiguration("could not read policy file"))?;
+    let policy = auth::JwtPolicy::from_json(&json)
+        .map_err(|_| StartupError::JwtConfiguration("policy file is invalid"))?;
+    let authentication = match sas {
+        Some(authentication) => authentication,
+        None => {
+            let host = if arguments.namespace.contains('.') {
+                arguments.namespace.to_ascii_lowercase()
+            } else {
+                format!("{}.servicebus.windows.net", arguments.namespace)
+            };
+            SharedAccessAuthentication::new(auth::SharedAccessPolicy::default(), host)?
+        }
+    };
+    Ok(Some(authentication.with_jwt_policy(policy)))
+}
+
 /// Reports why startup failed in the words the error was written in, rather
 /// than in the derived debug form `Termination` would print. A shutdown that
 /// finishes within its budget exits successfully.
@@ -350,13 +401,7 @@ fn run() -> Result<(), StartupError> {
         arguments.tls_private_key.as_deref(),
     )?;
     validate_transport_security(arguments.transport, tls.is_some())?;
-    let shared_access_authentication = load_shared_access_authentication(
-        mode,
-        tls.is_some(),
-        &arguments.namespace,
-        arguments.shared_access_key_name.as_deref(),
-        arguments.shared_access_key_file.as_deref(),
-    )?;
+    let shared_access_authentication = load_amqp_authentication(&arguments, mode, tls.is_some())?;
     let listen = listen_address(arguments.listen, arguments.transport, tls.is_some());
     let admin_config = load_admin_config(&arguments)?;
     let namespace = namespace_from_hostname(&arguments.namespace)?;
@@ -746,6 +791,63 @@ mod tests {
                 Some(Path::new("key")),
             ),
             Err(StartupError::AuthenticationRequiresTls)
+        ));
+    }
+
+    #[test]
+    fn jwt_configuration_requires_tls_before_reading_policy() {
+        let arguments =
+            Arguments::try_parse_from(["switchyard", "--jwt-policy-file", "missing-policy.json"])
+                .unwrap();
+        assert!(matches!(
+            load_amqp_authentication(&arguments, DeploymentMode::Development, false),
+            Err(StartupError::JwtConfiguration("requires a TLS listener"))
+        ));
+    }
+
+    #[test]
+    fn jwt_does_not_hide_incomplete_shared_access_configuration() {
+        let arguments = Arguments::try_parse_from([
+            "switchyard",
+            "--jwt-policy-file",
+            "missing-policy.json",
+            "--shared-access-key-name",
+            "rule",
+        ])
+        .unwrap();
+        assert!(matches!(
+            load_amqp_authentication(&arguments, DeploymentMode::Production, true),
+            Err(StartupError::IncompleteSharedAccessPolicy)
+        ));
+    }
+
+    #[test]
+    fn invalid_oversized_or_non_utf8_jwt_policy_is_bounded_and_redacted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("policy.json");
+        let arguments =
+            Arguments::try_parse_from(["switchyard", "--jwt-policy-file", path.to_str().unwrap()])
+                .unwrap();
+        for bytes in [
+            b"private-fixture-content-not-valid-json".to_vec(),
+            vec![b'x'; 64 * 1024 + 2],
+            vec![0xff],
+        ] {
+            fs::write(&path, bytes).unwrap();
+            let error = load_amqp_authentication(&arguments, DeploymentMode::Development, true)
+                .unwrap_err();
+            assert!(matches!(error, StartupError::JwtConfiguration(_)));
+            assert!(!error.to_string().contains("private-fixture-content"));
+            assert!(!format!("{error:?}").contains("private-fixture-content"));
+        }
+    }
+
+    #[test]
+    fn no_jwt_policy_preserves_the_production_authentication_refusal() {
+        let arguments = Arguments::try_parse_from(["switchyard"]).unwrap();
+        assert!(matches!(
+            load_amqp_authentication(&arguments, DeploymentMode::Production, true),
+            Err(StartupError::AuthenticationRequiredInProduction)
         ));
     }
 }

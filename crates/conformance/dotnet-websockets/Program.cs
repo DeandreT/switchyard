@@ -1,10 +1,17 @@
 using Azure;
 using Azure.Messaging.ServiceBus;
 
+// The credential workflow must not opt into verbose SDK token-bearing events,
+// even when a diagnostic setting was inherited from the parent process.
+if (args.Length > 0 && args[0] == "offline-jwt")
+    Environment.SetEnvironmentVariable("SWITCHYARD_SDK_DIAGNOSTICS", null);
+
 return await SdkCustody.RunAsync(args, WorkflowAsync);
 
 static async Task<int> WorkflowAsync(string[] args)
 {
+if (args.Length > 0 && args[0] == "offline-jwt")
+    return await OfflineJwtConformance.RunAsync(args[1..]);
 if (args.Length != 17)
 {
     Console.Error.WriteLine(

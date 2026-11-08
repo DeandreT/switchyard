@@ -2,6 +2,7 @@
 #![cfg(target_os = "linux")]
 
 mod admin_tls;
+mod jwt_process;
 
 use admin_api::wire::{self, EntityKind, entity_service_client::EntityServiceClient};
 use admin_tls::{claims, client, list, policy, request, sign};

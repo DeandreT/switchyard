@@ -127,6 +127,8 @@ pub enum StartupError {
     Runtime(String),
     #[error("native administration configuration is invalid: {0}")]
     AdminConfiguration(String),
+    #[error("offline AMQP JWT configuration is invalid: {0}")]
+    JwtConfiguration(&'static str),
     #[error(transparent)]
     Protocol(#[from] protocol_amqp::ProtocolError),
     #[error(transparent)]
