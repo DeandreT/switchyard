@@ -46,10 +46,10 @@ collections require refusal until truthful combined runtime data is available.
 | Topic profiles | Domain-only parent-topic size/TTL and named-subscription lock/delivery-count/TTL/expiry-policy/filter-error-policy patches prove all listed children before changing profiles. Size propagates to backing queues/DLQs; topic TTL does not overwrite child TTL. No-op direct calls preserve Clock; no administration or protocol activation. |
 | Topics/rules | Non-session immediate/scheduled singular/batch fanout; placeholder peek/cancel; independent subscription queues. Durable `$Default`, actionless true/false/correlation, typed equality; create/delete/paginated AMQP rules. Bounded [SQL](sql-predicates.md) filters over the stored typed projection: `add-rule` stores any compilable `sql-filter` expression verbatim and refuses others with 400 and the compile error; `enumerate-rules` returns them as `sql-filter` with the exact text and compatibility level 20. The SDK expressions `1=1`/`1=0` stay true/false filters. Non-empty `sql-rule-action` refuses. |
 | Time/identity | Bounded activation/lock/TTL/session-lock/history expiry. ASCII-folded namespace/entity/subscription addresses and SAS scope; session/placement IDs retain case. |
-| Local APIs | [Offline RS256 JWT](offline-jwt.md): pinned keys, injected time/local rights, issuer-qualified grants; SAS/PLAIN retain verified namespace-host qualification. [SQL filter kernel](sql-predicates.md): bounded local grammar/errors, IN/LIKE/scalar arithmetic. [SQL action kernel](sql-actions.md): bounded REMOVE/literal SET producing typed, isolated patches. No JWT wire activation or stored/wire SQL actions. |
+| Local APIs | [Offline RS256 JWT](offline-jwt.md): pinned keys/local rights and issuer-qualified grants; opt-in [native TLS/h2 EntityService](../crates/server/README.md) requires namespace-root Manage at current time for every RPC. SAS/PLAIN retain verified namespace-host qualification. [SQL filter kernel](sql-predicates.md): bounded local grammar/errors, IN/LIKE/scalar arithmetic. [SQL action kernel](sql-actions.md): bounded REMOVE/literal SET producing typed, isolated patches. No AMQP JWT activation or stored/wire SQL actions. |
 | Storage | Paired Memory/Fjall semantics; Fjall journal fsync before applied outcomes; exclusive directory ownership. |
 
-Library-only administration Get/page reads select one namespace and validate
+Administration Get/page reads select one namespace and validate
 canonical public queue/topic/subscription rows, live owners and required profiles.
 Internal queues are excluded; selected corruption, including lookahead, rejects
 the whole page. Pages return at most 100 entries and consume at most 256 raw rows
@@ -83,10 +83,18 @@ subscription message limits remain unsupported. Errors preserve typed catalog,
 domain, storage, clock, unexpected-outcome and stopped-owner information.
 
 The channel remains bounded to 1024 requests with asynchronous admission
-backpressure. Cancelling an unadmitted request does not enqueue it; dropping a
-reply after admission does not undo Create. Stop remains a queued request: work
-ahead completes, work behind may observe a stopped owner. No stronger drain or
-shutdown guarantee is implied. The additive protobuf profile fields preserve
+backpressure. For direct adapter calls, cancelling an unadmitted request does not
+enqueue it; dropping a reply after admission does not undo Create. Stop remains a
+queued request: work ahead completes, work behind may observe a stopped owner.
+The TLS listener independently retains accepted RPC work, including broker admission
+waits, through client cancellation and joins it before stopping the broker.
+There are at most 1024 accepted RPC operations listener-wide, across all h2
+connections, including broker-channel admission waits. Excess requests return
+ResourceExhausted before any retained backend task is spawned. Client cancellation
+does not return capacity; only an actual join of the original task does, including
+panic exits. Completed-but-unjoined originals remain charged. Rotating reaping
+priority prevents continuously ready stream/connection exits from starving RPC joins.
+The additive protobuf profile fields preserve
 existing numbers and legacy duplicate-history zero semantics; presence on scalar
 profile/availability fields distinguishes omission from explicit values.
 
@@ -101,17 +109,17 @@ responses use fixed messages rather than internal details. Delete remains
 `UNIMPLEMENTED`; unrelated native services are not registered. See the
 [handler contract](../crates/admin-api/README.md).
 
-These library handlers do not start a network administration API. TLS listener
-activation, startup wiring and CLI commands remain pending, alongside
-HTTP/OpenAPI, Update/Delete, rules, placement/capacity mutation and runtime counters.
+The server exposes these handlers only through its explicitly configured TLS/h2
+listener. HTTP/OpenAPI, the CLI, Update/Delete, rules, placement/capacity mutation
+and runtime counters remain outside this surface.
 
 Selected operational queue-profile reads validate after decode/owner proof,
 including backing queues/DLQs; invalid limits are corruption. Unread rows/raw
 catalogues are not certified; profile-free legacy operations remain unchanged.
 Typed content (#16) and actionless SQL filters (#20) are complete. Administration
-setters/capacity, JWT activation [#17](https://github.com/DeandreT/switchyard/issues/17),
-and bounded SQL actions (#21) remain pending. Grant consumers preserve verified
-principal identity and both validity bounds without activating JWT on the wire.
+setters/capacity, AMQP JWT activation [#17](https://github.com/DeandreT/switchyard/issues/17),
+and durable SQL actions/fanout (#21) remain pending. Grant consumers preserve verified
+principal identity and both validity bounds; JWT is active only on native admin RPCs.
 
 ### Absolute link addresses
 
@@ -490,8 +498,8 @@ namespace/server; no quotas, fair multi-tenancy or production durability.
 | Scope | Missing |
 | --- | --- |
 | Semantics | SQL actions/parameters/functions beyond the kernel, session subscriptions/session-ID predicates, administrable TTL expiry policy, DLQ forwarding/resubmit, same-group transactions. |
-| Administration | Atom/XML entities/rules; native TLS listener/startup and CLI activation (generated authenticated handlers exist). |
-| Security | JWT wire activation, network OIDC, mTLS, policy/full RBAC, namespace KMS/encryption, tamper-evident audit. |
+| Administration | Atom/XML entities/rules; native CLI, Update/Delete and other native services. |
+| Security | AMQP JWT activation, network OIDC, mTLS, policy/full RBAC, namespace KMS/encryption, tamper-evident audit. |
 | Production | Raft/placement, quotas/fairness, encrypted backup/restore, readiness/observability, release/performance evidence. |
 
 Partitioning/cross-placement transactions are later scope; geo-replication/Premium

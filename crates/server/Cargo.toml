@@ -17,11 +17,16 @@ clap.workspace = true
 cluster.workspace = true
 domain.workspace = true
 flume.workspace = true
+hyper = { version = "1", features = ["server", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 protocol-amqp.workspace = true
 rustls.workspace = true
 storage.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
+tokio-rustls.workspace = true
+tonic.workspace = true
+tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -31,6 +36,7 @@ base64.workspace = true
 fjall.workspace = true
 hmac.workspace = true
 rcgen.workspace = true
+ring.workspace = true
 roxmltree = "=0.21.1"
 rustls.workspace = true
 serde.workspace = true
@@ -45,4 +51,4 @@ tokio-tungstenite.workspace = true
 url.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-rustix = { version = "=1.1.4", features = ["fs", "process"] }
+rustix = { version = "=1.1.4", features = ["fs", "net", "process"] }

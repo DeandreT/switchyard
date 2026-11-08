@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    io::{self, Write},
+    io::{self, Read, Write},
     net::SocketAddr,
     num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
@@ -22,9 +22,11 @@ use protocol_amqp::{
 };
 use rustls::ServerConfig;
 use server::{
-    Broker, BrokerHandle, DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SWEEP_INTERVAL, LocalProposer,
-    NodeState, SHUTDOWN_EXPIRED_EXIT_CODE, ShutdownBudget, ShutdownExpired, ShutdownTrigger,
-    StartupError, StorageChoice, SystemClock, TimerThread, shut_down, stop_timer_and_broker,
+    AdminListenerService, AdminRetirement, AdminTlsConfig, Broker, BrokerHandle,
+    DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SWEEP_INTERVAL, LocalProposer, NodeState,
+    SHUTDOWN_EXPIRED_EXIT_CODE, ShutdownBudget, ShutdownExpired, ShutdownTrigger, StartupError,
+    StorageChoice, SystemClock, TimerThread, serve_transports, shut_down_with_admin,
+    stop_timer_and_broker,
 };
 #[cfg(debug_assertions)]
 use server::{Shutdown, TimerWorker};
@@ -112,6 +114,22 @@ struct Arguments {
     /// label taken, so a deployment can name namespaces in DNS.
     #[arg(long, default_value = "development")]
     namespace: String,
+
+    /// Explicitly enable native EntityService administration on this TLS/h2 address.
+    #[arg(long)]
+    admin_listen: Option<SocketAddr>,
+
+    /// PEM certificate chain for the native administration listener.
+    #[arg(long, value_name = "PATH")]
+    admin_tls_certificate: Option<PathBuf>,
+
+    /// PEM private key for --admin-tls-certificate (never a command-line secret).
+    #[arg(long, value_name = "PATH")]
+    admin_tls_private_key: Option<PathBuf>,
+
+    /// Offline JWT policy JSON with pinned public keys and local scope/rights bindings.
+    #[arg(long, value_name = "PATH")]
+    admin_jwt_policy_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -178,6 +196,46 @@ fn read_tls_file(path: &Path) -> Result<Vec<u8>, StartupError> {
         path: path.to_path_buf(),
         detail: error.to_string(),
     })
+}
+
+fn load_admin_config(arguments: &Arguments) -> Result<Option<AdminTlsConfig>, StartupError> {
+    let invalid = || {
+        StartupError::AdminConfiguration(String::from(
+            "requires explicit --admin-listen, --admin-tls-certificate, --admin-tls-private-key and --admin-jwt-policy-file",
+        ))
+    };
+    let paths = match (
+        arguments.admin_listen,
+        arguments.admin_tls_certificate.as_deref(),
+        arguments.admin_tls_private_key.as_deref(),
+        arguments.admin_jwt_policy_file.as_deref(),
+    ) {
+        (None, None, None, None) => return Ok(None),
+        (Some(_), Some(cert), Some(key), Some(policy)) => (cert, key, policy),
+        _ => return Err(invalid()),
+    };
+    let tls = tls_server_config(&read_tls_file(paths.0)?, &read_tls_file(paths.1)?)?;
+    // Match the offline profile's 64 KiB bound, reading one extra byte so an
+    // oversized file is refused by the policy parser rather than truncated.
+    let mut json = String::new();
+    fs::File::open(paths.2)
+        .and_then(|file| file.take(64 * 1024 + 1).read_to_string(&mut json))
+        .map_err(|_| {
+            StartupError::AdminConfiguration(String::from(
+                "could not read native administration JWT policy",
+            ))
+        })?;
+    let policy = auth::JwtPolicy::from_json(&json)
+        .map_err(|error| StartupError::AdminConfiguration(error.to_string()))?;
+    let host = if arguments.namespace.contains('.') {
+        arguments.namespace.to_ascii_lowercase()
+    } else {
+        format!("{}.servicebus.windows.net", arguments.namespace)
+    };
+    let root = auth::ResourceScope::namespace(&host)?;
+    AdminTlsConfig::new(tls, policy, root)
+        .map(Some)
+        .map_err(|error| StartupError::AdminConfiguration(error.to_owned()))
 }
 
 fn listen_address(
@@ -300,6 +358,12 @@ fn run() -> Result<(), StartupError> {
         arguments.shared_access_key_file.as_deref(),
     )?;
     let listen = listen_address(arguments.listen, arguments.transport, tls.is_some());
+    let admin_config = load_admin_config(&arguments)?;
+    let namespace = namespace_from_hostname(&arguments.namespace)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| StartupError::Runtime(error.to_string()))?;
     let state = server::open(cluster, storage_choice(&arguments)?)?;
 
     info!(
@@ -309,7 +373,6 @@ fn run() -> Result<(), StartupError> {
         transport = ?arguments.transport,
         "configuration is valid"
     );
-    let namespace = namespace_from_hostname(&arguments.namespace)?;
     let broker = match state {
         NodeState::Memory(machine) => Broker::spawn(LocalProposer::new(machine, SystemClock)),
         NodeState::Durable(machine) => Broker::spawn(LocalProposer::new(machine, SystemClock)),
@@ -325,10 +388,6 @@ fn run() -> Result<(), StartupError> {
     );
     let shutdown_timeout = Duration::from_secs(arguments.shutdown_timeout_secs.get());
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| StartupError::Runtime(error.to_string()))?;
     let served = runtime.block_on(async {
         // Registered before the listener exists, so a signal during startup
         // waits for the listener rather than killing the process outright.
@@ -341,6 +400,17 @@ fn run() -> Result<(), StartupError> {
                 detail: error.to_string(),
             })?;
         let address = listener.local_addr().unwrap_or(listen);
+        // Bind both sockets before starting either transport's serving tasks.
+        // A second-bind failure drops the first socket, with no detached service.
+        let mut admin = match (arguments.admin_listen, admin_config) {
+            (Some(address), Some(config)) => {
+                let socket = tokio::net::TcpListener::bind(address).await.map_err(|error| StartupError::Listen { address: address.to_string(), detail: error.to_string() })?;
+                let service = AdminListenerService::new(socket, config, handle.clone(), namespace.clone(), Duration::from_secs(arguments.admission_timeout_secs.get()));
+                info!(address = %service.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, "native administration TLS listener bound; authenticated RPC required for readiness");
+                Some(service)
+            },
+            _ => None,
+        };
         info!(address = %address, namespace = %namespace, tls = tls.is_some(), transport = ?arguments.transport, max_connections = ?arguments.max_connections, admission_timeout_secs = arguments.admission_timeout_secs, shutdown_timeout_secs = arguments.shutdown_timeout_secs, "accepting AMQP connections");
         let amqp = AmqpListener::new(handle, namespace).with_admission_timeout(
             Duration::from_secs(arguments.admission_timeout_secs.get()),
@@ -362,20 +432,27 @@ fn run() -> Result<(), StartupError> {
             TransportArgument::AmqpWebSockets => amqp.into_wss_service(listener),
         };
         let trigger = ShutdownTrigger::default();
-        tokio::spawn(forward_signals(
-            signals,
-            trigger.clone(),
-            service.retirement_handle(),
-        ));
+        let (stop_signals, stopped) = tokio::sync::oneshot::channel();
+        let signal_task = tokio::spawn({
+            let trigger = trigger.clone();
+            let retirement = service.retirement_handle();
+            let admin_retirement = admin.as_ref().map(AdminListenerService::retirement_handle);
+            async move {
+                tokio::select! {
+                    () = forward_signals(signals, trigger, retirement, admin_retirement) => {},
+                    _ = stopped => {},
+                }
+            }
+        });
 
-        // Serves until a signal retires the listener or accepting fails.
-        service.serve().await;
-        if trigger.request() {
-            info!("the listener stopped accepting; shutting down");
-        }
+        // Both original owners stay here if select cancels the other accept
+        // borrower. Either terminal transport retires the other immediately.
+        serve_transports(&mut service, admin.as_mut(), &trigger).await;
         let started = trigger.started().unwrap_or_else(Instant::now);
         let budget = ShutdownBudget::new(started, shutdown_timeout);
-        match shut_down(&budget, &mut service, &mut timer, &mut broker).await {
+        service.retirement_handle().request();
+        if let Some(admin) = admin.as_ref() { admin.retirement_handle().request(); }
+        let result = match shut_down_with_admin(&budget, &mut service, admin.as_mut(), &mut timer, &mut broker).await {
             Ok(exit) => {
                 info!(
                     elapsed_millis =
@@ -386,11 +463,17 @@ fn run() -> Result<(), StartupError> {
                     Some(AmqpListenerExit::Complete(Err(AmqpListenerFailure::Accept(error)))) => {
                         Err(StartupError::Runtime(error.to_string()))
                     }
-                    _ => Ok(()),
+                    _ => match admin.as_mut().and_then(AdminListenerService::take_failure) {
+                        Some(error) => Err(StartupError::Runtime(error.to_string())),
+                        None => Ok(()),
+                    },
                 }
             }
             Err(expired) => abandon_shutdown(expired, shutdown_timeout),
-        }
+        };
+        let _ = stop_signals.send(());
+        signal_task.await.map_err(|error| StartupError::Runtime(error.to_string()))?;
+        result
     });
 
     // Reached with the timer or broker still running only when startup failed
@@ -502,11 +585,15 @@ async fn forward_signals(
     mut signals: ProcessSignals,
     trigger: ShutdownTrigger,
     retirement: AmqpListenerRetirement,
+    admin_retirement: Option<AdminRetirement>,
 ) {
     while let Some(signal) = signals.next().await {
         if trigger.request() {
             info!(signal = %signal, "shutting down");
             retirement.request();
+            if let Some(admin) = admin_retirement.as_ref() {
+                admin.request();
+            }
         } else {
             info!(signal = %signal, "shutdown already in progress");
         }
