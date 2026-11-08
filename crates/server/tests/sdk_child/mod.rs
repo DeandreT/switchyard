@@ -5,7 +5,10 @@
 //! Project/bin/obj and NuGet paths are invocation-owned and pin-isolated.
 
 pub mod child;
+pub mod diagnostic_controls;
+pub mod diagnostics;
 pub mod identity;
+pub mod matrix;
 pub mod pins;
 
 use sha2::{Digest, Sha256};
@@ -249,6 +252,7 @@ impl SdkRun {
                 self.root.path().join("plugins-cache"),
             )
             .env("DOTNET_CLI_HOME", self.root.path().join("cli-home"))
+            .env("DOTNET_ADD_GLOBAL_TOOLS_TO_PATH", "false")
             .env("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
             .env("DOTNET_PROCESSOR_COUNT", "2");
         command

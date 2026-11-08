@@ -8,7 +8,7 @@ not compatibility certification.
 
 | Client | Evidence |
 | --- | --- |
-| Official .NET | Four opt-in experimental Memory TCP/WSS gates: declared-current ServiceBus 7.21.0 / Core 1.62.0 and previous 7.20.2 / 1.60.0, not latest. Isolated locked graphs/roots; approved ServiceBus/Core, output and nonce-bound loaded-file bytes; completion after async disposal. |
+| Official .NET | Eight opt-in experimental Memory/Fjall × TCP/WSS gates: declared-current ServiceBus 7.21.0 / Core 1.62.0 and previous 7.20.2 / 1.60.0, not latest. Isolated locked graphs/roots; approved ServiceBus/Core, output and nonce-bound loaded-file bytes; completion after async disposal. |
 | Rust AMQP | Broader protocol end-to-end suites, not official-SDK substitutes. |
 | Pinned Sift | Source-only Atom fixture pin; no execution gate. |
 
@@ -16,7 +16,8 @@ not compatibility certification.
 renew/abandon/defer/peek, DLQ, sessions/state, duplicates, scheduling/cancellation,
 filtered subscriptions, rules and case-insensitive addresses. Linux/.NET 10/NuGet
 restore are required; missing prerequisites fail. Workspace runs ignore these
-workflows; durable coverage is pending. TCP uses a permissive generated-identity
+workflows. Each Fjall cell joins its original listener task family, timer and broker,
+then drops stores before checking logical records across reopen. TCP uses a permissive generated-identity
 callback; WSS instead uses platform trust and child-scoped `SSL_CERT_FILE` root,
 without machine-wide changes. Neither certifies production trust, administration
 or whole-test task-tree shutdown. See [selectors/limits](sdk-gates.md),
