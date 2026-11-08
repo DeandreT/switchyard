@@ -183,6 +183,7 @@ impl Proposal {
                     max_delivery_count,
                     default_time_to_live_millis: default_time_to_live_millis.map(Into::into),
                     dead_lettering_on_message_expiration: None,
+                    dead_lettering_on_filter_evaluation_exceptions: None,
                 },
             },
         };

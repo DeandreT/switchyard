@@ -65,6 +65,7 @@ fn variants() -> Vec<CommandKind> {
                 max_delivery_count: 2,
                 default_time_to_live_millis: Some(3),
                 dead_lettering_on_message_expiration: true,
+                dead_lettering_on_filter_evaluation_exceptions: true,
             },
         },
         CommandKind::CreateRule {
@@ -189,6 +190,7 @@ fn topic_profile_commands_have_separate_v2_goldens_and_retain_invalid_intent() {
                     max_delivery_count: Some(0),
                     default_time_to_live_millis: Some(QueueTimeToLiveUpdate::Finite { millis: 0 }),
                     dead_lettering_on_message_expiration: None,
+                    dead_lettering_on_filter_evaluation_exceptions: None,
                 },
             },
             "53574450000000020000001000016e01710701017301000100010000",
@@ -232,6 +234,7 @@ fn topic_profile_commands_have_separate_v2_goldens_and_retain_invalid_intent() {
                 max_delivery_count: Some(u32::MAX),
                 default_time_to_live_millis: Some(QueueTimeToLiveUpdate::Unlimited),
                 dead_lettering_on_message_expiration: None,
+                dead_lettering_on_filter_evaluation_exceptions: None,
             },
         },
         CommandKind::UpdateSubscription {

@@ -1,6 +1,7 @@
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
+pub mod membership;
 pub mod message;
 pub mod queue;
 pub mod rule;

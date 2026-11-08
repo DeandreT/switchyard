@@ -80,6 +80,7 @@ fn subscription<S: StateStore>(
                 max_delivery_count: 3,
                 default_time_to_live_millis: Some(700),
                 dead_lettering_on_message_expiration: true,
+                dead_lettering_on_filter_evaluation_exceptions: true,
             },
         },
     );

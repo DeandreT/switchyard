@@ -42,7 +42,7 @@ collections require refusal until truthful combined runtime data is available.
 | Sessions | Named/next-available attach echoes identifier/deadline; exclusive locks, opaque state, release on close. Renewal/state use `$management`, not automatic renewal. |
 | Duplicates | Exact non-empty message IDs across immediate/batch/scheduled offers on enabled ordinary queues and topics; bounded history expiry. Topic enablement/window are creation-only (default off/10 minutes, inclusive 20 seconds–7 days). |
 | Profiles | Domain-only partial ordinary-queue updates atomically validate/change parent and exact DLQ profiles plus Clock. No-op patches write nothing; owner, records/deadlines remain. Session/duplicate modes are immutable; lock/TTL/message-size/history/expiry-policy changes govern future work. |
-| Topic profiles | Domain-only parent-topic size/TTL and named-subscription lock/delivery-count/TTL/expiry-policy patches prove all listed children before changing profiles. Size propagates to backing queues/DLQs; topic TTL does not overwrite child TTL. No-op direct calls preserve Clock; no administration or protocol activation. |
+| Topic profiles | Domain-only parent-topic size/TTL and named-subscription lock/delivery-count/TTL/expiry-policy/filter-error-policy patches prove all listed children before changing profiles. Size propagates to backing queues/DLQs; topic TTL does not overwrite child TTL. No-op direct calls preserve Clock; no administration or protocol activation. |
 | Topics/rules | Non-session immediate/scheduled singular/batch fanout; placeholder peek/cancel; independent subscription queues. Durable `$Default`, actionless true/false/correlation, typed equality; create/delete/paginated AMQP rules. Bounded [SQL](sql-predicates.md) filters over the stored typed projection: `add-rule` stores any compilable `sql-filter` expression verbatim and refuses others with 400 and the compile error; `enumerate-rules` returns them as `sql-filter` with the exact text and compatibility level 20. The SDK expressions `1=1`/`1=0` stay true/false filters. Non-empty `sql-rule-action` refuses. |
 | Time/identity | Bounded activation/lock/TTL/session-lock/history expiry. ASCII-folded namespace/entity/subscription addresses and SAS scope; session/placement IDs retain case. |
 | Local APIs | [Offline RS256 JWT](offline-jwt.md): pinned keys, injected time/local rights, issuer-qualified grants; SAS/PLAIN retain verified namespace-host qualification. [SQL kernel](sql-predicates.md): bounded local grammar/errors, IN/LIKE/scalar arithmetic. No JWT wire activation or SQL actions. |
@@ -97,7 +97,8 @@ including backing queues/DLQs; invalid limits are corruption. Unread rows/raw
 catalogues are not certified; profile-free legacy operations remain unchanged.
 Administration setters/capacity, JWT consumers [#71](https://github.com/DeandreT/switchyard/issues/71)
 and activation [#17](https://github.com/DeandreT/switchyard/issues/17), typed content
-#16 is complete; the SQL filter-error discard setting (#20) and #21 remain pending.
+#16 and actionless SQL filters (#20) are complete; bounded SQL actions (#21)
+remain pending.
 
 ### Absolute link addresses
 
@@ -132,7 +133,8 @@ the attach response.
 | TTL | Queues and subscriptions carry `dead_lettering_on_message_expiration`, defaulting on (Azure defaults off). On, expiry dead-letters as `TTLExpiredException`; off, it deletes the message and its indexes with no DLQ copy. Either applies on sweep, receive, abandon, lock expiry, deferred retrieval and activated schedules; delivery-count and application dead-lettering are unaffected. The setting is domain-only: administration and AMQP still create entities with the default. Expiry outcomes count deletions separately from DLQ copies, and the timer treats both as work for its paging and idle checks. Live locks remain settleable until expiry. |
 | Duplicate gaps/history | Suppression consumes acknowledgement sequence slots, stores no message. History starts at command time; hits do not extend it, nor settlement/cancellation/expiry/DLQ erase it. Missing raw-AMQP IDs bypass it. |
 | Scheduled topics | Children/rules snapshot at activation: later subscriptions may receive older publications. All-scheduled sends do not prove topology early. |
-| SQL filter errors | Azure dead-letters a message whose subscription filter throws by default; Switchyard's specific behavior is its own choice, not verified against Azure. When no rule of a subscription matches and a SQL rule fails to evaluate (type mismatch, unsupported or ambiguous property, overflow, budget), the subscription gets one dead-lettered copy with reason `FilterException` and description `rule <name>: <fixed error text>` for the first failing rule in name order. Any matching rule still delivers despite a failing sibling. Azure's per-subscription opt-out that discards instead is not configurable yet. |
+| SQL filter errors | Azure dead-letters a message whose subscription filter throws by default; Switchyard's specific behavior is its own choice, not verified against Azure. When no rule of a subscription matches and a SQL rule fails to evaluate (type mismatch, unsupported or ambiguous property, overflow, budget), the subscription gets one dead-lettered copy with reason `FilterException` and description `rule <name>: <fixed error text>` for the first failing rule in name order. Any matching rule still delivers despite a failing sibling. Ordinary, batch and scheduled fanout behave alike. |
+| Filter-error discard | Subscriptions carry `dead_lettering_on_filter_evaluation_exceptions` (Azure `DeadLetteringOnFilterEvaluationExceptions`), defaulting on as in Azure. Off, the copy a filter error would dead-letter is discarded: nothing is written for that subscription and its DLQ is not reported as populated. It is set at creation and changed by subscription profile updates, independently of `dead_lettering_on_message_expiration`; a change governs later fanout and activations only. Domain-only: administration and AMQP still create subscriptions with the default. |
 | SQL identifiers | `sys.MessageId`/`sys.CorrelationId` use the stored projection's text form for non-string AMQP identifiers: ulong as decimal, binary as lowercase hex, UUID as `Uuid([..])` byte-list text. SQL comparisons against Azure's GUID text form therefore do not match UUID identifiers. |
 | SQL rule quota | At most 2,000 SQL rules across all subscriptions of a topic (Azure's quota); the next SQL rule refuses with `SqlRuleLimitExceeded`. True/false/correlation rules keep only the per-subscription limit. |
 | Topic sequences | Each offered publication and selected due placeholder consumes one topic-owned slot, even with no matching subscriptions; fanout copies consume none. MAX-1 is the last fresh slot and MAX refuses with nonretryable `SequenceNumberExhausted`. Crossing batches or bounded activation sets retain every original record, counter and Clock without partial fanout. Idle activation and cancellation need no slot. |
@@ -230,8 +232,10 @@ queue/subscription updates naming that setting, use private V5. SQL rule creatio
 private V6, retaining the expression text uncompiled so an invalid predicate survives for
 deterministic refusal; true/false/correlation rule creation keeps V1. Finite queue
 creation and queue updates naming `capacity` use private V7; non-finite creation and
-updates that omit capacity keep their V1/V5 bytes. All other forms keep their V1/V2
-bytes. New readers accept V1 through V7; older readers refuse unsupported
+updates that omit capacity keep their V1/V5 bytes. Subscription creation that discards
+filter-error copies, and subscription updates naming that setting, use private V8;
+subscription intent without it keeps its V1/V2/V5 bytes. All other forms keep their V1/V2
+bytes. New readers accept V1 through V8; older readers refuse unsupported
 proposal versions. AMQP ingress sends every message as V4: a transfer as `SendContent`, and a
 Service Bus batch or scheduled-message request as `SendContentBatch` with each child's
 original bytes. Nothing new emits V1 sends; historical V1 sends still decode and replay
@@ -255,6 +259,11 @@ when expiry dead-lettering is disabled; enabled profiles and every DLQ shadow ke
 legacy V1 bytes, and the same refusals and rollback requirements apply. Finite queue
 profiles alone use queue V3, whatever their expiry policy; V1 and V2 always mean
 non-finite. Readers before V3 refuse those records, and the same rollback rules apply.
+Topic membership records hold the filter-error setting: a subscription that discards
+filter-error copies stores a membership V2 (child path and setting), while every
+dead-lettering subscription keeps the exact legacy V1 envelope of its child path.
+Readers before V2 refuse those memberships as topology corruption; noncanonical,
+redundant and foreign-child records are refused, and the same rollback rules apply.
 Rule records follow the same pattern: SQL
 rules alone use a V2 rule value (display name, exact expression text, creation time)
 that old readers refuse as an unsupported version, while true/false/correlation rules

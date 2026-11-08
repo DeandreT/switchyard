@@ -360,15 +360,17 @@ impl<S: StateStore> StateMachine<S> {
             return Ok(None);
         };
         let parent = parent.ok_or(AdminCatalogError::CorruptCatalog)?;
-        if raw != codec::encode(&path).map_err(|_| AdminCatalogError::CorruptCatalog)? {
-            return Err(AdminCatalogError::CorruptCatalog);
-        }
+        let dead_lettering_on_filter_evaluation_exceptions = codec::membership::decode(&path, &raw)
+            .map_err(|_| AdminCatalogError::CorruptCatalog)?;
         let raw = self
             .store()
             .get(&keys::queue_config(namespace, &path))?
             .ok_or(AdminCatalogError::CorruptCatalog)?;
         let backing = codec::queue::decode(&raw).map_err(|_| AdminCatalogError::CorruptCatalog)?;
-        let config = SubscriptionConfig::from_backing(backing);
+        let config = SubscriptionConfig::from_profile(
+            backing,
+            dead_lettering_on_filter_evaluation_exceptions,
+        );
         config
             .validate()
             .map_err(|_| AdminCatalogError::CorruptCatalog)?;

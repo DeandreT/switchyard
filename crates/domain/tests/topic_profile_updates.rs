@@ -358,6 +358,7 @@ fn retention_and_exact_mutations<P: StoreProvider>(provider: P) -> TestResult {
         max_delivery_count: Some(3),
         default_time_to_live_millis: Some(QueueTimeToLiveUpdate::Finite { millis: 200 }),
         dead_lettering_on_message_expiration: None,
+        dead_lettering_on_filter_evaluation_exceptions: None,
     };
     assert_eq!(
         fixture.machine.apply_bound(&BoundCommand::new(
@@ -627,6 +628,7 @@ fn input_refusals<P: StoreProvider>(provider: P) -> TestResult {
                     millis: u64::MAX,
                 }),
                 dead_lettering_on_message_expiration: None,
+                dead_lettering_on_filter_evaluation_exceptions: None,
             },
         ),
     )?;

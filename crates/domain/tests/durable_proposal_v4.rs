@@ -217,10 +217,10 @@ fn malformed_truncated_and_noncanonical_v4_bytes_refuse() {
         Err(DurableProposalError::NonCanonical)
     );
     let mut unknown = bytes;
-    unknown[4..8].copy_from_slice(&8_u32.to_be_bytes());
+    unknown[4..8].copy_from_slice(&9_u32.to_be_bytes());
     assert_eq!(
         DurableProposal::decode(&unknown),
-        Err(DurableProposalError::UnsupportedVersion(8))
+        Err(DurableProposalError::UnsupportedVersion(9))
     );
 }
 

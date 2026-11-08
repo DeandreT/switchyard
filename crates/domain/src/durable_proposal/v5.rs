@@ -147,8 +147,17 @@ pub(super) fn carries(kind: &CommandKind) -> bool {
         CommandKind::UpdateQueue { update } => {
             update.dead_lettering_on_message_expiration.is_some() && update.capacity.is_none()
         }
-        CommandKind::CreateSubscription { config, .. } => !config.is_legacy_representable(),
-        CommandKind::UpdateSubscription { update, .. } => !update.is_legacy_representable(),
+        // Subscription intent that names the filter-error setting is V8.
+        CommandKind::CreateSubscription { config, .. } => {
+            !config.dead_lettering_on_message_expiration
+                && config.dead_lettering_on_filter_evaluation_exceptions
+        }
+        CommandKind::UpdateSubscription { update, .. } => {
+            update.dead_lettering_on_message_expiration.is_some()
+                && update
+                    .dead_lettering_on_filter_evaluation_exceptions
+                    .is_none()
+        }
         _ => false,
     }
 }
@@ -298,6 +307,7 @@ impl Kind {
                     max_delivery_count,
                     default_time_to_live_millis,
                     dead_lettering_on_message_expiration,
+                    dead_lettering_on_filter_evaluation_exceptions: true,
                 },
             },
             Self::UpdateSubscription {
@@ -315,6 +325,7 @@ impl Kind {
                     dead_lettering_on_message_expiration: Some(
                         dead_lettering_on_message_expiration,
                     ),
+                    dead_lettering_on_filter_evaluation_exceptions: None,
                 },
             },
         };

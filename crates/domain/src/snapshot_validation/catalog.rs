@@ -129,14 +129,10 @@ impl<'a> Catalog<'a> {
                     let child = topic
                         .subscription(&name)
                         .map_err(|_| invalid_key(row, "subscription path cannot be formed"))?;
-                    let expected = codec::encode(&child)
-                        .map_err(|_| invalid_value(row, "membership cannot be encoded"))?;
-                    if *value != expected {
-                        return Err(invalid_value(
-                            row,
-                            "membership does not encode its exact canonical child",
-                        ));
-                    }
+                    // Either canonical record: the setting has no companion.
+                    codec::membership::decode(&child, value).map_err(|_| {
+                        invalid_value(row, "membership does not encode its exact canonical child")
+                    })?;
                     let parent = (namespace.clone(), topic);
                     if catalog
                         .memberships
@@ -252,7 +248,7 @@ impl<'a> Catalog<'a> {
                     .topics
                     .get(&membership.value)
                     .ok_or_else(|| inconsistent(queue.row, "subscription has no parent topic"))?;
-                let config = SubscriptionConfig::from_backing(queue.value);
+                let config = SubscriptionConfig::from_profile(queue.value, true);
                 config.validate().map_err(|_| {
                     invalid_value(queue.row, "subscription profile violates current policy")
                 })?;

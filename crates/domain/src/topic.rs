@@ -90,6 +90,11 @@ pub struct SubscriptionConfig {
     /// Same meaning and default as [`QueueConfig::dead_lettering_on_message_expiration`];
     /// stored only in the backing queue profile.
     pub dead_lettering_on_message_expiration: bool,
+    /// Service Bus `DeadLetteringOnFilterEvaluationExceptions`. `true` gives a
+    /// message whose SQL rules failed to evaluate, without any rule matching,
+    /// one dead-lettered copy; `false` discards that copy. Independent of the
+    /// expiry setting and stored only in the topic membership record.
+    pub dead_lettering_on_filter_evaluation_exceptions: bool,
 }
 
 impl Default for SubscriptionConfig {
@@ -99,6 +104,7 @@ impl Default for SubscriptionConfig {
             max_delivery_count: DEFAULT_MAX_DELIVERY_COUNT,
             default_time_to_live_millis: None,
             dead_lettering_on_message_expiration: true,
+            dead_lettering_on_filter_evaluation_exceptions: true,
         }
     }
 }
@@ -136,19 +142,26 @@ impl SubscriptionConfig {
         }
     }
 
-    /// The subscription settings a backing queue profile records. Callers still
-    /// prove the backing equals `queue_config` of the result.
-    pub(crate) fn from_backing(backing: QueueConfig) -> Self {
+    /// The subscription settings a backing queue profile and its membership
+    /// record hold. Callers still prove the backing equals `queue_config` of
+    /// the result.
+    pub(crate) fn from_profile(
+        backing: QueueConfig,
+        dead_lettering_on_filter_evaluation_exceptions: bool,
+    ) -> Self {
         Self {
             lock_duration_millis: backing.lock_duration_millis,
             max_delivery_count: backing.max_delivery_count,
             default_time_to_live_millis: backing.default_time_to_live_millis,
             dead_lettering_on_message_expiration: backing.dead_lettering_on_message_expiration,
+            dead_lettering_on_filter_evaluation_exceptions,
         }
     }
 
+    /// Whether the legacy V1 creation DTO represents this configuration exactly.
     pub(crate) fn is_legacy_representable(self) -> bool {
         self.dead_lettering_on_message_expiration
+            && self.dead_lettering_on_filter_evaluation_exceptions
     }
 }
 
