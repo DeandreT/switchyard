@@ -186,7 +186,7 @@ impl<S: StateStore> StateMachine<S> {
             }
             CommandKind::SendContent { content } => {
                 let input = content.derive().map_err(BrokerError::from)?;
-                let input = SendInput::content(&input);
+                let input = SendInput::content(&input, content);
                 if self
                     .topic_config(&command.namespace, &command.entity)?
                     .is_some()
@@ -201,7 +201,11 @@ impl<S: StateStore> StateMachine<S> {
                 // shared command-wide projection budget, so one invalid or
                 // over-budget child refuses the whole batch with no effects.
                 let derived = MessageContent::derive_batch(messages).map_err(BrokerError::from)?;
-                let inputs = derived.iter().map(SendInput::content).collect::<Vec<_>>();
+                let inputs = derived
+                    .iter()
+                    .zip(messages)
+                    .map(|(input, content)| SendInput::content(input, content))
+                    .collect::<Vec<_>>();
                 self.send_inputs(command, &inputs, &mut batch)?
             }
             CommandKind::CancelScheduled { sequences } => {

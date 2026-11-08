@@ -1,11 +1,12 @@
 //! Normalized send fields derived from original message content.
 //!
-//! The derivation reproduces what AMQP ingress computes for a legacy send:
-//! message and correlation identifiers as text, the session from `group-id`,
+//! The derivation preserves legacy duplicate identities and selects legacy or
+//! Azure SDK text for filter IDs explicitly from the content variant. It derives
+//! the session from `group-id`,
 //! the header TTL, the scheduled-enqueue annotation, and the filter projection.
 //! Filterable application-property values use the canonical AMQP encoding that
-//! correlation rule values are compared with, so moving the derivation into the
-//! state machine does not change which subscriptions a message reaches.
+//! correlation rule values are compared with. Legacy intent keeps its original
+//! rule-matching behavior during replay.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -119,6 +120,7 @@ pub(crate) fn effective_len(original: &[u8], overlay: &[OverlayProperty]) -> usi
 pub(crate) fn effective_projection(
     original: &[u8],
     overlay: &[OverlayProperty],
+    text_ids: bool,
 ) -> Result<FilterProperties, MessageContentError> {
     let content = decode_content(original, CONTENT_LIMITS).map_err(MessageContentError::Amqp)?;
     let values = overlay
@@ -137,6 +139,7 @@ pub(crate) fn effective_projection(
             .map(|(property, value)| (property.name.as_str(), value))
             .collect(),
         &mut budget,
+        text_ids,
     )
 }
 
@@ -153,7 +156,7 @@ enum EncodeError {
 
 impl MessageContent {
     /// The send input a single content send stands for. AMQP content keeps its
-    /// original bytes as the envelope and an empty body, because a V2 record
+    /// original bytes as the envelope and an empty body, because a V2/V3 record
     /// stores the content once; raw content keeps its bytes as the body.
     pub fn derive(&self) -> Result<MessageInput, MessageContentError> {
         let mut budget = self
@@ -184,7 +187,7 @@ impl MessageContent {
     /// Original byte length this content contributes to the per-command budget.
     fn original_len(&self) -> usize {
         match self {
-            Self::Amqp(bytes) => bytes.len(),
+            Self::Amqp(bytes) | Self::AmqpTextIds(bytes) => bytes.len(),
             Self::Raw(raw) => raw.body.len(),
         }
     }
@@ -200,7 +203,8 @@ impl MessageContent {
                 scheduled_enqueue_at: raw.scheduled_enqueue_at,
                 envelope: None,
             }),
-            Self::Amqp(bytes) => derive_amqp(bytes, remaining),
+            Self::Amqp(bytes) => derive_amqp(bytes, remaining, false),
+            Self::AmqpTextIds(bytes) => derive_amqp(bytes, remaining, true),
         }
     }
 }
@@ -208,6 +212,7 @@ impl MessageContent {
 fn derive_amqp(
     bytes: &[u8],
     remaining_total: &mut usize,
+    text_ids: bool,
 ) -> Result<MessageInput, MessageContentError> {
     let content = decode_content(bytes, CONTENT_LIMITS).map_err(MessageContentError::Amqp)?;
     let properties = content.properties.as_ref();
@@ -217,10 +222,15 @@ fn derive_amqp(
         .transpose()
         .map_err(|_| MessageContentError::InvalidSessionId)?;
     let scheduled_enqueue_at = scheduled_enqueue_at(content.message_annotations.as_deref())?;
-    let projection = project(&content, Vec::new(), remaining_total)?;
+    let projection = project(&content, Vec::new(), remaining_total, text_ids)?;
 
     Ok(MessageInput {
-        message_id: projection.message_id.clone().unwrap_or_default(),
+        // This is the durable duplicate-detection identity, not filter text.
+        // Changing it would invalidate retained history and cross-type aliases.
+        message_id: properties
+            .and_then(|properties| value(&properties.message_id))
+            .map(message_id_text)
+            .unwrap_or_default(),
         body: Vec::new(),
         time_to_live_millis: content
             .header
@@ -241,6 +251,7 @@ fn project<'a>(
     content: &'a Content,
     overlay: Vec<(&'a str, &'a Value)>,
     remaining_total: &mut usize,
+    text_ids: bool,
 ) -> Result<FilterProperties, MessageContentError> {
     let properties = content.properties.as_ref();
     // Ingress collapses duplicate application properties to the last value
@@ -285,13 +296,20 @@ fn project<'a>(
     let text = |field: Option<&Field<message_content::Text>>| {
         field.and_then(value).map(|text| text.text.clone())
     };
+    let id = |id: &MessageId| {
+        if text_ids {
+            azure_message_id_text(id)
+        } else {
+            message_id_text(id)
+        }
+    };
     Ok(FilterProperties {
         correlation_id: properties
             .and_then(|properties| value(&properties.correlation_id))
-            .map(message_id_text),
+            .map(id),
         message_id: properties
             .and_then(|properties| value(&properties.message_id))
-            .map(message_id_text),
+            .map(id),
         to: text(properties.map(|properties| &properties.to)),
         reply_to: text(properties.map(|properties| &properties.reply_to)),
         subject: text(properties.map(|properties| &properties.subject)),
@@ -339,6 +357,32 @@ fn message_id_text(message_id: &MessageId) -> String {
             .bytes
             .iter()
             .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    }
+}
+
+/// Azure AMQP SDK MessageId.ToString(): GUID D format, invariant decimal,
+/// uppercase hexadecimal binary without separators, and unchanged strings.
+/// This is filter text only; the original typed AMQP identifier is retained.
+fn azure_message_id_text(message_id: &MessageId) -> String {
+    match message_id {
+        MessageId::String(text) => text.text.clone(),
+        MessageId::ULong(value) => value.to_string(),
+        MessageId::Uuid(bytes) => {
+            let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+            format!(
+                "{}-{}-{}-{}-{}",
+                &hex[..8],
+                &hex[8..12],
+                &hex[12..16],
+                &hex[16..20],
+                &hex[20..]
+            )
+        }
+        MessageId::Binary(binary) => binary
+            .bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
             .collect(),
     }
 }

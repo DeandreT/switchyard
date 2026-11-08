@@ -149,7 +149,7 @@ fn scheduled_message(entry: &Value, index: usize) -> Result<MessageContent, Stri
     })?;
     // The cross-checks use the derivation the state machine applies, so the
     // request is checked against exactly the fields the stored record gets.
-    let content = MessageContent::Amqp(encoded.to_vec());
+    let content = MessageContent::AmqpTextIds(encoded.to_vec());
     let incoming = content
         .derive()
         .map_err(|error| format!("messages[{index}].message is invalid: {error}"))?;
@@ -161,7 +161,13 @@ fn scheduled_message(entry: &Value, index: usize) -> Result<MessageContent, Stri
 
     let message_id =
         string_entry(entry, MESSAGE_ID, index, true)?.expect("a required string entry is present");
-    if message_id != incoming.message_id {
+    if message_id
+        != incoming
+            .envelope
+            .as_ref()
+            .and_then(|envelope| envelope.filter_properties().message_id.as_deref())
+            .unwrap_or_default()
+    {
         return Err(format!(
             "messages[{index}].message-id must match the encoded AMQP message-id"
         ));
@@ -327,6 +333,34 @@ mod tests {
         Value::Map(entry)
     }
 
+    #[test]
+    fn schedule_cross_checks_filter_text_not_the_duplicate_identity() {
+        for (id, expected) in [
+            (Some(MessageId::String("literal".into())), "literal"),
+            (Some(MessageId::Ulong(u64::MAX)), "18446744073709551615"),
+            (
+                Some(MessageId::Uuid(serde_amqp::primitives::Uuid::from(
+                    [0xab; 16],
+                ))),
+                "abababab-abab-abab-abab-abababababab",
+            ),
+            (
+                Some(MessageId::Binary(vec![0, 0xab, 0xff].into())),
+                "00ABFF",
+            ),
+            (None, ""),
+        ] {
+            let mut message = decode_message(&encoded("source", 12_000)).unwrap();
+            message.properties.as_mut().unwrap().message_id = id;
+            let bytes = encode_message(&message).unwrap();
+            let content = scheduled_message(&entry(expected, bytes.clone()), 0).unwrap();
+            assert_eq!(content, MessageContent::AmqpTextIds(bytes));
+            assert!(
+                scheduled_message(&entry("wrong", encode_message(&message).unwrap()), 0).is_err()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn schedule_decodes_complete_messages_and_returns_long_sequences() {
         let broker = RecordingBroker::returning(CommandOutcome::BatchSent {
@@ -369,8 +403,8 @@ mod tests {
         assert_eq!(
             messages,
             &[
-                MessageContent::Amqp(encoded("one", 12_000)),
-                MessageContent::Amqp(encoded("two", 13_000))
+                MessageContent::AmqpTextIds(encoded("one", 12_000)),
+                MessageContent::AmqpTextIds(encoded("two", 13_000))
             ]
         );
         let derived = MessageContent::derive_batch(messages).expect("the batch derives");

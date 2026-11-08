@@ -160,7 +160,7 @@ pub struct MessageEnvelope {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct EnvelopeMetadata {
     filter_properties: FilterProperties,
-    /// Copy-local property values over the original bytes. Only V2 message
+    /// Copy-local property values over the original bytes. Only V2/V3 message
     /// records carry them; commands never do, and durable proposals refuse
     /// them, so the ordinary command serde shape omits them.
     overlay: Vec<OverlayProperty>,
@@ -258,7 +258,7 @@ impl From<Vec<u8>> for MessageEnvelope {
 }
 
 /// Stored format of a message record; see [`codec::message`]. Legacy sends
-/// write V1 and content sends write V2; a rewrite keeps the format a record
+/// write V1, legacy content writes V2 and Azure-text content writes V3; a rewrite keeps the format a record
 /// was read with, except that a property patch converts V1 to V2.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MessageRecordFormat {
@@ -267,6 +267,9 @@ pub enum MessageRecordFormat {
     /// Raw bytes, or AMQP content without a duplicated body: a V2 record with
     /// an envelope keeps `body` empty and readers use the envelope instead.
     V2,
+    /// V2 content layout with Azure-text filter IDs. The distinct version
+    /// prevents older readers from silently accepting the new semantics.
+    V3,
 }
 
 /// Stored only through [`codec::message`], never the generic value codec.
@@ -413,9 +416,9 @@ mod tests {
     #[test]
     fn a_newer_message_format_is_rejected() {
         assert_eq!(
-            MessageRecord::decode(&[codec::message::VALUE_FORMAT_V2 + 1, 0]),
+            MessageRecord::decode(&[codec::message::VALUE_FORMAT_V3 + 1, 0]),
             Err(CodecError::UnsupportedVersion {
-                version: codec::message::VALUE_FORMAT_V2 + 1,
+                version: codec::message::VALUE_FORMAT_V3 + 1,
             })
         );
     }

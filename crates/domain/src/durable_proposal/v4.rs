@@ -208,6 +208,7 @@ impl CopyBudget {
     fn content(&mut self, value: &MessageContent) -> Result<Content, Error> {
         Ok(match value {
             MessageContent::Amqp(bytes) => Content::Amqp(self.bytes(bytes)?),
+            MessageContent::AmqpTextIds(_) => return Err(Error::UnsupportedCommandVersion(4)),
             MessageContent::Raw(raw) => Content::Raw {
                 message_id: self.text(&raw.message_id)?,
                 body: self.bytes(&raw.body)?,

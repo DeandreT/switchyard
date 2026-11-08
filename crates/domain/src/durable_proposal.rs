@@ -1,6 +1,6 @@
 //! A frozen persistence envelope, not a client authentication or grant format.
 //!
-//! V1 through V8 carry intent, including intent the state machine may refuse.
+//! V1 through V9 carry intent, including intent the state machine may refuse.
 //! Decoding does not consult the catalog, acquire authority, apply a command, or
 //! parse message content.
 //! The byte ceiling bounds encoded input/output and copied variable data, not
@@ -18,6 +18,7 @@ mod v5;
 mod v6;
 mod v7;
 mod v8;
+mod v9;
 
 pub const MAX_DURABLE_PROPOSAL_BYTES: usize = 1024 * 1024;
 const HEADER_BYTES: usize = 12;
@@ -79,9 +80,12 @@ impl DurableProposal {
     /// Only finite queue creation and queue updates naming capacity use V7.
     /// Only subscription creation that discards filter-error copies and
     /// subscription updates naming that setting use V8.
+    /// Azure-text-ID sends require V9.
     /// No proposal format uses the ordinary Command serde shape.
     pub fn encode(&self) -> Result<Vec<u8>, DurableProposalError> {
-        if v8::carries(&self.command.kind) {
+        if v9::carries(&self.command.kind) {
+            encode_version(&v9::Proposal::capture(self)?, 9)
+        } else if v8::carries(&self.command.kind) {
             encode_version(&v8::Proposal::capture(self)?, 8)
         } else if v7::carries(&self.command.kind) {
             encode_version(&v7::Proposal::capture(self)?, 7)
@@ -110,7 +114,7 @@ impl DurableProposal {
             return Err(DurableProposalError::Malformed);
         }
         let version = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        if !matches!(version, 1..=8) {
+        if !matches!(version, 1..=9) {
             return Err(DurableProposalError::UnsupportedVersion(version));
         }
         let length = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
@@ -131,8 +135,10 @@ impl DurableProposal {
             decode_version::<v6::Proposal>(bytes, version)?.restore()
         } else if version == 7 {
             decode_version::<v7::Proposal>(bytes, version)?.restore()
-        } else {
+        } else if version == 8 {
             decode_version::<v8::Proposal>(bytes, version)?.restore()
+        } else {
+            decode_version::<v9::Proposal>(bytes, version)?.restore()
         }
     }
 }

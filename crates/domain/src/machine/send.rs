@@ -37,9 +37,13 @@ impl<'a> From<&'a MessageInput> for SendInput<'a> {
 
 impl<'a> SendInput<'a> {
     /// A send derived from original content, stored as a V2 record.
-    pub(super) fn content(input: &'a MessageInput) -> Self {
+    pub(super) fn content(input: &'a MessageInput, content: &crate::MessageContent) -> Self {
         Self {
-            format: MessageRecordFormat::V2,
+            format: if matches!(content, crate::MessageContent::AmqpTextIds(_)) {
+                MessageRecordFormat::V3
+            } else {
+                MessageRecordFormat::V2
+            },
             ..Self::from(input)
         }
     }

@@ -317,7 +317,7 @@ fn v2_goldens_round_trip_exactly() -> TestResult {
 #[test]
 fn malformed_and_unrepresentable_records_are_refused() {
     assert_eq!(MessageRecord::decode(&[]), Err(CodecError::EmptyEnvelope));
-    for version in [0, 3, 255] {
+    for version in [0, 4, 255] {
         assert_eq!(
             MessageRecord::decode(&[version, 0]),
             Err(CodecError::UnsupportedVersion { version })

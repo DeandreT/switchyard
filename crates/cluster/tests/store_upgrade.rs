@@ -132,6 +132,41 @@ fn assert_upgraded(directory: &Path, rows: &[(Key, Value)]) {
 }
 
 #[test]
+fn v3_id_projection_rows_are_preflighted_without_rewriting_bytes() {
+    let directory = TempDir::new().unwrap();
+    // Synthetic marker downgrade exercises the shared upgrade preflight; it
+    // does not assert that an old writer could have produced a V3 record.
+    let rows = legacy(directory.path(), |store| {
+        let machine = StateMachine::new(store.clone());
+        machine
+            .apply(&command(
+                0,
+                CommandKind::CreateQueue {
+                    config: QueueConfig::default(),
+                },
+            ))
+            .unwrap();
+        let mut bytes = vec![0, 0x53, 0x73, 0xc0, 18, 1, 0x98];
+        bytes.extend(0_u8..16);
+        for content in [
+            domain::MessageContent::Amqp(bytes.clone()),
+            domain::MessageContent::AmqpTextIds(bytes),
+        ] {
+            machine
+                .apply(&command(1, CommandKind::SendContent { content }))
+                .unwrap();
+        }
+    });
+    let versions: Vec<_> = rows
+        .iter()
+        .filter(|(key, _)| key[0] == 3)
+        .map(|(_, value)| value[0])
+        .collect();
+    assert_eq!(versions, vec![2, 3]);
+    assert_upgraded(directory.path(), &rows);
+}
+
+#[test]
 fn empty_and_populated_unindexed_stores_upgrade_without_adoption() {
     let directory = TempDir::new().unwrap();
     let rows = legacy(directory.path(), |_| {});

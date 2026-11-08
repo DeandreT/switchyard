@@ -317,8 +317,8 @@ fn assert_stored(actor: &Actor, count: u64) {
             .unwrap()
             .unwrap();
         assert_eq!(record.message_id, format!("ingress-{index}"));
-        // Ingress sends original content: the V2 record keeps it only once.
-        assert_eq!(record.format, MessageRecordFormat::V2);
+        // Ingress sends original content: the V3 record keeps it only once.
+        assert_eq!(record.format, MessageRecordFormat::V3);
         assert!(record.body.is_empty());
         let stored = decode_stored_message(record.envelope.as_ref().unwrap().as_bytes()).unwrap();
         assert_eq!(

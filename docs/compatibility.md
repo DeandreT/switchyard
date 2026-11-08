@@ -135,7 +135,7 @@ the attach response.
 | Scheduled topics | Children/rules snapshot at activation: later subscriptions may receive older publications. All-scheduled sends do not prove topology early. |
 | SQL filter errors | Azure dead-letters a message whose subscription filter throws by default; Switchyard's specific behavior is its own choice, not verified against Azure. When no rule of a subscription matches and a SQL rule fails to evaluate (type mismatch, unsupported or ambiguous property, overflow, budget), the subscription gets one dead-lettered copy with reason `FilterException` and description `rule <name>: <fixed error text>` for the first failing rule in name order. Any matching rule still delivers despite a failing sibling. Ordinary, batch and scheduled fanout behave alike. |
 | Filter-error discard | Subscriptions carry `dead_lettering_on_filter_evaluation_exceptions` (Azure `DeadLetteringOnFilterEvaluationExceptions`), defaulting on as in Azure. Off, the copy a filter error would dead-letter is discarded: nothing is written for that subscription and its DLQ is not reported as populated. It is set at creation and changed by subscription profile updates, independently of `dead_lettering_on_message_expiration`; a change governs later fanout and activations only. Domain-only: administration and AMQP still create subscriptions with the default. |
-| SQL identifiers | `sys.MessageId`/`sys.CorrelationId` use the stored projection's text form for non-string AMQP identifiers: ulong as decimal, binary as lowercase hex, UUID as `Uuid([..])` byte-list text. SQL comparisons against Azure's GUID text form therefore do not match UUID identifiers. |
+| Filter identifiers | New AMQP sends expose message/correlation IDs to SQL and correlation filters as unchanged strings, invariant decimal ulong, lowercase hyphenated UUID or uppercase hexadecimal binary. Retained V1/V2 projections keep legacy UUID debug text and lowercase binary text; duplicate-detection identities remain legacy regardless of projection version. These forms follow Azure SDK source, not live Azure filter-service verification; see the record-format contract below. |
 | SQL rule quota | At most 2,000 SQL rules across all subscriptions of a topic (Azure's quota); the next SQL rule refuses with `SqlRuleLimitExceeded`. True/false/correlation rules keep only the per-subscription limit. |
 | Topic sequences | Each offered publication and selected due placeholder consumes one topic-owned slot, even with no matching subscriptions; fanout copies consume none. MAX-1 is the last fresh slot and MAX refuses with nonretryable `SequenceNumberExhausted`. Crossing batches or bounded activation sets retain every original record, counter and Clock without partial fanout. Idle activation and cancellation need no slot. |
 | Browse/deferred | Positive signed peek count, reply cap 250, scan to cap/end; deferred retrieval atomically accepts at most 32 sequences in caller order. |
@@ -223,7 +223,7 @@ See [topic integrity](lifecycle.md#topic-integrity) for exact bounds and exclusi
 Durable proposals preserve legacy-representable commands' private V1 bytes and
 checkpoint identities. Topic/subscription profile updates use unchanged private V2
 DTOs. Only nonlegacy topic creation uses private V3, including invalid new settings
-that must survive for deterministic refusal. Content sends use private V4, carrying
+that must survive for deterministic refusal. Legacy content sends use private V4, carrying
 each message's original AMQP bytes once, or raw bytes with explicit normalized fields;
 decoding never parses or polices that content. Abandon, defer and dead-letter with a
 sparse property patch also use V4; their legacy replacement-envelope forms keep exact
@@ -235,8 +235,12 @@ creation and queue updates naming `capacity` use private V7; non-finite creation
 updates that omit capacity keep their V1/V5 bytes. Subscription creation that discards
 filter-error copies, and subscription updates naming that setting, use private V8;
 subscription intent without it keeps its V1/V2/V5 bytes. All other forms keep their V1/V2
-bytes. New readers accept V1 through V8; older readers refuse unsupported
-proposal versions. AMQP ingress sends every message as V4: a transfer as `SendContent`, and a
+bytes. Azure-text-ID content sends use private V9, composing an exact canonical
+V4 send envelope with one 0/1 mode byte per child; at least one child must select new
+AMQP projection semantics. Nested envelopes must be V4, never recursively V9. Decoding
+does not parse AMQP. New readers accept exactly V1 through V9; older
+readers refuse unsupported proposal versions. AMQP ingress sends every message as V9:
+a transfer as `SendContent`, and a
 Service Bus batch or scheduled-message request as `SendContentBatch` with each child's
 original bytes. Nothing new emits V1 sends; historical V1 sends still decode and replay
 unchanged. Link and management dispositions that change properties emit the V4 patch
@@ -277,19 +281,55 @@ encoding, so their message records are unchanged.
 See [profile lifecycle](lifecycle.md#profile-updates).
 
 Message records use a dedicated frozen codec. Legacy sends write V1, byte for byte
-the former generic encoding; content sends write V2: raw bytes, or original AMQP bytes
+the former generic encoding; legacy content sends write V2: raw bytes, or original AMQP bytes
 with a filter projection and a sparse property overlay (unique names in first-insertion
 order; each value one encoded AMQP value, where null is a value) and no duplicated body.
+`AmqpTextIds` content writes V3, using the frozen V2 content layout with explicitly
+different system-ID projection semantics. Old message-record readers refuse V3 at the
+version byte instead of silently treating it as V2. Raw content still writes V2.
 Rewrites, topic copies, scheduled activation and dead-letter moves keep the version a
 record was read with; only a property patch converts V1 to V2. Durable proposals
-refuse envelopes carrying overlays. Runtime V1 reads keep tolerating trailing bytes; V2 framing
-is exact, and snapshot validation requires canonical rows of either version.
+refuse envelopes carrying overlays. Runtime V1 reads keep tolerating trailing bytes;
+V2/V3 framing is exact, and snapshot validation requires canonical rows of all versions.
+Store-upgrade preflight, snapshot capture/restore/compaction and committed replay use
+the same versioned record/proposal readers. No open, preflight or upgrade rewrites old
+record bytes. This is a per-record/per-proposal refusal fence, not a whole-store
+downgrade barrier: an older binary may open the outer format-3 store before encountering
+an unsupported row. Rollback needs compatible readers or a coherent pre-feature
+state/journal/checkpoint backup; stripping version markers is not a downgrade.
+
+For new `AmqpTextIds` sends, SQL `sys.MessageId`/`sys.CorrelationId` and correlation
+filters see strings unchanged, ulong as invariant unsigned decimal, UUID as lowercase
+hyphenated `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` in AMQP network byte order, and binary
+as **uppercase hexadecimal without separators** (two digits per byte; empty binary is
+the empty string). These forms follow Azure SDK source:
+[MessageId.ToString](https://github.com/Azure/azure-amqp/blob/b690d6d6e15c3ee8844b570d65e7e1af657a0f55/src/Framing/MessageId.cs),
+[binary GetString](https://github.com/Azure/azure-amqp/blob/b690d6d6e15c3ee8844b570d65e7e1af657a0f55/src/AmqpExtensions.cs),
+[UUID decoding](https://github.com/Azure/azure-amqp/blob/b690d6d6e15c3ee8844b570d65e7e1af657a0f55/src/Encoding/AmqpBitConverter.cs),
+[Guid.ToString](https://learn.microsoft.com/en-us/dotnet/api/system.guid.tostring),
+and the Service Bus SDK's
+[annotated-message converter](https://github.com/Azure/azure-sdk-for-net/blob/6a909a735c23fa8e0f73e6bf3e1adf8cd7478611/sdk/core/Azure.Core.Amqp/src/Shared/AmqpAnnotatedMessageConverter.cs).
+This is source-based compatibility, not a claim of live Azure filter-service testing.
+The retained canonical AMQP bytes and typed outbound IDs never change.
+
+V1/V2 records and replayed V4 content keep their historical projection: UUID debug
+text `Uuid([..])`, lowercase hexadecimal binary, decimal ulong and unchanged strings.
+No stored string is reinterpreted as a UUID, including a literal string exactly equal
+to that debug text or to a hyphenated UUID. Property patches re-derive system IDs
+from the original typed bytes, using legacy semantics for V1/V2 and Azure-text
+semantics for V3; historical V4 replay therefore keeps its original behavior. A
+legacy whole-envelope replacement on
+a V3 copy derives that copy's new projection from the replacement's typed bytes.
+Duplicate detection deliberately keeps its existing identity: UUID debug text and
+lowercase hexadecimal binary, regardless of filter-projection version. Existing
+cross-type aliases therefore remain (a UUID and its literal debug-text string collide;
+binary and its lowercase-hex string collide), while an equivalent-looking hyphenated
+UUID string is distinct. This does not implement Azure's typed duplicate identity.
 
 A content send parses AMQP content when it applies, under the fixed content-safety
 profile (16 MiB, depth 128, 4,194,304 nodes, 268,435,456 work units), and derives the
-message ID, session, TTL, scheduled enqueue time and filter projection exactly as AMQP
-ingress derived them for a legacy send, so rule matching and duplicate-detection
-identities are unchanged across the switch. Ingress still applies the received-message
+duplicate identity, session, TTL, scheduled enqueue time and version-selected filter
+projection. Ingress still applies the received-message
 decode to each message or batch child before sending. Invalid content refuses
 deterministically, and one invalid child refuses its whole batch: transfers reject with
 `amqp:invalid-field`. Scheduling requests check each message, including its message-id
@@ -310,11 +350,11 @@ single `SendContent` uses the same formula over its one child.
 
 Some array shapes are refused because they are not sendable. Arrays whose elements are
 compound or described values are refused, which legacy AMQP ingress also refuses. Two
-further shapes are V4-only refusals, which historical V1 sends stored as their old bytes:
+further shapes are content-send refusals, which historical V1 sends stored as their old bytes:
 an array of empty lists (`list0` elements), which the canonical encoder has no spec
 rendering for, and an array of strings or symbols containing non-ASCII text, whose stored
 length would disagree with the text and not be decodable AMQP. Because ingress now sends
-V4, every AMQP send path refuses these shapes for new writes; projections that
+content intent, every AMQP send path refuses these shapes for new writes; projections that
 historical V1 sends already stored are unchanged. Property-modifying dispositions send
 patches whose values are checked under the same profile. Each derived value is
 additionally re-decoded under the profile as a safety net and refused if it does not

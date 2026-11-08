@@ -1,7 +1,8 @@
 //! Frozen message records. V1 reproduces exactly the bytes the generic value
 //! codec wrote for `MessageRecord`. V2 stores either raw bytes or the original
 //! AMQP message with a copy-local property overlay, without a duplicated body.
-//! Content sends produce V2; every rewrite keeps the record's source format,
+//! V3 uses the frozen V2 layout with Azure-text filter IDs. Legacy content sends
+//! produce V2, Azure-text content produces V3; rewrites preserve the version,
 //! except a property patch, which converts a V1 record to V2.
 
 use std::{borrow::Cow, collections::BTreeSet};
@@ -17,10 +18,12 @@ use crate::{
 use super::{CodecError, VALUE_FORMAT_V1};
 
 pub const VALUE_FORMAT_V2: u8 = 2;
+pub const VALUE_FORMAT_V3: u8 = 3;
 
 // Stored DTOs are frozen independently of the public types' serde: do not
-// reorder, extend or reuse them for a later version. `Cow` borrows the record
-// while encoding and owns the data after decoding.
+// reorder or extend them. V3 deliberately shares the exact V2 payload layout;
+// its version fences projection semantics only. `Cow` borrows the record while
+// encoding and owns the data after decoding.
 #[derive(Serialize, Deserialize)]
 struct RecordV1<'a> {
     sequence: u64,
@@ -155,7 +158,7 @@ pub fn encode(record: &MessageRecord) -> Result<Vec<u8>, CodecError> {
                 })
                 .transpose()?,
         }),
-        MessageRecordFormat::V2 => {
+        MessageRecordFormat::V2 | MessageRecordFormat::V3 => {
             let content = match &record.envelope {
                 None => Content::Raw(Cow::Borrowed(&record.body)),
                 Some(envelope) => {
@@ -169,7 +172,12 @@ pub fn encode(record: &MessageRecord) -> Result<Vec<u8>, CodecError> {
                     }
                 }
             };
-            let mut bytes = vec![VALUE_FORMAT_V2];
+            // V3 deliberately keeps the frozen V2 content layout, but fences
+            // its changed projection semantics from every V1/V2-only reader.
+            let mut bytes = vec![match record.format {
+                MessageRecordFormat::V3 => VALUE_FORMAT_V3,
+                _ => VALUE_FORMAT_V2,
+            }];
             bytes.extend(
                 postcard::to_stdvec(&RecordV2 {
                     sequence: record.sequence.as_u64(),
@@ -194,10 +202,10 @@ pub fn encode(record: &MessageRecord) -> Result<Vec<u8>, CodecError> {
 }
 
 /// Runtime reads keep the generic codec's tolerance of bytes after a V1
-/// record. V2 framing is exact.
+/// record. V2/V3 framing is exact.
 pub fn decode(bytes: &[u8]) -> Result<MessageRecord, CodecError> {
     let (record, unused) = read(bytes)?;
-    if record.format == MessageRecordFormat::V2 && !unused.is_empty() {
+    if record.format != MessageRecordFormat::V1 && !unused.is_empty() {
         return Err(CodecError::Decode);
     }
     Ok(record)
@@ -249,7 +257,7 @@ fn read(bytes: &[u8]) -> Result<(MessageRecord, &[u8]), CodecError> {
             };
             Ok((record, unused))
         }
-        VALUE_FORMAT_V2 => {
+        VALUE_FORMAT_V2 | VALUE_FORMAT_V3 => {
             let (stored, unused) =
                 postcard::take_from_bytes::<RecordV2>(payload).map_err(|_| CodecError::Decode)?;
             let (body, envelope) = match stored.content {
@@ -279,7 +287,11 @@ fn read(bytes: &[u8]) -> Result<(MessageRecord, &[u8]), CodecError> {
                 session_id: restore_session(stored.session_id)?,
                 dead_letter: stored.dead_letter.map(DeadLetter::restore),
                 envelope,
-                format: MessageRecordFormat::V2,
+                format: if version == VALUE_FORMAT_V3 {
+                    MessageRecordFormat::V3
+                } else {
+                    MessageRecordFormat::V2
+                },
             };
             Ok((record, unused))
         }
@@ -470,7 +482,11 @@ mod tests {
 
     #[test]
     fn canonical_decoding_keeps_the_version_and_refuses_trailing_bytes() {
-        for format in [MessageRecordFormat::V1, MessageRecordFormat::V2] {
+        for format in [
+            MessageRecordFormat::V1,
+            MessageRecordFormat::V2,
+            MessageRecordFormat::V3,
+        ] {
             let bytes = encode(&record(format)).expect("encodes");
             assert_eq!(decode_canonical(&bytes), Ok(record(format)));
             let mut trailing = bytes.clone();
@@ -485,9 +501,9 @@ mod tests {
             Err(CanonicalError::Codec(CodecError::EmptyEnvelope))
         );
         assert_eq!(
-            decode_canonical(&[3]),
+            decode_canonical(&[4]),
             Err(CanonicalError::Codec(CodecError::UnsupportedVersion {
-                version: 3
+                version: 4
             }))
         );
     }
