@@ -50,6 +50,13 @@ included; omitted, admission is unbounded. `--admission-timeout-secs <seconds>`
 SASL and AMQP Open together; a socket still handshaking at the deadline is
 closed. Plaintext is development-only. These checks do not provide replication.
 
+SIGTERM or SIGINT stops the node in order: the listener stops accepting, open
+connections are retired and closed and their connection, session and link tasks
+joined, then the timer and the broker stop and the store closes. `--shutdown-timeout-secs <seconds>` (default 30) bounds the
+whole sequence; a repeated signal joins it. Within budget the process exits 0;
+past it, the process reports the unfinished stage and exits with status 3
+without acknowledging anything that was not committed.
+
 ## Workspace
 
 | Crates | Responsibility |

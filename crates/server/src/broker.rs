@@ -17,7 +17,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     thread::{self, JoinHandle},
 };
 
@@ -186,25 +186,68 @@ fn makes_deliverable(outcome: &CommandOutcome) -> bool {
 /// onto the same owner.
 #[derive(Clone, Debug)]
 pub struct BrokerHandle {
-    requests: flume::Sender<Request>,
+    requests: Arc<RequestSlot>,
     watchers: Arc<Watchers>,
 }
 
+/// The one request sender every handle shares, emptied when the broker stops.
+///
+/// Flume keeps a buffered request, and the reply sender inside it, for as long
+/// as any request sender lives. If every handle kept its own sender, a caller
+/// whose request was queued behind `Stop` would wait for a reply until the last
+/// handle anywhere in the process dropped. Handles instead borrow a sender only
+/// to queue a request and drop it before waiting. Once the broker empties this
+/// slot and its owner exits, no sender remains, so the channel and the requests
+/// still buffered in it are freed and their callers see
+/// [`SubmitError::BrokerStopped`].
+#[derive(Debug)]
+struct RequestSlot(RwLock<Option<flume::Sender<Request>>>);
+
+impl RequestSlot {
+    fn sender(&self) -> Option<flume::Sender<Request>> {
+        // A poisoned slot reports a stopped broker rather than guessing.
+        self.0.read().ok().and_then(|sender| sender.clone())
+    }
+
+    fn take(&self) -> Option<flume::Sender<Request>> {
+        match self.0.write() {
+            Ok(mut sender) => sender.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        }
+    }
+}
+
 impl BrokerHandle {
+    /// Queues `request`, dropping the borrowed sender before the caller waits
+    /// for its reply; see [`RequestSlot`].
+    async fn enqueue(&self, request: Request) -> Result<(), SubmitError> {
+        let requests = self.requests.sender().ok_or(SubmitError::BrokerStopped)?;
+        requests
+            .send_async(request)
+            .await
+            .map_err(|_| SubmitError::BrokerStopped)
+    }
+
+    fn enqueue_blocking(&self, request: Request) -> Result<(), SubmitError> {
+        let requests = self.requests.sender().ok_or(SubmitError::BrokerStopped)?;
+        requests
+            .send(request)
+            .map_err(|_| SubmitError::BrokerStopped)
+    }
+
     pub(crate) async fn admin_get(
         &self,
         namespace: NamespaceName,
         target: EntityTarget,
     ) -> Result<Option<AdminCatalogEntry>, AdminError> {
         let (reply, result) = flume::bounded(1);
-        self.requests
-            .send_async(Request::AdminGet {
-                namespace,
-                target,
-                reply,
-            })
-            .await
-            .map_err(|_| ServiceError::Backend(SubmitError::BrokerStopped))?;
+        self.enqueue(Request::AdminGet {
+            namespace,
+            target,
+            reply,
+        })
+        .await
+        .map_err(|_| ServiceError::Backend(SubmitError::BrokerStopped))?;
         result
             .recv_async()
             .await
@@ -219,16 +262,15 @@ impl BrokerHandle {
         limit: usize,
     ) -> Result<AdminCatalogPage, AdminError> {
         let (reply, result) = flume::bounded(1);
-        self.requests
-            .send_async(Request::AdminList {
-                namespace,
-                kind,
-                after,
-                limit,
-                reply,
-            })
-            .await
-            .map_err(|_| ServiceError::Backend(SubmitError::BrokerStopped))?;
+        self.enqueue(Request::AdminList {
+            namespace,
+            kind,
+            after,
+            limit,
+            reply,
+        })
+        .await
+        .map_err(|_| ServiceError::Backend(SubmitError::BrokerStopped))?;
         result
             .recv_async()
             .await
@@ -247,14 +289,12 @@ impl BrokerHandle {
         kind: CommandKind,
     ) -> Result<CommandOutcome, SubmitError> {
         let (reply, outcome) = flume::bounded(1);
-        self.requests
-            .send(Request::Apply {
-                namespace,
-                entity,
-                kind: Box::new(kind),
-                reply,
-            })
-            .map_err(|_| SubmitError::BrokerStopped)?;
+        self.enqueue_blocking(Request::Apply {
+            namespace,
+            entity,
+            kind: Box::new(kind),
+            reply,
+        })?;
         outcome
             .recv()
             .map_err(|_| SubmitError::BrokerStopped)?
@@ -269,15 +309,14 @@ impl BrokerHandle {
         kind: CommandKind,
     ) -> Result<CommandOutcome, SubmitError> {
         let (reply, outcome) = flume::bounded(1);
-        self.requests
-            .send_async(Request::Apply {
-                namespace,
-                entity,
-                kind: Box::new(kind),
-                reply,
-            })
-            .await
-            .map_err(|_| SubmitError::BrokerStopped)?;
+        self.enqueue(Request::Apply {
+            namespace,
+            entity,
+            kind: Box::new(kind),
+            reply,
+        })
+        .await
+        .map_err(|_| SubmitError::BrokerStopped)?;
         outcome
             .recv_async()
             .await
@@ -292,13 +331,11 @@ impl BrokerHandle {
         entity: EntityPath,
     ) -> Result<EntityBinding, SubmitError> {
         let (reply, binding) = flume::bounded(1);
-        self.requests
-            .send(Request::Bind {
-                namespace,
-                entity,
-                reply,
-            })
-            .map_err(|_| SubmitError::BrokerStopped)?;
+        self.enqueue_blocking(Request::Bind {
+            namespace,
+            entity,
+            reply,
+        })?;
         binding
             .recv()
             .map_err(|_| SubmitError::BrokerStopped)?
@@ -312,14 +349,13 @@ impl BrokerHandle {
         entity: EntityPath,
     ) -> Result<EntityBinding, SubmitError> {
         let (reply, binding) = flume::bounded(1);
-        self.requests
-            .send_async(Request::Bind {
-                namespace,
-                entity,
-                reply,
-            })
-            .await
-            .map_err(|_| SubmitError::BrokerStopped)?;
+        self.enqueue(Request::Bind {
+            namespace,
+            entity,
+            reply,
+        })
+        .await
+        .map_err(|_| SubmitError::BrokerStopped)?;
         binding
             .recv_async()
             .await
@@ -334,13 +370,11 @@ impl BrokerHandle {
         kind: CommandKind,
     ) -> Result<CommandOutcome, SubmitError> {
         let (reply, outcome) = flume::bounded(1);
-        self.requests
-            .send(Request::ApplyBound {
-                binding,
-                kind: Box::new(kind),
-                reply,
-            })
-            .map_err(|_| SubmitError::BrokerStopped)?;
+        self.enqueue_blocking(Request::ApplyBound {
+            binding,
+            kind: Box::new(kind),
+            reply,
+        })?;
         outcome
             .recv()
             .map_err(|_| SubmitError::BrokerStopped)?
@@ -354,14 +388,13 @@ impl BrokerHandle {
         kind: CommandKind,
     ) -> Result<CommandOutcome, SubmitError> {
         let (reply, outcome) = flume::bounded(1);
-        self.requests
-            .send_async(Request::ApplyBound {
-                binding,
-                kind: Box::new(kind),
-                reply,
-            })
-            .await
-            .map_err(|_| SubmitError::BrokerStopped)?;
+        self.enqueue(Request::ApplyBound {
+            binding,
+            kind: Box::new(kind),
+            reply,
+        })
+        .await
+        .map_err(|_| SubmitError::BrokerStopped)?;
         outcome
             .recv_async()
             .await
@@ -372,9 +405,7 @@ impl BrokerHandle {
     /// The highest timestamp the machine has applied.
     pub fn last_applied_blocking(&self) -> Result<Timestamp, SubmitError> {
         let (reply, applied) = flume::bounded(1);
-        self.requests
-            .send(Request::LastApplied { reply })
-            .map_err(|_| SubmitError::BrokerStopped)?;
+        self.enqueue_blocking(Request::LastApplied { reply })?;
         applied
             .recv()
             .map_err(|_| SubmitError::BrokerStopped)?
@@ -396,13 +427,11 @@ impl BrokerHandle {
         limit: usize,
     ) -> Result<Vec<(NamespaceName, EntityPath)>, SubmitError> {
         let (reply, queues) = flume::bounded(1);
-        self.requests
-            .send(Request::ListQueues {
-                after: after.cloned(),
-                limit,
-                reply,
-            })
-            .map_err(|_| SubmitError::BrokerStopped)?;
+        self.enqueue_blocking(Request::ListQueues {
+            after: after.cloned(),
+            limit,
+            reply,
+        })?;
         queues
             .recv()
             .map_err(|_| SubmitError::BrokerStopped)?
@@ -416,13 +445,11 @@ impl BrokerHandle {
         limit: usize,
     ) -> Result<Vec<(NamespaceName, EntityPath)>, SubmitError> {
         let (reply, topics) = flume::bounded(1);
-        self.requests
-            .send(Request::ListTopics {
-                after: after.cloned(),
-                limit,
-                reply,
-            })
-            .map_err(|_| SubmitError::BrokerStopped)?;
+        self.enqueue_blocking(Request::ListTopics {
+            after: after.cloned(),
+            limit,
+            reply,
+        })?;
         topics
             .recv()
             .map_err(|_| SubmitError::BrokerStopped)?
@@ -564,7 +591,10 @@ impl Broker {
             .expect("the broker owner thread can be spawned");
 
         Self {
-            handle: BrokerHandle { requests, watchers },
+            handle: BrokerHandle {
+                requests: Arc::new(RequestSlot(RwLock::new(Some(requests)))),
+                watchers,
+            },
             owner: Some(owner),
         }
     }
@@ -578,13 +608,18 @@ impl Drop for Broker {
     /// Stops the owner even if handles are still outstanding, then waits for the
     /// command it was applying to finish.
     ///
-    /// Queueing the stop rather than closing the channel is what makes this
-    /// terminate: dropping this end alone would leave every clone keeping the
-    /// thread alive and the join would never return. Once the owner breaks it
-    /// drops the receiver, and outstanding handles start reporting
-    /// [`SubmitError::BrokerStopped`].
+    /// Emptying the shared slot first means no handle queues anything new:
+    /// callers after this point get [`SubmitError::BrokerStopped`] at once.
+    /// Every request queued ahead of `Stop` still applies and is answered.
+    /// Queueing the stop rather than only closing the channel is what makes
+    /// this terminate while a sender is mid-send. Once the owner breaks it
+    /// drops the receiver; the last borrowed sender then goes with its send, so
+    /// a request that slipped in behind `Stop` is freed and its caller released
+    /// rather than left waiting on outstanding handles.
     fn drop(&mut self) {
-        let _ = self.handle.requests.send(Request::Stop);
+        if let Some(requests) = self.handle.requests.take() {
+            let _ = requests.send(Request::Stop);
+        }
         if let Some(owner) = self.owner.take() {
             let _ = owner.join();
         }
@@ -986,8 +1021,7 @@ mod tests {
     ) -> flume::Receiver<Result<CommandOutcome, ProposeError>> {
         let (reply, result) = flume::bounded(1);
         handle
-            .requests
-            .send(Request::Apply {
+            .enqueue_blocking(Request::Apply {
                 namespace: names().0,
                 entity: EntityPath::new(entity).unwrap(),
                 kind: Box::new(CommandKind::CreateQueue {
@@ -1018,6 +1052,8 @@ mod tests {
             let (reply, _cancelled) = flume::bounded(1);
             handle
                 .requests
+                .sender()
+                .unwrap()
                 .try_send(Request::Bind {
                     namespace: names().0,
                     entity: names().1,
@@ -1026,7 +1062,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            handle.requests.len(),
+            handle.requests.sender().unwrap().len(),
             1_024,
             "the production queue bound is unchanged"
         );
@@ -1044,7 +1080,7 @@ mod tests {
             pending.as_mut().poll(&mut Context::from_waker(waker)),
             Poll::Pending
         ));
-        assert_eq!(handle.requests.len(), COMMAND_QUEUE_DEPTH);
+        assert_eq!(handle.requests.sender().unwrap().len(), COMMAND_QUEUE_DEPTH);
         drop(pending);
         resume.send(()).unwrap();
         assert_eq!(first.recv().unwrap().unwrap(), CommandOutcome::QueueCreated);
@@ -1079,7 +1115,12 @@ mod tests {
         let first = enqueue_queue(&handle, "first");
         entered.recv_timeout(crate::test_deadline::WAIT).unwrap();
         let ahead = enqueue_queue(&handle, "ahead");
-        handle.requests.send(Request::Stop).unwrap();
+        handle
+            .requests
+            .sender()
+            .unwrap()
+            .send(Request::Stop)
+            .unwrap();
         let behind = enqueue_queue(&handle, "behind");
         resume.send(()).unwrap();
         let timeout = crate::test_deadline::WAIT;
@@ -1097,12 +1138,14 @@ mod tests {
             handle.last_applied_blocking(),
             Err(SubmitError::BrokerStopped)
         );
-        // Flume retains buffered requests until every channel handle drops.
-        drop(handle);
+        // Flume frees a buffered request only once no sender remains. Handles
+        // hold none of their own, so the waiter behind Stop is released while
+        // `handle` is still alive rather than when the last handle drops.
         assert!(matches!(
             behind.recv_timeout(timeout),
             Err(flume::RecvTimeoutError::Disconnected)
         ));
+        drop(handle);
         let machine = StateMachine::new(store.clone());
         assert!(
             machine
@@ -1136,6 +1179,83 @@ mod tests {
     #[tokio::test]
     async fn fjall_full_channel_cancellation_does_not_admit_create() {
         full_channel_cancellation(testkit::DurableProvider::temporary().unwrap()).await;
+    }
+
+    /// An async caller whose request queued behind `Stop` is answered
+    /// `BrokerStopped` once the owner exits, even though other handles, the
+    /// ones a listener or timer would hold, are still alive.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_async_waiter_behind_stop_is_released_while_handles_live() {
+        let store = MemoryStore::default();
+        let (broker, entered, resume, _) = paused_broker(store.clone());
+        let handle = broker.handle();
+        let retained = broker.handle();
+        let first = enqueue_queue(&handle, "first");
+        entered.recv_timeout(crate::test_deadline::WAIT).unwrap();
+        handle
+            .requests
+            .sender()
+            .unwrap()
+            .send(Request::Stop)
+            .unwrap();
+        let waiter = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .submit(
+                        names().0,
+                        EntityPath::new("behind").unwrap(),
+                        CommandKind::CreateQueue {
+                            config: QueueConfig::default(),
+                        },
+                    )
+                    .await
+            }
+        });
+        let deadline = std::time::Instant::now() + crate::test_deadline::WAIT;
+        while handle.requests.sender().map_or(0, |sender| sender.len()) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the async request never queued behind Stop"
+            );
+            tokio::task::yield_now().await;
+        }
+        resume.send(()).unwrap();
+        tokio::task::spawn_blocking(move || drop(broker))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.recv_timeout(crate::test_deadline::WAIT).unwrap(),
+            Ok(CommandOutcome::QueueCreated),
+            "work admitted ahead of Stop completes"
+        );
+        assert_eq!(
+            tokio::time::timeout(crate::test_deadline::WAIT, waiter)
+                .await
+                .expect("the waiter behind Stop is released")
+                .unwrap(),
+            Err(SubmitError::BrokerStopped)
+        );
+        assert_eq!(
+            retained
+                .submit(
+                    names().0,
+                    EntityPath::new("later").unwrap(),
+                    CommandKind::CreateQueue {
+                        config: QueueConfig::default(),
+                    },
+                )
+                .await,
+            Err(SubmitError::BrokerStopped),
+            "a stopped broker admits nothing new"
+        );
+        let machine = StateMachine::new(store);
+        assert!(
+            machine
+                .admin_queue(&names().0, &EntityPath::new("behind").unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

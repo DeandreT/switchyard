@@ -18,8 +18,8 @@ Pre-alpha: only verified, merged `main` is complete.
 
 ## Next Main Increments
 
-#135/#136/#222/#224/#225 verified; #134 custody audit closed; #7 open. #248 wire bounds Blocked/unassigned.
-#65 owns process shutdown; joins have no Close/latency guarantee.
+#65/#135/#136/#222/#224/#225 verified; #134 custody audit closed; #7 open. #248 wire bounds Blocked/unassigned.
+Process shutdown is ordered and budgeted; joins have no Close/latency guarantee.
 Reference branches are not main evidence; #15 is entity retirement. #255's qualified history audit is closed.
 
 ```mermaid

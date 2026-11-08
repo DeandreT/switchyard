@@ -440,9 +440,12 @@ Session/link ownership covers #132 and
 [#133](https://github.com/DeandreT/switchyard/issues/133). Connection
 [terminal precedence](../crates/protocol-amqp/src/listener/connection_custody.rs)
 keeps raw faults before typed session reports, then connection/family diagnostics.
-[#7](https://github.com/DeandreT/switchyard/issues/7) process shutdown
-remains [roadmap work](roadmap.md#next-main-increments). No aborted-ancestor
-protection, graceful Close acknowledgement or finite broker/cleanup latency.
+Process shutdown ([#65](https://github.com/DeandreT/switchyard/issues/65))
+retires the listener, finishes this owner, joins the timer and then stops the
+broker under one total budget; see the
+[architecture](../ARCHITECTURE.md#process-shutdown). The budget bounds the
+process, not a drain: an expired stage is reported and the process exits with
+status 3. No aborted-ancestor protection or graceful Close acknowledgement.
 
 The [TCP service](../crates/protocol-amqp/src/listener/service.rs) (#224) installs
 the same native Ready connection in custody before grant/authorization/reporting.

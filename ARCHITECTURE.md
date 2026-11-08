@@ -47,9 +47,25 @@ per accepted socket (60 s by default) spans TLS, WebSocket upgrade, SASL and
 Open without resetting per stage; the native accept takes the remaining
 deadline. Expiry drops the handshake, closing the socket, and the original task
 returns `TimedOut` before Open, so no broker work has begun. Full task-family
-ownership and process signals remain planned.
-See [native custody](crates/amqp/src/server/tasks.rs) and the
-[shutdown sequence](docs/roadmap.md#next-main-increments).
+ownership remains planned.
+See [native custody](crates/amqp/src/server/tasks.rs).
+
+### Process Shutdown
+
+SIGTERM and SIGINT start one [shutdown sequence](crates/server/src/shutdown.rs);
+later signals join it. Stages run strictly in order: retire listener admission,
+finish protocol cleanup (join original connection, session, link and settlement
+tasks), stop and join the timer, then stop the broker owner after the requests
+queued ahead of it, which drops the state machine and closes the store. The
+broker outlives every stage that can submit, so begun work commits and answers
+its caller. Stopping the broker empties the one request sender all handles
+share, so later requests fail with `BrokerStopped` and a request queued behind
+the stop is freed with its waiter instead of being held by surviving handles.
+One budget (`--shutdown-timeout-secs`, default 30) spans all stages. On expiry
+the process logs the unfinished stage and exits with status 3 without waiting;
+nothing is settled on the way out, and only committed work was acknowledged. A
+startup that fails after the timer and broker start (such as an occupied listen
+address) stops them under the same budget and keeps its own error and status 1.
 
 Namespace, queue, topic, and subscription names are ASCII case-insensitive in
 typed identifiers, storage, AMQP addresses, and entity-scoped SAS audiences.

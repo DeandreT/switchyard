@@ -2,27 +2,34 @@
 
 use std::{
     fs,
+    io::{self, Write},
     net::SocketAddr,
     num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
-    process::ExitCode,
-    sync::Arc,
-    thread,
+    process::{self, ExitCode},
     time::Duration,
 };
+
+#[cfg(debug_assertions)]
+use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
 use cluster::{ClusterConfig, DeploymentMode};
 use protocol_amqp::{
-    AmqpListener, DEFAULT_ADMISSION_TIMEOUT, SharedAccessAuthentication, namespace_from_hostname,
+    AmqpListener, AmqpListenerExit, AmqpListenerFailure, AmqpListenerRetirement,
+    DEFAULT_ADMISSION_TIMEOUT, SharedAccessAuthentication, namespace_from_hostname,
     tls_server_config,
 };
 use rustls::ServerConfig;
 use server::{
-    Broker, DEFAULT_SWEEP_INTERVAL, LocalProposer, NodeState, Shutdown, StartupError,
-    StorageChoice, SystemClock, TimerWorker,
+    Broker, BrokerHandle, DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SWEEP_INTERVAL, LocalProposer,
+    NodeState, SHUTDOWN_EXPIRED_EXIT_CODE, ShutdownBudget, ShutdownExpired, ShutdownTrigger,
+    StartupError, StorageChoice, SystemClock, TimerThread, shut_down, stop_timer_and_broker,
 };
-use tracing::info;
+#[cfg(debug_assertions)]
+use server::{Shutdown, TimerWorker};
+use tokio::time::Instant;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -90,6 +97,16 @@ struct Arguments {
         default_value_t = default_admission_timeout_secs()
     )]
     admission_timeout_secs: NonZeroU64,
+
+    /// Seconds the whole shutdown may take after SIGTERM or SIGINT: stopping
+    /// admission, draining connections, stopping the timer and the broker. A
+    /// shutdown that overruns exits with status 3 without waiting further.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = default_shutdown_timeout_secs()
+    )]
+    shutdown_timeout_secs: NonZeroU64,
 
     /// The namespace this node serves. A hostname is accepted and its first
     /// label taken, so a deployment can name namespaces in DNS.
@@ -234,7 +251,8 @@ fn load_shared_access_authentication(
 }
 
 /// Reports why startup failed in the words the error was written in, rather
-/// than in the derived debug form `Termination` would print.
+/// than in the derived debug form `Termination` would print. A shutdown that
+/// finishes within its budget exits successfully.
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -247,6 +265,11 @@ fn main() -> ExitCode {
 
 fn default_admission_timeout_secs() -> NonZeroU64 {
     NonZeroU64::new(DEFAULT_ADMISSION_TIMEOUT.as_secs())
+        .expect("the default budget is whole nonzero seconds")
+}
+
+fn default_shutdown_timeout_secs() -> NonZeroU64 {
+    NonZeroU64::new(DEFAULT_SHUTDOWN_TIMEOUT.as_secs())
         .expect("the default budget is whole nonzero seconds")
 }
 
@@ -291,34 +314,35 @@ fn run() -> Result<(), StartupError> {
         NodeState::Memory(machine) => Broker::spawn(LocalProposer::new(machine, SystemClock)),
         NodeState::Durable(machine) => Broker::spawn(LocalProposer::new(machine, SystemClock)),
     };
-
-    // Nothing settles a message before its batch is fsynced, so an interrupt at
-    // any point loses no acknowledged state. That is why there is no signal
-    // handler yet: an abrupt stop is already safe.
-    let shutdown = Arc::new(Shutdown::default());
-    let interval = Duration::from_millis(arguments.sweep_interval_millis);
-    let sweeper = {
-        let handle = broker.handle();
-        let shutdown = Arc::clone(&shutdown);
-        thread::Builder::new()
-            .name(String::from("switchyard-timer"))
-            .spawn(move || TimerWorker::new(&handle).run(interval, &shutdown))
-            .map_err(|error| StartupError::Runtime(error.to_string()))?
-    };
+    let handle = broker.handle();
+    let mut broker = Some(broker);
+    let mut timer = Some(
+        spawn_timer(
+            handle.clone(),
+            Duration::from_millis(arguments.sweep_interval_millis),
+        )
+        .map_err(|error| StartupError::Runtime(error.to_string()))?,
+    );
+    let shutdown_timeout = Duration::from_secs(arguments.shutdown_timeout_secs.get());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|error| StartupError::Runtime(error.to_string()))?;
     let served = runtime.block_on(async {
+        // Registered before the listener exists, so a signal during startup
+        // waits for the listener rather than killing the process outright.
+        let signals =
+            ProcessSignals::register().map_err(|error| StartupError::Runtime(error.to_string()))?;
         let listener = tokio::net::TcpListener::bind(listen)
             .await
             .map_err(|error| StartupError::Listen {
                 address: listen.to_string(),
                 detail: error.to_string(),
             })?;
-        info!(address = %listen, namespace = %namespace, tls = tls.is_some(), transport = ?arguments.transport, max_connections = ?arguments.max_connections, admission_timeout_secs = arguments.admission_timeout_secs, "accepting AMQP connections");
-        let amqp = AmqpListener::new(broker.handle(), namespace).with_admission_timeout(
+        let address = listener.local_addr().unwrap_or(listen);
+        info!(address = %address, namespace = %namespace, tls = tls.is_some(), transport = ?arguments.transport, max_connections = ?arguments.max_connections, admission_timeout_secs = arguments.admission_timeout_secs, shutdown_timeout_secs = arguments.shutdown_timeout_secs, "accepting AMQP connections");
+        let amqp = AmqpListener::new(handle, namespace).with_admission_timeout(
             Duration::from_secs(arguments.admission_timeout_secs.get()),
         );
         let amqp = match arguments.max_connections {
@@ -333,16 +357,160 @@ fn run() -> Result<(), StartupError> {
             Some(authentication) => amqp.with_shared_access_authentication(authentication),
             None => amqp,
         };
-        match arguments.transport {
-            TransportArgument::AmqpTcp => amqp.serve(listener).await,
-            TransportArgument::AmqpWebSockets => amqp.serve_websockets(listener).await,
+        let mut service = match arguments.transport {
+            TransportArgument::AmqpTcp => amqp.into_tcp_service(listener),
+            TransportArgument::AmqpWebSockets => amqp.into_wss_service(listener),
+        };
+        let trigger = ShutdownTrigger::default();
+        tokio::spawn(forward_signals(
+            signals,
+            trigger.clone(),
+            service.retirement_handle(),
+        ));
+
+        // Serves until a signal retires the listener or accepting fails.
+        service.serve().await;
+        if trigger.request() {
+            info!("the listener stopped accepting; shutting down");
         }
-        .map_err(|error| StartupError::Runtime(error.to_string()))
+        let started = trigger.started().unwrap_or_else(Instant::now);
+        let budget = ShutdownBudget::new(started, shutdown_timeout);
+        match shut_down(&budget, &mut service, &mut timer, &mut broker).await {
+            Ok(exit) => {
+                info!(
+                    elapsed_millis =
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    "shutdown complete"
+                );
+                match exit {
+                    Some(AmqpListenerExit::Complete(Err(AmqpListenerFailure::Accept(error)))) => {
+                        Err(StartupError::Runtime(error.to_string()))
+                    }
+                    _ => Ok(()),
+                }
+            }
+            Err(expired) => abandon_shutdown(expired, shutdown_timeout),
+        }
     });
 
-    shutdown.signal();
-    let _ = sweeper.join();
+    // Reached with the timer or broker still running only when startup failed
+    // inside the runtime; a completed shutdown has already stopped both. The
+    // signal handlers are still installed, so this teardown gets the same
+    // budget rather than an unbounded wait nobody can interrupt.
+    if timer.is_some() || broker.is_some() {
+        let budget = ShutdownBudget::new(Instant::now(), shutdown_timeout);
+        let stopped = runtime.block_on(stop_timer_and_broker(&budget, &mut timer, &mut broker));
+        if let Err(expired) = stopped {
+            if let Err(error) = &served {
+                eprintln!("switchyard: {error}");
+            }
+            abandon_shutdown(expired, shutdown_timeout);
+        }
+    }
     served
+}
+
+/// The variable a debug build reads to hold the timer stage open for that
+/// many milliseconds after the timer is told to stop. Tests use it to stall
+/// shutdown from outside the process; release builds ignore it.
+#[cfg(debug_assertions)]
+const STALL_TIMER_VARIABLE: &str = "SWITCHYARD_TEST_STALL_TIMER_MILLIS";
+
+fn spawn_timer(handle: BrokerHandle, interval: Duration) -> io::Result<TimerThread> {
+    #[cfg(debug_assertions)]
+    if let Some(stall) = std::env::var(STALL_TIMER_VARIABLE)
+        .ok()
+        .and_then(|millis| millis.parse().ok())
+        .map(Duration::from_millis)
+    {
+        let latch = Arc::new(Shutdown::default());
+        let thread = std::thread::Builder::new()
+            .name(String::from("switchyard-timer"))
+            .spawn({
+                let latch = Arc::clone(&latch);
+                move || {
+                    TimerWorker::new(&handle).run(interval, &latch);
+                    std::thread::sleep(stall);
+                }
+            })?;
+        return Ok(TimerThread::new(latch, thread));
+    }
+    TimerThread::spawn(handle, interval)
+}
+
+/// Leaves the remaining stages running and exits at once with the status
+/// reserved for an expired shutdown. Nothing is settled on the way out; work
+/// the broker never committed was never acknowledged.
+fn abandon_shutdown(expired: ShutdownExpired, budget: Duration) -> ! {
+    error!(
+        stage = %expired.stage,
+        budget_secs = budget.as_secs(),
+        "shutdown budget expired; exiting without finishing the remaining stages"
+    );
+    eprintln!("switchyard: {expired}");
+    let _ = io::stdout().flush();
+    process::exit(i32::from(SHUTDOWN_EXPIRED_EXIT_CODE))
+}
+
+/// SIGTERM and SIGINT, the two requests to stop.
+#[cfg(unix)]
+struct ProcessSignals {
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ProcessSignals {
+    fn register() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            terminate: signal(SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    async fn next(&mut self) -> Option<&'static str> {
+        tokio::select! {
+            received = self.terminate.recv() => received.map(|()| "SIGTERM"),
+            received = self.interrupt.recv() => received.map(|()| "SIGINT"),
+        }
+    }
+}
+
+/// Ctrl-C, the only request to stop a Windows host delivers. Registered
+/// here, before the listener binds, like the Unix signals.
+#[cfg(windows)]
+struct ProcessSignals {
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+#[cfg(windows)]
+impl ProcessSignals {
+    fn register() -> io::Result<Self> {
+        Ok(Self {
+            ctrl_c: tokio::signal::windows::ctrl_c()?,
+        })
+    }
+
+    async fn next(&mut self) -> Option<&'static str> {
+        self.ctrl_c.recv().await.map(|()| "ctrl-c")
+    }
+}
+
+/// Starts shutdown on the first signal; later ones join it.
+async fn forward_signals(
+    mut signals: ProcessSignals,
+    trigger: ShutdownTrigger,
+    retirement: AmqpListenerRetirement,
+) {
+    while let Some(signal) = signals.next().await {
+        if trigger.request() {
+            info!(signal = %signal, "shutting down");
+            retirement.request();
+        } else {
+            info!(signal = %signal, "shutdown already in progress");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -422,6 +590,36 @@ mod tests {
                 "{invalid:?} is refused"
             );
         }
+    }
+
+    #[test]
+    fn the_shutdown_timeout_defaults_to_thirty_seconds_and_refuses_zero() {
+        let parse = |extra: &[&str]| {
+            Arguments::try_parse_from(["switchyard"].iter().chain(extra))
+                .map(|arguments| arguments.shutdown_timeout_secs.get())
+        };
+        assert_eq!(parse(&[]).unwrap(), 30);
+        assert_eq!(
+            Duration::from_secs(parse(&[]).unwrap()),
+            DEFAULT_SHUTDOWN_TIMEOUT
+        );
+        assert_eq!(parse(&["--shutdown-timeout-secs", "5"]).unwrap(), 5);
+        for invalid in ["0", "-1", "soon", "1.5", ""] {
+            assert!(
+                parse(&["--shutdown-timeout-secs", invalid]).is_err(),
+                "{invalid:?} is refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_expired_shutdown_has_its_own_exit_status() {
+        assert_ne!(SHUTDOWN_EXPIRED_EXIT_CODE, 0);
+        assert_ne!(
+            ExitCode::from(SHUTDOWN_EXPIRED_EXIT_CODE),
+            ExitCode::FAILURE,
+            "a refused startup and an overrun shutdown are told apart"
+        );
     }
 
     #[test]
