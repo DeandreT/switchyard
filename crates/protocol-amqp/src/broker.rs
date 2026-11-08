@@ -7,7 +7,7 @@
 
 use std::future::Future;
 
-use domain::{BrokerError, CommandKind, CommandOutcome, EntityPath, NamespaceName};
+use domain::{BrokerError, CommandKind, CommandOutcome, EntityBinding, EntityPath, NamespaceName};
 
 /// Why a command did not produce an outcome.
 ///
@@ -46,6 +46,33 @@ impl BrokerRejection {
 }
 
 pub trait Broker: Clone + Send + Sync + 'static {
+    /// Captures immutable authority on the broker owner. Unsupported adapters
+    /// refuse; resolving names locally is not an equivalent implementation.
+    fn bind_entity(
+        &self,
+        _namespace: NamespaceName,
+        _entity: EntityPath,
+    ) -> impl Future<Output = Result<EntityBinding, BrokerRejection>> + Send {
+        async {
+            Err(BrokerRejection::Unavailable(
+                "entity binding is unsupported".into(),
+            ))
+        }
+    }
+
+    /// Applies through captured authority, never through a name-based fallback.
+    fn submit_bound(
+        &self,
+        _binding: EntityBinding,
+        _kind: CommandKind,
+    ) -> impl Future<Output = Result<CommandOutcome, BrokerRejection>> + Send {
+        async {
+            Err(BrokerRejection::Unavailable(
+                "bound submission is unsupported".into(),
+            ))
+        }
+    }
+
     /// Applies one command and reports what it produced.
     ///
     /// The future is required to be `Send` because a link is driven from a task
@@ -70,9 +97,61 @@ pub trait Broker: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = ()> + Send;
 }
 
+/// Opaque, owner-created authority for qualified synthetic-outcome fixtures.
+#[cfg(test)]
+pub(crate) fn test_binding(namespace: NamespaceName, entity: EntityPath) -> EntityBinding {
+    let machine = domain::StateMachine::new(storage::MemoryStore::default());
+    machine
+        .apply(&domain::Command::new(
+            namespace.clone(),
+            entity.clone(),
+            domain::Timestamp::from_millis(0),
+            CommandKind::CreateQueue {
+                config: domain::QueueConfig::default(),
+            },
+        ))
+        .unwrap();
+    machine.bind_entity(&namespace, &entity).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct NameOnly;
+
+    impl Broker for NameOnly {
+        async fn submit(
+            &self,
+            _: NamespaceName,
+            _: EntityPath,
+            _: CommandKind,
+        ) -> Result<CommandOutcome, BrokerRejection> {
+            panic!("bound operations must never forward to names");
+        }
+
+        async fn deliverable(&self, _: &NamespaceName, _: &EntityPath) {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_bound_operations_fail_closed_without_name_fallback() {
+        let namespace = NamespaceName::new("tenant").unwrap();
+        let entity = EntityPath::new("orders").unwrap();
+        let binding = test_binding(namespace.clone(), entity.clone());
+        assert!(matches!(
+            NameOnly.bind_entity(namespace, entity).await,
+            Err(BrokerRejection::Unavailable(_))
+        ));
+        assert!(matches!(
+            NameOnly
+                .submit_bound(binding, CommandKind::ActivateScheduled)
+                .await,
+            Err(BrokerRejection::Unavailable(_))
+        ));
+    }
 
     #[test]
     fn a_refusal_carries_the_condition_of_the_error_behind_it() {

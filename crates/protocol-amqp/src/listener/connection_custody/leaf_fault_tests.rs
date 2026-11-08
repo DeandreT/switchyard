@@ -87,6 +87,24 @@ struct FaultBroker {
 }
 
 impl Broker for FaultBroker {
+    async fn bind_entity(
+        &self,
+        namespace: NamespaceName,
+        entity: EntityPath,
+    ) -> Result<domain::EntityBinding, BrokerRejection> {
+        Ok(crate::broker::test_binding(namespace, entity))
+    }
+
+    async fn submit_bound(
+        &self,
+        _: domain::EntityBinding,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, BrokerRejection> {
+        assert!(self.sends && matches!(kind, CommandKind::SendContent { .. }));
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        panic!("controlled admitted data-leaf original fault")
+    }
+
     async fn submit(
         &self,
         _: NamespaceName,

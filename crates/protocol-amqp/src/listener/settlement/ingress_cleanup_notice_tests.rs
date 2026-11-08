@@ -83,6 +83,26 @@ struct PostResultPoisonBroker {
 }
 
 impl Broker for PostResultPoisonBroker {
+    async fn bind_entity(
+        &self,
+        namespace: domain::NamespaceName,
+        entity: domain::EntityPath,
+    ) -> Result<domain::EntityBinding, BrokerRejection> {
+        self.actual.bind_entity(namespace, entity).await
+    }
+
+    async fn submit_bound(
+        &self,
+        binding: domain::EntityBinding,
+        command: CommandKind,
+    ) -> RawSendResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let _original_result = self.actual.submit_bound(binding, command).await;
+        self.ready.notify_one();
+        self.trigger.notified().await;
+        std::panic::panic_any(Arc::clone(&self.payload));
+    }
+
     async fn submit(
         &self,
         namespace: domain::NamespaceName,

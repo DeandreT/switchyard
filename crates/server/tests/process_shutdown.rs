@@ -22,8 +22,8 @@ use amqp::{
     ClientSession as Session, Message, Outcome, Properties,
 };
 use domain::{
-    CommandKind, CommandOutcome, EntityPath, NamespaceName, QueueConfig, SequenceNumber,
-    StateMachine, Timestamp,
+    CommandKind, CommandOutcome, EntityBinding, EntityPath, NamespaceName, QueueConfig,
+    SequenceNumber, StateMachine, Timestamp,
 };
 use protocol_amqp::{AmqpListener, AmqpListenerService, BrokerRejection};
 use server::{
@@ -260,10 +260,17 @@ struct StalledSends {
 }
 
 impl protocol_amqp::Broker for StalledSends {
-    async fn submit(
+    async fn bind_entity(
         &self,
         namespace: NamespaceName,
         entity: EntityPath,
+    ) -> Result<EntityBinding, BrokerRejection> {
+        protocol_amqp::Broker::bind_entity(&self.inner, namespace, entity).await
+    }
+
+    async fn submit_bound(
+        &self,
+        binding: EntityBinding,
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         if matches!(
@@ -275,6 +282,15 @@ impl protocol_amqp::Broker for StalledSends {
             }
             std::future::pending::<()>().await;
         }
+        protocol_amqp::Broker::submit_bound(&self.inner, binding, kind).await
+    }
+
+    async fn submit(
+        &self,
+        namespace: NamespaceName,
+        entity: EntityPath,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, BrokerRejection> {
         protocol_amqp::Broker::submit(&self.inner, namespace, entity, kind).await
     }
 

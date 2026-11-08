@@ -36,12 +36,16 @@ pub(super) async fn schedule<B: Broker>(
         }
     };
     let expected = messages.len();
+    // Parsing and the operation's Send authorization precede capture. The
+    // request-link adapter retains this binding; it never recaptures on drift.
+    let binding = match broker.bind_entity(namespace.clone(), entity.clone()).await {
+        Ok(binding) => binding,
+        Err(rejection) => {
+            return ManagementResponse::from_rejection(message_id, tracking_id, &rejection);
+        }
+    };
     let sequences = match broker
-        .submit(
-            namespace.clone(),
-            entity.clone(),
-            CommandKind::SendContentBatch { messages },
-        )
+        .submit_bound(binding, CommandKind::SendContentBatch { messages })
         .await
     {
         Ok(CommandOutcome::BatchSent { sequences, stored })
@@ -271,6 +275,23 @@ mod tests {
     }
 
     impl Broker for RecordingBroker {
+        async fn bind_entity(
+            &self,
+            namespace: NamespaceName,
+            entity: EntityPath,
+        ) -> Result<domain::EntityBinding, crate::BrokerRejection> {
+            Ok(crate::broker::test_binding(namespace, entity))
+        }
+
+        async fn submit_bound(
+            &self,
+            _binding: domain::EntityBinding,
+            kind: CommandKind,
+        ) -> Result<CommandOutcome, crate::BrokerRejection> {
+            self.commands.lock().expect("command recorder").push(kind);
+            Ok(self.outcome.clone())
+        }
+
         fn submit(
             &self,
             _namespace: NamespaceName,

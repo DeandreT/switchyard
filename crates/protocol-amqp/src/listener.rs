@@ -19,7 +19,9 @@ use amqp::{
     ServerSession,
 };
 use auth::{Permission, ResourceScope};
-use domain::{AcceptedSession, CommandKind, CommandOutcome, EntityPath, NamespaceName};
+use domain::{
+    AcceptedSession, CommandKind, CommandOutcome, EntityBinding, EntityPath, NamespaceName,
+};
 use futures_util::FutureExt;
 use rustls::ServerConfig;
 use serde_amqp::{Value, primitives::Symbol};
@@ -624,10 +626,23 @@ async fn serve_sending_client<B: Broker>(
         .await
 }
 
+#[cfg(test)]
 async fn serve_sending_client_with_retirement<B: Broker>(
-    mut receiver: Receiver,
+    receiver: Receiver,
     namespace: NamespaceName,
     entity: EntityPath,
+    broker: B,
+    authorization: Option<LinkAuthorization>,
+    notice: Option<ConnectionRetirementRequest>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let binding = broker.bind_entity(namespace, entity).await?;
+    serve_bound_sending_client_with_retirement(receiver, binding, broker, authorization, notice)
+        .await
+}
+
+async fn serve_bound_sending_client_with_retirement<B: Broker>(
+    mut receiver: Receiver,
+    binding: EntityBinding,
     broker: B,
     authorization: Option<LinkAuthorization>,
     notice: Option<ConnectionRetirementRequest>,
@@ -678,11 +693,10 @@ async fn serve_sending_client_with_retirement<B: Broker>(
             }
         }
         let mut custody = SendCustody::default();
-        let primary = AssertUnwindSafe(send_delivery_pump(
+        let primary = AssertUnwindSafe(send_bound_delivery_pump(
             &receiver,
             &delivery,
-            &namespace,
-            &entity,
+            &binding,
             &broker,
             &mut custody,
             retirement.as_mut(),
@@ -748,11 +762,28 @@ async fn finish_send_with_retirement(
     }
 }
 
+#[cfg(test)]
 async fn send_delivery_pump<'a, B: Broker>(
     receiver: &'a Receiver,
     delivery: &'a amqp::Delivery,
     namespace: &'a NamespaceName,
     entity: &'a EntityPath,
+    broker: &'a B,
+    custody: &mut SendCustody<'a>,
+    retirement: std::pin::Pin<&mut (impl std::future::Future<Output = SendRetirement> + Send)>,
+) -> Result<Option<SendRetirement>, EngineError> {
+    let binding = broker
+        .bind_entity(namespace.clone(), entity.clone())
+        .await
+        .expect("test sender binding");
+    // The actual command future in custody owns its binding clone.
+    send_bound_delivery_pump(receiver, delivery, &binding, broker, custody, retirement).await
+}
+
+async fn send_bound_delivery_pump<'a, B: Broker>(
+    receiver: &'a Receiver,
+    delivery: &'a amqp::Delivery,
+    binding: &EntityBinding,
     broker: &'a B,
     custody: &mut SendCustody<'a>,
     mut retirement: std::pin::Pin<&mut (impl std::future::Future<Output = SendRetirement> + Send)>,
@@ -787,10 +818,9 @@ async fn send_delivery_pump<'a, B: Broker>(
         }
     };
     custody.expected = Some(expected);
-    custody.original = Some(SendIntake::new(async {
-        broker
-            .submit(namespace.clone(), entity.clone(), command)
-            .await
+    let binding = binding.clone();
+    custody.original = Some(SendIntake::new(async move {
+        broker.submit_bound(binding, command).await
     }));
     ingress::custody::pump_checkpoint(SendPumpPoint::Prepared).await;
     let retired = tokio::select! {
