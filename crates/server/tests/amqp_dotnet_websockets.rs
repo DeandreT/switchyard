@@ -1,20 +1,26 @@
-//! Opt-in Memory WSS workflows for two fixed official .NET package selections.
+//! Opt-in Memory/Fjall WSS workflows for two fixed official .NET package selections.
 
-use std::{error::Error, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    error::Error,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[allow(dead_code)]
 mod sdk_child;
 
-use sdk_child::pins::SdkPin;
+use sdk_child::{
+    matrix::{self, Backend},
+    pins::SdkPin,
+};
 
 use auth::{PermissionSet, ResourceScope, SharedAccessKey, SharedAccessPolicy, SharedAccessRule};
 use domain::{
-    CommandKind, CommandOutcome, QueueConfig, ReceiveMode, StateMachine, SubscriptionConfig,
-    SubscriptionName, TopicConfig,
+    CommandKind, QueueConfig, StateMachine, SubscriptionConfig, SubscriptionName, TopicConfig,
 };
 use rcgen::{CertifiedKey, generate_simple_self_signed};
-use server::{Broker, LocalProposer, Shutdown, SystemClock, TimerWorker};
-use storage::MemoryStore;
+use server::{Broker, LocalProposer, SystemClock};
+use storage::{FjallStore, MemoryStore, StateStore};
 use tokio::net::TcpListener;
 
 const HOST: &str = "tenant.servicebus.windows.net";
@@ -26,25 +32,61 @@ const CASE_SUBSCRIPTION: &str = "Case-Identity-Subscription";
 const FILTER_TOPIC: &str = "Filtered-WebSocket-Events";
 const FILTER_SUBSCRIPTION: &str = "Filtered-WebSocket-Subscription";
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires dotnet and a NuGet restore"]
-async fn declared_current_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn Error>> {
-    run_wss_workflows(SdkPin::DeclaredCurrent).await
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux, dotnet 10 and a NuGet restore"]
+async fn declared_current_memory_wss() -> Result<(), Box<dyn Error>> {
+    run_wss_workflows(SdkPin::DeclaredCurrent, Backend::Memory).await
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires dotnet and a NuGet restore"]
-async fn previous_dotnet_client_uses_amqp_over_websockets() -> Result<(), Box<dyn Error>> {
-    run_wss_workflows(SdkPin::Previous).await
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux, dotnet 10 and a NuGet restore"]
+async fn previous_memory_wss() -> Result<(), Box<dyn Error>> {
+    run_wss_workflows(SdkPin::Previous, Backend::Memory).await
 }
 
-async fn run_wss_workflows(pin: SdkPin) -> Result<(), Box<dyn Error>> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux, dotnet 10 and a NuGet restore"]
+async fn declared_current_fjall_wss() -> Result<(), Box<dyn Error>> {
+    run_wss_workflows(SdkPin::DeclaredCurrent, Backend::Fjall).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux, dotnet 10 and a NuGet restore"]
+async fn previous_fjall_wss() -> Result<(), Box<dyn Error>> {
+    run_wss_workflows(SdkPin::Previous, Backend::Fjall).await
+}
+
+async fn run_wss_workflows(pin: SdkPin, backend: Backend) -> Result<(), Box<dyn Error>> {
+    println!(
+        "SDK_MATRIX_CELL pin={} backend={} transport=wss",
+        pin.selector(),
+        backend.name()
+    );
+    match backend {
+        Backend::Memory => run_wss_store(pin, MemoryStore::default(), None).await,
+        Backend::Fjall => {
+            let directory = tempfile::tempdir()?;
+            run_wss_store(
+                pin,
+                FjallStore::open(directory.path())?,
+                Some(directory.path()),
+            )
+            .await
+        }
+    }
+}
+
+async fn run_wss_store<S: StateStore>(
+    pin: SdkPin,
+    store: S,
+    directory: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
         .try_init();
     let broker = Broker::spawn(LocalProposer::new(
-        StateMachine::new(MemoryStore::default()),
+        StateMachine::new(store.clone()),
         SystemClock,
     ));
     let namespace = domain::NamespaceName::new("tenant")?;
@@ -150,24 +192,25 @@ async fn run_wss_workflows(pin: SdkPin) -> Result<(), Box<dyn Error>> {
     )?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let handle = broker.handle();
-    tokio::spawn(async move {
-        let _ = protocol_amqp::AmqpListener::new(handle, namespace)
-            .with_tls(tls)
-            .with_shared_access_authentication(authentication)
-            .serve_websockets(listener)
-            .await;
-    });
-
-    let timer_shutdown = Arc::new(Shutdown::default());
-    let timer_stop = Arc::clone(&timer_shutdown);
-    let timer_broker = broker.handle();
-    let timer = std::thread::spawn(move || {
-        TimerWorker::new(&timer_broker).run(Duration::from_millis(25), &timer_stop);
-    });
+    let mut service = protocol_amqp::AmqpListener::new(
+        sdk_child::diagnostics::ObservedBroker(broker.handle()),
+        namespace,
+    )
+    .with_tls(tls)
+    .with_shared_access_authentication(authentication)
+    .into_wss_service(listener);
+    let timer = matrix::Timer::start(broker.handle())?;
 
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../conformance/dotnet-websockets");
-    let output = async {
+    let diagnostic_entities = [
+        "websocket-events",
+        "websocket-events/subscriptions/first",
+        "websocket-events/subscriptions/second",
+        FILTER_TOPIC,
+        "Filtered-WebSocket-Events/subscriptions/Filtered-WebSocket-Subscription",
+    ];
+    sdk_child::diagnostics::state(&store, "before-child", &diagnostic_entities);
+    let output = matrix::serve(&mut service, async {
         let _trust = trust;
         let mut run = sdk_child::SdkRun::prepare(
             &source,
@@ -175,6 +218,7 @@ async fn run_wss_workflows(pin: SdkPin) -> Result<(), Box<dyn Error>> {
             pin,
         )?;
         run.build().await?;
+        sdk_child::diagnostics::emit("child-launch", pin.selector());
         let args = [
             HOST.into(),
             format!("sb://localhost:{}", address.port()).into(),
@@ -206,14 +250,39 @@ async fn run_wss_workflows(pin: SdkPin) -> Result<(), Box<dyn Error>> {
             "SDK_CUSTODY_VERIFIED {}",
             serde_json::to_string(&verified.records).map_err(std::io::Error::other)?
         );
+        println!(
+            "SDK_CHILD_STDOUT\n{}",
+            String::from_utf8_lossy(&verified.output.stdout)
+        );
+        println!(
+            "SDK_CHILD_STDERR\n{}",
+            String::from_utf8_lossy(&verified.output.stderr)
+        );
         Ok::<_, std::io::Error>(verified.output)
-    }
+    })
     .await;
-    timer_shutdown.signal();
-    timer
-        .join()
-        .map_err(|_| std::io::Error::other("the test timer worker panicked"))?;
+    sdk_child::diagnostics::emit(
+        "child-returned-before-retirement",
+        format!("success={}", output.is_ok()),
+    );
+    sdk_child::diagnostics::state(&store, "before-retirement", &diagnostic_entities);
+    let quiesced = matrix::quiesce(service, timer).await;
+    sdk_child::diagnostics::state(
+        &store,
+        "after-original-protocol-timer-joins",
+        &diagnostic_entities,
+    );
+    let native = (|| -> Result<(), Box<dyn Error>> {
+        for path in ["websocket-orders", "websocket-batch"] {
+            matrix::empty(&broker, domain::EntityPath::new(path)?)?;
+        }
+        Ok(())
+    })();
+    let finished = matrix::finish(broker, store, directory).await;
     let output = output?;
+    quiesced?;
+    native?;
+    finished?;
 
     assert!(
         output.status.success(),
@@ -228,31 +297,5 @@ async fn run_wss_workflows(pin: SdkPin) -> Result<(), Box<dyn Error>> {
         "the client exited without reporting the completed WebSocket workflow"
     );
 
-    assert_eq!(
-        broker.handle().submit_blocking(
-            domain::NamespaceName::new("tenant")?,
-            domain::EntityPath::new("websocket-orders")?,
-            CommandKind::Receive {
-                mode: ReceiveMode::ReceiveAndDelete,
-                lock_duration_millis: None,
-                session: None,
-            },
-        )?,
-        CommandOutcome::Received(None),
-        "the official client returned before completion emptied the queue"
-    );
-    assert_eq!(
-        broker.handle().submit_blocking(
-            domain::NamespaceName::new("tenant")?,
-            domain::EntityPath::new("websocket-batch")?,
-            CommandKind::Receive {
-                mode: ReceiveMode::ReceiveAndDelete,
-                lock_duration_millis: None,
-                session: None,
-            },
-        )?,
-        CommandOutcome::Received(None),
-        "the official client returned before completing the WebSocket batch"
-    );
     Ok(())
 }

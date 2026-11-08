@@ -1,11 +1,10 @@
 # SDK Gates
 
-The .NET TCP/WSS workflows are experimental, Memory-only data-plane gates.
+The .NET TCP/WSS workflows are experimental Memory/Fjall data-plane gates.
 Selectors are fixed: `declared-current` is ServiceBus 7.21.0 / Core 1.62.0;
 `previous` is 7.20.2 / 1.60.0. Neither means latest. Exact ranges, locked graphs
 and selected runtime DLL approvals are checked in under `crates/conformance/pins`.
-The durable matrix remains [#101](https://github.com/DeandreT/switchyard/issues/101).
-Ordinary workspace tests ignore four workflows and one restored-pin control.
+Ordinary workspace tests ignore eight workflows and one restored-pin control.
 Selecting one requires
 Linux, .NET 10 and NuGet restore; missing prerequisites fail rather than skip.
 
@@ -21,12 +20,83 @@ Original fetch tasks are directly awaited: cancellation cooperation is required,
 not a finite-progress promise for uncooperative delegates. Pins, custody and
 parent deadlines are unchanged.
 
+Scheduled-topic checks separate the intentional future enqueue interval from
+the positive receive window. Negative receives still check non-delivery before
+the due time; the fixture then waits for that same real due time, without moving
+the broker clock. Each subscription collects singular receives under one 12s
+monotonic budget using the same bounded accumulator. Empty short returns do not
+mean a missing publication; exact IDs, order-independent expected sets, counts,
+metadata, cancellation and post-completion empty checks still apply. No SDK
+operation/disposal timeout or outer child deadline is increased.
+
 ```sh
 cargo test --locked -p server --test sdk_child_custody -j2
 cargo test --locked -p server --test sdk_pin_controls -j2 -- --include-ignored --nocapture
-cargo test --locked -p server --test amqp_dotnet_current -j2 -- --ignored --nocapture
-cargo test --locked -p server --test amqp_dotnet_websockets -j2 -- --ignored --nocapture
+cargo test --locked -p server --test amqp_dotnet_current -j2 -- --ignored --nocapture --test-threads=1
+cargo test --locked -p server --test amqp_dotnet_websockets -j2 -- --ignored --nocapture --test-threads=1
+python3 -m unittest discover -s crates/conformance/tests
+# Run all eight, retaining each original gate log and a results.json summary;
+# a failed cell does not suppress later cells. Use a new external directory.
+python3 crates/conformance/run-sdk-matrix.py --output /path/to/new-evidence
+# Or select individual cells; every other SDK gate remains ignored:
+python3 crates/conformance/run-sdk-matrix.py --output /path/to/another-evidence --cell previous_fjall_wss
 ```
+
+| Exact Rust selector | Test target |
+| --- | --- |
+| `declared_current_memory_tcp` | `amqp_dotnet_current` |
+| `declared_current_fjall_tcp` | `amqp_dotnet_current` |
+| `previous_memory_tcp` | `amqp_dotnet_current` |
+| `previous_fjall_tcp` | `amqp_dotnet_current` |
+| `declared_current_memory_wss` | `amqp_dotnet_websockets` |
+| `declared_current_fjall_wss` | `amqp_dotnet_websockets` |
+| `previous_memory_wss` | `amqp_dotnet_websockets` |
+| `previous_fjall_wss` | `amqp_dotnet_websockets` |
+
+These are not eight identical scenarios: TCP retains DLQ, renewal, abandonment,
+property updates and session-state workflows; WSS retains its tunnel-specific
+batch/deferred/schedule/topic/session-attach workflows. Both retain SQL and
+correlation-rule conformance. Each cell reports its pin/backend/transport,
+approved resolved packages, exact loaded assembly identity/path/hash, bounded
+original-child output and transport-specific native empty-queue postconditions.
+Fjall cells retire/finish the retained listener service (joining its original
+connection family), signal/join the owned timer, explicitly join the broker by
+dropping it, capture a quiescent logical snapshot and drop the retained store.
+Only then do they reopen the same path and compare logical records, not files.
+Cooperative resource joins are not a universal finite-progress guarantee.
+
+The runner executes serially, fails a zero-test match, and returns nonzero if any
+selected cell fails. Missing prerequisites fail selected gates; there are no
+SDK/backend/transport fallbacks. Non-Linux platforms are unsupported by the child
+custody harness, including WSS trust setup: selecting a cell there fails rather
+than claiming a pass or silently skipping. `--jobs 1` reduces Cargo workers;
+`--cargo-wrapper /path/to/lease.sh` uses a Bash build-lease launcher. Set
+`CARGO_TARGET_DIR`/`CARGO_BUILD_BUILD_DIR` to the approved external target. Choose
+external evidence storage with sufficient space: the runner sets `TMPDIR` below
+it, so isolated project/bin/obj, NuGet caches and CLI homes also stay there.
+Isolated SDK commands set `DOTNET_ADD_GLOBAL_TOOLS_TO_PATH=false`.
+
+## Bounded Diagnosis
+
+`SWITCHYARD_SDK_DIAGNOSTICS=1` records wall/elapsed timestamps, SDK events including
+authorization expiry (never SAS tokens), native command outcomes, and read-only
+message inventories before retirement and after original protocol/timer joins.
+Native observations cap at 1200 lines/2048 characters and child observations at
+600 lines/1536 detail characters; the existing child stream ceilings still apply.
+The child's return/error is observed before fixture retirement, so a disposal
+timeout must not be attributed to teardown merely because cleanup follows it.
+
+Explicit latency probes are not qualifications: `SWITCHYARD_SDK_TEST_TIMER_LAG_MS`
+(1–5000ms) withholds the owned timer's sweeps until the scheduled-topic due time
+plus that lag, without changing the broker clock. The timer probe recognizes both
+legacy and current AMQP sends. `SWITCHYARD_SDK_DIAG_DELAY_RECEIVE`
+(`scheduled-topic` or `empty-rule`) plus `SWITCHYARD_SDK_DIAG_DELAY_MS` (1–30000ms)
+holds one original receiving command future after the selected fixture frontier.
+Both probes keep original resource custody and emit `NOT-QUALIFICATION` markers.
+The matrix runner refuses their environment variables; use an exact Cargo test
+only when deliberately diagnosing, and retain the attempt separately from matrix
+results. An empty SDK receive alone does not prove missing native records; a
+disposal timeout alone does not prove a pin regression or a protocol deadlock.
 
 Standalone fake-receiver controls use .NET 10 without NuGet packages; they are
 separate from ordinary Rust CI and do not certify SDK/broker behavior:
@@ -68,4 +138,5 @@ synchronous cleanup is not a sandbox or universal finite-progress guarantee.
 
 TCP retains its permissive test certificate callback; WSS retains child-scoped
 `SSL_CERT_FILE` trust. Neither certifies production trust, administration or
-whole-test listener/timer task-tree shutdown. See [compatibility](compatibility.md).
+universal task-tree shutdown or behavior under every injected failure. See
+[compatibility](compatibility.md).

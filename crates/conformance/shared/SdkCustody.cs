@@ -1,18 +1,42 @@
 using System.Reflection;
+using System.Diagnostics;
+using System.Diagnostics.Tracing;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Azure;
 using Azure.Messaging.ServiceBus;
+using Azure.Core.Diagnostics;
 
 internal static class SdkCustody
 {
     private const string Prefix = "SWITCHYARD_SDK_CUSTODY ";
     private const int RecordBytes = 16 * 1024;
     private const long ArtifactBytes = 64 * 1024 * 1024;
+    private static readonly Stopwatch DiagnosticClock = Stopwatch.StartNew();
+    private static int diagnosticLines;
+
+    internal static void Diagnostic(string phase, string detail)
+    {
+        if (Environment.GetEnvironmentVariable("SWITCHYARD_SDK_DIAGNOSTICS") is null ||
+            Interlocked.Increment(ref diagnosticLines) > 600)
+        {
+            return;
+        }
+        // Only synthetic fixture data; do not emit a SAS token even in diagnostics.
+        if (detail.Contains("SharedAccessSignature", StringComparison.OrdinalIgnoreCase))
+        {
+            detail = "[token-bearing diagnostic omitted]";
+        }
+        Console.WriteLine($"SDK_CHILD_DIAGNOSTIC wall={DateTimeOffset.UtcNow:o} elapsed_ms={DiagnosticClock.ElapsedMilliseconds} {phase} {detail[..Math.Min(detail.Length, 1536)]}");
+    }
 
     internal static async Task<int> RunAsync(string[] args, Func<string[], Task<int>> workflow)
     {
+        using AzureEventSourceListener? diagnostics =
+            Environment.GetEnvironmentVariable("SWITCHYARD_SDK_DIAGNOSTICS") is null ? null :
+            new AzureEventSourceListener((data, message) =>
+                Diagnostic($"sdk-event source={data.EventSource.Name} id={data.EventId} name={data.EventName}", message), EventLevel.Verbose);
         string nonce = Environment.GetEnvironmentVariable("SWITCHYARD_SDK_NONCE") ?? "";
         if (nonce.Length != 64 || !nonce.All(character => "0123456789abcdef".Contains(character)))
         {
@@ -25,8 +49,10 @@ internal static class SdkCustody
             Read("core", typeof(AzureNamedKeyCredential).Assembly),
         ];
         Emit("start", nonce, identities);
+        Diagnostic("workflow-start", $"pid={Environment.ProcessId}");
         // The original function's await-using scopes all finish before it returns here.
         int result = await workflow(args);
+        Diagnostic("workflow-returned-after-disposal", $"result={result}");
         if (result == 0)
         {
             AssemblyIdentity[] completed =

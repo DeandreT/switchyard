@@ -18,9 +18,11 @@ internal static class ScheduledTopicConformance
         await using ServiceBusReceiver topicBrowser = client.CreateReceiver(topic);
 
         DateTimeOffset dueAt = DateTimeOffset.UtcNow.AddSeconds(10);
+        SdkCustody.Diagnostic("scheduled-topic-start", $"topic={topic} due={dueAt:o}");
         long singleSequence = await sender.ScheduleMessageAsync(
             Message("topic-scheduled-single", SelectedSubject, "management-single"),
             dueAt);
+        SdkCustody.Diagnostic("scheduled-topic-single", $"sequence={singleSequence} due={dueAt:o}");
 
         var scheduledBatch = new[]
         {
@@ -68,8 +70,10 @@ internal static class ScheduledTopicConformance
             dueAt);
         if (placeholderFailure is not null)
         {
+            SdkCustody.Diagnostic("scheduled-topic-placeholder-failure", placeholderFailure);
             return placeholderFailure;
         }
+        SdkCustody.Diagnostic("scheduled-topic-placeholders-verified", $"count={placeholders.Count} due={dueAt:o}");
 
         // Scheduling owns a topic placeholder, not an eagerly materialized set
         // of subscription copies. Changing this subscription after scheduling
@@ -85,6 +89,17 @@ internal static class ScheduledTopicConformance
         {
             return "a scheduled topic publication reached a subscription before its due time";
         }
+        SdkCustody.Diagnostic("scheduled-topic-before-positive-receives", $"due={dueAt:o}");
+
+        // The negative receives above prove non-delivery while ineligible.
+        // Do not spend the positive receive budget on the deliberately future
+        // enqueue time. No clock is advanced and the broker still activates it.
+        TimeSpan untilEligible = dueAt - DateTimeOffset.UtcNow;
+        if (untilEligible > TimeSpan.Zero)
+        {
+            await Task.Delay(untilEligible);
+        }
+        SdkCustody.Diagnostic("scheduled-topic-eligible-positive-window", $"due={dueAt:o} per-receiver-total-budget=12s");
 
         IReadOnlyList<ServiceBusReceivedMessage> defaultCopies =
             await ReceiveExactlyAsync(defaultReceiver, 4);
@@ -93,8 +108,10 @@ internal static class ScheduledTopicConformance
         string? deliveryFailure = ValidateDeliveries(defaultCopies, filteredCopies, dueAt);
         if (deliveryFailure is not null)
         {
+            SdkCustody.Diagnostic("scheduled-topic-delivery-failure", deliveryFailure);
             return deliveryFailure;
         }
+        SdkCustody.Diagnostic("scheduled-topic-deliveries-verified", $"default={defaultCopies.Count} filtered={filteredCopies.Count} due={dueAt:o}");
 
         await CompleteAllAsync(defaultReceiver, defaultCopies);
         await CompleteAllAsync(filteredReceiver, filteredCopies);
@@ -222,22 +239,22 @@ internal static class ScheduledTopicConformance
         IEnumerable<ServiceBusReceivedMessage> messages) =>
         messages.Select(message => message.Body.ToString());
 
-    private static async Task<IReadOnlyList<ServiceBusReceivedMessage>> ReceiveExactlyAsync(
+    private static Task<IReadOnlyList<ServiceBusReceivedMessage>> ReceiveExactlyAsync(
         ServiceBusReceiver receiver,
         int count)
     {
-        var messages = new List<ServiceBusReceivedMessage>(count);
-        while (messages.Count < count)
-        {
-            ServiceBusReceivedMessage? message =
-                await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(12));
-            if (message is null)
+        // Keep singular receive coverage, but a short empty result is not proof
+        // that a scheduled publication is missing. Accumulate only within one
+        // unchanged 12s monotonic budget, not 12s for each individual message.
+        return BatchReceive.AccumulateAsync<ServiceBusReceivedMessage>(
+            count, TimeSpan.FromSeconds(12), async (remaining, wait, cancellation) =>
             {
-                break;
-            }
-            messages.Add(message);
-        }
-        return messages;
+                SdkCustody.Diagnostic("scheduled-topic-receive-start", $"entity={receiver.EntityPath} remaining={remaining}/{count} wait={wait}");
+                ServiceBusReceivedMessage? message =
+                    await receiver.ReceiveMessageAsync(wait, cancellation);
+                SdkCustody.Diagnostic("scheduled-topic-receive-end", $"entity={receiver.EntityPath} id={message?.MessageId ?? "<null>"}");
+                return message is null ? Array.Empty<ServiceBusReceivedMessage>() : new[] { message };
+            });
     }
 
     private static Task CompleteAllAsync(
