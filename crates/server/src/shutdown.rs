@@ -2,9 +2,9 @@
 //!
 //! The stages run strictly in order, each only after the previous one ended:
 //!
-//! 1. Listener admission: retirement is requested and the accept pump stops,
-//!    so no new socket is taken.
-//! 2. Protocol cleanup: the listener's original connection tasks, and the
+//! 1. Listener admission: both configured transports retire admission, including
+//!    new RPCs on existing HTTP/2 peers, before either protocol drain starts.
+//! 2. Protocol cleanup: both original connection/task families and accepted RPCs,
 //!    sessions, links and settlement work they own, are joined.
 //! 3. Timer: the sweep loop is told to stop and its thread is joined.
 //! 4. Broker: the owner thread stops after the requests queued ahead of it and
@@ -35,7 +35,7 @@ use thiserror::Error;
 use tokio::time::{Instant, timeout_at};
 use tracing::{info, warn};
 
-use crate::{Broker, BrokerHandle, Shutdown, TimerWorker};
+use crate::{AdminListenerService, Broker, BrokerHandle, Shutdown, TimerWorker};
 
 /// The budget a process gives its whole shutdown unless configured.
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -200,16 +200,62 @@ pub async fn shut_down<B: protocol_amqp::Broker>(
     timer: &mut Option<TimerThread>,
     broker: &mut Option<Broker>,
 ) -> Result<Option<AmqpListenerExit>, ShutdownExpired> {
+    shut_down_with_admin(budget, listener, None, timer, broker).await
+}
+
+/// Borrows the original accept pumps until either stops. Neither owner is
+/// dropped when select cancels a borrower; failure and signals use the same
+/// first-request timestamp and retire both RPC and socket admission.
+pub async fn serve_transports<B: protocol_amqp::Broker>(
+    listener: &mut AmqpListenerService<B>,
+    mut admin: Option<&mut AdminListenerService>,
+    trigger: &ShutdownTrigger,
+) {
+    if let Some(admin) = admin.as_mut() {
+        tokio::select! {
+            () = listener.serve() => {},
+            () = admin.serve() => {},
+        }
+    } else {
+        listener.serve().await;
+    }
+    trigger.request();
+    listener.retirement_handle().request();
+    if let Some(admin) = admin.as_ref() {
+        admin.retirement_handle().request();
+    }
+}
+
+/// Retires BOTH admissions before awaiting either protocol drain. The caller
+/// retains both original owners on cancellation or budget expiry.
+pub async fn shut_down_with_admin<B: protocol_amqp::Broker>(
+    budget: &ShutdownBudget,
+    listener: &mut AmqpListenerService<B>,
+    mut admin: Option<&mut AdminListenerService>,
+    timer: &mut Option<TimerThread>,
+    broker: &mut Option<Broker>,
+) -> Result<Option<AmqpListenerExit>, ShutdownExpired> {
+    listener.retirement_handle().request();
+    if let Some(admin) = admin.as_ref() {
+        admin.retirement_handle().request();
+    }
     budget
         .stage(ShutdownStage::ListenerAdmission, async {
             listener.retirement_handle().request();
             // Returns at once if the pump already observed retirement.
             listener.serve().await;
+            if let Some(admin) = admin.as_mut() {
+                admin.serve().await;
+            }
         })
         .await?;
     let exit = budget
         .stage(ShutdownStage::ProtocolCleanup, async {
-            listener.finish().await;
+            if let Some(admin) = admin.as_mut() {
+                tokio::join!(listener.finish(), admin.finish());
+            } else {
+                listener.finish().await;
+            }
             listener.take_exit()
         })
         .await?;
