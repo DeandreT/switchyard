@@ -5,6 +5,13 @@ use thiserror::Error;
 
 use crate::{RuleName, SqlCompileError, SqlProgram, Timestamp};
 
+mod action;
+pub use action::{
+    MAX_SQL_ACTION_PATCH_BYTES, MAX_SQL_ACTION_PATCH_PROPERTIES, MAX_SQL_ACTION_STATEMENTS,
+    SqlActionCompileError, SqlActionError, SqlActionLimits, SqlActionMetrics, SqlActionPatch,
+    SqlActionProgram, SqlActionProperty,
+};
+
 /// Name of the match-all rule created atomically with every subscription.
 pub const DEFAULT_RULE_NAME: &str = "$default";
 /// Maximum rules retained below one subscription in this initial Standard

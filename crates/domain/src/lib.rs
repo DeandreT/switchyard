@@ -63,8 +63,10 @@ pub use queue::{
 pub use rule::{
     CorrelationFilter, CorrelationValue, DEFAULT_RULE_NAME, FILTER_EVALUATION_DEAD_LETTER_REASON,
     FilterProperties, MAX_CORRELATION_FILTER_BYTES, MAX_CORRELATION_VALUE_BYTES, MAX_RULE_PAGE,
+    MAX_SQL_ACTION_PATCH_BYTES, MAX_SQL_ACTION_PATCH_PROPERTIES, MAX_SQL_ACTION_STATEMENTS,
     MAX_SUBSCRIPTION_RULES, MAX_TOPIC_SQL_RULES, RuleConfigError, RuleDefinition, RuleFilter,
-    SqlRuleFilter,
+    SqlActionCompileError, SqlActionError, SqlActionLimits, SqlActionMetrics, SqlActionPatch,
+    SqlActionProgram, SqlActionProperty, SqlRuleFilter,
 };
 pub use session::{AcceptedSession, SessionHold, SessionLock, SessionRecord};
 pub use sql_filter::{

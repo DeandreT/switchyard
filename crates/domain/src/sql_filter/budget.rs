@@ -44,7 +44,7 @@ impl SqlCompileBudget {
         self.used
     }
 
-    pub(super) fn source(&mut self, bytes: usize) -> Result<(), SqlCompileError> {
+    pub(crate) fn source(&mut self, bytes: usize) -> Result<(), SqlCompileError> {
         charge(&mut self.used.source_bytes, self.limits.source_bytes, bytes).map_err(|maximum| {
             SqlCompileError::Limit {
                 kind: SqlCompileLimit::AggregateSourceBytes,
@@ -53,7 +53,7 @@ impl SqlCompileBudget {
         })
     }
 
-    pub(super) fn tokens(&mut self, tokens: usize) -> Result<(), SqlCompileError> {
+    pub(crate) fn tokens(&mut self, tokens: usize) -> Result<(), SqlCompileError> {
         charge(&mut self.used.tokens, self.limits.tokens, tokens).map_err(|maximum| {
             SqlCompileError::Limit {
                 kind: SqlCompileLimit::AggregateTokens,
@@ -62,7 +62,7 @@ impl SqlCompileBudget {
         })
     }
 
-    pub(super) fn node(&mut self) -> Result<(), SqlCompileError> {
+    pub(crate) fn node(&mut self) -> Result<(), SqlCompileError> {
         charge(&mut self.used.nodes, self.limits.nodes, 1).map_err(|maximum| {
             SqlCompileError::Limit {
                 kind: SqlCompileLimit::AggregateNodes,
@@ -109,7 +109,7 @@ impl SqlEvaluationBudget {
         self.used
     }
 
-    pub(super) fn work(&mut self, amount: usize) -> Result<(), SqlEvaluationError> {
+    pub(crate) fn work(&mut self, amount: usize) -> Result<(), SqlEvaluationError> {
         charge(&mut self.used.work, self.limits.work, amount).map_err(|maximum| {
             SqlEvaluationError::Limit {
                 kind: SqlEvaluationLimit::WorkUnits,
@@ -118,7 +118,7 @@ impl SqlEvaluationBudget {
         })
     }
 
-    pub(super) fn bytes(&mut self, amount: usize) -> Result<(), SqlEvaluationError> {
+    pub(crate) fn bytes(&mut self, amount: usize) -> Result<(), SqlEvaluationError> {
         charge(
             &mut self.used.comparison_bytes,
             self.limits.comparison_bytes,
