@@ -5,7 +5,7 @@
 //! owner thread and the store it owns. The reopened broker reads back only
 //! what reached disk, so whatever a client sees afterwards came off the store.
 
-use std::{error::Error, io, time::Duration};
+use std::{error::Error, fmt::Display, time::Duration};
 
 use amqp::{
     AnnotationKey, ApplicationProperties, Array, Body, ClientConnection as Connection,
@@ -15,6 +15,7 @@ use amqp::{
 use domain::{
     CommandKind, CommandOutcome, EntityPath, NamespaceName, SequenceNumber, StateMachine,
 };
+use protocol_amqp::{AmqpListenerExit, AmqpListenerRetirement};
 use server::{Broker, LocalProposer, ManualClock};
 use storage::{FjallStore, StateStore, StoreSnapshot};
 use tempfile::TempDir;
@@ -31,10 +32,19 @@ mod test_deadline;
 
 pub(crate) use test_deadline::WAIT;
 
+pub fn phase(label: impl Display) {
+    eprintln!(
+        "[durable-content:{}] {label}",
+        std::thread::current().name().unwrap_or("unnamed")
+    );
+}
+
 struct Running {
     broker: Broker,
     clock: ManualClock,
-    listener: JoinHandle<io::Result<()>>,
+    listener: Option<JoinHandle<Result<(), String>>>,
+    listener_exit: Option<Result<(), String>>,
+    retirement: AmqpListenerRetirement,
     address: String,
 }
 
@@ -60,6 +70,7 @@ impl DurableNode {
     }
 
     async fn start(&mut self) -> TestResult {
+        phase("node start: store open");
         let clock = ManualClock::at(self.now);
         let broker = Broker::spawn(LocalProposer::new(
             StateMachine::new(FjallStore::open(self.directory.path())?),
@@ -67,26 +78,58 @@ impl DurableNode {
         ));
         let socket = TcpListener::bind("127.0.0.1:0").await?;
         let address = format!("amqp://{}", socket.local_addr()?);
-        let listener = tokio::spawn(
+        let mut service =
             protocol_amqp::AmqpListener::new(broker.handle(), NamespaceName::new(NAMESPACE)?)
-                .serve(socket),
-        );
+                .into_tcp_service(socket);
+        let retirement = service.retirement_handle();
+        let listener = tokio::spawn(async move {
+            service.serve().await;
+            service.finish().await;
+            match service.take_exit() {
+                Some(AmqpListenerExit::Complete(Ok(()))) => Ok(()),
+                Some(AmqpListenerExit::Complete(Err(error))) => Err(error.to_string()),
+                Some(AmqpListenerExit::ReportOnly(_)) => Err("listener owner panicked".into()),
+                None => Err("listener originals were not drained".into()),
+            }
+        });
         self.running = Some(Running {
             broker,
             clock,
-            listener,
+            listener: Some(listener),
+            listener_exit: None,
+            retirement,
             address,
         });
+        phase("node start: ready");
         Ok(())
     }
 
-    async fn stop(&mut self) {
-        if let Some(running) = self.running.take() {
-            running.listener.abort();
-            let _ = running.listener.await;
-            // Joins the owner thread, which drops the last store handle.
+    async fn stop(&mut self) -> TestResult {
+        if let Some(running) = self.running.as_mut() {
+            phase("node stop: retire and join original listener family");
+            running.retirement.request();
+            // Borrow the original handle. Cancellation must not remove custody
+            // or let reopen run while accepted operations can still use the store.
+            if let Some(listener) = running.listener.as_mut() {
+                let exit = listener
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|exit| exit);
+                running.listener_exit = Some(exit);
+                running.listener = None;
+            }
+            running
+                .listener_exit
+                .as_ref()
+                .expect("original listener exit")
+                .as_ref()
+                .map_err(Clone::clone)?;
+            phase("node stop: listener family joined; broker join");
+            let running = self.running.take().expect("the joined original node");
             drop(running.broker);
+            phase("node stop: broker joined and store released");
         }
+        Ok(())
     }
 
     /// Stops the broker, opens the directory on its own to run `inspect`
@@ -95,11 +138,14 @@ impl DurableNode {
         &mut self,
         inspect: impl FnOnce(&StateMachine<FjallStore>) -> TestResult<R>,
     ) -> TestResult<R> {
-        self.stop().await;
+        self.stop().await?;
+        phase("node reopen: isolated store open");
         let inspected = {
             let machine = StateMachine::new(FjallStore::open(self.directory.path())?);
+            phase("node reopen: inspection");
             inspect(&machine)
         };
+        phase("node reopen: isolated store dropped; restart");
         self.start().await?;
         inspected
     }
@@ -138,10 +184,18 @@ impl DurableNode {
     }
 
     pub async fn connect(&self) -> TestResult<Connection> {
-        Ok(Connection::builder()
+        phase("client connect: open");
+        let connection = Connection::builder()
             .container_id("durable-content-test-client")
             .open(self.running().address.as_str())
-            .await?)
+            .await?;
+        phase("client connect: opened");
+        Ok(connection)
+    }
+
+    /// Normal completion joins originals before the temporary directory drops.
+    pub async fn shutdown(&mut self) -> TestResult {
+        self.stop().await
     }
 
     pub fn submit(&self, entity: &str, kind: CommandKind) -> TestResult<CommandOutcome> {
@@ -155,10 +209,86 @@ impl DurableNode {
 
 impl Drop for DurableNode {
     fn drop(&mut self) {
+        phase("node Drop: fallback cleanup (not drain proof)");
         if let Some(running) = self.running.take() {
-            running.listener.abort();
+            running.retirement.request();
+            if let Some(listener) = running.listener {
+                listener.abort();
+            }
             drop(running.broker);
         }
+        phase("node Drop: fields/temporary directory follow");
+    }
+}
+
+#[cfg(test)]
+mod custody_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_reopen_keeps_the_original_listener_join_before_store_open() -> TestResult {
+        let mut node = DurableNode::create(Vec::new()).await?;
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let running = node.running.as_mut().expect("running");
+        let original = running.listener.take().expect("original listener");
+        // This retained wrapper cannot publish completion before its original
+        // listener has actually joined, even after the reopen waiter is canceled.
+        running.listener = Some(tokio::spawn(async move {
+            let result = original.await.map_err(|error| error.to_string())?;
+            let _ = gate.await;
+            result
+        }));
+        let inspected = Arc::new(AtomicBool::new(false));
+        {
+            let inspected = inspected.clone();
+            let reopen = node.reopen(move |_| {
+                inspected.store(true, Ordering::SeqCst);
+                Ok(())
+            });
+            tokio::pin!(reopen);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut reopen)
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            !inspected.load(Ordering::SeqCst),
+            "unjoined owners cannot authorize reopen"
+        );
+        release
+            .send(())
+            .expect("original waiter retained after cancellation");
+        node.reopen(|_| {
+            inspected.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await?;
+        assert!(inspected.load(Ordering::SeqCst));
+        node.shutdown().await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_protocol_header_is_retired_before_reopen() -> TestResult {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut node = DurableNode::create(Vec::new()).await?;
+        let address = node.running().address.trim_start_matches("amqp://");
+        let mut peer = tokio::net::TcpStream::connect(address).await?;
+        peer.write_all(b"AMQP\0\x01\0\0").await?;
+        let mut response = [0; 8];
+        tokio::time::timeout(WAIT, peer.read_exact(&mut response)).await??;
+        assert_eq!(&response, b"AMQP\0\x01\0\0");
+        // The response proves the original was accepted. No Open follows, so
+        // the peer cannot complete admission on its own.
+        node.snapshot().await?;
+        drop(peer);
+        node.shutdown().await
     }
 }
 
@@ -190,6 +320,7 @@ pub struct Management {
 
 impl Management {
     pub async fn attach(session: &mut Session, entity: &str) -> TestResult<Self> {
+        phase("management attach: response receiver");
         let node = format!("{entity}/$management");
         let reply_to = format!("{entity}-replies");
         let responses = Receiver::builder()
@@ -204,6 +335,7 @@ impl Management {
             node.as_str(),
         )
         .await?;
+        phase("management attach: complete");
         Ok(Self {
             requests,
             responses,
@@ -235,13 +367,17 @@ impl Management {
             .application_properties(properties)
             .body(Body::Value(Value::Map(body)))
             .build();
+        phase(format_args!("management {operation}: send"));
         assert!(matches!(
             self.requests.send(request).await?,
             Outcome::Accepted(_)
         ));
+        phase(format_args!("management {operation}: response wait"));
         let response = tokio::time::timeout(WAIT, self.responses.recv()).await??;
         let message = response.message().clone();
+        phase(format_args!("management {operation}: response accept"));
         self.responses.accept(&response).await?;
+        phase(format_args!("management {operation}: complete"));
         let status = match message
             .application_properties
             .as_ref()

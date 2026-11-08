@@ -38,6 +38,20 @@ Run focused tests first and broaden verification with the change's risk.
 Protocol/broker changes need relevant client or end-to-end coverage and a
 compatibility update; report skipped gates rather than imply they passed.
 
+The durable-content integration binary runs under an outer process deadline in
+CI using `tools/bounded_test.py`. Compile it first with Cargo's JSON artifact
+output, then select the exact test target with `--cargo-artifacts` and
+`--test-target`. `--nocapture` preserves named setup, operation, reopen and
+cleanup phases in the log. `--stacks` attempts a bounded GDB capture on expiry
+when GDB and local tracing permissions are available. Missing stacks are not
+evidence of a successful diagnostic capture.
+
+This deadline also contains synchronous destructors that an async timeout cannot
+interrupt. Expiry always fails the test; killing its owned process group is not
+proof of graceful drain and must never authorize reopening its store. Within
+the durable fixture, normal reopen waits for the retained listener family and
+broker owner to join before opening the directory again.
+
 ### Shared Target Handoffs
 
 Opt-in Linux/Python 3.11+ guard: [cargo_handoff.py](tools/cargo_handoff.py).

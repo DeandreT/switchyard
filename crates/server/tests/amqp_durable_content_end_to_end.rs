@@ -17,7 +17,7 @@ mod durable_node;
 
 use durable_node::{
     DurableNode, Expect, Management, TestResult, assert_nothing_more, assert_renders,
-    assert_stored, entity, holds, lock_token_of, namespace, next, sequence_of,
+    assert_stored, entity, holds, lock_token_of, namespace, next, phase, sequence_of,
 };
 
 fn queue(name: &str, config: QueueConfig) -> (&str, CommandKind) {
@@ -369,7 +369,8 @@ async fn sends_batches_peeks_and_both_receive_modes_render_the_original_after_re
         }
         Ok(())
     })
-    .await
+    .await?;
+    node.shutdown().await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -484,7 +485,8 @@ async fn scheduled_sends_activate_with_their_original_content_after_reopen() -> 
         assert!(ready(machine, "orders")?.is_empty());
         Ok(())
     })
-    .await
+    .await?;
+    node.shutdown().await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -603,7 +605,8 @@ async fn a_deferred_copy_keeps_its_content_and_patches_through_receive_by_sequen
         );
         Ok(())
     })
-    .await
+    .await?;
+    node.shutdown().await
 }
 
 /// Drains the one dead-lettered copy and checks it against the original.
@@ -837,7 +840,8 @@ async fn explicit_and_automatic_dead_letters_keep_their_content_after_reopen() -
             ..Expect::default()
         },
     )
-    .await
+    .await?;
+    node.shutdown().await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1002,7 +1006,8 @@ async fn property_patches_render_over_the_untouched_original_after_reopen() -> T
         );
         Ok(())
     })
-    .await
+    .await?;
+    node.shutdown().await
 }
 
 fn rejected_with(outcome: Outcome, condition: &str) {
@@ -1023,11 +1028,17 @@ async fn send_alone(
     message: Message,
     format: u32,
 ) -> TestResult<Result<Outcome, amqp::EngineError>> {
+    phase("send_alone: connect");
     let mut connection = node.connect().await?;
+    phase("send_alone: session begin");
     let mut session = Session::begin(&mut connection).await?;
+    phase("send_alone: sender attach");
     let mut sender = Sender::attach(&mut session, "refused", "orders").await?;
+    phase("send_alone: original send wait");
     let outcome = sender.send_with_format(message, format).await;
+    phase("send_alone: original close wait");
     let _ = connection.close().await;
+    phase("send_alone: complete");
     Ok(outcome)
 }
 
@@ -1041,6 +1052,7 @@ async fn lock_deferred(management: &mut Management) -> TestResult<amqp::Uuid> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_and_oversized_content_refuses_and_leaves_the_store_unchanged() -> TestResult {
+    phase("malformed content: setup");
     // A small limit keeps an oversized message under the links' own limits.
     const LIMIT: usize = 2_048;
     let mut node = DurableNode::create(vec![queue(
@@ -1069,6 +1081,7 @@ async fn malformed_and_oversized_content_refuses_and_leaves_the_store_unchanged(
         connection.close().await?;
     }
     let before = node.snapshot().await?;
+    phase("malformed content: initial snapshot complete");
 
     let oversized = rich(
         "oversized",
@@ -1125,6 +1138,7 @@ async fn malformed_and_oversized_content_refuses_and_leaves_the_store_unchanged(
             protocol_amqp::INVALID_FIELD,
         ),
     ] {
+        phase(format_args!("malformed content: refusal {label}"));
         let outcome = send_alone(&node, message, format).await?;
         rejected_with(
             outcome.map_err(|error| format!("{label}: {error:?}"))?,
@@ -1164,6 +1178,7 @@ async fn malformed_and_oversized_content_refuses_and_leaves_the_store_unchanged(
     }
 
     let after = node.snapshot().await?;
+    phase("malformed content: refusal snapshot complete; patch boundaries");
     assert!(
         after == before,
         "a refusal changed stored state across a restart"
@@ -1210,6 +1225,7 @@ async fn malformed_and_oversized_content_refuses_and_leaves_the_store_unchanged(
     // A patch value failing the received checks fails the request frame
     // itself, which ends the management link before any patch is read.
     {
+        phase("malformed content: malformed patch");
         let mut connection = node.connect().await?;
         let mut session = Session::begin(&mut connection).await?;
         let mut management = Management::attach(&mut session, "orders").await?;
@@ -1240,6 +1256,7 @@ async fn malformed_and_oversized_content_refuses_and_leaves_the_store_unchanged(
 
     // The copy still renders and the refusals consumed no sequence numbers.
     {
+        phase("malformed content: final rendering and sequence");
         let mut connection = node.connect().await?;
         let mut session = Session::begin(&mut connection).await?;
         let mut management = Management::attach(&mut session, "orders").await?;
@@ -1268,7 +1285,11 @@ async fn malformed_and_oversized_content_refuses_and_leaves_the_store_unchanged(
         let following = next(&mut receiver).await?;
         assert_eq!(sequence_of(following.message()), 2);
         receiver.accept(&following).await?;
+        phase("malformed content: final connection close");
         connection.close().await?;
     }
+    phase("malformed content: final original-owner shutdown");
+    node.shutdown().await?;
+    phase("malformed content: complete; destructors follow");
     Ok(())
 }
