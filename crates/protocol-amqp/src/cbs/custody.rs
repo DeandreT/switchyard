@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::CbsResponse;
-use crate::authorization::ConnectionAuthorization;
+use crate::authorization::{AuthorizationError, ConnectionAuthorization};
 use crate::listener::connection_custody::ConnectionRetirementRequest;
 
 pub(super) type PanicPayload = Box<dyn Any + Send>;
@@ -66,20 +66,37 @@ impl OperationControl {
 }
 
 pub(super) struct TokenValidation<'a> {
-    actual: Pin<Box<dyn Future<Output = Result<(), auth::SasError>> + Send + 'a>>,
+    actual: Pin<Box<dyn Future<Output = Result<(), AuthorizationError>> + Send + 'a>>,
     control: OperationControl,
     started: bool,
 }
 
 impl<'a> TokenValidation<'a> {
+    #[cfg(test)]
     pub(super) fn new(
         authorization: &'a ConnectionAuthorization,
         token: &'a str,
         audience: &'a str,
         control: OperationControl,
     ) -> Self {
+        Self::for_type(
+            authorization,
+            super::SAS_TOKEN_TYPE,
+            token,
+            audience,
+            control,
+        )
+    }
+
+    pub(super) fn for_type(
+        authorization: &'a ConnectionAuthorization,
+        token_type: &'a str,
+        token: &'a str,
+        audience: &'a str,
+        control: OperationControl,
+    ) -> Self {
         Self {
-            actual: Box::pin(authorization.validate_and_add(token, audience)),
+            actual: Box::pin(authorization.validate_token_and_add(token_type, token, audience)),
             control,
             started: false,
         }
@@ -87,14 +104,14 @@ impl<'a> TokenValidation<'a> {
 }
 
 impl Future for TokenValidation<'_> {
-    type Output = Option<Result<(), auth::SasError>>;
+    type Output = Option<Result<(), AuthorizationError>>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         if !self.started {
             if !self.control.begin() {
                 return Poll::Ready(None);
             }
-            // Constructing the concrete async validate_and_add future is
+            // Constructing the concrete async validate_token_and_add future is
             // inert. Its validation and grant-lock wait begin at this poll.
             self.started = true;
         }

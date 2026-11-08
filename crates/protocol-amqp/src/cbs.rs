@@ -28,6 +28,8 @@ type CbsError = Box<dyn std::error::Error + Send + Sync>;
 
 pub(crate) const PUT_TOKEN_OPERATION: &str = "put-token";
 pub(crate) const SAS_TOKEN_TYPE: &str = "servicebus.windows.net:sastoken";
+// Azure.Messaging.ServiceBus 7.21.0 and 7.20.2 CbsTokenProvider contract.
+pub(crate) const JWT_TOKEN_TYPE: &str = "jwt";
 
 const OPERATION_PROPERTY: &str = "operation";
 const TOKEN_TYPE_PROPERTY: &str = "type";
@@ -260,8 +262,9 @@ async fn process_request(
             "application properties are required",
         ));
     };
+    let token_type = string_property(properties, TOKEN_TYPE_PROPERTY);
     if string_property(properties, OPERATION_PROPERTY) != Some(PUT_TOKEN_OPERATION)
-        || string_property(properties, TOKEN_TYPE_PROPERTY) != Some(SAS_TOKEN_TYPE)
+        || !matches!(token_type, Some(SAS_TOKEN_TYPE | JWT_TOKEN_TYPE))
     {
         return Some(CbsResponse::bad_request(
             message_id,
@@ -277,12 +280,24 @@ async fn process_request(
     let Body::Value(Value::String(token)) = &message.body else {
         return Some(CbsResponse::bad_request(
             message_id,
-            "the SAS token must be an AMQP value string",
+            if token_type == Some(SAS_TOKEN_TYPE) {
+                "the SAS token must be an AMQP value string"
+            } else {
+                "the JWT token must be an AMQP value string"
+            },
         ));
     };
 
     Some(
-        match TokenValidation::new(authorization, token, audience, control).await? {
+        match TokenValidation::for_type(
+            authorization,
+            token_type.unwrap(),
+            token,
+            audience,
+            control,
+        )
+        .await?
+        {
             Ok(()) => CbsResponse::accepted(message_id),
             Err(_) => CbsResponse::unauthorized(message_id),
         },

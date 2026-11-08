@@ -34,6 +34,8 @@ mod connection_family;
 #[cfg(test)]
 mod deadline_tests;
 #[cfg(test)]
+mod jwt_tests;
+#[cfg(test)]
 mod tcp_tests;
 #[cfg(test)]
 mod test_support;
@@ -44,6 +46,11 @@ use connection_family::{AdmittedConnectionTask, ConnectionFamily, FamilyFailures
 
 type PanicPayload = Box<dyn Any + Send>;
 type Primary = std::thread::Result<io::Result<()>>;
+
+/// Private evidence of successful TLS admission of the stream passed onward.
+/// Only this module's TLS handshake branches can construct it; configuring a
+/// listener, accepting AMQP elsewhere, or peer input cannot mint this proof.
+pub(crate) struct TlsAdmission(());
 
 enum PumpExit {
     Retired,
@@ -438,12 +445,15 @@ async fn serve_wss_task<B: Broker>(
         Some(acceptor) => {
             let handshake = before_deadline(deadline, Stage::Tls, acceptor.accept(stream));
             match until_retired(&retirement, handshake, Stage::Tls).await {
-                Some(Ok(stream)) => serve_wss_stream(stream, config, retirement, deadline).await,
+                Some(Ok(stream)) => {
+                    serve_wss_stream(stream, config, retirement, deadline, Some(TlsAdmission(())))
+                        .await
+                }
                 Some(Err(error)) => ConnectionTaskExit::Complete(Err(error.into())),
                 None => ConnectionTaskExit::Complete(Ok(())),
             }
         }
-        None => serve_wss_stream(stream, config, retirement, deadline).await,
+        None => serve_wss_stream(stream, config, retirement, deadline, None).await,
     }
 }
 
@@ -452,6 +462,7 @@ async fn serve_wss_stream<Io, B>(
     config: AmqpListener<B>,
     retirement: AmqpListenerRetirement,
     deadline: Instant,
+    tls: Option<TlsAdmission>,
 ) -> ConnectionTaskExit
 where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -459,7 +470,9 @@ where
 {
     let upgrade = before_deadline(deadline, Stage::Upgrade, accept_amqp_websocket(stream));
     match until_retired(&retirement, upgrade, Stage::Upgrade).await {
-        Some(Ok(stream)) => serve_retained_connection(stream, config, retirement, deadline).await,
+        Some(Ok(stream)) => {
+            serve_retained_connection(stream, config, retirement, deadline, tls).await
+        }
         Some(Err(error)) => ConnectionTaskExit::Complete(Err(error.into())),
         None => ConnectionTaskExit::Complete(Ok(())),
     }
@@ -476,13 +489,20 @@ async fn serve_tcp_task<B: Broker>(
             let handshake = before_deadline(deadline, Stage::Tls, acceptor.accept(stream));
             match until_retired(&retirement, handshake, Stage::Tls).await {
                 Some(Ok(stream)) => {
-                    serve_retained_connection(stream, config, retirement, deadline).await
+                    serve_retained_connection(
+                        stream,
+                        config,
+                        retirement,
+                        deadline,
+                        Some(TlsAdmission(())),
+                    )
+                    .await
                 }
                 Some(Err(error)) => ConnectionTaskExit::Complete(Err(error.into())),
                 None => ConnectionTaskExit::Complete(Ok(())),
             }
         }
-        None => serve_retained_connection(stream, config, retirement, deadline).await,
+        None => serve_retained_connection(stream, config, retirement, deadline, None).await,
     }
 }
 
@@ -524,6 +544,7 @@ async fn serve_retained_connection<Io, B>(
     config: AmqpListener<B>,
     retirement: AmqpListenerRetirement,
     deadline: Instant,
+    tls: Option<TlsAdmission>,
 ) -> ConnectionTaskExit
 where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -554,7 +575,7 @@ where
         test_support::native_accepted();
         let authorization = config.shared_access_authentication.map(|config| {
             let grant = sasl.as_ref().and_then(SharedAccessSaslAcceptor::grant);
-            ConnectionAuthorization::new(config, grant)
+            ConnectionAuthorization::new_for_transport(config, grant, tls)
         });
         let request = custody.request_handle();
         tokio::select! {
