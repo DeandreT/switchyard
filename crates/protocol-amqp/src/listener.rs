@@ -507,6 +507,7 @@ struct LinkAuthorization {
 }
 
 struct ReceivingLinkProtocol {
+    authority: crate::broker::ReceivingAuthority,
     authorization: Option<LinkAuthorization>,
     management: Arc<ConnectionManagement>,
     session_registration: Option<SessionRegistration>,

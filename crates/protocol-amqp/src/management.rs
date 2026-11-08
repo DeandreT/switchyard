@@ -83,6 +83,30 @@ struct RequestResponseDeliveryKey {
 pub(crate) struct ManagedDelivery {
     entity: EntityPath,
     sequence: SequenceNumber,
+    authority: DeliveryAuthority,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DeliveryAuthority {
+    Receiving(crate::broker::ReceivingAuthority),
+    RequestResponse,
+}
+
+impl ManagedDelivery {
+    async fn submit<B: Broker>(
+        &self,
+        broker: &B,
+        namespace: NamespaceName,
+        entity: EntityPath,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, BrokerRejection> {
+        match &self.authority {
+            DeliveryAuthority::Receiving(authority) => {
+                authority.submit(broker, namespace, entity, kind).await
+            }
+            DeliveryAuthority::RequestResponse => broker.submit(namespace, entity, kind).await,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -240,13 +264,18 @@ impl ConnectionManagement {
         entity: EntityPath,
         sequence: SequenceNumber,
         lock_token: LockToken,
+        authority: crate::broker::ReceivingAuthority,
     ) -> DeliveryRegistration {
         let registration = DeliveryRegistration {
             key: DeliveryKey {
                 link_name: link_name.to_owned(),
                 lock_token,
             },
-            managed: ManagedDelivery { entity, sequence },
+            managed: ManagedDelivery {
+                entity,
+                sequence,
+                authority: DeliveryAuthority::Receiving(authority),
+            },
             identity: Arc::new(()),
         };
         self.deliveries
@@ -318,7 +347,11 @@ impl ConnectionManagement {
         deliveries.insert(
             registration.key.clone(),
             RequestResponseDelivery {
-                managed: ManagedDelivery { entity, sequence },
+                managed: ManagedDelivery {
+                    entity,
+                    sequence,
+                    authority: DeliveryAuthority::RequestResponse,
+                },
                 registration: registration.clone(),
                 expires_at: request_response_deadline(now, lock.lock_duration_millis),
             },
@@ -1268,8 +1301,10 @@ async fn renew_message_lock<B: Broker>(
         );
     };
 
-    match broker
+    match delivery
+        .managed
         .submit(
+            broker,
             namespace.clone(),
             entity.clone(),
             CommandKind::RenewLock {

@@ -22,7 +22,13 @@ async fn start_worker(
 ) -> (Id, u32, DeliveryRegistration) {
     let token = delivery.lock.unwrap().token;
     let registration = management
-        .register_delivery(LINK, actor.entity.clone(), delivery.sequence, token)
+        .register_delivery(
+            LINK,
+            actor.entity.clone(),
+            delivery.sequence,
+            token,
+            actor.authority(),
+        )
         .await;
     let (pending, wire_id) = wire.start(&delivery).await;
     let retired = workers.subscribe();
@@ -371,7 +377,13 @@ async fn actual_ready_remote_outcome_wins_sticky_retirement() {
             let mut wire = Wire::new(mode).await;
             let management = ConnectionManagement::new();
             let registration = management
-                .register_delivery(LINK, actor.entity.clone(), delivery.sequence, token)
+                .register_delivery(
+                    LINK,
+                    actor.entity.clone(),
+                    delivery.sequence,
+                    token,
+                    actor.authority(),
+                )
                 .await;
             // Retain the genuine PendingDelivery without polling its outcome.
             let (pending, wire_id) = wire.start(&delivery).await;
@@ -497,7 +509,13 @@ async fn stale_real_worker_preserves_an_equal_payload_replacement_registration()
             .await;
             let payload = management.delivery(LINK, token).await.unwrap();
             let replacement = management
-                .register_delivery(LINK, actor.entity.clone(), sequence, token)
+                .register_delivery(
+                    LINK,
+                    actor.entity.clone(),
+                    sequence,
+                    token,
+                    actor.authority(),
+                )
                 .await;
             assert_ne!(original, replacement);
             assert_eq!(
@@ -547,7 +565,13 @@ async fn original_real_worker_panic_retains_token_id_and_payload_through_next() 
     let retirement = workers.subscribe();
     let management = ConnectionManagement::new();
     let registration = management
-        .register_delivery(LINK, actor.entity.clone(), delivery.sequence, token)
+        .register_delivery(
+            LINK,
+            actor.entity.clone(),
+            delivery.sequence,
+            token,
+            actor.authority(),
+        )
         .await;
     let context = actor.context(management);
     let original = registration.clone();
@@ -717,7 +741,13 @@ async fn thirty_two_completed_unreaped_real_workers_still_consume_the_bound() {
     let retirement = workers.subscribe();
     let management = ConnectionManagement::new();
     let registration = management
-        .register_delivery(LINK, actor.entity.clone(), extra.sequence, token)
+        .register_delivery(
+            LINK,
+            actor.entity.clone(),
+            extra.sequence,
+            token,
+            actor.authority(),
+        )
         .await;
     let context = actor.context(management);
     let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -770,6 +800,7 @@ async fn natural_pump_joins_commit_before_releasing_its_held_session() {
             let namespace = actor.namespace.clone();
             let entity = actor.entity.clone();
             let protocol = ReceivingLinkProtocol {
+                authority: actor.authority(),
                 authorization: None,
                 management: Arc::clone(&management),
                 session_registration: None,
@@ -884,6 +915,10 @@ async fn late_adoption_preserves_retained_raw_failure_and_allows_only_one_origin
             domain::EntityPath::new("orders").unwrap(),
             domain::SequenceNumber::new(9),
             token,
+            crate::broker::ReceivingAuthority::Ordinary(crate::broker::test_binding(
+                domain::NamespaceName::new("tenant").unwrap(),
+                domain::EntityPath::new("orders").unwrap(),
+            )),
         )
         .await;
     let failed_id = workers.spawn(Some(registration.clone()), async {
@@ -909,6 +944,10 @@ async fn late_adoption_preserves_retained_raw_failure_and_allows_only_one_origin
             domain::EntityPath::new("orders").unwrap(),
             domain::SequenceNumber::new(9),
             token,
+            crate::broker::ReceivingAuthority::Ordinary(crate::broker::test_binding(
+                domain::NamespaceName::new("tenant").unwrap(),
+                domain::EntityPath::new("orders").unwrap(),
+            )),
         )
         .await;
     assert_ne!(registration, adopted_registration);

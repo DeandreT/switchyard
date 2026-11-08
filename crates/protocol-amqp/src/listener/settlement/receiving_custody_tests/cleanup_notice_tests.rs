@@ -24,6 +24,7 @@ fn context<B: Broker>(
     management: Arc<ConnectionManagement>,
 ) -> SettlementContext<B> {
     SettlementContext {
+        authority: actor.authority(),
         namespace: actor.namespace.clone(),
         entity: actor.entity.clone(),
         broker,
@@ -77,6 +78,7 @@ async fn start_worker<B: Broker>(
             actor.entity.clone(),
             delivery.sequence,
             delivery.lock.unwrap().token,
+            actor.authority(),
         )
         .await;
     let (pending, wire_id) = wire.start(&delivery).await;
@@ -552,10 +554,22 @@ async fn new_actual_native_error_notifies_before_conditional_row_wait_but_cached
             let management = ConnectionManagement::new();
             let token = delivery.lock.unwrap().token;
             let old = management
-                .register_delivery(LINK, actor.entity.clone(), delivery.sequence, token)
+                .register_delivery(
+                    LINK,
+                    actor.entity.clone(),
+                    delivery.sequence,
+                    token,
+                    actor.authority(),
+                )
                 .await;
             let replacement = management
-                .register_delivery(LINK, actor.entity.clone(), delivery.sequence, token)
+                .register_delivery(
+                    LINK,
+                    actor.entity.clone(),
+                    delivery.sequence,
+                    token,
+                    actor.authority(),
+                )
                 .await;
             assert_ne!(old, replacement);
             let context = actor.context(Arc::clone(&management));
@@ -645,6 +659,21 @@ struct CompletePanicBroker {
 }
 
 impl Broker for CompletePanicBroker {
+    async fn submit_bound(
+        &self,
+        binding: domain::EntityBinding,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, BrokerRejection> {
+        let panic =
+            matches!(kind, CommandKind::Complete { sequence, .. } if sequence == self.first);
+        let raw = self.actual.submit_bound(binding, kind).await;
+        if panic {
+            self.reached.notify_one();
+            self.allow.notified().await;
+            std::panic::panic_any(Arc::clone(&self.payload));
+        }
+        raw
+    }
     async fn submit(
         &self,
         namespace: NamespaceName,

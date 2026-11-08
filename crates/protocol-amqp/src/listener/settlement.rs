@@ -63,6 +63,7 @@ struct SettlementCompletion {
 
 #[derive(Clone)]
 struct SettlementContext<B> {
+    authority: crate::broker::ReceivingAuthority,
     namespace: NamespaceName,
     entity: EntityPath,
     broker: B,
@@ -147,12 +148,14 @@ pub(super) fn prepare_receiving_entry<B: Broker>(
     protocol: ReceivingLinkProtocol,
 ) -> PreparedReceivingEntry<B> {
     let ReceivingLinkProtocol {
+        authority,
         authorization,
         management,
         session_registration,
     } = protocol;
     let link_name = sender.name().to_owned();
     let settlement_context = SettlementContext {
+        authority,
         namespace: namespace.clone(),
         entity: entity.clone(),
         broker: broker.clone(),
@@ -279,8 +282,9 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
         let wakeup = broker.deliverable(&namespace, &entity);
         tokio::pin!(wakeup);
         *intake = Some(ReceiveIntake::new(reservation, async {
-            broker
+            settlement_context.authority
                 .submit(
+                    &broker,
                     namespace.clone(),
                     entity.clone(),
                     CommandKind::Receive {
@@ -388,8 +392,9 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
             Err(error) => break 'pump PumpExit::Engine(error),
         }
         if let Some(lock) = staged_lock {
-            let completed = broker
+            let completed = settlement_context.authority
                 .submit(
+                    &broker,
                     namespace.clone(),
                     entity.clone(),
                     CommandKind::Complete { sequence: delivery.sequence, lock_token: lock.token },
@@ -408,7 +413,7 @@ pub(super) async fn serve_receiving_entry<B: Broker>(
         let lock_token = delivery.lock.map(|lock| lock.token);
         *transfer_registration = if let Some(lock) = delivery.lock {
             let registration = management
-                .register_delivery(&link_name, entity.clone(), delivery.sequence, lock.token)
+                .register_delivery(&link_name, entity.clone(), delivery.sequence, lock.token, settlement_context.authority.clone())
                 .await;
             registered_deliveries.push(registration.clone());
             Some(registration)
@@ -685,6 +690,7 @@ async fn settle_started_delivery<B: Broker>(
     mut retirement: watch::Receiver<bool>,
 ) -> Result<(), SettlementFailure> {
     let SettlementContext {
+        authority,
         namespace,
         entity,
         broker,
@@ -754,7 +760,7 @@ async fn settle_started_delivery<B: Broker>(
     // Service Bus treats the second-mode confirmation as the result of the
     // durable broker operation, not as an echo of the requested disposition.
     // A polled submission may already be queued, so retirement cannot cancel it.
-    match broker.submit(namespace, entity, kind).await {
+    match authority.submit(&broker, namespace, entity, kind).await {
         Ok(outcome) if expected.matches(&outcome) => {
             confirm_if_needed(
                 confirmation,

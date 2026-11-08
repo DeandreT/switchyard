@@ -32,6 +32,9 @@ type RawResult = Result<CommandOutcome, BrokerRejection>;
 #[path = "request_panic_tests.rs"]
 mod panic_tests;
 
+#[path = "receiver_capability_tests.rs"]
+mod receiver_capability_tests;
+
 #[derive(Default)]
 struct ResultGate {
     paused: AtomicBool,
@@ -236,6 +239,38 @@ struct ActualBroker {
 }
 
 impl Broker for ActualBroker {
+    fn submit_bound(
+        &self,
+        binding: domain::EntityBinding,
+        kind: CommandKind,
+    ) -> impl Future<Output = RawResult> + Send {
+        let index = {
+            let mut submissions = self.submissions.lock().unwrap();
+            let index = submissions.len();
+            submissions.push(Submission {
+                kind: kind.clone(),
+                polled: false,
+                result: None,
+            });
+            index
+        };
+        async move {
+            self.submissions.lock().unwrap()[index].polled = true;
+            let result =
+                self.handle
+                    .submit_bound(binding, kind)
+                    .await
+                    .map_err(|error| match error {
+                        server::SubmitError::Propose(server::ProposeError::Broker(error)) => {
+                            BrokerRejection::Refused(error)
+                        }
+                        other => BrokerRejection::Unavailable(other.to_string()),
+                    });
+            self.submissions.lock().unwrap()[index].result = Some(result.clone());
+            self.result_gate.wait().await;
+            result
+        }
+    }
     fn submit(
         &self,
         namespace: NamespaceName,
@@ -278,6 +313,7 @@ impl Broker for ActualBroker {
 }
 
 struct Actor {
+    authority: Option<crate::broker::ReceivingAuthority>,
     owner: Option<server::Broker>,
     actual: Option<ActualBroker>,
     store: Option<GatedStore>,
@@ -292,6 +328,11 @@ struct Actor {
 }
 
 impl Actor {
+    fn authority(&self) -> crate::broker::ReceivingAuthority {
+        self.authority
+            .clone()
+            .expect("fixture captures before gated operations")
+    }
     fn new(durable: bool, sessions: bool) -> Self {
         let gate = Arc::new(ApplyGate::default());
         let memory = (!durable).then(MemoryStore::default);
@@ -316,7 +357,8 @@ impl Actor {
             submissions: Arc::clone(&submissions),
             result_gate: Arc::clone(&result_gate),
         };
-        let actor = Self {
+        let mut actor = Self {
+            authority: None,
             owner: Some(owner),
             actual: Some(actual),
             store: Some(store),
@@ -338,6 +380,19 @@ impl Actor {
             }),
             CommandOutcome::QueueCreated
         );
+        actor.authority = Some(if sessions {
+            crate::broker::ReceivingAuthority::Session
+        } else {
+            crate::broker::ReceivingAuthority::Ordinary(
+                actor
+                    .actual
+                    .as_ref()
+                    .unwrap()
+                    .handle
+                    .bind_entity_blocking(actor.namespace.clone(), actor.entity.clone())
+                    .unwrap(),
+            )
+        });
         actor
     }
 
@@ -493,7 +548,21 @@ async fn actual_cross_entity_token_collision_excludes_the_unrelated_ordinary_ali
         let (other, replacement) = replacement_delivery(&actor);
         let management = ConnectionManagement::new();
         let ordinary = management
-            .register_delivery(LINK, other.clone(), replacement.sequence, token)
+            .register_delivery(
+                LINK,
+                other.clone(),
+                replacement.sequence,
+                token,
+                crate::broker::ReceivingAuthority::Ordinary(
+                    actor
+                        .actual
+                        .as_ref()
+                        .unwrap()
+                        .handle
+                        .bind_entity_blocking(actor.namespace.clone(), other.clone())
+                        .unwrap(),
+                ),
+            )
             .await;
         let request_response = management
             .register_request_response_delivery(actor.entity.clone(), original.clone())
@@ -536,10 +605,22 @@ async fn actual_equal_payload_registrations_have_distinct_owners_for_remove_and_
         let lock = delivery.lock.unwrap();
         let management = ConnectionManagement::new();
         let old = management
-            .register_delivery(LINK, actor.entity.clone(), delivery.sequence, lock.token)
+            .register_delivery(
+                LINK,
+                actor.entity.clone(),
+                delivery.sequence,
+                lock.token,
+                actor.authority(),
+            )
             .await;
         let replacement = management
-            .register_delivery(LINK, actor.entity.clone(), delivery.sequence, lock.token)
+            .register_delivery(
+                LINK,
+                actor.entity.clone(),
+                delivery.sequence,
+                lock.token,
+                actor.authority(),
+            )
             .await;
         assert_eq!(old.managed, replacement.managed);
         assert_ne!(old, replacement);
@@ -601,7 +682,13 @@ async fn ordinary_authority_captures_an_expired_alias_and_renews_it_before_purge
         let lock = delivery.lock.unwrap();
         let management = ConnectionManagement::new();
         management
-            .register_delivery(LINK, actor.entity.clone(), delivery.sequence, lock.token)
+            .register_delivery(
+                LINK,
+                actor.entity.clone(),
+                delivery.sequence,
+                lock.token,
+                actor.authority(),
+            )
             .await;
         let now = Instant::now();
         let started = now - Duration::from_millis(lock.lock_duration_millis);
@@ -686,6 +773,19 @@ async fn actual_management_results_preserve_replaced_owners_after_success_and_de
                         actor.clock.set(2_000);
                     }
                     let (other, other_delivery) = replacement_delivery(&actor);
+                    let replacement_authority = if equal_payload {
+                        actor.authority()
+                    } else {
+                        crate::broker::ReceivingAuthority::Ordinary(
+                            actor
+                                .actual
+                                .as_ref()
+                                .unwrap()
+                                .handle
+                                .bind_entity_blocking(actor.namespace.clone(), other.clone())
+                                .unwrap(),
+                        )
+                    };
                     let other_before = actor.message_on(&other, other_delivery.sequence).unwrap();
                     let management = ConnectionManagement::new();
                     let (old, old_rr) = register_lock(&management, &actor, &delivery).await;
@@ -725,7 +825,13 @@ async fn actual_management_results_preserve_replaced_owners_after_success_and_de
                         other.clone()
                     };
                     let replacement = management
-                        .register_delivery(LINK, entity, delivery.sequence, lock.token)
+                        .register_delivery(
+                            LINK,
+                            entity,
+                            delivery.sequence,
+                            lock.token,
+                            replacement_authority,
+                        )
                         .await;
                     let replacement_rr = management
                         .register_request_response_delivery(actor.entity.clone(), delivery.clone())
@@ -864,6 +970,7 @@ async fn register_lock(
             actor.entity.clone(),
             delivery.sequence,
             delivery.lock.unwrap().token,
+            actor.authority(),
         )
         .await;
     let request_response = management

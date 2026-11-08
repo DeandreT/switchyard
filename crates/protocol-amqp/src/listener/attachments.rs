@@ -240,6 +240,7 @@ impl<'a> AttachmentHandoff<'a> {
 }
 
 pub(super) struct EntityLink {
+    pub(super) receiving_authority: Option<crate::broker::ReceivingAuthority>,
     pub(super) sender_binding: Option<EntityBinding>,
     pub(super) endpoint: LinkEndpoint,
     pub(super) entity: EntityPath,
@@ -271,6 +272,7 @@ impl EntityHandoffExit {
 }
 
 struct PreparedLink {
+    receiving_authority: Option<crate::broker::ReceivingAuthority>,
     sender_binding: Option<EntityBinding>,
     entity: EntityPath,
     authorization: Option<LinkAuthorization>,
@@ -309,6 +311,7 @@ async fn prepare_link(
         SessionRequest::None
     };
     Ok(PreparedLink {
+        receiving_authority: None,
         sender_binding: None,
         entity,
         authorization,
@@ -574,6 +577,14 @@ async fn entity_attachment_pump<'a, B: Broker>(
                         prepared.sender_binding = Some(broker.bind_entity(
                             namespace.clone(), prepared.entity.clone(),
                         ).await.map_err(|error| rejection_error(&error))?);
+                    } else {
+                        prepared.receiving_authority = Some(match prepared.session {
+                            SessionRequest::None => crate::broker::ReceivingAuthority::Ordinary(
+                                broker.bind_entity(namespace.clone(), prepared.entity.clone())
+                                    .await.map_err(|error| rejection_error(&error))?,
+                            ),
+                            _ => crate::broker::ReceivingAuthority::Session,
+                        });
                     }
                     Ok(prepared)
                 },
@@ -738,6 +749,7 @@ async fn entity_attachment_pump<'a, B: Broker>(
         unreachable!("captured native endpoint")
     };
     custody.ready = Some(EntityLink {
+        receiving_authority: prepared.receiving_authority,
         sender_binding: prepared.sender_binding,
         endpoint,
         entity: prepared.entity,
@@ -829,6 +841,10 @@ async fn prepare_and_adopt_with_retirement<B: Broker>(
                 ready.mode,
                 ready.accepted.as_ref().map(AcceptedSession::hold),
                 ReceivingLinkProtocol {
+                    authority: ready
+                        .receiving_authority
+                        .clone()
+                        .expect("receiving attachment captured authority"),
                     authorization: ready.authorization.clone(),
                     management: Arc::clone(management),
                     session_registration: ready.registration.clone(),

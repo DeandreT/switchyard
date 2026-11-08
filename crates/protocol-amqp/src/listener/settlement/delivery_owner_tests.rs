@@ -17,11 +17,23 @@ async fn cancelled_residual_cleanup_retains_originals_and_preserves_newer_regist
             let before = actor.store().snapshot().unwrap();
             let management = ConnectionManagement::new();
             let original = management
-                .register_delivery(LINK, actor.entity.clone(), delivery.sequence, token)
+                .register_delivery(
+                    LINK,
+                    actor.entity.clone(),
+                    delivery.sequence,
+                    token,
+                    actor.authority(),
+                )
                 .await;
             let payload = management.delivery(LINK, token).await.unwrap();
             let replacement = management
-                .register_delivery(LINK, actor.entity.clone(), delivery.sequence, token)
+                .register_delivery(
+                    LINK,
+                    actor.entity.clone(),
+                    delivery.sequence,
+                    token,
+                    actor.authority(),
+                )
                 .await;
             assert_ne!(original, replacement);
             assert_eq!(
@@ -31,7 +43,13 @@ async fn cancelled_residual_cleanup_retains_originals_and_preserves_newer_regist
             let mut retained = vec![original.clone(), replacement.clone()];
             let newer = if preserve_newer {
                 let registration = management
-                    .register_delivery(LINK, actor.entity.clone(), delivery.sequence, token)
+                    .register_delivery(
+                        LINK,
+                        actor.entity.clone(),
+                        delivery.sequence,
+                        token,
+                        actor.authority(),
+                    )
                     .await;
                 assert_ne!(registration, original);
                 assert_ne!(registration, replacement);
@@ -106,6 +124,7 @@ async fn cancelled_partial_residual_cleanup_retains_only_the_unfinished_original
                     actor.entity.clone(),
                     first_delivery.sequence,
                     first_token,
+                    actor.authority(),
                 )
                 .await;
             let remaining = management
@@ -114,6 +133,7 @@ async fn cancelled_partial_residual_cleanup_retains_only_the_unfinished_original
                     actor.entity.clone(),
                     remaining_delivery.sequence,
                     remaining_token,
+                    actor.authority(),
                 )
                 .await;
             assert!(management.delivery(LINK, first_token).await.is_some());
@@ -125,6 +145,7 @@ async fn cancelled_partial_residual_cleanup_retains_only_the_unfinished_original
                         actor.entity.clone(),
                         remaining_delivery.sequence,
                         remaining_token,
+                        actor.authority(),
                     )
                     .await;
                 assert_ne!(registration, remaining);

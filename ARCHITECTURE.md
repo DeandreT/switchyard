@@ -104,8 +104,12 @@ calls retain an opaque owner/target identity and recheck it before host or store
 Clock, including configuration-free commands. AMQP data senders retain that
 binding from authorized attach for ordinary/batch/scheduled transfers; management
 request links retain a separate capture used only for scheduled Send. Neither
-recaptures after a refusal. Receiving/session/other management operations, legacy
-name APIs, timers and raw catalog/diagnostic reads remain unfenced; no global
+recaptures after a refusal. Ordinary receiving links also capture once at attach:
+polls, both receive modes, staged deletion and delayed settlements retain it.
+Ordinary delivery capabilities preserve this provenance for management settlement
+and renewal after selection, independently of registry lifetime. Session and
+request-response consumption, other management operations, legacy name APIs,
+timers and raw catalog/diagnostic reads remain unfenced; no global
 orphan scan is added.
 See [topic routing](crates/domain/src/machine/topic.rs) and the
 [compatibility differences](docs/compatibility.md#known-differences-and-bounds).
