@@ -193,6 +193,94 @@ fn create(at: u64) -> DurableProposal {
 }
 
 #[test]
+fn action_rules_and_deletions_capture_but_uncompilable_action_refuses() {
+    for durable in [false, true] {
+        let mut fixture = Fixture::new(durable);
+        let subscription = path("events")
+            .subscription(&SubscriptionName::new("worker").unwrap())
+            .unwrap();
+        let originals = vec![
+            proposal(
+                1,
+                "events",
+                CommandKind::CreateTopic {
+                    config: TopicConfig::default(),
+                },
+            ),
+            proposal(
+                2,
+                "events",
+                CommandKind::CreateSubscription {
+                    name: SubscriptionName::new("worker").unwrap(),
+                    config: SubscriptionConfig::default(),
+                },
+            ),
+            proposal(
+                3,
+                subscription.as_str(),
+                CommandKind::CreateRuleWithAction {
+                    name: RuleName::new("remove").unwrap(),
+                    filter: RuleFilter::True,
+                    action: domain::SqlRuleAction::new("REMOVE user.old"),
+                },
+            ),
+            // A bounded empty AMQP message is valid typed content; removing an
+            // absent name still persists explicit removal intent in its copy.
+            proposal(
+                4,
+                "events",
+                CommandKind::SendContent {
+                    content: domain::MessageContent::AmqpTextIds(Vec::new()),
+                },
+            ),
+        ];
+        let payloads = originals
+            .iter()
+            .map(|p| p.encode().unwrap())
+            .collect::<Vec<_>>();
+        fixture.log(&payloads, originals.len() as u64);
+        fixture.seed(&originals);
+        let captured = fixture.check();
+        assert!(
+            captured
+                .image()
+                .snapshot()
+                .entries()
+                .iter()
+                .any(|(key, value)| key[0] == 3 && value[0] == 4)
+        );
+        let before = fixture.rows();
+        fixture.reopen();
+        assert_eq!(fixture.rows(), before);
+        fixture.check();
+        let (message_key, message_value) = before
+            .iter()
+            .find(|(key, value)| key[0] == 3 && value[0] == 4)
+            .unwrap();
+        let mut bad_copy = codec::message::decode(message_value).unwrap();
+        bad_copy.envelope = Some(bad_copy.envelope.unwrap().with_removals(vec!["\n".into()]));
+        fixture.raw(WriteBatch::default().put(
+            message_key.clone(),
+            codec::message::encode(&bad_copy).unwrap(),
+        ));
+        fixture.reject();
+        fixture.raw(WriteBatch::default().put(message_key.clone(), message_value.clone()));
+        let name = RuleName::new("remove").unwrap();
+        let bad = domain::RuleDefinition {
+            name: name.clone(),
+            filter: RuleFilter::True,
+            created_at: Timestamp::from_millis(3),
+            action: Some(domain::SqlRuleAction::new("SET sys.Label = 'unsupported'")),
+        };
+        fixture.raw(WriteBatch::default().put(
+            keys::subscription_rule(&ns(), &subscription, &name),
+            codec::rule::encode(&bad).unwrap(),
+        ));
+        fixture.reject();
+    }
+}
+
+#[test]
 fn v3_records_and_v9_proposals_capture_exactly_on_both_backends() {
     for durable in [false, true] {
         let mut fixture = Fixture::new(durable);

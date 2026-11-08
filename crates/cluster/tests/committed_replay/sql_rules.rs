@@ -167,3 +167,114 @@ fn v6_sql_rules_replay_and_route_identically_across_backends() -> TestResult {
     assert_eq!(replay(false)?, replay(true)?);
     Ok(())
 }
+
+fn replay_actions(durable: bool) -> Result<Vec<(Key, Value)>, Box<dyn Error>> {
+    let mut fixture = Fixture::new(durable)?;
+    let originals = vec![
+        proposal(
+            &topic(),
+            0,
+            CommandKind::CreateTopic {
+                config: TopicConfig::default(),
+            },
+        ),
+        proposal(
+            &topic(),
+            1,
+            CommandKind::CreateSubscription {
+                name: SubscriptionName::new("worker")?,
+                config: SubscriptionConfig::default(),
+            },
+        ),
+        proposal(
+            &subscription(),
+            2,
+            CommandKind::CreateRuleWithAction {
+                name: RuleName::new("remove")?,
+                filter: RuleFilter::True,
+                action: domain::SqlRuleAction::new("REMOVE user.region"),
+            },
+        ),
+        proposal(
+            &subscription(),
+            2,
+            CommandKind::CreateRuleWithAction {
+                name: RuleName::new("invalid")?,
+                filter: RuleFilter::True,
+                action: domain::SqlRuleAction::new("SET sys.Label = 'unsupported'"),
+            },
+        ),
+        publish(3, "original", &[0xa1, 4, b'w', b'e', b's', b't']),
+        proposal(
+            &subscription(),
+            4,
+            CommandKind::CreateRuleWithAction {
+                name: RuleName::new("error")?,
+                filter: RuleFilter::True,
+                action: domain::SqlRuleAction::new("SET user.region = 1"),
+            },
+        ),
+        publish(5, "error", &[0xa1, 4, b'w', b'e', b's', b't']),
+    ];
+    let total = originals.len() as u64;
+    fixture.proposals(&originals, total);
+    let mut owner = fixture.open()?;
+    assert_eq!(owner.replay_batch(4)?, progress(4, total, 4));
+    drop(owner);
+    fixture.reopen()?;
+    let mut owner = fixture.open()?;
+    assert_eq!(owner.replay_batch(64)?, progress(total, total, 3));
+    let machine = StateMachine::new(fixture.store().clone());
+    assert_eq!(
+        machine.rules(&ns(), &subscription(), 0, 10)?.len(),
+        3,
+        "invalid action checkpointed without admission"
+    );
+    let copies = machine.ready_sequences(&ns(), &subscription(), 20)?;
+    assert_eq!(
+        copies.iter().map(|s| s.as_u64()).collect::<Vec<_>>(),
+        [1, 2, 3, 5]
+    );
+    let removed = machine
+        .message(&ns(), &subscription(), SequenceNumber::new(2))?
+        .unwrap();
+    assert_eq!(
+        removed.format,
+        domain::MessageRecordFormat::V4 { text_ids: false }
+    );
+    assert_eq!(removed.envelope.as_ref().unwrap().removals(), ["region"]);
+    let dead = machine
+        .message(
+            &ns(),
+            &subscription().dead_letter_queue()?,
+            SequenceNumber::new(4),
+        )?
+        .unwrap();
+    assert_eq!(
+        dead.dead_letter.as_ref().unwrap().reason.as_str(),
+        "ActionException"
+    );
+    let rows = fixture.snapshot();
+    domain::snapshot_validation::validate_complete_state(&rows)?;
+    domain::legacy_content::validate_legacy_content(&rows)?;
+    let expected = Fixture::new(durable)?;
+    expected.seed(&originals);
+    assert_eq!(reserved(&rows, F1), reserved(&expected.snapshot(), F1));
+    let domain_rows = |rows: Vec<(Key, Value)>| {
+        rows.into_iter()
+            .filter(|(key, _)| key[0] < 0xF0)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(domain_rows(rows.clone()), domain_rows(expected.snapshot()));
+    drop(machine);
+    drop(owner);
+    fixture.reopen()?;
+    assert_eq!(fixture.snapshot(), rows);
+    Ok(rows)
+}
+
+#[test]
+fn v10_action_rules_and_v4_copies_replay_exactly_across_backends() -> TestResult {
+    assert_eq!(replay_actions(false)?, replay_actions(true)?);
+    Ok(())
+}

@@ -160,10 +160,11 @@ pub struct MessageEnvelope {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct EnvelopeMetadata {
     filter_properties: FilterProperties,
-    /// Copy-local property values over the original bytes. Only V2/V3 message
-    /// records carry them; commands never do, and durable proposals refuse
-    /// them, so the ordinary command serde shape omits them.
+    /// Copy-local property values over the original bytes. V2..V4 message
+    /// records carry them; commands never do. Both durable proposal capture and
+    /// ordinary legacy serde refuse them instead of dropping copy changes.
     overlay: Vec<OverlayProperty>,
+    removals: Vec<String>,
 }
 
 mod projection_only {
@@ -176,6 +177,11 @@ mod projection_only {
         value: &EnvelopeMetadata,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
+        if !value.overlay.is_empty() || !value.removals.is_empty() {
+            return Err(serde::ser::Error::custom(
+                "copy overlays require the versioned message codec",
+            ));
+        }
         value.filter_properties.serialize(serializer)
     }
 
@@ -185,6 +191,7 @@ mod projection_only {
         Ok(Box::new(EnvelopeMetadata {
             filter_properties: FilterProperties::deserialize(deserializer)?,
             overlay: Vec::new(),
+            removals: Vec::new(),
         }))
     }
 }
@@ -226,6 +233,17 @@ impl MessageEnvelope {
 
     pub fn overlay(&self) -> &[OverlayProperty] {
         &self.metadata.overlay
+    }
+
+    /// Explicit copy-local deletions, distinct from an encoded AMQP null.
+    /// V4 alone can persist these; names must be unique and disjoint from SETs.
+    pub fn removals(&self) -> &[String] {
+        &self.metadata.removals
+    }
+
+    pub fn with_removals(mut self, removals: Vec<String>) -> Self {
+        self.metadata.removals = removals;
+        self
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -270,6 +288,14 @@ pub enum MessageRecordFormat {
     /// V2 content layout with Azure-text filter IDs. The distinct version
     /// prevents older readers from silently accepting the new semantics.
     V3,
+    /// Action copy content, including explicit deletions and retained ID mode.
+    V4 { text_ids: bool },
+}
+
+impl MessageRecordFormat {
+    pub fn uses_text_ids(self) -> bool {
+        matches!(self, Self::V3 | Self::V4 { text_ids: true })
+    }
 }
 
 /// Stored only through [`codec::message`], never the generic value codec.
@@ -416,9 +442,9 @@ mod tests {
     #[test]
     fn a_newer_message_format_is_rejected() {
         assert_eq!(
-            MessageRecord::decode(&[codec::message::VALUE_FORMAT_V3 + 1, 0]),
+            MessageRecord::decode(&[codec::message::VALUE_FORMAT_V4 + 1, 0]),
             Err(CodecError::UnsupportedVersion {
-                version: codec::message::VALUE_FORMAT_V3 + 1,
+                version: codec::message::VALUE_FORMAT_V4 + 1,
             })
         );
     }

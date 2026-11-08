@@ -2,10 +2,11 @@
 //!
 //! Rules are compiled once per fanout command from the rule rows read at that
 //! command's log position, so ordinary sends and scheduled activations route
-//! against the same durable snapshot every replica reads. Matching is
-//! actionless: any rule that evaluates to `TRUE` delivers one copy. When no
-//! rule matches and at least one SQL rule failed to evaluate, the subscription
-//! receives one dead-lettered copy instead. This mirrors Service Bus's default
+//! against the same durable snapshot every replica reads. Matching actionless
+//! rules deduplicate to one copy. Action rules are evaluated
+//! independently against the original input and never short-circuit siblings.
+//! When no actionless rule matches and at least one actionless SQL rule failed,
+//! the subscription receives one dead-lettered copy instead. This mirrors the default
 //! of dead-lettering on filter evaluation exceptions; the reason, description
 //! and the rule that a match still delivers are Switchyard's chosen behavior.
 //! A subscription whose `dead_lettering_on_filter_evaluation_exceptions` is
@@ -19,10 +20,10 @@ use storage::WriteBatch;
 
 use crate::{
     BrokerError, CONTENT_LIMITS, CodecError, CorrelationFilter, DeadLetterInfo, DeadLetterReason,
-    EntityPath, FILTER_EVALUATION_DEAD_LETTER_REASON, FilterProperties, MessageRecord,
-    MessageState, NamespaceName, RuleFilter, RuleName, SqlEvaluationBudget, SqlEvaluationError,
-    SqlEvaluationLimit, SqlMessageContext, SqlProgram, SqlProperty, SqlRuleFilter,
-    SqlSystemProperty, SqlSystemValue, SqlTruth, SqlValue, Timestamp, codec, keys,
+    EntityPath, FilterProperties, MessageRecord, MessageState, NamespaceName, RuleFilter, RuleName,
+    SqlEvaluationBudget, SqlEvaluationError, SqlEvaluationLimit, SqlMessageContext, SqlProgram,
+    SqlProperty, SqlRuleFilter, SqlSystemProperty, SqlSystemValue, SqlTruth, SqlValue, Timestamp,
+    codec, keys,
 };
 
 use super::rules::CheckedRule;
@@ -31,16 +32,30 @@ use super::rules::CheckedRule;
 /// Never stored: a program is a pure function of its text and the current
 /// grammar, so sharing one between identical rules cannot change a result.
 #[derive(Default)]
-pub(super) struct ProgramCache(BTreeMap<String, Option<Arc<SqlProgram>>>);
+pub(super) struct ProgramCache {
+    filters: BTreeMap<String, Option<Arc<SqlProgram>>>,
+    actions: BTreeMap<String, Option<Arc<crate::SqlActionProgram>>>,
+}
 
 impl ProgramCache {
     /// `None` when the text does not compile under the default budget.
     pub(super) fn program(&mut self, expression: &str) -> Option<Arc<SqlProgram>> {
-        if let Some(program) = self.0.get(expression) {
+        if let Some(program) = self.filters.get(expression) {
             return program.clone();
         }
         let program = SqlRuleFilter::new(expression).compile().ok().map(Arc::new);
-        self.0.insert(expression.to_owned(), program.clone());
+        self.filters.insert(expression.to_owned(), program.clone());
+        program
+    }
+
+    pub(super) fn action(&mut self, expression: &str) -> Option<Arc<crate::SqlActionProgram>> {
+        if let Some(program) = self.actions.get(expression) {
+            return program.clone();
+        }
+        let program = crate::SqlActionProgram::compile(expression)
+            .ok()
+            .map(Arc::new);
+        self.actions.insert(expression.to_owned(), program.clone());
         program
     }
 }
@@ -48,7 +63,7 @@ impl ProgramCache {
 /// One subscription's rules and filter-error setting, ready to evaluate.
 /// Never stored.
 pub(super) struct CompiledRules {
-    rules: Vec<CompiledRule>,
+    rules: Vec<(CompiledRule, Option<Arc<crate::SqlActionProgram>>)>,
     dead_letter_on_failure: bool,
 }
 
@@ -72,17 +87,25 @@ impl CompiledRules {
     ) -> Result<Self, BrokerError> {
         let rules = rules
             .into_iter()
-            .map(|(definition, program)| match (definition.filter, program) {
-                (RuleFilter::True, None) => Ok(CompiledRule::True),
-                (RuleFilter::False, None) => Ok(CompiledRule::False),
-                (RuleFilter::Correlation(filter), None) => Ok(CompiledRule::Correlation(filter)),
-                (RuleFilter::Sql(_), Some(program)) => Ok(CompiledRule::Sql {
-                    name: definition.name,
-                    program,
-                }),
-                _ => Err(BrokerError::EntityMetadataCorrupt),
+            .map(|(definition, program, action)| {
+                if definition.action.is_some() != action.is_some() {
+                    return Err(BrokerError::EntityMetadataCorrupt);
+                }
+                let filter = match (definition.filter, program) {
+                    (RuleFilter::True, None) => Ok(CompiledRule::True),
+                    (RuleFilter::False, None) => Ok(CompiledRule::False),
+                    (RuleFilter::Correlation(filter), None) => {
+                        Ok(CompiledRule::Correlation(filter))
+                    }
+                    (RuleFilter::Sql(_), Some(program)) => Ok(CompiledRule::Sql {
+                        name: definition.name,
+                        program,
+                    }),
+                    _ => Err(BrokerError::EntityMetadataCorrupt),
+                }?;
+                Ok((filter, action))
             })
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<_, BrokerError>>()?;
         Ok(Self {
             rules,
             dead_letter_on_failure,
@@ -92,44 +115,66 @@ impl CompiledRules {
     pub(super) fn uses_sql(&self) -> bool {
         self.rules
             .iter()
-            .any(|rule| matches!(rule, CompiledRule::Sql { .. }))
+            .any(|(rule, action)| action.is_some() || matches!(rule, CompiledRule::Sql { .. }))
     }
 
-    pub(super) fn route(&self, message: &RoutingInput<'_>) -> Route {
+    pub(super) fn maximum_copies(&self) -> usize {
+        // Keep the historical timer budget for actionless subscriptions,
+        // including those with no matching rules.
+        1 + self
+            .rules
+            .iter()
+            .filter(|(_, action)| action.is_some())
+            .count()
+    }
+
+    pub(super) fn route(&self, message: &RoutingInput<'_>) -> Vec<Route> {
         let mut failure = None;
-        for rule in &self.rules {
-            match rule {
-                CompiledRule::True => return Route::Deliver,
-                CompiledRule::False => {}
-                CompiledRule::Correlation(filter) => {
-                    if filter.matches(message.properties) {
-                        return Route::Deliver;
-                    }
-                }
+        let mut matched = false;
+        let mut routes = Vec::new();
+        for (rule, action) in &self.rules {
+            let result = match rule {
+                CompiledRule::True => Ok(true),
+                CompiledRule::False => Ok(false),
+                CompiledRule::Correlation(filter) => Ok(filter.matches(message.properties)),
                 CompiledRule::Sql { name, program } => {
                     let mut budget = SqlEvaluationBudget::default();
                     match program.evaluate(message.context(), &mut budget) {
-                        Ok(SqlTruth::True) => return Route::Deliver,
-                        Ok(SqlTruth::False | SqlTruth::Unknown) => {}
+                        Ok(SqlTruth::True) => Ok(true),
+                        Ok(SqlTruth::False | SqlTruth::Unknown) => Ok(false),
                         // The first failure in canonical rule-name order is
                         // reported; a later match still delivers. A
                         // subscription that discards filter-error copies is
                         // skipped exactly as when no rule matched.
-                        Err(_) if !self.dead_letter_on_failure => {}
-                        Err(error) => {
-                            failure.get_or_insert_with(|| {
-                                format!(
-                                    "rule {}: {}",
-                                    name.display_name(),
-                                    evaluation_failure(error)
-                                )
-                            });
-                        }
+                        Err(error) => Err(format!(
+                            "rule {}: {}",
+                            name.display_name(),
+                            evaluation_failure(error)
+                        )),
                     }
                 }
+            };
+            match (result, action) {
+                (Ok(true), Some(program)) => routes.push(Route::Action {
+                    program: program.clone(),
+                    dead_letter_on_failure: self.dead_letter_on_failure,
+                }),
+                (Ok(true), None) => matched = true,
+                (Err(description), Some(_)) if self.dead_letter_on_failure => {
+                    routes.push(Route::ActionFilterError(description))
+                }
+                (Err(description), None) if self.dead_letter_on_failure => {
+                    failure.get_or_insert(description);
+                }
+                _ => {}
             }
         }
-        failure.map_or(Route::Skip, Route::DeadLetter)
+        if matched {
+            routes.insert(0, Route::Deliver);
+        } else if let Some(description) = failure {
+            routes.insert(0, Route::DeadLetter(description));
+        }
+        routes
     }
 }
 
@@ -138,7 +183,11 @@ pub(super) enum Route {
     Deliver,
     /// No rule matched and a SQL filter failed with this description.
     DeadLetter(String),
-    Skip,
+    Action {
+        program: Arc<crate::SqlActionProgram>,
+        dead_letter_on_failure: bool,
+    },
+    ActionFilterError(String),
 }
 
 /// Application-property values decoded from the stored filter projection.
@@ -214,7 +263,7 @@ pub(super) struct RoutingInput<'a> {
 }
 
 impl RoutingInput<'_> {
-    fn context(&self) -> SqlMessageContext<'_> {
+    pub(super) fn context(&self) -> SqlMessageContext<'_> {
         SqlMessageContext {
             application_properties: &self.application,
             system_properties: &self.system,
@@ -275,7 +324,7 @@ fn evaluation_failure(error: SqlEvaluationError) -> &'static str {
     }
 }
 
-/// Stages one filter-error copy in the subscription's dead-letter queue under
+/// Stages one rule-error copy in the subscription's dead-letter queue under
 /// the topic-assigned sequence, as an ordinary ready message without lifetime
 /// or session, exactly as other dead-lettering does. Returns the queue path.
 pub(super) fn stage_filter_dead_letter(
@@ -283,6 +332,7 @@ pub(super) fn stage_filter_dead_letter(
     subscription: &EntityPath,
     mut record: MessageRecord,
     description: String,
+    reason: &'static str,
     at: Timestamp,
     batch: &mut WriteBatch,
 ) -> Result<EntityPath, BrokerError> {
@@ -291,7 +341,7 @@ pub(super) fn stage_filter_dead_letter(
     record.expires_at = None;
     record.session_id = None;
     record.dead_letter = Some(DeadLetterInfo {
-        reason: DeadLetterReason::Application(FILTER_EVALUATION_DEAD_LETTER_REASON.to_owned()),
+        reason: DeadLetterReason::Application(reason.to_owned()),
         description,
         dead_lettered_at: at,
     });

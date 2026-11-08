@@ -232,7 +232,7 @@ pub(super) fn replace_envelope(
     if record
         .envelope
         .as_ref()
-        .is_some_and(|current| !current.overlay().is_empty())
+        .is_some_and(|current| !current.overlay().is_empty() || !current.removals().is_empty())
     {
         return Err(MessageContentError::ReplacementWouldDropOverlay.into());
     }
@@ -243,7 +243,7 @@ pub(super) fn replace_envelope(
         });
     }
     record.envelope = Some(envelope.clone());
-    if record.format == MessageRecordFormat::V3 {
+    if record.format.uses_text_ids() {
         // A legacy whole-envelope replacement may reach a current record
         // through the domain API. Derive V3 projection text from its typed
         // content, never accept a caller's legacy system-ID projection as V3.

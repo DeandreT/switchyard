@@ -616,6 +616,7 @@ fn unsafe_rule_and_filter_values_refuse_without_marker_change() {
     let rule = (
         keys::subscription_rule(&ns(), &subscription, &rule_name),
         codec::encode(&RuleDefinition {
+            action: None,
             name: rule_name,
             filter: RuleFilter::Correlation(CorrelationFilter {
                 application_properties: properties.clone(),

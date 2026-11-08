@@ -277,7 +277,10 @@ impl<S: StateStore> IndexedWriter<S> {
 
 fn deterministic_refusal(kind: &CommandKind, failure: &PreparationFailure) -> bool {
     match failure {
-        PreparationFailure::HealthyRuleCapacity => matches!(kind, CommandKind::CreateRule { .. }),
+        PreparationFailure::HealthyRuleCapacity => matches!(
+            kind,
+            CommandKind::CreateRule { .. } | CommandKind::CreateRuleWithAction { .. }
+        ),
         PreparationFailure::HealthySubscriptionCapacity => {
             matches!(kind, CommandKind::CreateSubscription { .. })
         }
@@ -337,9 +340,18 @@ fn ordinary_deterministic_refusal(kind: &CommandKind, error: &BrokerError) -> bo
             kind,
             C::CreateSubscription { .. } | C::UpdateSubscription { .. }
         ),
+        E::RuleConfig(crate::RuleConfigError::SqlActionPlanLimit) => matches!(
+            kind,
+            C::Send { .. }
+                | C::SendBatch { .. }
+                | C::SendContent { .. }
+                | C::SendContentBatch { .. }
+                | C::ActivateScheduled
+        ),
         E::RuleConfig(_) => matches!(
             kind,
             C::CreateRule { .. }
+                | C::CreateRuleWithAction { .. }
                 | C::Send { .. }
                 | C::SendBatch { .. }
                 | C::SendContent { .. }

@@ -757,6 +757,7 @@ fn capacity_setup(fixture: &Fixture, catalog: Catalog) -> Vec<DurableProposal> {
                 batch.push_put(
                     keys::subscription_rule(&ns(), &subscription(), &name),
                     codec::encode(&RuleDefinition {
+                        action: None,
                         name,
                         filter: RuleFilter::True,
                         created_at: Timestamp::from_millis(20),
@@ -818,6 +819,7 @@ fn corrupt_capacity(fixture: &Fixture, catalog: Catalog, overfull: bool) {
             let name = RuleName::new(if overfull { "zz-overfull" } else { "rule-0001" }).unwrap();
             let value = if overfull {
                 codec::encode(&RuleDefinition {
+                    action: None,
                     name: name.clone(),
                     filter: RuleFilter::True,
                     created_at: Timestamp::from_millis(20),

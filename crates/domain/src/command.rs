@@ -294,6 +294,12 @@ pub enum CommandKind {
         description: String,
         patch: Vec<OverlayProperty>,
     },
+    /// Domain-only rule action intent, fenced by durable proposal V10.
+    CreateRuleWithAction {
+        name: RuleName,
+        filter: RuleFilter,
+        action: crate::SqlRuleAction,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

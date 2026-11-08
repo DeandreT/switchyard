@@ -205,6 +205,7 @@ fn write_delivery_view(
 /// overlay value, a new name is appended, and an explicit null renders as an
 /// AMQP null rather than removing the property. The broker's filter
 /// projection keys properties by name, so it does not depend on this order.
+/// Explicit V4 removals delete names first without disturbing surviving order.
 fn overlay_copy_properties(
     message: &mut Message,
     delivery: &Delivery,
@@ -212,12 +213,15 @@ fn overlay_copy_properties(
     let Some(envelope) = delivery.envelope.as_ref() else {
         return Ok(());
     };
-    if envelope.overlay().is_empty() {
+    if envelope.overlay().is_empty() && envelope.removals().is_empty() {
         return Ok(());
     }
     let properties = message
         .application_properties
         .get_or_insert_with(ApplicationProperties::default);
+    for name in envelope.removals() {
+        properties.0.shift_remove(name.as_str());
+    }
     for property in envelope.overlay() {
         let value = decode_stored_value(&property.value).map_err(|error| {
             ProtocolError::InvalidEnvelope {
@@ -237,14 +241,17 @@ fn overlay_copy_properties(
 /// patched copy by the same measure and caps it at the same ceiling, so a
 /// copy over it is state the broker should never have accepted.
 fn check_render_ceiling(envelope: &MessageEnvelope) -> Result<(), ProtocolError> {
-    let rendered_bytes = envelope
-        .overlay()
-        .iter()
-        .fold(envelope.len(), |total, property| {
-            total
-                .saturating_add(property.name.len())
-                .saturating_add(property.value.len())
-        });
+    let rendered_bytes = envelope.removals().iter().fold(
+        envelope
+            .overlay()
+            .iter()
+            .fold(envelope.len(), |total, property| {
+                total
+                    .saturating_add(property.name.len())
+                    .saturating_add(property.value.len())
+            }),
+        |n, name| n.saturating_add(name.len()),
+    );
     if rendered_bytes > CONTENT_LIMITS.max_bytes {
         return Err(ProtocolError::InvalidEnvelope {
             detail: format!(
@@ -1215,6 +1222,103 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    fn domain_action_removals_render<S: storage::StateStore>(store: S) {
+        use domain::{
+            Command, CommandKind, CommandOutcome, EntityPath, NamespaceName, RuleFilter, RuleName,
+            SqlRuleAction, StateMachine, SubscriptionConfig, SubscriptionName, TopicConfig,
+        };
+        let machine = StateMachine::new(store);
+        let namespace = NamespaceName::new("tenant").unwrap();
+        let topic = EntityPath::new("events").unwrap();
+        let name = SubscriptionName::new("copies").unwrap();
+        let subscription = topic.subscription(&name).unwrap();
+        let apply = |entity: &EntityPath, kind| {
+            machine
+                .apply(&Command::new(
+                    namespace.clone(),
+                    entity.clone(),
+                    Timestamp::from_millis(1),
+                    kind,
+                ))
+                .unwrap()
+        };
+        apply(
+            &topic,
+            CommandKind::CreateTopic {
+                config: TopicConfig::default(),
+            },
+        );
+        apply(
+            &topic,
+            CommandKind::CreateSubscription {
+                name,
+                config: SubscriptionConfig::default(),
+            },
+        );
+        apply(
+            &subscription,
+            CommandKind::DeleteRule {
+                name: RuleName::new(domain::DEFAULT_RULE_NAME).unwrap(),
+            },
+        );
+        apply(
+            &subscription,
+            CommandKind::CreateRuleWithAction {
+                name: RuleName::new("remove").unwrap(),
+                filter: RuleFilter::True,
+                action: SqlRuleAction::new("REMOVE user.stale; SET user.added = TRUE"),
+            },
+        );
+        let original = Message::builder()
+            .application_properties(
+                ApplicationProperties::builder()
+                    .insert("stale", "remove me")
+                    .insert("null", Value::Null)
+                    .insert("keep", 3i32)
+                    .build(),
+            )
+            .body(Body::Data(vec![b"payload".to_vec().into()]))
+            .build();
+        let bytes = encode_message(&original).unwrap();
+        apply(
+            &topic,
+            CommandKind::SendContent {
+                content: MessageContent::AmqpTextIds(bytes.clone()),
+            },
+        );
+        let CommandOutcome::Received(Some(delivery)) = apply(
+            &subscription,
+            CommandKind::Receive {
+                mode: domain::ReceiveMode::PeekLock,
+                lock_duration_millis: None,
+                session: None,
+            },
+        ) else {
+            panic!("one action copy")
+        };
+        assert_eq!(delivery.envelope.as_ref().unwrap().as_bytes(), bytes);
+        assert_eq!(delivery.envelope.as_ref().unwrap().removals(), ["stale"]);
+        for rendered in views(&delivery).unwrap() {
+            let properties = rendered.application_properties.as_ref().unwrap();
+            assert!(!properties.0.contains_key("stale"));
+            assert_eq!(properties.get("null"), Some(&Value::Null));
+            assert_eq!(properties.get("keep"), Some(&Value::Int(3)));
+            assert_eq!(properties.get("added"), Some(&Value::Bool(true)));
+            assert_eq!(rendered.body, original.body);
+        }
+    }
+
+    #[test]
+    fn domain_seeded_action_removals_render_memory() {
+        domain_action_removals_render(storage::MemoryStore::default());
+    }
+
+    #[test]
+    fn domain_seeded_action_removals_render_fjall() {
+        let directory = tempfile::tempdir().unwrap();
+        domain_action_removals_render(storage::FjallStore::open(directory.path()).unwrap());
     }
 
     #[test]

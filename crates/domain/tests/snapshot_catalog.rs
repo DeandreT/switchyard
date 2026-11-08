@@ -640,6 +640,7 @@ fn rule_policy<P: StoreProvider>(provider: P) {
             &mut broken,
             key.clone(),
             codec::encode(&RuleDefinition {
+                action: None,
                 filter,
                 ..rule.clone()
             })
@@ -655,6 +656,7 @@ fn rule_policy<P: StoreProvider>(provider: P) {
         &mut wrong_name,
         key.clone(),
         codec::encode(&RuleDefinition {
+            action: None,
             name: RuleName::new("elsewhere").unwrap(),
             ..rule.clone()
         })
@@ -670,6 +672,7 @@ fn rule_policy<P: StoreProvider>(provider: P) {
         &mut future,
         key,
         codec::encode(&RuleDefinition {
+            action: None,
             created_at: Timestamp::from_millis(6),
             ..rule
         })
@@ -958,6 +961,7 @@ fn capacities<P: StoreProvider>(provider: P) {
     full_rules.retain(|(key, _)| !key.starts_with(&prefix));
     for i in 0..MAX_SUBSCRIPTION_RULES {
         let rule = RuleDefinition {
+            action: None,
             name: RuleName::new(format!("R{i:04}")).unwrap(),
             filter: RuleFilter::False,
             created_at: Timestamp::from_millis(6),
@@ -971,6 +975,7 @@ fn capacities<P: StoreProvider>(provider: P) {
     assert!(full_rules.iter().any(|(key, _)| key.starts_with(&keys::subscription_rule_prefix(&f.namespace, &second))));
     f.accept(&full_rules); // More than 2,000 globally is legal; the bound is per owner.
     let extra = RuleDefinition {
+        action: None,
         name: RuleName::new("overflow").unwrap(),
         filter: RuleFilter::True,
         created_at: Timestamp::from_millis(6),

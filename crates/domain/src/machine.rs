@@ -148,8 +148,13 @@ impl<S: StateStore> StateMachine<S> {
                 self.create_subscription(command, name, *config, &mut batch)?
             }
             CommandKind::CreateRule { name, filter } => {
-                self.create_rule(command, name, filter, &mut batch)?
+                self.create_rule(command, name, filter, None, &mut batch)?
             }
+            CommandKind::CreateRuleWithAction {
+                name,
+                filter,
+                action,
+            } => self.create_rule(command, name, filter, Some(action), &mut batch)?,
             CommandKind::DeleteRule { name } => self.delete_rule(command, name, &mut batch)?,
             CommandKind::ListRules { skip, max_rules } => {
                 self.list_rules(command, *skip, *max_rules)?

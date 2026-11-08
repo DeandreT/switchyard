@@ -1,4 +1,4 @@
-//! Durable actionless subscription rules and bounded rule browsing.
+//! Durable subscription filters/actions and bounded rule browsing.
 //!
 //! Every filter, SQL included, is validated and canonicalized before anything
 //! is staged, so an invalid definition refuses without mutation.
@@ -16,7 +16,11 @@ use crate::{
 use super::{PreparationFailure, StateMachine, topic_routing::ProgramCache};
 
 /// One validated rule row, with its compiled program when it is a SQL rule.
-pub(super) type CheckedRule = (RuleDefinition, Option<Arc<SqlProgram>>);
+pub(super) type CheckedRule = (
+    RuleDefinition,
+    Option<Arc<SqlProgram>>,
+    Option<Arc<crate::SqlActionProgram>>,
+);
 
 impl<S: StateStore> StateMachine<S> {
     /// Lists durable rules in canonical-name order.
@@ -42,10 +46,17 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         name: &RuleName,
         filter: &RuleFilter,
+        action: Option<&crate::SqlRuleAction>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, PreparationFailure> {
         self.ensure_subscription(&command.namespace, &command.entity)?;
         let filter = filter.canonicalized().map_err(BrokerError::from)?;
+        if let Some(action) = action {
+            action
+                .compile()
+                .map_err(crate::RuleConfigError::SqlAction)
+                .map_err(BrokerError::from)?;
+        }
         let key = keys::subscription_rule(&command.namespace, &command.entity, name);
         if self.store().get(&key).map_err(BrokerError::from)?.is_some() {
             return Err(BrokerError::RuleAlreadyExists { name: name.clone() }.into());
@@ -54,7 +65,7 @@ impl<S: StateStore> StateMachine<S> {
             // The bounded reader already rejected overfull or invalid touched rows.
             return Err(PreparationFailure::HealthyRuleCapacity);
         }
-        if !filter.is_legacy_representable()
+        if (action.is_some() || !filter.is_legacy_representable())
             && self.topic_sql_rules(&command.namespace, &command.entity)? >= MAX_TOPIC_SQL_RULES
         {
             return Err(BrokerError::SqlRuleLimitExceeded {
@@ -64,6 +75,7 @@ impl<S: StateStore> StateMachine<S> {
         }
 
         let definition = RuleDefinition {
+            action: action.cloned(),
             name: name.clone(),
             filter,
             created_at: command.issued_at,
@@ -123,12 +135,13 @@ impl<S: StateStore> StateMachine<S> {
         Ok(self
             .checked_rules(namespace, subscription, &mut ProgramCache::default())?
             .into_iter()
-            .map(|(definition, _)| definition)
+            .map(|(definition, _, _)| definition)
             .collect())
     }
 
-    /// Stored SQL rule rows across every subscription of the subscription's
-    /// topic. Rows are counted by their SQL record version without compiling
+    /// Stored SQL/action rows across every subscription of the subscription's
+    /// topic. V2 SQL and V3 action records each consume one quota slot, regardless
+    /// of filter kind. Rows are counted by their record version without compiling
     /// them; the selected subscription's rows were already fully validated.
     fn topic_sql_rules(
         &self,
@@ -149,7 +162,7 @@ impl<S: StateStore> StateMachine<S> {
                         MAX_SUBSCRIPTION_RULES + 1,
                     )?
                     .iter()
-                    .filter(|(_, value)| value.first() == Some(&codec::rule::VALUE_FORMAT_V2))
+                    .filter(|(_, value)| matches!(value.first(), Some(2 | 3)))
                     .count(),
             );
         }
@@ -208,7 +221,16 @@ impl<S: StateStore> StateMachine<S> {
                         None
                     }
                 };
-                Ok((definition, program))
+                let action = definition
+                    .action
+                    .as_ref()
+                    .map(|action| {
+                        cache
+                            .action(action.expression())
+                            .ok_or(BrokerError::EntityMetadataCorrupt)
+                    })
+                    .transpose()?;
+                Ok((definition, program, action))
             })
             .collect()
     }

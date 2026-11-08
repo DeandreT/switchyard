@@ -852,11 +852,13 @@ mod tests {
         let typed = correlation_value(&Value::Long(7)).expect("scalar encodes");
         let rules = vec![
             RuleDefinition {
+                action: None,
                 name: RuleName::new("$default").expect("default name"),
                 filter: RuleFilter::True,
                 created_at: Timestamp::from_millis(1_000),
             },
             RuleDefinition {
+                action: None,
                 name: RuleName::new("Typed").expect("rule name"),
                 filter: RuleFilter::Correlation(CorrelationFilter {
                     subject: Some("created".into()),
@@ -1065,11 +1067,13 @@ mod tests {
         let expression = "Priority >= 5 AND sys.Label = 'created'  ";
         let rules = vec![
             RuleDefinition {
+                action: None,
                 name: RuleName::new("Urgent").expect("rule name"),
                 filter: RuleFilter::Sql(SqlRuleFilter::new(expression)),
                 created_at: Timestamp::from_millis(1_000),
             },
             RuleDefinition {
+                action: None,
                 name: RuleName::new("Blocked").expect("rule name"),
                 filter: RuleFilter::False,
                 created_at: Timestamp::from_millis(2_000),

@@ -368,10 +368,10 @@ fn v7_goldens_round_trip_and_older_readers_refuse() {
         let mut other = bytes.clone();
         other[4..8].copy_from_slice(&6_u32.to_be_bytes());
         assert!(DurableProposal::decode(&other).is_err());
-        other[4..8].copy_from_slice(&10_u32.to_be_bytes());
+        other[4..8].copy_from_slice(&11_u32.to_be_bytes());
         assert_eq!(
             DurableProposal::decode(&other),
-            Err(DurableProposalError::UnsupportedVersion(10))
+            Err(DurableProposalError::UnsupportedVersion(11))
         );
     }
 }

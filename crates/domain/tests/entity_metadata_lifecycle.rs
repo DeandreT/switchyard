@@ -422,6 +422,7 @@ fn creates_one_owner_head_and_shared_shadows_atomically<P: StoreProvider>(
     let child_shadow = child.dead_letter_queue()?;
     let child_config = QueueConfig::default();
     let rule = RuleDefinition {
+        action: None,
         name: RuleName::new(domain::DEFAULT_RULE_NAME)?,
         filter: RuleFilter::True,
         created_at: Timestamp::from_millis(3),

@@ -177,6 +177,7 @@ impl<P: StoreProvider> Fixture<P> {
     }
     fn row(&self, name: &str, filter: RuleFilter) -> Result<RuleDefinition, Box<dyn Error>> {
         Ok(RuleDefinition {
+            action: None,
             name: RuleName::new(name)?,
             filter,
             created_at: Timestamp::from_millis(u64::MAX),
@@ -1268,6 +1269,7 @@ fn indexed_integrity<P: StoreProvider>(provider: P) -> Result<(), Box<dyn Error>
         IndexedApplyOutcome::Applied(published(&[1], &[]))
     );
     let bad = RuleDefinition {
+        action: None,
         name: RuleName::new("z-bad")?,
         filter: RuleFilter::Correlation(CorrelationFilter::default()),
         created_at: Timestamp::from_millis(u64::MAX),
@@ -1308,6 +1310,7 @@ fn indexed_integrity<P: StoreProvider>(provider: P) -> Result<(), Box<dyn Error>
     ];
     for definition in [
         RuleDefinition {
+            action: None,
             name: RuleName::new("wrong-name")?,
             filter: RuleFilter::True,
             ..bad.clone()

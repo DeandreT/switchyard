@@ -4,6 +4,7 @@
 //! V3 uses the frozen V2 layout with Azure-text filter IDs. Legacy content sends
 //! produce V2, Azure-text content produces V3; rewrites preserve the version,
 //! except a property patch, which converts a V1 record to V2.
+//! Action copies use V4: frozen V2 content, ID mode, explicit deletion names.
 
 use std::{borrow::Cow, collections::BTreeSet};
 
@@ -19,6 +20,14 @@ use super::{CodecError, VALUE_FORMAT_V1};
 
 pub const VALUE_FORMAT_V2: u8 = 2;
 pub const VALUE_FORMAT_V3: u8 = 3;
+pub const VALUE_FORMAT_V4: u8 = 4;
+
+#[derive(Serialize, Deserialize)]
+struct RecordV4<'a> {
+    record: RecordV2<'a>,
+    text_ids: bool,
+    removals: Vec<Cow<'a, str>>,
+}
 
 // Stored DTOs are frozen independently of the public types' serde: do not
 // reorder or extend them. V3 deliberately shares the exact V2 payload layout;
@@ -129,6 +138,21 @@ struct Entry<'a> {
 /// an overlay; V2 refuses an AMQP record that also carries a separate body,
 /// duplicate overlay names and empty overlay values.
 pub fn encode(record: &MessageRecord) -> Result<Vec<u8>, CodecError> {
+    let removals = record.envelope.as_ref().map_or(&[][..], |e| e.removals());
+    if !removals.is_empty() && !matches!(record.format, MessageRecordFormat::V4 { .. }) {
+        return Err(CodecError::Encode);
+    }
+    let mut names = BTreeSet::new();
+    for name in removals {
+        if !names.insert(name)
+            || record
+                .envelope
+                .as_ref()
+                .is_some_and(|e| e.overlay().iter().any(|p| &p.name == name))
+        {
+            return Err(CodecError::Encode);
+        }
+    }
     match record.format {
         MessageRecordFormat::V1 => super::encode(&RecordV1 {
             sequence: record.sequence.as_u64(),
@@ -158,7 +182,7 @@ pub fn encode(record: &MessageRecord) -> Result<Vec<u8>, CodecError> {
                 })
                 .transpose()?,
         }),
-        MessageRecordFormat::V2 | MessageRecordFormat::V3 => {
+        MessageRecordFormat::V2 | MessageRecordFormat::V3 | MessageRecordFormat::V4 { .. } => {
             let content = match &record.envelope {
                 None => Content::Raw(Cow::Borrowed(&record.body)),
                 Some(envelope) => {
@@ -176,26 +200,35 @@ pub fn encode(record: &MessageRecord) -> Result<Vec<u8>, CodecError> {
             // its changed projection semantics from every V1/V2-only reader.
             let mut bytes = vec![match record.format {
                 MessageRecordFormat::V3 => VALUE_FORMAT_V3,
+                MessageRecordFormat::V4 { .. } => VALUE_FORMAT_V4,
                 _ => VALUE_FORMAT_V2,
             }];
-            bytes.extend(
-                postcard::to_stdvec(&RecordV2 {
-                    sequence: record.sequence.as_u64(),
-                    message_id: Cow::Borrowed(&record.message_id),
-                    enqueued_at: record.enqueued_at.as_millis(),
-                    scheduled_enqueue_at: record.scheduled_enqueue_at.map(Timestamp::as_millis),
-                    expires_at: record.expires_at.map(Timestamp::as_millis),
-                    delivery_count: record.delivery_count,
-                    state: State::capture(&record.state),
-                    session_id: record
-                        .session_id
-                        .as_ref()
-                        .map(|id| Cow::Borrowed(id.as_str())),
-                    dead_letter: record.dead_letter.as_ref().map(DeadLetter::capture),
-                    content,
+            let stored = RecordV2 {
+                sequence: record.sequence.as_u64(),
+                message_id: Cow::Borrowed(&record.message_id),
+                enqueued_at: record.enqueued_at.as_millis(),
+                scheduled_enqueue_at: record.scheduled_enqueue_at.map(Timestamp::as_millis),
+                expires_at: record.expires_at.map(Timestamp::as_millis),
+                delivery_count: record.delivery_count,
+                state: State::capture(&record.state),
+                session_id: record
+                    .session_id
+                    .as_ref()
+                    .map(|id| Cow::Borrowed(id.as_str())),
+                dead_letter: record.dead_letter.as_ref().map(DeadLetter::capture),
+                content,
+            };
+            let payload = if let MessageRecordFormat::V4 { text_ids } = record.format {
+                postcard::to_stdvec(&RecordV4 {
+                    record: stored,
+                    text_ids,
+                    removals: removals.iter().map(|n| Cow::Borrowed(n.as_str())).collect(),
                 })
-                .map_err(|_| CodecError::Encode)?,
-            );
+            } else {
+                postcard::to_stdvec(&stored)
+            }
+            .map_err(|_| CodecError::Encode)?;
+            bytes.extend(payload);
             Ok(bytes)
         }
     }
@@ -257,11 +290,32 @@ fn read(bytes: &[u8]) -> Result<(MessageRecord, &[u8]), CodecError> {
             };
             Ok((record, unused))
         }
-        VALUE_FORMAT_V2 | VALUE_FORMAT_V3 => {
-            let (stored, unused) =
-                postcard::take_from_bytes::<RecordV2>(payload).map_err(|_| CodecError::Decode)?;
+        VALUE_FORMAT_V2 | VALUE_FORMAT_V3 | VALUE_FORMAT_V4 => {
+            let (stored, text_ids, removals, unused) = if version == VALUE_FORMAT_V4 {
+                let (stored, unused) = postcard::take_from_bytes::<RecordV4>(payload)
+                    .map_err(|_| CodecError::Decode)?;
+                let removals = stored
+                    .removals
+                    .into_iter()
+                    .map(Cow::into_owned)
+                    .collect::<Vec<_>>();
+                let mut names = BTreeSet::new();
+                if removals.iter().any(|n| !names.insert(n)) {
+                    return Err(CodecError::Decode);
+                }
+                (stored.record, stored.text_ids, removals, unused)
+            } else {
+                let (stored, unused) = postcard::take_from_bytes::<RecordV2>(payload)
+                    .map_err(|_| CodecError::Decode)?;
+                (stored, version == VALUE_FORMAT_V3, Vec::new(), unused)
+            };
             let (body, envelope) = match stored.content {
-                Content::Raw(bytes) => (bytes.into_owned(), None),
+                Content::Raw(bytes) => {
+                    if !removals.is_empty() {
+                        return Err(CodecError::Decode);
+                    }
+                    (bytes.into_owned(), None)
+                }
                 Content::Amqp {
                     original,
                     overlay,
@@ -271,7 +325,8 @@ fn read(bytes: &[u8]) -> Result<(MessageRecord, &[u8]), CodecError> {
                     Some(
                         MessageEnvelope::new(original.into_owned())
                             .with_filter_properties(projection.restore())
-                            .with_overlay(restore_overlay(overlay)?),
+                            .with_overlay(restore_overlay(overlay)?)
+                            .with_removals(removals),
                     ),
                 ),
             };
@@ -287,12 +342,21 @@ fn read(bytes: &[u8]) -> Result<(MessageRecord, &[u8]), CodecError> {
                 session_id: restore_session(stored.session_id)?,
                 dead_letter: stored.dead_letter.map(DeadLetter::restore),
                 envelope,
-                format: if version == VALUE_FORMAT_V3 {
+                format: if version == VALUE_FORMAT_V4 {
+                    MessageRecordFormat::V4 { text_ids }
+                } else if version == VALUE_FORMAT_V3 {
                     MessageRecordFormat::V3
                 } else {
                     MessageRecordFormat::V2
                 },
             };
+            if record.envelope.as_ref().is_some_and(|e| {
+                e.removals()
+                    .iter()
+                    .any(|n| e.overlay().iter().any(|p| &p.name == n))
+            }) {
+                return Err(CodecError::Decode);
+            }
             Ok((record, unused))
         }
         version => Err(CodecError::UnsupportedVersion { version }),
@@ -501,9 +565,9 @@ mod tests {
             Err(CanonicalError::Codec(CodecError::EmptyEnvelope))
         );
         assert_eq!(
-            decode_canonical(&[4]),
+            decode_canonical(&[5]),
             Err(CanonicalError::Codec(CodecError::UnsupportedVersion {
-                version: 4
+                version: 5
             }))
         );
     }
@@ -513,6 +577,25 @@ mod tests {
             .step_by(2)
             .map(|index| u8::from_str_radix(&text[index..index + 2], 16).expect("hex"))
             .collect()
+    }
+
+    #[test]
+    fn literal_v4_removal_layout_is_frozen_and_exact() {
+        let mut original = record(MessageRecordFormat::V4 { text_ids: false });
+        original.body.clear();
+        original.envelope =
+            Some(MessageEnvelope::new(Vec::new()).with_removals(vec!["old".to_owned()]));
+        let bytes = unhex("0401036d2d31000000000000000100000000000000000000000001036f6c64");
+        assert_eq!(encode(&original).unwrap(), bytes);
+        assert_eq!(decode_canonical(&bytes).unwrap(), original);
+        for version in 1..=3 {
+            let mut old = bytes.clone();
+            old[0] = version;
+            assert!(decode_canonical(&old).is_err());
+        }
+        for end in 0..bytes.len() {
+            assert!(decode_canonical(&bytes[..end]).is_err());
+        }
     }
 
     // A locked V1 record whose envelope projects application properties a and b.

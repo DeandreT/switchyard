@@ -1,6 +1,6 @@
 //! A frozen persistence envelope, not a client authentication or grant format.
 //!
-//! V1 through V9 carry intent, including intent the state machine may refuse.
+//! V1 through V10 carry intent, including intent the state machine may refuse.
 //! Decoding does not consult the catalog, acquire authority, apply a command, or
 //! parse message content.
 //! The byte ceiling bounds encoded input/output and copied variable data, not
@@ -11,6 +11,7 @@ use thiserror::Error;
 use crate::{BoundCommand, Command, CommandKind, EntityBinding};
 
 mod v1;
+mod v10;
 mod v2;
 mod v3;
 mod v4;
@@ -51,7 +52,12 @@ impl DurableProposal {
 
     pub fn bound(command: BoundCommand) -> Result<Self, DurableProposalError> {
         let (binding, command) = command.into_parts();
-        if uses_v2(&command.kind) {
+        if matches!(command.kind, CommandKind::CreateRuleWithAction { .. }) {
+            v10::validate(&Self {
+                command: command.clone(),
+                binding: Some(binding.clone()),
+            })?;
+        } else if uses_v2(&command.kind) {
             v2::validate_binding(&binding, &command)?;
         } else {
             v1::validate_binding(&binding, &command)?;
@@ -83,7 +89,9 @@ impl DurableProposal {
     /// Azure-text-ID sends require V9.
     /// No proposal format uses the ordinary Command serde shape.
     pub fn encode(&self) -> Result<Vec<u8>, DurableProposalError> {
-        if v9::carries(&self.command.kind) {
+        if matches!(self.command.kind, CommandKind::CreateRuleWithAction { .. }) {
+            encode_version(&v10::Proposal::capture(self)?, 10)
+        } else if v9::carries(&self.command.kind) {
             encode_version(&v9::Proposal::capture(self)?, 9)
         } else if v8::carries(&self.command.kind) {
             encode_version(&v8::Proposal::capture(self)?, 8)
@@ -114,7 +122,7 @@ impl DurableProposal {
             return Err(DurableProposalError::Malformed);
         }
         let version = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        if !matches!(version, 1..=9) {
+        if !matches!(version, 1..=10) {
             return Err(DurableProposalError::UnsupportedVersion(version));
         }
         let length = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
@@ -137,6 +145,8 @@ impl DurableProposal {
             decode_version::<v7::Proposal>(bytes, version)?.restore()
         } else if version == 8 {
             decode_version::<v8::Proposal>(bytes, version)?.restore()
+        } else if version == 10 {
+            decode_version::<v10::Proposal>(bytes, version)?.restore()
         } else {
             decode_version::<v9::Proposal>(bytes, version)?.restore()
         }
