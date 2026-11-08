@@ -13,18 +13,21 @@ Pre-alpha: only verified, merged `main` is complete.
 - [x] Source-bound builds and pinned Memory SDK TCP/WSS gates.
 - [x] Typed retained content: store format 3, proposal V4 sends and copy-local patches.
 - [x] Offline snapshot capture, install, anchors and journal compaction.
+- [x] Ordered, budgeted process shutdown through retained listener/protocol tasks,
+  timer and broker; cancellation and committed-state reopen controls.
 - [ ] Remaining semantics, administration and conserved physical-byte capacity.
 - [ ] Full recovery, quorum, multi-tenant security and measured release.
 
 ## Next Main Increments
 
-#65/#135/#136/#222/#224/#225 verified; #134 custody audit closed; #7 open. #248 wire bounds Blocked/unassigned.
+#7 and its listener/admission/process children are complete. #248 WSS fixture
+wire bounds and the namespace administration core (#18) are also complete.
 Process shutdown is ordered and budgeted; joins have no Close/latency guarantee.
 Reference branches are not main evidence; #15 is entity retirement. #255's qualified history audit is closed.
 
 ```mermaid
 flowchart TD
-    Main["Main"] --> Lifecycle["#7 Shutdown -> #12 Authority -> #15 Entity retirement"] --> Semantics["#20/#21 Rules -> #26-#28 Capacity"]
+    Main["Main"] --> Lifecycle["#12 Authority -> #15 Entity retirement"] --> Semantics["#20/#21 Rules -> #26-#28 Capacity"]
     Main --> Domain["#14/#16/#23 Domain"] --> Semantics
     Main --> Recovery["#37 Snapshots -> #38 Quorum"] --> Runtime["#41 Runtime"]
     Lifecycle --> Security["#71 Grants -> #17 JWT; #42/#43/#49 Identity"] --> Runtime
@@ -81,9 +84,9 @@ PRs in dependency order ([workflow](../CONTRIBUTING.md)). Ready is not evidence.
 | --- | --- |
 | Snapshots | #37 offline children are complete; live recovery follows #38/#41. |
 | Domain | #14, #16 and #23 are complete. |
-| Admin | #18 coordinator open; #243 and #244 are complete. |
+| Admin | #18, #243 and #244 are complete; TLS transport and CLI follow in #19. |
 | Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228), #238 ([PR258](https://github.com/DeandreT/switchyard/pull/258)), #239 ([PR264](https://github.com/DeandreT/switchyard/pull/264)) and #240 ([PR263](https://github.com/DeandreT/switchyard/pull/263)) and #232's allocation/graph composition verified. |
-| SDK/security | #71/#101 blocked on #7. |
+| SDK/security | #7 is complete; #71 grant consumers and #101 durable SDK matrix can proceed. |
 
 Shared: #243 keys.rs (released by #229); machine.rs overlaps #240. #244 serializes broker
 ownership. Allocator error/condition/indexed edits serialize; #239 also
