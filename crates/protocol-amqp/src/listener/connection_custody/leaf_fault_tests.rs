@@ -100,7 +100,11 @@ impl Broker for FaultBroker {
         _: domain::EntityBinding,
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
-        assert!(self.sends && matches!(kind, CommandKind::SendContent { .. }));
+        assert!(if self.sends {
+            matches!(kind, CommandKind::SendContent { .. })
+        } else {
+            matches!(kind, CommandKind::Receive { .. })
+        });
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         panic!("controlled admitted data-leaf original fault")
     }

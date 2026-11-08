@@ -97,6 +97,29 @@ pub trait Broker: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = ()> + Send;
 }
 
+/// Authority carried by a receiving link and its retained delivery capabilities.
+/// Session ownership is deliberately separate until session binding is implemented.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReceivingAuthority {
+    Ordinary(EntityBinding),
+    Session,
+}
+
+impl ReceivingAuthority {
+    pub(crate) async fn submit<B: Broker>(
+        &self,
+        broker: &B,
+        namespace: NamespaceName,
+        entity: EntityPath,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, BrokerRejection> {
+        match self {
+            Self::Ordinary(binding) => broker.submit_bound(binding.clone(), kind).await,
+            Self::Session => broker.submit(namespace, entity, kind).await,
+        }
+    }
+}
+
 /// Opaque, owner-created authority for qualified synthetic-outcome fixtures.
 #[cfg(test)]
 pub(crate) fn test_binding(namespace: NamespaceName, entity: EntityPath) -> EntityBinding {

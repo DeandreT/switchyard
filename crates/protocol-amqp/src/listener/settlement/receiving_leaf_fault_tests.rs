@@ -32,6 +32,7 @@ fn prepared<B: Broker>(
         ReceiveMode::PeekLock,
         hold,
         ReceivingLinkProtocol {
+            authority: actor.authority(),
             authorization: None,
             management,
             session_registration: registration,
@@ -172,6 +173,18 @@ struct CompleteFaultBroker {
 }
 
 impl Broker for CompleteFaultBroker {
+    async fn submit_bound(
+        &self,
+        binding: domain::EntityBinding,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, BrokerRejection> {
+        if matches!(kind, CommandKind::Complete { sequence, .. } if sequence == self.first) {
+            self.reached.notify_one();
+            self.release.notified().await;
+            std::panic::panic_any(Arc::clone(&self.payload));
+        }
+        self.actual.submit_bound(binding, kind).await
+    }
     async fn submit(
         &self,
         namespace: NamespaceName,
@@ -367,6 +380,14 @@ async fn receiving_protocol_cause_survives_notice_and_held_original_session_rele
 struct UnexpectedReceiveBroker;
 
 impl Broker for UnexpectedReceiveBroker {
+    async fn submit_bound(
+        &self,
+        _: domain::EntityBinding,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, BrokerRejection> {
+        assert!(matches!(kind, CommandKind::Receive { .. }));
+        Ok(CommandOutcome::QueueCreated)
+    }
     async fn submit(
         &self,
         _: NamespaceName,

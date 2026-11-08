@@ -336,7 +336,11 @@ pub(super) async fn update_disposition<B: Broker>(
         }
     };
 
-    match broker.submit(namespace.clone(), entity.clone(), kind).await {
+    match delivery
+        .managed
+        .submit(broker, namespace.clone(), entity.clone(), kind)
+        .await
+    {
         Ok(outcome) if expected.matches(&outcome) => {
             management.unregister_managed_delivery(&delivery).await;
             ManagementResponse::accepted(message_id, tracking_id, Value::Null)
@@ -603,6 +607,14 @@ mod tests {
     }
 
     impl Broker for RecordingBroker {
+        async fn submit_bound(
+            &self,
+            binding: domain::EntityBinding,
+            kind: CommandKind,
+        ) -> Result<CommandOutcome, crate::BrokerRejection> {
+            self.submit(binding.namespace().clone(), binding.target().clone(), kind)
+                .await
+        }
         fn submit(
             &self,
             _namespace: NamespaceName,
@@ -1272,6 +1284,10 @@ mod tests {
                 entity.clone(),
                 SequenceNumber::new(7),
                 LockToken::new(9),
+                crate::broker::ReceivingAuthority::Ordinary(crate::broker::test_binding(
+                    namespace.clone(),
+                    entity.clone(),
+                )),
             )
             .await;
         let mut properties = OrderedMap::new();
@@ -1328,6 +1344,21 @@ mod tests {
     struct RealBroker(server::BrokerHandle);
 
     impl Broker for RealBroker {
+        async fn submit_bound(
+            &self,
+            binding: domain::EntityBinding,
+            kind: CommandKind,
+        ) -> Result<CommandOutcome, crate::BrokerRejection> {
+            self.0
+                .submit_bound(binding, kind)
+                .await
+                .map_err(|error| match error {
+                    server::SubmitError::Propose(server::ProposeError::Broker(error)) => {
+                        crate::BrokerRejection::Refused(error)
+                    }
+                    other => crate::BrokerRejection::Unavailable(other.to_string()),
+                })
+        }
         fn submit(
             &self,
             namespace: NamespaceName,
@@ -1400,7 +1431,18 @@ mod tests {
         let link = "receiver-link";
         let management = ConnectionManagement::new();
         management
-            .register_delivery(link, entity.clone(), delivery.sequence, token)
+            .register_delivery(
+                link,
+                entity.clone(),
+                delivery.sequence,
+                token,
+                crate::broker::ReceivingAuthority::Ordinary(
+                    broker
+                        .0
+                        .bind_entity_blocking(namespace.clone(), entity.clone())
+                        .unwrap(),
+                ),
+            )
             .await;
         let peek = || {
             submit(CommandKind::Peek {

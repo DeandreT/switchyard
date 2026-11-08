@@ -44,6 +44,9 @@ const LINK: &str = "exact-handoff";
 #[path = "attachment_panic_tests.rs"]
 mod panic_tests;
 
+#[path = "receiver_authority_tests.rs"]
+mod receiver_authority_tests;
+
 fn frame(channel: u16, performative: Performative) -> Frame {
     Frame::Amqp {
         channel,
@@ -1271,6 +1274,7 @@ async fn healthy_named_and_next_available_handoffs_echo_and_register_the_exact_g
                         link.mode,
                         Some(expected.hold()),
                         ReceivingLinkProtocol {
+                            authority: actor.authority(),
                             authorization: None,
                             management: Arc::clone(&management),
                             session_registration: None,

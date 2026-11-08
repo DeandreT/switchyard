@@ -297,6 +297,7 @@ async fn actual_session_processed_end_joins_complete_before_one_captured_release
                             actor.entity.clone(),
                             sequence,
                             token,
+                            actor.authority(),
                         )
                         .await;
                     let claim = management

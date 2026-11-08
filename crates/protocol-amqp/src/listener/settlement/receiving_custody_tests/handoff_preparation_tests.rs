@@ -146,6 +146,7 @@ async fn actual_receive_retains_its_guarantee_when_pre_native_context_clone_pani
                         guarantee,
                         Some(hold),
                         ReceivingLinkProtocol {
+                            authority: actor.authority(),
                             authorization: None,
                             management: Arc::clone(&management),
                             session_registration: Some(old),
@@ -252,6 +253,7 @@ async fn actual_active_native_success_moves_prepared_context_without_a_second_cl
                     ReceiveMode::PeekLock,
                     Some(hold.clone()),
                     ReceivingLinkProtocol {
+                        authority: actor.authority(),
                         authorization: None,
                         management: Arc::clone(&management),
                         session_registration: Some(old_session),
@@ -278,7 +280,13 @@ async fn actual_active_native_success_moves_prepared_context_without_a_second_cl
                 };
                 let token = delivery.lock.unwrap().token;
                 let replacement_delivery = management
-                    .register_delivery(LINK, actor.entity.clone(), sequence, token)
+                    .register_delivery(
+                        LINK,
+                        actor.entity.clone(),
+                        sequence,
+                        token,
+                        actor.authority(),
+                    )
                     .await;
                 let replacement_session = register(&management, &actor, &hold).await;
                 control.request();
@@ -344,8 +352,8 @@ async fn actual_late_native_success_moves_one_context_across_cancelled_cleanup()
                     let management = ConnectionManagement::new();
                     let old_session = register(&management, &actor, &hold).await;
                     let replacement_session = register(&management, &actor, &hold).await;
-                    let old_delivery = management.register_delivery(LINK, actor.entity.clone(), sequence, token).await;
-                    let replacement_delivery = management.register_delivery(LINK, actor.entity.clone(), sequence, token).await;
+                    let old_delivery = management.register_delivery(LINK, actor.entity.clone(), sequence, token,actor.authority()).await;
+                    let replacement_delivery = management.register_delivery(LINK, actor.entity.clone(), sequence, token,actor.authority()).await;
                     assert_ne!(old_delivery, replacement_delivery);
                     assert_ne!(old_session, replacement_session);
                     let release_gate = Arc::new(ReleaseGate::default());

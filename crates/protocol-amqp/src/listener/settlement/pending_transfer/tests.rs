@@ -87,6 +87,7 @@ async fn registered(
             actor.entity.clone(),
             delivery.sequence,
             delivery.lock.unwrap().token,
+            actor.authority(),
         )
         .await;
     (management, registration)
@@ -435,6 +436,7 @@ async fn original_blocked_transfer_requires_native_stop_join_before_session_clea
                 mode,
                 Some(hold.clone()),
                 ReceivingLinkProtocol {
+                    authority: actor.authority(),
                     authorization: None,
                     management: Arc::clone(&management),
                     session_registration: None,
@@ -552,7 +554,7 @@ async fn actual_pump_adopts_cached_pending_with_ready_accepted_before_session_cl
                 wire.writes.block();
                 let _release = wire.writes.release_on_drop();
                 let sender = wire.sender.take().unwrap();
-                let mut pump = Box::pin(serve_receiving_client(sender, actor.namespace.clone(), actor.entity.clone(), actor.broker.as_ref().unwrap().clone(), ReceiveMode::PeekLock, Some(hold.clone()), ReceivingLinkProtocol { authorization: None, management: Arc::clone(&management), session_registration: None }));
+                let mut pump = Box::pin(serve_receiving_client(sender, actor.namespace.clone(), actor.entity.clone(), actor.broker.as_ref().unwrap().clone(), ReceiveMode::PeekLock, Some(hold.clone()), ReceivingLinkProtocol { authority: actor.authority(), authorization: None, management: Arc::clone(&management), session_registration: None }));
                 timeout(WAIT, async {
                     tokio::select! {
                         biased;
@@ -706,6 +708,7 @@ async fn actual_auth_retirement_retains_blocked_native_start_until_release_or_jo
                         mode,
                         Some(hold.clone()),
                         ReceivingLinkProtocol {
+                            authority: actor.authority(),
                             authorization: Some(authorization.clone()),
                             management: Arc::clone(&management),
                             session_registration: None,

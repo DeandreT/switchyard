@@ -412,6 +412,17 @@ impl BrokerHandle {
             .map_err(SubmitError::Propose)
     }
 
+    /// Subscribes to a possible delivery change; callers must recheck through
+    /// their retained authority rather than treating a wakeup as permission.
+    pub fn wait_until_deliverable(
+        &self,
+        namespace: &NamespaceName,
+        entity: &EntityPath,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        let notify = self.watchers.watch(namespace, entity);
+        async move { notify.notified().await }
+    }
+
     /// Every queue in the store, up to `limit`, in key order.
     pub fn queues_blocking(
         &self,
@@ -656,8 +667,7 @@ impl protocol_amqp::Broker for BrokerHandle {
         namespace: &NamespaceName,
         entity: &EntityPath,
     ) -> impl std::future::Future<Output = ()> + Send {
-        let notify = self.watchers.watch(namespace, entity);
-        async move { notify.notified().await }
+        self.wait_until_deliverable(namespace, entity)
     }
 
     async fn submit(

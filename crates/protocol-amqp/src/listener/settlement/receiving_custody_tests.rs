@@ -122,6 +122,7 @@ fn context<B: Broker>(
     management: Arc<ConnectionManagement>,
 ) -> SettlementContext<B> {
     SettlementContext {
+        authority: actor.authority(),
         namespace: actor.namespace.clone(),
         entity: actor.entity.clone(),
         broker,
@@ -153,6 +154,7 @@ async fn actual_primary_pump_panic_drains_one_complete_before_and_after_apply() 
                     ReceiveMode::PeekLock,
                     Some(hold.clone()),
                     ReceivingLinkProtocol {
+                        authority: actor.authority(),
                         authorization: None,
                         management: Arc::clone(&management),
                         session_registration: Some(registration.clone()),
@@ -240,6 +242,7 @@ async fn actual_pump_panic_retains_a_begun_receive_without_late_transfer() {
                     mode,
                     Some(hold),
                     ReceivingLinkProtocol {
+                        authority: actor.authority(),
                         authorization: None,
                         management: Arc::clone(&management),
                         session_registration: Some(registration),
@@ -304,6 +307,7 @@ async fn actual_completed_packets_survive_primary_panic_before_successor_adoptio
                     ReceiveMode::PeekLock,
                     Some(hold),
                     ReceivingLinkProtocol {
+                        authority: actor.authority(),
                         authorization: None,
                         management: Arc::clone(&management),
                         session_registration: Some(registration),
@@ -440,10 +444,22 @@ async fn cancelled_receiving_cleanup_retains_rows_and_one_original_session_relea
                 let new_session = register(&management, &actor, &hold).await;
                 assert_ne!(old_session, new_session);
                 let old_delivery = management
-                    .register_delivery(LINK, actor.entity.clone(), delivery.sequence, token)
+                    .register_delivery(
+                        LINK,
+                        actor.entity.clone(),
+                        delivery.sequence,
+                        token,
+                        actor.authority(),
+                    )
                     .await;
                 let new_delivery = management
-                    .register_delivery(LINK, actor.entity.clone(), delivery.sequence, token)
+                    .register_delivery(
+                        LINK,
+                        actor.entity.clone(),
+                        delivery.sequence,
+                        token,
+                        actor.authority(),
+                    )
                     .await;
                 assert_ne!(old_delivery, new_delivery);
                 let release_gate = Arc::new(ReleaseGate::default());
@@ -558,6 +574,7 @@ async fn actual_primary_pump_panic_keeps_a_blocked_native_start_until_its_result
                 ReceiveMode::PeekLock,
                 Some(hold),
                 ReceivingLinkProtocol {
+                    authority: actor.authority(),
                     authorization: None,
                     management: Arc::clone(&management),
                     session_registration: Some(registration.clone()),
@@ -615,7 +632,13 @@ async fn cancelled_outer_cleanup_adopts_the_same_ready_native_packet_and_origina
                 let token = delivery.lock.unwrap().token;
                 let management = ConnectionManagement::new();
                 let registration = management
-                    .register_delivery(LINK, actor.entity.clone(), sequence, token)
+                    .register_delivery(
+                        LINK,
+                        actor.entity.clone(),
+                        sequence,
+                        token,
+                        actor.authority(),
+                    )
                     .await;
                 let context = actor.context(Arc::clone(&management));
                 let mut wire = Wire::new_with_credit(mode.clone(), 1).await;
@@ -741,6 +764,7 @@ async fn actual_primary_panic_wins_secondary_worker_panic_and_stale_session_rele
                 ReceiveMode::PeekLock,
                 Some(old.clone()),
                 ReceivingLinkProtocol {
+                    authority: actor.authority(),
                     authorization: None,
                     management: Arc::clone(&management),
                     session_registration: Some(old_registration),
@@ -827,7 +851,13 @@ async fn poisoned_originals_keep_panic_and_metadata_without_repoll_or_fabricated
         let token = delivery.lock.unwrap().token;
         let management = ConnectionManagement::new();
         let registration = management
-            .register_delivery(LINK, actor.entity.clone(), sequence, token)
+            .register_delivery(
+                LINK,
+                actor.entity.clone(),
+                sequence,
+                token,
+                actor.authority(),
+            )
             .await;
         let context = actor.context(Arc::clone(&management));
         let mut wire = Wire::new_with_credit(ReceiverSettleMode::Second, 1).await;

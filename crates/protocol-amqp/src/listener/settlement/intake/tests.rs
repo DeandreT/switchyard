@@ -452,6 +452,7 @@ async fn natural_authorization_retirement_drains_the_original_receive_without_tr
             let mut wire = Wire::new_with_credit(ReceiverSettleMode::First, 1).await;
             let sender = wire.sender.take().unwrap();
             let protocol = ReceivingLinkProtocol {
+                authority: actor.authority(),
                 authorization: Some(authorization.clone()),
                 management: ConnectionManagement::new(),
                 session_registration: None,
@@ -522,7 +523,7 @@ async fn actual_receive_authorization_preparation_retires_with_grant_row_still_h
                     let mut original = Box::pin(serve_receiving_client(
                         wire.sender.take().unwrap(), actor.namespace.clone(), actor.entity.clone(),
                         broker.clone(), mode, Some(hold.clone()),
-                        ReceivingLinkProtocol {
+                        ReceivingLinkProtocol { authority: actor.authority(),
                             authorization: Some(authorization.clone()),
                             management: ConnectionManagement::new(),
                             session_registration: None,
@@ -579,6 +580,7 @@ async fn older_original_worker_failure_drains_receive_and_drops_only_its_credit(
             let mut wire = Wire::new_with_credit(ReceiverSettleMode::First, 2).await;
             let sender = wire.sender.take().unwrap();
             let protocol = ReceivingLinkProtocol {
+                authority: actor.authority(),
                 authorization: None,
                 management: ConnectionManagement::new(),
                 session_registration: None,
@@ -645,7 +647,7 @@ async fn natural_terminal_drains_receive_before_releasing_an_already_held_sessio
                     arm_receive(&actor, mode, sequence);
                     let mut wire = Wire::new_with_credit(ReceiverSettleMode::First, 1).await;
                     let sender = wire.sender.take().unwrap();
-                    let protocol = ReceivingLinkProtocol { authorization: None, management: ConnectionManagement::new(), session_registration: None };
+                    let protocol = ReceivingLinkProtocol { authority: actor.authority(), authorization: None, management: ConnectionManagement::new(), session_registration: None };
                     let mut pump = tokio::spawn(serve_receiving_client(
                         sender, actor.namespace.clone(), actor.entity.clone(), actor.broker.as_ref().unwrap().clone(), mode, Some(hold.clone()), protocol,
                     ));
@@ -730,6 +732,7 @@ async fn eager_actual_receive_returns_before_exact_session_cleanup_and_reopen() 
                         mode,
                         Some(hold),
                         ReceivingLinkProtocol {
+                            authority: actor.authority(),
                             authorization: None,
                             management: ConnectionManagement::new(),
                             session_registration: None,
@@ -860,6 +863,7 @@ async fn eager_actual_receive_returns_before_exact_session_cleanup_and_reopen() 
         ReceiveMode::PeekLock,
         Some(hold.clone()),
         ReceivingLinkProtocol {
+            authority: actor.authority(),
             authorization: None,
             management: ConnectionManagement::new(),
             session_registration: None,

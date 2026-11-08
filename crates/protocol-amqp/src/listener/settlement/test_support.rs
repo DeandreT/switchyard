@@ -21,7 +21,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
     time::Duration,
@@ -177,10 +177,15 @@ enum Backend {
 pub(super) struct GatedStore {
     inner: Backend,
     gate: Arc<CommitGate>,
+    pub(super) clock_reads: Arc<AtomicUsize>,
+    pub(super) applies: Arc<AtomicUsize>,
 }
 
 impl StateStore for GatedStore {
     fn get(&self, key: &[u8]) -> Result<Option<Value>, StorageError> {
+        if key == domain::keys::clock() {
+            self.clock_reads.fetch_add(1, Ordering::SeqCst);
+        }
         match &self.inner {
             Backend::Memory(store) => store.get(key),
             Backend::Durable(store) => store.get(key),
@@ -188,6 +193,7 @@ impl StateStore for GatedStore {
     }
 
     fn apply(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        self.applies.fetch_add(1, Ordering::SeqCst);
         let gated = self.gate.matches(&batch);
         if gated {
             self.gate.pause(false);
@@ -231,7 +237,7 @@ pub(super) struct Submission {
 
 #[derive(Clone)]
 pub(super) struct ActualBroker {
-    handle: server::BrokerHandle,
+    pub(super) handle: server::BrokerHandle,
     log: Arc<Mutex<Vec<Submission>>>,
     panic_complete: Arc<AtomicBool>,
 }
@@ -272,6 +278,11 @@ impl Broker for ActualBroker {
             kind: kind.clone(),
             returned: false,
         });
+        if matches!(kind, CommandKind::Complete { .. })
+            && self.panic_complete.load(Ordering::SeqCst)
+        {
+            panic!("older-settlement-failure");
+        }
         let result = self.handle.submit_bound(binding, kind.clone()).await;
         self.log.lock().unwrap().push(Submission {
             worker,
@@ -324,6 +335,9 @@ impl Broker for ActualBroker {
 }
 
 pub(super) struct Actor {
+    session: bool,
+    binding: Option<domain::EntityBinding>,
+    pub(super) clock_calls: Arc<AtomicUsize>,
     owner: Option<server::Broker>,
     pub(super) broker: Option<ActualBroker>,
     store: Option<GatedStore>,
@@ -336,7 +350,30 @@ pub(super) struct Actor {
     pub(super) clock: server::ManualClock,
 }
 
+#[derive(Clone)]
+struct ObservedClock {
+    clock: server::ManualClock,
+    calls: Arc<AtomicUsize>,
+}
+
+impl server::Clock for ObservedClock {
+    fn now(&self) -> domain::Timestamp {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        server::Clock::now(&self.clock)
+    }
+}
+
 impl Actor {
+    pub(super) fn authority(&self) -> crate::broker::ReceivingAuthority {
+        if self.session {
+            return crate::broker::ReceivingAuthority::Session;
+        }
+        crate::broker::ReceivingAuthority::Ordinary(
+            self.binding
+                .clone()
+                .expect("fixture captures once before gated operations"),
+        )
+    }
     pub(super) fn new(durable: bool, session: bool) -> Self {
         let gate = Arc::new(CommitGate::default());
         let directory = durable.then(|| tempfile::tempdir().unwrap());
@@ -348,11 +385,17 @@ impl Actor {
         let store = GatedStore {
             inner,
             gate: Arc::clone(&gate),
+            clock_reads: Arc::default(),
+            applies: Arc::default(),
         };
         let clock = server::ManualClock::at(1_000);
+        let clock_calls = Arc::new(AtomicUsize::new(0));
         let owner = server::Broker::spawn(server::LocalProposer::new(
             StateMachine::new(store.clone()),
-            clock.clone(),
+            ObservedClock {
+                clock: clock.clone(),
+                calls: clock_calls.clone(),
+            },
         ));
         let log = Arc::new(Mutex::new(Vec::new()));
         let broker = ActualBroker {
@@ -360,7 +403,10 @@ impl Actor {
             log: Arc::clone(&log),
             panic_complete: Arc::new(AtomicBool::new(false)),
         };
-        let actor = Self {
+        let mut actor = Self {
+            session,
+            binding: None,
+            clock_calls,
             owner: Some(owner),
             broker: Some(broker),
             store: Some(store),
@@ -380,6 +426,15 @@ impl Actor {
                 },
             }),
             CommandOutcome::QueueCreated
+        );
+        actor.binding = Some(
+            actor
+                .broker
+                .as_ref()
+                .unwrap()
+                .handle
+                .bind_entity_blocking(actor.namespace.clone(), actor.entity.clone())
+                .unwrap(),
         );
         actor
     }
@@ -431,6 +486,7 @@ impl Actor {
         management: Arc<ConnectionManagement>,
     ) -> SettlementContext<ActualBroker> {
         SettlementContext {
+            authority: self.authority(),
             namespace: self.namespace.clone(),
             entity: self.entity.clone(),
             broker: self.broker.as_ref().unwrap().clone(),
@@ -462,6 +518,8 @@ impl Actor {
         self.store = Some(GatedStore {
             inner,
             gate: Arc::clone(&self.gate),
+            clock_reads: Arc::default(),
+            applies: Arc::default(),
         });
     }
     pub(super) fn receive_count(&self) -> usize {

@@ -172,8 +172,20 @@ Management request links also capture scheduling authority before acceptance,
 after their Send-or-Listen attach authorization. Only `schedule-message` consumes
 it, after request parsing and Send authorization; a capture failure is retained
 for scheduling rather than rejecting other operations on that link. Scheduling
-does not require an associated data link. Cancellation, receiving, sessions and
-other management operations are not incarnation-fenced by this contract. No
+does not require an associated data link.
+
+Ordinary receiving links capture their own opaque binding after Listen
+authorization and session-filter parsing, before acceptance. Both receive modes,
+empty-queue rechecks, staged receive-delete completion, and delayed Complete,
+Abandon, Defer and DeadLetter (including property patches) reuse that capture.
+DLQ bindings retain their distinct target and owner. Ordinary delivery
+capabilities carry the same binding through management settlement and lock
+renewal, even when an already-selected capability outlives link teardown;
+cleanup cannot remove a replacement registration that reuses its key.
+Stale authority refuses with `amqp:not-found` before clocks or mutation, including
+configuration-free Complete. Parsing and authorization refusals keep their
+priority. Session and request-response consumption capabilities, cancellation,
+and other management operations remain outside this incarnation fence. No
 live deletion/recreation API or new stored/wire format is introduced.
 
 Second-mode delivery confirmations retain their original link incarnation. If
