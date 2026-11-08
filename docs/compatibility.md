@@ -87,10 +87,22 @@ reply after admission does not undo Create. Stop remains a queued request: work
 ahead completes, work behind may observe a stopped owner. No stronger drain or
 shutdown guarantee is implied. The additive protobuf profile fields preserve
 existing numbers and legacy duplicate-history zero semantics; presence on scalar
-profile/availability fields distinguishes omission from explicit values. Its
-contract does not activate a network administration API: HTTP/OpenAPI, generated
-gRPC handlers/listeners, startup wiring, authentication, CLI, Update/Delete, rules,
-placement/capacity mutation and runtime counters remain outside this surface.
+profile/availability fields distinguishes omission from explicit values.
+
+Generated protobuf bindings and `admin-api::rpc::EntityRpc` expose reusable
+Create/Get/List handlers over this service. Every request validates an offline
+JWT against the configured namespace root and requires Manage authority before
+backend dispatch, including reads. Missing/invalid credentials refuse as
+`UNAUTHENTICATED`; insufficient scope or rights refuse as `PERMISSION_DENIED`.
+Wire conversions retain scalar presence and opaque continuation bytes, including
+empty continuing pages, and reject deprecated textual page tokens. Backend error
+responses use fixed messages rather than internal details. Delete remains
+`UNIMPLEMENTED`; unrelated native services are not registered. See the
+[handler contract](../crates/admin-api/README.md).
+
+These library handlers do not start a network administration API. TLS listener
+activation, startup wiring and CLI commands remain pending, alongside
+HTTP/OpenAPI, Update/Delete, rules, placement/capacity mutation and runtime counters.
 
 Selected operational queue-profile reads validate after decode/owner proof,
 including backing queues/DLQs; invalid limits are corruption. Unread rows/raw
@@ -420,7 +432,7 @@ namespace/server; no quotas, fair multi-tenancy or production durability.
 | Scope | Missing |
 | --- | --- |
 | Semantics | SQL actions/parameters/functions beyond the kernel, session subscriptions/session-ID predicates, administrable TTL expiry policy, DLQ forwarding/resubmit, same-group transactions. |
-| Administration | Atom/XML entities/rules; native gRPC/CLI transport (contract only). |
+| Administration | Atom/XML entities/rules; native TLS listener/startup and CLI activation (generated authenticated handlers exist). |
 | Security | JWT wire activation, network OIDC, mTLS, policy/full RBAC, namespace KMS/encryption, tamper-evident audit. |
 | Production | Raft/placement, quotas/fairness, encrypted backup/restore, readiness/observability, release/performance evidence. |
 

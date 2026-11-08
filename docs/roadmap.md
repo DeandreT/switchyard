@@ -87,9 +87,10 @@ PRs in dependency order ([workflow](../CONTRIBUTING.md)). Ready is not evidence.
 | --- | --- |
 | Snapshots | #37 offline children are complete; live recovery follows #38/#41. |
 | Domain | #14, #16, #20, #22 and #23 are complete. Finite admission remains #27; SQL actions remain #21. |
-| Admin | #18, #243 and #244 are complete; TLS transport and CLI follow in #19. |
+| Admin | #18, #243, #244 and #328 are complete; TLS listener #329 and CLI #330 remain in #19. |
 | Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228), #238 ([PR258](https://github.com/DeandreT/switchyard/pull/258)), #239 ([PR264](https://github.com/DeandreT/switchyard/pull/264)) and #240 ([PR263](https://github.com/DeandreT/switchyard/pull/263)) and #232's allocation/graph composition verified. |
-| SDK/security | #7 is complete; #71 grant consumers and #101 durable SDK matrix can proceed. |
+| SDK/security | #7 and #71 grant consumers are complete; JWT activation #17 and durable SDK matrix #101 remain pending. |
+| Native Flow | Outgoing session windows #331 are complete; incoming conservation #332, receiver refill #69 and Flow echo #77 remain pending. |
 
 Shared: #243 keys.rs (released by #229); machine.rs overlaps #240. #244 serializes broker
 ownership. Allocator error/condition/indexed edits serialize; #239 also
