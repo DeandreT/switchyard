@@ -6,7 +6,7 @@ signing API or OAuth/RFC 9068 access-token compatibility is promised.
 
 ```mermaid
 flowchart LR
-    Policy["#8 Pure policy: implemented"] --> Consumers["#71 Grant consumers: pending"]
+    Policy["#8 Pure policy: implemented"] --> Consumers["#71 Grant consumers: implemented"]
     Consumers --> Activation["#17 JWT CBS activation: pending"]
 ```
 
@@ -62,4 +62,8 @@ is redacted, not a claim that grant subjects/scopes are hidden.
 `AccessGrant::same_principal` compares JWT issuer plus subject, or SAS/PLAIN verified
 namespace host plus key name, not scope. `is_valid_at`/`allows` enforce the stored
 interval even if supplied time moves backwards; SAS/PLAIN validity begins at zero.
-Consumer refresh/time adoption (#71) and transport activation (#17) remain pending.
+Connection refresh replaces rights and both validity bounds only for the same
+verified principal and scope; different issuers, SAS identities and scopes remain
+independent. Connection validity, operation checks and link-expiry waits honor the
+full interval, including its lower bound. Far-future SAS expiry waits use bounded
+timers without shortening the grant interval. Transport activation (#17) remains pending.
