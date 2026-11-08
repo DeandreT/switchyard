@@ -15,6 +15,9 @@ const DEFAULT_CBS_AUTHORIZATION_TIMEOUT: Duration = Duration::from_secs(20);
 const CBS_REPLY_ROUTE_TIMEOUT: Duration = Duration::from_secs(2);
 const CBS_REPLY_BUFFER: usize = 16;
 const MICROSOFT_CBS_SASL_MECHANISM: &str = "MSSBCBS";
+// SAS expiry values can exceed the timer's representable Instant range. Bound
+// each sleep, not the grant interval, and recheck authorization after waking.
+const MAX_AUTHORIZATION_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug)]
 pub struct SharedAccessAuthentication {
@@ -85,12 +88,15 @@ impl ConnectionAuthorization {
     }
 
     pub(crate) async fn has_valid_grant(&self) -> bool {
-        let now = epoch_seconds();
+        self.has_valid_grant_at(epoch_seconds()).await
+    }
+
+    async fn has_valid_grant_at(&self, now: u64) -> bool {
         self.grants
             .read()
             .await
             .iter()
-            .any(|grant| grant.expires_at_epoch_seconds() > now)
+            .any(|grant| grant.is_valid_at(now))
     }
 
     pub(crate) async fn wait_for_grant(&self) {
@@ -109,14 +115,19 @@ impl ConnectionAuthorization {
         audience: &str,
     ) -> Result<(), auth::SasError> {
         let grant = self.policy.validate_sas(token, audience, epoch_seconds())?;
+        self.add_verified_grant(grant).await;
+        Ok(())
+    }
+
+    // Accept only grants produced by an authentication policy's verification path.
+    async fn add_verified_grant(&self, grant: AccessGrant) {
         let mut grants = self.grants.write().await;
         grants.retain(|existing| {
-            existing.subject() != grant.subject() || existing.scope() != grant.scope()
+            !existing.same_principal(&grant) || existing.scope() != grant.scope()
         });
         grants.push(grant);
         drop(grants);
         self.grant_changed.notify_waiters();
-        Ok(())
     }
 
     #[cfg(test)]
@@ -158,17 +169,7 @@ impl ConnectionAuthorization {
         resource: &ResourceScope,
         permission: Permission,
     ) -> Result<(), AuthorizationError> {
-        if self
-            .grants
-            .read()
-            .await
-            .iter()
-            .any(|grant| grant.allows(resource, permission, epoch_seconds()))
-        {
-            Ok(())
-        } else {
-            Err(AuthorizationError)
-        }
+        self.authorize_resource_any(resource, &[permission]).await
     }
 
     pub(crate) async fn authorize_resource_any(
@@ -176,7 +177,16 @@ impl ConnectionAuthorization {
         resource: &ResourceScope,
         permissions: &[Permission],
     ) -> Result<(), AuthorizationError> {
-        let now = epoch_seconds();
+        self.authorize_resource_any_at(resource, permissions, epoch_seconds())
+            .await
+    }
+
+    async fn authorize_resource_any_at(
+        &self,
+        resource: &ResourceScope,
+        permissions: &[Permission],
+        now: u64,
+    ) -> Result<(), AuthorizationError> {
         if self.grants.read().await.iter().any(|grant| {
             permissions
                 .iter()
@@ -193,31 +203,8 @@ impl ConnectionAuthorization {
         resource: &ResourceScope,
         permission: Permission,
     ) {
-        loop {
-            let changed = self.grant_changed.notified();
-            let now = epoch_seconds();
-            let expiry = self
-                .grants
-                .read()
-                .await
-                .iter()
-                .filter(|grant| {
-                    grant.scope().contains(resource) && grant.permissions().allows(permission)
-                })
-                .map(AccessGrant::expires_at_epoch_seconds)
-                .filter(|expiry| *expiry > now)
-                .max();
-            let Some(expiry) = expiry else { return };
-            if expiry == u64::MAX {
-                changed.await;
-                continue;
-            }
-
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(expiry.saturating_sub(now))) => {}
-                () = changed => {}
-            }
-        }
+        self.wait_until_unauthorized_any(resource, &[permission])
+            .await;
     }
 
     pub(crate) async fn wait_until_unauthorized_any(
@@ -225,31 +212,36 @@ impl ConnectionAuthorization {
         resource: &ResourceScope,
         permissions: &[Permission],
     ) {
+        self.wait_until_unauthorized_with_clock(resource, permissions, epoch_seconds)
+            .await;
+    }
+
+    async fn wait_until_unauthorized_with_clock(
+        &self,
+        resource: &ResourceScope,
+        permissions: &[Permission],
+        now: impl Fn() -> u64,
+    ) {
         loop {
             let changed = self.grant_changed.notified();
-            let now = epoch_seconds();
+            let now = now();
             let expiry = self
                 .grants
                 .read()
                 .await
                 .iter()
                 .filter(|grant| {
-                    grant.scope().contains(resource)
-                        && permissions
-                            .iter()
-                            .any(|permission| grant.permissions().allows(*permission))
+                    permissions
+                        .iter()
+                        .any(|permission| grant.allows(resource, *permission, now))
                 })
                 .map(AccessGrant::expires_at_epoch_seconds)
-                .filter(|expiry| *expiry > now)
                 .max();
             let Some(expiry) = expiry else { return };
-            if expiry == u64::MAX {
-                changed.await;
-                continue;
-            }
-
             tokio::select! {
-                () = tokio::time::sleep(Duration::from_secs(expiry.saturating_sub(now))) => {}
+                () = tokio::time::sleep(
+                    Duration::from_secs(expiry.saturating_sub(now)).min(MAX_AUTHORIZATION_WAIT),
+                ) => {}
                 () = changed => {}
             }
         }
@@ -458,3 +450,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod grant_tests;

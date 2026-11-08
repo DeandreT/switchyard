@@ -35,7 +35,7 @@ collections require refusal until truthful combined runtime data is available.
 | Area | Contract |
 | --- | --- |
 | Transport/auth | AMQP 1.0 TCP/TLS; binary WSS `/$servicebus/websocket` (`AMQPWSB10`/`amqp`); development-only plaintext. TLS precedes AMQP; SASL PLAIN or ANONYMOUS/`MSSBCBS`, then CBS SAS. |
-| Rights | Namespace/entity Send, Listen, Manage (includes both). Send for scheduling/cancellation; Listen for receive management. CBS grants are connection-wide, expire links, and allow 20s initial authorization. |
+| Rights | Namespace/entity Send, Listen, Manage (includes both). Send for scheduling/cancellation; Listen for receive management. CBS grants are connection-wide, expire links, and allow 20s initial authorization. Refresh replaces rights/validity only for the same verified principal and scope; checks and expiry waits honor the full validity interval. |
 | Delivery | Singular/atomic batch send; peek-lock (unsettled) or receive-delete (pre-settled); independent out-of-order settlement; bounded prefetch/drain. Credit is reserved before mutation, empty results release it, and consumption/release completes drain. |
 | Envelope | Durable AMQP body/forms, identifiers, properties, annotations, application properties/footer; copy-local property patches; broker-authoritative delivery overlays. |
 | Management | Renew, abandon, defer/retrieve, ordered peek, schedule/cancel, custom dead-letter and DLQ receive/complete. Unsupported requests reject with compatible conditions/retry hints. |
@@ -95,10 +95,10 @@ placement/capacity mutation and runtime counters remain outside this surface.
 Selected operational queue-profile reads validate after decode/owner proof,
 including backing queues/DLQs; invalid limits are corruption. Unread rows/raw
 catalogues are not certified; profile-free legacy operations remain unchanged.
-Administration setters/capacity, JWT consumers [#71](https://github.com/DeandreT/switchyard/issues/71)
-and activation [#17](https://github.com/DeandreT/switchyard/issues/17), typed content
-#16 and actionless SQL filters (#20) are complete; bounded SQL actions (#21)
-remain pending.
+Typed content (#16) and actionless SQL filters (#20) are complete. Administration
+setters/capacity, JWT activation [#17](https://github.com/DeandreT/switchyard/issues/17),
+and bounded SQL actions (#21) remain pending. Grant consumers preserve verified
+principal identity and both validity bounds without activating JWT on the wire.
 
 ### Absolute link addresses
 
@@ -408,7 +408,7 @@ namespace/server; no quotas, fair multi-tenancy or production durability.
 | --- | --- |
 | Semantics | SQL actions/parameters/functions beyond the kernel, session subscriptions/session-ID predicates, administrable TTL expiry policy, DLQ forwarding/resubmit, same-group transactions. |
 | Administration | Atom/XML entities/rules; native gRPC/CLI transport (contract only). |
-| Security | JWT consumers/wire, network OIDC, mTLS, policy/full RBAC, namespace KMS/encryption, tamper-evident audit. |
+| Security | JWT wire activation, network OIDC, mTLS, policy/full RBAC, namespace KMS/encryption, tamper-evident audit. |
 | Production | Raft/placement, quotas/fairness, encrypted backup/restore, readiness/observability, release/performance evidence. |
 
 Partitioning/cross-placement transactions are later scope; geo-replication/Premium
