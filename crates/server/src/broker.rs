@@ -631,6 +631,26 @@ impl Drop for Broker {
 /// Separating a refusal from an unreachable broker is what lets the edge report
 /// a condition the client can act on instead of a generic failure.
 impl protocol_amqp::Broker for BrokerHandle {
+    async fn bind_entity(
+        &self,
+        namespace: NamespaceName,
+        entity: EntityPath,
+    ) -> Result<EntityBinding, protocol_amqp::BrokerRejection> {
+        BrokerHandle::bind_entity(self, namespace, entity)
+            .await
+            .map_err(protocol_rejection)
+    }
+
+    async fn submit_bound(
+        &self,
+        binding: EntityBinding,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, protocol_amqp::BrokerRejection> {
+        BrokerHandle::submit_bound(self, binding, kind)
+            .await
+            .map_err(protocol_rejection)
+    }
+
     fn deliverable(
         &self,
         namespace: &NamespaceName,
@@ -648,12 +668,16 @@ impl protocol_amqp::Broker for BrokerHandle {
     ) -> Result<CommandOutcome, protocol_amqp::BrokerRejection> {
         BrokerHandle::submit(self, namespace, entity, kind)
             .await
-            .map_err(|error| match error {
-                SubmitError::Propose(ProposeError::Broker(refused)) => {
-                    protocol_amqp::BrokerRejection::Refused(refused)
-                }
-                other => protocol_amqp::BrokerRejection::Unavailable(other.to_string()),
-            })
+            .map_err(protocol_rejection)
+    }
+}
+
+fn protocol_rejection(error: SubmitError) -> protocol_amqp::BrokerRejection {
+    match error {
+        SubmitError::Propose(ProposeError::Broker(refused)) => {
+            protocol_amqp::BrokerRejection::Refused(refused)
+        }
+        other => protocol_amqp::BrokerRejection::Unavailable(other.to_string()),
     }
 }
 

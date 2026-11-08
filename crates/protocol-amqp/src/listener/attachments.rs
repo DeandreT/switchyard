@@ -14,7 +14,8 @@ use amqp::{
 };
 use auth::Permission;
 use domain::{
-    AcceptedSession, CommandKind, CommandOutcome, EntityPath, NamespaceName, ReceiveMode,
+    AcceptedSession, CommandKind, CommandOutcome, EntityBinding, EntityPath, NamespaceName,
+    ReceiveMode,
 };
 use futures_util::FutureExt;
 use serde_amqp::primitives::Symbol;
@@ -239,6 +240,7 @@ impl<'a> AttachmentHandoff<'a> {
 }
 
 pub(super) struct EntityLink {
+    pub(super) sender_binding: Option<EntityBinding>,
     pub(super) endpoint: LinkEndpoint,
     pub(super) entity: EntityPath,
     pub(super) accepted: Option<AcceptedSession>,
@@ -269,6 +271,7 @@ impl EntityHandoffExit {
 }
 
 struct PreparedLink {
+    sender_binding: Option<EntityBinding>,
     entity: EntityPath,
     authorization: Option<LinkAuthorization>,
     session: SessionRequest,
@@ -306,6 +309,7 @@ async fn prepare_link(
         SessionRequest::None
     };
     Ok(PreparedLink {
+        sender_binding: None,
         entity,
         authorization,
         session,
@@ -564,7 +568,15 @@ async fn entity_attachment_pump<'a, B: Broker>(
         }
         plan = async {
             match resolved {
-                Ok(entity) => prepare_link(entity, &attach, authorization).await,
+                Ok(entity) => {
+                    let mut prepared = prepare_link(entity, &attach, authorization).await?;
+                    if attach.role == Role::Sender {
+                        prepared.sender_binding = Some(broker.bind_entity(
+                            namespace.clone(), prepared.entity.clone(),
+                        ).await.map_err(|error| rejection_error(&error))?);
+                    }
+                    Ok(prepared)
+                },
                 Err(error) => Err(error),
             }
         } => plan,
@@ -726,6 +738,7 @@ async fn entity_attachment_pump<'a, B: Broker>(
         unreachable!("captured native endpoint")
     };
     custody.ready = Some(EntityLink {
+        sender_binding: prepared.sender_binding,
         endpoint,
         entity: prepared.entity,
         accepted: custody.packet.as_mut().unwrap().accepted.take(),
@@ -776,8 +789,10 @@ async fn prepare_and_adopt_with_retirement<B: Broker>(
         .expect("entry preparation borrows its ready packet");
     match &ready.endpoint {
         LinkEndpoint::Receiver(receiver) => {
-            let namespace = namespace.clone();
-            let entity = ready.entity.clone();
+            let binding = ready
+                .sender_binding
+                .clone()
+                .expect("sending attachment captured authority");
             let broker = broker.clone();
             let authorization = ready.authorization.clone();
             let retirement = retirement.cloned();
@@ -795,10 +810,9 @@ async fn prepare_and_adopt_with_retirement<B: Broker>(
                 unreachable!("ready receiving endpoint retains its role")
             };
             *admitted = Some(prepared_task.spawn(async move {
-                super::serve_sending_client_with_retirement(
+                super::serve_bound_sending_client_with_retirement(
                     receiver,
-                    namespace,
-                    entity,
+                    binding,
                     broker,
                     authorization,
                     retirement,

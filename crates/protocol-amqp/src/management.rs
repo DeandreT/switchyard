@@ -696,7 +696,32 @@ pub(crate) async fn serve_management_requests<B: Broker>(
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn serve_management_requests_with_retirement<B: Broker>(
+    receiver: Receiver,
+    namespace: NamespaceName,
+    entity: EntityPath,
+    broker: B,
+    management: Arc<ConnectionManagement>,
+    authorization: Option<ManagementAuthorization>,
+    notice: Option<ConnectionRetirementRequest>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sender = broker.bind_entity(namespace.clone(), entity.clone()).await;
+    serve_management_requests_with_sender(
+        receiver,
+        namespace,
+        entity,
+        broker,
+        management,
+        authorization,
+        notice,
+        sender,
+    )
+    .await
+}
+
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn serve_management_requests_with_sender<B: Broker>(
     mut receiver: Receiver,
     namespace: NamespaceName,
     entity: EntityPath,
@@ -704,6 +729,7 @@ pub(crate) async fn serve_management_requests_with_retirement<B: Broker>(
     management: Arc<ConnectionManagement>,
     authorization: Option<ManagementAuthorization>,
     notice: Option<ConnectionRetirementRequest>,
+    sender: Result<domain::EntityBinding, BrokerRejection>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let detached = receiver.on_detach_owned();
     let retirement = async {
@@ -714,6 +740,7 @@ pub(crate) async fn serve_management_requests_with_retirement<B: Broker>(
         }
     };
     tokio::pin!(retirement);
+    let sender_authority = Arc::new(sender);
     loop {
         let received = tokio::select! {
             biased;
@@ -761,7 +788,8 @@ pub(crate) async fn serve_management_requests_with_retirement<B: Broker>(
                 return Ok(());
             }
         }
-        let request_broker = RequestBroker::new(broker.clone());
+        let request_broker =
+            RequestBroker::with_sender(broker.clone(), Arc::clone(&sender_authority));
         let mut custody = RequestCustody::default();
         let result = AssertUnwindSafe(management_request_pump(
             &receiver,

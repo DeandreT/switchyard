@@ -245,6 +245,47 @@ impl ActualBroker {
 // A unit-test crate and server's normal protocol dependency have distinct
 // Broker trait identities. Delegate inherent methods, not the foreign impl.
 impl Broker for ActualBroker {
+    async fn bind_entity(
+        &self,
+        namespace: NamespaceName,
+        entity: EntityPath,
+    ) -> Result<domain::EntityBinding, BrokerRejection> {
+        self.handle
+            .bind_entity(namespace, entity)
+            .await
+            .map_err(|error| match error {
+                server::SubmitError::Propose(server::ProposeError::Broker(error)) => {
+                    BrokerRejection::Refused(error)
+                }
+                other => BrokerRejection::Unavailable(other.to_string()),
+            })
+    }
+
+    async fn submit_bound(
+        &self,
+        binding: domain::EntityBinding,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, BrokerRejection> {
+        let worker = tokio::task::id();
+        self.log.lock().unwrap().push(Submission {
+            worker,
+            kind: kind.clone(),
+            returned: false,
+        });
+        let result = self.handle.submit_bound(binding, kind.clone()).await;
+        self.log.lock().unwrap().push(Submission {
+            worker,
+            kind,
+            returned: true,
+        });
+        result.map_err(|error| match error {
+            server::SubmitError::Propose(server::ProposeError::Broker(error)) => {
+                BrokerRejection::Refused(error)
+            }
+            other => BrokerRejection::Unavailable(other.to_string()),
+        })
+    }
+
     async fn submit(
         &self,
         namespace: NamespaceName,

@@ -10,7 +10,7 @@ use std::{
 };
 
 use amqp::{EngineError, Outcome};
-use domain::{CommandKind, CommandOutcome, EntityPath, NamespaceName};
+use domain::{CommandKind, CommandOutcome, EntityBinding, EntityPath, NamespaceName};
 use futures_util::FutureExt;
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -72,13 +72,28 @@ impl OperationControl {
 pub(super) struct RequestBroker<B> {
     actual: B,
     control: OperationControl,
+    sender: Arc<Result<EntityBinding, BrokerRejection>>,
 }
 
 impl<B> RequestBroker<B> {
+    #[cfg(test)]
     pub(super) fn new(actual: B) -> Self {
+        Self::with_sender(
+            actual,
+            Arc::new(Err(BrokerRejection::Unavailable(
+                "no scheduled-Send authority in this fixture".into(),
+            ))),
+        )
+    }
+
+    pub(super) fn with_sender(
+        actual: B,
+        sender: Arc<Result<EntityBinding, BrokerRejection>>,
+    ) -> Self {
         Self {
             actual,
             control: OperationControl::new(),
+            sender,
         }
     }
 
@@ -88,6 +103,41 @@ impl<B> RequestBroker<B> {
 }
 
 impl<B: Broker> Broker for RequestBroker<B> {
+    async fn bind_entity(
+        &self,
+        namespace: NamespaceName,
+        entity: EntityPath,
+    ) -> Result<EntityBinding, BrokerRejection> {
+        if !self.control.begin() {
+            return Err(BrokerRejection::Unavailable(
+                "management request retired before binding".into(),
+            ));
+        }
+        // Only scheduled Send asks for a binding here. Production supplies the
+        // original capture (including a refusal) from before link acceptance.
+        // Listen/session/rule/cancellation operations retain their existing path.
+        let binding = self.sender.as_ref().clone()?;
+        if binding.namespace() != &namespace || binding.target() != &entity {
+            return Err(BrokerRejection::Refused(
+                domain::BrokerError::StaleEntityBinding,
+            ));
+        }
+        Ok(binding)
+    }
+
+    async fn submit_bound(
+        &self,
+        binding: EntityBinding,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, BrokerRejection> {
+        if !self.control.begin() {
+            return Err(BrokerRejection::Unavailable(
+                "management request retired before bound submission".into(),
+            ));
+        }
+        self.actual.submit_bound(binding, kind).await
+    }
+
     async fn submit(
         &self,
         namespace: NamespaceName,

@@ -374,9 +374,13 @@ async fn actual_connection_family_processed_end_and_reuse_keep_original_admissio
             assert_ne!(new_id, old_id);
             assert_eq!(facts(&observer, FamilyPoint::Adopted, 1).pending, 2);
             assert!(!notice.is_requested());
+            // Sender admission now captures authority through the same broker
+            // owner. A fresh attach cannot finish behind the held old Send.
+            // Session reuse is already witnessed above; release its commit
+            // before waiting for the new sending link's acceptance.
+            actor.gate.release_all();
             wire.offer(1, 2, false).await;
             drive(original.as_mut(), wire.accepted(1, 2)).await;
-            actor.gate.release_all();
             drive(original.as_mut(), reaped(&observer, old_id)).await;
             assert_eq!(invocations(&actor), 1);
             assert_eq!(actor.gate.state.lock().unwrap().commits, 1);

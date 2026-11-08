@@ -605,6 +605,31 @@ enum TestBroker {
 }
 
 impl Broker for TestBroker {
+    async fn bind_entity(
+        &self,
+        namespace: domain::NamespaceName,
+        entity: domain::EntityPath,
+    ) -> Result<domain::EntityBinding, BrokerRejection> {
+        match self {
+            Self::Actual(broker) => broker.bind_entity(namespace, entity).await,
+            Self::Unexpected(_) => Ok(crate::broker::test_binding(namespace, entity)),
+        }
+    }
+
+    async fn submit_bound(
+        &self,
+        binding: domain::EntityBinding,
+        command: CommandKind,
+    ) -> Result<CommandOutcome, BrokerRejection> {
+        match self {
+            Self::Actual(broker) => broker.submit_bound(binding, command).await,
+            Self::Unexpected(calls) => {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CommandOutcome::QueueCreated)
+            }
+        }
+    }
+
     async fn submit(
         &self,
         namespace: domain::NamespaceName,
@@ -871,6 +896,28 @@ struct EagerBroker {
 }
 
 impl Broker for EagerBroker {
+    async fn bind_entity(
+        &self,
+        namespace: domain::NamespaceName,
+        entity: domain::EntityPath,
+    ) -> Result<domain::EntityBinding, BrokerRejection> {
+        self.actual.bind_entity(namespace, entity).await
+    }
+
+    fn submit_bound(
+        &self,
+        binding: domain::EntityBinding,
+        command: CommandKind,
+    ) -> impl Future<Output = Result<CommandOutcome, BrokerRejection>> + Send {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let actual = self.actual.clone();
+        let bodies = Arc::clone(&self.bodies);
+        async move {
+            bodies.fetch_add(1, Ordering::SeqCst);
+            actual.submit_bound(binding, command).await
+        }
+    }
+
     fn submit(
         &self,
         namespace: domain::NamespaceName,

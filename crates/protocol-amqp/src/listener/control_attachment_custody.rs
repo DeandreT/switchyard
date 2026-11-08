@@ -27,7 +27,7 @@ use crate::{
     cbs::{CbsResponse, serve_cbs_replies_with_retirement, serve_cbs_requests_with_retirement},
     management::{
         ConnectionManagement, ManagementAuthorization, ManagementResponse,
-        serve_management_replies_with_retirement, serve_management_requests_with_retirement,
+        serve_management_replies_with_retirement, serve_management_requests_with_sender,
     },
 };
 
@@ -708,7 +708,19 @@ pub(crate) async fn serve_control_attachment<B: Broker>(
                     }
                     None => None,
                 };
-                Ok((entity, link_authorization))
+                // This is only scheduled-Send authority, not a fence for other
+                // management operations. Keep even a capture refusal so a
+                // later schedule cannot silently resolve a newer incarnation.
+                // Refuse malformed schedules/unauthorized operations first at
+                // request time; do not reject a Listen-only management link.
+                let sender = if attach.role == Role::Sender {
+                    Some(tokio::select! {
+                        biased;
+                        () = &mut custody.retirement_observer => { custody.retire(); return Ok(()); },
+                        result = context.broker.bind_entity(context.namespace.clone(), entity.clone()) => result,
+                    })
+                } else { None };
+                Ok((entity, link_authorization, sender))
             }
             Err(error) => Err(error_for(amqp::AmqpError::InvalidField, error.to_string())),
         };
@@ -716,7 +728,7 @@ pub(crate) async fn serve_control_attachment<B: Broker>(
         if !accept_native(&mut custody, attach).await? {
             return Ok(());
         }
-        let (entity, link_authorization) = match plan {
+        let (entity, link_authorization, sender) = match plan {
             Ok(plan) => plan,
             Err(error) => { refuse(&mut custody, error).await; return Ok(()); }
         };
@@ -731,7 +743,7 @@ pub(crate) async fn serve_control_attachment<B: Broker>(
                 if custody.is_retired() { return Ok(()); }
                 if let Some(LinkEndpoint::Receiver(receiver)) = custody.take_endpoint() {
                     custody.admitted = Some(prepared_task.spawn(async move {
-                        serve_management_requests_with_retirement(receiver, namespace, entity, broker, management, link_authorization, retirement).await
+                        serve_management_requests_with_sender(receiver, namespace, entity, broker, management, link_authorization, retirement, sender.expect("request link captured scheduled-Send authority")).await
                     }));
                 }
             }

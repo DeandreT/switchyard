@@ -146,6 +146,23 @@ the attach response.
 
 ### Atomicity And Lifecycle
 
+AMQP data senders capture an opaque entity binding after address validation and
+Send authorization, before attach acceptance. Ordinary, batch and annotated
+scheduled transfers reuse that binding. A same-kind owner generation change
+refuses well-formed transfers with `amqp:not-found`, without clock access,
+state/sequence changes or deliverability wakeups; a fresh healthy link can send.
+Authorization expiry and malformed-message refusals retain their priority, and
+successful sends are confirmed only after commit. DLQ/subscription sender
+addresses remain invalid before any owner lookup.
+
+Management request links also capture scheduling authority before acceptance,
+after their Send-or-Listen attach authorization. Only `schedule-message` consumes
+it, after request parsing and Send authorization; a capture failure is retained
+for scheduling rather than rejecting other operations on that link. Scheduling
+does not require an associated data link. Cancellation, receiving, sessions and
+other management operations are not incarnation-fenced by this contract. No
+live deletion/recreation API or new stored/wire format is introduced.
+
 Second-mode delivery confirmations retain their original link incarnation. If
 native Detach or End retires that owner before confirmation, the native API returns
 `RemoteDetached` without writing a disposition, even after channel/handle reuse.

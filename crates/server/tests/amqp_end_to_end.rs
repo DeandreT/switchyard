@@ -1018,13 +1018,14 @@ async fn attaching_to_a_queue_that_does_not_exist_is_refused() -> Result<(), Box
     let mut session = Session::begin(&mut connection).await?;
     let mut sender = Sender::attach(&mut session, "test-sender", "invoices").await?;
 
-    // The link attaches — the broker learns the queue is missing only when a
-    // command reaches it — and the send is rejected rather than silently lost.
+    // Sender admission must capture a live owner before adopting the link.
+    // Native Attach is answered before the refusal Detach, so a sender handle
+    // can arrive first, but it must never become a usable sending link.
     let outcome = sender
         .send(Message::builder().body(body("nowhere")).build())
-        .await?;
+        .await;
     assert!(
-        matches!(outcome, Outcome::Rejected(_)),
+        matches!(outcome, Err(amqp::EngineError::RemoteDetached)),
         "expected a rejection, got {outcome:?}"
     );
 
