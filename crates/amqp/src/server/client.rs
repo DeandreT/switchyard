@@ -697,12 +697,15 @@ where
                         let attach = *attach;
                         if let Some(pending) = pending_attaches.remove(&(channel, attach.name.clone())) {
                             if attach.role == Role::Sender {
+                                if let Some(LinkState::Receiving(link)) = sessions.get_mut(&channel).and_then(|session| session.links.get_mut(&pending.handle)) {
+                                    link.credit = engine::incoming::ReceivingCredit::new(attach.initial_delivery_count.unwrap_or(0));
+                                }
                                 write_amqp(
                                     &mut writer,
                                     channel,
                                     Performative::Flow(Flow {
                                         handle: Some(pending.handle),
-                                        delivery_count: Some(0),
+                                        delivery_count: Some(attach.initial_delivery_count.unwrap_or(0)),
                                         link_credit: Some(LINK_CREDIT),
                                         ..engine::incoming::session_flow(&sessions[&channel])
                                     }),
@@ -892,6 +895,7 @@ where
                                 let incarnation = next_link_incarnation();
                                 session.links.insert(handle, LinkState::Receiving(ReceivingLink {
                                     incarnation,
+                                    credit: engine::incoming::ReceivingCredit::new(0),
                                     max_message_size: receive_limit,
                                     deliveries: deliveries_tx,
                                     partial: None,
@@ -1099,6 +1103,130 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn client_receives_3072_on_one_link_with_peer_seeded_wrapping_refills() {
+        let (stream, mut peer) = tokio::io::duplex(64 * 1024);
+        let (commands, command_rx) = mpsc::channel(256);
+        let (closed_tx, closed) = watch::channel(false);
+        let driver = tokio::spawn(run_client(stream, 1024, command_rx, closed_tx));
+        let mut connection = ClientConnection { commands, closed };
+        let (finished, peer_finished) = oneshot::channel();
+        async fn control(peer: &mut tokio::io::DuplexStream) -> Performative {
+            let Frame::Amqp {
+                performative: Some(value),
+                ..
+            } = read_frame(peer).await.unwrap()
+            else {
+                panic!("AMQP control")
+            };
+            value
+        }
+        tokio::time::timeout(crate::test_deadline::WAIT, async {
+            tokio::join!(
+                async {
+                    let mut session = connection.begin().await.unwrap();
+                    let mut receiver = session
+                        .attach_receiver("sustained", "orders")
+                        .await
+                        .unwrap();
+                    for _ in 0..3072 {
+                        assert_eq!(
+                            receiver.recv().await.unwrap().message(),
+                            &Message::default()
+                        );
+                    }
+                    peer_finished.await.unwrap();
+                    connection.close().await.unwrap();
+                },
+                async {
+                    assert!(matches!(control(&mut peer).await, Performative::Begin(_)));
+                    write_amqp(
+                        &mut peer,
+                        0,
+                        Performative::Begin(Begin {
+                            remote_channel: Some(0),
+                            ..Begin::default()
+                        }),
+                        vec![],
+                    )
+                    .await
+                    .unwrap();
+                    let Performative::Attach(mut attach) = control(&mut peer).await else {
+                        panic!("receiver Attach")
+                    };
+                    let handle = attach.handle;
+                    let seed = u32::MAX - 1000;
+                    attach.role = Role::Sender;
+                    attach.initial_delivery_count = Some(seed);
+                    write_amqp(&mut peer, 0, Performative::Attach(attach), vec![])
+                        .await
+                        .unwrap();
+                    let Performative::Flow(flow) = control(&mut peer).await else {
+                        panic!("initial credit")
+                    };
+                    assert_eq!(flow.delivery_count, Some(seed));
+                    assert_eq!(flow.link_credit, Some(LINK_CREDIT));
+                    for batch in 0..3 {
+                        for id in batch * 1024..(batch + 1) * 1024 {
+                            write_amqp(
+                                &mut peer,
+                                0,
+                                Performative::Transfer(Transfer {
+                                    handle,
+                                    delivery_id: Some(id),
+                                    delivery_tag: Some(DeliveryTag::from(
+                                        id.to_be_bytes().to_vec(),
+                                    )),
+                                    message_format: Some(0),
+                                    settled: Some(true),
+                                    more: false,
+                                    rcv_settle_mode: None,
+                                    state: None,
+                                    resume: false,
+                                    aborted: false,
+                                    batchable: false,
+                                }),
+                                vec![],
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        loop {
+                            let Performative::Flow(flow) = control(&mut peer).await else {
+                                panic!("capacity Flow")
+                            };
+                            if flow.handle == Some(handle) {
+                                assert_eq!(
+                                    flow.delivery_count,
+                                    Some(seed.wrapping_add((batch + 1) * 1024))
+                                );
+                                assert_eq!(flow.link_credit, Some(LINK_CREDIT));
+                                break;
+                            }
+                        }
+                    }
+                    finished.send(()).unwrap();
+                    // Any final session-only refund is independent of link credit.
+                    loop {
+                        if matches!(control(&mut peer).await, Performative::Close(_)) {
+                            break;
+                        }
+                    }
+                    write_amqp(&mut peer, 0, Performative::Close(Close::default()), vec![])
+                        .await
+                        .unwrap();
+                }
+            );
+        })
+        .await
+        .expect("original sustained client receive deadline");
+        tokio::time::timeout(crate::test_deadline::WAIT, driver)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn client_replenishes_fragment_capacity_and_new_links_report_real_received_progress() {
         let (stream, mut peer) = tokio::io::duplex(64 * 1024);
         let (commands, command_rx) = mpsc::channel(256);
@@ -1154,7 +1282,7 @@ mod tests {
                     };
                     let handle = attach.handle;
                     attach.role = Role::Sender;
-                    attach.initial_delivery_count = Some(0);
+                    attach.initial_delivery_count = Some(u32::MAX);
                     write_amqp(&mut peer, channel, Performative::Attach(attach), Vec::new())
                         .await
                         .unwrap();
@@ -1163,6 +1291,7 @@ mod tests {
                         panic!("initial credit")
                     };
                     assert_eq!(flow.next_incoming_id, Some(17));
+                    assert_eq!(flow.delivery_count, Some(u32::MAX));
                     for (index, byte) in payload.into_iter().enumerate() {
                         let first = index == 0;
                         write_amqp(

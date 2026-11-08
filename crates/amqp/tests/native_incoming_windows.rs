@@ -147,11 +147,22 @@ impl Fixture {
         session
     }
     async fn accept(&mut self, handle: u32, role: Role, maximum: u64) -> LinkEndpoint {
+        self.accept_at(handle, role, maximum, 0).await
+    }
+    async fn accept_at(
+        &mut self,
+        handle: u32,
+        role: Role,
+        maximum: u64,
+        count: u32,
+    ) -> LinkEndpoint {
         let receiving = role == Role::Sender;
+        let mut offer = attach(handle, role);
+        offer.initial_delivery_count = receiving.then_some(count);
         write(
             &mut self.peer,
             1,
-            Performative::Attach(Box::new(attach(handle, role))),
+            Performative::Attach(Box::new(offer)),
             vec![],
         )
         .await;
@@ -171,10 +182,11 @@ impl Fixture {
                 response.max_message_size,
                 Some(maximum.min(16 * 1024 * 1024))
             );
-            assert!(matches!(
-                read(&mut self.peer).await.1,
-                Performative::Flow(_)
-            ));
+            let Performative::Flow(flow) = read(&mut self.peer).await.1 else {
+                panic!("initial credit")
+            };
+            assert_eq!(flow.delivery_count, Some(count));
+            assert_eq!(flow.link_credit, Some(2048));
         }
         endpoint
     }
@@ -186,6 +198,10 @@ impl Fixture {
         receiver
     }
     async fn barrier(&mut self) -> Flow {
+        self.barrier_flows().await.0
+    }
+    async fn barrier_flows(&mut self) -> (Flow, Vec<Flow>) {
+        let mut flows = Vec::new();
         write(
             &mut self.peer,
             1,
@@ -208,8 +224,9 @@ impl Fixture {
                 panic!("Flow barrier: {p:?}")
             };
             if flow.drain {
-                return flow;
+                return (flow, flows);
             }
+            flows.push(flow);
         }
     }
     async fn replenished(&mut self, expected: u32) -> Flow {
@@ -768,5 +785,202 @@ async fn incoming_zero_window_still_dispatches_flow_that_resumes_the_original_ou
         amqp::Outcome::Accepted(_)
     ));
     drop(sending);
+    f.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_link_sustains_6144_deliveries_across_count_wrap_and_consumer_stalls() {
+    let mut f = Fixture::new(53).await;
+    let seed = u32::MAX - 1000;
+    let LinkEndpoint::Receiver(mut receiver) = f.accept_at(1, Role::Sender, 4096, seed).await
+    else {
+        panic!("receiver")
+    };
+    let mut sent = 0_u32;
+    let mut credit = 2048;
+    while sent < 6144 {
+        let batch = credit.min(6144 - sent);
+        assert!(
+            batch > 0,
+            "actual consumption must restore sender admission"
+        );
+        for id in sent..sent + batch {
+            write(
+                &mut f.peer,
+                1,
+                Performative::Transfer(transfer(1, Some(id), false)),
+                encode_message(&Message::data(id.to_be_bytes().to_vec())).unwrap(),
+            )
+            .await;
+        }
+        sent += batch;
+        credit -= batch;
+        let (stalled, flows) = f.barrier_flows().await;
+        assert!(
+            flows.iter().all(|flow| flow.handle != Some(1)),
+            "no consumption, no link refill"
+        );
+        assert_eq!(stalled.next_incoming_id, Some(53 + sent));
+        if sent == 2048 {
+            assert_eq!(stalled.incoming_window, 0);
+            drop(receiver.recv());
+            assert!(
+                f.barrier_flows().await.1.is_empty(),
+                "cancelled recv returns no capacity"
+            );
+        }
+        for id in sent - batch..sent {
+            assert_eq!(
+                receiver.recv().await.unwrap().message(),
+                &Message::data(id.to_be_bytes().to_vec())
+            );
+        }
+        let (_, flows) = f.barrier_flows().await;
+        for flow in flows.into_iter().filter(|flow| flow.handle == Some(1)) {
+            assert_eq!(flow.delivery_count, Some(seed.wrapping_add(sent)));
+            credit = flow.link_credit.unwrap();
+            assert!(credit <= 2048);
+        }
+    }
+    assert!(seed.wrapping_add(sent) < seed);
+    f.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn receiving_echo_and_drain_are_explicitly_refused_without_false_progress() {
+    for echo in [false, true] {
+        let mut f = Fixture::new(0).await;
+        let mut old = f.receiver(1, 4096).await;
+        write(
+            &mut f.peer,
+            1,
+            Performative::Transfer(transfer(1, Some(0), true)),
+            vec![0],
+        )
+        .await;
+        write(
+            &mut f.peer,
+            1,
+            Performative::Flow(Flow {
+                handle: Some(1),
+                delivery_count: Some(1000),
+                drain: !echo,
+                echo,
+                incoming_window: 2048,
+                ..Flow::default()
+            }),
+            vec![],
+        )
+        .await;
+        let Performative::Detach(detach) = read(&mut f.peer).await.1 else {
+            panic!("explicit refusal")
+        };
+        assert_eq!(
+            detach.error.unwrap().condition.as_symbol().to_string(),
+            "amqp:not-implemented"
+        );
+        timeout(WAIT, old.on_detach()).await.unwrap();
+        // An already in-flight transfer can consume a frame but cannot recreate
+        // the refused link or fabricate a delivery acknowledgement.
+        write(
+            &mut f.peer,
+            1,
+            Performative::Transfer(transfer(1, None, false)),
+            vec![1],
+        )
+        .await;
+        assert_eq!(f.barrier().await.next_incoming_id, Some(2));
+        assert!(old.recv().await.is_err());
+        f.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn retired_queue_dequeue_never_refills_a_reused_handle() {
+    let mut f = Fixture::new(0).await;
+    let mut old = f.receiver(1, 4096).await;
+    for id in 0..1024 {
+        write(
+            &mut f.peer,
+            1,
+            Performative::Transfer(transfer(1, Some(id), false)),
+            vec![],
+        )
+        .await;
+    }
+    f.barrier().await;
+    write(
+        &mut f.peer,
+        1,
+        Performative::Detach(amqp::Detach {
+            handle: 1,
+            closed: true,
+            error: None,
+        }),
+        vec![],
+    )
+    .await;
+    assert!(matches!(read(&mut f.peer).await.1, Performative::Detach(_)));
+    let _new = f.receiver(1, 4096).await;
+    for _ in 0..1024 {
+        old.recv().await.unwrap();
+    }
+    let (flow, refunds) = f.barrier_flows().await;
+    assert_eq!(flow.incoming_window, 2048);
+    assert!(
+        refunds.iter().all(|flow| flow.handle != Some(1)),
+        "old custody cannot grant new link credit"
+    );
+    f.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fragmented_aborts_refill_once_per_delivery_not_per_repeated_continuation_id() {
+    let mut f = Fixture::new(0).await;
+    let seed = u32::MAX - 511;
+    let _receiver = f.accept_at(1, Role::Sender, 4096, seed).await;
+    for id in 0..1024 {
+        write(
+            &mut f.peer,
+            1,
+            Performative::Transfer(transfer(1, Some(id), true)),
+            vec![0],
+        )
+        .await;
+        let mut abort = transfer(1, Some(id), false);
+        abort.aborted = true;
+        write(&mut f.peer, 1, Performative::Transfer(abort), vec![]).await;
+    }
+    let (session, flows) = f.barrier_flows().await;
+    assert_eq!(session.next_incoming_id, Some(2048));
+    assert_eq!(session.incoming_window, 2048);
+    let refunds = flows
+        .iter()
+        .filter(|flow| flow.handle == Some(1))
+        .collect::<Vec<_>>();
+    assert_eq!(refunds.len(), 1);
+    assert_eq!(refunds[0].delivery_count, Some(seed.wrapping_add(1024)));
+    assert_eq!(refunds[0].link_credit, Some(2048));
+    f.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_a_stalled_consumer_returns_global_storage_but_no_more_link_credit() {
+    let mut f = Fixture::new(0).await;
+    let receiver = f.receiver(1, 4096).await;
+    for id in 0..2048 {
+        write(
+            &mut f.peer,
+            1,
+            Performative::Transfer(transfer(1, Some(id), false)),
+            vec![],
+        )
+        .await;
+    }
+    assert_eq!(f.barrier().await.incoming_window, 0);
+    drop(receiver);
+    let (session, flows) = f.barrier_flows().await;
+    assert_eq!(session.incoming_window, 2048);
+    assert!(flows.iter().all(|flow| flow.handle != Some(1)));
     f.shutdown().await;
 }

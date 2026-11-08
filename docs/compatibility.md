@@ -201,9 +201,39 @@ These are native encoded-retention and count bounds, not a process RSS quota:
 decoded values, allocator overhead, the separately bounded reader frame queue,
 outgoing queues, link/session metadata and application-owned dequeued messages
 are additional storage.
-They make no hardware, throughput or latency claim. Receiving-link credit refill
-and Flow echo response remain separate work. No persisted formats change; an
+They make no hardware, throughput or latency claim. No persisted formats change; an
 older native implementation does not enforce these receive-storage bounds.
+
+### Native receiving-link credit
+
+Each receiving link initially grants 2,048 deliveries. Its delivery count starts
+at the peer sender's Attach count and advances modulo 2^32 once per delivery,
+including an aborted delivery, never once per continuation frame. Continuations
+may finish at zero link credit. A new start beyond the grant detaches that link
+with `amqp:link:transfer-limit-exceeded` (session-window violations still take
+precedence).
+
+Actual native dequeue, consumer drop or abort releases the original delivery's
+slot, not settlement. Per-incarnation counters and a coalesced connection wakeup
+replenish credit at 1,024 released slots or an exhausted grant. Completed queues
+and prepaid partials retain the shared byte/count budget above; credit does not
+promise that every new start can reserve storage. Cancelled receives and returned
+Delivery clones cannot refill credit. Retired queues never refund a replacement
+link, and a dropped consumer receives no further link grants. The feature test
+client uses the same bounded receive path and peer-count initialization.
+
+Ordinary sender Flow observations do not advance received delivery progress or
+return credit; already in-flight transfers remain charged normally. Receiving-role
+Flow echo and sender drain-completion requests are explicitly refused by detaching
+that link with `amqp:not-implemented`, without acknowledging unseen transfers or
+claiming quiescence. General Flow echo/drain work remains in
+[#77](https://github.com/DeandreT/switchyard/issues/77).
+
+The opt-in declared-current TCP sustained-send gate sends 2,305 individual
+deliveries with one SDK sender and retries disabled, checks the selected runtime
+assets and original child custody, then verifies ordered native stored bodies and
+an empty queue after joining the original listener/timer. Its fixture-only TLS
+trust bypass is not production certificate validation.
 
 ### Other differences
 
@@ -585,11 +615,9 @@ actual outgoing frame progress rather than delivery counts. The feature-gated
 test client replenishes received session frames; it is not production incoming
 buffer accounting.
 
-Sustained bidirectional traffic remains uncertified: incoming session conservation
-in [#332](https://github.com/DeandreT/switchyard/issues/332) (part of
-[#68](https://github.com/DeandreT/switchyard/issues/68)), receiving-link refill in
-[#69](https://github.com/DeandreT/switchyard/issues/69), and
-[#77](https://github.com/DeandreT/switchyard/issues/77) Flow echo remain absent.
+Sustained bidirectional traffic remains uncertified. Receiving-link refill and
+incoming session conservation do not establish general Flow echo/quiescence;
+[#77](https://github.com/DeandreT/switchyard/issues/77) remains separate.
 Timer commands drive expiry/activation, not wall-clock mutation. Small clock
 regressions hold time; large ones refuse/retry without readiness signal. One
 namespace/server; no quotas, fair multi-tenancy or production durability.

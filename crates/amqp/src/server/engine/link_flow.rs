@@ -230,7 +230,19 @@ pub(in crate::server) async fn apply_flow<W: AsyncWrite + Unpin>(
     let link = match session.links.get_mut(&handle) {
         Some(LinkState::Sending(link)) => link,
         Some(LinkState::Receiving(_)) => {
-            trace!(channel, handle, "ignoring flow for a receiving link");
+            if flow.drain || flow.echo {
+                // Returning unused receiver credit needs a separate drain
+                // handshake. Never treat a sender's count as received data or
+                // acknowledge quiescence while transfers may still be in flight.
+                incoming::retire_receiver(
+                    channel,
+                    handle,
+                    "amqp:not-implemented",
+                    sessions,
+                    writer,
+                )
+                .await?;
+            }
             return Ok(());
         }
         None if session.pending_attaches.contains_key(&handle) => {

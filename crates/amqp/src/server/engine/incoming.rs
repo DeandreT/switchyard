@@ -5,6 +5,53 @@ pub(in crate::server) const MAX_MESSAGE: u64 = 16 * 1024 * 1024;
 const STORAGE_BYTES: u64 = 64 * 1024 * 1024;
 const STORAGE_COUNT: usize = 2048;
 
+/// Delivery progress is independent of session frame progress. Each incarnation
+/// owns its own coalesced refunds, including after its queue has been retired.
+pub(in crate::server) struct ReceivingCredit {
+    count: u32,
+    remaining: u32,
+    released: Arc<Mutex<u32>>,
+}
+
+impl ReceivingCredit {
+    pub(in crate::server) fn new(count: u32) -> Self {
+        Self {
+            count,
+            remaining: LINK_CREDIT,
+            released: Arc::default(),
+        }
+    }
+
+    fn start(&mut self) -> Result<(), EngineError> {
+        if self.remaining == 0 {
+            return Err(EngineError::IncomingCreditLimit);
+        }
+        self.remaining -= 1;
+        self.count = self.count.wrapping_add(1);
+        Ok(())
+    }
+
+    fn replenish(&mut self) -> bool {
+        let mut released = self.released.lock().unwrap();
+        if *released == 0 || (*released < LINK_CREDIT / 2 && self.remaining != 0) {
+            return false;
+        }
+        self.remaining += *released;
+        *released = 0;
+        debug_assert!(self.remaining <= LINK_CREDIT);
+        true
+    }
+
+    pub(in crate::server) fn flow(&self, handle: u32, session: Flow) -> Flow {
+        Flow {
+            handle: Some(handle),
+            delivery_count: Some(self.count),
+            link_credit: Some(self.remaining),
+            ..session
+        }
+    }
+}
+
 /// Frame grants and message storage are separate resources. Reserve the whole
 /// assembly ceiling at start, so other partials cannot starve its continuation.
 pub(in crate::server) struct IncomingWindow {
@@ -82,12 +129,13 @@ impl IncomingWindow {
             wake: self.wake.clone(),
             bytes: ceiling,
             final_frame: false,
+            link_released: None,
         })
     }
 
     /// Only released frame slots are re-granted. Batching does not change the
     /// remaining grant until a real Flow is going to advertise it.
-    fn replenish(&mut self) -> bool {
+    pub(super) fn replenish(&mut self) -> bool {
         let mut released = self.released.lock().unwrap();
         if *released == 0 || (*released < SESSION_WINDOW / 2 && self.remaining != 0) {
             return false;
@@ -106,6 +154,7 @@ pub(in crate::server) struct Custody {
     wake: Arc<Resources>,
     bytes: u64,
     final_frame: bool,
+    link_released: Option<Arc<Mutex<u32>>>,
 }
 
 impl Custody {
@@ -124,6 +173,9 @@ impl Drop for Custody {
         storage.count -= 1;
         drop(storage);
         *self.released.lock().unwrap() += u32::from(self.final_frame);
+        if let Some(released) = &self.link_released {
+            *released.lock().unwrap() += 1;
+        }
         self.wake.notify_one();
     }
 }
@@ -146,6 +198,10 @@ pub(in crate::server) fn delivery_channel() -> (DeliverySender, DeliveryReceiver
 }
 
 impl DeliverySender {
+    fn consumer_closed(&self) -> bool {
+        self.0.state.lock().unwrap().1
+    }
+
     fn send(&self, delivery: Delivery) {
         let mut state = self.0.state.lock().unwrap();
         if !state.1 {
@@ -211,7 +267,25 @@ pub(in crate::server) async fn replenish<W: AsyncWrite + Unpin>(
     session: &mut SessionState,
     writer: &mut W,
 ) -> Result<(), EngineError> {
-    if session.incoming.replenish() {
+    let session_changed = session.incoming.replenish();
+    let mut link_changed = false;
+    let flow = session_flow(session);
+    for (&handle, link) in &mut session.links {
+        if let LinkState::Receiving(link) = link
+            && !link.deliveries.consumer_closed()
+            && link.credit.replenish()
+        {
+            link_changed = true;
+            write_amqp(
+                writer,
+                channel,
+                Performative::Flow(link.credit.flow(handle, flow.clone())),
+                Vec::new(),
+            )
+            .await?;
+        }
+    }
+    if session_changed && !link_changed {
         write_amqp(
             writer,
             channel,
@@ -302,6 +376,16 @@ pub(in crate::server) async fn receive<W: AsyncWrite + Unpin>(
             )
             .await?;
         }
+        Err(EngineError::IncomingCreditLimit) => {
+            retire_receiver(
+                channel,
+                handle,
+                "amqp:link:transfer-limit-exceeded",
+                sessions,
+                writer,
+            )
+            .await?;
+        }
         Err(error) => return Err(error),
     }
     if let Some(session) = sessions.get_mut(&channel) {
@@ -310,7 +394,7 @@ pub(in crate::server) async fn receive<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-async fn retire_receiver<W: AsyncWrite + Unpin>(
+pub(in crate::server) async fn retire_receiver<W: AsyncWrite + Unpin>(
     channel: u16,
     handle: u32,
     condition: &str,
@@ -330,7 +414,7 @@ async fn retire_receiver<W: AsyncWrite + Unpin>(
             closed: true,
             error: Some(Error::new(
                 crate::ErrorCondition::Custom(Symbol::from(condition)),
-                "native incoming storage limit",
+                "native receiving link refused peer operation",
                 None,
             )),
         }),
@@ -369,9 +453,12 @@ fn assemble(
     let LinkState::Receiving(link) = link else {
         return Err(invalid_state("transfer sent to a sending link"));
     };
-    if transfer.aborted {
-        link.partial = None;
-        return Ok(false);
+    if let Some(partial) = &link.partial
+        && transfer.delivery_id.is_some_and(|id| id != partial.id)
+    {
+        return Err(invalid_state(
+            "delivery id changed across transfer continuations",
+        ));
     }
     let message_format = transfer
         .message_format
@@ -387,19 +474,35 @@ fn assemble(
     }
     let mut partial = match link.partial.take() {
         Some(partial) => partial,
-        None => PartialDelivery {
-            id: transfer
+        None => {
+            let id = transfer
                 .delivery_id
-                .ok_or_else(|| invalid_state("first transfer has no delivery id"))?,
-            settled: transfer.settled.unwrap_or(false),
-            message_format,
-            bytes: Vec::new(),
-            custody: session
+                .ok_or_else(|| invalid_state("first transfer has no delivery id"))?;
+            link.credit.start()?;
+            if transfer.aborted {
+                *link.credit.released.lock().unwrap() += 1;
+                session.incoming.wake.notify_one();
+                return Ok(false);
+            }
+            let mut custody = session
                 .incoming
                 .reserve(link.max_message_size.min(MAX_MESSAGE))
-                .ok_or(EngineError::IncomingResourceLimit)?,
-        },
+                .ok_or(EngineError::IncomingResourceLimit)?;
+            custody.link_released = Some(link.credit.released.clone());
+            PartialDelivery {
+                id,
+                settled: transfer.settled.unwrap_or(false),
+                message_format,
+                bytes: Vec::new(),
+                custody,
+            }
+        }
     };
+    if transfer.aborted {
+        // An aborted new delivery still consumes one credit; continuations do
+        // not. Dropping its prepaid reservation returns that single slot.
+        return Ok(false);
+    }
     let size = partial.bytes.len() as u64 + payload.len() as u64;
     if size > partial.custody.bytes {
         return Err(EngineError::MessageSizeExceeded {

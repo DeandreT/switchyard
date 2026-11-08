@@ -200,6 +200,7 @@ pub(super) struct PendingConfirmation {
 
 pub(super) struct ReceivingLink {
     pub(super) incarnation: u64,
+    pub(super) credit: incoming::ReceivingCredit,
     pub(super) max_message_size: u64,
     pub(super) deliveries: incoming::DeliverySender,
     pub(super) partial: Option<PartialDelivery>,
@@ -603,6 +604,9 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                         handle,
                         LinkState::Receiving(ReceivingLink {
                             incarnation,
+                            credit: incoming::ReceivingCredit::new(
+                                attach.initial_delivery_count.unwrap_or(0),
+                            ),
                             max_message_size,
                             deliveries: deliveries_tx,
                             partial: None,
@@ -614,7 +618,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                         channel,
                         Performative::Flow(Flow {
                             handle: Some(handle),
-                            delivery_count: Some(0),
+                            delivery_count: Some(attach.initial_delivery_count.unwrap_or(0)),
                             link_credit: Some(LINK_CREDIT),
                             ..incoming::session_flow(session)
                         }),

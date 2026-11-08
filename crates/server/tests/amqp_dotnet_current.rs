@@ -56,6 +56,12 @@ async fn previous_fjall_tcp() -> Result<(), Box<dyn Error>> {
     run_tcp_workflows(SdkPin::Previous, Backend::Fjall).await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux, dotnet 10 and a NuGet restore"]
+async fn declared_current_memory_tcp_sustained_send() -> Result<(), Box<dyn Error>> {
+    run_tcp_store(SdkPin::DeclaredCurrent, MemoryStore::default(), None, true).await
+}
+
 async fn run_tcp_workflows(pin: SdkPin, backend: Backend) -> Result<(), Box<dyn Error>> {
     println!(
         "SDK_MATRIX_CELL pin={} backend={} transport=tcp",
@@ -63,13 +69,14 @@ async fn run_tcp_workflows(pin: SdkPin, backend: Backend) -> Result<(), Box<dyn 
         backend.name()
     );
     match backend {
-        Backend::Memory => run_tcp_store(pin, MemoryStore::default(), None).await,
+        Backend::Memory => run_tcp_store(pin, MemoryStore::default(), None, false).await,
         Backend::Fjall => {
             let directory = tempfile::tempdir()?;
             run_tcp_store(
                 pin,
                 FjallStore::open(directory.path())?,
                 Some(directory.path()),
+                false,
             )
             .await
         }
@@ -80,6 +87,7 @@ async fn run_tcp_store<S: StateStore>(
     pin: SdkPin,
     store: S,
     directory: Option<&Path>,
+    sustained: bool,
 ) -> Result<(), Box<dyn Error>> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -213,26 +221,37 @@ async fn run_tcp_store<S: StateStore>(
         )?;
         run.build().await?;
         sdk_child::diagnostics::emit("child-launch", pin.selector());
-        let args = [
-            HOST.into(),
-            format!("sb://localhost:{}", address.port()).into(),
-            "orders".into(),
-            "batch-orders".into(),
-            "peek-orders".into(),
-            "scheduled-orders".into(),
-            "dedupe-orders".into(),
-            "sessions".into(),
-            "events".into(),
-            "accounting".into(),
-            "analytics".into(),
-            CASE_QUEUE.into(),
-            CASE_TOPIC.into(),
-            CASE_SUBSCRIPTION.into(),
-            FILTER_TOPIC.into(),
-            FILTER_SUBSCRIPTION.into(),
-            RULE.into(),
-            KEY.into(),
-        ];
+        let args = if sustained {
+            vec![
+                "--sustained-send".into(),
+                HOST.into(),
+                format!("sb://localhost:{}", address.port()).into(),
+                "orders".into(),
+                RULE.into(),
+                KEY.into(),
+            ]
+        } else {
+            vec![
+                HOST.into(),
+                format!("sb://localhost:{}", address.port()).into(),
+                "orders".into(),
+                "batch-orders".into(),
+                "peek-orders".into(),
+                "scheduled-orders".into(),
+                "dedupe-orders".into(),
+                "sessions".into(),
+                "events".into(),
+                "accounting".into(),
+                "analytics".into(),
+                CASE_QUEUE.into(),
+                CASE_TOPIC.into(),
+                CASE_SUBSCRIPTION.into(),
+                FILTER_TOPIC.into(),
+                FILTER_SUBSCRIPTION.into(),
+                RULE.into(),
+                KEY.into(),
+            ]
+        };
         let verified = run.run(&args, &[]).await?;
         println!(
             "SDK_PIN_VERIFIED {} {}",
@@ -266,6 +285,36 @@ async fn run_tcp_store<S: StateStore>(
         &diagnostic_entities,
     );
     let native = (|| -> Result<(), Box<dyn Error>> {
+        if sustained {
+            for index in 0..2305 {
+                let domain::CommandOutcome::Received(Some(delivery)) =
+                    broker.handle().submit_blocking(
+                        domain::NamespaceName::new("tenant")?,
+                        domain::EntityPath::new("orders")?,
+                        CommandKind::Receive {
+                            mode: domain::ReceiveMode::ReceiveAndDelete,
+                            lock_duration_millis: None,
+                            session: None,
+                        },
+                    )?
+                else {
+                    return Err(format!("missing sustained delivery {index}").into());
+                };
+                let envelope = delivery
+                    .envelope
+                    .as_ref()
+                    .ok_or("missing sustained envelope")?;
+                let message = amqp::decode_stored_message(envelope.as_bytes())?;
+                if message.body
+                    != amqp::Body::Data(vec![format!("sustained-{index}").into_bytes().into()])
+                {
+                    return Err(format!("wrong sustained body at delivery {index}").into());
+                }
+            }
+            println!(
+                "SUSTAINED_NATIVE_VERIFIED count=2305 ordered-bodies; original listener/timer joined"
+            );
+        }
         for path in ["orders", "batch-orders", "scheduled-orders"] {
             matrix::empty(&broker, domain::EntityPath::new(path)?)?;
         }
@@ -286,8 +335,10 @@ async fn run_tcp_store<S: StateStore>(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains(concat!(
+    let expected = if sustained {
+        "SUSTAINED_SEND_VERIFIED count=2305 senders=1 retries=0"
+    } else {
+        concat!(
             "batch send/prefetch/concurrent settlement, envelope fidelity, ",
             "send/receive/renew/complete, abandon/redelivery/property-update, ",
             "dead-letter/DLQ receive/complete, ",
@@ -296,7 +347,10 @@ async fn run_tcp_store<S: StateStore>(
             "case-insensitive queue/topic/subscription identity, ",
             "durable correlation rule management and filtered fan-out, ",
             "and session renew/state/peek passed"
-        )),
+        )
+    };
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(expected),
         "the client exited without reporting the completed workflow"
     );
     Ok(())

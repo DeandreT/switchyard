@@ -90,6 +90,7 @@ impl SdkRun {
             "ScheduledTopicConformance.cs",
             "SdkCustody.cs",
             "OfflineJwtConformance.cs",
+            "SustainedFlowConformance.cs",
         ] {
             fs::copy(shared_source.join(name), shared_dir.join(name))?;
         }
