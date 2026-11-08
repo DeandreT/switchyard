@@ -104,7 +104,7 @@ pub fn read_incoming_messages(
     encoded_message: &[u8],
 ) -> Result<IncomingMessages, ProtocolError> {
     match message_format {
-        0 => Ok(IncomingMessages::Single(MessageContent::Amqp(
+        0 => Ok(IncomingMessages::Single(MessageContent::AmqpTextIds(
             encoded_message.to_vec(),
         ))),
         SERVICE_BUS_BATCH_MESSAGE_FORMAT => read_batch(message).map(IncomingMessages::Batch),
@@ -132,7 +132,7 @@ fn read_batch(message: &Message) -> Result<Vec<MessageContent>, ProtocolError> {
             decode_message(encoded).map_err(|error| ProtocolError::InvalidBatch {
                 detail: format!("child message {index} is not a complete AMQP message: {error}"),
             })?;
-            Ok(MessageContent::Amqp(encoded.to_vec()))
+            Ok(MessageContent::AmqpTextIds(encoded.to_vec()))
         })
         .collect()
 }
@@ -516,6 +516,9 @@ fn body_bytes(body: &Body) -> Vec<u8> {
 }
 
 fn message_id_text(message_id: &MessageId) -> String {
+    // Frozen legacy projection AND duplicate-detection identity. Current
+    // ingress uses AmqpTextIds and derives its filter projection in domain;
+    // never change this helper to implement filter-text normalization.
     match message_id {
         MessageId::String(text) => text.to_string(),
         MessageId::Ulong(value) => value.to_string(),
@@ -589,6 +592,76 @@ mod tests {
     fn read(message: &Message) -> Result<IncomingMessage, ProtocolError> {
         let encoded = amqp::encode_message(message).expect("the test message encodes");
         read_incoming(message, &encoded)
+    }
+
+    #[test]
+    fn current_ingress_projects_azure_id_text_without_changing_outbound_types() {
+        for (id, expected) in [
+            (MessageId::String("Uuid([0, 1])".into()), "Uuid([0, 1])"),
+            (MessageId::Ulong(u64::MAX), "18446744073709551615"),
+            (
+                MessageId::Uuid(Uuid::from([
+                    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+                    0xdd, 0xee, 0xff,
+                ])),
+                "00112233-4455-6677-8899-aabbccddeeff",
+            ),
+            (MessageId::Binary(vec![0, 0xab, 0xff].into()), "00ABFF"),
+        ] {
+            let message = sent(
+                Some(Properties {
+                    message_id: Some(id.clone()),
+                    correlation_id: Some(id.clone()),
+                    ..Properties::default()
+                }),
+                vec![1, 2],
+            );
+            let bytes = encode_message(&message).unwrap();
+            let IncomingMessages::Single(content) =
+                read_incoming_messages(0, &message, &bytes).unwrap()
+            else {
+                panic!("single")
+            };
+            assert!(matches!(content, MessageContent::AmqpTextIds(_)));
+            let proposal = domain::DurableProposal::unbound(domain::Command::new(
+                domain::NamespaceName::new("n").unwrap(),
+                domain::EntityPath::new("q").unwrap(),
+                Timestamp::UNIX_EPOCH,
+                domain::CommandKind::SendContent {
+                    content: content.clone(),
+                },
+            ));
+            assert_eq!(proposal.encode().unwrap()[7], 9);
+            let input = content.derive().unwrap();
+            let envelope = input.envelope.as_ref().unwrap();
+            assert_eq!(envelope.as_bytes(), bytes);
+            assert_eq!(
+                envelope.filter_properties().message_id.as_deref(),
+                Some(expected)
+            );
+            assert_eq!(
+                envelope.filter_properties().correlation_id.as_deref(),
+                Some(expected)
+            );
+            let delivery = Delivery {
+                sequence: SequenceNumber::new(1),
+                message_id: input.message_id,
+                body: input.body,
+                enqueued_at: Timestamp::UNIX_EPOCH,
+                scheduled_enqueue_at: None,
+                expires_at: None,
+                delivery_count: 1,
+                origin: domain::DeliveryOrigin::Ready,
+                lock: None,
+                session_id: None,
+                dead_letter: None,
+                envelope: input.envelope,
+            };
+            let outbound = write_delivery(&delivery).unwrap();
+            let properties = outbound.properties.unwrap();
+            assert_eq!(properties.message_id, Some(id.clone()));
+            assert_eq!(properties.correlation_id, Some(id));
+        }
     }
 
     #[test]
@@ -759,8 +832,8 @@ mod tests {
         assert_eq!(
             children,
             vec![
-                MessageContent::Amqp(first_encoded),
-                MessageContent::Amqp(second_encoded)
+                MessageContent::AmqpTextIds(first_encoded),
+                MessageContent::AmqpTextIds(second_encoded)
             ]
         );
         let derived = MessageContent::derive_batch(&children).expect("the children derive");
@@ -840,7 +913,7 @@ mod tests {
 
         assert_eq!(
             read_incoming_messages(0, &message, &encoded)?,
-            IncomingMessages::Single(MessageContent::Amqp(encoded)),
+            IncomingMessages::Single(MessageContent::AmqpTextIds(encoded)),
             "format zero must never be inferred to be a batch"
         );
         Ok(())

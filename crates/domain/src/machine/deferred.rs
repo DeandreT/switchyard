@@ -243,10 +243,17 @@ pub(super) fn replace_envelope(
         });
     }
     record.envelope = Some(envelope.clone());
+    if record.format == MessageRecordFormat::V3 {
+        // A legacy whole-envelope replacement may reach a current record
+        // through the domain API. Derive V3 projection text from its typed
+        // content, never accept a caller's legacy system-ID projection as V3.
+        let input = crate::MessageContent::AmqpTextIds(envelope.as_bytes().to_vec()).derive()?;
+        record.envelope = input.envelope;
+    }
     // A V2 record stores exactly one content form, so the replacement becomes
     // its AMQP content. Only a copy without an overlay reaches this point, and
     // the replacement carries none either.
-    if record.format == MessageRecordFormat::V2 {
+    if record.format != MessageRecordFormat::V1 {
         record.body.clear();
     }
     Ok(())

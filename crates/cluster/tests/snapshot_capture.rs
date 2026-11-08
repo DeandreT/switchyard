@@ -191,6 +191,40 @@ fn create(at: u64) -> DurableProposal {
         },
     )
 }
+
+#[test]
+fn v3_records_and_v9_proposals_capture_exactly_on_both_backends() {
+    for durable in [false, true] {
+        let mut fixture = Fixture::new(durable);
+        let mut bytes = vec![0, 0x53, 0x73, 0xc0, 18, 1, 0x98];
+        bytes.extend(0_u8..16);
+        let originals = [
+            create(0),
+            proposal(
+                1,
+                "orders",
+                CommandKind::SendContent {
+                    content: domain::MessageContent::Amqp(bytes.clone()),
+                },
+            ),
+            proposal(
+                2,
+                "orders",
+                CommandKind::SendContent {
+                    content: domain::MessageContent::AmqpTextIds(bytes),
+                },
+            ),
+        ];
+        let payloads: Vec<_> = originals.iter().map(|p| p.encode().unwrap()).collect();
+        fixture.log(&payloads, 3);
+        fixture.seed(&originals);
+        let before = fixture.rows();
+        fixture.check();
+        fixture.reopen();
+        assert_eq!(fixture.rows(), before);
+        fixture.check();
+    }
+}
 fn noop(at: u64) -> DurableProposal {
     proposal(at, "orders", CommandKind::ExpireSessionLocks)
 }

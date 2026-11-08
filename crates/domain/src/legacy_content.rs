@@ -3,7 +3,7 @@
 //! Every message record's retained AMQP content (ready, scheduled, deferred,
 //! locked, topic placeholder and dead-letter rows alike) is checked under
 //! [`LEGACY_CONTENT_LIMITS`]: the V1 envelope or V2 original as a whole message,
-//! each V2 overlay value and each filter-projection application-property value
+//! each V2/V3 overlay value and each filter-projection application-property value
 //! as a standalone value. Each retained correlation-rule property value is
 //! checked the same way. These are per-content parser
 //! safety bounds, not queue admission limits, storage quotas or a whole-image
@@ -131,7 +131,7 @@ pub fn validate_legacy_content(
                         }
                     })?;
                 report.message_rows += 1;
-                // V2 raw content has no envelope; a V1 overlay is unrepresentable.
+                // V2/V3 raw content has no envelope; a V1 overlay is unrepresentable.
                 if let Some(envelope) = &record.envelope {
                     decode_content(envelope.as_bytes(), LEGACY_CONTENT_LIMITS)
                         .map_err(|error| content(row, LegacyContentField::Envelope, error))?;

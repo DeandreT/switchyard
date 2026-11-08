@@ -32,16 +32,21 @@ pub struct MessageInput {
 /// One message's original content, carried once by a content send.
 ///
 /// The state machine derives every normalized field of AMQP content when it
-/// applies the send, and stores the result as a V2 message record. Content is
+/// applies the send. Legacy content produces V2 records; Azure-text content
+/// produces V3 records. Content is
 /// not validated when it is built or decoded from a durable proposal, so
 /// invalid content survives replication and is refused deterministically.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageContent {
-    /// One complete encoded AMQP message.
+    /// One complete encoded AMQP message with frozen legacy ID projection.
     Amqp(Vec<u8>),
     /// Bytes from a producer without a protocol envelope.
     Raw(RawMessage),
+    /// Original AMQP bytes with Azure SDK text IDs in the filter projection.
+    /// Duplicate detection still uses the legacy identifier identity. Durable
+    /// proposals containing this intent require V9, never V4.
+    AmqpTextIds(Vec<u8>),
 }
 
 /// A message without a protocol envelope, with its normalized fields stated

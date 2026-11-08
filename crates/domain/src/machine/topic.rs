@@ -447,7 +447,9 @@ pub(super) fn filter_properties(input: &SendInput<'_>) -> Result<FilterPropertie
         .envelope
         .map(|envelope| envelope.filter_properties().clone())
         .unwrap_or_default();
-    if !input.message_id.is_empty() {
+    // V1/V2 routing historically used the duplicate identity here. V3 keeps
+    // the typed-ID-derived text in its projection instead.
+    if input.format != crate::MessageRecordFormat::V3 && !input.message_id.is_empty() {
         properties.message_id = Some(input.message_id.to_owned());
     }
     if let Some(session_id) = input.session_id {

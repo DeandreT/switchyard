@@ -28,8 +28,13 @@ fn amqp(id: &str, scheduled: Option<u64>) -> MessageContent {
     MessageContent::Amqp(bytes)
 }
 
-fn replay(durable: bool) -> Result<Vec<(Key, Value)>, Box<dyn Error>> {
+fn replay(durable: bool, text_ids: bool) -> Result<Vec<(Key, Value)>, Box<dyn Error>> {
     let mut fixture = Fixture::new(durable)?;
+    let current = |content| match content {
+        MessageContent::Amqp(bytes) if text_ids => MessageContent::AmqpTextIds(bytes),
+        other => other,
+    };
+    let amqp = |id, scheduled| current(amqp(id, scheduled));
     let content = |entity: &EntityPath, at, content| {
         proposal(entity, at, CommandKind::SendContent { content })
     };
@@ -52,7 +57,11 @@ fn replay(durable: bool) -> Result<Vec<(Key, Value)>, Box<dyn Error>> {
         ),
         content(&queue(), 1, amqp("first", None)),
         // Refused at apply, yet checkpointed and replayed identically.
-        content(&queue(), 2, MessageContent::Amqp(vec![0x00, 0x53, 0x75])),
+        content(
+            &queue(),
+            2,
+            current(MessageContent::Amqp(vec![0x00, 0x53, 0x75])),
+        ),
         proposal(
             &queue(),
             3,
@@ -77,7 +86,18 @@ fn replay(durable: bool) -> Result<Vec<(Key, Value)>, Box<dyn Error>> {
         receive(5),
         proposal(&topic(), 20, CommandKind::ActivateScheduled),
     ];
-    for (p, version) in originals.iter().zip([1, 1, 1, 4, 4, 4, 4, 1, 1]) {
+    let send_version = if text_ids { 9 } else { 4 };
+    for (p, version) in originals.iter().zip([
+        1,
+        1,
+        1,
+        send_version,
+        send_version,
+        send_version,
+        send_version,
+        1,
+        1,
+    ]) {
         let bytes = p.encode()?;
         assert_eq!(bytes[7], version);
         assert_eq!(DurableProposal::decode(&bytes)?, *p);
@@ -103,7 +123,13 @@ fn replay(durable: bool) -> Result<Vec<(Key, Value)>, Box<dyn Error>> {
     // the immediate subscription copy.
     assert_eq!(messages.len(), 5);
     for (_, value) in &messages {
-        assert_eq!(value[0], codec::message::VALUE_FORMAT_V2);
+        let record = domain::MessageRecord::decode(value)?;
+        let version = if text_ids && record.envelope.is_some() {
+            codec::message::VALUE_FORMAT_V3
+        } else {
+            codec::message::VALUE_FORMAT_V2
+        };
+        assert_eq!(value[0], version);
     }
     domain::snapshot_validation::validate_complete_state(&rows)?;
 
@@ -130,6 +156,12 @@ fn replay(durable: bool) -> Result<Vec<(Key, Value)>, Box<dyn Error>> {
 
 #[test]
 fn v4_content_sends_replay_as_v2_records_identically_across_backends() -> TestResult {
-    assert_eq!(replay(false)?, replay(true)?);
+    assert_eq!(replay(false, false)?, replay(true, false)?);
+    Ok(())
+}
+
+#[test]
+fn v9_content_sends_replay_as_v3_records_identically_across_backends() -> TestResult {
+    assert_eq!(replay(false, true)?, replay(true, true)?);
     Ok(())
 }

@@ -62,7 +62,14 @@ fn patch_properties(
             maximum_bytes,
         });
     }
-    let projection = content::effective_projection(envelope.as_bytes(), &overlay)?;
+    // Keep historical V4 replay's legacy re-derivation for V1/V2, and derive
+    // V3 IDs in Azure text form. Both parse original typed bytes; neither
+    // guesses a type from a retained projection string.
+    let projection = content::effective_projection(
+        envelope.as_bytes(),
+        &overlay,
+        record.format == MessageRecordFormat::V3,
+    )?;
     let original = record
         .envelope
         .take()
@@ -74,6 +81,8 @@ fn patch_properties(
             .with_overlay(overlay),
     );
     record.body.clear();
-    record.format = MessageRecordFormat::V2;
+    if record.format != MessageRecordFormat::V3 {
+        record.format = MessageRecordFormat::V2;
+    }
     Ok(())
 }
