@@ -25,6 +25,7 @@ async fn an_ended_pending_session_cannot_accept_across_channel_reuse() {
         &mut pending_sessions,
         &mut sessions,
         u32::MAX,
+        &mut HashSet::new(),
     )
     .await
     .expect("End invalidates the pending session");
@@ -60,6 +61,7 @@ async fn an_ended_pending_session_cannot_accept_across_channel_reuse() {
         &mut pending_sessions,
         &mut sessions,
         u32::MAX,
+        &Arc::default(),
     )
     .await
     .expect("a stale session acceptance keeps the connection live");
@@ -89,6 +91,7 @@ async fn an_ended_pending_session_cannot_accept_across_channel_reuse() {
         &mut pending_sessions,
         &mut sessions,
         u32::MAX,
+        &Arc::default(),
     )
     .await
     .expect("the current session is accepted");
@@ -117,11 +120,12 @@ async fn a_stale_session_cannot_install_a_link_into_its_replacement() {
             pending_flows: HashMap::new(),
             next_delivery_id: 0,
             outgoing: OutgoingWindow::new(0, SESSION_WINDOW),
+            incoming: IncomingWindow::new(0, Arc::default()),
         },
     )]);
     let mut pending_sessions = HashMap::new();
     let (mut wire, mut peer) = tokio::io::duplex(64 * 1024);
-    let (deliveries_tx, _deliveries) = mpsc::channel(1);
+    let (deliveries_tx, _deliveries) = incoming::delivery_channel();
     let (detached_tx, _detached) = watch::channel(false);
     let (drain_tx, _drains) = watch::channel(None);
     let (credit_tx, _credits) = watch::channel(false);
@@ -160,6 +164,7 @@ async fn a_stale_session_cannot_install_a_link_into_its_replacement() {
         &mut pending_sessions,
         &mut sessions,
         u32::MAX,
+        &Arc::default(),
     )
     .await
     .expect("a stale link acceptance keeps the connection live");
@@ -188,6 +193,7 @@ async fn a_detached_pending_attach_cannot_cross_handle_reuse() {
             pending_flows: HashMap::new(),
             next_delivery_id: 0,
             outgoing: OutgoingWindow::new(0, SESSION_WINDOW),
+            incoming: IncomingWindow::new(0, Arc::default()),
         },
     )]);
     let mut pending_sessions = HashMap::new();
@@ -235,6 +241,7 @@ async fn a_detached_pending_attach_cannot_cross_handle_reuse() {
         &mut pending_sessions,
         &mut sessions,
         u32::MAX,
+        &mut HashSet::new(),
     )
     .await
     .expect("Detach cancels the pending Attach");
@@ -324,6 +331,7 @@ async fn settlement_after_session_end_is_link_scoped() {
         &mut pending_sessions,
         &mut sessions,
         u32::MAX,
+        &Arc::default(),
     )
     .await
     .expect("late settlement must not stop the connection");
@@ -348,6 +356,7 @@ async fn receive_begin(
         pending_sessions,
         sessions,
         u32::MAX,
+        &mut HashSet::new(),
     )
     .await
     .expect("Begin queues an incoming session");
@@ -387,6 +396,7 @@ async fn receive_attach(
         pending_sessions,
         sessions,
         u32::MAX,
+        &mut HashSet::new(),
     )
     .await
     .expect("Attach queues a generation-bound incoming link");
@@ -400,7 +410,7 @@ async fn accept_link(
     pending_sessions: &mut HashMap<u16, PendingSession>,
     sessions: &mut HashMap<u16, SessionState>,
 ) -> Result<u64, EngineError> {
-    let (deliveries_tx, _deliveries) = mpsc::channel(1);
+    let (deliveries_tx, _deliveries) = incoming::delivery_channel();
     let (detached_tx, _detached) = watch::channel(false);
     let (drain_tx, _drains) = watch::channel(None);
     let (credit_tx, _credits) = watch::channel(false);
@@ -423,6 +433,7 @@ async fn accept_link(
         pending_sessions,
         sessions,
         u32::MAX,
+        &Arc::default(),
     )
     .await
     .expect("link acceptance handling keeps the connection live");

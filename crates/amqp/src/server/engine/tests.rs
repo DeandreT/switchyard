@@ -23,6 +23,7 @@ async fn test_handle_command<W: tokio::io::AsyncWrite + Unpin>(
         &mut HashMap::new(),
         sessions,
         remote_max_frame_size,
+        &Arc::default(),
     )
     .await
 }
@@ -80,6 +81,7 @@ fn sending_session(
         pending_flows: HashMap::new(),
         next_delivery_id: 0,
         outgoing: OutgoingWindow::new(0, SESSION_WINDOW),
+        incoming: IncomingWindow::new(0, Arc::default()),
     };
     (HashMap::from([(channel, session)]), outcome)
 }
@@ -87,8 +89,8 @@ fn sending_session(
 fn receiving_session(
     channel: u16,
     handle: u32,
-) -> (HashMap<u16, SessionState>, mpsc::Receiver<Delivery>) {
-    let (deliveries, receiver) = mpsc::channel(4);
+) -> (HashMap<u16, SessionState>, incoming::DeliveryReceiver) {
+    let (deliveries, receiver) = incoming::delivery_channel();
     let (detached, _detached) = watch::channel(false);
     let link = ReceivingLink {
         incarnation: next_link_incarnation(),
@@ -106,6 +108,7 @@ fn receiving_session(
         pending_flows: HashMap::new(),
         next_delivery_id: 0,
         outgoing: OutgoingWindow::new(0, SESSION_WINDOW),
+        incoming: IncomingWindow::new(0, Arc::default()),
     };
     (HashMap::from([(channel, session)]), receiver)
 }
@@ -196,6 +199,7 @@ fn queued_sending_session(
         pending_flows: HashMap::new(),
         next_delivery_id: 0,
         outgoing: OutgoingWindow::new(0, SESSION_WINDOW),
+        incoming: IncomingWindow::new(0, Arc::default()),
     };
     HashMap::from([(channel, session)])
 }
@@ -515,6 +519,7 @@ async fn link_credit_arriving_during_attach_is_applied_when_the_link_is_accepted
             pending_flows: HashMap::new(),
             next_delivery_id: 0,
             outgoing: OutgoingWindow::new(0, SESSION_WINDOW),
+            incoming: IncomingWindow::new(0, Arc::default()),
         },
     )]);
     sessions
@@ -540,7 +545,7 @@ async fn link_credit_arriving_during_attach_is_applied_when_the_link_is_accepted
     .expect("an early flow is buffered");
     assert!(sessions[&channel].pending_flows.contains_key(&handle));
 
-    let (deliveries_tx, _deliveries) = mpsc::channel(1);
+    let (deliveries_tx, _deliveries) = incoming::delivery_channel();
     let (detached_tx, _detached) = watch::channel(false);
     let (drain_tx, _drains) = watch::channel(None);
     let (credit_tx, _credits) = watch::channel(false);
@@ -622,6 +627,7 @@ async fn drain_acknowledgement_is_generation_bound_and_returns_unused_credit() {
         pending_flows: HashMap::new(),
         next_delivery_id: 2,
         outgoing: OutgoingWindow::new(2, SESSION_WINDOW),
+        incoming: IncomingWindow::new(0, Arc::default()),
     };
     let mut sessions = HashMap::from([(channel, session)]);
     let (mut wire, mut peer) = tokio::io::duplex(64 * 1024);
@@ -1016,6 +1022,7 @@ async fn a_range_disposition_completes_only_matching_deliveries() {
         pending_flows: HashMap::new(),
         next_delivery_id: 13,
         outgoing: OutgoingWindow::new(13, SESSION_WINDOW),
+        incoming: IncomingWindow::new(0, Arc::default()),
     };
     let mut sessions = HashMap::from([(channel, session)]);
 
@@ -1108,6 +1115,7 @@ async fn a_send_command_crossing_a_detach_gets_a_detach_error() {
             pending_flows: HashMap::new(),
             next_delivery_id: 0,
             outgoing: OutgoingWindow::new(0, SESSION_WINDOW),
+            incoming: IncomingWindow::new(0, Arc::default()),
         },
     )]);
     let (mut wire, _peer) = tokio::io::duplex(64 * 1024);

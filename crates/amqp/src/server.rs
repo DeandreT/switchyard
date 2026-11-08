@@ -61,6 +61,8 @@ pub enum EngineError {
     SaslAuthentication(SaslCode),
     #[error("encoded message size {size} exceeds the peer's {maximum}-byte link limit")]
     MessageSizeExceeded { size: u64, maximum: u64 },
+    #[error("native incoming message storage is full")]
+    IncomingResourceLimit,
 }
 
 /// The link error a sender reports when a delivery exceeds the receiving
@@ -146,7 +148,7 @@ pub struct Receiver {
     handle: u32,
     incarnation: u64,
     commands: mpsc::Sender<Command>,
-    deliveries: mpsc::Receiver<Delivery>,
+    deliveries: engine::incoming::DeliveryReceiver,
     detached: watch::Receiver<bool>,
 }
 
@@ -157,6 +159,7 @@ pub struct Delivery {
     message_format: u32,
     message: Message,
     encoded_message: Vec<u8>,
+    custody: Option<Arc<engine::incoming::Custody>>,
 }
 
 impl Delivery {
@@ -634,7 +637,7 @@ impl ServerSession {
             return Err(EngineError::RemoteDetached);
         }
         let incarnation = identity.incarnation;
-        let (deliveries_tx, deliveries) = mpsc::channel(32);
+        let (deliveries_tx, deliveries) = engine::incoming::delivery_channel();
         let (detached_tx, detached) = watch::channel(false);
         let (drain_tx, drains) = watch::channel(None);
         let (credit_tx, credits) = watch::channel(false);

@@ -32,7 +32,7 @@ pub struct ClientReceiver {
     incarnation: u64,
     source: Option<Source>,
     commands: mpsc::Sender<ClientCommand>,
-    deliveries: mpsc::Receiver<Delivery>,
+    deliveries: engine::incoming::DeliveryReceiver,
     detached: watch::Receiver<bool>,
     detach_error: DetachErrorSlot,
 }
@@ -193,7 +193,7 @@ impl ClientSession {
         target: Target,
     ) -> Result<ClientSender, EngineError> {
         let name = name.into();
-        let (deliveries_tx, _) = mpsc::channel(1);
+        let (deliveries_tx, _) = engine::incoming::delivery_channel();
         let (detached_tx, detached) = watch::channel(false);
         let (drain_tx, _drains) = watch::channel(None);
         let (credit_tx, _credits) = watch::channel(false);
@@ -268,7 +268,7 @@ impl ClientSession {
         max_message_size: Option<u64>,
     ) -> Result<ClientReceiver, EngineError> {
         let name = name.into();
-        let (deliveries_tx, deliveries) = mpsc::channel(32);
+        let (deliveries_tx, deliveries) = engine::incoming::delivery_channel();
         let (detached_tx, detached) = watch::channel(false);
         let (drain_tx, _drains) = watch::channel(None);
         let (credit_tx, _credits) = watch::channel(false);
@@ -497,7 +497,8 @@ impl ClientReceiverBuilder {
         self
     }
 
-    /// The `max-message-size` this receiver advertises; `None` omits it.
+    /// Requests a receive limit. Absent/zero means the native ceiling, not an
+    /// unlimited advertisement; larger limits are clamped to that ceiling.
     pub fn max_message_size(mut self, max_message_size: Option<u64>) -> Self {
         self.max_message_size = max_message_size;
         self
@@ -539,6 +540,13 @@ struct AttachRequest {
     detach_error: Option<DetachErrorSlot>,
 }
 
+fn receiver_message_limit(requested: Option<u64>) -> u64 {
+    requested
+        .filter(|limit| *limit != 0)
+        .unwrap_or(engine::incoming::MAX_MESSAGE)
+        .min(engine::incoming::MAX_MESSAGE)
+}
+
 enum ClientCommand {
     Begin {
         reply: oneshot::Sender<Result<u16, EngineError>>,
@@ -546,7 +554,7 @@ enum ClientCommand {
     Attach {
         channel: u16,
         request: Box<AttachRequest>,
-        deliveries_tx: mpsc::Sender<Delivery>,
+        deliveries_tx: engine::incoming::DeliverySender,
         detached_tx: watch::Sender<bool>,
         drain_tx: watch::Sender<Option<DrainRequest>>,
         credit_tx: watch::Sender<bool>,
@@ -592,6 +600,29 @@ struct PendingAttach {
     reply: oneshot::Sender<Result<(u32, u64, Attach), EngineError>>,
 }
 
+type PendingBegins = HashMap<u16, oneshot::Sender<Result<u16, EngineError>>>;
+type PendingAttaches = HashMap<(u16, String), PendingAttach>;
+type PendingDetaches = HashMap<(u16, u32), oneshot::Sender<Result<(), EngineError>>>;
+
+/// Complete channel-owned replies as soon as their original session retires.
+/// Connection Close is deliberately not part of this channel-scoped custody.
+fn retire_pending_operations(
+    channel: u16,
+    begins: &mut PendingBegins,
+    attaches: &mut PendingAttaches,
+    detaches: &mut PendingDetaches,
+) {
+    if let Some(reply) = begins.remove(&channel) {
+        let _ = reply.send(Err(EngineError::RemoteDetached));
+    }
+    for (_, pending) in attaches.extract_if(|(owner, _), _| *owner == channel) {
+        let _ = pending.reply.send(Err(EngineError::RemoteDetached));
+    }
+    for (_, reply) in detaches.extract_if(|(owner, _), _| *owner == channel) {
+        let _ = reply.send(Err(EngineError::RemoteDetached));
+    }
+}
+
 async fn client_request<T>(
     commands: &mpsc::Sender<ClientCommand>,
     make: impl FnOnce(oneshot::Sender<Result<T, EngineError>>) -> ClientCommand,
@@ -627,29 +658,35 @@ where
 
     let (unused_attach_tx, _) = mpsc::channel(1);
     let mut sessions = HashMap::<u16, SessionState>::new();
+    let mut ending_sessions = HashSet::new();
     let mut next_channel = 0_u16;
     let mut next_handles = HashMap::<u16, u32>::new();
-    let mut pending_begins = HashMap::<u16, oneshot::Sender<Result<u16, EngineError>>>::new();
-    // Test-client receive progress only. Production incoming conservation and
-    // bounded consumer handoff are implemented independently by the server.
-    let mut incoming_progress = HashMap::<u16, (u32, u32)>::new();
-    let mut pending_attaches = HashMap::<String, PendingAttach>::new();
-    let mut pending_detaches =
-        HashMap::<(u16, u32), oneshot::Sender<Result<(), EngineError>>>::new();
+    let mut pending_begins = PendingBegins::new();
+    let receive_wake = Arc::new(engine::incoming::Resources::default());
+    let mut pending_attaches = PendingAttaches::new();
+    let mut pending_detaches = PendingDetaches::new();
     let mut closing: Option<oneshot::Sender<Result<(), EngineError>>> = None;
     let mut detach_errors = HashMap::<(u16, u32), DetachErrorSlot>::new();
 
     loop {
         tokio::select! {
+            () = receive_wake.notified() => {
+                for (&channel, session) in &mut sessions {
+                    engine::incoming::replenish(channel, session, &mut writer).await?;
+                }
+            }
             frame = frames.recv() => {
                 let Some(Ok(frame)) = frame else { break };
                 let Frame::Amqp { channel, performative, payload } = frame else { break };
                 let Some(performative) = performative else { continue };
+                if engine::incoming::discard_ending_frame(channel, &performative, &mut ending_sessions) {
+                    continue;
+                }
                 let result = match performative {
                     Performative::Begin(begin) => {
-                        incoming_progress.insert(channel, (begin.next_outgoing_id, 0));
                         if let Some(session) = sessions.get_mut(&channel) {
                             session.outgoing = engine::OutgoingWindow::new(0, begin.incoming_window);
+                            session.incoming = engine::IncomingWindow::new(begin.next_outgoing_id, receive_wake.clone());
                         }
                         if let Some(reply) = pending_begins.remove(&channel) {
                             let _ = reply.send(Ok(channel));
@@ -658,20 +695,16 @@ where
                     }
                     Performative::Attach(attach) => {
                         let attach = *attach;
-                        if let Some(pending) = pending_attaches.remove(&attach.name) {
+                        if let Some(pending) = pending_attaches.remove(&(channel, attach.name.clone())) {
                             if attach.role == Role::Sender {
                                 write_amqp(
                                     &mut writer,
                                     channel,
                                     Performative::Flow(Flow {
-                                        next_incoming_id: incoming_progress.get(&channel).map(|(next, _)| *next),
-                                        incoming_window: SESSION_WINDOW,
-                                        next_outgoing_id: sessions.get(&channel).map_or(0, |session| session.outgoing.next_id()),
-                                        outgoing_window: SESSION_WINDOW,
                                         handle: Some(pending.handle),
                                         delivery_count: Some(0),
                                         link_credit: Some(LINK_CREDIT),
-                                        ..Flow::default()
+                                        ..engine::incoming::session_flow(&sessions[&channel])
                                     }),
                                     Vec::new(),
                                 ).await?;
@@ -695,21 +728,11 @@ where
                         Ok(false)
                     }
                     Performative::Transfer(transfer) => {
-                        receive_transfer(channel, transfer, payload, &mut sessions).await?;
-                        if let Some((next, consumed)) = incoming_progress.get_mut(&channel) {
-                            *next = next.wrapping_add(1);
-                            *consumed += 1;
-                            if *consumed == SESSION_WINDOW / 2 {
-                                *consumed = 0;
-                                write_amqp(&mut writer, channel, Performative::Flow(Flow {
-                                    next_incoming_id: Some(*next),
-                                    incoming_window: SESSION_WINDOW,
-                                    next_outgoing_id: sessions.get(&channel).map_or(0, |session| session.outgoing.next_id()),
-                                    outgoing_window: SESSION_WINDOW,
-                                    ..Flow::default()
-                                }), Vec::new()).await?;
-                            }
-                        }
+                        engine::incoming::receive(channel, transfer, payload, &mut sessions, &mut ending_sessions, &mut writer, || {
+                            retire_pending_operations(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches);
+                            next_handles.remove(&channel);
+                            detach_errors.retain(|(owner, _), _| *owner != channel);
+                        }).await?;
                         Ok(false)
                     }
                     Performative::Disposition(disposition) => {
@@ -745,12 +768,14 @@ where
                         Ok(false)
                     }
                     Performative::End(_) => {
-                        incoming_progress.remove(&channel);
                         if let Some(mut session) = sessions.remove(&channel) {
                             for link in session.links.values_mut() {
                                 stop_link(link);
                             }
                         }
+                        retire_pending_operations(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches);
+                        next_handles.remove(&channel);
+                        detach_errors.retain(|(owner, _), _| *owner != channel);
                         Ok(false)
                     }
                     Performative::Close(_) => {
@@ -789,6 +814,7 @@ where
                             pending_flows: HashMap::new(),
                             next_delivery_id: 0,
                             outgoing: engine::OutgoingWindow::new(0, 0),
+                            incoming: engine::IncomingWindow::new(0, receive_wake.clone()),
                         });
                         next_handles.insert(channel, 0);
                         pending_begins.insert(channel, reply);
@@ -809,6 +835,10 @@ where
                         reply,
                     } => {
                         let request = *request;
+                        if !sessions.contains_key(&channel) {
+                            let _ = reply.send(Err(EngineError::RemoteDetached));
+                            continue;
+                        }
                         let next_handle = next_handles
                             .get_mut(&channel)
                             .ok_or_else(|| invalid_state("attach on an unknown session"))?;
@@ -817,6 +847,7 @@ where
                         if let Some(slot) = request.detach_error.clone() {
                             detach_errors.insert((channel, handle), slot);
                         }
+                        let receive_limit = receiver_message_limit(request.max_message_size);
                         let attach = Attach {
                             name: request.name.clone(),
                             handle,
@@ -828,7 +859,7 @@ where
                             unsettled: None,
                             incomplete_unsettled: false,
                             initial_delivery_count: (request.role == Role::Sender).then_some(0),
-                            max_message_size: request.max_message_size,
+                            max_message_size: if request.role == Role::Receiver { Some(receive_limit) } else { request.max_message_size },
                             offered_capabilities: None,
                             desired_capabilities: None,
                             properties: None,
@@ -861,7 +892,7 @@ where
                                 let incarnation = next_link_incarnation();
                                 session.links.insert(handle, LinkState::Receiving(ReceivingLink {
                                     incarnation,
-                                    max_message_size: usize::MAX as u64,
+                                    max_message_size: receive_limit,
                                     deliveries: deliveries_tx,
                                     partial: None,
                                     detached: detached_tx,
@@ -870,7 +901,7 @@ where
                             }
                         };
                         pending_attaches.insert(
-                            request.name,
+                            (channel, request.name),
                             PendingAttach {
                                 handle,
                                 incarnation,
@@ -971,6 +1002,10 @@ where
                         incarnation,
                         reply,
                     } => {
+                        if !sessions.contains_key(&channel) {
+                            let _ = reply.send(Err(EngineError::RemoteDetached));
+                            continue;
+                        }
                         let is_current = sessions
                             .get(&channel)
                             .and_then(|session| session.links.get(&handle))
@@ -993,7 +1028,10 @@ where
                         }
                     }
                     ClientCommand::End { channel, reply } => {
-                        incoming_progress.remove(&channel);
+                        if !sessions.contains_key(&channel) {
+                            let _ = reply.send(Err(EngineError::RemoteDetached));
+                            continue;
+                        }
                         let result = write_amqp(
                             &mut writer,
                             channel,
@@ -1005,6 +1043,10 @@ where
                                 stop_link(link);
                             }
                         }
+                        ending_sessions.insert(channel);
+                        retire_pending_operations(channel, &mut pending_begins, &mut pending_attaches, &mut pending_detaches);
+                        next_handles.remove(&channel);
+                        detach_errors.retain(|(owner, _), _| *owner != channel);
                         let _ = reply.send(result.as_ref().map(|_| ()).map_err(|error| {
                             EngineError::InvalidState(error.to_string())
                         }));
@@ -1047,6 +1089,10 @@ where
     let _ = closed.send(true);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "client_limit_tests.rs"]
+mod limit_tests;
 
 #[cfg(test)]
 mod tests {

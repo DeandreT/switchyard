@@ -50,6 +50,13 @@ returns `TimedOut` before Open, so no broker work has begun. Full task-family
 ownership remains planned.
 See [native custody](crates/amqp/src/server/tasks.rs).
 
+Incoming session frame grants are independent of bounded message storage.
+Native assembly reserves the effective link ceiling before accepting a start;
+completed handoffs retain an encoded-byte/count reservation and their final
+frame slot until actual dequeue. Original queue/storage ownership survives
+retirement without refunding a replacement session. Receive handoffs never wait
+inside frame dispatch. See [receive limits](docs/compatibility.md#native-session-receive-capacity).
+
 ### Process Shutdown
 
 SIGTERM and SIGINT start one [shutdown sequence](crates/server/src/shutdown.rs);
