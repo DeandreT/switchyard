@@ -149,9 +149,13 @@ original handle identity, then reads metadata and records through one snapshot.
 Callers must exclude all writers and keyspace creation, deletion and configuration
 changes; it is not authentication or a read-only directory opener.
 
+The pure [retained-byte kernel](docs/retained-byte-accounting.md) measures exact
+message/index KV lengths and prepaid automatic-growth reservations. It has no
+live writer or admission integration; finite profiles remain metadata only.
+
 Production startup remains refused. These libraries do not activate runtime
 replay, quorum, full-state recovery, installation or compaction. Encryption and
-quota accounting remain planned; see [compatibility](docs/compatibility.md).
+live quota enforcement remain planned; see [compatibility](docs/compatibility.md).
 
 ## Production Target: Not Implemented
 
