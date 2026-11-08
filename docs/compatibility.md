@@ -43,7 +43,7 @@ collections require refusal until truthful combined runtime data is available.
 | Duplicates | Exact non-empty message IDs across immediate/batch/scheduled offers on enabled ordinary queues and topics; bounded history expiry. Topic enablement/window are creation-only (default off/10 minutes, inclusive 20 seconds–7 days). |
 | Profiles | Domain-only partial ordinary-queue updates atomically validate/change parent and exact DLQ profiles plus Clock. No-op patches write nothing; owner, records/deadlines remain. Session/duplicate modes are immutable; lock/TTL/message-size/history/expiry-policy changes govern future work. |
 | Topic profiles | Domain-only parent-topic size/TTL and named-subscription lock/delivery-count/TTL/expiry-policy patches prove all listed children before changing profiles. Size propagates to backing queues/DLQs; topic TTL does not overwrite child TTL. No-op direct calls preserve Clock; no administration or protocol activation. |
-| Topics/rules | Non-session immediate/scheduled singular/batch fanout; placeholder peek/cancel; independent subscription queues. Durable `$Default`, actionless true/false/correlation, typed equality; create/delete/paginated AMQP rules. Domain-only bounded [SQL](sql-predicates.md) filters over the stored typed projection; AMQP rule management still accepts only `1=1`/`1=0` and refuses to enumerate stored SQL rules. |
+| Topics/rules | Non-session immediate/scheduled singular/batch fanout; placeholder peek/cancel; independent subscription queues. Durable `$Default`, actionless true/false/correlation, typed equality; create/delete/paginated AMQP rules. Bounded [SQL](sql-predicates.md) filters over the stored typed projection: `add-rule` stores any compilable `sql-filter` expression verbatim and refuses others with 400 and the compile error; `enumerate-rules` returns them as `sql-filter` with the exact text and compatibility level 20. The SDK expressions `1=1`/`1=0` stay true/false filters. Non-empty `sql-rule-action` refuses. |
 | Time/identity | Bounded activation/lock/TTL/session-lock/history expiry. ASCII-folded namespace/entity/subscription addresses and SAS scope; session/placement IDs retain case. |
 | Local APIs | [Offline RS256 JWT](offline-jwt.md): pinned keys, injected time/local rights, issuer-qualified grants; SAS/PLAIN retain verified namespace-host qualification. [SQL kernel](sql-predicates.md): bounded local grammar/errors, IN/LIKE/scalar arithmetic. No JWT wire activation or SQL actions. |
 | Storage | Paired Memory/Fjall semantics; Fjall journal fsync before applied outcomes; exclusive directory ownership. |
@@ -94,7 +94,7 @@ including backing queues/DLQs; invalid limits are corruption. Unread rows/raw
 catalogues are not certified; profile-free legacy operations remain unchanged.
 Administration setters/capacity, JWT consumers [#71](https://github.com/DeandreT/switchyard/issues/71)
 and activation [#17](https://github.com/DeandreT/switchyard/issues/17), typed content
-#16 is complete; SQL rule wire management (#20) and #21 remain pending.
+#16 is complete; the SQL filter-error discard setting (#20) and #21 remain pending.
 
 ### Absolute link addresses
 

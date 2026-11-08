@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use amqp::{Body, Message, MessageId};
 use domain::{
     CommandKind, CommandOutcome, CorrelationFilter, EntityPath, NamespaceName, RuleDefinition,
-    RuleFilter, RuleName,
+    RuleFilter, RuleName, SqlRuleFilter,
 };
 use serde_amqp::{Value, described::Described, descriptor::Descriptor, primitives::OrderedMap};
 
@@ -24,6 +24,7 @@ const SQL_FILTER: &str = "sql-filter";
 const CORRELATION_FILTER: &str = "correlation-filter";
 const SQL_RULE_ACTION: &str = "sql-rule-action";
 const EXPRESSION: &str = "expression";
+const COMPATIBILITY_LEVEL: &str = "compatibility-level";
 const CORRELATION_ID: &str = "correlation-id";
 const MESSAGE_ID: &str = "message-id";
 const TO: &str = "to";
@@ -38,10 +39,14 @@ const TOP: &str = "top";
 
 const RULE_DESCRIPTION_CODE: u64 = 0x0000_0137_0000_0004;
 const EMPTY_RULE_ACTION_CODE: u64 = 0x0000_0137_0000_0005;
+const SQL_FILTER_CODE: u64 = 0x0000_0013_7000_0006;
 const TRUE_FILTER_CODE: u64 = 0x0000_0013_7000_0007;
 const FALSE_FILTER_CODE: u64 = 0x0000_0013_7000_0008;
 const CORRELATION_FILTER_CODE: u64 = 0x0000_0013_7000_0009;
 const EMPTY_RULE_ACTION_NAME: &str = "com.microsoft:empty-rule-action:list";
+/// The only SQL dialect level Service Bus defines; enumerated SQL filters
+/// report it, and add requests may name it.
+const SQL_COMPATIBILITY_LEVEL: i32 = 20;
 
 pub(super) async fn add<B: Broker>(
     message: &Message,
@@ -209,12 +214,24 @@ fn sql_filter(value: &Value) -> Result<RuleFilter, String> {
     let Value::Map(filter) = value else {
         return Err(String::from("sql-filter must be an AMQP map"));
     };
+    match entry_value(filter, COMPATIBILITY_LEVEL) {
+        None | Some(Value::Null) => {}
+        Some(Value::Int(level)) if *level == SQL_COMPATIBILITY_LEVEL => {}
+        Some(_) => {
+            return Err(format!(
+                "sql-filter.compatibility-level must be the AMQP int {SQL_COMPATIBILITY_LEVEL}"
+            ));
+        }
+    }
+    // The SDKs send their true and false filters as these exact expressions;
+    // keeping them as the dedicated filters preserves their enumerated type.
+    // Any other text is retained verbatim and compiled by validation.
     match entry_value(filter, EXPRESSION) {
         Some(Value::String(expression)) if expression == "1=1" => Ok(RuleFilter::True),
         Some(Value::String(expression)) if expression == "1=0" => Ok(RuleFilter::False),
-        Some(Value::String(_)) => Err(String::from(
-            "only the SQL filter expressions 1=1 and 1=0 are supported",
-        )),
+        Some(Value::String(expression)) => {
+            Ok(RuleFilter::Sql(SqlRuleFilter::new(expression.clone())))
+        }
         _ => Err(String::from("sql-filter.expression must be an AMQP string")),
     }
 }
@@ -374,10 +391,12 @@ fn filter_value(filter: &RuleFilter) -> Result<Value, String> {
     match filter {
         RuleFilter::True => Ok(described(TRUE_FILTER_CODE, Value::List(Vec::new()))),
         RuleFilter::False => Ok(described(FALSE_FILTER_CODE, Value::List(Vec::new()))),
-        // The SQL filter description is not projected on this wire yet; an
-        // honest refusal is preferred to a filter the client would misread.
-        RuleFilter::Sql(_) => Err(String::from(
-            "stored SQL rule filters cannot be enumerated over AMQP yet",
+        RuleFilter::Sql(filter) => Ok(described(
+            SQL_FILTER_CODE,
+            Value::List(vec![
+                Value::String(filter.expression().to_owned()),
+                Value::Int(SQL_COMPATIBILITY_LEVEL),
+            ]),
         )),
         RuleFilter::Correlation(filter) => {
             let mut properties = OrderedMap::new();
@@ -622,18 +641,120 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_sql_and_actions_are_bad_requests_before_submission() {
+    async fn add_retains_sql_expression_text_verbatim() {
         let broker = RecordingBroker::returning(Ok(CommandOutcome::RuleCreated));
         let (namespace, entity) = names();
-        let unsupported = add_message(
-            "sql",
+        let expression = "Priority >= 5 AND sys.Label = 'created'  ";
+        for filter in [
+            map([(EXPRESSION, Value::String(expression.into()))]),
+            map([
+                (EXPRESSION, Value::String(expression.into())),
+                (COMPATIBILITY_LEVEL, Value::Int(SQL_COMPATIBILITY_LEVEL)),
+            ]),
+        ] {
+            let response = add(
+                &add_message("Urgent", SQL_FILTER, filter),
+                MessageId::Ulong(1),
+                None,
+                &namespace,
+                &entity,
+                &broker,
+            )
+            .await;
+            assert_eq!(response.status_code, 200);
+        }
+        let expected = CommandKind::CreateRule {
+            name: RuleName::new("urgent").expect("rule name"),
+            filter: RuleFilter::Sql(SqlRuleFilter::new(expression)),
+        };
+        assert_eq!(broker.commands(), vec![expected.clone(), expected]);
+    }
+
+    #[tokio::test]
+    async fn add_keeps_the_sdk_false_expression_a_false_filter() {
+        let broker = RecordingBroker::returning(Ok(CommandOutcome::RuleCreated));
+        let (namespace, entity) = names();
+        let message = add_message(
+            "Blocked",
             SQL_FILTER,
-            map([(EXPRESSION, Value::String("priority > 10".into()))]),
+            map([(EXPRESSION, Value::String("1=0".into()))]),
+        );
+
+        let response = add(
+            &message,
+            MessageId::Ulong(1),
+            None,
+            &namespace,
+            &entity,
+            &broker,
+        )
+        .await;
+
+        assert_eq!(response.status_code, 200);
+        assert_eq!(
+            broker.commands(),
+            vec![CommandKind::CreateRule {
+                name: RuleName::new("blocked").expect("rule name"),
+                filter: RuleFilter::False,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn uncompilable_sql_is_a_bad_request_naming_the_compile_error() {
+        let broker = RecordingBroker::returning(Ok(CommandOutcome::RuleCreated));
+        let (namespace, entity) = names();
+        for (expression, expected) in [
+            ("Priority >", "invalid SQL predicate syntax"),
+            ("newid() = 'x'", "unsupported SQL predicate"),
+            ("sys.Unknown = 1", "unsupported SQL predicate"),
+        ] {
+            let response = add(
+                &add_message(
+                    "broken",
+                    SQL_FILTER,
+                    map([(EXPRESSION, Value::String(expression.into()))]),
+                ),
+                MessageId::Ulong(1),
+                None,
+                &namespace,
+                &entity,
+                &broker,
+            )
+            .await;
+            assert_eq!(response.status_code, 400, "{expression}");
+            assert!(
+                response
+                    .status_description
+                    .starts_with("SQL filter cannot be compiled: "),
+                "{expression}: {}",
+                response.status_description
+            );
+            assert!(
+                response.status_description.contains(expected),
+                "{expression}: {}",
+                response.status_description
+            );
+        }
+        assert!(broker.commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sql_actions_and_other_compatibility_levels_are_bad_requests_before_submission() {
+        let broker = RecordingBroker::returning(Ok(CommandOutcome::RuleCreated));
+        let (namespace, entity) = names();
+        let other_level = add_message(
+            "level",
+            SQL_FILTER,
+            map([
+                (EXPRESSION, Value::String("Priority > 10".into())),
+                (COMPATIBILITY_LEVEL, Value::Int(10)),
+            ]),
         );
         let mut action_description = OrderedMap::new();
         action_description.insert(
             Value::String(SQL_FILTER.into()),
-            map([(EXPRESSION, Value::String("1=0".into()))]),
+            map([(EXPRESSION, Value::String("Priority > 10".into()))]),
         );
         action_description.insert(
             Value::String(SQL_RULE_ACTION.into()),
@@ -647,7 +768,10 @@ mod tests {
             ..Message::default()
         };
 
-        for message in [&unsupported, &action] {
+        for (message, expected) in [
+            (&other_level, "compatibility-level"),
+            (&action, "SQL rule actions are not supported"),
+        ] {
             let response = add(
                 message,
                 MessageId::Ulong(1),
@@ -658,8 +782,69 @@ mod tests {
             )
             .await;
             assert_eq!(response.status_code, 400);
+            assert!(
+                response.status_description.contains(expected),
+                "{}",
+                response.status_description
+            );
         }
         assert!(broker.commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_topic_sql_rule_quota_is_a_resource_limit() {
+        let broker = RecordingBroker::returning(Err(BrokerRejection::Refused(
+            BrokerError::SqlRuleLimitExceeded {
+                maximum: domain::MAX_TOPIC_SQL_RULES,
+            },
+        )));
+        let (namespace, entity) = names();
+        let response = add(
+            &add_message(
+                "one-too-many",
+                SQL_FILTER,
+                map([(EXPRESSION, Value::String("Priority > 10".into()))]),
+            ),
+            MessageId::Ulong(1),
+            None,
+            &namespace,
+            &entity,
+            &broker,
+        )
+        .await;
+
+        assert_eq!(response.status_code, 403);
+        assert_eq!(
+            response.error_condition,
+            Some(crate::RESOURCE_LIMIT_EXCEEDED)
+        );
+        assert_eq!(broker.commands().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_a_sql_rule_by_name() {
+        let broker = RecordingBroker::returning(Ok(CommandOutcome::RuleDeleted));
+        let (namespace, entity) = names();
+        let response = remove(
+            &Message {
+                body: Body::Value(map([(RULE_NAME, Value::String("Urgent".into()))])),
+                ..Message::default()
+            },
+            MessageId::Ulong(1),
+            None,
+            &namespace,
+            &entity,
+            &broker,
+        )
+        .await;
+
+        assert_eq!(response.status_code, 200);
+        assert_eq!(
+            broker.commands(),
+            vec![CommandKind::DeleteRule {
+                name: RuleName::new("urgent").expect("rule name"),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -875,9 +1060,72 @@ mod tests {
         assert!(filter_value(&malformed).is_err());
     }
 
-    #[test]
-    fn stored_sql_filters_are_not_projected_as_another_filter() {
-        let sql = RuleFilter::Sql(domain::SqlRuleFilter::new("Region = 'west'"));
-        assert!(filter_value(&sql).is_err());
+    #[tokio::test]
+    async fn enumerate_projects_sql_rules_with_their_exact_text() {
+        let expression = "Priority >= 5 AND sys.Label = 'created'  ";
+        let rules = vec![
+            RuleDefinition {
+                name: RuleName::new("Urgent").expect("rule name"),
+                filter: RuleFilter::Sql(SqlRuleFilter::new(expression)),
+                created_at: Timestamp::from_millis(1_000),
+            },
+            RuleDefinition {
+                name: RuleName::new("Blocked").expect("rule name"),
+                filter: RuleFilter::False,
+                created_at: Timestamp::from_millis(2_000),
+            },
+        ];
+        let broker = RecordingBroker::returning(Ok(CommandOutcome::RulesListed { rules }));
+        let (namespace, entity) = names();
+        let message = Message {
+            body: Body::Value(map([(SKIP, Value::Int(0)), (TOP, Value::Int(100))])),
+            ..Message::default()
+        };
+
+        let response = enumerate(
+            &message,
+            MessageId::Ulong(1),
+            None,
+            &namespace,
+            &entity,
+            &broker,
+        )
+        .await;
+
+        assert_eq!(response.status_code, 200);
+        let Body::Value(Value::Map(body)) = response.into_message().body else {
+            panic!("expected an AMQP map body")
+        };
+        let Some(Value::List(entries)) = entry_value(&body, RULES) else {
+            panic!("expected rules list")
+        };
+        let filters: Vec<&Described<Value>> = entries
+            .iter()
+            .map(|entry| {
+                let Value::Map(entry) = entry else {
+                    panic!("expected rule map")
+                };
+                let Some(Value::Described(description)) = entry_value(entry, RULE_DESCRIPTION)
+                else {
+                    panic!("expected described rule")
+                };
+                let Value::List(fields) = &description.value else {
+                    panic!("expected described list")
+                };
+                let Value::Described(filter) = &fields[0] else {
+                    panic!("expected described filter")
+                };
+                filter.as_ref()
+            })
+            .collect();
+        assert_eq!(filters[0].descriptor, Descriptor::Code(SQL_FILTER_CODE));
+        assert_eq!(
+            filters[0].value,
+            Value::List(vec![
+                Value::String(expression.into()),
+                Value::Int(SQL_COMPATIBILITY_LEVEL),
+            ])
+        );
+        assert_eq!(filters[1].descriptor, Descriptor::Code(FALSE_FILTER_CODE));
     }
 }
