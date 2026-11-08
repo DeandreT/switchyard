@@ -43,7 +43,9 @@ administration listener. For local persistence, select
 can explicitly enable TLS/h2 Create/Get/List with offline namespace-Manage JWTs.
 
 The [server arguments](crates/server/src/main.rs) expose TLS certificate/key
-files, shared-access policy files, namespace, and transport selection. TLS
+files, shared-access policy files, an explicit offline `--jwt-policy-file`, namespace,
+and transport selection. The AMQP JWT policy requires TLS and is independent of
+native administration; it can be used alone or alongside SAS. TLS
 defaults to port 5671; `--transport amqp-websockets` requires TLS and defaults to
 443. `--max-connections <count>` bounds live listener sockets, handshakes
 included; omitted, admission is unbounded. `--admission-timeout-secs <seconds>`

@@ -1,14 +1,14 @@
 # Offline JWT Policy
 
 `auth::JwtPolicy` is an immutable local verifier ([#8](https://github.com/DeandreT/switchyard/issues/8)),
-with deliberate library CBS composition, not server CLI configuration. No network lookup,
+with explicit TLS server activation and library CBS composition. No network lookup,
 signing API or OAuth/RFC 9068 access-token compatibility is promised.
 
 ```mermaid
 flowchart LR
     Policy["#8 Pure policy: implemented"] --> Consumers["#71 Grant consumers: implemented"]
     Consumers --> Composition["#349 Library CBS composition: implemented"]
-    Composition --> Activation["#350 Server activation: pending"]
+    Composition --> Activation["Server: explicit TLS policy file"]
 ```
 
 ## API
@@ -107,5 +107,14 @@ Verified grants enter the same connection store and operation/link consumers as
 SAS. Refresh retains principal/scope isolation and the full validity interval;
 failed refresh does not remove an existing grant. CBS request/reply custody still
 retains and joins original started operations; retiring unstarted validation does
-not publish a grant. Library composition adds no server startup flags, discovery,
-signing setup or production activation. Server activation is tracked by #350.
+not publish a grant.
+
+## Server Activation
+
+`--jwt-policy-file PATH` explicitly enables this profile on a TLS AMQP TCP or WSS
+listener. See the [server configuration](../crates/server/README.md#offline-amqp-jwt).
+The bounded policy load and TLS/configuration checks precede durable state open.
+The AMQP policy is independent of native administration. JWT-only and combined
+SAS/JWT configurations are supported; incomplete SAS configuration still refuses.
+This adds no discovery, signing setup, generic Azure-token compatibility or
+production activation. The existing production quorum guard remains closed.

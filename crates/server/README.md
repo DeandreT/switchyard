@@ -1,10 +1,43 @@
-# Native entity administration
+# Server security and native entity administration
 
 The server can explicitly enable the existing tonic 0.14 EntityService over
 rustls TLS and HTTP/2. It uses the real single-owner broker and the same
 memory/Fjall state as AMQP. Queue, topic and named-subscription Create/Get/List
 are supported; Delete returns Unimplemented, and other native services are not registered.
-This does not enable the CLI, Atom, AMQP JWT, OAuth discovery or production use.
+This does not enable the CLI, Atom, OAuth discovery or production use.
+
+## Offline AMQP JWT
+
+The AMQP listener separately accepts `--jwt-policy-file /path/to/amqp-policy.json`
+with `--tls-certificate` and `--tls-private-key`. It supports trusted TLS TCP and
+`--transport amqp-websockets`. This policy is independent of
+`--admin-jwt-policy-file`; enabling either does not enable the other. Native
+administration can seed entities but is not an AMQP authorization mechanism.
+
+The file contains the [offline RS256 profile](../../docs/offline-jwt.md), not a
+generic Azure/OIDC access token configuration. The server reads at most 64 KiB
+plus one byte and rejects invalid, oversized, unreadable or non-UTF-8 policy files
+with a fixed error that excludes file contents and paths, before opening durable
+state. Plaintext JWT activation refuses before policy I/O. Policy changes require
+a restart; there is no network discovery, signing or key-provisioning service.
+
+JWT-only configuration needs no SAS rule. Supplying both existing shared-access
+arguments composes SAS and JWT on the same listener; supplying only one still
+refuses. Without `--jwt-policy-file`, the existing SAS-only behavior is unchanged.
+Neither profile bypasses production storage or unavailable-quorum guards.
+
+Clients must validate the actual endpoint certificate chain and hostname. CBS
+uses exact token type `jwt`, with `name` identifying an AMQPS namespace/entity
+resource. That resource, the policy's deployment audience, and an SDK credential's
+token-acquisition scope are distinct. Locally bound Send/Listen/Manage rights
+govern data and management operations, including retained links and refresh.
+
+The opt-in `declared_current_offline_jwt_credential_wss_on_spawned_server` test in
+`admin_tls_process` selects only the declared-current official SDK's custom
+`TokenCredential` workflow. It requires Linux, .NET 10 and a locked NuGet restore;
+missing prerequisites fail when selected. It uses a token file, child-scoped
+`SSL_CERT_FILE` trust and normal platform hostname verification, retaining SDK
+loaded-file/start/completion custody through the existing SDK harness.
 
 ## Configuration
 
@@ -25,7 +58,7 @@ mode, even in development; ALPN must negotiate `h2`. TLS/key matching, the offli
 policy and namespace configuration are validated before opening durable state.
 Both sockets bind before either transport starts serving. A bind failure closes
 any earlier socket and shuts down the timer and broker under the shutdown budget.
-Existing production TLS, SAS, storage and unavailable-replication guards remain.
+Existing production TLS, authentication, storage and unavailable-replication guards remain.
 
 The [offline JWT policy](../../docs/offline-jwt.md) supplies pinned public RSA keys,
 issuer, deployment audience and local subject/scope/rights bindings. No signing

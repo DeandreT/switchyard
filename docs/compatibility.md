@@ -35,7 +35,7 @@ collections require refusal until truthful combined runtime data is available.
 
 | Area | Contract |
 | --- | --- |
-| Transport/auth | AMQP 1.0 TCP/TLS; binary WSS `/$servicebus/websocket` (`AMQPWSB10`/`amqp`); development-only plaintext. TLS precedes AMQP; SASL PLAIN or ANONYMOUS/`MSSBCBS`, then CBS SAS. Library-configured offline JWT CBS requires actual TLS admission; server activation remains pending. |
+| Transport/auth | AMQP 1.0 TCP/TLS; binary WSS `/$servicebus/websocket` (`AMQPWSB10`/`amqp`); development-only plaintext. TLS precedes AMQP; SASL PLAIN or ANONYMOUS/`MSSBCBS`, then CBS SAS. Explicit `--jwt-policy-file` enables offline JWT CBS only with actual TLS admission, alone or alongside SAS. |
 | Rights | Namespace/entity Send, Listen, Manage (includes both). Send for scheduling/cancellation; Listen for receive management. CBS grants are connection-wide, expire links, and allow 20s initial authorization. Refresh replaces rights/validity only for the same verified principal and scope; checks and expiry waits honor the full validity interval. |
 | Delivery | Singular/atomic batch send; peek-lock (unsettled) or receive-delete (pre-settled); independent out-of-order settlement; bounded prefetch/drain. Credit is reserved before mutation, empty results release it, and consumption/release completes drain. |
 | Envelope | Durable AMQP body/forms, identifiers, properties, annotations, application properties/footer; copy-local property patches; broker-authoritative delivery overlays. |
@@ -46,7 +46,7 @@ collections require refusal until truthful combined runtime data is available.
 | Topic profiles | Domain-only parent-topic size/TTL and named-subscription lock/delivery-count/TTL/expiry-policy/filter-error-policy patches prove all listed children before changing profiles. Size propagates to backing queues/DLQs; topic TTL does not overwrite child TTL. No-op direct calls preserve Clock; no administration or protocol activation. |
 | Topics/rules | Non-session immediate/scheduled singular/batch fanout; placeholder peek/cancel; independent subscription queues. Durable `$Default`, actionless true/false/correlation, typed equality; create/delete/paginated AMQP rules. Bounded [SQL](sql-predicates.md) filters over the stored typed projection: `add-rule` stores any compilable `sql-filter` expression verbatim and refuses others with 400 and the compile error; `enumerate-rules` returns them as `sql-filter` with the exact text and compatibility level 20. The SDK expressions `1=1`/`1=0` stay true/false filters. Non-empty `sql-rule-action` refuses. |
 | Time/identity | Bounded activation/lock/TTL/session-lock/history expiry. ASCII-folded namespace/entity/subscription addresses and SAS scope; session/placement IDs retain case. |
-| Local APIs | [Offline RS256 JWT](offline-jwt.md): pinned keys/local rights, issuer-qualified grants and opt-in TLS CBS composition; opt-in [native TLS/h2 EntityService](../crates/server/README.md) requires namespace-root Manage at current time for every RPC. SAS/PLAIN retain verified namespace-host qualification. [SQL filter kernel](sql-predicates.md): bounded local grammar/errors, IN/LIKE/scalar arithmetic. [SQL action kernel](sql-actions.md): bounded REMOVE/literal SET producing typed, isolated patches. No server AMQP JWT activation or stored/wire SQL actions. |
+| Local APIs | [Offline RS256 JWT](offline-jwt.md): pinned keys/local rights, issuer-qualified grants and explicit TLS server CBS configuration; opt-in [native TLS/h2 EntityService](../crates/server/README.md) requires namespace-root Manage at current time for every RPC. SAS/PLAIN retain verified namespace-host qualification. [SQL filter kernel](sql-predicates.md): bounded local grammar/errors, IN/LIKE/scalar arithmetic. [SQL action kernel](sql-actions.md): bounded REMOVE/literal SET producing typed, isolated patches. No stored/wire SQL actions. |
 | Storage | Paired Memory/Fjall semantics; Fjall journal fsync before applied outcomes; exclusive directory ownership. |
 
 Administration Get/page reads select one namespace and validate
@@ -122,9 +122,8 @@ Selected operational queue-profile reads validate after decode/owner proof,
 including backing queues/DLQs; invalid limits are corruption. Unread rows/raw
 catalogues are not certified; profile-free legacy operations remain unchanged.
 Typed content (#16) and actionless SQL filters (#20) are complete. Administration
-setters/capacity, server AMQP JWT activation [#350](https://github.com/DeandreT/switchyard/issues/350),
-and durable SQL actions/fanout (#21) remain pending. Grant consumers preserve verified
-principal identity and both validity bounds for SAS and library-configured TLS JWT CBS.
+setters/capacity and durable SQL actions/fanout (#21) remain pending. Grant consumers preserve verified
+principal identity and both validity bounds for SAS and explicitly configured TLS JWT CBS.
 Native admin RPCs use the configured offline JWT policy.
 
 ### Absolute link addresses
@@ -573,7 +572,7 @@ namespace/server; no quotas, fair multi-tenancy or production durability.
 | --- | --- |
 | Semantics | SQL actions/parameters/functions beyond the kernel, session subscriptions/session-ID predicates, administrable TTL expiry policy, DLQ forwarding/resubmit, same-group transactions. |
 | Administration | Atom/XML entities/rules; native Update/Delete and other native services. |
-| Security | Server AMQP JWT activation, network OIDC, mTLS, policy/full RBAC, namespace KMS/encryption, tamper-evident audit. |
+| Security | Network OIDC, mTLS, policy/full RBAC, namespace KMS/encryption, tamper-evident audit. |
 | Production | Raft/placement, quotas/fairness, encrypted backup/restore, readiness/observability, release/performance evidence. |
 
 Partitioning/cross-placement transactions are later scope; geo-replication/Premium
