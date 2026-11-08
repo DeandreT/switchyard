@@ -257,6 +257,11 @@ impl<S: StateStore> StateMachine<S> {
         if &command.namespace != binding.namespace() || &command.entity != binding.target() {
             return Err(BrokerError::InvalidEntityBinding.into());
         }
+        crate::capacity_fence::check_bound_profile(
+            self.store(),
+            &command.namespace,
+            &command.entity,
+        )?;
         self.validate_binding(binding)?;
         self.prepare(command)
     }

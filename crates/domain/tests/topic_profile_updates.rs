@@ -15,11 +15,16 @@ use domain::{
 };
 use storage::{Key, Mutation, StateStore, StorageError, StoreSnapshot, Value, WriteBatch};
 use testkit::{DurableProvider, MemoryProvider, StoreProvider};
+#[path = "support/capacity_trace.rs"]
+mod capacity_trace;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
 #[derive(Clone, Debug, Default)]
 struct Trace {
+    events: Vec<capacity_trace::Event>,
+    gets: Vec<Key>,
+    starts: Vec<Key>,
     scans: Vec<(Key, usize, usize)>,
     batches: Vec<WriteBatch>,
     snapshots: usize,
@@ -33,13 +38,27 @@ struct Observed<S> {
 
 impl<S: StateStore> StateStore for Observed<S> {
     fn get(&self, key: &[u8]) -> Result<Option<Value>, StorageError> {
+        let mut trace = self.trace.lock().unwrap();
+        trace.gets.push(key.to_vec());
+        trace.events.push(capacity_trace::Event::Get(key.to_vec()));
+        drop(trace);
         self.inner.get(key)
     }
     fn apply(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .events
+            .push(capacity_trace::Event::Apply);
         self.trace.lock().unwrap().batches.push(batch.clone());
         self.inner.apply(batch)
     }
     fn snapshot(&self) -> Result<StoreSnapshot, StorageError> {
+        self.trace
+            .lock()
+            .unwrap()
+            .events
+            .push(capacity_trace::Event::Snapshot);
         self.trace.lock().unwrap().snapshots += 1;
         self.inner.snapshot()
     }
@@ -49,6 +68,14 @@ impl<S: StateStore> StateStore for Observed<S> {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Key, Value)>, StorageError> {
+        let mut trace = self.trace.lock().unwrap();
+        trace.starts.push(start.to_vec());
+        trace.events.push(capacity_trace::Event::Scan(
+            prefix.to_vec(),
+            start.to_vec(),
+            limit,
+        ));
+        drop(trace);
         let rows = self.inner.scan_from(prefix, start, limit)?;
         self.trace
             .lock()
@@ -156,7 +183,25 @@ impl<P: StoreProvider> Fixture<P> {
         *self.machine.store().trace.lock().unwrap() = Trace::default();
     }
     fn trace(&self) -> Trace {
-        self.machine.store().trace.lock().unwrap().clone()
+        let mut trace = self.machine.store().trace.lock().unwrap().clone();
+        let raw = trace
+            .scans
+            .iter()
+            .zip(&trace.starts)
+            .map(|((prefix, limit, _), start)| (prefix.clone(), start.clone(), *limit))
+            .collect::<Vec<_>>();
+        let probes = capacity_trace::handler_trace(&mut trace.gets, &raw, &trace.events);
+        for index in &probes {
+            assert_eq!(trace.scans[*index].2, 0);
+        }
+        trace.scans = trace
+            .scans
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| !probes.contains(index))
+            .map(|(_, scan)| scan)
+            .collect();
+        trace
     }
     fn at(&self, at: u64, kind: CommandKind) -> Result<CommandOutcome, BrokerError> {
         self.machine.apply(&command(at, kind))

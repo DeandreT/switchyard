@@ -13,6 +13,12 @@ use crate::{
 /// command rejects it exactly where the leader did.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum BrokerError {
+    #[error("capacity-owned state requires unsupported lifecycle conservation")]
+    CapacityStateUnsupported,
+    #[error("capacity-owned state is corrupt or has incompatible ownership")]
+    CapacityStateCorrupt,
+    #[error("capacity-owned queue has no usage row; implicit rebuild is forbidden")]
+    CapacityUsageMissing,
     #[error("entity does not exist")]
     EntityNotFound,
     #[error("retained entity authority no longer names the live owner")]

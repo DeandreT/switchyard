@@ -93,7 +93,7 @@ impl<S: StateStore> IndexedWriter<S> {
         }
         let mut owner_version = VERSION;
         let checkpoint = if entries.is_empty() {
-            for tag in 0x00..=0x11 {
+            for tag in 0x00..=crate::capacity_fence::DATA_TAG {
                 if !store.scan_prefix(&[tag], 1)?.is_empty() {
                     return Err(IndexedApplyError::PopulatedStore);
                 }
@@ -107,7 +107,9 @@ impl<S: StateStore> IndexedWriter<S> {
                 return Err(corrupt("ownership keys are incomplete or noncanonical"));
             }
             owner_version = decode_owner(&entries[0].1)?;
-            Some(decode_checkpoint(&entries[1].1)?)
+            let checkpoint = decode_checkpoint(&entries[1].1)?;
+            crate::capacity_fence::check_recovery(&store).map_err(IndexedApplyError::Domain)?;
+            Some(checkpoint)
         };
         Ok(Self {
             machine: StateMachine::new(store),

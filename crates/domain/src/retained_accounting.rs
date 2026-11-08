@@ -212,6 +212,11 @@ pub fn encoded_row_bytes(key: &[u8], value: &[u8]) -> Result<u64, AccountingErro
 }
 
 fn charged(key: &[u8]) -> Result<Option<domain_keys::StateKey>, AccountingError> {
+    let key = if key.first() == Some(&crate::capacity_fence::DATA_TAG) {
+        crate::capacity_fence::original_key(key)?
+    } else {
+        key
+    };
     match key.first().copied() {
         Some(0x03..=0x07 | 0x0B) => domain_keys::state_parts(key)
             .map(Some)
@@ -270,18 +275,22 @@ pub fn calculate_batch(
         let delta = &mut result[index];
         if let Some(old) = original.get(key) {
             add(&mut delta.removed_bytes, encoded_row_bytes(key, old)?)?;
-            if key[0] == 0x03 {
+            if primary_key(key) {
                 add(&mut delta.removed_messages, 1)?;
             }
         }
         if let Some(new) = value {
             add(&mut delta.added_bytes, encoded_row_bytes(key, new)?)?;
-            if key[0] == 0x03 {
+            if primary_key(key) {
                 add(&mut delta.added_messages, 1)?;
             }
         }
     }
     Ok(result)
+}
+
+fn primary_key(key: &[u8]) -> bool {
+    key.first() == Some(&3) || key.get(..2) == Some(&[crate::capacity_fence::DATA_TAG, 3])
 }
 
 fn owner_index(owners: &[CapacityOwner], key: &[u8]) -> Result<Option<usize>, AccountingError> {

@@ -9,16 +9,19 @@ use crate::{
 };
 
 /// Required explicit coordination with the capacity-owned message fence.
-/// Current inputs are canonical *unframed* V1/V2/V3 rows. A future framing
-/// allowance is additional retained message-value bytes, including every byte
-/// of its header/trailer. It is not journal, ledger or filesystem overhead.
-/// A framed codec must be integrated before framed rows can use this kernel.
+/// Message values are canonical unframed V1/V2/V3. Key framing is selected
+/// explicitly; a future value-framing allowance covers every header/trailer
+/// byte and still requires its own codec/proof before framed values are used.
+/// This is not journal, ledger or filesystem overhead.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CapacityFramingBudget {
     /// Proves bounds for today's encoding only; NOT permission to activate.
     CurrentUnframedEncoding,
     /// Maximum additional bytes in any automatic state and either queue path.
     AdditionalMessageValueBytes(u64),
+    /// Capacity keyspace V1: tag 13 before EACH canonical key; no value frame.
+    /// Inputs must already use that layout. V4 message values still refuse.
+    IsolatedKeyspaceV1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,6 +42,32 @@ pub fn reserve_message(
     rows: &[(Key, Value)],
     framing: CapacityFramingBudget,
 ) -> Result<MessageReservation, AccountingError> {
+    if framing == CapacityFramingBudget::IsolatedKeyspaceV1 {
+        let original = rows
+            .iter()
+            .map(|(key, value)| {
+                Ok((
+                    crate::capacity_fence::original_key(key)?.to_vec(),
+                    value.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>, AccountingError>>()?;
+        return reserve_original(
+            owner,
+            &original,
+            framing,
+            crate::capacity_fence::DATA_KEY_OVERHEAD,
+        );
+    }
+    reserve_original(owner, rows, framing, 0)
+}
+
+fn reserve_original(
+    owner: &CapacityOwner,
+    rows: &[(Key, Value)],
+    framing: CapacityFramingBudget,
+    key_overhead: u64,
+) -> Result<MessageReservation, AccountingError> {
     let mut primary = None;
     let mut actual = 0_u64;
     let mut supplied = BTreeSet::new();
@@ -53,6 +82,7 @@ pub fn reserve_message(
         }
         actual = actual
             .checked_add(encoded_row_bytes(key, value)?)
+            .and_then(|bytes| bytes.checked_add(key_overhead))
             .ok_or(AccountingError::Overflow)?;
         if let keys::StateKey::Message(_, _, sequence) = &parsed {
             if primary.is_some() {
@@ -99,7 +129,7 @@ pub fn reserve_message(
     if let Some(info) = &mut maximum.dead_letter {
         info.dead_lettered_at = Timestamp::from_millis(u64::MAX);
     }
-    let mut ceiling = peak_states(owner, &entity, &maximum)?;
+    let mut ceiling = peak_states(owner, &entity, &maximum, key_overhead)?;
     if !shadow {
         maximum.expires_at = None;
         for (reason, description) in [
@@ -121,11 +151,12 @@ pub fn reserve_message(
                 description: description.to_owned(),
                 dead_lettered_at: Timestamp::from_millis(u64::MAX),
             });
-            ceiling = ceiling.max(peak_states(owner, owner.shadow(), &maximum)?);
+            ceiling = ceiling.max(peak_states(owner, owner.shadow(), &maximum, key_overhead)?);
         }
     }
     let extra = match framing {
-        CapacityFramingBudget::CurrentUnframedEncoding => 0,
+        CapacityFramingBudget::CurrentUnframedEncoding
+        | CapacityFramingBudget::IsolatedKeyspaceV1 => 0,
         CapacityFramingBudget::AdditionalMessageValueBytes(bytes) => bytes,
     };
     ceiling = ceiling
@@ -145,6 +176,7 @@ fn peak_states(
     owner: &CapacityOwner,
     entity: &EntityPath,
     maximum: &MessageRecord,
+    key_overhead: u64,
 ) -> Result<u64, AccountingError> {
     let mut states = vec![
         MessageState::Ready,
@@ -178,6 +210,7 @@ fn peak_states(
             };
             size = size
                 .checked_add(encoded_row_bytes(&key, bytes)?)
+                .and_then(|bytes| bytes.checked_add(key_overhead))
                 .ok_or(AccountingError::Overflow)?;
         }
         ceiling = ceiling.max(size);

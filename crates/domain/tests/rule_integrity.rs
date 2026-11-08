@@ -16,6 +16,8 @@ use domain::{
 };
 use storage::{Key, StateStore, StorageError, StoreSnapshot, Value, WriteBatch};
 use testkit::{DurableProvider, MemoryProvider, StoreProvider};
+#[path = "support/capacity_trace.rs"]
+mod capacity_trace;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Scan {
@@ -27,6 +29,7 @@ struct Scan {
 
 #[derive(Clone, Debug, Default)]
 struct Trace {
+    events: Vec<capacity_trace::Event>,
     gets: Vec<Key>,
     scans: Vec<Scan>,
     batches: Vec<WriteBatch>,
@@ -56,7 +59,24 @@ impl<S> Observed<S> {
         self.controls.lock().unwrap().trace = Trace::default();
     }
     fn trace(&self) -> Trace {
-        self.controls.lock().unwrap().trace.clone()
+        let mut trace = self.controls.lock().unwrap().trace.clone();
+        let raw = trace
+            .scans
+            .iter()
+            .map(|scan| (scan.prefix.clone(), scan.start.clone(), scan.limit))
+            .collect::<Vec<_>>();
+        let probes = capacity_trace::handler_trace(&mut trace.gets, &raw, &trace.events);
+        for index in &probes {
+            assert_eq!(trace.scans[*index].returned, 0);
+        }
+        trace.scans = trace
+            .scans
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| !probes.contains(index))
+            .map(|(_, scan)| scan)
+            .collect();
+        trace
     }
 }
 
@@ -69,10 +89,22 @@ fn scan_failure() -> StorageError {
 
 impl<S: StateStore> StateStore for Observed<S> {
     fn get(&self, key: &[u8]) -> Result<Option<Value>, StorageError> {
+        self.controls
+            .lock()
+            .unwrap()
+            .trace
+            .events
+            .push(capacity_trace::Event::Get(key.to_vec()));
         self.controls.lock().unwrap().trace.gets.push(key.to_vec());
         self.inner.get(key)
     }
     fn apply(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        self.controls
+            .lock()
+            .unwrap()
+            .trace
+            .events
+            .push(capacity_trace::Event::Apply);
         self.controls
             .lock()
             .unwrap()
@@ -82,6 +114,12 @@ impl<S: StateStore> StateStore for Observed<S> {
         self.inner.apply(batch)
     }
     fn snapshot(&self) -> Result<StoreSnapshot, StorageError> {
+        self.controls
+            .lock()
+            .unwrap()
+            .trace
+            .events
+            .push(capacity_trace::Event::Snapshot);
         self.controls.lock().unwrap().trace.snapshots += 1;
         self.inner.snapshot()
     }
@@ -91,6 +129,16 @@ impl<S: StateStore> StateStore for Observed<S> {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Key, Value)>, StorageError> {
+        self.controls
+            .lock()
+            .unwrap()
+            .trace
+            .events
+            .push(capacity_trace::Event::Scan(
+                prefix.to_vec(),
+                start.to_vec(),
+                limit,
+            ));
         let fail = self.controls.lock().unwrap().fail_scan.as_deref() == Some(prefix);
         let result = if fail {
             Err(scan_failure())

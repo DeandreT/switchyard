@@ -90,6 +90,41 @@ fn independent_bytes(rows: &[(Key, Value)]) -> u64 {
     rows.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum()
 }
 
+fn isolated_reservation(
+    owner: &CapacityOwner,
+    rows: &[(Key, Value)],
+) -> domain::retained_accounting::MessageReservation {
+    let framed = rows
+        .iter()
+        .map(|(key, value)| {
+            (
+                domain::capacity_fence::data_key(key).unwrap(),
+                value.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for ((key, value), (original, original_value)) in framed.iter().zip(rows) {
+        assert_eq!(key.len(), original.len() + 1);
+        assert_eq!(value, original_value, "zero message-value framing overhead");
+        assert_eq!(domain::capacity_fence::original_key(key).unwrap(), original);
+    }
+    let reserved =
+        reserve_message(owner, &framed, CapacityFramingBudget::IsolatedKeyspaceV1).unwrap();
+    assert_eq!(reserved.retained_bytes, independent_bytes(&framed));
+    assert_eq!(
+        reserved.retained_bytes,
+        independent_bytes(rows) + rows.len() as u64
+    );
+    let mut batch = WriteBatch::default();
+    for (key, value) in &framed {
+        batch.push_put(key.clone(), value.clone());
+    }
+    let delta = calculate_batch(std::slice::from_ref(owner), &[], &batch).unwrap();
+    assert_eq!(delta[0].added_bytes, reserved.retained_bytes);
+    assert_eq!(delta[0].added_messages, 1);
+    reserved
+}
+
 #[test]
 fn exact_fixture_charges_only_six_tags_parent_and_shadow() {
     let owner = owner();
@@ -365,6 +400,8 @@ fn current_encoding_bounds_cover_all_automatic_states_and_varint_edges() {
         for amqp in [false, true] {
             let original = record(format, amqp);
             let initial = rows(&owner, owner.parent(), &original);
+            let isolated_prepaid = isolated_reservation(&owner, &initial);
+            let mut independently_measured_peak = 0;
             let prepaid = reserve_message(
                 &owner,
                 &initial,
@@ -407,6 +444,11 @@ fn current_encoding_bounds_cover_all_automatic_states_and_varint_edges() {
                 ] {
                     next.state = state;
                     let current = rows(&owner, owner.parent(), &next);
+                    let isolated = isolated_reservation(&owner, &current);
+                    independently_measured_peak =
+                        independently_measured_peak.max(isolated.retained_bytes);
+                    assert_eq!(isolated.ceiling_bytes, isolated_prepaid.ceiling_bytes);
+                    assert!(isolated.retained_bytes <= isolated_prepaid.ceiling_bytes);
                     let reservation = reserve_message(
                         &owner,
                         &current,
@@ -446,9 +488,19 @@ fn current_encoding_bounds_cover_all_automatic_states_and_varint_edges() {
                             locked_until: Timestamp::from_millis(number),
                             origin: DeliveryOrigin::Ready,
                         },
+                        MessageState::Locked {
+                            token: LockToken::new(number),
+                            locked_until: Timestamp::from_millis(number),
+                            origin: DeliveryOrigin::Deferred,
+                        },
                     ] {
                         next.state = state;
                         let current = rows(&owner, owner.shadow(), &next);
+                        let isolated = isolated_reservation(&owner, &current);
+                        independently_measured_peak =
+                            independently_measured_peak.max(isolated.retained_bytes);
+                        assert!(isolated.ceiling_bytes <= isolated_prepaid.ceiling_bytes);
+                        assert!(isolated.retained_bytes <= isolated_prepaid.ceiling_bytes);
                         let reserved = reserve_message(
                             &owner,
                             &current,
@@ -460,6 +512,7 @@ fn current_encoding_bounds_cover_all_automatic_states_and_varint_edges() {
                     }
                 }
             }
+            assert_eq!(isolated_prepaid.ceiling_bytes, independently_measured_peak);
         }
     }
 }
@@ -489,6 +542,24 @@ fn reservation_refuses_incomplete_corrupt_session_and_unbounded_rewrite_assumpti
     );
     let mut future = initial.clone();
     future[0].1[0] = 4;
+    let isolated_future = future
+        .iter()
+        .map(|(key, value)| {
+            (
+                domain::capacity_fence::data_key(key).unwrap(),
+                value.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reserve_message(
+            &owner,
+            &isolated_future,
+            CapacityFramingBudget::IsolatedKeyspaceV1
+        ),
+        Err(AccountingError::InvalidMessage)
+    );
+    assert!(reserve_message(&owner, &initial, CapacityFramingBudget::IsolatedKeyspaceV1).is_err());
     assert_eq!(
         reserve_message(
             &owner,
@@ -569,14 +640,23 @@ fn reservation_refuses_incomplete_corrupt_session_and_unbounded_rewrite_assumpti
     );
 }
 
-fn backend_rows<P: StoreProvider>(provider: P) {
+fn backend_rows<P: StoreProvider>(provider: P, isolated: bool) {
     let owner = owner();
     let store = provider.open().unwrap();
-    let original = rows(
+    let mut original = rows(
         &owner,
         owner.parent(),
         &record(MessageRecordFormat::V1, true),
     );
+    let framing = if isolated {
+        original = original
+            .into_iter()
+            .map(|(key, value)| (domain::capacity_fence::data_key(&key).unwrap(), value))
+            .collect();
+        CapacityFramingBudget::IsolatedKeyspaceV1
+    } else {
+        CapacityFramingBudget::CurrentUnframedEncoding
+    };
     let mut batch = WriteBatch::default();
     for (key, value) in &original {
         batch.push_put(key.clone(), value.clone());
@@ -585,12 +665,7 @@ fn backend_rows<P: StoreProvider>(provider: P) {
     store.apply(batch).unwrap();
     let image = store.snapshot().unwrap();
     assert_eq!(image.entries(), original);
-    let bound = reserve_message(
-        &owner,
-        image.entries(),
-        CapacityFramingBudget::CurrentUnframedEncoding,
-    )
-    .unwrap();
+    let bound = reserve_message(&owner, image.entries(), framing).unwrap();
     assert_eq!(delta[0].added_bytes, independent_bytes(image.entries()));
     let usage =
         RetainedUsage::new(7, bound.retained_bytes, bound.reserved_growth_bytes, 1).unwrap();
@@ -635,12 +710,18 @@ fn backend_rows<P: StoreProvider>(provider: P) {
 
 #[test]
 fn memory_raw_rows_and_read_only_calculations() {
-    backend_rows(MemoryProvider::new());
+    backend_rows(MemoryProvider::new(), false);
 }
 
 #[test]
 fn fjall_raw_rows_and_reopen() {
-    backend_rows(DurableProvider::temporary().unwrap());
+    backend_rows(DurableProvider::temporary().unwrap(), false);
+}
+
+#[test]
+fn isolated_rows_and_exact_usage_roundtrip_memory_and_fjall_reopen() {
+    backend_rows(MemoryProvider::new(), true);
+    backend_rows(DurableProvider::temporary().unwrap(), true);
 }
 
 #[derive(Clone, Copy)]
@@ -695,6 +776,9 @@ fn actual_lifecycle<P: StoreProvider>(provider: P, case: AutomaticCase) {
         )
         .unwrap();
         assert_eq!(bound.retained_bytes, independent_bytes(&message_rows));
+        let isolated = isolated_reservation(&owner, &message_rows);
+        assert!(isolated.ceiling_bytes >= bound.ceiling_bytes + 2);
+        assert!(isolated.ceiling_bytes <= bound.ceiling_bytes + 3);
         // A full raw before-image retains profiles, Clock and counters. Pure
         // accounting neither changes them nor counts them toward capacity.
         let delta = calculate_batch(

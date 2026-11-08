@@ -99,6 +99,9 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         // Nothing a client did. Corrupt indexes, unreadable records, and storage
         // failures are the broker's problem and are reported as its fault.
         BrokerError::DanglingIndexEntry { .. }
+        | BrokerError::CapacityStateUnsupported
+        | BrokerError::CapacityStateCorrupt
+        | BrokerError::CapacityUsageMissing
         | BrokerError::DanglingSubscription { .. }
         | BrokerError::TopicTopologyCorrupt
         | BrokerError::EntityMetadataCorrupt

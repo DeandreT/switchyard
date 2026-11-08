@@ -388,6 +388,20 @@ when expiry dead-lettering is disabled; enabled profiles and every DLQ shadow ke
 legacy V1 bytes, and the same refusals and rollback requirements apply. Finite queue
 profiles alone use queue V3, whatever their expiry policy; V1 and V2 always mean
 non-finite. Readers before V3 refuse those records, and the same rollback rules apply.
+
+New capacity ownership has separate, currently inert
+[writer/recovery fences](capacity-writer-fences.md): queue profile V4 on both parent
+and publicly non-finite shadow, isolated data tag `13`, unchanged usage V1/tag `12`,
+and a separate capacity-intent V11 envelope. Historical V3 profiles and V7 intent
+remain metadata-only and are never adopted or reinterpreted. Current runtime,
+snapshot/capture/install/recovery and offline upgrade explicitly refuse unsupported
+new-owned state before mutation; no live writer emits it. Old domain writers
+cannot decode the profile pair or discover isolated owned rows, including through
+Complete or config-free maintenance. No outer store-format bump is required.
+The isolated-key reservation measures one additional byte on every message/index
+key in every automatic parent/DLQ candidate; only message V1–V3 is proved, and V4
+continues to refuse. This does not enable finite admission or lifecycle writes.
+
 Topic membership records hold the filter-error setting: a subscription that discards
 filter-error copies stores a membership V2 (child path and setting), while every
 dead-lettering subscription keeps the exact legacy V1 envelope of its child path.
