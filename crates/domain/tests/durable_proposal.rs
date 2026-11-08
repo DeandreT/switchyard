@@ -4,9 +4,10 @@ use domain::{
     BoundCommand, Command, CommandKind, CorrelationFilter, CorrelationValue, DurableProposal,
     DurableProposalAuthority, DurableProposalError, EntityBindingKind, EntityPath,
     FilterProperties, LockToken, MAX_DURABLE_PROPOSAL_BYTES, MessageEnvelope, MessageInput,
-    NamespaceName, QueueConfig, QueueConfigUpdate, QueueTimeToLiveUpdate, ReceiveMode, RuleFilter,
-    RuleName, SequenceNumber, SessionHold, SessionId, StateMachine, SubscriptionConfig,
-    SubscriptionConfigUpdate, SubscriptionName, Timestamp, TopicConfig, TopicConfigUpdate,
+    NamespaceName, QueueCapacity, QueueConfig, QueueConfigUpdate, QueueTimeToLiveUpdate,
+    ReceiveMode, RuleFilter, RuleName, SequenceNumber, SessionHold, SessionId, StateMachine,
+    SubscriptionConfig, SubscriptionConfigUpdate, SubscriptionName, Timestamp, TopicConfig,
+    TopicConfigUpdate,
 };
 use storage::{MemoryStore, StateStore, WriteBatch};
 
@@ -47,6 +48,7 @@ fn variants() -> Vec<CommandKind> {
                 requires_duplicate_detection: false,
                 duplicate_detection_history_millis: 5,
                 dead_lettering_on_message_expiration: true,
+                capacity: QueueCapacity::NonFinite,
             },
         },
         CommandKind::CreateTopic {
@@ -161,6 +163,7 @@ fn variants() -> Vec<CommandKind> {
                 requires_duplicate_detection: Some(false),
                 duplicate_detection_history_millis: Some(0),
                 dead_lettering_on_message_expiration: None,
+                capacity: None,
             },
         },
     ]
@@ -926,6 +929,7 @@ fn original_timestamp_extremes_and_semantically_invalid_config_are_preserved() {
                 requires_duplicate_detection: true,
                 duplicate_detection_history_millis: 0,
                 dead_lettering_on_message_expiration: true,
+                capacity: QueueCapacity::NonFinite,
             },
         });
         original.issued_at = issued_at;

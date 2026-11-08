@@ -10,9 +10,10 @@ use serde::{
 use crate::{
     Command, CommandKind, CorrelationFilter, CorrelationValue, DEAD_LETTER_QUEUE_SUFFIX,
     EntityBinding, EntityBindingKind, EntityPath, FilterProperties, LockToken, MessageEnvelope,
-    MessageInput, NamespaceName, QueueConfig, QueueConfigUpdate, QueueTimeToLiveUpdate,
-    ReceiveMode, RuleFilter, RuleName, SequenceNumber, SessionHold, SessionId, SubscriptionConfig,
-    SubscriptionName, Timestamp, TopicConfig, identifier::SUBSCRIPTION_PATH_SEGMENT,
+    MessageInput, NamespaceName, QueueCapacity, QueueConfig, QueueConfigUpdate,
+    QueueTimeToLiveUpdate, ReceiveMode, RuleFilter, RuleName, SequenceNumber, SessionHold,
+    SessionId, SubscriptionConfig, SubscriptionName, Timestamp, TopicConfig,
+    identifier::SUBSCRIPTION_PATH_SEGMENT,
 };
 
 use super::{DurableProposal, DurableProposalError as Error, MAX_DURABLE_PROPOSAL_BYTES};
@@ -681,6 +682,7 @@ impl Kind {
                     requires_duplicate_detection: false,
                     duplicate_detection_history_millis:
                         crate::DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS,
+                    capacity: crate::TopicCapacity::NonFinite,
                 },
             },
             Self::CreateSubscription { name, config } => CommandKind::CreateSubscription {
@@ -855,6 +857,7 @@ impl Queue {
             requires_duplicate_detection: self.requires_duplicate_detection,
             duplicate_detection_history_millis: self.duplicate_detection_history_millis,
             dead_lettering_on_message_expiration: true,
+            capacity: QueueCapacity::NonFinite,
         })
     }
 }
@@ -890,6 +893,7 @@ impl QueueUpdate {
             requires_duplicate_detection: self.requires_duplicate_detection,
             duplicate_detection_history_millis: self.duplicate_detection_history_millis,
             dead_lettering_on_message_expiration: None,
+            capacity: None,
         })
     }
 }

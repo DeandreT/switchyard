@@ -3,8 +3,9 @@
 
 use domain::{
     BoundCommand, CodecError, Command, CommandKind, DurableProposal, DurableProposalError,
-    EntityPath, NamespaceName, QueueConfig, QueueConfigUpdate, QueueTimeToLiveUpdate, StateMachine,
-    SubscriptionConfig, SubscriptionConfigUpdate, SubscriptionName, Timestamp, TopicConfig, codec,
+    EntityPath, NamespaceName, QueueCapacity, QueueConfig, QueueConfigUpdate,
+    QueueTimeToLiveUpdate, StateMachine, SubscriptionConfig, SubscriptionConfigUpdate,
+    SubscriptionName, Timestamp, TopicConfig, codec,
 };
 use serde::{Deserialize, Serialize};
 use storage::MemoryStore;
@@ -45,6 +46,7 @@ fn configs() -> Vec<QueueConfig> {
             requires_duplicate_detection: true,
             duplicate_detection_history_millis: 20_000,
             dead_lettering_on_message_expiration: true,
+            capacity: QueueCapacity::NonFinite,
         },
         // Invalid policy is a caller concern; the codec keeps it verbatim.
         QueueConfig {
@@ -110,9 +112,10 @@ fn disabled_profiles_use_a_fenced_version_that_legacy_readers_refuse() {
         *boolean.last_mut().unwrap() = 2;
         assert_eq!(codec::queue::decode(&boolean), Err(CodecError::Decode));
     }
+    // Version 3 is the finite-capacity record, so probe the next one.
     assert_eq!(
-        codec::queue::decode(&[3, 0]),
-        Err(CodecError::UnsupportedVersion { version: 3 })
+        codec::queue::decode(&[4, 0]),
+        Err(CodecError::UnsupportedVersion { version: 4 })
     );
     assert_eq!(codec::queue::decode(&[]), Err(CodecError::EmptyEnvelope));
 }
@@ -140,6 +143,7 @@ fn v5_kinds() -> Vec<(&'static str, CommandKind)> {
                     requires_duplicate_detection: false,
                     duplicate_detection_history_millis: 5,
                     dead_lettering_on_message_expiration: false,
+                    capacity: QueueCapacity::NonFinite,
                 },
             },
         ),

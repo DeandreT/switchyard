@@ -21,9 +21,9 @@ use admin_api::{
 use domain::{
     AdminCatalogCursor, AdminCatalogEntry, AdminCatalogError, AdminCatalogKind, AdminCatalogPage,
     BrokerError, CommandKind, CommandOutcome, EntityPath, MAX_ADMIN_CATALOG_PAGE,
-    MAX_ADMIN_CATALOG_SCAN, NamespaceName, QueueConfig, QueueConfigError, StateMachine,
-    SubscriptionConfig, SubscriptionConfigError, SubscriptionName, Timestamp, TopicConfig,
-    TopicConfigError, codec, keys,
+    MAX_ADMIN_CATALOG_SCAN, NamespaceName, QUEUE_CAPACITY_GRANULARITY_BYTES, QueueCapacity,
+    QueueConfig, QueueConfigError, StateMachine, SubscriptionConfig, SubscriptionConfigError,
+    SubscriptionName, Timestamp, TopicConfig, TopicConfigError, codec, keys,
 };
 use server::{
     AdminError, AdminService, Broker, Clock, LocalProposer, ManualClock, ProposeError, SubmitError,
@@ -1359,6 +1359,38 @@ async fn serialized_reads_and_cancel<P: StoreProvider>(provider: P) {
     assert_eq!(provider.open().unwrap().snapshot().unwrap(), before);
 }
 
+/// Today's projection of a domain-created finite queue: its profile carries the
+/// recorded mode while the top-level size field stays absent until #28.
+async fn finite_queue_projection<P: StoreProvider>(provider: P) {
+    let raw = provider.open().unwrap();
+    let config = QueueConfig {
+        capacity: QueueCapacity::Finite {
+            max_size_bytes: QUEUE_CAPACITY_GRANULARITY_BYTES,
+        },
+        ..QueueConfig::default()
+    };
+    StateMachine::new(raw.clone())
+        .apply(&domain::Command::new(
+            ns("tenant"),
+            path("finite"),
+            Timestamp::from_millis(1),
+            CommandKind::CreateQueue { config },
+        ))
+        .unwrap();
+    let (broker, service) = owner(raw.clone(), CountingClock::new());
+    let entity = service.get(get(address("finite"))).await.unwrap();
+    assert_eq!(entity.profile, EntityProfile::Queue(config));
+    assert_eq!(entity.max_size_bytes, None);
+    assert_eq!(entity.used_logical_bytes, None);
+    let page = service
+        .list(list(AdminCatalogKind::Queues, None, 10))
+        .await
+        .unwrap();
+    assert_eq!(page.entities, vec![entity]);
+    drop(service);
+    drop(broker);
+}
+
 macro_rules! paired {
     ($memory:ident, $fjall:ident, $suite:ident) => {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1371,6 +1403,11 @@ macro_rules! paired {
         }
     };
 }
+paired!(
+    memory_finite_queue_projection,
+    fjall_finite_queue_projection,
+    finite_queue_projection
+);
 paired!(
     memory_profiles_and_errors,
     fjall_profiles_and_errors,

@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS, TopicConfig};
+use crate::{DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS, TopicCapacity, TopicConfig};
 
 use super::{CodecError, VALUE_FORMAT_V1};
 
@@ -25,6 +25,7 @@ struct TopicV2 {
 }
 
 /// Preserve exact legacy bytes iff both new settings have their legacy values.
+/// Every topic is non-finite, the only capacity either version implies.
 /// Policy validation belongs to callers, so corrupt-profile fixtures and invalid
 /// proposal intent are not silently normalized here.
 pub fn encode(config: &TopicConfig) -> Result<Vec<u8>, CodecError> {
@@ -62,6 +63,7 @@ pub fn decode(bytes: &[u8]) -> Result<TopicConfig, CodecError> {
                     max_message_bytes: old.max_message_bytes,
                     requires_duplicate_detection: false,
                     duplicate_detection_history_millis: DEFAULT_DUPLICATE_DETECTION_HISTORY_MILLIS,
+                    capacity: TopicCapacity::NonFinite,
                 },
                 unused,
             )
@@ -75,6 +77,7 @@ pub fn decode(bytes: &[u8]) -> Result<TopicConfig, CodecError> {
                     max_message_bytes: stored.max_message_bytes,
                     requires_duplicate_detection: stored.requires_duplicate_detection,
                     duplicate_detection_history_millis: stored.duplicate_detection_history_millis,
+                    capacity: TopicCapacity::NonFinite,
                 },
                 unused,
             )
