@@ -1,6 +1,12 @@
 #![forbid(unsafe_code)]
 
+pub mod rpc;
 mod service;
+
+/// Generated v1 protobuf clients, servers and messages, separate from the typed API.
+pub mod wire {
+    tonic::include_proto!("switchyard.admin.v1");
+}
 
 use domain::{EntityPath, NamespaceName, PlacementGroupId};
 use serde::{Deserialize, Serialize};
