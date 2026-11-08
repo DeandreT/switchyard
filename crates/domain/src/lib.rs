@@ -12,6 +12,9 @@ pub mod keys;
 pub mod legacy_content;
 pub mod snapshot_validation;
 
+// Retained-byte kernel (#341); independent of live admission and SQL budgets.
+pub mod retained_accounting;
+
 mod command;
 mod content;
 mod durable_proposal;
