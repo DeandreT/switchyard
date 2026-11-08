@@ -80,6 +80,7 @@ async fn injected_attachment_cleanup_poison_is_cached_before_actual_native_and_r
                     AttachmentCustody::new(&session).with_retirement(captured.then_some(&notice));
                 custody.grant = Some(Ok(CommandOutcome::SessionAccepted(Some(accepted.clone()))));
                 custody.entity = Some(actor.entity.clone());
+                custody.receiving_authority = Some(actor.authority());
                 custody.registration = Some(registration.clone());
                 let original_trigger = Arc::clone(&trigger);
                 let original_payload = Arc::clone(&payload);
@@ -219,6 +220,7 @@ async fn actual_attachment_native_cleanup_error_notifies_before_held_registry_an
             let mut custody = AttachmentCustody::new(&session).with_retirement(Some(&notice));
             custody.grant = Some(Ok(CommandOutcome::SessionAccepted(Some(accepted.clone()))));
             custody.entity = Some(actor.entity.clone());
+            custody.receiving_authority = Some(actor.authority());
             custody.registration = Some(registration.clone());
             custody.handoff.begin_accept(session.accept_attach(attach,
                 crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64));
@@ -413,10 +415,10 @@ struct ReleaseFaultBroker {
 }
 
 impl Broker for ReleaseFaultBroker {
-    async fn submit(
+    crate::listener::settlement::test_support::bound_fixture_entries!(self);
+    async fn submit_bound(
         &self,
-        namespace: NamespaceName,
-        entity: EntityPath,
+        binding: domain::EntityBinding,
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         if matches!(&kind, CommandKind::ReleaseSession { .. }) {
@@ -424,10 +426,10 @@ impl Broker for ReleaseFaultBroker {
             if !self.after {
                 std::panic::panic_any(Arc::clone(&self.payload));
             }
-            let _raw = self.actual.submit(namespace, entity, kind).await;
+            let _raw = self.actual.submit_bound(binding, kind).await;
             std::panic::panic_any(Arc::clone(&self.payload));
         }
-        self.actual.submit(namespace, entity, kind).await
+        self.actual.submit_bound(binding, kind).await
     }
     fn deliverable(
         &self,
@@ -513,10 +515,10 @@ struct UnavailableReleaseBroker {
 }
 
 impl Broker for UnavailableReleaseBroker {
-    async fn submit(
+    crate::listener::settlement::test_support::bound_fixture_entries!(self);
+    async fn submit_bound(
         &self,
-        namespace: NamespaceName,
-        entity: EntityPath,
+        binding: domain::EntityBinding,
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         if matches!(&kind, CommandKind::ReleaseSession { .. }) {
@@ -525,7 +527,7 @@ impl Broker for UnavailableReleaseBroker {
                 "injected original release unavailable",
             )));
         }
-        self.actual.submit(namespace, entity, kind).await
+        self.actual.submit_bound(binding, kind).await
     }
     fn deliverable(
         &self,

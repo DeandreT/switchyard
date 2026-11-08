@@ -89,6 +89,7 @@ pub(in crate::listener) struct AttachmentCustody<'a> {
     pub(in crate::listener) packet: Option<HandoffPacket>,
     pub(in crate::listener) ready: Option<EntityLink>,
     pub(in crate::listener) entity: Option<EntityPath>,
+    pub(in crate::listener) receiving_authority: Option<crate::broker::ReceivingAuthority>,
     pub(in crate::listener) registration: Option<crate::management::SessionRegistration>,
     refusal: Option<OriginalCleanup<'a, Result<(), EngineError>>>,
     unregister: Option<OriginalCleanup<'a, ()>>,
@@ -109,6 +110,7 @@ impl<'a> AttachmentCustody<'a> {
             packet: None,
             ready: None,
             entity: None,
+            receiving_authority: None,
             registration: None,
             refusal: None,
             unregister: None,
@@ -267,11 +269,19 @@ impl<'a> AttachmentCustody<'a> {
                     .expect("an exact captured session grant has an entity")
                     .clone();
                 let namespace = namespace.clone();
+                let authority = self
+                    .ready
+                    .as_ref()
+                    .and_then(|ready| ready.receiving_authority.as_ref())
+                    .or(self.receiving_authority.as_ref())
+                    .expect("an exact session grant retains its authority")
+                    .clone();
                 // Capture before registry cleanup can await. Broker invocation
                 // remains lazy and is never reconstructed on a cancelled finish.
                 self.release = Some(OriginalCleanup::new(async move {
-                    broker
+                    authority
                         .submit(
+                            broker,
                             namespace,
                             entity,
                             CommandKind::ReleaseSession { session: hold },

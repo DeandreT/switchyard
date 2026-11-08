@@ -316,13 +316,13 @@ impl Clone for CloneFaultBroker {
     }
 }
 impl Broker for CloneFaultBroker {
-    async fn submit(
+    crate::listener::settlement::test_support::bound_fixture_entries!(self);
+    async fn submit_bound(
         &self,
-        namespace: NamespaceName,
-        entity: EntityPath,
+        binding: domain::EntityBinding,
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
-        self.actual.submit(namespace, entity, kind).await
+        self.actual.submit_bound(binding, kind).await
     }
     fn deliverable(
         &self,

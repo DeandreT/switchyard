@@ -53,6 +53,14 @@ use crate::management::ConnectionManagement;
 use crate::{Broker, BrokerRejection};
 
 pub(super) use crate::test_deadline::WAIT;
+// Binding is an additional asynchronous owner round trip before acceptance.
+// Drive the original until the named store frontier, not just its first Pending.
+pub(super) async fn drive_to_gate<F: Future + ?Sized>(future: Pin<&mut F>, gate: &CommitGate) {
+    tokio::select! {
+        _ = future => panic!("original completed before its held apply"),
+        () = gate.reached(false) => {},
+    }
+}
 pub(super) const CHANNEL: u16 = 1;
 pub(super) const HANDLE: u32 = 1;
 pub(super) const LINK: &str = "owned-settlement";
@@ -334,6 +342,29 @@ impl Broker for ActualBroker {
     }
 }
 
+// Preserve old name-entry controls while moving fault interception onto the
+// actual retained-bound path. No production adapter uses this fixture bridge.
+macro_rules! bound_fixture_entries {
+    ($this:ident) => {
+        async fn bind_entity(
+            &$this,
+            namespace: domain::NamespaceName,
+            entity: domain::EntityPath,
+        ) -> Result<domain::EntityBinding, crate::BrokerRejection> {
+            $this.actual.bind_entity(namespace, entity).await
+        }
+        fn submit(
+            &$this,
+            namespace: domain::NamespaceName,
+            entity: domain::EntityPath,
+            kind: domain::CommandKind,
+        ) -> impl std::future::Future<Output = Result<domain::CommandOutcome, crate::BrokerRejection>> + Send {
+            $this.submit_bound(crate::broker::test_binding(namespace, entity), kind)
+        }
+    };
+}
+pub(crate) use bound_fixture_entries;
+
 pub(super) struct Actor {
     session: bool,
     binding: Option<domain::EntityBinding>,
@@ -366,7 +397,7 @@ impl server::Clock for ObservedClock {
 impl Actor {
     pub(super) fn authority(&self) -> crate::broker::ReceivingAuthority {
         if self.session {
-            return crate::broker::ReceivingAuthority::Session;
+            return crate::broker::ReceivingAuthority::Session(self.binding.clone().unwrap());
         }
         crate::broker::ReceivingAuthority::Ordinary(
             self.binding
@@ -1163,14 +1194,35 @@ impl EagerAcquisitionBroker {
 }
 
 impl Broker for EagerAcquisitionBroker {
+    async fn bind_entity(
+        &self,
+        namespace: NamespaceName,
+        entity: EntityPath,
+    ) -> Result<domain::EntityBinding, BrokerRejection> {
+        self.actor
+            .broker
+            .as_ref()
+            .unwrap()
+            .bind_entity(namespace, entity)
+            .await
+    }
+
     fn submit(
         &self,
         namespace: NamespaceName,
         entity: EntityPath,
         kind: CommandKind,
     ) -> impl Future<Output = Result<CommandOutcome, BrokerRejection>> + Send {
-        assert_eq!(namespace, self.actor.namespace);
-        assert_eq!(entity, self.actor.entity);
+        self.submit_bound(crate::broker::test_binding(namespace, entity), kind)
+    }
+
+    fn submit_bound(
+        &self,
+        binding: domain::EntityBinding,
+        kind: CommandKind,
+    ) -> impl Future<Output = Result<CommandOutcome, BrokerRejection>> + Send {
+        assert_eq!(binding.namespace(), &self.actor.namespace);
+        assert_eq!(binding.target(), &self.actor.entity);
         self.gates
             .state
             .lock()
@@ -1182,10 +1234,17 @@ impl Broker for EagerAcquisitionBroker {
             (EagerTarget::Grant, CommandKind::AcceptSession { .. })
                 | (EagerTarget::Receive, CommandKind::Receive { .. })
         );
-        // Actor.intent applies on the real owner thread during method invocation,
+        // Apply on the real owner thread during method invocation,
         // before a future exists. It intentionally bypasses ActualBroker's log.
         let captured = eager.then(|| {
-            let outcome = self.actor.intent(kind.clone());
+            let outcome = self
+                .actor
+                .broker
+                .as_ref()
+                .unwrap()
+                .handle
+                .submit_bound_blocking(binding.clone(), kind.clone())
+                .unwrap();
             let mut state = self.gates.state.lock().unwrap();
             state.events.push(EagerEvent::Captured(outcome.clone()));
             self.gates.changed.notify_waiters();
@@ -1207,7 +1266,7 @@ impl Broker for EagerAcquisitionBroker {
                     .push(EagerEvent::RawReturned(outcome.clone()));
                 Ok(outcome)
             } else {
-                let result = actual.submit(namespace, entity, kind.clone()).await;
+                let result = actual.submit_bound(binding, kind.clone()).await;
                 gates
                     .state
                     .lock()

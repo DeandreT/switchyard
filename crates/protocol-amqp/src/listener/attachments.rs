@@ -578,12 +578,11 @@ async fn entity_attachment_pump<'a, B: Broker>(
                             namespace.clone(), prepared.entity.clone(),
                         ).await.map_err(|error| rejection_error(&error))?);
                     } else {
+                        let binding = broker.bind_entity(namespace.clone(), prepared.entity.clone())
+                            .await.map_err(|error| rejection_error(&error))?;
                         prepared.receiving_authority = Some(match prepared.session {
-                            SessionRequest::None => crate::broker::ReceivingAuthority::Ordinary(
-                                broker.bind_entity(namespace.clone(), prepared.entity.clone())
-                                    .await.map_err(|error| rejection_error(&error))?,
-                            ),
-                            _ => crate::broker::ReceivingAuthority::Session,
+                            SessionRequest::None => crate::broker::ReceivingAuthority::Ordinary(binding),
+                            _ => crate::broker::ReceivingAuthority::Session(binding),
                         });
                     }
                     Ok(prepared)
@@ -598,6 +597,9 @@ async fn entity_attachment_pump<'a, B: Broker>(
 
     if let Ok(prepared) = &plan {
         custody.entity = Some(prepared.entity.clone());
+        // Retain before starting the grant: even an unobserved late grant must
+        // be released through this exact authority by attachment custody.
+        custody.receiving_authority = prepared.receiving_authority.clone();
         let session_id = match &prepared.session {
             SessionRequest::None => None,
             SessionRequest::NextAvailable => Some(None),
@@ -606,12 +608,18 @@ async fn entity_attachment_pump<'a, B: Broker>(
         if let Some(session_id) = session_id {
             let grant_namespace = namespace.clone();
             let grant_entity = prepared.entity.clone();
+            let authority = prepared
+                .receiving_authority
+                .clone()
+                .expect("session authority captured");
             let command = CommandKind::AcceptSession {
                 session_id,
                 lock_duration_millis: None,
             };
             custody.handoff.begin_grant(async move {
-                broker.submit(grant_namespace, grant_entity, command).await
+                authority
+                    .submit(broker, grant_namespace, grant_entity, command)
+                    .await
             });
             pump_checkpoint(PumpPoint::Prepared).await;
             tokio::select! {
@@ -706,9 +714,13 @@ async fn entity_attachment_pump<'a, B: Broker>(
                 biased;
                 () = &mut ended => None,
                 () = pump_fault(PumpPoint::Registry) => unreachable!("attachment fault checkpoint panics"),
-                registration = management.install_session(
+                registration = management.install_bound_session(
                     claim.expect("a receiving attachment captured its claim"),
                     accepted.hold(),
+                    match prepared.receiving_authority.as_ref() {
+                        Some(crate::broker::ReceivingAuthority::Session(binding)) => binding.clone(),
+                        _ => unreachable!("session grant has captured authority"),
+                    },
                     || {
                         retired = session.is_ended() || detached.as_mut().now_or_never().is_some();
                         !retired

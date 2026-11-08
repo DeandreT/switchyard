@@ -650,10 +650,10 @@ impl ReleaseGateBroker {
 }
 
 impl Broker for ReleaseGateBroker {
-    async fn submit(
+    crate::listener::settlement::test_support::bound_fixture_entries!(self);
+    async fn submit_bound(
         &self,
-        namespace: NamespaceName,
-        entity: EntityPath,
+        binding: domain::EntityBinding,
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         if matches!(&kind, CommandKind::ReleaseSession { .. }) {
@@ -662,7 +662,7 @@ impl Broker for ReleaseGateBroker {
             self.barrier.entered.notify_waiters();
             self.barrier.release.notified().await;
         }
-        self.actual.submit(namespace, entity, kind).await
+        self.actual.submit_bound(binding, kind).await
     }
 
     fn deliverable(

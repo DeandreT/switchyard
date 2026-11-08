@@ -217,6 +217,7 @@ pub(crate) struct SessionRegistration {
     link_name: String,
     entity: EntityPath,
     hold: SessionHold,
+    binding: domain::EntityBinding,
     identity: Arc<()>,
 }
 
@@ -226,6 +227,7 @@ impl PartialEq for SessionRegistration {
             && self.link_name == other.link_name
             && self.entity == other.entity
             && self.hold == other.hold
+            && self.binding == other.binding
     }
 }
 
@@ -503,10 +505,11 @@ impl ConnectionManagement {
         }
     }
 
-    pub(crate) async fn install_session(
+    pub(crate) async fn install_bound_session(
         &self,
         claim: &SessionClaim,
         hold: SessionHold,
+        binding: domain::EntityBinding,
         is_live: impl FnOnce() -> bool,
     ) -> Option<SessionRegistration> {
         let mut sessions = self.sessions.write().await;
@@ -528,11 +531,33 @@ impl ConnectionManagement {
             link_name: claim.link_name.clone(),
             entity: claim.entity.clone(),
             hold,
+            binding,
             identity: Arc::clone(&claim.identity),
         };
         sessions.insert(claim.link_name.clone(), registration.clone());
         claims.remove(&claim.link_name);
         Some(registration)
+    }
+
+    // Older registry/custody fixtures isolate protocol identity independently
+    // of broker authority. Production always supplies the pre-grant binding.
+    #[cfg(test)]
+    pub(crate) async fn install_session(
+        &self,
+        claim: &SessionClaim,
+        hold: SessionHold,
+        is_live: impl FnOnce() -> bool,
+    ) -> Option<SessionRegistration> {
+        self.install_bound_session(
+            claim,
+            hold,
+            crate::broker::test_binding(
+                NamespaceName::new("tenant").unwrap(),
+                claim.entity.clone(),
+            ),
+            is_live,
+        )
+        .await
     }
 
     pub(crate) async fn unregister_session(&self, registration: &SessionRegistration) {

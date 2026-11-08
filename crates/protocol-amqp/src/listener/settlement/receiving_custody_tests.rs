@@ -380,15 +380,15 @@ struct ReleaseGateBroker {
 }
 
 impl Broker for ReleaseGateBroker {
-    async fn submit(
+    crate::listener::settlement::test_support::bound_fixture_entries!(self);
+    async fn submit_bound(
         &self,
-        namespace: domain::NamespaceName,
-        entity: domain::EntityPath,
+        binding: domain::EntityBinding,
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         let release = matches!(kind, CommandKind::ReleaseSession { .. });
         let complete = matches!(kind, CommandKind::Complete { .. });
-        let result = self.actual.submit(namespace, entity, kind).await;
+        let result = self.actual.submit_bound(binding, kind).await;
         if complete && self.panic_complete {
             panic!("secondary-worker-panic");
         }
