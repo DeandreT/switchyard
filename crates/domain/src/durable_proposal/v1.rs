@@ -371,6 +371,8 @@ impl CopyBudget {
     }
     fn filter(&mut self, value: &RuleFilter) -> Result<Filter, Error> {
         Ok(match value {
+            // SQL rule intent is frozen in V6 only.
+            RuleFilter::Sql(_) => return Err(Error::UnsupportedCommandVersion(1)),
             RuleFilter::True => Filter::True,
             RuleFilter::False => Filter::False,
             RuleFilter::Correlation(value) => Filter::Correlation(Box::new(Properties {

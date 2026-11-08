@@ -37,6 +37,8 @@ mod content_sends;
 mod fixtures;
 #[path = "committed_replay/patched_dispositions.rs"]
 mod patched_dispositions;
+#[path = "committed_replay/sql_rules.rs"]
+mod sql_rules;
 #[path = "committed_replay/topic_duplicates.rs"]
 mod topic_duplicates;
 #[path = "committed_replay/ttl_dead_letter.rs"]

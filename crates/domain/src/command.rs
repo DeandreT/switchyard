@@ -100,7 +100,7 @@ pub enum CommandKind {
         config: SubscriptionConfig,
     },
     /// Creates one actionless rule below the subscription named by
-    /// `Command::entity`.
+    /// `Command::entity`. A SQL filter is compiled before anything is staged.
     CreateRule {
         name: RuleName,
         filter: RuleFilter,
@@ -320,7 +320,8 @@ pub enum CommandOutcome {
     /// A topic publication committed atomically. Every sequence is owned by the
     /// topic and is either stamped into its immediate subscription copies or
     /// names a topic-owned scheduled placeholder. The returned subscriptions
-    /// contain only paths populated immediately; scheduled fanout reports its
+    /// contain only paths populated immediately, followed by the dead-letter
+    /// queues that received a filter-error copy; scheduled fanout reports its
     /// destinations from [`CommandOutcome::ScheduledActivated`].
     Published {
         sequences: Vec<SequenceNumber>,
@@ -333,7 +334,8 @@ pub enum CommandOutcome {
         activated: u32,
         /// Concrete receive paths made ready by activation, with each path
         /// reported once. Queue activation names its queue; topic activation
-        /// names only the subscriptions that received a matching copy.
+        /// names only the subscriptions that received a matching copy, then
+        /// the dead-letter queues that received a filter-error copy.
         deliverable_entities: Vec<EntityPath>,
     },
     DuplicateHistoryExpired {

@@ -6,8 +6,11 @@ use storage::{Key, Value};
 use crate::{
     DEAD_LETTER_QUEUE_SUFFIX, EntityBindingKind, EntityPath, MAX_SUBSCRIPTION_RULES,
     MAX_TOPIC_SUBSCRIPTIONS, NamespaceName, QueueConfig, QueueCounters, RuleDefinition,
-    SubscriptionConfig, SubscriptionName, Timestamp, TopicConfig, codec,
-    identifier::SUBSCRIPTION_PATH_SEGMENT, keys, machine::decode_catalog_owner,
+    SubscriptionConfig, SubscriptionName, Timestamp, TopicConfig,
+    codec::{self, message::CanonicalError},
+    identifier::SUBSCRIPTION_PATH_SEGMENT,
+    keys,
+    machine::decode_catalog_owner,
 };
 
 use super::{CatalogValidation, SnapshotCatalogError};
@@ -146,7 +149,15 @@ impl<'a> Catalog<'a> {
                 0x10 => {
                     let (namespace, subscription, name) = keys::catalog_rule_parts(key)
                         .ok_or_else(|| invalid_key(row, "rule key is not canonical"))?;
-                    let definition = decode::<RuleDefinition>(value, row)?;
+                    let definition = codec::rule::decode_canonical(value).map_err(|error| {
+                        invalid_value(
+                            row,
+                            match error {
+                                CanonicalError::Codec(_) => "catalog value cannot be decoded",
+                                CanonicalError::NonCanonical => "catalog value is not canonical",
+                            },
+                        )
+                    })?;
                     if definition.name.as_str() != name.as_str() {
                         return Err(invalid_value(row, "rule name does not match its key"));
                     }

@@ -11,7 +11,7 @@
 //!
 //! Each content-bearing row's key and outer value are checked as canonical
 //! before any recursive decoding. Message rows use the frozen message-record
-//! codec and rules the V1 value codec; both are non-recursive, with allocations
+//! codec and rules the rule codec; both are non-recursive, with allocations
 //! bounded by the stored value length. Raw message bodies (V1 bodies and V2 raw
 //! content) and session state are opaque bytes, not AMQP, and are not parsed. Other
 //! domain tags carry no AMQP content, external F0/F1 rows belong to their own
@@ -19,14 +19,13 @@
 //! Nothing is normalized, rewritten, replayed or certified as healthy.
 
 use message_content::{decode_content, decode_value};
-use serde::{Serialize, de::DeserializeOwned};
 use storage::{Key, Value};
 use thiserror::Error;
 
 pub use message_content::{Error as ContentError, Limits as ContentLimits};
 
 use crate::{
-    RuleDefinition, RuleFilter,
+    RuleFilter,
     codec::{
         self,
         message::{self as message_codec, CanonicalError},
@@ -158,7 +157,13 @@ pub fn validate_legacy_content(
                 if keys::catalog_rule_parts(key).is_none() {
                     return Err(invalid_key(row, "rule key is not canonical"));
                 }
-                let definition = canonical::<RuleDefinition>(value, row)?;
+                let definition =
+                    codec::rule::decode_canonical(value).map_err(|error| match error {
+                        CanonicalError::Codec(_) => invalid_record(row, "value cannot be decoded"),
+                        CanonicalError::NonCanonical => {
+                            invalid_record(row, "value is not canonical")
+                        }
+                    })?;
                 report.rule_rows += 1;
                 if let RuleFilter::Correlation(filter) = &definition.filter {
                     for (ordinal, property) in filter.application_properties.values().enumerate() {
@@ -179,17 +184,6 @@ pub fn validate_legacy_content(
         }
     }
     Ok(report)
-}
-
-fn canonical<T: DeserializeOwned + Serialize>(
-    raw: &[u8],
-    row: usize,
-) -> Result<T, LegacyContentError> {
-    let value = codec::decode(raw).map_err(|_| invalid_record(row, "value cannot be decoded"))?;
-    if codec::encode(&value).map_err(|_| invalid_record(row, "value cannot be encoded"))? != raw {
-        return Err(invalid_record(row, "value is not canonical"));
-    }
-    Ok(value)
 }
 
 fn invalid_key(row: usize, detail: &'static str) -> LegacyContentError {

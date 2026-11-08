@@ -198,7 +198,7 @@ pub(super) fn evaluate<'a>(
     }
     let mut slots: Vec<Slot<'a>> = Vec::with_capacity(program.nodes.len());
     let mut first_error = None;
-    for node in &program.nodes {
+    for (index, node) in program.nodes.iter().enumerate() {
         let slot = match node {
             Node::Literal(literal) => Slot::new(
                 Ok(match literal {
@@ -317,8 +317,13 @@ pub(super) fn evaluate<'a>(
                 let input = slots[usize::from(*input)];
                 let pattern = slots[usize::from(*pattern)];
                 let escape = escape.map(|index| slots[usize::from(index)]);
+                let literal = program
+                    .literal_patterns
+                    .binary_search_by_key(&index, |(node, _)| usize::from(*node))
+                    .ok()
+                    .map(|position| &program.literal_patterns[position].1);
                 Slot::new(
-                    like(input, pattern, escape, *negated, budget),
+                    like(input, pattern, escape, *negated, literal, budget),
                     input.string_bound.max(pattern.string_bound),
                 )
             }
@@ -379,6 +384,7 @@ fn like<'a>(
     pattern: Slot<'a>,
     escape: Option<Slot<'a>>,
     negated: bool,
+    literal: Option<&Result<super::pattern::LikeRegex, SqlEvaluationError>>,
     budget: &mut SqlEvaluationBudget,
 ) -> Result<Value<'a>, SqlEvaluationError> {
     let escape = match escape.map(|slot| slot.value).transpose()? {
@@ -396,7 +402,14 @@ fn like<'a>(
     };
     // Build even with null, incompatible or unsupported input: those values
     // cannot conceal a regex limit. Matching work is charged before its cache.
-    let regex = super::pattern::compile(pattern, escape)?;
+    let built;
+    let regex = match literal {
+        Some(result) => result.as_ref().map_err(|error| *error)?,
+        None => {
+            built = super::pattern::compile(pattern, escape)?;
+            &built
+        }
+    };
     budget.work(
         input
             .string_bound

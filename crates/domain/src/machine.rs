@@ -21,6 +21,7 @@ mod rules;
 mod scheduling;
 mod send;
 mod topic;
+mod topic_routing;
 mod topic_scheduling;
 mod topic_updates;
 

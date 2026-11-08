@@ -31,6 +31,8 @@ pub(super) fn build_work_bound(pattern_bytes: usize) -> usize {
     allocation_bound(pattern_bytes).saturating_add(MAX_SQL_REGEX_BYTES / size_of::<State>())
 }
 
+pub(super) type LikeRegex = PikeVM;
+
 pub(super) fn compile(text: &str, escape: Option<char>) -> Result<PikeVM, SqlEvaluationError> {
     if text.len() > MAX_SQL_LIKE_PATTERN_BYTES {
         return Err(SqlEvaluationError::Limit {

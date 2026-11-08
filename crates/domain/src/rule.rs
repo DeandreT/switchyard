@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{RuleName, Timestamp};
+use crate::{RuleName, SqlCompileError, SqlProgram, Timestamp};
 
 /// Name of the match-all rule created atomically with every subscription.
 pub const DEFAULT_RULE_NAME: &str = "$default";
@@ -16,6 +16,15 @@ pub const MAX_RULE_PAGE: u32 = 100;
 /// message. This bounds both replicated commands and publish-time evaluation.
 pub const MAX_CORRELATION_FILTER_BYTES: usize = 256 * 1024;
 pub const MAX_CORRELATION_VALUE_BYTES: usize = MAX_CORRELATION_FILTER_BYTES;
+/// Most SQL rules retained across all subscriptions of one topic, Azure's
+/// Standard quota. Correlation, true and false rules count only toward the
+/// per-subscription limit.
+pub const MAX_TOPIC_SQL_RULES: usize = 2_000;
+/// Dead-letter reason Switchyard chose for a subscription copy whose SQL
+/// filter failed to evaluate. It is taken from the exception name Azure's
+/// documentation associates with filter errors; Azure's exact reason text is
+/// not verified.
+pub const FILTER_EVALUATION_DEAD_LETTER_REASON: &str = "FilterException";
 
 /// Canonical encoding of one scalar application-property value.
 ///
@@ -195,9 +204,36 @@ impl FilterProperties {
     }
 }
 
-/// An actionless subscription filter. SQL filters and actions remain explicit
-/// future variants rather than strings that this build would silently accept
-/// without implementing their language.
+/// A bounded SQL predicate retained as the caller's exact expression text.
+///
+/// Programs are never stored: every reader compiles the text again under the
+/// current grammar and limits, so a record this build cannot compile is
+/// refused rather than evaluated differently.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SqlRuleFilter {
+    expression: String,
+}
+
+impl SqlRuleFilter {
+    /// Builds unvalidated intent; [`RuleFilter::validate`] compiles it.
+    pub fn new(expression: impl Into<String>) -> Self {
+        Self {
+            expression: expression.into(),
+        }
+    }
+
+    pub fn expression(&self) -> &str {
+        &self.expression
+    }
+
+    /// Compiles the expression with a fresh default budget.
+    pub fn compile(&self) -> Result<SqlProgram, RuleConfigError> {
+        SqlProgram::compile(&self.expression).map_err(RuleConfigError::Sql)
+    }
+}
+
+/// An actionless subscription filter. Actions remain an explicit future
+/// variant rather than text this build would silently accept.
 // The correlation payload stays inline so this public durable value remains
 // straightforward to construct at protocol boundaries. The number of rules
 // evaluated for one subscription is bounded.
@@ -208,6 +244,9 @@ pub enum RuleFilter {
     True,
     False,
     Correlation(CorrelationFilter),
+    /// Matches only when the predicate evaluates to SQL `TRUE`. Evaluation
+    /// errors are routed by topic fanout, not reported as non-matches.
+    Sql(SqlRuleFilter),
 }
 
 impl RuleFilter {
@@ -215,15 +254,14 @@ impl RuleFilter {
         match self {
             Self::True | Self::False => Ok(()),
             Self::Correlation(filter) => filter.validate(),
+            Self::Sql(filter) => filter.compile().map(drop),
         }
     }
 
-    pub fn matches(&self, properties: &FilterProperties) -> bool {
-        match self {
-            Self::True => true,
-            Self::False => false,
-            Self::Correlation(filter) => filter.matches(properties),
-        }
+    /// Whether the record and proposal formats that predate SQL rules can
+    /// represent this filter.
+    pub const fn is_legacy_representable(&self) -> bool {
+        !matches!(self, Self::Sql(_))
     }
 
     pub(crate) fn canonicalized(&self) -> Result<Self, RuleConfigError> {
@@ -231,6 +269,11 @@ impl RuleFilter {
             Self::True => Ok(Self::True),
             Self::False => Ok(Self::False),
             Self::Correlation(filter) => Ok(Self::Correlation(filter.canonicalized()?)),
+            // Expression text is retained verbatim; only compilation is checked.
+            Self::Sql(filter) => {
+                filter.compile()?;
+                Ok(Self::Sql(filter.clone()))
+            }
         }
     }
 }
@@ -256,6 +299,8 @@ impl RuleDefinition {
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum RuleConfigError {
+    #[error("SQL filter cannot be compiled: {0}")]
+    Sql(SqlCompileError),
     #[error("session-id correlation predicates require session-aware topic fanout")]
     SessionIdNotSupported,
     #[error("a correlation filter must name at least one property")]
@@ -356,9 +401,19 @@ mod tests {
     }
 
     #[test]
-    fn actionless_rule_variants_have_expected_truth_tables() {
-        let properties = FilterProperties::default();
-        assert!(RuleFilter::True.matches(&properties));
-        assert!(!RuleFilter::False.matches(&properties));
+    fn sql_filters_compile_on_validation_and_keep_their_text() {
+        let filter = RuleFilter::Sql(SqlRuleFilter::new("Region = 'west' AND sys.Label IS NULL"));
+        assert_eq!(filter.validate(), Ok(()));
+        assert_eq!(filter.canonicalized(), Ok(filter.clone()));
+        assert!(!filter.is_legacy_representable());
+        assert!(RuleFilter::True.is_legacy_representable());
+        assert!(matches!(
+            RuleFilter::Sql(SqlRuleFilter::new("Region =")).validate(),
+            Err(RuleConfigError::Sql(SqlCompileError::Syntax))
+        ));
+        assert!(matches!(
+            RuleFilter::Sql(SqlRuleFilter::new("SET x = 1")).canonicalized(),
+            Err(RuleConfigError::Sql(_))
+        ));
     }
 }

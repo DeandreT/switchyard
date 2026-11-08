@@ -3,6 +3,7 @@ use thiserror::Error;
 
 pub mod message;
 pub mod queue;
+pub mod rule;
 pub mod topic;
 
 /// Leading byte of every stored value.

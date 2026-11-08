@@ -10,7 +10,8 @@ use super::{
     StateMachine, TIMER_SCAN_LIMIT,
     scheduling::{scheduled_lifetime, validate_cancellation},
     send::{SendInput, effective_time_to_live},
-    topic::{filter_properties, matches_any},
+    topic::{filter_properties, populated_entities, uses_sql},
+    topic_routing::{Route, TypedProperties, stage_filter_dead_letter},
 };
 
 impl<S: StateStore> StateMachine<S> {
@@ -76,7 +77,7 @@ impl<S: StateStore> StateMachine<S> {
         }
 
         // Every message activated by this command observes this one durable
-        // topology/rule snapshot. Divide the normal timer budget by fanout so
+        // topology/rule snapshot, including SQL rules compiled from it. Divide the normal timer budget by fanout so
         // the number of subscription copies stays bounded. One publication is
         // still atomic even when the topic itself has more than the budgeted
         // number of subscriptions.
@@ -114,6 +115,8 @@ impl<S: StateStore> StateMachine<S> {
 
         let mut counters = self.load_counters(command)?;
         let mut populated = vec![false; subscriptions.len()];
+        let mut dead_lettered = vec![false; subscriptions.len()];
+        let uses_sql = uses_sql(&subscription_state);
         let activated = u32::try_from(prepared.len()).unwrap_or(u32::MAX);
         for (index_key, placeholder_sequence, mut record, properties, topic_lifetime) in prepared {
             let active_sequence = SequenceNumber::new(counters.next_sequence);
@@ -127,11 +130,26 @@ impl<S: StateStore> StateMachine<S> {
             record.sequence = active_sequence;
             record.enqueued_at = command.issued_at;
             record.state = MessageState::Ready;
+            let typed = TypedProperties::new(&properties, uses_sql)?;
+            let routing = typed.input();
             for (index, (subscription, (config, rules))) in
                 subscriptions.iter().zip(&subscription_state).enumerate()
             {
-                if !matches_any(rules, &properties) {
-                    continue;
+                match rules.route(&routing) {
+                    Route::Deliver => {}
+                    Route::Skip => continue,
+                    Route::DeadLetter(description) => {
+                        dead_lettered[index] = true;
+                        stage_filter_dead_letter(
+                            namespace,
+                            subscription,
+                            record.clone(),
+                            description,
+                            command.issued_at,
+                            batch,
+                        )?;
+                        continue;
+                    }
                 }
 
                 populated[index] = true;
@@ -163,11 +181,7 @@ impl<S: StateStore> StateMachine<S> {
 
         Ok(CommandOutcome::ScheduledActivated {
             activated,
-            deliverable_entities: subscriptions
-                .into_iter()
-                .zip(populated)
-                .filter_map(|(subscription, populated)| populated.then_some(subscription))
-                .collect(),
+            deliverable_entities: populated_entities(&subscriptions, &populated, &dead_lettered)?,
         })
     }
 }
