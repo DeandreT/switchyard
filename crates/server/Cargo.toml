@@ -21,7 +21,7 @@ protocol-amqp.workspace = true
 rustls.workspace = true
 storage.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -39,6 +39,7 @@ serde_amqp.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 testkit.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tokio-rustls.workspace = true
 tokio-tungstenite.workspace = true
 url.workspace = true

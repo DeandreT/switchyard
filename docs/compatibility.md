@@ -362,7 +362,10 @@ Custody is owner-scoped, not whole-task-tree shielding. Borrowed cancellation/re
 requires a surviving owner; retirement requests prove neither joins nor peer answers.
 Raw priorities and cleanup notices differ by owner. Begun broker/cleanup drains
 remain unbounded; owner-drop and aborted-ancestor survival are excluded. TCP custody
-is included; WSS #225 and process shutdown #7 remain separate.
+is included; WSS #225 remains separate. SIGTERM/SIGINT shut the process down in
+order (listener admission, protocol cleanup, timer, broker) within
+`--shutdown-timeout-secs` (default 30); an overrun exits with status 3 and
+acknowledges nothing uncommitted.
 The optional listener socket limit (`--max-connections`, unbounded by default)
 counts TLS/upgrade/AMQP handshakes and open connections until their original task
 joins; at the limit the listener stops accepting and new peers wait in the OS

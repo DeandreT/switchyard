@@ -11,6 +11,7 @@ mod admin;
 mod broker;
 mod clock;
 mod proposer;
+mod shutdown;
 #[cfg(test)]
 mod test_deadline;
 mod timer;
@@ -27,6 +28,10 @@ pub use crate::{
     broker::{Broker, BrokerHandle, SubmitError},
     clock::{Clock, ManualClock, SystemClock},
     proposer::{DEFAULT_MAX_CLOCK_REGRESSION_MILLIS, LocalProposer, ProposeError},
+    shutdown::{
+        DEFAULT_SHUTDOWN_TIMEOUT, SHUTDOWN_EXPIRED_EXIT_CODE, ShutdownBudget, ShutdownExpired,
+        ShutdownStage, ShutdownTrigger, TimerThread, shut_down, stop_timer_and_broker,
+    },
     timer::{
         DEFAULT_SWEEP_INTERVAL, MAX_QUEUES_PER_SWEEP, MAX_ROUNDS_PER_INDEX, Shutdown, SweepReport,
         TimerWorker,
