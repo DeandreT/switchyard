@@ -630,6 +630,9 @@ where
     let mut next_channel = 0_u16;
     let mut next_handles = HashMap::<u16, u32>::new();
     let mut pending_begins = HashMap::<u16, oneshot::Sender<Result<u16, EngineError>>>::new();
+    // Test-client receive progress only. Production incoming conservation and
+    // bounded consumer handoff are implemented independently by the server.
+    let mut incoming_progress = HashMap::<u16, (u32, u32)>::new();
     let mut pending_attaches = HashMap::<String, PendingAttach>::new();
     let mut pending_detaches =
         HashMap::<(u16, u32), oneshot::Sender<Result<(), EngineError>>>::new();
@@ -643,7 +646,11 @@ where
                 let Frame::Amqp { channel, performative, payload } = frame else { break };
                 let Some(performative) = performative else { continue };
                 let result = match performative {
-                    Performative::Begin(_) => {
+                    Performative::Begin(begin) => {
+                        incoming_progress.insert(channel, (begin.next_outgoing_id, 0));
+                        if let Some(session) = sessions.get_mut(&channel) {
+                            session.outgoing = engine::OutgoingWindow::new(0, begin.incoming_window);
+                        }
                         if let Some(reply) = pending_begins.remove(&channel) {
                             let _ = reply.send(Ok(channel));
                         }
@@ -657,9 +664,9 @@ where
                                     &mut writer,
                                     channel,
                                     Performative::Flow(Flow {
-                                        next_incoming_id: Some(0),
+                                        next_incoming_id: incoming_progress.get(&channel).map(|(next, _)| *next),
                                         incoming_window: SESSION_WINDOW,
-                                        next_outgoing_id: 0,
+                                        next_outgoing_id: sessions.get(&channel).map_or(0, |session| session.outgoing.next_id()),
                                         outgoing_window: SESSION_WINDOW,
                                         handle: Some(pending.handle),
                                         delivery_count: Some(0),
@@ -678,7 +685,7 @@ where
                         Ok(false)
                     }
                     Performative::Flow(flow) => {
-                        apply_flow(
+                        engine::apply_session_flow(
                             channel,
                             flow,
                             &mut writer,
@@ -689,6 +696,20 @@ where
                     }
                     Performative::Transfer(transfer) => {
                         receive_transfer(channel, transfer, payload, &mut sessions).await?;
+                        if let Some((next, consumed)) = incoming_progress.get_mut(&channel) {
+                            *next = next.wrapping_add(1);
+                            *consumed += 1;
+                            if *consumed == SESSION_WINDOW / 2 {
+                                *consumed = 0;
+                                write_amqp(&mut writer, channel, Performative::Flow(Flow {
+                                    next_incoming_id: Some(*next),
+                                    incoming_window: SESSION_WINDOW,
+                                    next_outgoing_id: sessions.get(&channel).map_or(0, |session| session.outgoing.next_id()),
+                                    outgoing_window: SESSION_WINDOW,
+                                    ..Flow::default()
+                                }), Vec::new()).await?;
+                            }
+                        }
                         Ok(false)
                     }
                     Performative::Disposition(disposition) => {
@@ -724,6 +745,7 @@ where
                         Ok(false)
                     }
                     Performative::End(_) => {
+                        incoming_progress.remove(&channel);
                         if let Some(mut session) = sessions.remove(&channel) {
                             for link in session.links.values_mut() {
                                 stop_link(link);
@@ -765,7 +787,8 @@ where
                             pending_attaches: HashMap::new(),
                             links: HashMap::new(),
                             pending_flows: HashMap::new(),
-                            next_outgoing_id: 0,
+                            next_delivery_id: 0,
+                            outgoing: engine::OutgoingWindow::new(0, 0),
                         });
                         next_handles.insert(channel, 0);
                         pending_begins.insert(channel, reply);
@@ -823,6 +846,7 @@ where
                                     delivery_count: 0,
                                     credit_limit: 0,
                                     queued: VecDeque::new(),
+                                    transmitting: None,
                                     unsettled: HashMap::new(),
                                     detached: detached_tx,
                                     drain,
@@ -969,6 +993,7 @@ where
                         }
                     }
                     ClientCommand::End { channel, reply } => {
+                        incoming_progress.remove(&channel);
                         let result = write_amqp(
                             &mut writer,
                             channel,
@@ -1026,6 +1051,141 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn client_replenishes_fragment_capacity_and_new_links_report_real_received_progress() {
+        let (stream, mut peer) = tokio::io::duplex(64 * 1024);
+        let (commands, command_rx) = mpsc::channel(256);
+        let (closed_tx, closed) = watch::channel(false);
+        let driver = tokio::spawn(run_client(stream, 1024, command_rx, closed_tx));
+        let mut connection = ClientConnection { commands, closed };
+        let expected = Message::data(vec![0x5a; 2050]);
+        let payload = encode_message(&expected).unwrap();
+        let frames = payload.len() as u32;
+
+        async fn performative(peer: &mut tokio::io::DuplexStream) -> (u16, Performative) {
+            let Frame::Amqp {
+                channel,
+                performative: Some(value),
+                ..
+            } = read_frame(peer).await.unwrap()
+            else {
+                panic!("AMQP performative")
+            };
+            (channel, value)
+        }
+
+        let ((), ()) = tokio::time::timeout(crate::test_deadline::WAIT, async {
+            tokio::join!(
+                async {
+                    let mut session = connection.begin().await.unwrap();
+                    let mut receiver = session.attach_receiver("first", "orders").await.unwrap();
+                    let delivery = receiver.recv().await.unwrap();
+                    assert_eq!(delivery.message(), &expected);
+                    let _second = session.attach_receiver("second", "orders").await.unwrap();
+                    connection.close().await.unwrap();
+                },
+                async {
+                    let (channel, begin) = performative(&mut peer).await;
+                    assert!(matches!(begin, Performative::Begin(_)));
+                    write_amqp(
+                        &mut peer,
+                        channel,
+                        Performative::Begin(Begin {
+                            remote_channel: Some(channel),
+                            next_outgoing_id: 17,
+                            incoming_window: SESSION_WINDOW,
+                            outgoing_window: SESSION_WINDOW,
+                            ..Begin::default()
+                        }),
+                        Vec::new(),
+                    )
+                    .await
+                    .unwrap();
+                    let (_, attach) = performative(&mut peer).await;
+                    let Performative::Attach(mut attach) = attach else {
+                        panic!("receiver Attach")
+                    };
+                    let handle = attach.handle;
+                    attach.role = Role::Sender;
+                    attach.initial_delivery_count = Some(0);
+                    write_amqp(&mut peer, channel, Performative::Attach(attach), Vec::new())
+                        .await
+                        .unwrap();
+                    let (_, flow) = performative(&mut peer).await;
+                    let Performative::Flow(flow) = flow else {
+                        panic!("initial credit")
+                    };
+                    assert_eq!(flow.next_incoming_id, Some(17));
+                    for (index, byte) in payload.into_iter().enumerate() {
+                        let first = index == 0;
+                        write_amqp(
+                            &mut peer,
+                            channel,
+                            Performative::Transfer(Transfer {
+                                handle,
+                                delivery_id: first.then_some(0),
+                                delivery_tag: first.then(|| DeliveryTag::from(vec![1])),
+                                message_format: first.then_some(0),
+                                settled: first.then_some(true),
+                                more: index as u32 + 1 < frames,
+                                rcv_settle_mode: None,
+                                state: None,
+                                resume: false,
+                                aborted: false,
+                                batchable: false,
+                            }),
+                            vec![byte],
+                        )
+                        .await
+                        .unwrap();
+                        if (index as u32 + 1).is_multiple_of(SESSION_WINDOW / 2) {
+                            let (_, flow) = performative(&mut peer).await;
+                            let Performative::Flow(flow) = flow else {
+                                panic!("session refill")
+                            };
+                            assert_eq!(flow.handle, None);
+                            assert_eq!(flow.next_incoming_id, Some(17 + index as u32 + 1));
+                            assert_eq!(flow.incoming_window, SESSION_WINDOW);
+                        }
+                    }
+                    let (_, attach) = performative(&mut peer).await;
+                    let Performative::Attach(mut attach) = attach else {
+                        panic!("second Attach")
+                    };
+                    attach.role = Role::Sender;
+                    attach.initial_delivery_count = Some(0);
+                    write_amqp(&mut peer, channel, Performative::Attach(attach), Vec::new())
+                        .await
+                        .unwrap();
+                    let (_, flow) = performative(&mut peer).await;
+                    let Performative::Flow(flow) = flow else {
+                        panic!("second link credit")
+                    };
+                    assert_eq!(flow.next_incoming_id, Some(17 + frames));
+                    assert!(matches!(
+                        performative(&mut peer).await.1,
+                        Performative::Close(_)
+                    ));
+                    write_amqp(
+                        &mut peer,
+                        0,
+                        Performative::Close(Close::default()),
+                        Vec::new(),
+                    )
+                    .await
+                    .unwrap();
+                }
+            )
+        })
+        .await
+        .expect("original test-client workflow deadline");
+        tokio::time::timeout(crate::test_deadline::WAIT, driver)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn client_sender_can_send_an_explicit_message_format() {

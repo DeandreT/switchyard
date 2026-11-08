@@ -2,11 +2,13 @@ use super::*;
 use tokio::io::AsyncWriteExt;
 
 mod link_flow;
+mod session_flow;
 
 pub(super) use link_flow::{LinkDrain, apply_flow};
 use link_flow::{
     acknowledge_drain, complete_zero_credit_drain, publish_credit, release_credit, reserve_credit,
 };
+pub(super) use session_flow::OutgoingWindow;
 
 pub(super) enum Command {
     AcceptSession {
@@ -101,7 +103,15 @@ pub(super) struct SessionState {
     pub(super) pending_attaches: HashMap<u32, u64>,
     pub(super) links: HashMap<u32, LinkState>,
     pub(super) pending_flows: HashMap<u32, Flow>,
-    pub(super) next_outgoing_id: u32,
+    /// Delivery IDs remain independent from the per-frame sequence in Flow.
+    pub(super) next_delivery_id: u32,
+    pub(super) outgoing: OutgoingWindow,
+}
+
+#[derive(Debug)]
+pub(super) struct PendingSession {
+    incarnation: u64,
+    incoming_window: u32,
 }
 
 pub(super) enum LinkState {
@@ -124,6 +134,7 @@ pub(super) struct SendingLink {
     pub(super) delivery_count: u32,
     pub(super) credit_limit: u64,
     pub(super) queued: VecDeque<QueuedSend>,
+    pub(super) transmitting: Option<Box<TransmittingSend>>,
     pub(super) unsettled: HashMap<u32, UnsettledSend>,
     pub(super) detached: watch::Sender<bool>,
     pub(super) drain: LinkDrain,
@@ -142,6 +153,25 @@ pub(super) struct QueuedSend {
     pub(super) permit: OwnedSemaphorePermit,
     pub(super) started: oneshot::Sender<Result<DeliveryIdentity, EngineError>>,
     pub(super) reply: oneshot::Sender<Result<RemoteOutcome, EngineError>>,
+}
+
+pub(super) struct TransmittingSend {
+    payload: Vec<u8>,
+    offset: usize,
+    first: bool,
+    delivery_id: u32,
+    delivery_tag: DeliveryTag,
+    message_format: u32,
+    settled: bool,
+    // A canceled/failed original write drops its reply channels (Stopped),
+    // unlike a peer retirement observed between writes (RemoteDetached).
+    writing: bool,
+    started: oneshot::Sender<Result<DeliveryIdentity, EngineError>>,
+    // The unsettled map owns the permit until transmission and any required
+    // settlement finish. Early peer outcomes stay here until the final frame.
+    early_outcome: Option<(Outcome, bool, bool)>,
+    settled_reply: Option<oneshot::Sender<Result<RemoteOutcome, EngineError>>>,
+    _settled_permit: Option<OwnedSemaphorePermit>,
 }
 
 pub(super) struct UnsettledSend {
@@ -189,7 +219,7 @@ pub(super) async fn run_connection<W>(
     W: AsyncWrite + Send + Unpin + 'static,
 {
     let mut sessions = HashMap::<u16, SessionState>::new();
-    let mut pending_sessions = HashMap::<u16, u64>::new();
+    let mut pending_sessions = HashMap::<u16, PendingSession>::new();
     let mut closing_reply: Option<oneshot::Sender<Result<(), EngineError>>> = None;
     let mut cleanup_open = true;
     // Cancellation must reach nested writes and channel sends before link cleanup.
@@ -281,7 +311,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
     frame: Frame,
     writer: &mut W,
     incoming_sessions: &mpsc::Sender<IncomingSession>,
-    pending_sessions: &mut HashMap<u16, u64>,
+    pending_sessions: &mut HashMap<u16, PendingSession>,
     sessions: &mut HashMap<u16, SessionState>,
     remote_max_frame_size: u32,
 ) -> Result<FrameAction, EngineError> {
@@ -303,7 +333,13 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                 return Err(invalid_state("duplicate AMQP session channel"));
             }
             let incarnation = next_session_incarnation();
-            pending_sessions.insert(channel, incarnation);
+            pending_sessions.insert(
+                channel,
+                PendingSession {
+                    incarnation,
+                    incoming_window: begin.incoming_window,
+                },
+            );
             incoming_sessions
                 .send(IncomingSession {
                     channel,
@@ -338,7 +374,7 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                 .map_err(|_| EngineError::Stopped)?;
         }
         Performative::Flow(flow) => {
-            apply_flow(channel, flow, writer, sessions, remote_max_frame_size).await?;
+            apply_session_flow(channel, flow, writer, sessions, remote_max_frame_size).await?;
         }
         Performative::Transfer(transfer) => {
             receive_transfer(channel, transfer, payload, sessions).await?;
@@ -401,6 +437,32 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
     Ok(FrameAction::Continue)
 }
 
+pub(in crate::server) async fn apply_session_flow<W: AsyncWrite + Unpin>(
+    channel: u16,
+    flow: Flow,
+    writer: &mut W,
+    sessions: &mut HashMap<u16, SessionState>,
+    remote_max_frame_size: u32,
+) -> Result<(), EngineError> {
+    let Some(session) = sessions.get_mut(&channel) else {
+        return Ok(());
+    };
+    session.outgoing.update(&flow)?;
+    apply_flow(channel, flow, writer, sessions, remote_max_frame_size).await?;
+    // Link hints cached before AcceptLink are replayed by apply_flow alone;
+    // replaying their older session acknowledgement would rewind peer state.
+    // Session-only Flow also wakes sends on every applicable link.
+    let session = sessions
+        .get_mut(&channel)
+        .expect("the session remains installed");
+    let mut handles = session.links.keys().copied().collect::<Vec<_>>();
+    handles.sort_unstable();
+    for handle in handles {
+        flush_sends(channel, handle, session, writer, remote_max_frame_size).await?;
+    }
+    Ok(())
+}
+
 enum CommandAction {
     Continue,
     Closing(oneshot::Sender<Result<(), EngineError>>),
@@ -409,7 +471,7 @@ enum CommandAction {
 async fn handle_command<W: AsyncWrite + Unpin>(
     command: Command,
     writer: &mut W,
-    pending_sessions: &mut HashMap<u16, u64>,
+    pending_sessions: &mut HashMap<u16, PendingSession>,
     sessions: &mut HashMap<u16, SessionState>,
     remote_max_frame_size: u32,
 ) -> Result<CommandAction, EngineError> {
@@ -421,11 +483,17 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             ended_tx,
             reply,
         } => {
-            if pending_sessions.get(&channel) != Some(&incarnation) {
+            if pending_sessions
+                .get(&channel)
+                .map(|pending| pending.incarnation)
+                != Some(incarnation)
+            {
                 let _ = reply.send(Err(EngineError::RemoteDetached));
                 return Ok(CommandAction::Continue);
             }
-            pending_sessions.remove(&channel);
+            let pending = pending_sessions
+                .remove(&channel)
+                .expect("the original pending session exists");
             write_amqp(
                 writer,
                 channel,
@@ -445,7 +513,8 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                     pending_attaches: HashMap::new(),
                     links: HashMap::new(),
                     pending_flows: HashMap::new(),
-                    next_outgoing_id: 0,
+                    next_delivery_id: 0,
+                    outgoing: OutgoingWindow::new(0, pending.incoming_window),
                 },
             );
             let _ = reply.send(Ok(()));
@@ -511,7 +580,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                         Performative::Flow(Flow {
                             next_incoming_id: Some(0),
                             incoming_window: SESSION_WINDOW,
-                            next_outgoing_id: session.next_outgoing_id,
+                            next_outgoing_id: session.outgoing.next_id(),
                             outgoing_window: SESSION_WINDOW,
                             handle: Some(handle),
                             delivery_count: Some(0),
@@ -534,6 +603,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                             delivery_count: 0,
                             credit_limit: 0,
                             queued: VecDeque::new(),
+                            transmitting: None,
                             unsettled: HashMap::new(),
                             detached: detached_tx,
                             drain,
@@ -853,86 +923,142 @@ pub(super) async fn flush_sends<W: AsyncWrite + Unpin>(
         let Some(LinkState::Sending(link)) = session.links.get_mut(&handle) else {
             return Ok(());
         };
-        let front_is_reserved = link
-            .queued
-            .front()
-            .is_some_and(|queued| queued.reservation.is_some());
-        let committed =
-            u64::from(link.delivery_count).saturating_add(link.credit_reservations.len() as u64);
-        if !front_is_reserved && committed >= link.credit_limit {
-            trace!(
-                channel,
-                handle,
-                delivery_count = link.delivery_count,
-                credit_limit = link.credit_limit,
-                reservations = link.credit_reservations.len(),
-                queued = link.queued.len(),
-                "send is waiting for link credit"
-            );
+        if link.transmitting.is_none() {
+            let front_is_reserved = link
+                .queued
+                .front()
+                .is_some_and(|queued| queued.reservation.is_some());
+            let committed = u64::from(link.delivery_count)
+                .saturating_add(link.credit_reservations.len() as u64);
+            if !front_is_reserved && committed >= link.credit_limit {
+                publish_credit(link);
+                complete_zero_credit_drain(channel, handle, session, writer).await?;
+                return Ok(());
+            }
+            if link.queued.is_empty() || !session.outgoing.has_capacity() {
+                publish_credit(link);
+                return Ok(());
+            }
+            let queued = link
+                .queued
+                .pop_front()
+                .expect("the queued send remains owned");
+            if let Some(reservation) = queued.reservation {
+                let removed = reservation.incarnation == link.drain.incarnation
+                    && link.credit_reservations.remove(&reservation.reservation_id);
+                debug_assert!(removed, "queued sends retain their credit reservation");
+            }
+            let payload = encode_message(&queued.message)?;
+            if let Some(maximum) = link.max_message_size
+                && payload.len() as u64 > maximum
+            {
+                let size = payload.len() as u64;
+                let _ = queued
+                    .started
+                    .send(Err(EngineError::MessageSizeExceeded { size, maximum }));
+                let _ = queued
+                    .reply
+                    .send(Err(EngineError::MessageSizeExceeded { size, maximum }));
+                return detach_oversized(channel, handle, session, writer, size, maximum).await;
+            }
+            let delivery_id = session.next_delivery_id;
+            session.next_delivery_id = session.next_delivery_id.wrapping_add(1);
+            link.delivery_count = link.delivery_count.wrapping_add(1);
+            let settled = link.settle_mode == SenderSettleMode::Settled;
+            let (settled_reply, settled_permit) = if settled {
+                (Some(queued.reply), Some(queued.permit))
+            } else {
+                link.unsettled.insert(
+                    delivery_id,
+                    UnsettledSend {
+                        reply: queued.reply,
+                        _permit: queued.permit,
+                    },
+                );
+                (None, None)
+            };
+            link.transmitting = Some(Box::new(TransmittingSend {
+                payload,
+                offset: 0,
+                first: true,
+                delivery_id,
+                delivery_tag: queued.delivery_tag,
+                message_format: queued.message_format,
+                settled,
+                writing: false,
+                started: queued.started,
+                early_outcome: None,
+                settled_reply,
+                _settled_permit: settled_permit,
+            }));
+        }
+        if !session.outgoing.has_capacity() {
             publish_credit(link);
-            complete_zero_credit_drain(channel, handle, session, writer).await?;
             return Ok(());
         }
-        let Some(queued) = link.queued.pop_front() else {
-            publish_credit(link);
-            return Ok(());
-        };
-        if let Some(reservation) = queued.reservation {
-            let removed = reservation.incarnation == link.drain.incarnation
-                && link.credit_reservations.remove(&reservation.reservation_id);
-            debug_assert!(removed, "queued sends retain their credit reservation");
-        }
-        let payload = encode_message(&queued.message)?;
-        if let Some(maximum) = link.max_message_size
-            && payload.len() as u64 > maximum
-        {
-            // The peer must never see a transfer above its own limit. The
-            // delivery consumes no credit or delivery id; the link ends.
-            let size = payload.len() as u64;
-            let _ = queued
-                .started
-                .send(Err(EngineError::MessageSizeExceeded { size, maximum }));
-            let _ = queued
-                .reply
-                .send(Err(EngineError::MessageSizeExceeded { size, maximum }));
-            return detach_oversized(channel, handle, session, writer, size, maximum).await;
-        }
-        let delivery_id = session.next_outgoing_id;
-        session.next_outgoing_id = session.next_outgoing_id.wrapping_add(1);
-        link.delivery_count = link.delivery_count.wrapping_add(1);
-        let identity = DeliveryIdentity {
-            channel,
-            handle,
-            delivery_id,
-        };
-        let settled = link.settle_mode == SenderSettleMode::Settled;
-        write_transfer(
+        let sending = link
+            .transmitting
+            .as_mut()
+            .expect("the original partial send is owned");
+        let maximum = usize::try_from(remote_max_frame_size)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(FRAME_OVERHEAD_RESERVE)
+            .max(1);
+        let end = sending
+            .offset
+            .saturating_add(maximum)
+            .min(sending.payload.len());
+        let more = end < sending.payload.len();
+        sending.writing = true;
+        write_amqp(
             writer,
             channel,
-            handle,
-            delivery_id,
-            queued.delivery_tag,
-            queued.message_format,
-            settled,
-            payload,
-            remote_max_frame_size,
+            Performative::Transfer(Transfer {
+                handle,
+                delivery_id: sending.first.then_some(sending.delivery_id),
+                delivery_tag: sending.first.then(|| sending.delivery_tag.clone()),
+                message_format: sending.first.then_some(sending.message_format),
+                settled: sending.first.then_some(sending.settled),
+                more,
+                rcv_settle_mode: None,
+                state: None,
+                resume: false,
+                aborted: false,
+                batchable: false,
+            }),
+            sending.payload[sending.offset..end].to_vec(),
         )
         .await?;
-        if settled {
-            let _ = queued.started.send(Ok(identity));
-            let _ = queued.reply.send(Ok(RemoteOutcome {
-                outcome: Outcome::Accepted(Accepted),
-                confirmation: None,
+        sending.writing = false;
+        session.outgoing.sent()?;
+        sending.offset = end;
+        sending.first = false;
+        if !more {
+            let sending = link
+                .transmitting
+                .take()
+                .expect("the completed original send is owned");
+            let _ = sending.started.send(Ok(DeliveryIdentity {
+                channel,
+                handle,
+                delivery_id: sending.delivery_id,
             }));
-        } else {
-            link.unsettled.insert(
-                delivery_id,
-                UnsettledSend {
-                    reply: queued.reply,
-                    _permit: queued.permit,
-                },
-            );
-            let _ = queued.started.send(Ok(identity));
+            if let Some(reply) = sending.settled_reply {
+                let _ = reply.send(Ok(RemoteOutcome {
+                    outcome: Outcome::Accepted(Accepted),
+                    confirmation: None,
+                }));
+            }
+            if let Some((outcome, settled, batchable)) = sending.early_outcome {
+                settle_send(
+                    link,
+                    handle,
+                    sending.delivery_id,
+                    outcome,
+                    settled,
+                    batchable,
+                );
+            }
         }
     }
 }
@@ -970,52 +1096,6 @@ async fn detach_oversized<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn write_transfer<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    channel: u16,
-    handle: u32,
-    delivery_id: u32,
-    delivery_tag: DeliveryTag,
-    message_format: u32,
-    settled: bool,
-    payload: Vec<u8>,
-    remote_max_frame_size: u32,
-) -> Result<(), EngineError> {
-    let maximum = usize::try_from(remote_max_frame_size)
-        .unwrap_or(usize::MAX)
-        .saturating_sub(FRAME_OVERHEAD_RESERVE)
-        .max(1);
-    let chunks = if payload.is_empty() {
-        vec![&[][..]]
-    } else {
-        payload.chunks(maximum).collect()
-    };
-    let chunk_count = chunks.len();
-    for (index, chunk) in chunks.into_iter().enumerate() {
-        write_amqp(
-            writer,
-            channel,
-            Performative::Transfer(Transfer {
-                handle,
-                delivery_id: (index == 0).then_some(delivery_id),
-                delivery_tag: (index == 0).then_some(delivery_tag.clone()),
-                message_format: (index == 0).then_some(message_format),
-                settled: (index == 0).then_some(settled),
-                more: index + 1 < chunk_count,
-                rcv_settle_mode: None,
-                state: None,
-                resume: false,
-                aborted: false,
-                batchable: false,
-            }),
-            chunk.to_vec(),
-        )
-        .await?;
-    }
-    Ok(())
-}
-
 pub(super) fn apply_disposition(
     channel: u16,
     disposition: Disposition,
@@ -1049,22 +1129,51 @@ pub(super) fn apply_disposition(
             .collect::<Vec<_>>();
         delivery_ids.sort_unstable();
         for id in delivery_ids {
-            if let Some(unsettled) = link.unsettled.remove(&id) {
-                let confirmation = (link.receiver_settle_mode == ReceiverSettleMode::Second
-                    && !disposition.settled)
-                    .then(|| PendingConfirmation {
-                        handle: *handle,
-                        incarnation: link.drain.incarnation,
-                        delivery_id: id,
-                        batchable: disposition.batchable,
-                        permit: unsettled._permit,
-                    });
-                let _ = unsettled.reply.send(Ok(RemoteOutcome {
-                    outcome: outcome.clone(),
-                    confirmation,
-                }));
+            if let Some(sending) = link.transmitting.as_mut()
+                && sending.delivery_id == id
+            {
+                // Do not release the original send permit while its payload
+                // is still retained, or expose a complete send prematurely.
+                sending.early_outcome.get_or_insert((
+                    outcome.clone(),
+                    disposition.settled,
+                    disposition.batchable,
+                ));
+                continue;
             }
+            settle_send(
+                link,
+                *handle,
+                id,
+                outcome.clone(),
+                disposition.settled,
+                disposition.batchable,
+            );
         }
+    }
+}
+
+fn settle_send(
+    link: &mut SendingLink,
+    handle: u32,
+    id: u32,
+    outcome: Outcome,
+    settled: bool,
+    batchable: bool,
+) {
+    if let Some(unsettled) = link.unsettled.remove(&id) {
+        let confirmation = (link.receiver_settle_mode == ReceiverSettleMode::Second && !settled)
+            .then(|| PendingConfirmation {
+                handle,
+                incarnation: link.drain.incarnation,
+                delivery_id: id,
+                batchable,
+                permit: unsettled._permit,
+            });
+        let _ = unsettled.reply.send(Ok(RemoteOutcome {
+            outcome,
+            confirmation,
+        }));
     }
 }
 
@@ -1072,6 +1181,19 @@ pub(super) fn stop_link(link: &mut LinkState) {
     match link {
         LinkState::Sending(link) => {
             let _ = link.detached.send(true);
+            if let Some(sending) = link.transmitting.take() {
+                if sending.writing {
+                    // Preserve the original write-future cancellation result:
+                    // no peer Detach was received, so close the channels and
+                    // let the caller observe Stopped, not fabricated retirement.
+                    link.unsettled.remove(&sending.delivery_id);
+                } else {
+                    let _ = sending.started.send(Err(EngineError::RemoteDetached));
+                    if let Some(reply) = sending.settled_reply {
+                        let _ = reply.send(Err(EngineError::RemoteDetached));
+                    }
+                }
+            }
             for queued in link.queued.drain(..) {
                 let _ = queued.started.send(Err(EngineError::RemoteDetached));
                 let _ = queued.reply.send(Err(EngineError::RemoteDetached));

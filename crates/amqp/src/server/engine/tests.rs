@@ -9,6 +9,7 @@ mod credit;
 mod incarnation;
 mod message_size;
 mod session_incarnation;
+mod session_windows;
 
 async fn test_handle_command<W: tokio::io::AsyncWrite + Unpin>(
     command: Command,
@@ -68,6 +69,7 @@ fn sending_session(
         credit_reservations: HashSet::new(),
         next_credit_reservation: 0,
         max_message_size: None,
+        transmitting: None,
     };
     let session = SessionState {
         incarnation: 0,
@@ -76,7 +78,8 @@ fn sending_session(
         pending_attaches: HashMap::new(),
         links: HashMap::from([(handle, LinkState::Sending(link))]),
         pending_flows: HashMap::new(),
-        next_outgoing_id: 0,
+        next_delivery_id: 0,
+        outgoing: OutgoingWindow::new(0, SESSION_WINDOW),
     };
     (HashMap::from([(channel, session)]), outcome)
 }
@@ -101,7 +104,8 @@ fn receiving_session(
         pending_attaches: HashMap::new(),
         links: HashMap::from([(handle, LinkState::Receiving(link))]),
         pending_flows: HashMap::new(),
-        next_outgoing_id: 0,
+        next_delivery_id: 0,
+        outgoing: OutgoingWindow::new(0, SESSION_WINDOW),
     };
     (HashMap::from([(channel, session)]), receiver)
 }
@@ -181,6 +185,7 @@ fn queued_sending_session(
         credit_reservations: HashSet::new(),
         next_credit_reservation: 0,
         max_message_size: None,
+        transmitting: None,
     };
     let session = SessionState {
         incarnation: 0,
@@ -189,7 +194,8 @@ fn queued_sending_session(
         pending_attaches: HashMap::new(),
         links: HashMap::from([(handle, LinkState::Sending(link))]),
         pending_flows: HashMap::new(),
-        next_outgoing_id: 0,
+        next_delivery_id: 0,
+        outgoing: OutgoingWindow::new(0, SESSION_WINDOW),
     };
     HashMap::from([(channel, session)])
 }
@@ -507,7 +513,8 @@ async fn link_credit_arriving_during_attach_is_applied_when_the_link_is_accepted
             pending_attaches: HashMap::new(),
             links: HashMap::new(),
             pending_flows: HashMap::new(),
-            next_outgoing_id: 0,
+            next_delivery_id: 0,
+            outgoing: OutgoingWindow::new(0, SESSION_WINDOW),
         },
     )]);
     sessions
@@ -604,6 +611,7 @@ async fn drain_acknowledgement_is_generation_bound_and_returns_unused_credit() {
         credit_reservations: HashSet::new(),
         next_credit_reservation: 0,
         max_message_size: None,
+        transmitting: None,
     };
     let session = SessionState {
         incarnation: 0,
@@ -612,7 +620,8 @@ async fn drain_acknowledgement_is_generation_bound_and_returns_unused_credit() {
         pending_attaches: HashMap::new(),
         links: HashMap::from([(handle, LinkState::Sending(link))]),
         pending_flows: HashMap::new(),
-        next_outgoing_id: 2,
+        next_delivery_id: 2,
+        outgoing: OutgoingWindow::new(2, SESSION_WINDOW),
     };
     let mut sessions = HashMap::from([(channel, session)]);
     let (mut wire, mut peer) = tokio::io::duplex(64 * 1024);
@@ -803,7 +812,7 @@ async fn a_drain_can_complete_after_queued_transfers_exhaust_credit() {
     assert!(flow.drain);
 
     let session = &sessions[&channel];
-    assert_eq!(session.next_outgoing_id, 2);
+    assert_eq!(session.next_delivery_id, 2);
     let Some(LinkState::Sending(link)) = session.links.get(&handle) else {
         panic!("sending link remains attached");
     };
@@ -996,6 +1005,7 @@ async fn a_range_disposition_completes_only_matching_deliveries() {
         credit_reservations: HashSet::new(),
         next_credit_reservation: 0,
         max_message_size: None,
+        transmitting: None,
     };
     let session = SessionState {
         incarnation: 0,
@@ -1004,7 +1014,8 @@ async fn a_range_disposition_completes_only_matching_deliveries() {
         pending_attaches: HashMap::new(),
         links: HashMap::from([(handle, LinkState::Sending(link))]),
         pending_flows: HashMap::new(),
-        next_outgoing_id: 13,
+        next_delivery_id: 13,
+        outgoing: OutgoingWindow::new(13, SESSION_WINDOW),
     };
     let mut sessions = HashMap::from([(channel, session)]);
 
@@ -1054,6 +1065,7 @@ async fn detach_fails_queued_and_unsettled_sends_and_releases_capacity() {
         credit_reservations: HashSet::new(),
         next_credit_reservation: 0,
         max_message_size: None,
+        transmitting: None,
     });
 
     stop_link(&mut link);
@@ -1094,7 +1106,8 @@ async fn a_send_command_crossing_a_detach_gets_a_detach_error() {
             pending_attaches: HashMap::new(),
             links: HashMap::new(),
             pending_flows: HashMap::new(),
-            next_outgoing_id: 0,
+            next_delivery_id: 0,
+            outgoing: OutgoingWindow::new(0, SESSION_WINDOW),
         },
     )]);
     let (mut wire, _peer) = tokio::io::duplex(64 * 1024);

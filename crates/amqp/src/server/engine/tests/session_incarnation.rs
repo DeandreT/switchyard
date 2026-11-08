@@ -68,7 +68,12 @@ async fn an_ended_pending_session_cannot_accept_across_channel_reuse() {
         Err(EngineError::RemoteDetached)
     ));
     assert!(sessions.is_empty());
-    assert_eq!(pending_sessions.get(&channel), Some(&second.incarnation));
+    assert_eq!(
+        pending_sessions
+            .get(&channel)
+            .map(|pending| pending.incarnation),
+        Some(second.incarnation)
+    );
 
     let (attach_tx, _attaches) = mpsc::channel(1);
     let (reply, response) = oneshot::channel();
@@ -110,7 +115,8 @@ async fn a_stale_session_cannot_install_a_link_into_its_replacement() {
             pending_attaches: HashMap::from([(1, 44)]),
             links: HashMap::new(),
             pending_flows: HashMap::new(),
-            next_outgoing_id: 0,
+            next_delivery_id: 0,
+            outgoing: OutgoingWindow::new(0, SESSION_WINDOW),
         },
     )]);
     let mut pending_sessions = HashMap::new();
@@ -180,7 +186,8 @@ async fn a_detached_pending_attach_cannot_cross_handle_reuse() {
             pending_attaches: HashMap::new(),
             links: HashMap::new(),
             pending_flows: HashMap::new(),
-            next_outgoing_id: 0,
+            next_delivery_id: 0,
+            outgoing: OutgoingWindow::new(0, SESSION_WINDOW),
         },
     )]);
     let mut pending_sessions = HashMap::new();
@@ -330,7 +337,7 @@ async fn settlement_after_session_end_is_link_scoped() {
 async fn receive_begin(
     channel: u16,
     incoming: &mpsc::Sender<IncomingSession>,
-    pending_sessions: &mut HashMap<u16, u64>,
+    pending_sessions: &mut HashMap<u16, PendingSession>,
     sessions: &mut HashMap<u16, SessionState>,
     wire: &mut tokio::io::DuplexStream,
 ) {
@@ -351,7 +358,7 @@ async fn receive_attach(
     handle: u32,
     name: &str,
     incoming: &mpsc::Sender<IncomingSession>,
-    pending_sessions: &mut HashMap<u16, u64>,
+    pending_sessions: &mut HashMap<u16, PendingSession>,
     sessions: &mut HashMap<u16, SessionState>,
     wire: &mut tokio::io::DuplexStream,
 ) {
@@ -390,7 +397,7 @@ async fn accept_link(
     session_incarnation: u64,
     incoming: IncomingAttach,
     wire: &mut tokio::io::DuplexStream,
-    pending_sessions: &mut HashMap<u16, u64>,
+    pending_sessions: &mut HashMap<u16, PendingSession>,
     sessions: &mut HashMap<u16, SessionState>,
 ) -> Result<u64, EngineError> {
     let (deliveries_tx, _deliveries) = mpsc::channel(1);
