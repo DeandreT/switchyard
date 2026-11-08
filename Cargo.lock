@@ -1841,12 +1841,25 @@ name = "switchyardctl"
 version = "0.1.0"
 dependencies = [
  "admin-api",
+ "auth",
+ "base64",
  "clap",
  "cluster",
  "domain",
  "fjall",
+ "protocol-amqp",
+ "rcgen",
+ "ring",
+ "rustix",
+ "serde_json",
+ "server",
+ "sha2",
  "storage",
  "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "url",
 ]
 
 [[package]]

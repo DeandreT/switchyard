@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod native;
+
 use std::{path::PathBuf, process::ExitCode};
 
 use admin_api::PROTOBUF_PACKAGE;
@@ -10,12 +12,20 @@ use storage::{STORE_FORMAT_V2, STORE_FORMAT_V3};
 #[derive(Debug, Parser)]
 #[command(name = "switchyardctl", version, about = "Administer Switchyard")]
 struct Arguments {
+    #[command(flatten)]
+    connection: native::Connection,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Native TLS queue Create/Get/List.
+    Queue(native::EntityCommands),
+    /// Native TLS topic Create/Get/List.
+    Topic(native::EntityCommands),
+    /// Native TLS explicit subscription Create/Get/List.
+    Subscription(native::SubscriptionCommands),
     /// Print the native API package and implementation status.
     Compatibility,
     /// Offline maintenance of a durable store directory.
@@ -40,7 +50,9 @@ fn main() -> ExitCode {
     let arguments = Arguments::parse();
     match arguments.command {
         Command::Compatibility => {
-            println!("{PROTOBUF_PACKAGE}: contract scaffolded, transport not implemented");
+            println!(
+                "{PROTOBUF_PACKAGE}: HTTPS Create/Get/List queues, topics and explicit subscriptions; namespace-root Manage JWT required (not AMQP CBS); offline store upgrade 2 to 3; no Delete/Update or other native services"
+            );
         }
         Command::Store {
             command: StoreCommand::Upgrade { data_dir },
@@ -58,6 +70,18 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         },
+        remote => {
+            let operation = match remote {
+                Command::Queue(command) => command.operation(native::Kind::Queue),
+                Command::Topic(command) => command.operation(native::Kind::Topic),
+                Command::Subscription(command) => command.operation(),
+                _ => unreachable!(),
+            };
+            if let Err(error) = native::run(arguments.connection, operation) {
+                eprintln!("switchyardctl: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
     ExitCode::SUCCESS
 }

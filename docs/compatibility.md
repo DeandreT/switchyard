@@ -110,7 +110,12 @@ responses use fixed messages rather than internal details. Delete remains
 [handler contract](../crates/admin-api/README.md).
 
 The server exposes these handlers only through its explicitly configured TLS/h2
-listener. HTTP/OpenAPI, the CLI, Update/Delete, rules, placement/capacity mutation
+listener. The [native CLI](../crates/switchyardctl/README.md) exercises Create/Get/List
+for queues, topics and explicit subscriptions using verified HTTPS, a supplied
+CA and a token file. It preserves optional false/zero values, follows opaque
+continuations through empty pages, and fails without partial catalog output on
+page/output/deadline exhaustion or cursor cycles. Offline store upgrade requires
+no connection options. HTTP/OpenAPI, Update/Delete, rules, placement/capacity mutation
 and runtime counters remain outside this surface.
 
 Selected operational queue-profile reads validate after decode/owner proof,
@@ -567,7 +572,7 @@ namespace/server; no quotas, fair multi-tenancy or production durability.
 | Scope | Missing |
 | --- | --- |
 | Semantics | SQL actions/parameters/functions beyond the kernel, session subscriptions/session-ID predicates, administrable TTL expiry policy, DLQ forwarding/resubmit, same-group transactions. |
-| Administration | Atom/XML entities/rules; native CLI, Update/Delete and other native services. |
+| Administration | Atom/XML entities/rules; native Update/Delete and other native services. |
 | Security | Server AMQP JWT activation, network OIDC, mTLS, policy/full RBAC, namespace KMS/encryption, tamper-evident audit. |
 | Production | Raft/placement, quotas/fairness, encrypted backup/restore, readiness/observability, release/performance evidence. |
 
