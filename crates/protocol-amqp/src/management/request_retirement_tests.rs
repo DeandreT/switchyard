@@ -381,7 +381,15 @@ impl Actor {
             CommandOutcome::QueueCreated
         );
         actor.authority = Some(if sessions {
-            crate::broker::ReceivingAuthority::Session
+            crate::broker::ReceivingAuthority::Session(
+                actor
+                    .actual
+                    .as_ref()
+                    .unwrap()
+                    .handle
+                    .bind_entity_blocking(actor.namespace.clone(), actor.entity.clone())
+                    .unwrap(),
+            )
         } else {
             crate::broker::ReceivingAuthority::Ordinary(
                 actor

@@ -70,15 +70,15 @@ impl<B: Clone> Clone for CloneProbe<B> {
 }
 
 impl<B: Broker> Broker for CloneProbe<B> {
-    async fn submit(
+    crate::listener::settlement::test_support::bound_fixture_entries!(self);
+    async fn submit_bound(
         &self,
-        namespace: domain::NamespaceName,
-        entity: domain::EntityPath,
+        binding: domain::EntityBinding,
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         let receive = matches!(kind, CommandKind::Receive { .. });
         let complete = matches!(kind, CommandKind::Complete { .. });
-        let result = self.actual.submit(namespace, entity, kind).await;
+        let result = self.actual.submit_bound(binding, kind).await;
         if receive {
             *self.control.received.lock().unwrap() = Some(result.clone());
             if self.arm_after_receive && matches!(result, Ok(CommandOutcome::Received(Some(_)))) {

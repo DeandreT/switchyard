@@ -295,14 +295,14 @@ struct ProtocolReleaseBroker {
 }
 
 impl Broker for ProtocolReleaseBroker {
-    async fn submit(
+    crate::listener::settlement::test_support::bound_fixture_entries!(self);
+    async fn submit_bound(
         &self,
-        namespace: NamespaceName,
-        entity: EntityPath,
+        binding: domain::EntityBinding,
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         let receiving = matches!(kind, CommandKind::Receive { .. });
-        let result = self.actual.submit(namespace, entity, kind).await;
+        let result = self.actual.submit_bound(binding, kind).await;
         if receiving && let Ok(CommandOutcome::Received(Some(delivery))) = &result {
             let cause = crate::message::write_delivery_from(delivery, None)
                 .err()

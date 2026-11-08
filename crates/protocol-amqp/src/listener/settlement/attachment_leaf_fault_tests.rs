@@ -295,14 +295,14 @@ impl Clone for GrantCleanupBroker {
 }
 
 impl Broker for GrantCleanupBroker {
-    async fn submit(
+    crate::listener::settlement::test_support::bound_fixture_entries!(self);
+    async fn submit_bound(
         &self,
-        namespace: NamespaceName,
-        entity: EntityPath,
+        binding: domain::EntityBinding,
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         let grant = matches!(&kind, CommandKind::AcceptSession { .. });
-        let result = self.actual.submit(namespace, entity, kind).await;
+        let result = self.actual.submit_bound(binding, kind).await;
         if grant && matches!(&result, Ok(CommandOutcome::SessionAccepted(Some(_)))) {
             // The actual grant has returned. Gate only its original cleanup.
             self.gate.arm_put(self.key.clone());
@@ -492,17 +492,17 @@ struct GrantPoisonBroker {
 }
 
 impl Broker for GrantPoisonBroker {
-    fn submit(
+    crate::listener::settlement::test_support::bound_fixture_entries!(self);
+    fn submit_bound(
         &self,
-        namespace: NamespaceName,
-        entity: EntityPath,
+        binding: domain::EntityBinding,
         kind: CommandKind,
     ) -> impl Future<Output = Result<CommandOutcome, BrokerRejection>> + Send {
         let poison = matches!(&kind, CommandKind::AcceptSession { .. });
         let actual: SubmissionFuture<'_> = if poison {
             Box::pin(std::future::pending())
         } else {
-            Box::pin(self.actual.submit(namespace, entity, kind))
+            Box::pin(self.actual.submit_bound(binding, kind))
         };
         GrantPollPoison {
             actual,

@@ -68,8 +68,7 @@ async fn outer_attachment_panic_drains_actual_hidden_grant_before_and_after_appl
                             .catch_unwind(),
                         ),
                     );
-                    pending_once(original.as_mut()).await;
-                    actor.gate.reached(false).await;
+                    drive_to_gate(original.as_mut(), &actor.gate).await;
                     timeout(WAIT, fault.reached.notified()).await.unwrap();
                     if after {
                         actor.gate.release(false);
@@ -186,8 +185,10 @@ async fn outer_attachment_panic_before_first_grant_poll_submits_nothing() {
                     .catch_unwind(),
                 ),
             );
-            pending_once(original.as_mut()).await;
-            timeout(WAIT, fault.reached.notified()).await.unwrap();
+            tokio::select! {
+                _ = original.as_mut() => panic!("original completed before prepared fault"),
+                () = fault.reached.notified() => {},
+            }
             fault.trigger.notify_one();
             assert_outer(timeout(WAIT, original.as_mut()).await.unwrap(), &fault);
             drop(original);
@@ -276,13 +277,13 @@ impl Clone for CloneFaultBroker {
 }
 
 impl Broker for CloneFaultBroker {
-    async fn submit(
+    crate::listener::settlement::test_support::bound_fixture_entries!(self);
+    async fn submit_bound(
         &self,
-        namespace: NamespaceName,
-        entity: EntityPath,
+        binding: domain::EntityBinding,
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
-        self.actual.submit(namespace, entity, kind).await
+        self.actual.submit_bound(binding, kind).await
     }
     fn deliverable(
         &self,

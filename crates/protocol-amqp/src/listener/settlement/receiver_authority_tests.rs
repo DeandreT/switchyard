@@ -11,6 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use storage::WriteBatch;
 use tokio::sync::Notify;
 
+#[path = "session_authority_tests.rs"]
+mod session_authority_tests;
+
 struct StagedFrontier {
     snapshot: storage::StoreSnapshot,
     counts: (usize, usize, usize),
@@ -21,9 +24,12 @@ struct Witness {
     actual: ActualBroker,
     captures: Arc<AtomicUsize>,
     operations: Arc<Mutex<Vec<EntityBinding>>>,
+    commands: Arc<Mutex<Vec<CommandKind>>>,
     empty: Arc<Notify>,
     wake: Arc<Notify>,
     drift_after_receive: Arc<AtomicBool>,
+    drift_after_bind: Arc<AtomicBool>,
+    drift_after_grant: Arc<AtomicBool>,
     staged_frontier: Arc<Mutex<Option<StagedFrontier>>>,
     clock_calls: Arc<AtomicUsize>,
     store: GatedStore,
@@ -37,9 +43,12 @@ impl Witness {
             actual: actor.broker.as_ref().unwrap().clone(),
             captures: Arc::default(),
             operations: Arc::default(),
+            commands: Arc::default(),
             empty: Arc::default(),
             wake: Arc::default(),
             drift_after_receive: Arc::default(),
+            drift_after_bind: Arc::default(),
+            drift_after_grant: Arc::default(),
             staged_frontier: Arc::default(),
             clock_calls: actor.clock_calls.clone(),
             store: actor.store().clone(),
@@ -72,7 +81,12 @@ impl Broker for Witness {
         entity: EntityPath,
     ) -> Result<EntityBinding, BrokerRejection> {
         self.captures.fetch_add(1, Ordering::SeqCst);
-        self.actual.bind_entity(namespace, entity).await
+        let binding = self.actual.bind_entity(namespace, entity).await?;
+        if self.drift_after_bind.swap(false, Ordering::SeqCst) {
+            self.drift();
+            self.record_frontier();
+        }
+        Ok(binding)
     }
     async fn submit_bound(
         &self,
@@ -80,8 +94,17 @@ impl Broker for Witness {
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         self.operations.lock().unwrap().push(binding.clone());
+        self.commands.lock().unwrap().push(kind.clone());
         let receiving = matches!(kind, CommandKind::Receive { .. });
+        let granting = matches!(kind, CommandKind::AcceptSession { .. });
         let result = self.actual.submit_bound(binding, kind).await;
+        if granting
+            && matches!(result, Ok(CommandOutcome::SessionAccepted(Some(_))))
+            && self.drift_after_grant.swap(false, Ordering::SeqCst)
+        {
+            self.drift();
+            self.record_frontier();
+        }
         if receiving && matches!(result, Ok(CommandOutcome::Received(None))) {
             self.empty.notify_one();
         }
@@ -107,10 +130,23 @@ impl Broker for Witness {
         _: EntityPath,
         _: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
-        panic!("ordinary receiving must never submit by name")
+        panic!("receiving must never submit by name")
     }
     async fn deliverable(&self, _: &NamespaceName, _: &EntityPath) {
         self.wake.notified().await;
+    }
+}
+
+impl Witness {
+    fn record_frontier(&self) {
+        *self.staged_frontier.lock().unwrap() = Some(StagedFrontier {
+            snapshot: self.store.snapshot().unwrap(),
+            counts: (
+                self.clock_calls.load(Ordering::SeqCst),
+                self.store.clock_reads.load(Ordering::SeqCst),
+                self.store.applies.load(Ordering::SeqCst),
+            ),
+        });
     }
 }
 
@@ -125,7 +161,29 @@ async fn attached(
     PendingWire,
     tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
 ) {
+    attached_with_session(actor, broker, management, target, mode, maximum, None).await
+}
+
+async fn attached_with_session(
+    actor: &Actor,
+    broker: Witness,
+    management: Arc<ConnectionManagement>,
+    target: &EntityPath,
+    mode: ReceiveMode,
+    maximum: Option<u64>,
+    request: Option<bool>,
+) -> (
+    PendingWire,
+    tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+) {
     let (mut wire, mut session) = PendingWire::new().await;
+    let mut source = Source::new(target.as_str());
+    if let Some(next) = request {
+        source
+            .filter
+            .get_or_insert_with(Default::default)
+            .insert(Symbol::from(crate::SESSION_FILTER), super::filter(next));
+    }
     write_frame(
         &mut wire.peer,
         &frame(
@@ -140,7 +198,7 @@ async fn attached(
                     SenderSettleMode::Settled
                 },
                 rcv_settle_mode: ReceiverSettleMode::Second,
-                source: Some(Source::new(target.as_str())),
+                source: Some(source),
                 target: None,
                 unsettled: None,
                 incomplete_unsettled: false,
@@ -170,13 +228,20 @@ async fn attached(
     .await
     .unwrap()
     .unwrap();
-    assert!(matches!(
-        control(&mut wire.peer, CHANNEL).await,
-        Performative::Attach(_)
-    ));
+    let Performative::Attach(echo) = control(&mut wire.peer, CHANNEL).await else {
+        panic!("native attach echo")
+    };
     let authority = link.receiving_authority.unwrap();
-    let ReceivingAuthority::Ordinary(binding) = &authority else {
-        panic!("ordinary provenance");
+    let binding = match (&authority, request) {
+        (ReceivingAuthority::Ordinary(binding), None) => binding,
+        (ReceivingAuthority::Session(binding), Some(_)) => {
+            assert_eq!(
+                crate::read_session_filter(echo.source.as_ref()).unwrap(),
+                crate::SessionRequest::Named(link.accepted.as_ref().unwrap().session_id.clone())
+            );
+            binding
+        }
+        _ => panic!("receiving provenance"),
     };
     assert_eq!(binding.target(), target);
     assert_eq!(binding.owner(), &actor.entity);
@@ -189,12 +254,12 @@ async fn attached(
         target.clone(),
         broker,
         mode,
-        None,
+        link.accepted.as_ref().map(domain::AcceptedSession::hold),
         ReceivingLinkProtocol {
             authority,
             authorization: None,
             management,
-            session_registration: None,
+            session_registration: link.registration,
         },
     );
     // Keep the exact native session alive until the original receiving future joins.

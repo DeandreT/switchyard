@@ -253,8 +253,16 @@ renewal, even when an already-selected capability outlives link teardown;
 cleanup cannot remove a replacement registration that reuses its key.
 Stale authority refuses with `amqp:not-found` before clocks or mutation, including
 configuration-free Complete. Parsing and authorization refusals keep their
-priority. Session and request-response consumption capabilities, cancellation,
-and other management operations remain outside this incarnation fence. No
+priority. Session receiving links likewise capture before `AcceptSession` and
+retain that authority with their exact granted hold and registry identity.
+Named/next-available filter echo, FIFO and session isolation are unchanged.
+Receive, message settlement and all session releases (including failed Attach,
+late admission, authorization expiry and shutdown) use the original capture;
+cleanup never resolves the entity again. Reused link names or equal hold/token
+tuples cannot replace a selected registration's authority or let old cleanup
+remove a newer registration. Management session state and session-lock renewal
+consumption, request-response consumption capabilities, cancellation, legacy
+name commands and timer expiry remain outside this adapter fence. No
 live deletion/recreation API or new stored/wire format is introduced.
 
 Second-mode delivery confirmations retain their original link incarnation. If

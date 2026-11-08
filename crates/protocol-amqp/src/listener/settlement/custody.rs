@@ -208,8 +208,9 @@ impl<'a, B: Broker> ReceivingCustody<'a, B> {
             // the original intake, native start and workers have all drained.
             OriginalCleanup::new(async move {
                 context
-                    .broker
+                    .authority
                     .submit(
+                        &context.broker,
                         context.namespace,
                         context.entity,
                         CommandKind::ReleaseSession { session: hold },

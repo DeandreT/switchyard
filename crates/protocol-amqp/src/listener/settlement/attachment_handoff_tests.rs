@@ -24,7 +24,7 @@ use tokio::{
 };
 
 use super::test_support::{
-    Actor, ActualBroker, EagerAcquisitionBroker, EagerTarget, WAIT, pending_once,
+    Actor, ActualBroker, EagerAcquisitionBroker, EagerTarget, WAIT, drive_to_gate, pending_once,
 };
 use crate::authorization::ConnectionAuthorization;
 use crate::listener::ReceivingLinkProtocol;
@@ -393,17 +393,17 @@ impl ReleaseWitness {
 }
 
 impl Broker for ReleaseWitness {
-    async fn submit(
+    crate::listener::settlement::test_support::bound_fixture_entries!(self);
+    async fn submit_bound(
         &self,
-        namespace: NamespaceName,
-        entity: EntityPath,
+        binding: domain::EntityBinding,
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         let hold = match &kind {
             CommandKind::ReleaseSession { session } => Some(session.clone()),
             _ => None,
         };
-        let result = self.actual.submit(namespace, entity, kind).await;
+        let result = self.actual.submit_bound(binding, kind).await;
         if let Some(hold) = hold {
             self.results
                 .lock()
@@ -558,8 +558,7 @@ async fn actual_helper_drains_one_hidden_grant_then_releases_its_exact_hold() {
                         None,
                         &management,
                     ));
-                    pending_once(original.as_mut()).await;
-                    actor.gate.reached(false).await;
+                    drive_to_gate(original.as_mut(), &actor.gate).await;
                     if after {
                         actor.gate.release(false);
                         actor.gate.reached(true).await;
@@ -812,8 +811,7 @@ async fn late_helper_release_refusal_preserves_same_entity_replacement_and_regis
             let management = ConnectionManagement::new();
             let broker = ReleaseWitness::new(&actor);
             let mut original = Box::pin(accept_entity_link(&session, &broker, &actor.namespace, "orders", attach, None, &management));
-            pending_once(original.as_mut()).await;
-            actor.gate.reached(false).await;
+            drive_to_gate(original.as_mut(), &actor.gate).await;
             actor.gate.release(false);
             actor.gate.reached(true).await;
             let old = stored_grant(&actor);
@@ -886,8 +884,7 @@ async fn actual_handoff_waiting_on_registry_write_lock_cannot_replace_a_newer_cl
                     None,
                     &management,
                 ));
-                pending_once(original.as_mut()).await;
-                actor.gate.reached(false).await;
+                drive_to_gate(original.as_mut(), &actor.gate).await;
                 actor.gate.release(false);
                 actor.gate.reached(true).await;
                 let old = stored_grant(&actor);
@@ -1010,8 +1007,7 @@ async fn actual_native_retirement_while_registry_install_waits_releases_without_
                     None,
                     &management,
                 ));
-                pending_once(original.as_mut()).await;
-                actor.gate.reached(false).await;
+                drive_to_gate(original.as_mut(), &actor.gate).await;
                 actor.gate.release(false);
                 actor.gate.reached(true).await;
                 let expected = stored_grant(&actor);
@@ -1445,6 +1441,25 @@ async fn ordinary_and_refused_links_keep_existing_plan_precedence_and_wire_condi
 struct UnexpectedGrantShape;
 
 impl Broker for UnexpectedGrantShape {
+    async fn bind_entity(
+        &self,
+        namespace: NamespaceName,
+        entity: EntityPath,
+    ) -> Result<domain::EntityBinding, BrokerRejection> {
+        Ok(crate::broker::test_binding(namespace, entity))
+    }
+    async fn submit_bound(
+        &self,
+        _: domain::EntityBinding,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, BrokerRejection> {
+        self.submit(
+            NamespaceName::new("tenant").unwrap(),
+            EntityPath::new("orders").unwrap(),
+            kind,
+        )
+        .await
+    }
     async fn submit(
         &self,
         _: NamespaceName,
@@ -1529,8 +1544,7 @@ async fn actual_helper_native_result_retirement() {
                     None,
                     &management,
                 ));
-                pending_once(original.as_mut()).await;
-                actor.gate.reached(false).await;
+                drive_to_gate(original.as_mut(), &actor.gate).await;
                 actor.gate.release(false);
                 actor.gate.reached(true).await;
                 let expected = stored_grant(&actor);

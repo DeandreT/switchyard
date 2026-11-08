@@ -96,6 +96,44 @@ impl Grants {
         }
     }
 
+    fn binding(&self, entity: &EntityPath) -> domain::EntityBinding {
+        match self.machine.as_ref().unwrap() {
+            Machine::Memory(machine) => machine.bind_entity(&self.namespace, entity).unwrap(),
+            Machine::Fjall(machine) => machine.bind_entity(&self.namespace, entity).unwrap(),
+        }
+    }
+
+    fn drift(&self, entity: &EntityPath) {
+        let batch = storage::WriteBatch::default().put(
+            domain::keys::entity_metadata(&self.namespace, entity),
+            domain::codec::encode(&(2_u64, 0_u32, false)).unwrap(),
+        );
+        match self.machine.as_ref().unwrap() {
+            Machine::Memory(machine) => machine.store().apply(batch).unwrap(),
+            Machine::Fjall(machine) => machine.store().apply(batch).unwrap(),
+        }
+    }
+
+    fn bound(
+        &self,
+        binding: &domain::EntityBinding,
+        kind: CommandKind,
+    ) -> Result<CommandOutcome, domain::BrokerError> {
+        let command = domain::BoundCommand::new(
+            binding.clone(),
+            Command::new(
+                self.namespace.clone(),
+                binding.target().clone(),
+                Timestamp::from_millis(0),
+                kind,
+            ),
+        );
+        match self.machine.as_ref().unwrap() {
+            Machine::Memory(machine) => machine.apply_bound(&command),
+            Machine::Fjall(machine) => machine.apply_bound(&command),
+        }
+    }
+
     fn session(&self, entity: &EntityPath) -> SessionRecord {
         match self.machine.as_ref().unwrap() {
             Machine::Memory(machine) => machine
@@ -137,6 +175,68 @@ fn entity(name: &str) -> EntityPath {
 
 fn session_id() -> SessionId {
     SessionId::new("shared-session").unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn selected_session_keeps_its_binding_when_link_and_full_hold_are_reused_during_close() {
+    for durable in [false, true] {
+        let mut grants = Grants::new(durable);
+        let entity = entity("orders");
+        let binding = grants.binding(&entity);
+        let grant = grants.accept(&entity, 1_000);
+        let management = ConnectionManagement::new();
+        let claim = management.claim_session(LINK, entity.clone());
+        let old_owner = management
+            .install_bound_session(&claim, grant.hold(), binding.clone(), || true)
+            .await
+            .unwrap();
+        let selected = management.session(LINK).await.unwrap();
+        assert_eq!(selected.binding, binding);
+
+        // Owned same-kind generation injection, with exactly equal token/hold
+        // aliases to isolate binding and registration identity from lock checks.
+        grants.drift(&entity);
+        let replacement_binding = grants.binding(&entity);
+        let claim = management.claim_session(LINK, entity.clone());
+        let replacement = management
+            .install_bound_session(&claim, grant.hold(), replacement_binding.clone(), || true)
+            .await
+            .unwrap();
+        assert_eq!(selected.hold, replacement.hold);
+        assert_ne!(selected.binding, replacement.binding);
+        assert_ne!(old_owner, replacement);
+        management.unregister_session(&old_owner).await;
+        assert_eq!(management.session(LINK).await, Some(replacement.clone()));
+        let before = grants.snapshot();
+        for kind in [
+            CommandKind::Receive {
+                mode: domain::ReceiveMode::PeekLock,
+                lock_duration_millis: None,
+                session: Some(selected.hold.clone()),
+            },
+            CommandKind::RenewSessionLock {
+                session: selected.hold.clone(),
+                lock_duration_millis: None,
+            },
+            CommandKind::ReleaseSession {
+                session: selected.hold.clone(),
+            },
+        ] {
+            // The zero timestamp is behind the persisted clock. Stale binding
+            // must win before clock validation as well as before any apply.
+            assert_eq!(
+                grants.bound(&selected.binding, kind),
+                Err(domain::BrokerError::StaleEntityBinding)
+            );
+            assert_eq!(grants.snapshot(), before);
+        }
+        assert_eq!(
+            management.session(LINK).await.unwrap().binding,
+            replacement_binding
+        );
+        management.unregister_session(&replacement).await;
+        grants.reopen_unchanged(&before, &[(&entity, &grant)]);
+    }
 }
 
 async fn pending_once<F: Future + ?Sized>(mut future: Pin<&mut F>) {

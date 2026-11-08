@@ -837,22 +837,22 @@ struct ReleasePanicBroker {
 }
 
 impl Broker for ReleasePanicBroker {
-    async fn submit(
+    crate::listener::settlement::test_support::bound_fixture_entries!(self);
+    async fn submit_bound(
         &self,
-        namespace: NamespaceName,
-        entity: EntityPath,
+        binding: domain::EntityBinding,
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         if matches!(kind, CommandKind::ReleaseSession { .. }) {
             if self.delegate {
-                let raw = self.actual.submit(namespace, entity, kind).await;
+                let raw = self.actual.submit_bound(binding, kind).await;
                 assert!(matches!(raw, Ok(CommandOutcome::SessionReleased)));
             }
             self.reached.notify_one();
             self.allow.notified().await;
             std::panic::panic_any(Arc::clone(&self.payload));
         }
-        self.actual.submit(namespace, entity, kind).await
+        self.actual.submit_bound(binding, kind).await
     }
     fn deliverable(
         &self,
@@ -971,10 +971,10 @@ struct RefusedReleaseBroker {
     unavailable: bool,
 }
 impl Broker for RefusedReleaseBroker {
-    async fn submit(
+    crate::listener::settlement::test_support::bound_fixture_entries!(self);
+    async fn submit_bound(
         &self,
-        namespace: NamespaceName,
-        entity: EntityPath,
+        binding: domain::EntityBinding,
         kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         if self.unavailable && matches!(kind, CommandKind::ReleaseSession { .. }) {
@@ -982,7 +982,7 @@ impl Broker for RefusedReleaseBroker {
                 "controlled unavailable release".to_owned(),
             ));
         }
-        self.actual.submit(namespace, entity, kind).await
+        self.actual.submit_bound(binding, kind).await
     }
     fn deliverable(
         &self,
