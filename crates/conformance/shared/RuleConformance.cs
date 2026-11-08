@@ -80,6 +80,87 @@ internal static class RuleConformance
             return "an empty rule set selected a publication";
         }
 
+        return await SqlAsync(client, rules, sender, receiver, topic, subscription);
+    }
+
+    private static async Task<string?> SqlAsync(
+        ServiceBusClient client,
+        ServiceBusRuleManager rules,
+        ServiceBusSender sender,
+        ServiceBusReceiver receiver,
+        string topic,
+        string subscription)
+    {
+        const string sqlRule = "Priority-Sql";
+        // Adding zero to a string fails evaluation, so a string priority is
+        // dead-lettered rather than skipped.
+        const string expression = "priority + 0 > 7 AND region = 'west'";
+
+        try
+        {
+            await rules.CreateRuleAsync("Broken-Sql", new SqlRuleFilter("priority >"));
+            return "an uncompilable SQL filter was accepted";
+        }
+        catch (Exception error) when (error.Message.Contains("SQL filter cannot be compiled"))
+        {
+        }
+
+        await rules.CreateRuleAsync(sqlRule, new SqlRuleFilter(expression));
+        IReadOnlyList<RuleProperties> configured = await ReadRulesAsync(rules);
+        if (configured.Count != 1 ||
+            configured[0].Name != sqlRule ||
+            configured[0].Filter.GetType() != typeof(SqlRuleFilter) ||
+            ((SqlRuleFilter)configured[0].Filter).SqlExpression != expression)
+        {
+            return $"SQL rule did not round-trip: {Describe(configured)}";
+        }
+
+        await sender.SendMessageAsync(Message("sql-low-priority", priority: 5));
+        await sender.SendMessageAsync(Message("sql-text-priority", priority: "high"));
+        await sender.SendMessageAsync(Message("sql-selected", priority: 8L));
+        ServiceBusReceivedMessage? selected =
+            await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+        if (selected?.Body.ToString() != "sql-selected")
+        {
+            return $"SQL filtering selected {selected?.Body}";
+        }
+        await receiver.CompleteMessageAsync(selected);
+        if (await receiver.ReceiveMessageAsync(TimeSpan.FromMilliseconds(500)) is not null)
+        {
+            return "a SQL rule selected a nonmatching or failing publication";
+        }
+
+        await using ServiceBusReceiver deadLetters = client.CreateReceiver(
+            topic,
+            subscription,
+            new ServiceBusReceiverOptions { SubQueue = SubQueue.DeadLetter });
+        ServiceBusReceivedMessage? failed =
+            await deadLetters.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+        if (failed?.Body.ToString() != "sql-text-priority" ||
+            failed.DeadLetterReason != "FilterException" ||
+            failed.DeadLetterErrorDescription !=
+                $"rule {sqlRule}: SQL operands have incompatible types")
+        {
+            return "a SQL filter error was not dead-lettered as FilterException: " +
+                $"{failed?.Body} {failed?.DeadLetterReason} {failed?.DeadLetterErrorDescription}";
+        }
+        await deadLetters.CompleteMessageAsync(failed);
+        if (await deadLetters.ReceiveMessageAsync(TimeSpan.FromMilliseconds(500)) is not null)
+        {
+            return "a SQL filter error produced more than one dead-lettered copy";
+        }
+
+        await rules.DeleteRuleAsync(sqlRule);
+        if ((await ReadRulesAsync(rules)).Count != 0)
+        {
+            return "deleting the SQL rule left a durable rule behind";
+        }
+        await sender.SendMessageAsync(Message("sql-after-delete", priority: 8));
+        if (await receiver.ReceiveMessageAsync(TimeSpan.FromMilliseconds(500)) is not null)
+        {
+            return "a deleted SQL rule selected a publication";
+        }
+
         return null;
     }
 
