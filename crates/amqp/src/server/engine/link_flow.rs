@@ -135,7 +135,7 @@ pub(super) async fn acknowledge_drain<W: AsyncWrite + Unpin>(
         let _ = reply.send(Err(EngineError::RemoteDetached));
         return Ok(());
     };
-    let next_outgoing_id = session.next_outgoing_id;
+    let next_outgoing_id = session.outgoing.next_id();
     let Some(LinkState::Sending(link)) = session.links.get_mut(&request.handle) else {
         let _ = reply.send(Err(EngineError::RemoteDetached));
         return Ok(());
@@ -302,7 +302,7 @@ pub(super) async fn complete_zero_credit_drain<W: AsyncWrite + Unpin>(
     session: &mut SessionState,
     writer: &mut W,
 ) -> Result<(), EngineError> {
-    let next_outgoing_id = session.next_outgoing_id;
+    let next_outgoing_id = session.outgoing.next_id();
     let Some(LinkState::Sending(link)) = session.links.get_mut(&handle) else {
         return Ok(());
     };

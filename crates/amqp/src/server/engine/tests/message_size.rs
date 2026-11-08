@@ -126,5 +126,5 @@ async fn a_delivery_one_byte_over_the_peer_limit_detaches_the_link_instead() {
     );
     let session = sessions.get(&channel).expect("the session survives");
     assert!(!session.links.contains_key(&handle));
-    assert_eq!(session.next_outgoing_id, 0, "no delivery id was consumed");
+    assert_eq!(session.next_delivery_id, 0, "no delivery id was consumed");
 }

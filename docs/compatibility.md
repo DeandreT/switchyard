@@ -395,8 +395,21 @@ The budget ends at Open; the CBS authorization deadline is separate. See
 [storage limits](lifecycle.md#storage-and-runtime-limits) and the
 [eleven owner contracts](lifecycle.md#owner-custody).
 
-Sustained traffic beyond initial credit is uncertified: [#68](https://github.com/DeandreT/switchyard/issues/68)
-windows/[#69](https://github.com/DeandreT/switchyard/issues/69) refill and
+Native outgoing sends enforce the peer's session receive window per Transfer
+frame, independently of link credit and delivery IDs. Fragmented sends retain
+their original payload, completion and capacity permit across zero-window waits;
+session-only Flow or Flow on another link can resume them. Repeated Flow cannot
+restore consumed capacity, invalid acknowledgements refuse, and frame progress
+wraps modulo 2^32. Detach, End, EOF and local stop release queued/partial work;
+native shutdown still joins the original connection tasks. Flow/drain reports
+actual outgoing frame progress rather than delivery counts. The feature-gated
+test client replenishes received session frames; it is not production incoming
+buffer accounting.
+
+Sustained bidirectional traffic remains uncertified: incoming session conservation
+in [#332](https://github.com/DeandreT/switchyard/issues/332) (part of
+[#68](https://github.com/DeandreT/switchyard/issues/68)), receiving-link refill in
+[#69](https://github.com/DeandreT/switchyard/issues/69), and
 [#77](https://github.com/DeandreT/switchyard/issues/77) Flow echo remain absent.
 Timer commands drive expiry/activation, not wall-clock mutation. Small clock
 regressions hold time; large ones refuse/retry without readiness signal. One
