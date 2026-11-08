@@ -7,7 +7,8 @@ Pre-alpha: only verified, merged `main` is complete.
 ## Main Progress
 
 - [x] AMQP/SASL/CBS; settlement, DLQ, deferral, peek, sessions, scheduling, queue duplicates.
-- [x] Actionless topics/rules, bounded topology and selected profile integrity.
+- [x] Actionless topics/rules, bounded SQL filters and filter-error routing,
+  AMQP rule management, bounded topology and selected profile integrity.
 - [x] Memory/Fjall format-2 and opt-in journal/indexed apply/local replay.
 - [x] Local authority, JWT/SQL kernels and native/link/session/connection custody.
 - [x] Source-bound builds and pinned Memory SDK TCP/WSS gates.
@@ -15,6 +16,8 @@ Pre-alpha: only verified, merged `main` is complete.
 - [x] Offline snapshot capture, install, anchors and journal compaction.
 - [x] Ordered, budgeted process shutdown through retained listener/protocol tasks,
   timer and broker; cancellation and committed-state reopen controls.
+- [x] Explicit queue/topic capacity profiles; finite sizes are recorded metadata,
+  not retained-byte admission or usage accounting.
 - [ ] Remaining semantics, administration and conserved physical-byte capacity.
 - [ ] Full recovery, quorum, multi-tenant security and measured release.
 
@@ -27,7 +30,7 @@ Reference branches are not main evidence; #15 is entity retirement. #255's quali
 
 ```mermaid
 flowchart TD
-    Main["Main"] --> Lifecycle["#12 Authority -> #15 Entity retirement"] --> Semantics["#20/#21 Rules -> #26-#28 Capacity"]
+    Main["Main"] --> Lifecycle["#12 Authority -> #15 Entity retirement"] --> Semantics["#21 Rule actions -> #26-#28 Capacity"]
     Main --> Domain["#14/#16/#23 Domain"] --> Semantics
     Main --> Recovery["#37 Snapshots -> #38 Quorum"] --> Runtime["#41 Runtime"]
     Lifecycle --> Security["#71 Grants -> #17 JWT; #42/#43/#49 Identity"] --> Runtime
@@ -83,7 +86,7 @@ PRs in dependency order ([workflow](../CONTRIBUTING.md)). Ready is not evidence.
 | Lane | Pickup / overlap |
 | --- | --- |
 | Snapshots | #37 offline children are complete; live recovery follows #38/#41. |
-| Domain | #14, #16 and #23 are complete. |
+| Domain | #14, #16, #20, #22 and #23 are complete. Finite admission remains #27; SQL actions remain #21. |
 | Admin | #18, #243 and #244 are complete; TLS transport and CLI follow in #19. |
 | Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228), #238 ([PR258](https://github.com/DeandreT/switchyard/pull/258)), #239 ([PR264](https://github.com/DeandreT/switchyard/pull/264)) and #240 ([PR263](https://github.com/DeandreT/switchyard/pull/263)) and #232's allocation/graph composition verified. |
 | SDK/security | #7 is complete; #71 grant consumers and #101 durable SDK matrix can proceed. |
