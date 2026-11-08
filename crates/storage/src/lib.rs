@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+mod consensus;
 mod durable;
 mod format_upgrade;
 mod image_install;
@@ -19,7 +20,11 @@ mod memory;
 use thiserror::Error;
 
 pub use crate::{
-    durable::{ACTIVE_STORE_FORMAT, FjallStore, STORE_FORMAT_V1, STORE_FORMAT_V2, STORE_FORMAT_V3},
+    consensus::{ConsensusBackend, ConsensusFjallStore, ConsensusMemoryStore},
+    durable::{
+        ACTIVE_STORE_FORMAT, CONSENSUS_STORE_FORMAT, FjallStore, STORE_FORMAT_V1, STORE_FORMAT_V2,
+        STORE_FORMAT_V3,
+    },
     format_upgrade::{
         PreparedStoreFormatUpgrade, StoreFormatCommitError, StoreFormatInspection,
         StoreFormatUpgradeError, StoreFormatUpgradeOwner,

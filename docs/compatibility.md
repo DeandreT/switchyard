@@ -537,6 +537,14 @@ Memory is volatile; neither backend is replicated. Production durable startup
 returns static replication-unavailable before storage/listeners; production Memory
 refuses too. Fjall restart is not node-loss recovery; development is single-node.
 
+The opt-in [consensus persistence API](consensus-persistence.md) uses separate
+non-Clone backends and storage profile 4, not the ordinary domain profile 3 or a
+queue value version. It bootstraps only fresh fixed-three stores and preserves
+local Raft metadata/log entries, without running elections or proving quorum.
+Legacy opening, native image/snapshot inspection and offline upgrade refuse
+profile 4; its wrappers do not implement legacy snapshot/install backend traits.
+There is no automatic adoption, profile migration or recovered-outcome promise.
+
 Fjall stores use format 3. Ordinary opening never upgrades format 2; development
 startup refuses it before listening and names the offline
 `switchyardctl store upgrade --data-dir <path>` command. The upgrade preflights

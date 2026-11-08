@@ -173,6 +173,12 @@ Production startup remains refused. These libraries do not activate runtime
 replay, quorum, full-state recovery, installation or compaction. Encryption and
 live quota enforcement remain planned; see [compatibility](docs/compatibility.md).
 
+Separate opt-in [consensus persistence](docs/consensus-persistence.md) pins a Raft
+core and stores fixed-three identity, term/vote/log/commit under `0xF2` in isolated
+storage profile 4. Ordinary storage remains profile 3. This local foundation does
+not run the core's election/transport driver or establish quorum; its exclusive
+backends cannot be used as unindexed domain writers or legacy snapshot targets.
+
 ## Production Target: Not Implemented
 
 The intended release is a Rust-native Linux broker with quorum durability,
