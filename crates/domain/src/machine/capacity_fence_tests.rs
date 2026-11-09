@@ -182,6 +182,11 @@ fn commands() -> Vec<CommandKind> {
             name,
             update: SubscriptionConfigUpdate::default(),
         },
+        CommandKind::CreateRuleWithAction {
+            name: RuleName::new("action-rule").unwrap(),
+            filter: RuleFilter::True,
+            action: crate::SqlRuleAction::new("SET copied = 1"),
+        },
     ]
 }
 
