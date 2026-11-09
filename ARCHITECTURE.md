@@ -144,14 +144,15 @@ require private live owner heads; DLQs share their owner's head. Bound broker
 calls retain an opaque owner/target identity and recheck it before host or stored
 Clock, including configuration-free commands. AMQP data senders retain that
 binding from authorized attach for ordinary/batch/scheduled transfers; management
-request links retain a separate capture used only for scheduled Send. Neither
-recaptures after a refusal. Ordinary receiving links also capture once at attach:
+request links retain a separate capture for Peek, scheduling/cancellation and rule
+operations. Neither recaptures after a refusal. Ordinary receiving links also capture once at attach:
 polls, both receive modes, staged deletion and delayed settlements retain it.
 Ordinary delivery capabilities preserve this provenance for management settlement
-and renewal after selection, independently of registry lifetime. Session
-acceptance and release also retain original entity authority. Other request-link
-operations and deferred/session management capabilities, including session-lock
-renewal, still need their retained-authority adapter; legacy name APIs, timers and raw
+and renewal after selection, independently of registry lifetime. Deferred locks
+retain receive-time authority, while session state and renewal consume the selected
+original session registration and hold. Session acceptance and release also retain
+original entity authority. This fences owner incarnations, not the remaining
+held-session-grant semantics. Legacy name APIs, timers, native APIs and raw
 catalog/diagnostic reads are outside the declared AMQP fencing surface. No global
 orphan scan is added.
 See [topic routing](crates/domain/src/machine/topic.rs) and the

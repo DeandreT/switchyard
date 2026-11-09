@@ -94,7 +94,7 @@ PRs in dependency order ([workflow](../CONTRIBUTING.md)). Ready is not evidence.
 | Lane | Pickup / overlap |
 | --- | --- |
 | Snapshots | #37 offline children are complete; live recovery follows #38/#41. |
-| Domain | #14, #16, #20, #22 and #23 are complete. Finite admission remains #27; SQL actions remain #21. |
+| Domain | #14, #16, #20, #22 and #23 are complete. Finite admission remains #27; domain SQL actions are delivered, with wire management #337 remaining in #21. |
 | Admin | Authenticated TLS/h2 Create/Get/List and native CLI are delivered. Closed Atom HTTPS is available; subscription Get #31 and later CRUD/rule profiles remain separate. |
 | Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228), #238 ([PR258](https://github.com/DeandreT/switchyard/pull/258)), #239 ([PR264](https://github.com/DeandreT/switchyard/pull/264)) and #240 ([PR263](https://github.com/DeandreT/switchyard/pull/263)) and #232's allocation/graph composition verified. |
 | SDK/security | Offline JWT activation and declared current/previous Memory/Fjall data-plane gates are delivered. OIDC is library-only; workload consumers and identity administration remain pending. |
