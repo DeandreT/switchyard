@@ -654,7 +654,24 @@ async fn client_request<T>(
         .send(make(reply))
         .await
         .map_err(|_| EngineError::Stopped)?;
-    response.await.map_err(|_| EngineError::Stopped)?
+    client_response(response, commands.closed()).await
+}
+
+async fn client_response<T>(
+    mut response: oneshot::Receiver<Result<T, EngineError>>,
+    closed: impl Future<Output = ()>,
+) -> Result<T, EngineError> {
+    tokio::select! {
+        biased;
+        result = &mut response => result.map_err(|_| EngineError::Stopped)?,
+        () = closed => {
+            // A previously admitted command may be published after the inbox's
+            // final drain. Its queued sender cannot promise a reply. Recheck
+            // the original receiver: a reply may have arrived after its first
+            // Pending poll but before closure became ready.
+            response.try_recv().unwrap_or(Err(EngineError::Stopped))
+        }
+    }
 }
 
 async fn run_client<Io>(
@@ -1196,6 +1213,10 @@ async fn drive_client<W: AsyncWrite + Unpin>(
 #[cfg(test)]
 #[path = "client_limit_tests.rs"]
 mod limit_tests;
+
+#[cfg(test)]
+#[path = "client_reply_wait_tests.rs"]
+mod reply_wait_tests;
 
 #[cfg(test)]
 mod tests {
