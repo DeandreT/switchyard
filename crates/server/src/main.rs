@@ -525,8 +525,14 @@ fn run() -> Result<(), StartupError> {
         // Every configured socket is bound before any serving family starts.
         let mut admin = admin_bound.map(|(socket, config)| AdminListenerService::new(socket, config, handle.clone(), namespace.clone(), Duration::from_secs(arguments.admission_timeout_secs.get())));
         if let Some(service) = &admin { info!(address = %service.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, "native administration TLS listener bound; authenticated RPC required for readiness"); }
-        let mut atom = atom_bound.map(|(socket, config)| HttpsListener::new(socket, config));
-        if atom.is_some() { info!("Atom HTTPS boundary bound; routes remain unsupported"); }
+        let mut atom = atom_bound.map(|(socket, config)| HttpsListener::with_handler(socket, config,
+            std::sync::Arc::new(admin_api::atom::subscription_get::SubscriptionGet::new(
+                server::AdminService::new(namespace.clone(), handle.clone()),
+                |error: &server::SubmitError| if matches!(error, server::SubmitError::BrokerStopped) {
+                    admin_api::rpc::BackendErrorKind::Unavailable
+                } else { admin_api::rpc::BackendErrorKind::Internal },
+            ))));
+        if atom.is_some() { info!("Atom HTTPS boundary bound; ordinary subscription definition Get only"); }
         info!(address = %address, namespace = %namespace, tls = tls.is_some(), transport = ?arguments.transport, max_connections = ?arguments.max_connections, admission_timeout_secs = arguments.admission_timeout_secs, shutdown_timeout_secs = arguments.shutdown_timeout_secs, "accepting AMQP connections");
         let amqp = AmqpListener::new(handle, namespace).with_admission_timeout(
             Duration::from_secs(arguments.admission_timeout_secs.get()),

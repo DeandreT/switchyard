@@ -71,6 +71,16 @@
       }
     }
   },
+  "subscription_get_profile": {
+    "scope": "opt-in ordinary subscription definition singleton only; no collection, runtime, write, topic or rule adapter",
+    "grammar": "profiles/subscription-get.rng",
+    "error_grammar": "profiles/subscription-get-error.rng",
+    "fixtures": ["normal", "min", "max", "unlimited"],
+    "fixture_directory": "responses/subscription-get",
+    "provenance": "deterministic Rust writer output checked byte-for-byte against real HTTPS Memory/Fjall handler responses",
+    "client_controls": "dotnet subscription-get mode consumes fresh Rust HTTPS capture JSON, never falls back to these XML fixtures",
+    "fields_in_order": ["LockDuration", "RequiresSession", "DefaultMessageTimeToLive", "DeadLetteringOnMessageExpiration", "DeadLetteringOnFilterEvaluationExceptions", "MaxDeliveryCount"]
+  },
   "namespaces": {
     "atom": "http://www.w3.org/2005/Atom",
     "connect": "http://schemas.microsoft.com/netservices/2010/10/servicebus/connect",

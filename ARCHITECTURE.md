@@ -96,9 +96,11 @@ See [native administration](crates/server/README.md) and
 Atom has a separate opt-in TLS/HTTP/1 listener with namespace/entity Manage checks,
 bounded admission, messages and deadlines, and one request per connection. Accepted
 handler originals survive client disconnect or wire deadlines until actual join.
-Shipped routes remain closed: definition singletons return 501 and unsupported or
-ambiguous profiles refuse. No XML/CRUD/rule adapter or administration-client
-certification follows merely from this transport.
+The server installs one [ordinary subscription definition Get](docs/atom-subscription-get.md)
+adapter with bounded structured XML and truthful client-representable fields.
+Other definition singletons remain 501; unsupported or ambiguous profiles refuse.
+Mutable CRUD, collections/runtime and rule adapters remain closed. In-memory
+client controls are not SDK network administration certification.
 
 The [OIDC library](docs/offline-jwt.md#bounded-discovery-library)
 supports explicit HTTPS discovery/key refresh with exact issuer/JWKS URL and public

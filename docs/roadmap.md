@@ -20,7 +20,8 @@ Pre-alpha: only verified, merged `main` is complete.
   not live admission. Pure retained-byte accounting and inert owned-writer/recovery
   fences are available; lifecycle conservation and activation remain separate.
 - [x] Native TLS/h2 entity Create/Get/List, verified native CLI and bounded closed
-  Atom HTTPS transport; offline server JWT CBS and a separate pinned OIDC library.
+  Atom HTTPS transport with ordinary subscription definition Get; offline server
+  JWT CBS and a separate pinned OIDC library.
 - [x] Optional locally pinned workload policy and verified TLS proof foundation;
   protocol/admin consumers and server activation remain separate.
 - [x] Incoming/outgoing session windows and consumption-based receiving-link refill.
@@ -95,7 +96,7 @@ PRs in dependency order ([workflow](../CONTRIBUTING.md)). Ready is not evidence.
 | --- | --- |
 | Snapshots | #37 offline children are complete; live recovery follows #38/#41. |
 | Domain | #14, #16, #20, #22 and #23 are complete. Finite admission remains #27; domain SQL actions are delivered, with wire management #337 remaining in #21. |
-| Admin | Authenticated TLS/h2 Create/Get/List and native CLI are delivered. Closed Atom HTTPS is available; subscription Get #31 and later CRUD/rule profiles remain separate. |
+| Admin | Authenticated TLS/h2 Create/Get/List, native CLI and Atom ordinary subscription definition Get are delivered. Other Atom CRUD/rule and collection/runtime profiles remain separate. |
 | Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228), #238 ([PR258](https://github.com/DeandreT/switchyard/pull/258)), #239 ([PR264](https://github.com/DeandreT/switchyard/pull/264)) and #240 ([PR263](https://github.com/DeandreT/switchyard/pull/263)) and #232's allocation/graph composition verified. |
 | SDK/security | Offline JWT activation and declared current/previous Memory/Fjall data-plane gates are delivered. OIDC is library-only; workload consumers and identity administration remain pending. |
 | Native Flow | Outgoing/incoming session conservation and receiver refill are delivered; sending-count wrap #368 and general Flow echo #77 remain pending. |

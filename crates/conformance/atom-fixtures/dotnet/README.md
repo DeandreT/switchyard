@@ -1,5 +1,40 @@
 # In-memory .NET administration controls
 
+## Selected ordinary subscription Get controls
+
+The optional sixth argument `subscription-get` selects only the ordinary
+subscription singleton controls. It requires `SWITCHYARD_ATOM31_CAPTURE_ROOT`
+to name an absolute, task-owned directory freshly produced by the Rust
+`atom_subscription_get` integration binary. That binary runs the real private-CA
+HTTPS listener over Memory/Fjall broker owners and records bounded JSON containing
+actual HTTP status, content type and complete body. Its definition bytes must
+also match the checked-in six-field fixtures. Do not supply an old/stale directory
+or present handwritten fixtures as runtime captures.
+
+Compile the Rust binary with Cargo `--no-run --message-format=json`; select its
+exact emitted executable with the checked-in bounded test runner outside the
+build lease. Set the capture root only for that owned run and retain its source,
+artifact, exit and capture hashes. Build this standalone project with the same
+isolated/pinned procedure below, then append `subscription-get` to the existing
+five DLL arguments and pass the same capture-root environment variable.
+
+This mode verifies both backend captures, six fields including false values,
+finite duration fractions and bounds, unlimited TTL, and HTTP 400/404/500/501/503
+remaining errors. The SDK request itself is still in-memory with no body, retry
+or network; it must select the pin's API version and explicit `enrich=False`.
+The original five-argument workflow remains the source-fixture control suite.
+Neither mode is SDK network/administration certification or Sift execution.
+
+Parent qualification must additionally require all 18 selected observations per
+SDK selector, both backend names, matching capture-body hashes/status/media,
+unchanged inputs/loaded files, zero exit and matching Atom/shared-custody
+completion. Wrong entry hash, approval hash or selector must fail without any
+selected observation or completion. Every isolated .NET child environment,
+including cleared/rebuilt environments, must retain
+`DOTNET_ADD_GLOBAL_TOOLS_TO_PATH=false`; no machine trust is modified.
+
+## Original source-fixture controls
+
 This standalone executable follows the existing .NET conformance-project
 pattern, imports the repository's exact `SdkPin.props` and `packages.lock.json`,
 and links `../../shared/SdkCustody.cs` without modifying it. It needs no server,

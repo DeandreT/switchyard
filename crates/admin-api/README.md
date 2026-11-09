@@ -48,8 +48,8 @@ resolved graph is pinned in `Cargo.lock`.
 ## Closed Atom HTTPS transport
 
 `atom::https::HttpsListener` owns a rustls HTTP/1 acceptor, independent of the
-native h2 service. Its production constructor installs only `ClosedRoutes`,
-without a broker handle or XML parser. Explicit definition-singleton GETs return
+native h2 service. Its `new` constructor installs only `ClosedRoutes`,
+without a broker handle or XML parser. Those explicit definition-singleton GETs return
 501; ambiguous/runtime profiles and writes return 400. No empty successful
 catalog, runtime counters, CRUD or rule adapters are supplied.
 
@@ -84,3 +84,27 @@ disconnect ends the wire wait, not begun callback work. A request that has not
 begun its callback at expiry cannot start it afterward. Finish joins connections
 and accepted work before its caller may stop a backend. See the server's
 [configuration, limits and shutdown contract](../server/README.md#atom-https).
+
+## Ordinary subscription definition Get
+
+`atom::subscription_get::SubscriptionGet` privately holds the existing
+namespace-bound `EntityService<B>`. It uses only Get, in the transport-retained
+callback, and delegates every other method/address/profile to `ClosedRoutes`.
+The server installs it explicitly on its opt-in Atom listener; the library's
+`HttpsListener::new` stays closed. It does not use the native RPC wrapper's
+namespace-root-only policy or add another authority/owner path.
+
+Only `GET /topic/Subscriptions/name?api-version=2021-05|2024-05&enrich=False`
+selects this profile. Manage must cover that canonical subscription; namespace
+or parent-topic Manage also covers it. Input is HTTP-empty: no XML is parsed,
+and nonempty/encoded/chunked bodies refuse before body polling or Get. One real
+broker-owner turn validates the membership, parent, live owner, backing profile
+and DLQ without Clock access or writes.
+
+The structured `quick-xml` writer has a 4 KiB pre-extension sink bound, fixed
+names/media and escaped, validated scalar text. It returns one Atom entry with
+six actual definition fields, including both stored dead-letter policies. A
+healthy absence returns 404; corrupt state returns fixed 500, stopped backend
+503, and domain-valid values outside the selected client's representation 501.
+No error includes backend diagnostics. Details, bounds and remaining closed
+surfaces are in [the profile contract](../../docs/atom-subscription-get.md).

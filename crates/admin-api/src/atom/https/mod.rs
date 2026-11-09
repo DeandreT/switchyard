@@ -262,10 +262,34 @@ pub enum BodyMode {
 pub struct Reply {
     status: StatusCode,
     bytes: Vec<u8>,
+    media: ReplyMedia,
+}
+enum ReplyMedia {
+    Text,
+    Atom,
+    Xml,
 }
 impl Reply {
     pub fn new(status: StatusCode, bytes: Vec<u8>) -> Self {
-        Self { status, bytes }
+        Self {
+            status,
+            bytes,
+            media: ReplyMedia::Text,
+        }
+    }
+    pub(super) fn atom_entry(bytes: Vec<u8>) -> Self {
+        Self {
+            status: StatusCode::OK,
+            bytes,
+            media: ReplyMedia::Atom,
+        }
+    }
+    pub(super) fn xml_error(status: StatusCode, bytes: Vec<u8>) -> Self {
+        Self {
+            status,
+            bytes,
+            media: ReplyMedia::Xml,
+        }
     }
 }
 
@@ -515,9 +539,13 @@ impl Boundary {
 }
 
 fn response(result: Result<Reply, Refusal>) -> Response<Full<Bytes>> {
-    let (status, bytes) = match result {
-        Ok(reply) => (reply.status, Bytes::from(reply.bytes)),
-        Err(error) => (error.status(), Bytes::from_static(error.message())),
+    let (status, bytes, media) = match result {
+        Ok(reply) => (reply.status, Bytes::from(reply.bytes), reply.media),
+        Err(error) => (
+            error.status(),
+            Bytes::from_static(error.message()),
+            ReplyMedia::Text,
+        ),
     };
     let mut response = Response::new(Full::new(bytes.clone()));
     *response.status_mut() = status;
@@ -527,7 +555,11 @@ fn response(result: Result<Reply, Refusal>) -> Response<Full<Bytes>> {
     );
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        header::HeaderValue::from_static("text/plain; charset=utf-8"),
+        header::HeaderValue::from_static(match media {
+            ReplyMedia::Text => "text/plain; charset=utf-8",
+            ReplyMedia::Atom => "application/atom+xml; charset=utf-8",
+            ReplyMedia::Xml => "application/xml; charset=utf-8",
+        }),
     );
     response.headers_mut().insert(
         header::CONTENT_LENGTH,

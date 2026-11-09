@@ -27,12 +27,17 @@ or whole-test task-tree shutdown. See [selectors/limits](sdk-gates.md),
 
 Source-derived [Atom profiles](../crates/conformance/atom-fixtures/README.md)
 record indistinguishable definition/runtime collection requests and closed XML
-shapes. The in-memory .NET controls exercise request construction and synthetic
+shapes. The original in-memory .NET controls exercise request construction and synthetic
 response parsing, not a running endpoint. The opt-in [HTTP/1 HTTPS boundary](../crates/server/README.md#atom-https)
 uses offline namespace/entity Manage authorization with bounded TLS admission,
-headers, bodies, replies and deadlines. Production routes remain closed: definition
-singletons return 501, ambiguous/runtime profiles and writes 400 after authorization.
-There is no Atom CRUD/XML/rule adapter or SDK administration certification.
+headers, bodies, replies and deadlines. Its only installed adapter is
+[ordinary subscription definition Get](atom-subscription-get.md), requiring an
+explicit definition singleton selector. It returns six current fields from one
+serialized owner read; it parses no request XML and performs no mutation.
+Queue/topic definition singletons remain 501, ambiguous/runtime profiles and writes
+400 after authorization; rules stay closed. The selected current/previous
+in-memory SDK controls can consume fresh Rust HTTPS response captures without
+making SDK network calls. They are not SDK administration certification.
 Ambiguous collections require refusal until truthful combined runtime data is available.
 
 ## Implemented Surface
@@ -685,7 +690,7 @@ namespace/server; no quotas, fair multi-tenancy or production durability.
 | Scope | Missing |
 | --- | --- |
 | Semantics | SQL actions/parameters/functions beyond the kernel, session subscriptions/session-ID predicates, administrable TTL expiry policy, DLQ forwarding/resubmit, same-group transactions. |
-| Administration | Atom/XML entities/rules; native Update/Delete and other native services. |
+| Administration | Atom/XML beyond ordinary subscription definition Get, including collections/runtime, writes and rules; native Update/Delete and other native services. |
 | Security | Network OIDC, mTLS, policy/full RBAC, namespace KMS/encryption, tamper-evident audit. |
 | Production | Raft/placement, quotas/fairness, encrypted backup/restore, readiness/observability, release/performance evidence. |
 
