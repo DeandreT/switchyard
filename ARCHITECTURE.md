@@ -108,7 +108,9 @@ dial-IP pins, no DNS tasks or token-triggered fetch, and shared bounded freshnes
 It preserves the narrow local JWT profile; the server still uses offline policy
 files. The optional [workload TLS foundation](docs/workload-identity.md) verifies
 client certificates and provides endpoint-bound scoped authority with a fixed
-lease. AMQP/admin consumption and restart activation are not yet connected.
+lease. An optional AMQP TCP/WSS library consumer preserves that lease across
+token refresh and checks it at final broker admission. Server/admin consumption
+and restart activation remain separate.
 Transactions and production activation also remain separate work.
 
 ### Message State
