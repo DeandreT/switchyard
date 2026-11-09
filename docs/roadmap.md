@@ -7,8 +7,8 @@ Pre-alpha: only verified, merged `main` is complete.
 ## Main Progress
 
 - [x] AMQP/SASL/CBS; settlement, DLQ, deferral, peek, sessions, scheduling, queue duplicates.
-- [x] Actionless topics/rules, bounded SQL filters, durable domain SQL actions and
-  isolated copy overlays; actionless AMQP rule management and bounded topology.
+- [x] Topics/rules, bounded SQL filters/actions and isolated copy overlays, with
+  AMQP rule management and bounded topology.
 - [x] Memory/Fjall format 3 and opt-in journal/indexed apply/local replay.
 - [x] Local authority, JWT/SQL kernels and native/link/session/connection custody.
 - [x] Source-bound builds and pinned Memory/Fjall SDK TCP/WSS data-plane gates.
@@ -96,7 +96,7 @@ PRs in dependency order ([workflow](../CONTRIBUTING.md)). Ready is not evidence.
 | Lane | Pickup / overlap |
 | --- | --- |
 | Snapshots | #37 offline children are complete; live recovery follows #38/#41. |
-| Domain | #14, #16, #20, #22 and #23 are complete. Finite admission remains #27; domain SQL actions are delivered, with wire management #337 remaining in #21. |
+| Domain | #14, #16, #20, #21, #22 and #23 are complete. Finite admission remains #27; SQL actions include durable isolated copies and AMQP rule management. |
 | Admin | Authenticated TLS/h2 Create/Get/List, native CLI and Atom ordinary subscription definition Get are delivered. Other Atom CRUD/rule and collection/runtime profiles remain separate. |
 | Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228), #238 ([PR258](https://github.com/DeandreT/switchyard/pull/258)), #239 ([PR264](https://github.com/DeandreT/switchyard/pull/264)) and #240 ([PR263](https://github.com/DeandreT/switchyard/pull/263)) and #232's allocation/graph composition verified. |
 | SDK/security | Offline JWT activation and declared current/previous Memory/Fjall data-plane gates are delivered. OIDC and AMQP workload identity are library-only; workload server/admin activation and identity administration remain pending. |
