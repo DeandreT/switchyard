@@ -880,6 +880,7 @@ async fn receiving_echo_and_drain_are_explicitly_refused_without_false_progress(
             "amqp:not-implemented"
         );
         timeout(WAIT, old.on_detach()).await.unwrap();
+        timeout(WAIT, old.close()).await.unwrap().unwrap();
         // An already in-flight transfer can consume a frame but cannot recreate
         // the refused link or fabricate a delivery acknowledgement.
         write(
@@ -889,8 +890,64 @@ async fn receiving_echo_and_drain_are_explicitly_refused_without_false_progress(
             vec![1],
         )
         .await;
+        // A crossed offer/echo cannot reserve a replacement or emit another
+        // refusal while the original Detach is waiting for its answer.
+        write(
+            &mut f.peer,
+            1,
+            Performative::Attach(Box::new(attach(1, Role::Sender))),
+            vec![],
+        )
+        .await;
+        write(
+            &mut f.peer,
+            1,
+            Performative::Flow(Flow {
+                handle: Some(1),
+                echo: true,
+                incoming_window: 2048,
+                ..Flow::default()
+            }),
+            vec![],
+        )
+        .await;
         assert_eq!(f.barrier().await.next_incoming_id, Some(2));
         assert!(old.recv().await.is_err());
+        write(
+            &mut f.peer,
+            1,
+            Performative::Detach(amqp::Detach {
+                handle: 1,
+                closed: true,
+                error: None,
+            }),
+            vec![],
+        )
+        .await;
+        // This ordered Flow barrier fails on any extra Detach; no elapsed-time
+        // absence assertion is used to establish acknowledgement consumption.
+        f.barrier().await;
+        let mut replacement = f.receiver(1, 4096).await;
+        let mut healthy = f.receiver(2, 4096).await;
+        old.close().await.unwrap();
+        for handle in [1, 2] {
+            write(
+                &mut f.peer,
+                1,
+                Performative::Transfer(transfer(handle, Some(handle), false)),
+                encode_message(&Message::data(vec![handle as u8])).unwrap(),
+            )
+            .await;
+        }
+        assert_eq!(
+            replacement.recv().await.unwrap().message(),
+            &Message::data(vec![1])
+        );
+        assert_eq!(
+            healthy.recv().await.unwrap().message(),
+            &Message::data(vec![2])
+        );
+        f.barrier().await;
         f.shutdown().await;
     }
 }
@@ -983,4 +1040,133 @@ async fn dropping_a_stalled_consumer_returns_global_storage_but_no_more_link_cre
     assert_eq!(session.incoming_window, 2048);
     assert!(flows.iter().all(|flow| flow.handle != Some(1)));
     f.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn storage_and_message_refusal_detach_answers_preserve_reuse_and_unrelated_progress() {
+    for resource in [false, true] {
+        let mut f = Fixture::new(0).await;
+        let maximum = if resource { 16 * 1024 * 1024 } else { 8 };
+        let mut old = f.receiver(1, maximum).await;
+        let mut held = Vec::new();
+        if resource {
+            for handle in 2..=5 {
+                held.push(f.receiver(handle, maximum).await);
+                write(
+                    &mut f.peer,
+                    1,
+                    Performative::Transfer(transfer(handle, Some(handle), true)),
+                    vec![0],
+                )
+                .await;
+            }
+        }
+        let encoded = encode_message(&Message::data(vec![1; 4])).unwrap();
+        assert_eq!(encoded.len(), 9);
+        write(
+            &mut f.peer,
+            1,
+            Performative::Transfer(transfer(1, Some(0), false)),
+            encoded,
+        )
+        .await;
+        let Performative::Detach(refusal) = read(&mut f.peer).await.1 else {
+            panic!("native refusal")
+        };
+        assert_eq!(
+            refusal.error.unwrap().condition.as_symbol().to_string(),
+            if resource {
+                "amqp:resource-limit-exceeded"
+            } else {
+                "amqp:link:message-size-exceeded"
+            }
+        );
+        assert!(old.recv().await.is_err());
+        old.close().await.unwrap();
+        write(
+            &mut f.peer,
+            1,
+            Performative::Transfer(transfer(1, Some(99), false)),
+            vec![0xff],
+        )
+        .await;
+        for handle in 2..=if resource { 5 } else { 1 } {
+            let mut abort = transfer(handle, Some(handle), false);
+            abort.aborted = true;
+            write(&mut f.peer, 1, Performative::Transfer(abort), vec![]).await;
+        }
+        write(
+            &mut f.peer,
+            1,
+            Performative::Detach(amqp::Detach {
+                handle: 1,
+                closed: true,
+                error: None,
+            }),
+            vec![],
+        )
+        .await;
+        f.barrier().await; // positive wire proof: no second Detach
+        let mut replacement = f.receiver(1, 4096).await;
+        let mut other = f.receiver(6, 4096).await;
+        old.close().await.unwrap();
+        for handle in [1, 6] {
+            write(
+                &mut f.peer,
+                1,
+                Performative::Transfer(transfer(handle, Some(handle + 100), false)),
+                vec![],
+            )
+            .await;
+        }
+        replacement.recv().await.unwrap();
+        other.recv().await.unwrap();
+        f.barrier().await;
+        f.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn withholding_detach_answers_hits_a_fixed_connection_retirement_bound() {
+    let mut f = Fixture::new(0).await;
+    let mut retired = Vec::new();
+    for handle in 1..=64 {
+        let receiver = f.receiver(handle, 4096).await;
+        write(
+            &mut f.peer,
+            1,
+            Performative::Flow(Flow {
+                handle: Some(handle),
+                echo: true,
+                incoming_window: 2048,
+                ..Flow::default()
+            }),
+            vec![],
+        )
+        .await;
+        assert!(matches!(read(&mut f.peer).await.1, Performative::Detach(_)));
+        retired.push(receiver);
+    }
+    f.barrier().await; // unrelated link is live below the shared bound
+    let mut last = f.receiver(65, 4096).await;
+    write(
+        &mut f.peer,
+        1,
+        Performative::Flow(Flow {
+            handle: Some(65),
+            echo: true,
+            incoming_window: 2048,
+            ..Flow::default()
+        }),
+        vec![],
+    )
+    .await;
+    assert!(
+        timeout(WAIT, read_frame(&mut f.peer))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    timeout(WAIT, last.on_detach()).await.unwrap();
+    f.shutdown().await; // join the originals; EOF is not a graceful Close claim
 }

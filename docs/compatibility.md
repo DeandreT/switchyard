@@ -229,6 +229,20 @@ that link with `amqp:not-implemented`, without acknowledging unseen transfers or
 claiming quiescence. General Flow echo/drain work remains in
 [#77](https://github.com/DeandreT/switchyard/issues/77).
 
+Locally initiated Detach, including automatic receive refusals, retires the
+endpoint but keeps its handle reserved until the peer answers. Crossed Attach,
+Flow and Transfer traffic cannot recreate that endpoint; crossed transfers still
+consume session-frame capacity. The answer is consumed without a second Detach,
+and only then can the handle be reused. Existing application-close replies keep
+their original owner and complete on their normal terminal path. At most 64
+unanswered local Detach records may coexist per connection; exhausting this
+shared retirement budget stops the connection rather than growing a peer-driven
+ledger. End, EOF and local stop release those records with their original session.
+On normal and error actor returns, the feature client requests cancellation of
+its read-only frame task, joins that original reader, then releases the split
+transport before publishing its closed signal. The retirement-limit path does
+not require peer EOF, End or a cooperative Close to release the connection.
+
 The opt-in declared-current TCP sustained-send gate sends 2,305 individual
 deliveries with one SDK sender and retries disabled, checks the selected runtime
 assets and original child custody, then verifies ordered native stored bodies and

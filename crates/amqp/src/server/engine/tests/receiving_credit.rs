@@ -126,3 +126,31 @@ async fn over_credit_refuses_but_a_continuation_at_zero_credit_still_finishes() 
         Err(EngineError::IncomingCreditLimit)
     ));
 }
+
+#[tokio::test]
+async fn unanswered_detach_custody_is_connection_bounded_and_idempotent() {
+    let (mut sessions, mut receiver) = receiving_session(1, 2);
+    assert!(begin_detach(1, 2, &mut sessions).unwrap());
+    assert!(
+        receiver.recv().await.is_none(),
+        "the closing record owns no live producer"
+    );
+    assert!(!begin_detach(1, 2, &mut sessions).unwrap());
+    for handle in 3..MAX_DETACHING_LINKS as u32 + 2 {
+        sessions
+            .get_mut(&1)
+            .unwrap()
+            .links
+            .insert(handle, LinkState::Detaching(u64::from(handle)));
+    }
+    let (other, _receiver) = receiving_session(2, 0);
+    sessions.extend(other);
+    assert!(matches!(
+        begin_detach(2, 0, &mut sessions),
+        Err(EngineError::InvalidState(_))
+    ));
+    // Only a real acknowledgement/session retirement frees ledger space;
+    // repeated observations/refusals do not mint another slot.
+    sessions.get_mut(&1).unwrap().links.remove(&2);
+    assert!(begin_detach(2, 0, &mut sessions).unwrap());
+}

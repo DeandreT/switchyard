@@ -228,6 +228,7 @@ pub(in crate::server) async fn apply_flow<W: AsyncWrite + Unpin>(
         return Ok(());
     };
     let link = match session.links.get_mut(&handle) {
+        Some(LinkState::Detaching(_)) => return Ok(()),
         Some(LinkState::Sending(link)) => link,
         Some(LinkState::Receiving(_)) => {
             if flow.drain || flow.echo {

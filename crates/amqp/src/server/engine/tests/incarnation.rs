@@ -14,7 +14,7 @@ async fn a_stale_sender_detach_cannot_remove_a_reused_handle() {
     assert_no_frame(&mut peer).await;
 
     detach(channel, handle, current, &mut wire, &mut sessions).await;
-    assert!(!sessions[&channel].links.contains_key(&handle));
+    assert!(sessions[&channel].links[&handle].is_detaching());
     assert_detach_frame(channel, handle, &mut peer).await;
 }
 
@@ -32,7 +32,7 @@ async fn a_stale_receiver_detach_cannot_remove_a_reused_handle() {
     assert_no_frame(&mut peer).await;
 
     detach(channel, handle, current, &mut wire, &mut sessions).await;
-    assert!(!sessions[&channel].links.contains_key(&handle));
+    assert!(sessions[&channel].links[&handle].is_detaching());
     assert_detach_frame(channel, handle, &mut peer).await;
 }
 

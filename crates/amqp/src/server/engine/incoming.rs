@@ -401,10 +401,8 @@ pub(in crate::server) async fn retire_receiver<W: AsyncWrite + Unpin>(
     sessions: &mut HashMap<u16, SessionState>,
     writer: &mut W,
 ) -> Result<(), EngineError> {
-    if let Some(session) = sessions.get_mut(&channel)
-        && let Some(mut link) = session.links.remove(&handle)
-    {
-        stop_link(&mut link);
+    if !begin_detach(channel, handle, sessions)? {
+        return Ok(());
     }
     write_amqp(
         writer,
@@ -450,6 +448,9 @@ fn assemble(
     let Some(link) = session.links.get_mut(&transfer.handle) else {
         return Ok(false);
     };
+    if link.is_detaching() {
+        return Ok(false);
+    }
     let LinkState::Receiving(link) = link else {
         return Err(invalid_state("transfer sent to a sending link"));
     };
