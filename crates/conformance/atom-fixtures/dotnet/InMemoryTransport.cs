@@ -6,7 +6,7 @@ using Azure.Core.Pipeline;
 
 internal sealed record RequestShape(string Method, string Path, string Query);
 
-internal sealed class InMemoryTransport(int status, string body) : HttpPipelineTransport, IDisposable
+internal sealed class InMemoryTransport(int status, string body, string? contentType = null) : HttpPipelineTransport, IDisposable
 {
     private readonly List<MemoryResponse> responses = [];
     internal List<RequestShape> Requests { get; } = [];
@@ -25,7 +25,7 @@ internal sealed class InMemoryTransport(int status, string body) : HttpPipelineT
         FixtureInputs.Require(message.Request.Content is null, "unexpected GET request body");
         FixtureInputs.Require(Requests.Count == 0, "unexpected second request or retry");
         Requests.Add(new(message.Request.Method.ToString(), uri.AbsolutePath, uri.Query.TrimStart('?')));
-        var response = new MemoryResponse(status, body);
+        var response = new MemoryResponse(status, body, contentType);
         responses.Add(response);
         message.Response = response;
     }
@@ -44,11 +44,11 @@ internal sealed class InMemoryTransport(int status, string body) : HttpPipelineT
         }
     }
 
-    private sealed class MemoryResponse(int status, string body) : Response
+    private sealed class MemoryResponse(int status, string body, string? contentType) : Response
     {
         private readonly Dictionary<string, string> headers = new(StringComparer.OrdinalIgnoreCase)
         {
-            ["Content-Type"] = status == 200 ? "application/atom+xml" : "application/xml",
+            ["Content-Type"] = contentType ?? (status == 200 ? "application/atom+xml" : "application/xml"),
         };
         public override int Status => status;
         public override string ReasonPhrase => status == 200 ? "OK" : "Bad Request";

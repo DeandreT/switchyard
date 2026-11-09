@@ -71,6 +71,15 @@ internal sealed class FixtureInputs : IDisposable
     internal JsonElement Request(string id) => manifest.RootElement.GetProperty("requests")
         .EnumerateArray().Single(value => value.GetProperty("id").GetString() == id);
 
+    internal string ReadSubscriptionCapture(string backend, string name)
+    {
+        Require(backend is "memory" or "fjall", "unsupported capture backend");
+        Require(new[] { "normal", "min", "max", "unlimited", "missing", "corrupt", "unsupported", "stopped", "invalid" }.Contains(name), "unsupported capture case");
+        string captures = Absolute(Environment.GetEnvironmentVariable("SWITCHYARD_ATOM31_CAPTURE_ROOT")
+            ?? throw new InvalidOperationException("selected subscription controls require actual Rust HTTPS captures"));
+        return ReadAndRemember(Path.Combine(captures, backend, name + ".json"), 16 * 1024);
+    }
+
     internal void VerifyUnchanged()
     {
         foreach ((string path, string fingerprint) in fingerprints)
@@ -79,14 +88,14 @@ internal sealed class FixtureInputs : IDisposable
         }
     }
 
-    private string ReadAndRemember(string path)
+    private string ReadAndRemember(string path, int limit = FileBytes)
     {
         path = Path.GetFullPath(path);
         if (contents.TryGetValue(path, out string? cached))
         {
             return cached;
         }
-        byte[] bytes = ReadBounded(path, FileBytes);
+        byte[] bytes = ReadBounded(path, limit);
         string text = new UTF8Encoding(false, true).GetString(bytes);
         fingerprints.Add(path, Hash(bytes));
         contents.Add(path, text);

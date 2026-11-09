@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- #31 only: one entry with all six verified current subscription fields. -->
+<grammar xmlns="http://relaxng.org/ns/structure/1.0" datatypeLibrary="http://www.w3.org/2001/XMLSchema-datatypes">
+  <start>
+    <element name="entry" ns="http://www.w3.org/2005/Atom">
+      <element name="title"><attribute name="type"><value>text</value></attribute><data type="string"><param name="minLength">1</param><param name="maxLength">50</param></data></element>
+      <element name="content">
+        <attribute name="type"><value>application/xml</value></attribute>
+        <element name="SubscriptionDescription" ns="http://schemas.microsoft.com/netservices/2010/10/servicebus/connect">
+          <element name="LockDuration"><data type="duration"/></element>
+          <element name="RequiresSession"><value>false</value></element>
+          <element name="DefaultMessageTimeToLive"><data type="duration"/></element>
+          <element name="DeadLetteringOnMessageExpiration"><data type="boolean"/></element>
+          <element name="DeadLetteringOnFilterEvaluationExceptions"><data type="boolean"/></element>
+          <element name="MaxDeliveryCount"><data type="positiveInteger"><param name="maxInclusive">2147483647</param></data></element>
+        </element>
+      </element>
+    </element>
+  </start>
+</grammar>

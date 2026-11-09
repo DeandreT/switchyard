@@ -147,12 +147,14 @@ open; no URL, key or bearer value is a command-line argument. These options do
 not enable AMQP JWT or native h2, nor bypass the existing production guards.
 All configured sockets bind before any serving family starts.
 
-The server installs only closed routes, with no broker handle or XML parser.
-After authorization, a definition-singleton GET with explicit `enrich=False`
-returns 501 (adapter unavailable); ambiguous collections/runtime profiles and
-unsupported writes return 400. Unknown/duplicate query options and unsupported
-versions refuse. These responses do not establish administration readiness,
-CRUD, rules, runtime metadata or SDK administration compatibility.
+The server installs only the [ordinary subscription definition Get profile](../../docs/atom-subscription-get.md)
+over the existing namespace-bound typed owner service. After authorization,
+`GET /topic/Subscriptions/name` with explicit `enrich=False` and API version
+2021-05 or 2024-05 can return one truthful Atom entry. No request XML parser is
+installed. Queue/topic definition singletons stay 501; ambiguous collections,
+runtime profiles and unsupported writes stay 400. Unknown/duplicate query
+options and unsupported versions refuse. Rule/namespace endpoints remain closed.
+This is not mutable CRUD, runtime metadata or SDK administration certification.
 
 Each request independently requires exactly one Bearer credential, validated
 against the [offline policy](../../docs/offline-jwt.md) at the current time.
@@ -172,6 +174,11 @@ serves one HTTP/1.1 request; keep-alive and upgrades are disabled. The reusable
 Rust API validates configurable limits, but no CLI limit surface is exposed.
 Bodies, when a trusted adapter opts in, must be bounded UTF-8 Atom content;
 compressed content, unsupported framing/types and trailers refuse.
+The installed subscription Get selects empty-body mode: positive Content-Length,
+any Transfer-Encoding or Content-Encoding refuse before its owner read. Its XML
+writer independently caps complete entry/error output to 4 KiB; it never truncates
+a successful response. New profile success/error media are Atom XML/XML; existing
+transport/auth/closed-route responses keep their plain-text contract.
 
 Excess accepted requests return 503 without waiting or spawning a callback;
 connection admission pauses at its bound. Body timeout/oversize return 408/413,

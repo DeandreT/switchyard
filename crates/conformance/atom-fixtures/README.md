@@ -1,5 +1,13 @@
 # Atom collection profiles
 
+The original #10 fixtures below remain source-derived synthetic inputs. The
+separate [ordinary subscription Get profile](../../../docs/atom-subscription-get.md)
+adds `profiles/subscription-get.rng` and `responses/subscription-get/*.xml` without
+changing their five-field grammar. Its six-field fixtures are checked against
+deterministic Rust writer/real HTTPS owner responses. Selected SDK controls use
+fresh response captures, not fixture-only decoding; they are still in-memory SDK
+controls, not a full administration network compatibility gate.
+
 This is a **source-derived, synthetic, scrubbed fixture contract**, not a wire
 capture, SDK execution result, running administration endpoint, or compatibility
 claim. All names, dates, property values and statistics are invented test inputs.

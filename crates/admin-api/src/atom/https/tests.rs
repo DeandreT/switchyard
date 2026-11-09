@@ -1129,3 +1129,193 @@ fn limits_fail_closed() {
         assert!(limits.validate().is_err());
     }
 }
+
+#[derive(Clone, Default)]
+struct GetOnly(Arc<AtomicUsize>);
+impl crate::EntityBackend for GetOnly {
+    type Error = std::io::Error;
+    async fn create(
+        &self,
+        _: NamespaceName,
+        _: domain::EntityPath,
+        _: domain::CommandKind,
+    ) -> Result<domain::CommandOutcome, crate::ServiceError<Self::Error>> {
+        panic!("Get must not create")
+    }
+    async fn list(
+        &self,
+        _: NamespaceName,
+        _: domain::AdminCatalogKind,
+        _: Option<domain::AdminCatalogCursor>,
+        _: usize,
+    ) -> Result<domain::AdminCatalogPage, crate::ServiceError<Self::Error>> {
+        panic!("Get must not list")
+    }
+    async fn get(
+        &self,
+        _: NamespaceName,
+        target: crate::EntityTarget,
+    ) -> Result<Option<domain::AdminCatalogEntry>, crate::ServiceError<Self::Error>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let crate::EntityTarget::Subscription { topic, name, path } = target else {
+            panic!("subscription only")
+        };
+        Ok(Some(domain::AdminCatalogEntry::Subscription(
+            domain::AdminSubscription {
+                topic,
+                name,
+                path,
+                config: domain::SubscriptionConfig::default(),
+            },
+        )))
+    }
+}
+
+#[tokio::test]
+async fn subscription_adapter_auth_empty_input_and_closed_fallback_precede_every_get() -> TestResult
+{
+    use crate::{
+        EntityService, atom::subscription_get::SubscriptionGet, rpc::InternalBackendErrors,
+    };
+    let identity = identity()?;
+    let backend = GetOnly::default();
+    let adapter = Arc::new(SubscriptionGet::new(
+        EntityService::new(NamespaceName::new("tenant")?, backend.clone()),
+        InternalBackendErrors,
+    ));
+    let boundary = boundary(&identity, adapter, Limits::default());
+    let target = "/orders/Subscriptions/sub?api-version=2024-05&enrich=False";
+    for (token, expected) in [
+        (None, Refusal::Unauthenticated),
+        (
+            Some(fixture::sign(fixture::claims("sender"))),
+            Refusal::Forbidden,
+        ),
+        (
+            Some(fixture::sign(fixture::claims("foreign"))),
+            Refusal::Forbidden,
+        ),
+    ] {
+        let (request, polls) = counted(
+            token.as_deref(),
+            target,
+            Method::GET,
+            b"<!DOCTYPE not-read>",
+        );
+        assert_eq!(
+            boundary
+                .dispatch(request, Instant::now() + WAIT)
+                .await
+                .err(),
+            Some(expected)
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+    }
+    let token = fixture::sign(fixture::claims("operator"));
+    for (name, value, expected) in [
+        (header::CONTENT_LENGTH, "1", Refusal::Encoding),
+        (header::CONTENT_LENGTH, "9999999", Refusal::TooLarge),
+        (header::TRANSFER_ENCODING, "chunked", Refusal::Encoding),
+        (header::CONTENT_ENCODING, "gzip", Refusal::Encoding),
+    ] {
+        let (mut request, polls) =
+            counted(Some(&token), target, Method::GET, b"<!DOCTYPE not-read>");
+        request
+            .headers_mut()
+            .insert(name, header::HeaderValue::from_static(value));
+        assert_eq!(
+            boundary
+                .dispatch(request, Instant::now() + WAIT)
+                .await
+                .err(),
+            Some(expected)
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+    }
+    for (target, method, expected) in [
+        (
+            "/orders?api-version=2024-05&enrich=False",
+            Method::GET,
+            Refusal::Unsupported,
+        ),
+        (
+            "/orders/Subscriptions?api-version=2024-05&enrich=False",
+            Method::GET,
+            Refusal::RuntimeUnavailable,
+        ),
+        (
+            "/orders/Subscriptions/sub?api-version=2024-05&enrich=True",
+            Method::GET,
+            Refusal::RuntimeUnavailable,
+        ),
+        (
+            "/orders/Subscriptions/sub?api-version=2024-05&enrich=False&extra=true",
+            Method::GET,
+            Refusal::Invalid,
+        ),
+        (target, Method::PUT, Refusal::Invalid),
+    ] {
+        let (request, polls) = counted(Some(&token), target, method, b"not-read");
+        assert_eq!(
+            boundary
+                .dispatch(request, Instant::now() + WAIT)
+                .await
+                .err(),
+            Some(expected)
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+    }
+    let entity = fixture::sign(fixture::claims("entity"));
+    let (request, polls) = counted(
+        Some(&entity),
+        target,
+        Method::GET,
+        b"not-an-HTTP-framed-body",
+    );
+    let reply = boundary
+        .dispatch(request, Instant::now() + WAIT)
+        .await
+        .unwrap_or_else(|_| panic!("authorized Get"));
+    let response = response(Ok(reply));
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "application/atom+xml; charset=utf-8"
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.0.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn subscription_service_namespace_cannot_override_transport_authority() -> TestResult {
+    use crate::{
+        EntityService, atom::subscription_get::SubscriptionGet, rpc::InternalBackendErrors,
+    };
+    let identity = identity()?;
+    let backend = GetOnly::default();
+    let handler = Arc::new(SubscriptionGet::new(
+        EntityService::new(NamespaceName::new("other")?, backend.clone()),
+        InternalBackendErrors,
+    ));
+    let boundary = boundary(&identity, handler, Limits::default());
+    let token = fixture::sign(fixture::claims("operator"));
+    let (request, polls) = counted(
+        Some(&token),
+        "/orders/Subscriptions/sub?api-version=2024-05&enrich=False",
+        Method::GET,
+        b"not-read",
+    );
+    assert_eq!(
+        boundary
+            .dispatch(request, Instant::now() + WAIT)
+            .await
+            .err(),
+        Some(Refusal::Forbidden)
+    );
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+    Ok(())
+}
