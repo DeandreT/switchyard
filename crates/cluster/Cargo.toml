@@ -14,8 +14,12 @@ serde.workspace = true
 sha2.workspace = true
 storage.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 fjall.workspace = true
+futures-util = { workspace = true, features = ["std", "async-await"] }
+serde_json.workspace = true
 slog = "2.8"
 tempfile.workspace = true
+tokio = { workspace = true, features = ["io-std", "process"] }
