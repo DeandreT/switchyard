@@ -25,8 +25,9 @@ Pre-alpha: only verified, merged `main` is complete.
 - [x] Optional locally pinned workload policy, verified TLS proof foundation and
   AMQP TCP/WSS library consumer; admin consumption and server activation remain separate.
 - [x] Incoming/outgoing session windows and consumption-based receiving-link refill.
-- [x] Isolated fixed-three-voter consensus persistence/bootstrap, without elections
-  or quorum activation.
+- [x] Isolated fixed-three-voter persistence/bootstrap, real peer transport,
+  elections and majority-durable log replication. Application projection, client
+  outcomes and server quorum activation remain separate.
 - [ ] Remaining semantics, administration and conserved physical-byte capacity.
 - [ ] Full recovery, quorum, multi-tenant security and measured release.
 
