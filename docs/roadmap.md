@@ -7,17 +7,25 @@ Pre-alpha: only verified, merged `main` is complete.
 ## Main Progress
 
 - [x] AMQP/SASL/CBS; settlement, DLQ, deferral, peek, sessions, scheduling, queue duplicates.
-- [x] Actionless topics/rules, bounded SQL filters and filter-error routing,
-  AMQP rule management, bounded topology and selected profile integrity.
-- [x] Memory/Fjall format-2 and opt-in journal/indexed apply/local replay.
+- [x] Actionless topics/rules, bounded SQL filters, durable domain SQL actions and
+  isolated copy overlays; actionless AMQP rule management and bounded topology.
+- [x] Memory/Fjall format 3 and opt-in journal/indexed apply/local replay.
 - [x] Local authority, JWT/SQL kernels and native/link/session/connection custody.
-- [x] Source-bound builds and pinned Memory SDK TCP/WSS gates.
+- [x] Source-bound builds and pinned Memory/Fjall SDK TCP/WSS data-plane gates.
 - [x] Typed retained content: store format 3, proposal V4 sends and copy-local patches.
 - [x] Offline snapshot capture, install, anchors and journal compaction.
 - [x] Ordered, budgeted process shutdown through retained listener/protocol tasks,
   timer and broker; cancellation and committed-state reopen controls.
 - [x] Explicit queue/topic capacity profiles; finite sizes are recorded metadata,
-  not retained-byte admission or usage accounting.
+  not live admission. Pure retained-byte accounting and inert owned-writer/recovery
+  fences are available; lifecycle conservation and activation remain separate.
+- [x] Native TLS/h2 entity Create/Get/List, verified native CLI and bounded closed
+  Atom HTTPS transport; offline server JWT CBS and a separate pinned OIDC library.
+- [x] Optional locally pinned workload policy and verified TLS proof foundation;
+  protocol/admin consumers and server activation remain separate.
+- [x] Incoming/outgoing session windows and consumption-based receiving-link refill.
+- [x] Isolated fixed-three-voter consensus persistence/bootstrap, without elections
+  or quorum activation.
 - [ ] Remaining semantics, administration and conserved physical-byte capacity.
 - [ ] Full recovery, quorum, multi-tenant security and measured release.
 
@@ -33,7 +41,7 @@ flowchart TD
     Main["Main"] --> Lifecycle["#12 Authority -> #15 Entity retirement"] --> Semantics["#21 Rule actions -> #26-#28 Capacity"]
     Main --> Domain["#14/#16/#23 Domain"] --> Semantics
     Main --> Recovery["#37 Snapshots -> #38 Quorum"] --> Runtime["#41 Runtime"]
-    Lifecycle --> Security["#71 Grants -> #17 JWT; #42/#43/#49 Identity"] --> Runtime
+    Lifecycle --> Security["Grants/offline JWT; #42 library, #43/#49 identity"] --> Runtime
     Atom["#10 Atom"] --> Gates["#53 Release"]
     Admin["#18 Coordinator"] --> Catalog["#243 Catalog"] --> Broker["#244 Broker"] --> Gates
     Allocation["#228 Queue ACKs"] --> Activation["#238 Activation"]
@@ -86,17 +94,20 @@ PRs in dependency order ([workflow](../CONTRIBUTING.md)). Ready is not evidence.
 | Lane | Pickup / overlap |
 | --- | --- |
 | Snapshots | #37 offline children are complete; live recovery follows #38/#41. |
-| Domain | #14, #16, #20, #22 and #23 are complete. Finite admission remains #27; SQL actions remain #21. |
-| Admin | Authenticated TLS/h2 EntityService exposes Create/Get/List over the bounded broker owner; CLI #330 remains in #19. |
+| Domain | #14, #16, #20, #22 and #23 are complete. Finite admission remains #27; domain SQL actions are delivered, with wire management #337 remaining in #21. |
+| Admin | Authenticated TLS/h2 Create/Get/List and native CLI are delivered. Closed Atom HTTPS is available; subscription Get #31 and later CRUD/rule profiles remain separate. |
 | Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228), #238 ([PR258](https://github.com/DeandreT/switchyard/pull/258)), #239 ([PR264](https://github.com/DeandreT/switchyard/pull/264)) and #240 ([PR263](https://github.com/DeandreT/switchyard/pull/263)) and #232's allocation/graph composition verified. |
-| SDK/security | #7 and #71 grant consumers are complete; JWT activation #17 and durable SDK matrix #101 remain pending. |
-| Native Flow | Outgoing session windows #331 are complete; incoming conservation #332, receiver refill #69 and Flow echo #77 remain pending. |
+| SDK/security | Offline JWT activation and declared current/previous Memory/Fjall data-plane gates are delivered. OIDC is library-only; workload consumers and identity administration remain pending. |
+| Native Flow | Outgoing/incoming session conservation and receiver refill are delivered; sending-count wrap #368 and general Flow echo #77 remain pending. |
 
 Shared: #243 keys.rs (released by #229); machine.rs overlaps #240. #244 serializes broker
 ownership. Allocator error/condition/indexed edits serialize; #239 also
 coordinates #14/#23.
 
-SDK evidence is experimental current/previous Memory, not latest/durable.
+SDK gates are experimental declared current/previous Memory/Fjall TCP/WSS data-plane
+workflows, not latest, administration or production certification. Original
+attempts and selected reruns remain distinct evidence; a rerun does not create a
+fresh eight-cell qualification.
 Production still refuses; quorum/recovery/runtime remain pending.
 #234 and [#236](https://github.com/DeandreT/switchyard/issues/236) are closed/verified; PR246 split the lifecycle reference.
 
@@ -104,7 +115,7 @@ Production still refuses; quorum/recovery/runtime remain pending.
 
 | Gate | Remaining work |
 | --- | --- |
-| [M1](https://github.com/DeandreT/switchyard/milestone/1) | Lifecycle, authority, profiles, entity retirement, typed content. |
+| [M1](https://github.com/DeandreT/switchyard/milestone/1) | Lifecycle, authority, profiles and entity retirement. |
 | [M2](https://github.com/DeandreT/switchyard/milestone/2) | SDK/admin semantics, sustained Flow, capacity, same-group transactions. |
 | [M3](https://github.com/DeandreT/switchyard/milestone/3) | Recovery/quorum, identity/fairness, encrypted audit/backup, measured release. |
 
