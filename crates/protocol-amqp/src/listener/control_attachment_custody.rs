@@ -708,11 +708,10 @@ pub(crate) async fn serve_control_attachment<B: Broker>(
                     }
                     None => None,
                 };
-                // This is only scheduled-Send authority, not a fence for other
-                // management operations. Keep even a capture refusal so a
-                // later schedule cannot silently resolve a newer incarnation.
-                // Refuse malformed schedules/unauthorized operations first at
-                // request time; do not reject a Listen-only management link.
+                // Capture request-link authority once, including refusal, after
+                // Send-or-Listen authorization and before native acceptance.
+                // Parsing and per-operation permissions still take priority at
+                // request time; Listen-only management links remain accepted.
                 let sender = if attach.role == Role::Sender {
                     Some(tokio::select! {
                         biased;
@@ -743,7 +742,7 @@ pub(crate) async fn serve_control_attachment<B: Broker>(
                 if custody.is_retired() { return Ok(()); }
                 if let Some(LinkEndpoint::Receiver(receiver)) = custody.take_endpoint() {
                     custody.admitted = Some(prepared_task.spawn(async move {
-                        serve_management_requests_with_sender(receiver, namespace, entity, broker, management, link_authorization, retirement, sender.expect("request link captured scheduled-Send authority")).await
+                        serve_management_requests_with_sender(receiver, namespace, entity, broker, management, link_authorization, retirement, sender.expect("request link captured entity authority")).await
                     }));
                 }
             }

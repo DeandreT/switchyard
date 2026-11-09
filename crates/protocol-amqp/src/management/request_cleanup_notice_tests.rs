@@ -276,17 +276,19 @@ struct PoisonAfterActualResult {
 }
 
 impl Broker for PoisonAfterActualResult {
-    fn submit(
+    async fn submit(&self, _: NamespaceName, _: EntityPath, _: CommandKind) -> RawResult {
+        panic!("retained request cannot submit by name")
+    }
+    fn submit_bound(
         &self,
-        namespace: NamespaceName,
-        entity: EntityPath,
+        binding: domain::EntityBinding,
         kind: CommandKind,
     ) -> impl Future<Output = RawResult> + Send {
         let fault = Arc::clone(&self.fault);
         let polls = Arc::clone(&fault);
         let mut original: Pin<Box<dyn Future<Output = RawResult> + Send + '_>> =
             Box::pin(async move {
-                let _raw = self.actual.submit(namespace, entity, kind).await;
+                let _raw = self.actual.submit_bound(binding, kind).await;
                 fault.reached.notify_one();
                 fault.trigger.notified().await;
                 std::panic::panic_any(Arc::clone(&fault.payload))

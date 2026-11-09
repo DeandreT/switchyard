@@ -286,11 +286,13 @@ Authorization expiry and malformed-message refusals retain their priority, and
 successful sends are confirmed only after commit. DLQ/subscription sender
 addresses remain invalid before any owner lookup.
 
-Management request links also capture scheduling authority before acceptance,
-after their Send-or-Listen attach authorization. Only `schedule-message` consumes
-it, after request parsing and Send authorization; a capture failure is retained
-for scheduling rather than rejecting other operations on that link. Scheduling
-does not require an associated data link.
+Management request links capture entity authority once after Send-or-Listen
+attach authorization and before acceptance. The original capture, including a
+refusal, is retained for Peek, schedule/cancel and add/remove/enumerate rules;
+request parsing, unsupported-operation and per-operation authorization refusals
+keep their priority. Listen-only links remain accepted, and scheduling does not
+require an associated data link. A newer request link cannot upgrade an older
+delivery or session capability.
 
 Ordinary receiving links capture their own opaque binding after Listen
 authorization and session-filter parsing, before acceptance. Both receive modes,
@@ -309,10 +311,24 @@ Receive, message settlement and all session releases (including failed Attach,
 late admission, authorization expiry and shutdown) use the original capture;
 cleanup never resolves the entity again. Reused link names or equal hold/token
 tuples cannot replace a selected registration's authority or let old cleanup
-remove a newer registration. Management session state and session-lock renewal
-consumption, request-response consumption capabilities, cancellation, legacy
-name commands and timer expiry remain outside this adapter fence. No
-live deletion/recreation API or new stored/wire format is introduced.
+remove a newer registration.
+
+Management deferred receives retain receive-time authority before publishing
+their lock capabilities, including the SDK path without an associated data link.
+Both stages of a measured receive-delete use that same binding. Management
+message renewal and every disposition/property patch use the selected original
+ordinary or deferred delivery authority, not the request-link binding. Alias
+refresh and removal require the same entity, sequence and binding; conditional
+registry updates also retain their registration identity and monotonic deadline.
+Session state get/set, session-lock renewal and optional session Peek/deferred
+receive use the selected registration's original binding and exact full hold.
+Replacing a link or registry row cannot change an already-selected operation.
+
+This fence covers these retained AMQP adapters, not every broker API. Legacy
+name-based commands, native/raw broker consumers and reads without retained
+authority, background timer expiry/activation, administration and transactions
+are outside this adapter guarantee. No live deletion/recreation API or new
+stored, replicated-command or wire format is introduced.
 
 Second-mode delivery confirmations retain their original link incarnation. If
 native Detach or End retires that owner before confirmation, the native API returns

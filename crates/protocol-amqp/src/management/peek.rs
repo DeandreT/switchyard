@@ -1,9 +1,7 @@
 //! Service Bus request/response browsing without acquiring message locks.
 
 use amqp::{Body, Message, MessageId, encode_message};
-use domain::{
-    CommandKind, CommandOutcome, Delivery, EntityPath, NamespaceName, SequenceNumber, SessionHold,
-};
+use domain::{CommandKind, CommandOutcome, Delivery, EntityPath, NamespaceName, SequenceNumber};
 use serde_amqp::{
     Value,
     primitives::{Binary, OrderedMap},
@@ -53,17 +51,15 @@ pub(super) async fn peek<B: Broker>(
         Err(response) => return response,
     };
 
-    let result = broker
-        .submit(
-            namespace.clone(),
-            entity.clone(),
-            CommandKind::Peek {
-                from_sequence,
-                max_messages,
-                session,
-            },
-        )
-        .await;
+    let kind = CommandKind::Peek {
+        from_sequence,
+        max_messages,
+        session: session.as_ref().map(|session| session.hold.clone()),
+    };
+    let result = match session {
+        Some(session) => broker.submit_bound(session.binding, kind).await,
+        None => super::submit_request(broker, namespace, entity, kind).await,
+    };
     let deliveries = match result {
         Ok(CommandOutcome::Peeked(deliveries)) => deliveries,
         Ok(other) => {
@@ -118,13 +114,13 @@ async fn optional_session(
     tracking_id: Option<String>,
     entity: &EntityPath,
     management: &ConnectionManagement,
-) -> Result<Option<SessionHold>, ManagementResponse> {
+) -> Result<Option<super::SessionRegistration>, ManagementResponse> {
     if map_value(&message.body, SESSION_ID).is_none() {
         return Ok(None);
     }
     requested_session(message, entity, management)
         .await
-        .map(|session| Some(session.hold))
+        .map(Some)
         .map_err(|error| session_lookup_response(message_id, tracking_id, error))
 }
 
@@ -160,7 +156,7 @@ mod tests {
     };
     use domain::{
         DeadLetterInfo, DeadLetterReason, DeliveryLock, DeliveryOrigin, LockToken, MessageEnvelope,
-        SessionId, Timestamp,
+        SessionHold, SessionId, Timestamp,
     };
     use serde_amqp::primitives::Uuid;
 
@@ -190,10 +186,24 @@ mod tests {
     }
 
     impl Broker for RecordingBroker {
-        fn submit(
+        async fn bind_entity(
+            &self,
+            namespace: NamespaceName,
+            entity: EntityPath,
+        ) -> Result<domain::EntityBinding, crate::BrokerRejection> {
+            Ok(crate::broker::test_binding(namespace, entity))
+        }
+        async fn submit(
             &self,
             _namespace: NamespaceName,
             _entity: EntityPath,
+            _kind: CommandKind,
+        ) -> Result<CommandOutcome, crate::BrokerRejection> {
+            panic!("bound outcome fixture cannot submit by name")
+        }
+        fn submit_bound(
+            &self,
+            _binding: domain::EntityBinding,
             kind: CommandKind,
         ) -> impl std::future::Future<Output = Result<CommandOutcome, crate::BrokerRejection>> + Send
         {

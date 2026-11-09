@@ -89,7 +89,7 @@ pub(crate) struct ManagedDelivery {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DeliveryAuthority {
     Receiving(crate::broker::ReceivingAuthority),
-    RequestResponse,
+    RequestResponse(domain::EntityBinding),
 }
 
 impl ManagedDelivery {
@@ -104,8 +104,22 @@ impl ManagedDelivery {
             DeliveryAuthority::Receiving(authority) => {
                 authority.submit(broker, namespace, entity, kind).await
             }
-            DeliveryAuthority::RequestResponse => broker.submit(namespace, entity, kind).await,
+            DeliveryAuthority::RequestResponse(binding) => {
+                broker.submit_bound(binding.clone(), kind).await
+            }
         }
+    }
+
+    fn same_capability(&self, other: &Self) -> bool {
+        fn binding(authority: &DeliveryAuthority) -> &domain::EntityBinding {
+            match authority {
+                DeliveryAuthority::Receiving(authority) => authority.binding(),
+                DeliveryAuthority::RequestResponse(binding) => binding,
+            }
+        }
+        self.entity == other.entity
+            && self.sequence == other.sequence
+            && binding(&self.authority) == binding(&other.authority)
     }
 }
 
@@ -322,8 +336,9 @@ impl ConnectionManagement {
         &self,
         entity: EntityPath,
         delivery: Delivery,
+        binding: domain::EntityBinding,
     ) -> RequestResponseDeliveryRegistration {
-        self.register_request_response_delivery_at(entity, delivery, Instant::now())
+        self.register_request_response_delivery_at(entity, delivery, binding, Instant::now())
             .await
     }
 
@@ -331,6 +346,7 @@ impl ConnectionManagement {
         &self,
         entity: EntityPath,
         delivery: Delivery,
+        binding: domain::EntityBinding,
         now: Instant,
     ) -> RequestResponseDeliveryRegistration {
         let sequence = delivery.sequence;
@@ -352,7 +368,7 @@ impl ConnectionManagement {
                 managed: ManagedDelivery {
                     entity,
                     sequence,
-                    authority: DeliveryAuthority::RequestResponse,
+                    authority: DeliveryAuthority::RequestResponse(binding),
                 },
                 registration: registration.clone(),
                 expires_at: request_response_deadline(now, lock.lock_duration_millis),
@@ -475,7 +491,13 @@ impl ConnectionManagement {
         if ordinary.is_none() {
             purge_request_response_deliveries(&mut deliveries, Instant::now());
         }
-        let request_response = deliveries.get(&key);
+        // A token/sequence alias from another generation is not the selected
+        // ordinary capability. Never refresh or unregister that replacement.
+        let request_response = deliveries.get(&key).filter(|registered| {
+            ordinary
+                .as_ref()
+                .is_none_or(|ordinary| ordinary.managed.same_capability(&registered.managed))
+        });
         let managed = ordinary
             .as_ref()
             .map(|registered| registered.managed.clone())
@@ -1281,6 +1303,20 @@ fn management_permission(operation: &str) -> Permission {
     }
 }
 
+/// Request-link operations ask the adapter for its original capture only after
+/// parsing/authorization. RequestBroker returns the retained Result, not a lookup.
+async fn submit_request<B: Broker>(
+    broker: &B,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    kind: CommandKind,
+) -> Result<CommandOutcome, BrokerRejection> {
+    let binding = broker
+        .bind_entity(namespace.clone(), entity.clone())
+        .await?;
+    broker.submit_bound(binding, kind).await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn renew_message_lock<B: Broker>(
     message: &Message,
@@ -1436,7 +1472,7 @@ async fn renew_session_lock<B: Broker>(
     message: &Message,
     message_id: MessageId,
     tracking_id: Option<String>,
-    namespace: &NamespaceName,
+    _namespace: &NamespaceName,
     entity: &EntityPath,
     broker: &B,
     management: &ConnectionManagement,
@@ -1446,9 +1482,8 @@ async fn renew_session_lock<B: Broker>(
         Err(error) => return session_lookup_response(message_id, tracking_id, error),
     };
     match broker
-        .submit(
-            namespace.clone(),
-            entity.clone(),
+        .submit_bound(
+            session.binding,
             CommandKind::RenewSessionLock {
                 session: session.hold,
                 lock_duration_millis: None,
@@ -1475,7 +1510,7 @@ async fn get_session_state<B: Broker>(
     message: &Message,
     message_id: MessageId,
     tracking_id: Option<String>,
-    namespace: &NamespaceName,
+    _namespace: &NamespaceName,
     entity: &EntityPath,
     broker: &B,
     management: &ConnectionManagement,
@@ -1485,9 +1520,8 @@ async fn get_session_state<B: Broker>(
         Err(error) => return session_lookup_response(message_id, tracking_id, error),
     };
     match broker
-        .submit(
-            namespace.clone(),
-            entity.clone(),
+        .submit_bound(
+            session.binding,
             CommandKind::GetSessionState {
                 session: session.hold,
             },
@@ -1516,7 +1550,7 @@ async fn set_session_state<B: Broker>(
     message: &Message,
     message_id: MessageId,
     tracking_id: Option<String>,
-    namespace: &NamespaceName,
+    _namespace: &NamespaceName,
     entity: &EntityPath,
     broker: &B,
     management: &ConnectionManagement,
@@ -1537,9 +1571,8 @@ async fn set_session_state<B: Broker>(
         }
     };
     match broker
-        .submit(
-            namespace.clone(),
-            entity.clone(),
+        .submit_bound(
+            session.binding,
             CommandKind::SetSessionState {
                 session: session.hold,
                 state,

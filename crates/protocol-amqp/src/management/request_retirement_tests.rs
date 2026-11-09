@@ -5,7 +5,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Condvar, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::Poll,
 };
@@ -34,6 +34,9 @@ mod panic_tests;
 
 #[path = "receiver_capability_tests.rs"]
 mod receiver_capability_tests;
+
+#[path = "management_authority_tests.rs"]
+mod management_authority_tests;
 
 #[derive(Default)]
 struct ResultGate {
@@ -179,10 +182,34 @@ enum Backend {
 struct GatedStore {
     backend: Backend,
     gate: Arc<ApplyGate>,
+    observations: Arc<Observations>,
+}
+
+#[derive(Default)]
+struct Observations {
+    clock_calls: AtomicUsize,
+    clock_reads: AtomicUsize,
+    applies: AtomicUsize,
+}
+
+#[derive(Clone)]
+struct ObservedClock {
+    actual: server::ManualClock,
+    observations: Arc<Observations>,
+}
+
+impl server::Clock for ObservedClock {
+    fn now(&self) -> domain::Timestamp {
+        self.observations.clock_calls.fetch_add(1, Ordering::SeqCst);
+        server::Clock::now(&self.actual)
+    }
 }
 
 impl StateStore for GatedStore {
     fn get(&self, key: &[u8]) -> Result<Option<StoredValue>, StorageError> {
+        if key == domain::keys::clock() {
+            self.observations.clock_reads.fetch_add(1, Ordering::SeqCst);
+        }
         match &self.backend {
             Backend::Memory(store) => store.get(key),
             Backend::Fjall(store) => store.get(key),
@@ -190,6 +217,7 @@ impl StateStore for GatedStore {
     }
 
     fn apply(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        self.observations.applies.fetch_add(1, Ordering::SeqCst);
         let gated = self.gate.matches(&batch);
         if gated {
             self.gate.pause(false);
@@ -239,6 +267,21 @@ struct ActualBroker {
 }
 
 impl Broker for ActualBroker {
+    async fn bind_entity(
+        &self,
+        namespace: NamespaceName,
+        entity: EntityPath,
+    ) -> Result<domain::EntityBinding, BrokerRejection> {
+        self.handle
+            .bind_entity(namespace, entity)
+            .await
+            .map_err(|error| match error {
+                server::SubmitError::Propose(server::ProposeError::Broker(error)) => {
+                    BrokerRejection::Refused(error)
+                }
+                other => BrokerRejection::Unavailable(other.to_string()),
+            })
+    }
     fn submit_bound(
         &self,
         binding: domain::EntityBinding,
@@ -344,11 +387,15 @@ impl Actor {
         let store = GatedStore {
             backend,
             gate: Arc::clone(&gate),
+            observations: Arc::default(),
         };
         let clock = server::ManualClock::at(1_000);
         let owner = server::Broker::spawn(server::LocalProposer::new(
             StateMachine::new(store.clone()),
-            clock.clone(),
+            ObservedClock {
+                actual: clock.clone(),
+                observations: store.observations.clone(),
+            },
         ));
         let submissions = Arc::new(StdMutex::new(Vec::new()));
         let result_gate = Arc::new(ResultGate::default());
@@ -418,7 +465,10 @@ impl Actor {
     }
 
     fn request_broker(&self) -> RequestBroker<ActualBroker> {
-        RequestBroker::new(self.actual.as_ref().unwrap().clone())
+        RequestBroker::with_sender(
+            self.actual.as_ref().unwrap().clone(),
+            Arc::new(Ok(self.authority().binding().clone())),
+        )
     }
 
     fn accept(&self) -> SessionHold {
@@ -510,6 +560,7 @@ impl Actor {
         self.store = Some(GatedStore {
             backend,
             gate: Arc::clone(&self.gate),
+            observations: Arc::default(),
         });
         assert_eq!(&self.snapshot(), expected);
     }
@@ -573,7 +624,11 @@ async fn actual_cross_entity_token_collision_excludes_the_unrelated_ordinary_ali
             )
             .await;
         let request_response = management
-            .register_request_response_delivery(actor.entity.clone(), original.clone())
+            .register_request_response_delivery(
+                actor.entity.clone(),
+                original.clone(),
+                actor.authority().binding().clone(),
+            )
             .await;
         let selected = management
             .managed_delivery(&actor.entity, Some(LINK), token)
@@ -639,10 +694,20 @@ async fn actual_equal_payload_registrations_have_distinct_owners_for_remove_and_
         );
         let started = Instant::now();
         let old_rr = management
-            .register_request_response_delivery_at(actor.entity.clone(), delivery.clone(), started)
+            .register_request_response_delivery_at(
+                actor.entity.clone(),
+                delivery.clone(),
+                actor.authority().binding().clone(),
+                started,
+            )
             .await;
         let replacement_rr = management
-            .register_request_response_delivery_at(actor.entity.clone(), delivery, started)
+            .register_request_response_delivery_at(
+                actor.entity.clone(),
+                delivery,
+                actor.authority().binding().clone(),
+                started,
+            )
             .await;
         assert_ne!(old_rr, replacement_rr);
         let before_rr = management
@@ -701,7 +766,12 @@ async fn ordinary_authority_captures_an_expired_alias_and_renews_it_before_purge
         let now = Instant::now();
         let started = now - Duration::from_millis(lock.lock_duration_millis);
         let registration = management
-            .register_request_response_delivery_at(actor.entity.clone(), delivery.clone(), started)
+            .register_request_response_delivery_at(
+                actor.entity.clone(),
+                delivery.clone(),
+                actor.authority().binding().clone(),
+                started,
+            )
             .await;
         let selected = management
             .managed_delivery(&actor.entity, Some(LINK), lock.token)
@@ -725,7 +795,12 @@ async fn ordinary_authority_captures_an_expired_alias_and_renews_it_before_purge
             .clone();
         assert!(row.expires_at > now);
         let expired = management
-            .register_request_response_delivery_at(actor.entity.clone(), delivery.clone(), started)
+            .register_request_response_delivery_at(
+                actor.entity.clone(),
+                delivery.clone(),
+                actor.authority().binding().clone(),
+                started,
+            )
             .await;
         assert!(
             management
@@ -741,7 +816,12 @@ async fn ordinary_authority_captures_an_expired_alias_and_renews_it_before_purge
                 .contains_key(&expired.key)
         );
         let expired = management
-            .register_request_response_delivery_at(actor.entity.clone(), delivery, started)
+            .register_request_response_delivery_at(
+                actor.entity.clone(),
+                delivery,
+                actor.authority().binding().clone(),
+                started,
+            )
             .await;
         management
             .refresh_request_response_delivery_at(None, lock.lock_duration_millis, now)
@@ -842,7 +922,11 @@ async fn actual_management_results_preserve_replaced_owners_after_success_and_de
                         )
                         .await;
                     let replacement_rr = management
-                        .register_request_response_delivery(actor.entity.clone(), delivery.clone())
+                        .register_request_response_delivery(
+                            actor.entity.clone(),
+                            delivery.clone(),
+                            actor.authority().binding().clone(),
+                        )
                         .await;
                     assert_ne!(old, replacement);
                     assert_ne!(old_rr, replacement_rr);
@@ -982,7 +1066,11 @@ async fn register_lock(
         )
         .await;
     let request_response = management
-        .register_request_response_delivery(actor.entity.clone(), delivery.clone())
+        .register_request_response_delivery(
+            actor.entity.clone(),
+            delivery.clone(),
+            actor.authority().binding().clone(),
+        )
         .await;
     (ordinary, request_response)
 }
@@ -996,6 +1084,13 @@ async fn pending_once<F: Future + ?Sized>(mut future: Pin<&mut F>) {
         Poll::Ready(())
     })
     .await;
+}
+
+async fn drive_to_apply<F: Future + ?Sized>(future: Pin<&mut F>, gate: &ApplyGate) {
+    tokio::select! {
+        _ = future => panic!("original completed before its named apply frontier"),
+        () = gate.reached(false) => {},
+    }
 }
 
 async fn returned_while_pending(
@@ -1074,9 +1169,8 @@ async fn retirement_before_first_poll_never_invokes_an_eager_broker_constructor(
         let before = actor.snapshot();
         let broker = actor.request_broker();
         let mut operation = PendingOperation::new(
-            broker.submit(
-                actor.namespace.clone(),
-                actor.entity.clone(),
+            broker.submit_bound(
+                actor.authority().binding().clone(),
                 CommandKind::SetSessionState {
                     session: hold.clone(),
                     state: STATE.to_vec(),
@@ -1215,7 +1309,7 @@ async fn a_begun_actual_mutation_retains_its_original_raw_result_before_and_afte
             );
             let broker = actor.request_broker();
             let mut operation = PendingOperation::new(
-                broker.submit(actor.namespace.clone(), actor.entity.clone(), kind.clone()),
+                broker.submit_bound(actor.authority().binding().clone(), kind.clone()),
                 broker.control(),
             );
             let mut observation = Box::pin(operation.observe());
@@ -1706,8 +1800,7 @@ async fn actual_request_detach_drains_begun_session_mutation_without_a_new_ackno
                 Arc::clone(&management),
                 None,
             ));
-            pending_once(serving.as_mut()).await;
-            actor.gate.reached(false).await;
+            drive_to_apply(serving.as_mut(), &actor.gate).await;
             assert_eq!(actor.submissions.lock().unwrap().len(), 1);
             assert!(actor.submissions.lock().unwrap()[0].polled);
             assert!(actor.submissions.lock().unwrap()[0].result.is_none());
