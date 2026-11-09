@@ -191,6 +191,7 @@ The optional parser is pinned to `x509-parser` 0.18.1 (MIT OR Apache-2.0,
 declared MSRV 1.67.1), with signature-verification features disabled. The runtime
 uses the existing ring/rustls family, not OpenSSL/system TLS or AWS-LC. The locked
 parser graph includes `time` 0.3.54 (MSRV 1.88), below the workspace's pinned
-Rust 1.97.1. Default auth features do not select parser, rustls or Tokio runtime
-dependencies. Synthetic fixture signing is test-only and provides no runtime
+Rust 1.97.1. Disabled workload features add no workload-specific parser or PEM
+dependencies. Rustls and Tokio remain required by the separate OIDC client;
+enabling workload TLS reuses them. Synthetic fixture signing is test-only and provides no runtime
 signing or certificate-provisioning interface.
