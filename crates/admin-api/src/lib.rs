@@ -1,7 +1,12 @@
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+extern crate self as admin_api;
+
+pub mod atom;
 pub mod rpc;
 mod service;
+pub mod transport;
 
 /// Generated v1 protobuf clients, servers and messages, separate from the typed API.
 pub mod wire {

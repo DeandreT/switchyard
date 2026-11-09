@@ -28,8 +28,12 @@ or whole-test task-tree shutdown. See [selectors/limits](sdk-gates.md),
 Source-derived [Atom profiles](../crates/conformance/atom-fixtures/README.md)
 record indistinguishable definition/runtime collection requests and closed XML
 shapes. The in-memory .NET controls exercise request construction and synthetic
-response parsing, not a running endpoint. Atom remains unimplemented; ambiguous
-collections require refusal until truthful combined runtime data is available.
+response parsing, not a running endpoint. The opt-in [HTTP/1 HTTPS boundary](../crates/server/README.md#atom-https)
+uses offline namespace/entity Manage authorization with bounded TLS admission,
+headers, bodies, replies and deadlines. Production routes remain closed: definition
+singletons return 501, ambiguous/runtime profiles and writes 400 after authorization.
+There is no Atom CRUD/XML/rule adapter or SDK administration certification.
+Ambiguous collections require refusal until truthful combined runtime data is available.
 
 ## Implemented Surface
 

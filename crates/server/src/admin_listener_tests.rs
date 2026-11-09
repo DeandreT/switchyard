@@ -304,7 +304,7 @@ async fn listener_wide_rpc_bound_survives_repeated_client_cancellation_and_recon
     assert!(admin.take_failure().is_none());
     assert!(broker.is_none());
     assert_eq!(permits.available_permits(), LIMIT);
-    assert!(admin.calls.0.tasks.lock().unwrap().is_empty());
+    assert!(admin.calls.is_empty());
     assert_eq!(
         clock.calls.load(Ordering::SeqCst),
         4,
@@ -408,18 +408,15 @@ async fn completed_backend_unjoined_originals_keep_listener_capacity() -> TestRe
         0,
         "completed-but-unjoined originals still consume every slot"
     );
-    {
-        let originals = admin.calls.0.tasks.lock().unwrap();
-        assert_eq!(originals.tasks.len(), LIMIT);
-        assert_eq!(originals.permits.len(), LIMIT);
-    }
+    assert_eq!(admin.calls.len(), LIMIT);
+    assert_eq!(admin.calls.permit_count(), LIMIT);
     for _ in 0..8 {
         let status = rpc
             .create_entity(request(create("unjoined-overflow"), &token))
             .await
             .unwrap_err();
         assert_eq!(status.code(), Code::ResourceExhausted);
-        assert_eq!(admin.calls.0.tasks.lock().unwrap().tasks.len(), LIMIT);
+        assert_eq!(admin.calls.len(), LIMIT);
     }
     // Actual join, not backend completion or dropping a caller, returns one slot.
     admin
@@ -431,7 +428,7 @@ async fn completed_backend_unjoined_originals_keep_listener_capacity() -> TestRe
     rpc.create_entity(request(create("after-join"), &token))
         .await?;
     assert_eq!(permits.available_permits(), 0);
-    assert_eq!(admin.calls.0.tasks.lock().unwrap().tasks.len(), LIMIT);
+    assert_eq!(admin.calls.len(), LIMIT);
     let page =
         admin_api::EntityBackend::list(&handle, namespace, AdminCatalogKind::Queues, None, 100)
             .await?;
@@ -443,7 +440,7 @@ async fn completed_backend_unjoined_originals_keep_listener_capacity() -> TestRe
     tokio::time::timeout(WAIT, admin.finish()).await?;
     assert!(admin.take_failure().is_none());
     assert_eq!(permits.available_permits(), LIMIT);
-    assert!(admin.calls.0.tasks.lock().unwrap().is_empty());
+    assert!(admin.calls.is_empty());
     drop((admin, handle, broker));
     Ok(())
 }
@@ -511,8 +508,8 @@ async fn continuously_ready_families_reap_in_bounded_rotating_turns() -> TestRes
     calls.join_next().await.unwrap()?;
     streams.join_next().await.unwrap()?;
     connections.join_next().await.unwrap()?;
-    assert!(calls.0.tasks.lock().unwrap().is_empty());
-    assert!(streams.0.tasks.lock().unwrap().is_empty());
+    assert!(calls.is_empty());
+    assert!(streams.is_empty());
     assert!(connections.is_empty());
     assert_eq!(permits.available_permits(), 1);
     Ok(())
@@ -557,12 +554,12 @@ async fn original_panic_and_cancelled_join_waiter_return_capacity_only_on_join()
         0,
         "cancelling a pending join must retain its original and permit"
     );
-    assert_eq!(calls.0.tasks.lock().unwrap().tasks.len(), 1);
+    assert_eq!(calls.len(), 1);
     release.send(()).unwrap();
     tokio::time::timeout(WAIT, calls.join_next())
         .await?
         .unwrap()?;
     assert_eq!(permits.available_permits(), 1);
-    assert!(calls.0.tasks.lock().unwrap().is_empty());
+    assert!(calls.is_empty());
     Ok(())
 }

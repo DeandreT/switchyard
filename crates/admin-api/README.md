@@ -8,8 +8,8 @@ The existing typed `EntityService<B>` API remains separate and transport-free.
 `rpc::EntityRpc` adapts Create/Get/List to any `EntityBackend`. Construct it with
 the typed service, an offline `auth::JwtPolicy`, a namespace-root `ResourceScope`
 and a backend error classifier. `into_service()` returns only the generated
-entity server. This crate starts no listener, registers no other services, and
-does not configure TLS, shutdown or the CLI. Delete is unimplemented.
+entity server. This RPC adapter starts no listener, registers no other services,
+and does not configure TLS, shutdown or the CLI. Delete is unimplemented.
 
 Every unary call, including Get/List and the reserved Delete, requires exactly
 one `authorization: Bearer <JWT>` metadata value. The offline policy verifies the
@@ -44,3 +44,43 @@ explicit transport/router/codegen and ring TLS features use the workspace's
 rustls 0.23 / tokio-rustls 0.26 family, without enabling an AWS-LC provider. Direct
 tonic crates are pinned to 0.14.9 (MIT), prost to 0.14.4 (Apache-2.0), and the
 resolved graph is pinned in `Cargo.lock`.
+
+## Closed Atom HTTPS transport
+
+`atom::https::HttpsListener` owns a rustls HTTP/1 acceptor, independent of the
+native h2 service. Its production constructor installs only `ClosedRoutes`,
+without a broker handle or XML parser. Explicit definition-singleton GETs return
+501; ambiguous/runtime profiles and writes return 400. No empty successful
+catalog, runtime counters, CRUD or rule adapters are supplied.
+
+Every admitted request validates the existing offline `JwtPolicy` and requires
+Manage on its canonical namespace/entity resource before profile selection,
+handler callbacks or body polling. The authority is configured, never selected
+by HTTP Host; the TLS endpoint identity, resource host and JWT deployment audience
+are independent. There is no connection-level authorization cache.
+
+Management segments are structural, not globally reserved entity words:
+`rules` and leading `subscriptions` may name ordinary entities, and either may
+name a subscription. Only `Subscriptions` below a topic selects its collection
+or named subscription; extra suffixes such as `Rules` below that subscription
+remain unsupported and require the existing namespace-root authorization.
+
+`Handler` is a trusted Rust extension boundary for future adapters and transport
+tests, not a runtime plugin or server activation flag. It receives credential-free
+authorized metadata and bounded UTF-8 bytes; it must bound its own reply allocation
+and must not block the runtime. The boundary rejects oversized replies before
+writing them. It performs no XML validation; a future adapter must independently
+enforce strict XML resource limits with DTD/entity expansion disabled.
+
+Hyper decodes HTTP/1 framing: differing Content-Length values refuse, while
+Content-Length plus chunked Transfer-Encoding selects the chunked body and closes
+the connection. Only that one bounded request is handled; a pipelined second
+request is never dispatched. Trailers and invalid UTF-8 refuse before `handle`.
+
+Connections and accepted request originals have separate listener-wide quotas.
+`transport::TaskFamily` retains originals and their permits until actual join,
+including panic exits; native h2 uses the same custody primitive. Deadline or
+disconnect ends the wire wait, not begun callback work. A request that has not
+begun its callback at expiry cannot start it afterward. Finish joins connections
+and accepted work before its caller may stop a backend. See the server's
+[configuration, limits and shutdown contract](../server/README.md#atom-https).
