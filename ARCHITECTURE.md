@@ -147,9 +147,9 @@ recaptures after a refusal. Ordinary receiving links also capture once at attach
 polls, both receive modes, staged deletion and delayed settlements retain it.
 Ordinary delivery capabilities preserve this provenance for management settlement
 and renewal after selection, independently of registry lifetime. Session
-acceptance, renewal and release also retain original entity authority. Other
-request-link operations and deferred/session management capabilities still need
-their retained-authority adapter; legacy name APIs, timers and raw
+acceptance and release also retain original entity authority. Other request-link
+operations and deferred/session management capabilities, including session-lock
+renewal, still need their retained-authority adapter; legacy name APIs, timers and raw
 catalog/diagnostic reads are outside the declared AMQP fencing surface. No global
 orphan scan is added.
 See [topic routing](crates/domain/src/machine/topic.rs) and the

@@ -113,7 +113,7 @@ Production still refuses; quorum/recovery/runtime remain pending.
 
 | Gate | Remaining work |
 | --- | --- |
-| [M1](https://github.com/DeandreT/switchyard/milestone/1) | Lifecycle, authority, profiles, entity retirement, typed content. |
+| [M1](https://github.com/DeandreT/switchyard/milestone/1) | Lifecycle, authority, profiles and entity retirement. |
 | [M2](https://github.com/DeandreT/switchyard/milestone/2) | SDK/admin semantics, sustained Flow, capacity, same-group transactions. |
 | [M3](https://github.com/DeandreT/switchyard/milestone/3) | Recovery/quorum, identity/fairness, encrypted audit/backup, measured release. |
 
