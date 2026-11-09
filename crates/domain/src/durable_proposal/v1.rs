@@ -397,7 +397,7 @@ impl CopyBudget {
             .as_ref()
             .map(|value| {
                 // Overlays belong to stored V2 records, never to proposal intent.
-                if !value.overlay().is_empty() {
+                if !value.overlay().is_empty() || !value.removals().is_empty() {
                     return Err(Error::UnsupportedCommandVersion(1));
                 }
                 Ok(Box::new(Envelope {
@@ -665,6 +665,9 @@ impl Kind {
             | CommandKind::AbandonWithPatch { .. }
             | CommandKind::DeferWithPatch { .. }
             | CommandKind::DeadLetterWithPatch { .. } => {
+                return Err(Error::UnsupportedCommandVersion(1));
+            }
+            CommandKind::CreateRuleWithAction { .. } => {
                 return Err(Error::UnsupportedCommandVersion(1));
             }
         })

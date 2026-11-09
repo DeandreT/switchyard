@@ -131,6 +131,47 @@ pub fn validate_legacy_content(
                         }
                     })?;
                 report.message_rows += 1;
+                if let crate::MessageRecordFormat::V4 { text_ids } = record.format {
+                    if let Some(envelope) = &record.envelope {
+                        if envelope.removals().len() > crate::MAX_SQL_ACTION_PATCH_PROPERTIES
+                            || envelope.removals().iter().any(|name| {
+                                name.is_empty()
+                                    || name.len() > crate::MAX_SQL_EXPRESSION_BYTES
+                                    || name.chars().any(char::is_control)
+                            })
+                            || crate::content::effective_copy_len(
+                                envelope.as_bytes(),
+                                envelope.overlay(),
+                                envelope.removals(),
+                            ) > crate::CONTENT_LIMITS.max_bytes
+                        {
+                            return Err(invalid_record(
+                                row,
+                                "action copy exceeds its content bounds",
+                            ));
+                        }
+                        let expected = crate::content::effective_projection_with_removals(
+                            envelope.as_bytes(),
+                            envelope.overlay(),
+                            envelope.removals(),
+                            text_ids,
+                        )
+                        .map_err(|_| {
+                            invalid_record(row, "action copy projection cannot be derived")
+                        })?;
+                        if &expected != envelope.filter_properties() {
+                            return Err(invalid_record(
+                                row,
+                                "action copy projection does not match its content",
+                            ));
+                        }
+                    } else if record.body.len() > crate::CONTENT_LIMITS.max_bytes {
+                        return Err(invalid_record(
+                            row,
+                            "raw action error copy exceeds its content bound",
+                        ));
+                    }
+                }
                 // V2/V3 raw content has no envelope; a V1 overlay is unrepresentable.
                 if let Some(envelope) = &record.envelope {
                     decode_content(envelope.as_bytes(), LEGACY_CONTENT_LIMITS)
@@ -165,6 +206,11 @@ pub fn validate_legacy_content(
                         }
                     })?;
                 report.rule_rows += 1;
+                if let Some(action) = &definition.action {
+                    action
+                        .compile()
+                        .map_err(|_| invalid_record(row, "rule action cannot be compiled"))?;
+                }
                 if let RuleFilter::Correlation(filter) = &definition.filter {
                     for (ordinal, property) in filter.application_properties.values().enumerate() {
                         decode_value(property.as_bytes(), LEGACY_CONTENT_LIMITS).map_err(

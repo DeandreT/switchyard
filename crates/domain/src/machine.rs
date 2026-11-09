@@ -77,6 +77,7 @@ pub struct StateMachine<S> {
 pub(crate) enum PreparationFailure {
     Ordinary(BrokerError),
     HealthyRuleCapacity,
+    HealthySqlRuleCapacity,
     HealthySubscriptionCapacity,
 }
 
@@ -86,6 +87,9 @@ impl PreparationFailure {
             Self::Ordinary(error) => error,
             Self::HealthyRuleCapacity => BrokerError::RuleLimitExceeded {
                 maximum: crate::MAX_SUBSCRIPTION_RULES,
+            },
+            Self::HealthySqlRuleCapacity => BrokerError::SqlRuleLimitExceeded {
+                maximum: crate::MAX_TOPIC_SQL_RULES,
             },
             Self::HealthySubscriptionCapacity => BrokerError::SubscriptionLimitExceeded {
                 maximum: crate::MAX_TOPIC_SUBSCRIPTIONS,
@@ -148,8 +152,13 @@ impl<S: StateStore> StateMachine<S> {
                 self.create_subscription(command, name, *config, &mut batch)?
             }
             CommandKind::CreateRule { name, filter } => {
-                self.create_rule(command, name, filter, &mut batch)?
+                self.create_rule(command, name, filter, None, &mut batch)?
             }
+            CommandKind::CreateRuleWithAction {
+                name,
+                filter,
+                action,
+            } => self.create_rule(command, name, filter, Some(action), &mut batch)?,
             CommandKind::DeleteRule { name } => self.delete_rule(command, name, &mut batch)?,
             CommandKind::ListRules { skip, max_rules } => {
                 self.list_rules(command, *skip, *max_rules)?

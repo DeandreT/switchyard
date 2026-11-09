@@ -97,8 +97,13 @@ mTLS, transactions, and Atom/XML administration are not implemented.
 Immediate topic publication evaluates subscriptions and rules at command apply.
 Scheduled publication stores only a topic-owned placeholder: subscriptions and
 rules are evaluated at later activation, not send time. Each subscription starts
-with `$Default`; actionless true/false/correlation rules use OR across rules and
-typed AND within a correlation filter. Multiple matches produce one copy. A
+with `$Default`; actionless true/false/correlation/SQL rules use OR across rules and
+typed AND within a correlation filter. Multiple actionless matches produce one copy.
+Each matching action rule adds an isolated copy with a copy-local SET/removal
+overlay and an additional parent sequence slot. All filters inspect original
+input; complete bounded copy/sequence planning precedes writes. Exact action
+source uses rule V3/proposal V10, and deletion-bearing copies use message V4;
+see [SQL actions](docs/sql-actions.md) for bounds and failure policy. A
 publication with no matches succeeds without retaining an active copy. Payloads
 are copied per subscription; shared payload storage is not implemented.
 

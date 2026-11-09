@@ -38,6 +38,9 @@ macro_rules! paired {
     };
 }
 
+#[path = "sql_rule_fanout/durable_actions.rs"]
+mod durable_actions;
+
 fn text(value: &str) -> Text {
     Text {
         text: value.into(),
@@ -598,6 +601,7 @@ fn uncompilable_stored_rule<P: StoreProvider>(provider: P) -> TestResult {
     let name = RuleName::new("hot")?;
     let key = keys::subscription_rule(&t.namespace, &entity, &name);
     let corrupt = codec::rule::encode(&RuleDefinition {
+        action: None,
         name,
         filter: sql("priority >"),
         created_at: Timestamp::from_millis(2),
@@ -634,6 +638,7 @@ fn rule_record_fence_keeps_legacy_bytes_and_versions_sql() {
     let name = RuleName::new("Hot").unwrap();
     for filter in [RuleFilter::True, RuleFilter::False] {
         let definition = RuleDefinition {
+            action: None,
             name: name.clone(),
             filter,
             created_at: Timestamp::from_millis(7),
@@ -643,6 +648,7 @@ fn rule_record_fence_keeps_legacy_bytes_and_versions_sql() {
         assert_eq!(codec::rule::decode(&legacy).unwrap(), definition);
     }
     let definition = RuleDefinition {
+        action: None,
         name: name.clone(),
         filter: sql("a = 1"),
         created_at: Timestamp::from_millis(7),
@@ -823,8 +829,13 @@ fn sql_rule_quota<P: StoreProvider>(provider: P) -> TestResult {
         seeded.push_put(
             keys::subscription_rule(&t.namespace, &entity, &name),
             codec::rule::encode(&RuleDefinition {
+                action: (index == 0).then(|| domain::SqlRuleAction::new("REMOVE user.unused")),
                 name,
-                filter: sql(&expression(index)),
+                filter: if index == 0 {
+                    RuleFilter::True
+                } else {
+                    sql(&expression(index))
+                },
                 created_at: Timestamp::from_millis(2),
             })?,
         );
@@ -847,6 +858,21 @@ fn sql_rule_quota<P: StoreProvider>(provider: P) -> TestResult {
     );
     let before = image(&machine);
     for entity in ["a", "b"] {
+        assert_eq!(
+            t.apply(
+                &machine,
+                &t.subscription(entity),
+                3,
+                CommandKind::CreateRuleWithAction {
+                    name: RuleName::new("over-action")?,
+                    filter: RuleFilter::True,
+                    action: domain::SqlRuleAction::new("REMOVE user.unused"),
+                }
+            ),
+            Err(BrokerError::SqlRuleLimitExceeded {
+                maximum: MAX_TOPIC_SQL_RULES
+            })
+        );
         assert_eq!(
             create(entity, "over", sql("1 = 1")),
             Err(BrokerError::SqlRuleLimitExceeded {

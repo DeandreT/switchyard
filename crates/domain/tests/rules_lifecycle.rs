@@ -194,6 +194,7 @@ fn default_rules_are_atomic_durable_and_case_insensitive<P: StoreProvider>(
     assert_eq!(
         fixture.list_rules(&subscription, 11, 0, 10)?,
         vec![RuleDefinition {
+            action: None,
             name: RuleName::new(DEFAULT_RULE_NAME)?,
             filter: RuleFilter::True,
             created_at: Timestamp::from_millis(10),

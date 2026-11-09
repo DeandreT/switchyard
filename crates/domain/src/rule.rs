@@ -5,6 +5,9 @@ use thiserror::Error;
 
 use crate::{RuleName, SqlCompileError, SqlProgram, Timestamp};
 
+mod action_intent;
+pub use action_intent::SqlRuleAction;
+
 mod action;
 pub use action::{
     MAX_SQL_ACTION_PATCH_BYTES, MAX_SQL_ACTION_PATCH_PROPERTIES, MAX_SQL_ACTION_STATEMENTS,
@@ -24,8 +27,8 @@ pub const MAX_RULE_PAGE: u32 = 100;
 pub const MAX_CORRELATION_FILTER_BYTES: usize = 256 * 1024;
 pub const MAX_CORRELATION_VALUE_BYTES: usize = MAX_CORRELATION_FILTER_BYTES;
 /// Most SQL rules retained across all subscriptions of one topic, Azure's
-/// Standard quota. Correlation, true and false rules count only toward the
-/// per-subscription limit.
+/// Standard quota. Action-bearing rules count once regardless of filter kind;
+/// actionless correlation, true and false rules count only per subscription.
 pub const MAX_TOPIC_SQL_RULES: usize = 2_000;
 /// Dead-letter reason Switchyard chose for a subscription copy whose SQL
 /// filter failed to evaluate. It is taken from the exception name Azure's
@@ -239,8 +242,7 @@ impl SqlRuleFilter {
     }
 }
 
-/// An actionless subscription filter. Actions remain an explicit future
-/// variant rather than text this build would silently accept.
+/// A subscription predicate, separate from its optional rule action.
 // The correlation payload stays inline so this public durable value remains
 // straightforward to construct at protocol boundaries. The number of rules
 // evaluated for one subscription is bounded.
@@ -287,11 +289,57 @@ impl RuleFilter {
 
 /// Durable rule revision. `created_at` comes from the replicated command, not
 /// from a local clock, so every replica and restart reports the same value.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuleDefinition {
     pub name: RuleName,
     pub filter: RuleFilter,
     pub created_at: Timestamp,
+    pub action: Option<SqlRuleAction>,
+}
+
+// The ordinary serde profile is the frozen actionless V1 shape. New action
+// records must go through codec::rule's explicit versioned representation;
+// generic legacy serialization must refuse instead of dropping the action.
+#[derive(Serialize)]
+struct LegacyRuleRef<'a> {
+    name: &'a RuleName,
+    filter: &'a RuleFilter,
+    created_at: Timestamp,
+}
+
+#[derive(Deserialize)]
+struct LegacyRule {
+    name: RuleName,
+    filter: RuleFilter,
+    created_at: Timestamp,
+}
+
+impl Serialize for RuleDefinition {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.action.is_some() {
+            return Err(serde::ser::Error::custom(
+                "action rules require the versioned rule codec",
+            ));
+        }
+        LegacyRuleRef {
+            name: &self.name,
+            filter: &self.filter,
+            created_at: self.created_at,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RuleDefinition {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let legacy = LegacyRule::deserialize(deserializer)?;
+        Ok(Self {
+            name: legacy.name,
+            filter: legacy.filter,
+            created_at: legacy.created_at,
+            action: None,
+        })
+    }
 }
 
 impl RuleDefinition {
@@ -300,12 +348,17 @@ impl RuleDefinition {
             name: RuleName::new(DEFAULT_RULE_NAME).expect("the default rule name is valid"),
             filter: RuleFilter::True,
             created_at,
+            action: None,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum RuleConfigError {
+    #[error("SQL action fanout exceeds its bounded command plan")]
+    SqlActionPlanLimit,
+    #[error("SQL action cannot be compiled: {0}")]
+    SqlAction(SqlActionCompileError),
     #[error("SQL filter cannot be compiled: {0}")]
     Sql(SqlCompileError),
     #[error("session-id correlation predicates require session-aware topic fanout")]

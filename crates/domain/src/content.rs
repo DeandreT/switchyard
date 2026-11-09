@@ -122,7 +122,35 @@ pub(crate) fn effective_projection(
     overlay: &[OverlayProperty],
     text_ids: bool,
 ) -> Result<FilterProperties, MessageContentError> {
-    let content = decode_content(original, CONTENT_LIMITS).map_err(MessageContentError::Amqp)?;
+    effective_projection_with_removals(original, overlay, &[], text_ids)
+}
+
+pub(crate) fn effective_copy_len(
+    original: &[u8],
+    overlay: &[OverlayProperty],
+    removals: &[String],
+) -> usize {
+    removals.iter().fold(
+        effective_len(original, overlay).saturating_add(overlay.len().saturating_mul(5)),
+        |n, name| n.saturating_add(name.len()).saturating_add(5),
+    )
+}
+
+pub(crate) fn effective_projection_with_removals(
+    original: &[u8],
+    overlay: &[OverlayProperty],
+    removals: &[String],
+    text_ids: bool,
+) -> Result<FilterProperties, MessageContentError> {
+    let mut content =
+        decode_content(original, CONTENT_LIMITS).map_err(MessageContentError::Amqp)?;
+    let removed = removals
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if let Some(properties) = &mut content.application_properties {
+        properties.retain(|(name, _)| !removed.contains(name.text.as_str()));
+    }
     let values = overlay
         .iter()
         .map(|property| {
@@ -401,7 +429,7 @@ enum Position {
 /// what rule values are compared with. The output is bounded by the retained
 /// correlation-value ceiling so a single huge or deeply duplicated value cannot
 /// cost unbounded work on every apply and replay.
-fn encode_correlation_value(value: &Value) -> Result<Vec<u8>, MessageContentError> {
+pub(crate) fn encode_correlation_value(value: &Value) -> Result<Vec<u8>, MessageContentError> {
     let mut out = Vec::new();
     // A value may reach, but not exceed, the retained correlation-value ceiling,
     // so the budget is exactly that ceiling. Nested containers are buffered and

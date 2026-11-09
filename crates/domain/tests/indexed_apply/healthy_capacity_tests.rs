@@ -86,6 +86,7 @@ fn seed_full<P: StoreProvider>(
                 batch.push_put(
                     keys::subscription_rule(&namespace(), &subscription(), &name),
                     codec::encode(&RuleDefinition {
+                        action: None,
                         name,
                         filter: RuleFilter::True,
                         created_at: Timestamp::from_millis(20),
@@ -288,6 +289,7 @@ fn corrupt_catalog<P: StoreProvider>(
                     &mut undo,
                     keys::subscription_rule(&namespace(), &subscription(), &name),
                     codec::encode(&RuleDefinition {
+                        action: None,
                         name,
                         filter: RuleFilter::Correlation(CorrelationFilter::default()),
                         created_at: Timestamp::from_millis(20),

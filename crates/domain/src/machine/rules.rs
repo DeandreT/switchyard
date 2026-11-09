@@ -1,4 +1,4 @@
-//! Durable actionless subscription rules and bounded rule browsing.
+//! Durable subscription filters/actions and bounded rule browsing.
 //!
 //! Every filter, SQL included, is validated and canonicalized before anything
 //! is staged, so an invalid definition refuses without mutation.
@@ -16,7 +16,11 @@ use crate::{
 use super::{PreparationFailure, StateMachine, topic_routing::ProgramCache};
 
 /// One validated rule row, with its compiled program when it is a SQL rule.
-pub(super) type CheckedRule = (RuleDefinition, Option<Arc<SqlProgram>>);
+pub(super) type CheckedRule = (
+    RuleDefinition,
+    Option<Arc<SqlProgram>>,
+    Option<Arc<crate::SqlActionProgram>>,
+);
 
 impl<S: StateStore> StateMachine<S> {
     /// Lists durable rules in canonical-name order.
@@ -42,10 +46,17 @@ impl<S: StateStore> StateMachine<S> {
         command: &Command,
         name: &RuleName,
         filter: &RuleFilter,
+        action: Option<&crate::SqlRuleAction>,
         batch: &mut WriteBatch,
     ) -> Result<CommandOutcome, PreparationFailure> {
         self.ensure_subscription(&command.namespace, &command.entity)?;
         let filter = filter.canonicalized().map_err(BrokerError::from)?;
+        if let Some(action) = action {
+            action
+                .compile()
+                .map_err(crate::RuleConfigError::SqlAction)
+                .map_err(BrokerError::from)?;
+        }
         let key = keys::subscription_rule(&command.namespace, &command.entity, name);
         if self.store().get(&key).map_err(BrokerError::from)?.is_some() {
             return Err(BrokerError::RuleAlreadyExists { name: name.clone() }.into());
@@ -54,16 +65,35 @@ impl<S: StateStore> StateMachine<S> {
             // The bounded reader already rejected overfull or invalid touched rows.
             return Err(PreparationFailure::HealthyRuleCapacity);
         }
-        if !filter.is_legacy_representable()
-            && self.topic_sql_rules(&command.namespace, &command.entity)? >= MAX_TOPIC_SQL_RULES
-        {
-            return Err(BrokerError::SqlRuleLimitExceeded {
-                maximum: MAX_TOPIC_SQL_RULES,
+        if action.is_some() || !filter.is_legacy_representable() {
+            let count = self.topic_sql_rules(&command.namespace, &command.entity)?;
+            if count > MAX_TOPIC_SQL_RULES {
+                // Overfull is already established without compiling stored
+                // sources. It is an ordinary fail-stop, never a healthy origin.
+                return Err(BrokerError::SqlRuleLimitExceeded {
+                    maximum: MAX_TOPIC_SQL_RULES,
+                }
+                .into());
             }
-            .into());
+            if count == MAX_TOPIC_SQL_RULES {
+                // Version counting alone is not a health proof. Only a complete
+                // canonical/compiled exact-full catalog can checkpoint a refusal.
+                // Keep below-quota creation's existing unselected-reader boundary.
+                return Err(
+                    match self.checked_topic_sql_rules(&command.namespace, &command.entity)? {
+                        MAX_TOPIC_SQL_RULES => PreparationFailure::HealthySqlRuleCapacity,
+                        count if count > MAX_TOPIC_SQL_RULES => BrokerError::SqlRuleLimitExceeded {
+                            maximum: MAX_TOPIC_SQL_RULES,
+                        }
+                        .into(),
+                        _ => BrokerError::EntityMetadataCorrupt.into(),
+                    },
+                );
+            }
         }
 
         let definition = RuleDefinition {
+            action: action.cloned(),
             name: name.clone(),
             filter,
             created_at: command.issued_at,
@@ -123,12 +153,13 @@ impl<S: StateStore> StateMachine<S> {
         Ok(self
             .checked_rules(namespace, subscription, &mut ProgramCache::default())?
             .into_iter()
-            .map(|(definition, _)| definition)
+            .map(|(definition, _, _)| definition)
             .collect())
     }
 
-    /// Stored SQL rule rows across every subscription of the subscription's
-    /// topic. Rows are counted by their SQL record version without compiling
+    /// Stored SQL/action rows across every subscription of the subscription's
+    /// topic. V2 SQL and V3 action records each consume one quota slot, regardless
+    /// of filter kind. Rows are counted by their record version without compiling
     /// them; the selected subscription's rows were already fully validated.
     fn topic_sql_rules(
         &self,
@@ -149,9 +180,48 @@ impl<S: StateStore> StateMachine<S> {
                         MAX_SUBSCRIPTION_RULES + 1,
                     )?
                     .iter()
-                    .filter(|(_, value)| value.first() == Some(&codec::rule::VALUE_FORMAT_V2))
+                    .filter(|(_, value)| matches!(value.first(), Some(2 | 3)))
                     .count(),
             );
+            if count > MAX_TOPIC_SQL_RULES {
+                // No later sibling can make an overfull catalog healthy.
+                return Ok(count);
+            }
+        }
+        Ok(count)
+    }
+
+    /// Proves every bounded sibling rule row before the healthy quota origin
+    /// can be minted. Overfull or malformed catalogs never become client refusals.
+    fn checked_topic_sql_rules(
+        &self,
+        namespace: &NamespaceName,
+        subscription: &EntityPath,
+    ) -> Result<usize, BrokerError> {
+        let (topic, _) = subscription
+            .as_str()
+            .split_once(SUBSCRIPTION_PATH_SEGMENT)
+            .ok_or(BrokerError::SubscriptionNotFound)?;
+        let topic = EntityPath::from_internal(topic.to_owned())?;
+        let mut cache = ProgramCache::default();
+        let mut count = 0usize;
+        for sibling in self.subscriptions(namespace, &topic, usize::MAX)? {
+            count = count.saturating_add(
+                self.checked_rules(namespace, &sibling, &mut cache)?
+                    .iter()
+                    .filter(|(definition, _, _)| {
+                        definition.action.is_some()
+                            || matches!(definition.filter, RuleFilter::Sql(_))
+                    })
+                    .count(),
+            );
+            if count > MAX_TOPIC_SQL_RULES {
+                // Defensive bound even if the raw count and canonical proof
+                // disagree: never retain programs for further siblings.
+                return Err(BrokerError::SqlRuleLimitExceeded {
+                    maximum: MAX_TOPIC_SQL_RULES,
+                });
+            }
         }
         Ok(count)
     }
@@ -208,7 +278,16 @@ impl<S: StateStore> StateMachine<S> {
                         None
                     }
                 };
-                Ok((definition, program))
+                let action = definition
+                    .action
+                    .as_ref()
+                    .map(|action| {
+                        cache
+                            .action(action.expression())
+                            .ok_or(BrokerError::EntityMetadataCorrupt)
+                    })
+                    .transpose()?;
+                Ok((definition, program, action))
             })
             .collect()
     }

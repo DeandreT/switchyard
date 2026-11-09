@@ -64,7 +64,7 @@ fn v9_refuses_unknown_versions_and_older_schema_dispatch() {
         content: MessageContent::AmqpTextIds(vec![0xff]),
     });
     let bytes = proposal.encode().unwrap();
-    for version in [0_u32, 10, u32::MAX] {
+    for version in [0_u32, 11, u32::MAX] {
         let mut unknown = bytes.clone();
         unknown[4..8].copy_from_slice(&version.to_be_bytes());
         assert_eq!(

@@ -46,7 +46,7 @@ collections require refusal until truthful combined runtime data is available.
 | Topic profiles | Domain-only parent-topic size/TTL and named-subscription lock/delivery-count/TTL/expiry-policy/filter-error-policy patches prove all listed children before changing profiles. Size propagates to backing queues/DLQs; topic TTL does not overwrite child TTL. No-op direct calls preserve Clock; no administration or protocol activation. |
 | Topics/rules | Non-session immediate/scheduled singular/batch fanout; placeholder peek/cancel; independent subscription queues. Durable `$Default`, actionless true/false/correlation, typed equality; create/delete/paginated AMQP rules. Bounded [SQL](sql-predicates.md) filters over the stored typed projection: `add-rule` stores any compilable `sql-filter` expression verbatim and refuses others with 400 and the compile error; `enumerate-rules` returns them as `sql-filter` with the exact text and compatibility level 20. The SDK expressions `1=1`/`1=0` stay true/false filters. Non-empty `sql-rule-action` refuses. |
 | Time/identity | Bounded activation/lock/TTL/session-lock/history expiry. ASCII-folded namespace/entity/subscription addresses and SAS scope; session/placement IDs retain case. |
-| Local APIs | [Offline RS256 JWT](offline-jwt.md): pinned keys/local rights, issuer-qualified grants and explicit TLS server CBS configuration; opt-in [native TLS/h2 EntityService](../crates/server/README.md) requires namespace-root Manage at current time for every RPC. SAS/PLAIN retain verified namespace-host qualification. [SQL filter kernel](sql-predicates.md): bounded local grammar/errors, IN/LIKE/scalar arithmetic. [SQL action kernel](sql-actions.md): bounded REMOVE/literal SET producing typed, isolated patches. No stored/wire SQL actions. |
+| Local APIs | [Offline RS256 JWT](offline-jwt.md): pinned keys/local rights, issuer-qualified grants and explicit TLS server CBS configuration; opt-in [native TLS/h2 EntityService](../crates/server/README.md) requires namespace-root Manage at current time for every RPC. SAS/PLAIN retain verified namespace-host qualification. [SQL filter kernel](sql-predicates.md): bounded local grammar/errors, IN/LIKE/scalar arithmetic. [SQL actions](sql-actions.md): bounded REMOVE/literal SET, durable domain rules and isolated ordinary/batch/scheduled copies. No SQL action wire management. |
 | Storage | Paired Memory/Fjall semantics; Fjall journal fsync before applied outcomes; exclusive directory ownership. |
 
 Administration Get/page reads select one namespace and validate
@@ -122,8 +122,9 @@ Selected operational queue-profile reads validate after decode/owner proof,
 including backing queues/DLQs; invalid limits are corruption. Unread rows/raw
 catalogues are not certified; profile-free legacy operations remain unchanged.
 Typed content (#16) and actionless SQL filters (#20) are complete. Administration
-setters/capacity and durable SQL actions/fanout (#21) remain pending. Grant consumers preserve verified
-principal identity and both validity bounds for SAS and explicitly configured TLS JWT CBS.
+setters/capacity and SQL action wire management (#337) remain pending. Grant consumers
+preserve verified principal identity and both validity bounds for SAS and explicitly
+configured TLS JWT CBS.
 Native admin RPCs use the configured offline JWT policy.
 
 ### Absolute link addresses
@@ -218,7 +219,7 @@ older native implementation does not enforce these receive-storage bounds.
 | SQL filter errors | Azure dead-letters a message whose subscription filter throws by default; Switchyard's specific behavior is its own choice, not verified against Azure. When no rule of a subscription matches and a SQL rule fails to evaluate (type mismatch, unsupported or ambiguous property, overflow, budget), the subscription gets one dead-lettered copy with reason `FilterException` and description `rule <name>: <fixed error text>` for the first failing rule in name order. Any matching rule still delivers despite a failing sibling. Ordinary, batch and scheduled fanout behave alike. |
 | Filter-error discard | Subscriptions carry `dead_lettering_on_filter_evaluation_exceptions` (Azure `DeadLetteringOnFilterEvaluationExceptions`), defaulting on as in Azure. Off, the copy a filter error would dead-letter is discarded: nothing is written for that subscription and its DLQ is not reported as populated. It is set at creation and changed by subscription profile updates, independently of `dead_lettering_on_message_expiration`; a change governs later fanout and activations only. Domain-only: administration and AMQP still create subscriptions with the default. |
 | Filter identifiers | New AMQP sends expose message/correlation IDs to SQL and correlation filters as unchanged strings, invariant decimal ulong, lowercase hyphenated UUID or uppercase hexadecimal binary. Retained V1/V2 projections keep legacy UUID debug text and lowercase binary text; duplicate-detection identities remain legacy regardless of projection version. These forms follow Azure SDK source, not live Azure filter-service verification; see the record-format contract below. |
-| SQL rule quota | At most 2,000 SQL rules across all subscriptions of a topic (Azure's quota); the next SQL rule refuses with `SqlRuleLimitExceeded`. True/false/correlation rules keep only the per-subscription limit. |
+| SQL rule quota | At most 2,000 SQL-filter or action-bearing rules across all subscriptions of a topic; a rule with both counts once. The next refuses with `SqlRuleLimitExceeded`. Actionless true/false/correlation rules keep only the per-subscription limit. |
 | Topic sequences | Each offered publication and selected due placeholder consumes one topic-owned slot, even with no matching subscriptions; fanout copies consume none. MAX-1 is the last fresh slot and MAX refuses with nonretryable `SequenceNumberExhausted`. Crossing batches or bounded activation sets retain every original record, counter and Clock without partial fanout. Idle activation and cancellation need no slot. |
 | Browse/deferred | Positive signed peek count, reply cap 250, scan to cap/end; deferred retrieval atomically accepts at most 32 sequences in caller order. |
 | Outbound message size | A receiving peer's nonzero link `max-message-size` bounds each rendered transfer; absent, zero or the maximum value is unlimited. An oversized delivery is never sent: the link detaches with `amqp:link:message-size-exceeded` and the message lock is left to expire, not dead-lettered at once. Each refused lock counts a delivery, so a message whose lock expires at the queue's max delivery count dead-letters with `MaxDeliveryCountExceeded`, including staged receive-and-delete and receive-by-sequence locks. Receive-and-delete on a bounded link locks, measures, then deletes, so a refusal loses nothing; it costs an extra command per message. Peek returns the longest prefix that fits the reply link; receive-by-sequence is all or nothing. Either answers 403 `amqp:link:message-size-exceeded` when nothing fits, leaving any locks to expire. A reply link attached after its request was processed gets that error instead of an oversized reply. Receive-and-delete by sequence waits up to the reply-routing timeout for its reply link and otherwise answers 400 without deleting anything; peek-lock and peek need no attached reply link. |
@@ -357,7 +358,12 @@ subscription intent without it keeps its V1/V2/V5 bytes. All other forms keep th
 bytes. Azure-text-ID content sends use private V9, composing an exact canonical
 V4 send envelope with one 0/1 mode byte per child; at least one child must select new
 AMQP projection semantics. Nested envelopes must be V4, never recursively V9. Decoding
-does not parse AMQP. New readers accept exactly V1 through V9; older
+does not parse AMQP. Domain action-rule creation uses V10, composing an exact
+V1/V6 actionless creation envelope with exact UTF-8 action source. Only those
+nested versions are accepted, so nesting cannot recurse. Bound action intent
+requires the exact subscription target/owner and a nonzero retained generation.
+Invalid action source survives capture for deterministic admission refusal.
+New readers accept exactly V1 through V10; older
 readers refuse unsupported proposal versions. AMQP ingress sends every message as V9:
 a transfer as `SendContent`, and a
 Service Bus batch or scheduled-message request as `SendContentBatch` with each child's
@@ -395,7 +401,10 @@ text that no longer compiles is corruption, refused by rule reads, fanout and sn
 validation. The SQL grammar, value semantics and limits are therefore frozen for V2 rule
 records: a change that could accept, refuse or evaluate stored text differently needs a
 new rule-record version. Fanout compiles each distinct expression once per command, in
-memory only. Filter-error copies use the existing application dead-letter reason
+memory only. Action-bearing rules use rule V3 and recompile both programs before
+selection; see [SQL actions](sql-actions.md) for copy/error/quota policy. Legacy
+rule serialization refuses action-bearing definitions instead of dropping actions.
+Actionless filter-error copies use the existing application dead-letter reason
 encoding, so their message records are unchanged.
 See [profile lifecycle](lifecycle.md#profile-updates).
 
@@ -407,9 +416,12 @@ order; each value one encoded AMQP value, where null is a value) and no duplicat
 different system-ID projection semantics. Old message-record readers refuse V3 at the
 version byte instead of silently treating it as V2. Raw content still writes V2.
 Rewrites, topic copies, scheduled activation and dead-letter moves keep the version a
-record was read with; only a property patch converts V1 to V2. Durable proposals
-refuse envelopes carrying overlays. Runtime V1 reads keep tolerating trailing bytes;
-V2/V3 framing is exact, and snapshot validation requires canonical rows of all versions.
+record was read with; only a property patch converts V1 to V2. Action copies use
+message V4: the frozen V2 content layout, followed by a Boolean ID projection mode
+and unique removal names disjoint from SET names. Removal is not AMQP null.
+Subsequent rewrites retain V4 and its ID mode. Durable proposals
+refuse envelopes carrying overlays or removals. Runtime V1 reads keep tolerating trailing bytes;
+V2..V4 framing is exact, and snapshot validation requires canonical rows of all versions.
 Store-upgrade preflight, snapshot capture/restore/compaction and committed replay use
 the same versioned record/proposal readers. No open, preflight or upgrade rewrites old
 record bytes. This is a per-record/per-proposal refusal fence, not a whole-store

@@ -90,6 +90,7 @@ fn rule_row(properties: BTreeMap<String, CorrelationValue>) -> (Key, Value) {
         .unwrap();
     let name = RuleName::new("match").unwrap();
     let definition = RuleDefinition {
+        action: None,
         name: name.clone(),
         filter: RuleFilter::Correlation(CorrelationFilter {
             application_properties: properties,

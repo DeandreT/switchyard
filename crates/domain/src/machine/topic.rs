@@ -20,6 +20,270 @@ use super::{
 type SubscriptionFanoutState = (QueueConfig, CompiledRules);
 type TopicFanoutState = (Vec<EntityPath>, Vec<SubscriptionFanoutState>);
 
+/// Action work retained by one ordinary/batch/activation command. Discarded
+/// attempts count too, so error policy cannot bypass the planning bound.
+#[derive(Default)]
+pub(super) struct ActionPlanBudget {
+    attempts: usize,
+    bytes: usize,
+}
+
+impl ActionPlanBudget {
+    fn charge(
+        &mut self,
+        record: &crate::MessageRecord,
+        properties: Option<&FilterProperties>,
+    ) -> Result<(), BrokerError> {
+        self.attempts = self.attempts.saturating_add(1);
+        let original = record
+            .envelope
+            .as_ref()
+            .map_or(record.body.len(), MessageEnvelope::len);
+        let projection = properties.map_or(0, |p| {
+            let system = [
+                &p.correlation_id,
+                &p.message_id,
+                &p.to,
+                &p.reply_to,
+                &p.subject,
+                &p.session_id,
+                &p.reply_to_session_id,
+                &p.content_type,
+            ]
+            .into_iter()
+            .flatten()
+            .fold(0usize, |n, s| n.saturating_add(s.len()));
+            p.application_properties.iter().fold(system, |n, (k, v)| {
+                n.saturating_add(k.len()).saturating_add(v.as_bytes().len())
+            })
+        });
+        let bytes = original.saturating_add(projection);
+        self.bytes = self
+            .bytes
+            .saturating_add(bytes)
+            .saturating_add(crate::PROPERTY_PATCH_HEADROOM_BYTES);
+        if self.attempts > 4096 || self.bytes > 64 * 1024 * 1024 {
+            return Err(crate::RuleConfigError::SqlActionPlanLimit.into());
+        }
+        Ok(())
+    }
+}
+
+pub(super) struct PlannedCopy {
+    index: usize,
+    sequence: SequenceNumber,
+    lifetime: Option<u64>,
+    envelope: Option<MessageEnvelope>,
+    action: bool,
+    failure: Option<(String, &'static str)>,
+}
+
+pub(super) fn reserve_sequence(
+    counters: &mut crate::QueueCounters,
+) -> Result<SequenceNumber, BrokerError> {
+    let sequence = SequenceNumber::new(counters.next_sequence);
+    counters.next_sequence = counters
+        .next_sequence
+        .checked_add(1)
+        .ok_or(BrokerError::SequenceNumberExhausted)?;
+    Ok(sequence)
+}
+
+/// Pure full-copy selection: every filter observes the original input and
+/// every action starts from a separate original copy. No writes or clocks.
+pub(super) fn plan_copies(
+    record: &crate::MessageRecord,
+    properties: &FilterProperties,
+    state: &[SubscriptionFanoutState],
+    topic_lifetime: Option<u64>,
+    counters: &mut crate::QueueCounters,
+    budget: &mut ActionPlanBudget,
+) -> Result<Vec<PlannedCopy>, BrokerError> {
+    let typed = TypedProperties::new(properties, uses_sql(state))?;
+    let routing = typed.input();
+    // Actions use typed canonical content, not an arbitrary legacy caller's
+    // projection. A malformed envelope refuses the whole command; a raw message
+    // has no application-property content and fails only matching action copies.
+    let action_properties = if state.iter().any(|(_, rules)| rules.maximum_copies() > 1) {
+        record
+            .envelope
+            .as_ref()
+            .map(|envelope| {
+                crate::content::effective_projection_with_removals(
+                    envelope.as_bytes(),
+                    envelope.overlay(),
+                    envelope.removals(),
+                    record.format.uses_text_ids(),
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let action_typed = action_properties
+        .as_ref()
+        .map(|p| TypedProperties::new(p, true))
+        .transpose()?;
+    let mut plan = Vec::new();
+    for (index, (config, rules)) in state.iter().enumerate() {
+        for route in rules.route(&routing) {
+            let action = matches!(
+                route,
+                Route::Action { .. } | Route::ActionFilterError { .. }
+            );
+            if action {
+                budget.charge(record, action_properties.as_ref())?;
+            }
+            if matches!(
+                route,
+                Route::ActionFilterError {
+                    dead_letter_on_failure: false,
+                    ..
+                }
+            ) {
+                // Discards still consume work/byte allowance, but never clone
+                // an envelope or reserve an extra parent sequence slot.
+                continue;
+            }
+            let mut envelope = if action {
+                record.envelope.as_ref().map(|e| {
+                    e.clone().with_filter_properties(
+                        action_properties
+                            .as_ref()
+                            .expect("AMQP action input was derived")
+                            .clone(),
+                    )
+                })
+            } else {
+                None
+            };
+            let failure = match route {
+                Route::Deliver => None,
+                Route::DeadLetter(description) | Route::ActionFilterError { description, .. } => {
+                    Some((description, crate::FILTER_EVALUATION_DEAD_LETTER_REASON))
+                }
+                Route::Action {
+                    program,
+                    dead_letter_on_failure,
+                } => {
+                    let mut copy = record.clone();
+                    let result = action_typed
+                        .as_ref()
+                        .ok_or(())
+                        .and_then(|typed| {
+                            program
+                                .evaluate(
+                                    typed.input().context(),
+                                    &mut crate::SqlEvaluationBudget::default(),
+                                )
+                                .map_err(|_| ())
+                        })
+                        .and_then(|patch| {
+                            super::patch::apply_action(config, &mut copy, patch).map_err(|_| ())
+                        });
+                    match result {
+                        Ok(()) => {
+                            envelope = copy.envelope;
+                            None
+                        }
+                        Err(()) if !dead_letter_on_failure => continue,
+                        Err(()) => Some((
+                            "SQL action failed; no changes were applied".to_owned(),
+                            "ActionException",
+                        )),
+                    }
+                }
+            };
+            if action
+                && record.envelope.is_none()
+                && record.body.len() > crate::CONTENT_LIMITS.max_bytes
+            {
+                return Err(BrokerError::MessageTooLarge {
+                    body_bytes: record.body.len(),
+                    maximum_bytes: crate::CONTENT_LIMITS.max_bytes,
+                });
+            }
+            let sequence = if action {
+                reserve_sequence(counters)?
+            } else {
+                record.sequence
+            };
+            plan.push(PlannedCopy {
+                index,
+                sequence,
+                lifetime: effective_time_to_live(
+                    topic_lifetime,
+                    config.default_time_to_live_millis,
+                ),
+                envelope,
+                action,
+                failure,
+            });
+        }
+    }
+    Ok(plan)
+}
+
+pub(super) fn stage_copies(
+    command: &Command,
+    record: &crate::MessageRecord,
+    subscriptions: &[EntityPath],
+    plan: Vec<PlannedCopy>,
+    populated: &mut [bool],
+    dead_lettered: &mut [bool],
+    batch: &mut WriteBatch,
+) -> Result<(), BrokerError> {
+    for planned in plan {
+        let subscription = &subscriptions[planned.index];
+        let mut copy = record.clone();
+        copy.sequence = planned.sequence;
+        if planned.action {
+            copy.format = crate::MessageRecordFormat::V4 {
+                text_ids: record.format.uses_text_ids(),
+            };
+            if copy.envelope.is_some() {
+                copy.body.clear();
+            }
+        }
+        if let Some(envelope) = planned.envelope {
+            copy.envelope = Some(envelope);
+            copy.body.clear();
+        }
+        if let Some((description, reason)) = planned.failure {
+            dead_lettered[planned.index] = true;
+            stage_filter_dead_letter(
+                &command.namespace,
+                subscription,
+                copy,
+                description,
+                reason,
+                command.issued_at,
+                batch,
+            )?;
+            continue;
+        }
+        populated[planned.index] = true;
+        copy.expires_at = planned
+            .lifetime
+            .map(|ms| command.issued_at.saturating_add_millis(ms));
+        batch.push_put(
+            keys::message(&command.namespace, subscription, copy.sequence),
+            codec::message::encode(&copy)?,
+        );
+        batch.push_put(
+            keys::ready(&command.namespace, subscription, copy.sequence),
+            Vec::new(),
+        );
+        if let Some(expires_at) = copy.expires_at {
+            batch.push_put(
+                keys::expiry(&command.namespace, subscription, expires_at, copy.sequence),
+                Vec::new(),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Captured by the complete bounded topology proof, before any update is staged.
 pub(super) struct SubscriptionProfile {
     pub entity: EntityPath,
@@ -316,24 +580,22 @@ impl<S: StateStore> StateMachine<S> {
             (Vec::new(), Vec::new())
         };
 
+        let mut history = WriteBatch::default();
         let stored = self.stage_topic_duplicate_history(
             command,
             &topic,
             inputs.iter().map(|input| input.message_id),
-            batch,
+            &mut history,
         )?;
 
         let mut counters = self.load_counters(command)?;
         let mut sequences = Vec::with_capacity(inputs.len());
         let mut populated = vec![false; subscriptions.len()];
         let mut dead_lettered = vec![false; subscriptions.len()];
-        let uses_sql = uses_sql(&subscription_state);
+        let mut budget = ActionPlanBudget::default();
+        let mut prepared = Vec::new();
         for ((input, properties), stored) in inputs.iter().zip(&properties).zip(stored) {
-            let sequence = SequenceNumber::new(counters.next_sequence);
-            counters.next_sequence = counters
-                .next_sequence
-                .checked_add(1)
-                .ok_or(BrokerError::SequenceNumberExhausted)?;
+            let sequence = reserve_sequence(&mut counters)?;
             sequences.push(sequence);
             if !stored {
                 continue;
@@ -345,56 +607,53 @@ impl<S: StateStore> StateMachine<S> {
             );
             if let Some(enqueue_at) = input.scheduled_enqueue_at {
                 let record = message_record(command, *input, sequence, topic_lifetime);
-                batch.push_put(
-                    keys::message(&command.namespace, &command.entity, sequence),
-                    codec::message::encode(&record)?,
-                );
-                batch.push_put(
-                    keys::scheduled(&command.namespace, &command.entity, enqueue_at, sequence),
-                    Vec::new(),
-                );
+                prepared.push((record, Some(enqueue_at), Vec::new()));
                 continue;
             }
-
-            let typed = TypedProperties::new(properties, uses_sql)?;
-            let routing = typed.input();
-            for (index, (subscription, (config, rules))) in
-                subscriptions.iter().zip(&subscription_state).enumerate()
-            {
-                match rules.route(&routing) {
-                    Route::Deliver => {}
-                    Route::Skip => continue,
-                    Route::DeadLetter(description) => {
-                        dead_lettered[index] = true;
-                        stage_filter_dead_letter(
-                            &command.namespace,
-                            subscription,
-                            message_record(command, *input, sequence, None),
-                            description,
-                            command.issued_at,
-                            batch,
-                        )?;
-                        continue;
-                    }
-                }
-                populated[index] = true;
-                let lifetime =
-                    effective_time_to_live(topic_lifetime, config.default_time_to_live_millis);
-                let record = message_record(command, *input, sequence, lifetime);
+            let record = message_record(command, *input, sequence, topic_lifetime);
+            let plan = plan_copies(
+                &record,
+                properties,
+                &subscription_state,
+                topic_lifetime,
+                &mut counters,
+                &mut budget,
+            )?;
+            prepared.push((record, None, plan));
+        }
+        // Full reservation and bounded action evaluation precede every staged
+        // message/history write, including the last child of a batch.
+        for mutation in history.into_mutations() {
+            match mutation {
+                storage::Mutation::Put { key, value } => batch.push_put(key, value),
+                storage::Mutation::Delete { key } => batch.push_delete(key),
+            }
+        }
+        for (record, scheduled, plan) in prepared {
+            if let Some(enqueue_at) = scheduled {
                 batch.push_put(
-                    keys::message(&command.namespace, subscription, sequence),
+                    keys::message(&command.namespace, &command.entity, record.sequence),
                     codec::message::encode(&record)?,
                 );
                 batch.push_put(
-                    keys::ready(&command.namespace, subscription, sequence),
+                    keys::scheduled(
+                        &command.namespace,
+                        &command.entity,
+                        enqueue_at,
+                        record.sequence,
+                    ),
                     Vec::new(),
                 );
-                if let Some(expires_at) = record.expires_at {
-                    batch.push_put(
-                        keys::expiry(&command.namespace, subscription, expires_at, sequence),
-                        Vec::new(),
-                    );
-                }
+            } else {
+                stage_copies(
+                    command,
+                    &record,
+                    &subscriptions,
+                    plan,
+                    &mut populated,
+                    &mut dead_lettered,
+                    batch,
+                )?;
             }
         }
 
@@ -430,9 +689,22 @@ impl<S: StateStore> StateMachine<S> {
         let mut subscriptions = Vec::with_capacity(topology.len());
         let mut state = Vec::with_capacity(topology.len());
         let mut cache = ProgramCache::default();
+        let mut sql_rules = 0usize;
         for profile in topology {
+            let checked = self.checked_rules(&command.namespace, &profile.entity, &mut cache)?;
+            sql_rules = sql_rules.saturating_add(
+                checked
+                    .iter()
+                    .filter(|(d, _, _)| {
+                        d.action.is_some() || matches!(d.filter, crate::RuleFilter::Sql(_))
+                    })
+                    .count(),
+            );
+            if sql_rules > crate::MAX_TOPIC_SQL_RULES {
+                return Err(BrokerError::EntityMetadataCorrupt);
+            }
             let rules = CompiledRules::new(
-                self.checked_rules(&command.namespace, &profile.entity, &mut cache)?,
+                checked,
                 profile.dead_lettering_on_filter_evaluation_exceptions,
             )?;
             subscriptions.push(profile.entity);
@@ -449,7 +721,7 @@ pub(super) fn filter_properties(input: &SendInput<'_>) -> Result<FilterPropertie
         .unwrap_or_default();
     // V1/V2 routing historically used the duplicate identity here. V3 keeps
     // the typed-ID-derived text in its projection instead.
-    if input.format != crate::MessageRecordFormat::V3 && !input.message_id.is_empty() {
+    if !input.format.uses_text_ids() && !input.message_id.is_empty() {
         properties.message_id = Some(input.message_id.to_owned());
     }
     if let Some(session_id) = input.session_id {

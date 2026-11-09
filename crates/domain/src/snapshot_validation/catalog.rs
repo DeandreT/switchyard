@@ -164,6 +164,11 @@ impl<'a> Catalog<'a> {
                     if canonical != definition.filter {
                         return Err(invalid_value(row, "rule filter is not canonical"));
                     }
+                    if let Some(action) = &definition.action {
+                        action.compile().map_err(|_| {
+                            invalid_value(row, "rule action violates current policy")
+                        })?;
+                    }
                     catalog.rules.push((
                         (namespace, subscription),
                         Located {
@@ -324,6 +329,7 @@ impl<'a> Catalog<'a> {
 
     fn validate_rules(&self) -> Result<(), SnapshotCatalogError> {
         let mut counts = BTreeMap::<&Scope, usize>::new();
+        let mut sql_counts = BTreeMap::<&Scope, usize>::new();
         for (scope, rule) in &self.rules {
             if !self.memberships.contains_key(scope) {
                 return Err(inconsistent(
@@ -347,6 +353,18 @@ impl<'a> Catalog<'a> {
                     rule.row,
                     "subscription rules exceed current capacity",
                 ));
+            }
+            if rule.value.action.is_some() || matches!(rule.value.filter, crate::RuleFilter::Sql(_))
+            {
+                let topic = &self.memberships[scope].value;
+                let count = sql_counts.entry(topic).or_default();
+                *count += 1;
+                if *count > crate::MAX_TOPIC_SQL_RULES {
+                    return Err(inconsistent(
+                        rule.row,
+                        "topic SQL/action rules exceed current capacity",
+                    ));
+                }
             }
         }
         Ok(())

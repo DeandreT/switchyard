@@ -9,9 +9,11 @@ use crate::{
 use super::{
     StateMachine, TIMER_SCAN_LIMIT,
     scheduling::{scheduled_lifetime, validate_cancellation},
-    send::{SendInput, effective_time_to_live},
-    topic::{filter_properties, populated_entities, uses_sql},
-    topic_routing::{Route, TypedProperties, stage_filter_dead_letter},
+    send::SendInput,
+    topic::{
+        ActionPlanBudget, filter_properties, plan_copies, populated_entities, reserve_sequence,
+        stage_copies,
+    },
 };
 
 impl<S: StateStore> StateMachine<S> {
@@ -82,7 +84,12 @@ impl<S: StateStore> StateMachine<S> {
         // still atomic even when the topic itself has more than the budgeted
         // number of subscriptions.
         let (subscriptions, subscription_state) = self.topic_fanout_state(command)?;
-        let activation_limit = topic_activation_limit(subscriptions.len());
+        let activation_limit = topic_activation_limit(
+            subscription_state
+                .iter()
+                .map(|(_, rules)| rules.maximum_copies())
+                .sum(),
+        );
         let due = self
             .store()
             .scan_prefix(&scheduled_prefix, activation_limit)?;
@@ -116,63 +123,37 @@ impl<S: StateStore> StateMachine<S> {
         let mut counters = self.load_counters(command)?;
         let mut populated = vec![false; subscriptions.len()];
         let mut dead_lettered = vec![false; subscriptions.len()];
-        let uses_sql = uses_sql(&subscription_state);
+        let mut budget = ActionPlanBudget::default();
+        let mut plans = Vec::new();
         let activated = u32::try_from(prepared.len()).unwrap_or(u32::MAX);
         for (index_key, placeholder_sequence, mut record, properties, topic_lifetime) in prepared {
-            let active_sequence = SequenceNumber::new(counters.next_sequence);
-            counters.next_sequence = counters
-                .next_sequence
-                .checked_add(1)
-                .ok_or(BrokerError::SequenceNumberExhausted)?;
-            batch.push_delete(index_key);
-            batch.push_delete(keys::message(namespace, topic, placeholder_sequence));
+            let active_sequence = reserve_sequence(&mut counters)?;
 
             record.sequence = active_sequence;
             record.enqueued_at = command.issued_at;
             record.state = MessageState::Ready;
-            let typed = TypedProperties::new(&properties, uses_sql)?;
-            let routing = typed.input();
-            for (index, (subscription, (config, rules))) in
-                subscriptions.iter().zip(&subscription_state).enumerate()
-            {
-                match rules.route(&routing) {
-                    Route::Deliver => {}
-                    Route::Skip => continue,
-                    Route::DeadLetter(description) => {
-                        dead_lettered[index] = true;
-                        stage_filter_dead_letter(
-                            namespace,
-                            subscription,
-                            record.clone(),
-                            description,
-                            command.issued_at,
-                            batch,
-                        )?;
-                        continue;
-                    }
-                }
-
-                populated[index] = true;
-                let mut copy = record.clone();
-                let lifetime =
-                    effective_time_to_live(topic_lifetime, config.default_time_to_live_millis);
-                copy.expires_at =
-                    lifetime.map(|millis| command.issued_at.saturating_add_millis(millis));
-                batch.push_put(
-                    keys::message(namespace, subscription, active_sequence),
-                    codec::message::encode(&copy)?,
-                );
-                batch.push_put(
-                    keys::ready(namespace, subscription, active_sequence),
-                    Vec::new(),
-                );
-                if let Some(expires_at) = copy.expires_at {
-                    batch.push_put(
-                        keys::expiry(namespace, subscription, expires_at, active_sequence),
-                        Vec::new(),
-                    );
-                }
-            }
+            let plan = plan_copies(
+                &record,
+                &properties,
+                &subscription_state,
+                topic_lifetime,
+                &mut counters,
+                &mut budget,
+            )?;
+            plans.push((index_key, placeholder_sequence, record, plan));
+        }
+        for (index_key, placeholder_sequence, record, plan) in plans {
+            batch.push_delete(index_key);
+            batch.push_delete(keys::message(namespace, topic, placeholder_sequence));
+            stage_copies(
+                command,
+                &record,
+                &subscriptions,
+                plan,
+                &mut populated,
+                &mut dead_lettered,
+                batch,
+            )?;
         }
         batch.push_put(
             keys::queue_counters(namespace, topic),

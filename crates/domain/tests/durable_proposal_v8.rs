@@ -99,10 +99,10 @@ fn v8_goldens_round_trip_and_older_readers_refuse() {
             Err(DurableProposalError::Malformed)
         );
         let mut unknown = bytes.clone();
-        unknown[4..8].copy_from_slice(&10_u32.to_be_bytes());
+        unknown[4..8].copy_from_slice(&11_u32.to_be_bytes());
         assert_eq!(
             DurableProposal::decode(&unknown),
-            Err(DurableProposalError::UnsupportedVersion(10))
+            Err(DurableProposalError::UnsupportedVersion(11))
         );
     }
 }

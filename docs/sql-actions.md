@@ -1,10 +1,10 @@
-# SQL action kernel
+# SQL rule actions
 
 The domain's `SqlActionProgram` compiles and evaluates an ephemeral, transport-free
-action program. It returns a typed `SqlActionPatch` for one copy; it does not
-change the original message, persist rule intent, enable fanout, or enable AMQP
-rule management. Nonempty wire actions still refuse. No stored semantic version
-or record/proposal format is introduced by this API.
+action program. It returns a typed `SqlActionPatch` for one copy without changing
+the original message. The domain also persists exact `SqlRuleAction` source in
+action-bearing rules and routes isolated copies. AMQP rule management still
+refuses nonempty wire actions; domain-seeded copies render their removals.
 
 ## Grammar and names
 
@@ -119,7 +119,83 @@ assert_eq!(patch.entries().len(), 2);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-`crates/domain/tests/sql_actions.rs` exercises this public API without a store.
-Durable rule intent, per-matching-rule fanout, full-copy size/accounting,
-per-copy failure routing and wire management belong to the subsequent activation
-and management increments, not this kernel.
+`crates/domain/tests/sql_actions.rs` exercises the kernel without a store.
+
+## Durable rules and copy selection
+
+`CreateRuleWithAction` retains exact source, including whitespace, and compiles
+both the filter and the action before admission. Rule reads, fanout, content
+preflight and snapshot validation compile retained actions under the same bounded
+profile. Programs are never deserialized. Action-bearing rules count toward both
+the 2,000-rule subscription limit and the 2,000 SQL/action-rule topic limit,
+regardless of their filter kind. An actionless true/false/correlation rule does
+not consume the topic SQL quota.
+An exact-full quota refusal is checkpointed only after a complete bounded
+canonical/compiled proof of the topic's rule rows. Corrupt or overfull catalogs
+remain fail-stop errors; they cannot be treated as healthy client refusals.
+Raw counting stops once overfull quota is established, before compiling a global
+proof. A canonical proof also stops on overfull count rather than retaining
+programs for later siblings.
+
+For each subscription, matching actionless rules produce one deduplicated copy.
+Each matching action rule produces its own independent copy in canonical rule
+name order. Filters inspect the original routing input; actions use the original
+bounded AMQP application's canonical typed values, not a caller-supplied legacy
+projection. No filter or action observes a sibling's changes. Original AMQP bytes,
+duplicate identity and legacy/Azure-text ID mode remain unchanged.
+
+An actionless filter error produces one `FilterException` copy only when no
+actionless rule matches. Each action rule whose filter fails independently
+produces a `FilterException` copy. A matching action that fails evaluation, type,
+patch, projection or effective-copy bounds produces an unchanged original copy
+with reason `ActionException` and fixed description
+`SQL action failed; no changes were applied`. No partial action output escapes.
+Both kinds of error copy follow the subscription's
+`dead_lettering_on_filter_evaluation_exceptions` setting: false discards that
+copy. A sibling's success neither hides nor duplicates an action-rule failure.
+Raw domain messages can still match filters, but matching actions fail per-copy
+because there are no AMQP application properties to edit. A malformed legacy
+AMQP envelope on an action-enabled topology refuses the command before writes,
+rather than creating an unreadable action copy. Actionless behavior is unchanged.
+Retaining a raw action-error copy beyond 16 MiB refuses the command instead;
+the discard policy does not retain that copy.
+
+All ordinary, batch and scheduled-activation copies and sequences are planned
+before staging message writes. Each publication still reserves its historical
+base slot, including duplicates and no-match publications. Actionless copies use
+that slot. Each retained action success or error copy reserves an additional
+parent-topic slot; discarded attempts reserve none. A batch acknowledgement
+reports only each publication's base slot. Scheduled intake reserves only the
+placeholder: activation reads the then-current rules and reserves a fresh base
+and any retained action-copy slots atomically. Sequence exhaustion leaves clock,
+history, placeholders, counters and message indexes unchanged.
+
+One command allows at most 4,096 action attempts and a conservative 64 MiB action
+plan charge: each attempt charges original/body bytes, canonical system/application
+projection text/name/value bytes, and 64 KiB patch allowance before cloning content. Failed and
+discarded attempts also count. Exceeding this budget refuses the whole command
+with `RuleConfigError::SqlActionPlanLimit`; it is not a per-copy action failure.
+Timer scans divide their 256-copy target by the topology's maximum action-copy
+fanout, with at least one atomic publication per activation command.
+
+Effective action-copy size charges original bytes plus every SET name/value,
+every removal name and five framing bytes per overlay entry. The ceiling is the
+subscription message limit plus 64 KiB, capped at 16 MiB. Native parser limits
+are unchanged. Later disposition patches preserve removals of unrelated names;
+setting a removed name (including to AMQP null) explicitly restores it. Whole
+replacement envelopes refuse copies with either SETs or removals.
+On a V4 copy without changes, replacement content is validated and its projection
+is derived in the copy's retained legacy or Azure-text ID mode. The record codec
+checks the 32-removal bound before testing SET/removal name intersection.
+
+Action-bearing intent uses proposal V10 (an exact V1/V6 creation envelope plus
+UTF-8 source; nesting is nonrecursive), rule V3 (name, filter, creation time,
+source), and message V4 (frozen V2 content followed by ID mode and distinct removal
+names). Old capture paths refuse action intent and deletion-bearing envelopes.
+Actionless message V1..V3, proposal V1..V9 and rule V1/V2 bytes are unchanged.
+The V3 action grammar and evaluation semantics are frozen: accepting, refusing
+or evaluating retained source differently requires a new rule version.
+These are per-record/proposal fences, not a whole-store downgrade barrier.
+Rollback needs compatible readers or a coherent pre-feature backup; never strip
+the fences or turn removal into null. Finite-topic admission and accounting
+remain disabled; action fanout does not introduce a placeholder overdraft.

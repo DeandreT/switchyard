@@ -69,7 +69,7 @@ pub use rule::{
     MAX_SQL_ACTION_PATCH_BYTES, MAX_SQL_ACTION_PATCH_PROPERTIES, MAX_SQL_ACTION_STATEMENTS,
     MAX_SUBSCRIPTION_RULES, MAX_TOPIC_SQL_RULES, RuleConfigError, RuleDefinition, RuleFilter,
     SqlActionCompileError, SqlActionError, SqlActionLimits, SqlActionMetrics, SqlActionPatch,
-    SqlActionProgram, SqlActionProperty, SqlRuleFilter,
+    SqlActionProgram, SqlActionProperty, SqlRuleAction, SqlRuleFilter,
 };
 pub use session::{AcceptedSession, SessionHold, SessionLock, SessionRecord};
 pub use sql_filter::{

@@ -34,6 +34,9 @@ mod panic_apply_tests;
 #[path = "indexed_apply/healthy_capacity_tests.rs"]
 mod healthy_capacity_tests;
 
+#[path = "indexed_apply/healthy_sql_capacity_tests.rs"]
+mod healthy_sql_capacity_tests;
+
 #[derive(Clone, Debug, Default)]
 struct Trace {
     gets: Vec<Key>,
@@ -967,6 +970,7 @@ fn rule_caps_are_conservative<P: StoreProvider>(provider: P) -> TestResult {
     for offset in 1..MAX_SUBSCRIPTION_RULES {
         let name = RuleName::new(format!("rule-{offset:04}"))?;
         let definition = RuleDefinition {
+            action: None,
             name: name.clone(),
             filter: RuleFilter::True,
             created_at: Timestamp::from_millis(20),
@@ -1003,6 +1007,7 @@ fn rule_caps_are_conservative<P: StoreProvider>(provider: P) -> TestResult {
     fixture.raw(WriteBatch::default().put(
         keys::subscription_rule(&namespace(), &subscription(), &name),
         codec::encode(&RuleDefinition {
+            action: None,
             name,
             filter: RuleFilter::True,
             created_at: Timestamp::from_millis(20),
