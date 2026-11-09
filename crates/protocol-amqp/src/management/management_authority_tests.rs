@@ -5,6 +5,10 @@ use super::*;
 use crate::listener::control_attachment_custody::{ControlContext, serve_control_attachment};
 use domain::{EntityBinding, codec, keys};
 
+#[cfg(feature = "workload-tls")]
+#[path = "workload_authority_tests.rs"]
+mod workload_authority_tests;
+
 #[derive(Clone)]
 struct Witness {
     actual: ActualBroker,

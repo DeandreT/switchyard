@@ -70,6 +70,8 @@ pub struct AmqpListener<B> {
     namespace: NamespaceName,
     container_id: String,
     tls_acceptor: Option<TlsAcceptor>,
+    #[cfg(feature = "workload-tls")]
+    workload_endpoint: Option<auth::workload::PreparedWorkloadTls>,
     shared_access_authentication: Option<SharedAccessAuthentication>,
     max_connections: Option<NonZeroUsize>,
     admission_timeout: Duration,
@@ -85,6 +87,8 @@ impl<B: Broker> AmqpListener<B> {
             namespace,
             container_id: String::from("switchyard"),
             tls_acceptor: None,
+            #[cfg(feature = "workload-tls")]
+            workload_endpoint: None,
             shared_access_authentication: None,
             max_connections: None,
             admission_timeout: DEFAULT_ADMISSION_TIMEOUT,
@@ -126,6 +130,48 @@ impl<B: Broker> AmqpListener<B> {
     pub fn with_tls(mut self, config: ServerConfig) -> Self {
         self.tls_acceptor = Some(TlsAcceptor::from(std::sync::Arc::new(config)));
         self
+    }
+
+    /// Freezes TLS/credential configuration after validating this listener's
+    /// locally configured namespace. The resulting type cannot downgrade TLS.
+    #[cfg(feature = "workload-tls")]
+    pub fn with_workload_tls(
+        mut self,
+        endpoint: auth::workload::PreparedWorkloadTls,
+    ) -> Result<crate::WorkloadAmqpListener<B>, crate::WorkloadListenerError> {
+        use crate::WorkloadListenerError;
+        if self.tls_acceptor.is_some() {
+            return Err(WorkloadListenerError::ConflictingTls);
+        }
+        if crate::namespace_from_hostname(endpoint.namespace().host())
+            .ok()
+            .as_ref()
+            != Some(&self.namespace)
+        {
+            return Err(WorkloadListenerError::NamespaceMismatch);
+        }
+        match &self.shared_access_authentication {
+            Some(authentication)
+                if authentication.audience_host() != endpoint.namespace().host() =>
+            {
+                return Err(WorkloadListenerError::NamespaceMismatch);
+            }
+            None if !endpoint.requires_client_certificate() => {
+                return Err(WorkloadListenerError::AlternativeCredentialRequired);
+            }
+            None => {
+                self.shared_access_authentication = Some(
+                    SharedAccessAuthentication::new(
+                        auth::SharedAccessPolicy::default(),
+                        endpoint.namespace().host(),
+                    )
+                    .map_err(|_| WorkloadListenerError::NamespaceMismatch)?,
+                );
+            }
+            Some(_) => {}
+        }
+        self.workload_endpoint = Some(endpoint);
+        Ok(crate::workload::WorkloadAmqpListener::new(self))
     }
 
     /// Requires SASL MSSBCBS/ANONYMOUS plus CBS, or valid SASL PLAIN

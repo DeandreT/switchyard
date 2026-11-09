@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+workload-tls = ["auth/workload-tls"]
+
 [dependencies]
 amqp.workspace = true
 auth.workspace = true
@@ -26,6 +30,8 @@ amqp = { workspace = true, features = ["test-client"] }
 base64.workspace = true
 hmac.workspace = true
 ring.workspace = true
+rcgen.workspace = true
+time = "0.3"
 serde_json.workspace = true
 server.workspace = true
 sha2.workspace = true
