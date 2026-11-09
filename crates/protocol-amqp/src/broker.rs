@@ -20,6 +20,9 @@ pub enum BrokerRejection {
     Refused(BrokerError),
     /// The broker could not be reached, or failed for a reason of its own.
     Unavailable(String),
+    /// A presented workload certificate's nonrenewable connection lease ended.
+    #[cfg(feature = "workload-tls")]
+    AuthorizationExpired,
 }
 
 impl std::fmt::Display for BrokerRejection {
@@ -27,6 +30,10 @@ impl std::fmt::Display for BrokerRejection {
         match self {
             Self::Refused(error) => write!(formatter, "{error}"),
             Self::Unavailable(detail) => write!(formatter, "broker unavailable: {detail}"),
+            #[cfg(feature = "workload-tls")]
+            Self::AuthorizationExpired => {
+                formatter.write_str("connection authorization has expired")
+            }
         }
     }
 }
@@ -41,6 +48,8 @@ impl BrokerRejection {
             // Not the client's fault and worth retrying, which is what this
             // condition tells an SDK.
             Self::Unavailable(_) => crate::RESOURCE_LOCKED,
+            #[cfg(feature = "workload-tls")]
+            Self::AuthorizationExpired => "amqp:unauthorized-access",
         }
     }
 }

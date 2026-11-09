@@ -136,10 +136,14 @@ preserve verified principal identity and both validity bounds for SAS and explic
 configured TLS JWT CBS.
 Native admin RPCs use the configured offline JWT policy.
 
-The optional [local workload identity foundation](workload-identity.md) provides
+The optional [workload identity library profile](workload-identity.md) provides
 bounded pinned policy and actual-handshake endpoint-bound TLS peer capabilities.
-It does not activate AMQP/WSS/admin certificate authorization, retire their live
-connections, or change existing SAS/JWT/default transport behavior.
+With `protocol-amqp/workload-tls`, a fallible frozen listener consumes these on
+actual TCP/WSS, combines locally scoped rights with independent token grants,
+and fences all new broker work at the presented certificate's nonrenewable lease.
+Expiry retires only that connection and joins its originals without rolling back
+begun work. Server CLI/admin activation remains separate; default SAS/JWT/TLS
+configuration and trust behavior are unchanged.
 
 ### Absolute link addresses
 

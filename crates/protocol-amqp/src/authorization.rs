@@ -30,6 +30,10 @@ pub struct SharedAccessAuthentication {
 }
 
 impl SharedAccessAuthentication {
+    #[cfg(feature = "workload-tls")]
+    pub(crate) fn audience_host(&self) -> &str {
+        &self.audience_host
+    }
     pub fn new(
         policy: SharedAccessPolicy,
         audience_host: impl AsRef<str>,
@@ -73,6 +77,8 @@ pub(crate) struct ConnectionAuthorization {
     grant_changed: Notify,
     routes: Mutex<ReplyRoutes>,
     route_changed: Notify,
+    #[cfg(feature = "workload-tls")]
+    workload: Option<crate::workload::WorkloadPeer>,
 }
 
 impl ConnectionAuthorization {
@@ -84,7 +90,16 @@ impl ConnectionAuthorization {
         Self::new_for_transport(config, initial_grant, None)
     }
 
+    #[cfg(any(not(feature = "workload-tls"), test))]
     pub(crate) fn new_for_transport(
+        config: SharedAccessAuthentication,
+        initial_grant: Option<AccessGrant>,
+        tls: Option<crate::listener::service::TlsAdmission>,
+    ) -> Arc<Self> {
+        Self::prepare(config, initial_grant, tls)
+    }
+
+    fn prepare(
         config: SharedAccessAuthentication,
         initial_grant: Option<AccessGrant>,
         tls: Option<crate::listener::service::TlsAdmission>,
@@ -100,7 +115,58 @@ impl ConnectionAuthorization {
                 senders: HashMap::new(),
             }),
             route_changed: Notify::new(),
+            #[cfg(feature = "workload-tls")]
+            workload: None,
         })
+    }
+
+    #[cfg(feature = "workload-tls")]
+    pub(crate) fn new_for_workload_transport(
+        config: SharedAccessAuthentication,
+        initial: Option<AccessGrant>,
+        tls: Option<crate::listener::service::TlsAdmission>,
+        workload: Option<crate::workload::WorkloadPeer>,
+    ) -> Arc<Self> {
+        let mut authorization = Self::prepare(config, initial, tls);
+        Arc::get_mut(&mut authorization)
+            .expect("new connection authorization is exclusive")
+            .workload = workload;
+        authorization
+    }
+
+    fn session_live(&self) -> bool {
+        #[cfg(feature = "workload-tls")]
+        if let Some(peer) = &self.workload {
+            return peer.is_live();
+        }
+        true
+    }
+
+    fn workload_grant_live(&self) -> bool {
+        #[cfg(feature = "workload-tls")]
+        if let Some(peer) = &self.workload {
+            return peer.is_live();
+        }
+        false
+    }
+
+    fn workload_allows(&self, resource: &ResourceScope, permissions: &[Permission]) -> bool {
+        #[cfg(feature = "workload-tls")]
+        if let Some(peer) = &self.workload {
+            return permissions
+                .iter()
+                .any(|permission| peer.allows(resource, *permission));
+        }
+        let _ = (resource, permissions);
+        false
+    }
+
+    async fn session_expired(&self) {
+        #[cfg(feature = "workload-tls")]
+        if let Some(peer) = &self.workload {
+            return peer.expired().await;
+        }
+        std::future::pending().await
     }
 
     pub(crate) fn authorization_timeout(&self) -> Duration {
@@ -112,24 +178,30 @@ impl ConnectionAuthorization {
     }
 
     pub(crate) async fn has_valid_grant(&self) -> bool {
-        self.has_valid_grant_at(epoch_seconds()).await
+        self.has_valid_grant_with_clock(epoch_seconds).await
     }
 
+    #[cfg(test)]
     async fn has_valid_grant_at(&self, now: u64) -> bool {
-        self.grants
-            .read()
-            .await
-            .iter()
-            .any(|grant| grant.is_valid_at(now))
+        self.has_valid_grant_with_clock(|| now).await
+    }
+
+    async fn has_valid_grant_with_clock(&self, now: impl Fn() -> u64) -> bool {
+        let grants = self.grants.read().await;
+        let now = now(); // All freshness checks follow the potentially blocked lock.
+        self.session_live()
+            && (self.workload_grant_live() || grants.iter().any(|grant| grant.is_valid_at(now)))
     }
 
     pub(crate) async fn wait_for_grant(&self) {
         loop {
             let changed = self.grant_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             if self.has_valid_grant().await {
                 return;
             }
-            changed.await;
+            tokio::select! { () = changed => {}, () = self.session_expired() => std::future::pending().await }
         }
     }
 
@@ -151,8 +223,7 @@ impl ConnectionAuthorization {
         resource: &str,
     ) -> Result<(), AuthorizationError> {
         let grant = self.verify_token(token_type, token, resource, epoch_seconds())?;
-        self.add_verified_grant(grant).await;
-        Ok(())
+        self.try_add_verified_grant(grant).await
     }
 
     fn verify_token(
@@ -179,14 +250,25 @@ impl ConnectionAuthorization {
     }
 
     // Accept only grants produced by an authentication policy's verification path.
+    #[cfg(test)]
     async fn add_verified_grant(&self, grant: AccessGrant) {
+        self.try_add_verified_grant(grant)
+            .await
+            .expect("test grant admission");
+    }
+
+    async fn try_add_verified_grant(&self, grant: AccessGrant) -> Result<(), AuthorizationError> {
         let mut grants = self.grants.write().await;
+        if !self.session_live() {
+            return Err(AuthorizationError);
+        }
         grants.retain(|existing| {
             !existing.same_principal(&grant) || existing.scope() != grant.scope()
         });
         grants.push(grant);
         drop(grants);
         self.grant_changed.notify_waiters();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -236,21 +318,37 @@ impl ConnectionAuthorization {
         resource: &ResourceScope,
         permissions: &[Permission],
     ) -> Result<(), AuthorizationError> {
-        self.authorize_resource_any_at(resource, permissions, epoch_seconds())
+        self.authorize_resource_any_with_clock(resource, permissions, epoch_seconds)
             .await
     }
 
+    #[cfg(test)]
     async fn authorize_resource_any_at(
         &self,
         resource: &ResourceScope,
         permissions: &[Permission],
         now: u64,
     ) -> Result<(), AuthorizationError> {
-        if self.grants.read().await.iter().any(|grant| {
-            permissions
-                .iter()
-                .any(|permission| grant.allows(resource, *permission, now))
-        }) {
+        self.authorize_resource_any_with_clock(resource, permissions, || now)
+            .await
+    }
+
+    async fn authorize_resource_any_with_clock(
+        &self,
+        resource: &ResourceScope,
+        permissions: &[Permission],
+        now: impl Fn() -> u64,
+    ) -> Result<(), AuthorizationError> {
+        let grants = self.grants.read().await;
+        let now = now();
+        if self.session_live()
+            && (self.workload_allows(resource, permissions)
+                || grants.iter().any(|grant| {
+                    permissions
+                        .iter()
+                        .any(|permission| grant.allows(resource, *permission, now))
+                }))
+        {
             Ok(())
         } else {
             Err(AuthorizationError)
@@ -283,11 +381,15 @@ impl ConnectionAuthorization {
     ) {
         loop {
             let changed = self.grant_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let grants = self.grants.read().await;
             let now = now();
-            let expiry = self
-                .grants
-                .read()
-                .await
+            if !self.session_live() {
+                return;
+            }
+            let workload = self.workload_allows(resource, permissions);
+            let expiry = grants
                 .iter()
                 .filter(|grant| {
                     permissions
@@ -296,12 +398,17 @@ impl ConnectionAuthorization {
                 })
                 .map(AccessGrant::expires_at_epoch_seconds)
                 .max();
-            let Some(expiry) = expiry else { return };
+            if expiry.is_none() && !workload {
+                return;
+            }
+            let expiry = expiry.unwrap_or(u64::MAX);
+            drop(grants);
             tokio::select! {
                 () = tokio::time::sleep(
                     Duration::from_secs(expiry.saturating_sub(now)).min(MAX_AUTHORIZATION_WAIT),
                 ) => {}
                 () = changed => {}
+                () = self.session_expired() => return,
             }
         }
     }

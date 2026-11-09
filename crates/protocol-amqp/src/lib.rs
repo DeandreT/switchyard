@@ -21,6 +21,11 @@ mod test_deadline;
 mod test_sas;
 mod tls;
 mod websocket;
+#[cfg(feature = "workload-tls")]
+mod workload;
+
+#[cfg(feature = "workload-tls")]
+pub use workload::{WorkloadAmqpListener, WorkloadListenerError};
 
 use thiserror::Error;
 

@@ -78,11 +78,11 @@ fn signed(header: &Json, claims: &Json) -> String {
 fn header() -> Json {
     json!({"alg":"RS256", "kid":"key-1", "typ":"switchyard+jwt"})
 }
-fn token(iat: u64, exp: u64) -> String {
+pub(super) fn token(iat: u64, exp: u64) -> String {
     signed(&header(), &claims(iat, exp))
 }
 
-fn policy() -> JwtPolicy {
+pub(super) fn policy() -> JwtPolicy {
     JwtPolicy::from_json(&json!({"version":1, "issuer":"https://issuer.example/", "audience":"urn:switchyard:tenant",
         "keys":[{"kid":"key-1","kty":"RSA","alg":"RS256","use":"sig","n":fixture::MODULUS,"e":"AQAB"}],
         "bindings":[{"subject":"producer","scope":RESOURCE,"permissions":["send"]}]}).to_string()).unwrap()
@@ -269,7 +269,12 @@ async fn connect(address: SocketAddr, tls: bool, websocket: bool) -> Connection 
     }
 }
 
-async fn put_token(session: &mut Session, token_type: &str, resource: &str, token: String) -> i32 {
+pub(super) async fn put_token(
+    session: &mut Session,
+    token_type: &str,
+    resource: &str,
+    token: String,
+) -> i32 {
     let mut requests = Sender::attach(session, "cbs-request", crate::CBS_NODE)
         .await
         .unwrap();
@@ -342,7 +347,7 @@ async fn refused_send(session: &mut Session, name: &str, entity: &str) {
     );
 }
 
-fn sas_token(expiry: u64) -> String {
+pub(super) fn sas_token(expiry: u64) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     let resource =
@@ -355,7 +360,7 @@ fn sas_token(expiry: u64) -> String {
     format!("SharedAccessSignature sr={resource}&sig={signature}&se={expiry}&skn=sas")
 }
 
-async fn management(
+pub(super) async fn management(
     requests: &mut Sender,
     responses: &mut Receiver,
     operation: &str,
@@ -393,7 +398,7 @@ async fn management(
     status
 }
 
-fn cancel_body() -> OrderedMap<Value, Value> {
+pub(super) fn cancel_body() -> OrderedMap<Value, Value> {
     let mut body = OrderedMap::new();
     body.insert(
         Value::String("sequence-numbers".into()),
@@ -402,7 +407,7 @@ fn cancel_body() -> OrderedMap<Value, Value> {
     body
 }
 
-fn schedule_body() -> OrderedMap<Value, Value> {
+pub(super) fn schedule_body() -> OrderedMap<Value, Value> {
     let mut annotations = amqp::MessageAnnotations::default();
     annotations.insert(
         amqp::AnnotationKey::from("x-opt-scheduled-enqueue-time"),

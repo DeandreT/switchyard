@@ -99,6 +99,7 @@ impl ManagementResponse {
     ) -> Self {
         let condition = rejection.condition();
         let status_code = match condition {
+            "amqp:unauthorized-access" => 401,
             crate::MESSAGE_LOCK_LOST | crate::SESSION_LOCK_LOST => 410,
             crate::NOT_FOUND => 404,
             crate::ENTITY_ALREADY_EXISTS => 409,

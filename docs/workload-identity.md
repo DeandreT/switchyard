@@ -7,10 +7,10 @@ The `auth` crate has two opt-in features:
   actual client stream and returns an opaque, endpoint-bound peer capability.
 
 Default features remain empty. Existing SAS and offline JWT APIs are unchanged.
-This foundation does **not** activate AMQP, WSS, native administration or Atom,
-install certificates, provision identities, fetch issuers or enable production.
-An integrating transport must enforce credential selection, operation admission,
-socket retirement and original-task custody itself.
+The protocol library can opt into the AMQP TCP/WSS consumer described below.
+There is no server CLI, native administration or Atom activation, certificate
+installation/provisioning, issuer fetching or production enablement. Other
+consumers must enforce credential selection, admission, retirement and custody.
 
 ## Policy format
 
@@ -159,8 +159,102 @@ cap later upgrade/protocol stages by the peer deadline, retire affected admissio
 and I/O on expiry, and preserve already begun originals through their normal
 drain. A token refresh or successful RPC cannot renew this TLS lease; renewal
 requires another verified connection. A capability is not permission to bypass
-future operation checks or discard a begun commit. Those transport integrations
-are separate from this foundation.
+future operation checks or discard a begun commit. These integrations are
+separate from the auth foundation. The AMQP library consumer below implements
+this boundary without changing the broker state model.
+
+## AMQP TCP and WSS library consumer
+
+Enable `protocol-amqp`'s optional `workload-tls` feature, which selects
+`auth/workload-tls`. Its default feature set is empty; ordinary TLS, SAS/PLAIN,
+offline JWT and development no-auth APIs remain available unchanged.
+
+Prepare an auth endpoint with its own pinned policy, then consume the legacy
+listener through the fallible conversion:
+
+```rust,ignore
+let listener = protocol_amqp::AmqpListener::new(broker, namespace)
+    // Optional: explicit independent SAS/JWT policy, configured BEFORE conversion.
+    .with_shared_access_authentication(tokens)
+    .with_workload_tls(prepared_workload_tls)?;
+let mut service = listener.into_tcp_service(socket); // or into_wss_service
+// Retain this original owner through serve(), finish() and take_exit().
+```
+
+Certificate-only mode omits `with_shared_access_authentication`; conversion
+installs an empty SAS policy **with an authorization context**, never the
+unrestricted development path. Use SASL ANONYMOUS; the certificate proof already
+satisfies initial authorization and no CBS token is necessary. MSSBCBS keeps its
+existing exchange behavior. PLAIN still requires independently valid shared-key
+credentials; there is no EXTERNAL/authzid/CN/header principal fallback.
+
+Conversion rejects an existing plain-TLS configuration, a mismatched broker
+namespace, an alternative policy whose exact audience host differs from the
+endpoint root, or optional certificates without explicitly supplied alternative
+authentication. An explicitly empty alternative policy remains deny-all, not
+permission for an absent certificate. The endpoint audience's first label binds
+the existing broker namespace, while its full canonical host binds resource
+authorization; SNI, SASL/Open hostnames and absolute peer addresses cannot select
+a different authority.
+
+The result is `WorkloadAmqpListener`, not a legacy listener with a hidden invalid
+flag. It exposes safe connection-limit/admission-timeout setters and retained
+TCP/WSS serving, but no TLS/credential replacement, raw inner listener or Deref.
+TLS-before-conversion conflicts refuse; TLS-after-conversion does not compile.
+The underlying legacy builder's return types and defaults do not change.
+
+Only this listener's actual `PreparedWorkloadTls::accept_before` success creates
+its connection-local workload proof and the separate private TLS admission proof
+that enables JWT. The proof stays associated with that stream through WSS
+upgrade and native AMQP acceptance. Missing optional certificates create no
+workload proof; invalid presented certificates fail TLS even with valid tokens
+configured. The original accept deadline is never reset: remaining upgrade,
+SASL and Open stages use the earlier of that deadline and the peer lease, and
+also observe the peer's wall-time expiry future. A returned native connection
+enters existing custody before any reporting or post-accept authorization check.
+
+For a live session, each permission can come from an independently verified
+token grant **or** the certificate principal's local mapping. Token claims do not
+become certificate rights, and different sockets/principals do not share proof.
+Failed CBS keeps its existing 400/401 behavior and does not erase previous good
+grants or certificate authority. Issuer/scope refresh isolation and both token
+validity bounds remain intact. Checks sample token time and live certificate
+state after awaiting the grant lock, not before a blocked frontier.
+
+A **presented certificate's lease is an outer session guard** on all these
+rights, including longer-lived SAS/PLAIN/JWT grants. It cannot be renewed by CBS,
+and permission expiry waits cannot extend it by taking the maximum token expiry.
+An optional socket without a certificate instead keeps ordinary token validity;
+no certificate deadline is invented for it.
+
+Each original connection task selects its own expiry future and requests its
+existing native stop/retirement on expiry. This interrupts idle/partial socket
+IO and retires that connection's admission only. The listener and unrelated
+connections remain live. There are no detached expiry tasks, replacement task
+families, abort-all operations or independent shutdown budgets. Existing custody
+retains and joins original native, session, link and worker tasks.
+
+The connection also supplies a private lease-fenced broker adapter to **every**
+protocol path. Inside each operation future, immediately before invoking the
+real bind/name-submit/bound-submit method, it rechecks live certificate state
+without an intervening await. Earlier attach/authentication, a prepared future,
+an expired token refresh or a held protocol frontier cannot authorize fresh
+broker work after cutoff. Captured bindings are forwarded unchanged; there is
+no name fallback or authority recapture. The fence does not interpret command
+permissions or replace existing operation-specific checks. A cutoff refusal has
+the unauthorized-access condition (management 401 when a reply remains possible);
+socket retirement may instead be observed as disconnection.
+
+Once the real original has begun before cutoff, it is retained to completion,
+even if a commit/reply or broker-channel admission finishes later. Expiry is not
+rollback and does not discard a begun send or receive. A client may still dequeue
+a delivery buffered before expiry, but cannot thereby start a new post-cutoff
+settlement. This is a connection-authentication boundary, not a new entity-holder
+or storage/consensus contract.
+
+This is a library opt-in, not server-main/CLI, native administration or Atom
+activation. Restart orchestration, actual admin proof consumption and shared
+process shutdown integration remain separate.
 
 ## Restart-only trust rotation and local revocation
 

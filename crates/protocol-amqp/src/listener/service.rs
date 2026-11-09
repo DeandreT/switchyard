@@ -39,6 +39,8 @@ mod jwt_tests;
 mod tcp_tests;
 #[cfg(test)]
 mod test_support;
+#[cfg(all(test, feature = "workload-tls"))]
+mod workload_tests;
 #[cfg(test)]
 mod wss_tests;
 
@@ -51,6 +53,44 @@ type Primary = std::thread::Result<io::Result<()>>;
 /// Only this module's TLS handshake branches can construct it; configuring a
 /// listener, accepting AMQP elsewhere, or peer input cannot mint this proof.
 pub(crate) struct TlsAdmission(());
+
+// Travels with exactly the stream admitted here, including through WSS upgrade.
+struct TransportAdmission {
+    tls: Option<TlsAdmission>,
+    #[cfg(feature = "workload-tls")]
+    workload: Option<crate::workload::WorkloadPeer>,
+}
+
+impl TransportAdmission {
+    fn new(tls: Option<TlsAdmission>) -> Self {
+        Self {
+            tls,
+            #[cfg(feature = "workload-tls")]
+            workload: None,
+        }
+    }
+    fn deadline(&self, original: Instant) -> Instant {
+        #[cfg(feature = "workload-tls")]
+        if let Some(peer) = &self.workload {
+            return original.min(peer.deadline());
+        }
+        original
+    }
+    fn live(&self) -> bool {
+        #[cfg(feature = "workload-tls")]
+        if let Some(peer) = &self.workload {
+            return peer.is_live();
+        }
+        true
+    }
+    async fn expired(&self) {
+        #[cfg(feature = "workload-tls")]
+        if let Some(peer) = &self.workload {
+            return peer.expired().await;
+        }
+        std::future::pending().await
+    }
+}
 
 enum PumpExit {
     Retired,
@@ -225,6 +265,8 @@ impl<B: Broker> AmqpListenerService<B> {
                         namespace: self.config.namespace.clone(),
                         container_id: self.config.container_id.clone(),
                         tls_acceptor: self.config.tls_acceptor.clone(),
+                        #[cfg(feature = "workload-tls")]
+                        workload_endpoint: self.config.workload_endpoint.clone(),
                         shared_access_authentication: self
                             .config
                             .shared_access_authentication
@@ -429,6 +471,10 @@ async fn serve_binding_task<B: Broker>(
     binding: Binding,
     deadline: Instant,
 ) -> ConnectionTaskExit {
+    #[cfg(feature = "workload-tls")]
+    if let Some(endpoint) = config.workload_endpoint.clone() {
+        return serve_workload_task(stream, config, retirement, binding, deadline, endpoint).await;
+    }
     match binding {
         Binding::Tcp => serve_tcp_task(stream, config, retirement, deadline).await,
         Binding::WebSocket => serve_wss_task(stream, config, retirement, deadline).await,
@@ -446,14 +492,29 @@ async fn serve_wss_task<B: Broker>(
             let handshake = before_deadline(deadline, Stage::Tls, acceptor.accept(stream));
             match until_retired(&retirement, handshake, Stage::Tls).await {
                 Some(Ok(stream)) => {
-                    serve_wss_stream(stream, config, retirement, deadline, Some(TlsAdmission(())))
-                        .await
+                    serve_wss_stream(
+                        stream,
+                        config,
+                        retirement,
+                        deadline,
+                        TransportAdmission::new(Some(TlsAdmission(()))),
+                    )
+                    .await
                 }
                 Some(Err(error)) => ConnectionTaskExit::Complete(Err(error.into())),
                 None => ConnectionTaskExit::Complete(Ok(())),
             }
         }
-        None => serve_wss_stream(stream, config, retirement, deadline, None).await,
+        None => {
+            serve_wss_stream(
+                stream,
+                config,
+                retirement,
+                deadline,
+                TransportAdmission::new(None),
+            )
+            .await
+        }
     }
 }
 
@@ -462,16 +523,17 @@ async fn serve_wss_stream<Io, B>(
     config: AmqpListener<B>,
     retirement: AmqpListenerRetirement,
     deadline: Instant,
-    tls: Option<TlsAdmission>,
+    admission: TransportAdmission,
 ) -> ConnectionTaskExit
 where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     B: Broker,
 {
+    let deadline = admission.deadline(deadline);
     let upgrade = before_deadline(deadline, Stage::Upgrade, accept_amqp_websocket(stream));
-    match until_retired(&retirement, upgrade, Stage::Upgrade).await {
+    match until_admitted(&retirement, &admission, upgrade, Stage::Upgrade).await {
         Some(Ok(stream)) => {
-            serve_retained_connection(stream, config, retirement, deadline, tls).await
+            serve_retained_connection(stream, config, retirement, deadline, admission).await
         }
         Some(Err(error)) => ConnectionTaskExit::Complete(Err(error.into())),
         None => ConnectionTaskExit::Complete(Ok(())),
@@ -494,7 +556,7 @@ async fn serve_tcp_task<B: Broker>(
                         config,
                         retirement,
                         deadline,
-                        Some(TlsAdmission(())),
+                        TransportAdmission::new(Some(TlsAdmission(()))),
                     )
                     .await
                 }
@@ -502,7 +564,16 @@ async fn serve_tcp_task<B: Broker>(
                 None => ConnectionTaskExit::Complete(Ok(())),
             }
         }
-        None => serve_retained_connection(stream, config, retirement, deadline, None).await,
+        None => {
+            serve_retained_connection(
+                stream,
+                config,
+                retirement,
+                deadline,
+                TransportAdmission::new(None),
+            )
+            .await
+        }
     }
 }
 
@@ -539,12 +610,57 @@ async fn until_retired<F: Future>(
     }
 }
 
+async fn until_admitted<T, E: From<io::Error>>(
+    retirement: &AmqpListenerRetirement,
+    admission: &TransportAdmission,
+    future: impl Future<Output = Result<T, E>>,
+    stage: Stage,
+) -> Option<Result<T, E>> {
+    tokio::select! {
+        biased;
+        () = admission.expired() => Some(Err(io::Error::new(io::ErrorKind::PermissionDenied, "workload connection lease expired").into())),
+        result = until_retired(retirement, future, stage) => result,
+    }
+}
+
+#[cfg(feature = "workload-tls")]
+async fn serve_workload_task<B: Broker>(
+    stream: TcpStream,
+    config: AmqpListener<B>,
+    retirement: AmqpListenerRetirement,
+    binding: Binding,
+    deadline: Instant,
+    endpoint: auth::workload::PreparedWorkloadTls,
+) -> ConnectionTaskExit {
+    let handshake = endpoint.accept_before(stream, deadline);
+    let stream = match until_retired(&retirement, handshake, Stage::Tls).await {
+        Some(Ok(stream)) => stream,
+        Some(Err(error)) => return ConnectionTaskExit::Complete(Err(error.into())),
+        None => return ConnectionTaskExit::Complete(Ok(())),
+    };
+    // Both the strong peer proof and the JWT encryption proof come only from
+    // this endpoint's actual successful handshake of the SAME retained stream.
+    let workload = crate::workload::WorkloadPeer::from_admitted(endpoint, &stream);
+    let admission = TransportAdmission {
+        tls: Some(TlsAdmission(())),
+        workload,
+    };
+    match binding {
+        Binding::Tcp => {
+            serve_retained_connection(stream, config, retirement, deadline, admission).await
+        }
+        Binding::WebSocket => {
+            serve_wss_stream(stream, config, retirement, deadline, admission).await
+        }
+    }
+}
+
 async fn serve_retained_connection<Io, B>(
     stream: Io,
     config: AmqpListener<B>,
     retirement: AmqpListenerRetirement,
     deadline: Instant,
-    tls: Option<TlsAdmission>,
+    mut admission: TransportAdmission,
 ) -> ConnectionTaskExit
 where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -557,8 +673,10 @@ where
     let authenticator = sasl
         .as_ref()
         .map(|sasl| Arc::new(sasl.clone()) as Arc<dyn amqp::SaslAuthenticator>);
-    let accepted = until_retired(
+    let deadline = admission.deadline(deadline);
+    let accepted = until_admitted(
         &retirement,
+        &admission,
         // SASL and Open share the budget that TLS and any upgrade drew from.
         ServerConnection::accept_before(stream, config.container_id, authenticator, deadline),
         Stage::Protocol,
@@ -573,18 +691,29 @@ where
     let primary = AssertUnwindSafe(async {
         #[cfg(test)]
         test_support::native_accepted();
+        let request = custody.request_handle();
+        // A returned native connection is already in custody even if expiry or
+        // a reporting/diagnostic frontier overtook its final admission.
+        if !admission.live() { request.request(); return Ok(()); }
         let authorization = config.shared_access_authentication.map(|config| {
             let grant = sasl.as_ref().and_then(SharedAccessSaslAcceptor::grant);
-            ConnectionAuthorization::new_for_transport(config, grant, tls)
+            #[cfg(feature = "workload-tls")]
+            { ConnectionAuthorization::new_for_workload_transport(config, grant, admission.tls.take(), admission.workload.clone()) }
+            #[cfg(not(feature = "workload-tls"))]
+            { ConnectionAuthorization::new_for_transport(config, grant, admission.tls.take()) }
         });
-        let request = custody.request_handle();
+        #[cfg(feature = "workload-tls")]
+        let broker = crate::workload::LeaseBroker::new(config.broker, admission.workload.clone());
+        #[cfg(not(feature = "workload-tls"))]
+        let broker = config.broker;
         tokio::select! {
             biased;
+            () = admission.expired() => { request.request(); Ok(()) },
             () = retirement.observer() => {
                 request.request();
                 Ok(())
             },
-            primary = serve_open_connection(&mut custody, config.namespace, config.broker, authorization) => primary,
+            primary = serve_open_connection(&mut custody, config.namespace, broker, authorization) => primary,
         }
     }).catch_unwind().await;
     custody.record_primary(primary);

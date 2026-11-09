@@ -64,6 +64,26 @@ fn sas_token(audience: &str, expiry: u64) -> String {
 }
 
 #[tokio::test]
+async fn authorization_samples_time_after_the_grants_lock_frontier() {
+    let authorization = connection(Some(verified_jwt(FIRST, ISSUER, AUDIENCE, r#""send""#)));
+    let resource = ResourceScope::parse(AUDIENCE).unwrap();
+    let now = Cell::new(150);
+    let lock = authorization.grant_write_lock().await;
+    let mut check = pin!(authorization.authorize_resource_any_with_clock(
+        &resource,
+        &[Permission::Send],
+        || now.get()
+    ));
+    assert!(poll_once(check.as_mut()).is_pending());
+    now.set(200);
+    drop(lock);
+    assert!(
+        check.await.is_err(),
+        "the pre-await epoch cannot keep a grant alive"
+    );
+}
+
+#[tokio::test]
 async fn same_principal_and_scope_refresh_replaces_rights_and_both_validity_bounds() {
     let first = verified_jwt(FIRST, ISSUER, AUDIENCE, r#""send","listen""#);
     let refreshed = verified_jwt(REFRESH, ISSUER, AUDIENCE, r#""listen""#);
