@@ -131,6 +131,11 @@ preserve verified principal identity and both validity bounds for SAS and explic
 configured TLS JWT CBS.
 Native admin RPCs use the configured offline JWT policy.
 
+The optional [local workload identity foundation](workload-identity.md) provides
+bounded pinned policy and actual-handshake endpoint-bound TLS peer capabilities.
+It does not activate AMQP/WSS/admin certificate authorization, retire their live
+connections, or change existing SAS/JWT/default transport behavior.
+
 ### Absolute link addresses
 
 Data and entity-management links accept relative entity paths or absolute
