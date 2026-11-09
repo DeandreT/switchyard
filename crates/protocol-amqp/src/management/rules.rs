@@ -62,13 +62,13 @@ pub(super) async fn add<B: Broker>(
             return ManagementResponse::bad_request(message_id, tracking_id, description);
         }
     };
-    match broker
-        .submit(
-            namespace.clone(),
-            entity.clone(),
-            CommandKind::CreateRule { name, filter },
-        )
-        .await
+    match super::submit_request(
+        broker,
+        namespace,
+        entity,
+        CommandKind::CreateRule { name, filter },
+    )
+    .await
     {
         Ok(CommandOutcome::RuleCreated) => {
             ManagementResponse::accepted(message_id, tracking_id, Value::Null)
@@ -96,14 +96,7 @@ pub(super) async fn remove<B: Broker>(
             return ManagementResponse::bad_request(message_id, tracking_id, description);
         }
     };
-    match broker
-        .submit(
-            namespace.clone(),
-            entity.clone(),
-            CommandKind::DeleteRule { name },
-        )
-        .await
-    {
+    match super::submit_request(broker, namespace, entity, CommandKind::DeleteRule { name }).await {
         Ok(CommandOutcome::RuleDeleted) => {
             ManagementResponse::accepted(message_id, tracking_id, Value::Null)
         }
@@ -130,13 +123,13 @@ pub(super) async fn enumerate<B: Broker>(
             return ManagementResponse::bad_request(message_id, tracking_id, description);
         }
     };
-    match broker
-        .submit(
-            namespace.clone(),
-            entity.clone(),
-            CommandKind::ListRules { skip, max_rules },
-        )
-        .await
+    match super::submit_request(
+        broker,
+        namespace,
+        entity,
+        CommandKind::ListRules { skip, max_rules },
+    )
+    .await
     {
         Ok(CommandOutcome::RulesListed { rules }) if rules.is_empty() => {
             ManagementResponse::no_content(message_id, tracking_id)
@@ -475,10 +468,24 @@ mod tests {
     }
 
     impl Broker for RecordingBroker {
-        fn submit(
+        async fn bind_entity(
+            &self,
+            namespace: NamespaceName,
+            entity: EntityPath,
+        ) -> Result<domain::EntityBinding, BrokerRejection> {
+            Ok(crate::broker::test_binding(namespace, entity))
+        }
+        async fn submit(
             &self,
             _namespace: NamespaceName,
             _entity: EntityPath,
+            _kind: CommandKind,
+        ) -> Result<CommandOutcome, BrokerRejection> {
+            panic!("bound outcome fixture cannot submit by name")
+        }
+        fn submit_bound(
+            &self,
+            _binding: domain::EntityBinding,
             kind: CommandKind,
         ) -> impl std::future::Future<Output = Result<CommandOutcome, BrokerRejection>> + Send
         {

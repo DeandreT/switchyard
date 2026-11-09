@@ -106,6 +106,11 @@ pub(crate) enum ReceivingAuthority {
 }
 
 impl ReceivingAuthority {
+    pub(crate) fn binding(&self) -> &EntityBinding {
+        match self {
+            Self::Ordinary(binding) | Self::Session(binding) => binding,
+        }
+    }
     pub(crate) async fn submit<B: Broker>(
         &self,
         broker: &B,
@@ -125,16 +130,46 @@ impl ReceivingAuthority {
 #[cfg(test)]
 pub(crate) fn test_binding(namespace: NamespaceName, entity: EntityPath) -> EntityBinding {
     let machine = domain::StateMachine::new(storage::MemoryStore::default());
+    let (owner, subscription) = match crate::parse_attachment(entity.as_str()).unwrap() {
+        crate::Attachment::Queue(owner) | crate::Attachment::DeadLetter(owner) => (owner, None),
+        crate::Attachment::Subscription {
+            topic,
+            subscription,
+        }
+        | crate::Attachment::SubscriptionDeadLetter {
+            topic,
+            subscription,
+        } => (topic, Some(subscription)),
+    };
     machine
         .apply(&domain::Command::new(
             namespace.clone(),
-            entity.clone(),
+            owner.clone(),
             domain::Timestamp::from_millis(0),
-            CommandKind::CreateQueue {
-                config: domain::QueueConfig::default(),
+            if subscription.is_some() {
+                CommandKind::CreateTopic {
+                    config: domain::TopicConfig::default(),
+                }
+            } else {
+                CommandKind::CreateQueue {
+                    config: domain::QueueConfig::default(),
+                }
             },
         ))
         .unwrap();
+    if let Some(name) = subscription {
+        machine
+            .apply(&domain::Command::new(
+                namespace.clone(),
+                owner,
+                domain::Timestamp::from_millis(0),
+                CommandKind::CreateSubscription {
+                    name,
+                    config: domain::SubscriptionConfig::default(),
+                },
+            ))
+            .unwrap();
+    }
     machine.bind_entity(&namespace, &entity).unwrap()
 }
 

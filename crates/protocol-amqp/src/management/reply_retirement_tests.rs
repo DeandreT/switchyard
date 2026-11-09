@@ -309,12 +309,16 @@ impl Wire {
     }
 
     pub(super) async fn detach(&mut self) {
+        self.detach_on(HANDLE).await;
+    }
+
+    pub(super) async fn detach_on(&mut self, handle: u32) {
         write_frame(
             &mut self.peer,
             &frame(
                 CHANNEL,
                 Performative::Detach(amqp::Detach {
-                    handle: HANDLE,
+                    handle,
                     closed: true,
                     error: None,
                 }),
@@ -344,14 +348,18 @@ impl Wire {
     }
 
     pub(super) async fn request_message(&mut self, message: &Message) {
+        self.request_message_on(HANDLE, 1, message).await;
+    }
+
+    pub(super) async fn request_message_on(&mut self, handle: u32, id: u32, message: &Message) {
         write_frame(
             &mut self.peer,
             &Frame::Amqp {
                 channel: CHANNEL,
                 performative: Some(Performative::Transfer(Transfer {
-                    handle: HANDLE,
-                    delivery_id: Some(1),
-                    delivery_tag: Some(Binary::from(vec![1])),
+                    handle,
+                    delivery_id: Some(id),
+                    delivery_tag: Some(Binary::from(id.to_be_bytes().to_vec())),
                     message_format: Some(0),
                     settled: Some(false),
                     more: false,
@@ -366,6 +374,89 @@ impl Wire {
         )
         .await
         .unwrap();
+    }
+
+    /// Offer a real additional management request on the baseline reply session.
+    /// Return its original session separately so native acceptance may be borrowed
+    /// while the peer reads frames; no endpoint or driver task is reconstructed.
+    pub(super) async fn offer_management_request(
+        &mut self,
+        entity: &EntityPath,
+        handle: u32,
+    ) -> (ServerSession, Attach) {
+        let attach = Attach {
+            name: "retained-request-link".into(),
+            handle,
+            role: Role::Sender,
+            snd_settle_mode: SenderSettleMode::Unsettled,
+            rcv_settle_mode: ReceiverSettleMode::First,
+            source: None,
+            target: Some(Target::new(format!("{entity}/$management"))),
+            unsettled: None,
+            incomplete_unsettled: false,
+            initial_delivery_count: Some(0),
+            max_message_size: None,
+            offered_capabilities: None,
+            desired_capabilities: None,
+            properties: None,
+        };
+        write_frame(
+            &mut self.peer,
+            &frame(CHANNEL, Performative::Attach(Box::new(attach))),
+        )
+        .await
+        .unwrap();
+        let mut session = self.sessions.remove(0);
+        let attach = timeout(WAIT, session.next_incoming_attach())
+            .await
+            .unwrap()
+            .unwrap();
+        (session, attach)
+    }
+
+    pub(super) fn restore_session(&mut self, session: ServerSession) {
+        self.sessions.insert(0, session);
+    }
+
+    pub(super) async fn response_message(&mut self) -> Message {
+        loop {
+            let Frame::Amqp {
+                channel: CHANNEL,
+                performative: Some(performative),
+                payload,
+            } = timeout(WAIT, read_frame(&mut self.peer))
+                .await
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("actual management response frame")
+            };
+            match performative {
+                Performative::Transfer(transfer) => {
+                    assert_eq!(transfer.handle, HANDLE);
+                    let message = decode_message(&payload).unwrap();
+                    write_frame(
+                        &mut self.peer,
+                        &frame(
+                            CHANNEL,
+                            Performative::Disposition(Disposition {
+                                role: Role::Receiver,
+                                first: transfer.delivery_id.unwrap(),
+                                last: None,
+                                settled: true,
+                                state: Some(DeliveryState::Accepted(Accepted)),
+                                batchable: false,
+                            }),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    return message;
+                }
+                Performative::Disposition(_) | Performative::Flow(_) => {}
+                other => panic!("unexpected request/reply frame: {other:?}"),
+            }
+        }
     }
 
     pub(super) async fn no_frame_yet(&mut self) {

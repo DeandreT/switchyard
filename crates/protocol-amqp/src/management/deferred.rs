@@ -3,7 +3,7 @@
 use amqp::{Body, Fields, Message, MessageId, encode_message};
 use domain::{
     CommandKind, CommandOutcome, Delivery, EntityPath, LockToken, NamespaceName, ReceiveMode,
-    SequenceNumber, SessionHold,
+    SequenceNumber,
 };
 use serde_amqp::{
     Value,
@@ -90,15 +90,23 @@ pub(super) async fn receive_by_sequence_number<B: Broker>(
     // Against a bounded reply link it is staged: lock, measure the response,
     // then delete.
     let staged = mode == ReceiveMode::ReceiveAndDelete && reply_limit.is_some();
+    let binding = match session.as_ref() {
+        Some(session) => session.binding.clone(),
+        None => match broker.bind_entity(namespace.clone(), entity.clone()).await {
+            Ok(binding) => binding,
+            Err(rejection) => {
+                return ManagementResponse::from_rejection(message_id, tracking_id, &rejection);
+            }
+        },
+    };
     let result = broker
-        .submit(
-            namespace.clone(),
-            entity.clone(),
+        .submit_bound(
+            binding.clone(),
             CommandKind::ReceiveDeferred {
                 sequences,
                 mode: if staged { ReceiveMode::PeekLock } else { mode },
                 lock_duration_millis: None,
-                session,
+                session: session.map(|session| session.hold),
             },
         )
         .await;
@@ -155,8 +163,7 @@ pub(super) async fn receive_by_sequence_number<B: Broker>(
         return delete_staged(
             message_id,
             tracking_id,
-            namespace,
-            entity,
+            &binding,
             broker,
             deliveries,
             staged_locks,
@@ -167,7 +174,7 @@ pub(super) async fn receive_by_sequence_number<B: Broker>(
     for delivery in deliveries {
         if delivery.lock.is_some() {
             management
-                .register_request_response_delivery(entity.clone(), delivery)
+                .register_request_response_delivery(entity.clone(), delivery, binding.clone())
                 .await;
         }
     }
@@ -185,8 +192,7 @@ pub(super) async fn receive_by_sequence_number<B: Broker>(
 async fn delete_staged<B: Broker>(
     message_id: MessageId,
     tracking_id: Option<String>,
-    namespace: &NamespaceName,
-    entity: &EntityPath,
+    binding: &domain::EntityBinding,
     broker: &B,
     deliveries: Vec<Delivery>,
     locks: Vec<Option<domain::DeliveryLock>>,
@@ -205,9 +211,8 @@ async fn delete_staged<B: Broker>(
             continue;
         };
         let completed = broker
-            .submit(
-                namespace.clone(),
-                entity.clone(),
+            .submit_bound(
+                binding.clone(),
                 CommandKind::Complete {
                     sequence: delivery.sequence,
                     lock_token: lock.token,
@@ -370,13 +375,13 @@ async fn optional_session(
     tracking_id: Option<String>,
     entity: &EntityPath,
     management: &ConnectionManagement,
-) -> Result<Option<SessionHold>, ManagementResponse> {
+) -> Result<Option<super::SessionRegistration>, ManagementResponse> {
     if map_value(&message.body, SESSION_ID).is_none() {
         return Ok(None);
     }
     requested_session(message, entity, management)
         .await
-        .map(|session| Some(session.hold))
+        .map(Some)
         .map_err(|error| session_lookup_response(message_id, tracking_id, error))
 }
 
@@ -607,18 +612,24 @@ mod tests {
     }
 
     impl Broker for RecordingBroker {
-        async fn submit_bound(
+        async fn bind_entity(
             &self,
-            binding: domain::EntityBinding,
-            kind: CommandKind,
-        ) -> Result<CommandOutcome, crate::BrokerRejection> {
-            self.submit(binding.namespace().clone(), binding.target().clone(), kind)
-                .await
+            namespace: NamespaceName,
+            entity: EntityPath,
+        ) -> Result<domain::EntityBinding, crate::BrokerRejection> {
+            Ok(crate::broker::test_binding(namespace, entity))
         }
-        fn submit(
+        async fn submit(
             &self,
             _namespace: NamespaceName,
             _entity: EntityPath,
+            _kind: CommandKind,
+        ) -> Result<CommandOutcome, crate::BrokerRejection> {
+            panic!("bound outcome fixture cannot submit by name")
+        }
+        fn submit_bound(
+            &self,
+            _binding: domain::EntityBinding,
             kind: CommandKind,
         ) -> impl std::future::Future<Output = Result<CommandOutcome, crate::BrokerRejection>> + Send
         {
@@ -977,6 +988,10 @@ mod tests {
         ));
     }
 
+    fn fixture_binding(entity: &EntityPath) -> domain::EntityBinding {
+        crate::broker::test_binding(NamespaceName::new("tenant").unwrap(), entity.clone())
+    }
+
     fn locked_delivery(sequence: u64, token: u64, lock_duration_millis: u64) -> Delivery {
         Delivery {
             sequence: SequenceNumber::new(sequence),
@@ -1007,6 +1022,7 @@ mod tests {
             .register_request_response_delivery_at(
                 entity.clone(),
                 locked_delivery(7, 9, 1_000),
+                fixture_binding(&entity),
                 started,
             )
             .await;
@@ -1045,13 +1061,15 @@ mod tests {
             .register_request_response_delivery_at(
                 entity.clone(),
                 locked_delivery(8, 10, 1),
+                fixture_binding(&entity),
                 started,
             )
             .await;
         management
             .register_request_response_delivery_at(
-                entity,
+                entity.clone(),
                 locked_delivery(9, 11, 1_000),
+                fixture_binding(&entity),
                 started + std::time::Duration::from_millis(1),
             )
             .await;
@@ -1067,6 +1085,7 @@ mod tests {
             .register_request_response_delivery_at(
                 entity.clone(),
                 locked_delivery(7, 9, 1_000),
+                fixture_binding(&entity),
                 started,
             )
             .await;
@@ -1136,7 +1155,7 @@ mod tests {
             Some(&Value::Uuid(lock_uuid(LockToken::new(9))))
         );
         management
-            .register_request_response_delivery(entity.clone(), delivery)
+            .register_request_response_delivery(entity.clone(), delivery, fixture_binding(&entity))
             .await;
 
         assert_eq!(
@@ -1182,7 +1201,7 @@ mod tests {
             origin: domain::DeliveryOrigin::Deferred,
         };
         management
-            .register_request_response_delivery(entity.clone(), delivery)
+            .register_request_response_delivery(entity.clone(), delivery, fixture_binding(&entity))
             .await;
         let request = Message {
             body: body([
@@ -1233,7 +1252,11 @@ mod tests {
         let entity = EntityPath::new("orders").expect("valid entity");
         let namespace = NamespaceName::new("tenant").expect("valid namespace");
         management
-            .register_request_response_delivery(entity.clone(), locked_delivery(7, 9, 60_000))
+            .register_request_response_delivery(
+                entity.clone(),
+                locked_delivery(7, 9, 60_000),
+                fixture_binding(&entity),
+            )
             .await;
         let request = Message {
             body: body([
@@ -1344,6 +1367,21 @@ mod tests {
     struct RealBroker(server::BrokerHandle);
 
     impl Broker for RealBroker {
+        async fn bind_entity(
+            &self,
+            namespace: NamespaceName,
+            entity: EntityPath,
+        ) -> Result<domain::EntityBinding, crate::BrokerRejection> {
+            self.0
+                .bind_entity(namespace, entity)
+                .await
+                .map_err(|error| match error {
+                    server::SubmitError::Propose(server::ProposeError::Broker(error)) => {
+                        crate::BrokerRejection::Refused(error)
+                    }
+                    other => crate::BrokerRejection::Unavailable(other.to_string()),
+                })
+        }
         async fn submit_bound(
             &self,
             binding: domain::EntityBinding,

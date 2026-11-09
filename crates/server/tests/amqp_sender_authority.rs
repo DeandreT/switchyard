@@ -3,10 +3,12 @@
 
 use std::{
     error::Error,
+    future::{Future, poll_fn},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    task::Poll,
     time::Duration,
 };
 
@@ -400,15 +402,17 @@ async fn attached_senders_reject_drift<P: StoreProvider>(
         assert_eq!(raw.snapshot()?, committed);
 
         if !topic {
-            // A management link remains usable for other operations when its
-            // scheduling capture fails. Creating the name later must not let
-            // that same link recapture authority on its first schedule.
+            // Request-link operations, including Peek, retain the original
+            // failed entity capture. Creating the name later cannot upgrade
+            // that link; malformed requests still take priority. Separately
+            // selected delivery/session capabilities keep their own authority.
+            let missing_entity = EntityPath::new("missing")?;
             let mut missing =
                 Sender::attach(&mut session, "missing-schedule", "missing/$management").await?;
             handle
                 .submit(
                     namespace.clone(),
-                    EntityPath::new("missing")?,
+                    missing_entity.clone(),
                     CommandKind::CreateQueue {
                         config: QueueConfig::default(),
                     },
@@ -427,6 +431,15 @@ async fn attached_senders_reject_drift<P: StoreProvider>(
             .await?;
             observations.assert_no_effect();
             assert_eq!(raw.snapshot()?, created);
+            let mut missing_wake = Box::pin(handle.deliverable(&namespace, &missing_entity));
+            poll_fn(|context| {
+                assert!(
+                    missing_wake.as_mut().poll(context).is_pending(),
+                    "empty newly created queue has no pending deliverability wake"
+                );
+                Poll::Ready(())
+            })
+            .await;
             let peek = Message::builder()
                 .properties(Properties {
                     message_id: Some("missing-capture-listen".to_owned().into()),
@@ -446,7 +459,53 @@ async fn attached_senders_reject_drift<P: StoreProvider>(
                     (Value::String("message-count".into()), Value::Int(1)),
                 ]))))
                 .build();
-            assert!(matches!(missing.send(peek).await?, Outcome::Accepted(_)));
+            assert!(matches!(
+                missing.send(peek.clone()).await?,
+                Outcome::Accepted(_)
+            ));
+            let response = timeout(WAIT, responses.recv()).await??;
+            let properties = response
+                .message()
+                .application_properties
+                .as_ref()
+                .expect("stale Peek response properties");
+            assert_eq!(
+                properties.get(protocol_amqp::STATUS_CODE_PROPERTY),
+                Some(&Value::Int(404)),
+                "Peek must retain the request link's original failed entity capture",
+            );
+            assert_eq!(
+                properties.get(protocol_amqp::ERROR_CONDITION_PROPERTY),
+                Some(&Value::Symbol(protocol_amqp::NOT_FOUND.into())),
+            );
+            responses.accept(&response).await?;
+            observations.assert_no_effect();
+            assert_eq!(
+                raw.snapshot()?,
+                created,
+                "stale Peek leaves all store bytes unchanged"
+            );
+            poll_fn(|context| {
+                assert!(
+                    missing_wake.as_mut().poll(context).is_pending(),
+                    "stale Peek must not notify deliverability"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            drop(missing_wake);
+
+            // A fresh request link captures the now-live queue. Peek before
+            // scheduling proves the empty queue is usable through valid authority.
+            let mut now_present =
+                Sender::attach(&mut session, "now-present-schedule", "missing/$management").await?;
+            let mut fresh_peek = peek;
+            fresh_peek.properties.as_mut().unwrap().message_id =
+                Some("present-capture-listen".to_owned().into());
+            assert!(matches!(
+                now_present.send(fresh_peek).await?,
+                Outcome::Accepted(_)
+            ));
             let response = timeout(WAIT, responses.recv()).await??;
             assert_eq!(
                 response
@@ -456,18 +515,29 @@ async fn attached_senders_reject_drift<P: StoreProvider>(
                     .unwrap()
                     .get(protocol_amqp::STATUS_CODE_PROPERTY),
                 Some(&Value::Int(204)),
-                "failed scheduling authority must not fence unrelated Listen operations",
+                "fresh request-link authority permits Peek on the empty queue",
             );
             responses.accept(&response).await?;
-            let mut now_present =
-                Sender::attach(&mut session, "now-present-schedule", "missing/$management").await?;
             schedule(&mut now_present, &mut responses, "new-capture", false, 200).await?;
         }
 
+        let final_snapshot = raw.snapshot()?;
         connection.close().await?;
         retirement.request();
-        assert!(timeout(WAIT, service_task).await??.is_some());
+        assert!(matches!(
+            timeout(WAIT, service_task).await??,
+            Some(protocol_amqp::AmqpListenerExit::Complete(Ok(())))
+        ));
+        drop(wake);
+        drop(handle);
         drop(broker);
+        drop(raw);
+        let reopened = provider.open()?;
+        assert_eq!(
+            reopened.snapshot()?,
+            final_snapshot,
+            "joined-owner reopen preserves exact store bytes"
+        );
     }
     Ok(())
 }

@@ -94,13 +94,13 @@ pub(super) async fn cancel<B: Broker>(
         }
     };
     let expected = u32::try_from(sequences.len()).unwrap_or(u32::MAX);
-    match broker
-        .submit(
-            namespace.clone(),
-            entity.clone(),
-            CommandKind::CancelScheduled { sequences },
-        )
-        .await
+    match super::submit_request(
+        broker,
+        namespace,
+        entity,
+        CommandKind::CancelScheduled { sequences },
+    )
+    .await
     {
         Ok(CommandOutcome::ScheduledCancelled { cancelled }) if cancelled == expected => {
             ManagementResponse::accepted(message_id, tracking_id, Value::Null)

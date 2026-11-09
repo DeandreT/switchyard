@@ -63,8 +63,7 @@ async fn outer_request_panic_drains_actual_session_mutation_before_and_after_app
                     .catch_unwind(),
                 ),
             );
-            pending_once(serving.as_mut()).await;
-            actor.gate.reached(false).await;
+            drive_to_apply(serving.as_mut(), &actor.gate).await;
             timeout(WAIT, fault.reached.notified()).await.unwrap();
             if after {
                 actor.gate.release(false);
@@ -202,8 +201,10 @@ async fn outer_request_panic_drains_actual_registry_refresh_and_removals_without
             let held = management.request_response_deliveries.write().await;
             let replacement_row = held.get(&rr.key).unwrap().clone();
             actor.result_gate.release();
-            pending_once(serving.as_mut()).await;
-            timeout(WAIT, fault.reached.notified()).await.unwrap();
+            tokio::select! {
+                _ = serving.as_mut() => panic!("original completed before its prepared fault frontier"),
+                () = fault.reached.notified() => {},
+            }
             fault.trigger.notify_one();
             for _ in 0..2 {
                 pending_once(serving.as_mut()).await;
@@ -294,8 +295,10 @@ async fn outer_request_panic_retires_unstarted_and_registry_locked_preparation_w
                     .catch_unwind(),
                 ),
             );
-            pending_once(serving.as_mut()).await;
-            timeout(WAIT, fault.reached.notified()).await.unwrap();
+            tokio::select! {
+                _ = serving.as_mut() => panic!("original completed before its preparation/registry fault frontier"),
+                () = fault.reached.notified() => {},
+            }
             assert!(actor.submissions.lock().unwrap().is_empty());
             fault.trigger.notify_one();
             assert_outer_panic(timeout(WAIT, serving.as_mut()).await.unwrap());

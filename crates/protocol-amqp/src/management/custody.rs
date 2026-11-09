@@ -72,7 +72,7 @@ impl OperationControl {
 pub(super) struct RequestBroker<B> {
     actual: B,
     control: OperationControl,
-    sender: Arc<Result<EntityBinding, BrokerRejection>>,
+    binding: Arc<Result<EntityBinding, BrokerRejection>>,
 }
 
 impl<B> RequestBroker<B> {
@@ -81,19 +81,19 @@ impl<B> RequestBroker<B> {
         Self::with_sender(
             actual,
             Arc::new(Err(BrokerRejection::Unavailable(
-                "no scheduled-Send authority in this fixture".into(),
+                "no request-link authority in this fixture".into(),
             ))),
         )
     }
 
     pub(super) fn with_sender(
         actual: B,
-        sender: Arc<Result<EntityBinding, BrokerRejection>>,
+        binding: Arc<Result<EntityBinding, BrokerRejection>>,
     ) -> Self {
         Self {
             actual,
             control: OperationControl::new(),
-            sender,
+            binding,
         }
     }
 
@@ -113,10 +113,9 @@ impl<B: Broker> Broker for RequestBroker<B> {
                 "management request retired before binding".into(),
             ));
         }
-        // Only scheduled Send asks for a binding here. Production supplies the
-        // original capture (including a refusal) from before link acceptance.
-        // Listen/session/rule/cancellation operations retain their existing path.
-        let binding = self.sender.as_ref().clone()?;
+        // Return the original pre-Attach capture, including a capture refusal.
+        // Capability operations bypass it with their selected original binding.
+        let binding = self.binding.as_ref().clone()?;
         if binding.namespace() != &namespace || binding.target() != &entity {
             return Err(BrokerRejection::Refused(
                 domain::BrokerError::StaleEntityBinding,
@@ -140,9 +139,9 @@ impl<B: Broker> Broker for RequestBroker<B> {
 
     async fn submit(
         &self,
-        namespace: NamespaceName,
-        entity: EntityPath,
-        kind: CommandKind,
+        _namespace: NamespaceName,
+        _entity: EntityPath,
+        _kind: CommandKind,
     ) -> Result<CommandOutcome, BrokerRejection> {
         // Even an eager underlying method is invoked only inside this
         // retained first poll. Started is not proof of broker admission.
@@ -151,7 +150,9 @@ impl<B: Broker> Broker for RequestBroker<B> {
                 "management request retired before broker invocation".to_owned(),
             ));
         }
-        self.actual.submit(namespace, entity, kind).await
+        Err(BrokerRejection::Unavailable(
+            "management operations require retained authority".into(),
+        ))
     }
 
     fn deliverable(
