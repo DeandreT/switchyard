@@ -34,6 +34,7 @@ mod custody;
 mod deferred;
 mod peek;
 mod response;
+mod rule_schema;
 mod rules;
 mod scheduled;
 
@@ -969,8 +970,9 @@ async fn management_request_pump<'a, B: Broker>(
     // A reply link attached after this lookup is still bounded when sent.
     let reply_route = management.reply_route(&reply_to).await;
     custody.request = Some(PendingOperation::new(
-        process_bounded_request(
+        process_encoded_request(
             delivery.message(),
+            delivery.encoded_message(),
             message_id,
             namespace,
             entity,
@@ -1150,9 +1152,39 @@ impl ReplyRoute {
 }
 
 /// Processes one request whose reply goes over `reply_route`.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn process_bounded_request<B: Broker>(
     message: &Message,
+    message_id: MessageId,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    broker: &B,
+    management: &ConnectionManagement,
+    authorization: Option<&ManagementAuthorization>,
+    reply_route: ReplyRoute,
+) -> ManagementResponse {
+    let encoded = amqp::encode_message(message).expect("test request encodes");
+    process_encoded_request(
+        message,
+        &encoded,
+        message_id,
+        namespace,
+        entity,
+        broker,
+        management,
+        authorization,
+        reply_route,
+    )
+    .await
+}
+
+/// The original delivery bytes are borrowed through the same request future.
+/// Normalized maps cannot establish that a peer supplied unique schema keys.
+#[allow(clippy::too_many_arguments)]
+async fn process_encoded_request<B: Broker>(
+    message: &Message,
+    encoded: &[u8],
     message_id: MessageId,
     namespace: &NamespaceName,
     entity: &EntityPath,
@@ -1185,6 +1217,13 @@ async fn process_bounded_request<B: Broker>(
             tracking_id,
             format!("{permission:?} is not authorized for this management operation"),
         );
+    }
+    if matches!(
+        operation,
+        ADD_RULE_OPERATION | REMOVE_RULE_OPERATION | ENUMERATE_RULES_OPERATION
+    ) && let Err(description) = rule_schema::validate(encoded, operation)
+    {
+        return ManagementResponse::bad_request(message_id, tracking_id, description);
     }
     match operation {
         RENEW_LOCK_OPERATION => {
@@ -1280,7 +1319,16 @@ async fn process_bounded_request<B: Broker>(
             rules::remove(message, message_id, tracking_id, namespace, entity, broker).await
         }
         ENUMERATE_RULES_OPERATION => {
-            rules::enumerate(message, message_id, tracking_id, namespace, entity, broker).await
+            rules::enumerate_bounded(
+                message,
+                message_id,
+                tracking_id,
+                namespace,
+                entity,
+                broker,
+                reply_route.limit(),
+            )
+            .await
         }
         SCHEDULE_MESSAGE_OPERATION => {
             scheduled::schedule(message, message_id, tracking_id, namespace, entity, broker).await
@@ -1299,6 +1347,9 @@ async fn process_bounded_request<B: Broker>(
 fn management_permission(operation: &str) -> Permission {
     match operation {
         SCHEDULE_MESSAGE_OPERATION | CANCEL_SCHEDULED_MESSAGE_OPERATION => Permission::Send,
+        ADD_RULE_OPERATION | REMOVE_RULE_OPERATION | ENUMERATE_RULES_OPERATION => {
+            Permission::Manage
+        }
         _ => Permission::Listen,
     }
 }
@@ -1999,11 +2050,15 @@ mod tests {
             RENEW_SESSION_LOCK_OPERATION,
             GET_SESSION_STATE_OPERATION,
             SET_SESSION_STATE_OPERATION,
+        ] {
+            assert_eq!(management_permission(operation), Permission::Listen);
+        }
+        for operation in [
             ADD_RULE_OPERATION,
             REMOVE_RULE_OPERATION,
             ENUMERATE_RULES_OPERATION,
         ] {
-            assert_eq!(management_permission(operation), Permission::Listen);
+            assert_eq!(management_permission(operation), Permission::Manage);
         }
     }
 }

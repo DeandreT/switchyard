@@ -1528,6 +1528,7 @@ dependencies = [
  "domain",
  "futures-util",
  "hmac",
+ "message-content",
  "percent-encoding",
  "rcgen",
  "ring",

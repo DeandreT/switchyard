@@ -80,7 +80,97 @@ internal static class RuleConformance
             return "an empty rule set selected a publication";
         }
 
-        return await SqlAsync(client, rules, sender, receiver, topic, subscription);
+        string? sqlFailure = await SqlAsync(client, rules, sender, receiver, topic, subscription);
+        return sqlFailure ?? await ActionsAsync(client, rules, sender, receiver, topic, subscription);
+    }
+
+    private static async Task<string?> ActionsAsync(
+        ServiceBusClient client,
+        ServiceBusRuleManager rules,
+        ServiceBusSender sender,
+        ServiceBusReceiver receiver,
+        string topic,
+        string subscription)
+    {
+        const string first = " SET priority=9;REMOVE region;SET route='alpha'; ";
+        const string second = "SET route='beta';SET fresh=3";
+        foreach (string name in new[] { "Plain-A", "Plain-B" })
+            await rules.CreateRuleAsync(name, new TrueRuleFilter());
+        await rules.CreateRuleAsync(new CreateRuleOptions("Action-A", new SqlRuleFilter("priority=7"))
+            { Action = new SqlRuleAction(first) });
+        await rules.CreateRuleAsync(new CreateRuleOptions("Action-B", new SqlRuleFilter("priority=7 AND region='west'"))
+            { Action = new SqlRuleAction(second) });
+        await rules.CreateRuleAsync(new CreateRuleOptions("No-Leak", new SqlRuleFilter("route='alpha'"))
+            { Action = new SqlRuleAction("SET leaked=TRUE") });
+        await rules.CreateRuleAsync(new CreateRuleOptions("Action-Fails", new TrueRuleFilter())
+            { Action = new SqlRuleAction("SET priority='incompatible'") });
+        IReadOnlyList<RuleProperties> configured = await ReadRulesAsync(rules);
+        if (configured.Count != 6 ||
+            configured.Single(rule => rule.Name == "Action-A").Action is not SqlRuleAction actionA ||
+            actionA.SqlExpression != first ||
+            configured.Single(rule => rule.Name == "Action-B").Action is not SqlRuleAction actionB ||
+            actionB.SqlExpression != second ||
+            configured.Where(rule => rule.Name.StartsWith("Plain-")).Any(rule => rule.Action is not null))
+            return "SQL actions did not enumerate exact sources and actionless descriptors";
+
+        await sender.SendMessageAsync(Message("action-copies", 7));
+        var copies = new List<ServiceBusReceivedMessage>();
+        for (int i = 0; i < 3; i++)
+        {
+            ServiceBusReceivedMessage? copy = await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+            if (copy is null) return "a matching action copy was missing";
+            copies.Add(copy);
+            await receiver.CompleteMessageAsync(copy);
+        }
+        if (await receiver.ReceiveMessageAsync(TimeSpan.FromMilliseconds(500)) is not null ||
+            copies.Any(copy => copy.Body.ToString() != "action-copies" ||
+                copy.MessageId != "rule-message" || copy.CorrelationId != "rule-correlation" ||
+                copy.Subject != "rule.subject" || copy.ApplicationProperties.ContainsKey("leaked")))
+            return "actions changed body/IDs, leaked a sibling value or emitted an extra copy";
+        ServiceBusReceivedMessage plain = copies.Single(copy => !copy.ApplicationProperties.ContainsKey("route"));
+        ServiceBusReceivedMessage alpha = copies.Single(copy => Equals(copy.ApplicationProperties.GetValueOrDefault("route"), "alpha"));
+        ServiceBusReceivedMessage beta = copies.Single(copy => Equals(copy.ApplicationProperties.GetValueOrDefault("route"), "beta"));
+        if (!Equals(plain.ApplicationProperties["priority"], 7) ||
+            !Equals(alpha.ApplicationProperties["priority"], 9) || alpha.ApplicationProperties.ContainsKey("region") ||
+            !Equals(beta.ApplicationProperties["priority"], 7) || !Equals(beta.ApplicationProperties["region"], "west") ||
+            !Equals(beta.ApplicationProperties["fresh"], 3L))
+            return "SQL actions lost scalar types, removal, original filtering or copy isolation";
+        await using (ServiceBusReceiver deadLetters = client.CreateReceiver(topic, subscription,
+            new ServiceBusReceiverOptions { SubQueue = SubQueue.DeadLetter }))
+        {
+            ServiceBusReceivedMessage? failed = await deadLetters.ReceiveMessageAsync(TimeSpan.FromSeconds(10));
+            if (failed?.Body.ToString() != "action-copies" || failed.DeadLetterReason != "ActionException" ||
+                failed.DeadLetterErrorDescription != "SQL action failed; no changes were applied" ||
+                !Equals(failed.ApplicationProperties["priority"], 7) || failed.ApplicationProperties.ContainsKey("route"))
+                return "SQL action failure was not one unchanged fixed-error copy";
+            await deadLetters.CompleteMessageAsync(failed);
+            if (await deadLetters.ReceiveMessageAsync(TimeSpan.FromMilliseconds(500)) is not null)
+                return "one failed SQL action produced extra dead letters";
+        }
+
+        // Schedule with the old rules, then replace/delete before activation.
+        await sender.ScheduleMessageAsync(Message("action-scheduled", 7), DateTimeOffset.UtcNow.AddSeconds(30));
+        foreach (string name in new[] { "Action-A", "Action-B", "No-Leak", "Action-Fails" })
+            await rules.DeleteRuleAsync(name);
+        await rules.CreateRuleAsync(new CreateRuleOptions("Action-Current", new TrueRuleFilter())
+            { Action = new SqlRuleAction("SET route='current'") });
+        var activated = new List<ServiceBusReceivedMessage>();
+        for (int i = 0; i < 2; i++)
+        {
+            ServiceBusReceivedMessage? copy = await receiver.ReceiveMessageAsync(TimeSpan.FromSeconds(45));
+            if (copy is null) return "a scheduled action copy was missing";
+            activated.Add(copy);
+            await receiver.CompleteMessageAsync(copy);
+        }
+        if (activated.Any(copy => copy.Body.ToString() != "action-scheduled" ||
+                !Equals(copy.ApplicationProperties["priority"], 7) || !Equals(copy.ApplicationProperties["region"], "west")) ||
+            activated.Count(copy => Equals(copy.ApplicationProperties.GetValueOrDefault("route"), "current")) != 1 ||
+            activated.Count(copy => !copy.ApplicationProperties.ContainsKey("route")) != 1 ||
+            await receiver.ReceiveMessageAsync(TimeSpan.FromMilliseconds(500)) is not null)
+            return "scheduled activation did not select current rules against the original";
+        foreach (string name in new[] { "Plain-A", "Plain-B", "Action-Current" })
+            await rules.DeleteRuleAsync(name);
+        return (await ReadRulesAsync(rules)).Count == 0 ? null : "SQL action deletion left a rule behind";
     }
 
     private static async Task<string?> SqlAsync(

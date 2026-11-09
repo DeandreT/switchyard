@@ -173,7 +173,7 @@ async fn run_wss_store<S: StateStore>(
         ResourceScope::namespace(HOST)?,
         SharedAccessKey::new(KEY)?,
         None,
-        PermissionSet::SEND | PermissionSet::LISTEN,
+        PermissionSet::MANAGE,
     )?;
     let authentication =
         protocol_amqp::SharedAccessAuthentication::new(SharedAccessPolicy::new([rule])?, HOST)?

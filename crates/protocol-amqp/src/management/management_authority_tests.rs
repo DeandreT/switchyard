@@ -103,12 +103,18 @@ fn capture(actor: &Actor, entity: &EntityPath) -> EntityBinding {
 }
 
 fn listen_authorization() -> Arc<crate::authorization::ConnectionAuthorization> {
+    permission_authorization(auth::PermissionSet::LISTEN)
+}
+
+fn permission_authorization(
+    permissions: auth::PermissionSet,
+) -> Arc<crate::authorization::ConnectionAuthorization> {
     let rule = auth::SharedAccessRule::new(
         "listen",
         ResourceScope::namespace("tenant.servicebus.windows.net").unwrap(),
         auth::SharedAccessKey::new("secret").unwrap(),
         None,
-        auth::PermissionSet::LISTEN,
+        permissions,
     )
     .unwrap();
     let policy = auth::SharedAccessPolicy::new([rule]).unwrap();
@@ -117,6 +123,178 @@ fn listen_authorization() -> Arc<crate::authorization::ConnectionAuthorization> 
         crate::SharedAccessAuthentication::new(policy, "tenant.servicebus.windows.net").unwrap(),
         Some(grant),
     )
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sql_action_management_requires_manage_before_lossless_shape_and_compile_checks() {
+    for durable in [false, true] {
+        let mut actor = Actor::new(durable, false);
+        let target = prepare_subscription(&actor);
+        let witness = Witness::new(&actor);
+        let broker =
+            RequestBroker::with_sender(witness.clone(), Arc::new(Ok(capture(&actor, &target))));
+        let management = ConnectionManagement::new();
+        let malformed = request(
+            ADD_RULE_OPERATION,
+            false,
+            [
+                ("rule-name", Value::String("action".into())),
+                (
+                    "rule-description",
+                    value_map([
+                        (
+                            "sql-filter",
+                            value_map([("expression", Value::String("1=1".into()))]),
+                        ),
+                        (
+                            "sql-rule-action",
+                            value_map([(
+                                "expression",
+                                Value::String("SET secret = newid()".into()),
+                            )]),
+                        ),
+                    ]),
+                ),
+            ],
+        );
+        let before = actor.snapshot();
+        let observed = counts(&actor);
+        for permission in [auth::PermissionSet::LISTEN, auth::PermissionSet::SEND] {
+            let authorization = ManagementAuthorization::new(
+                permission_authorization(permission),
+                ResourceScope::entity("tenant.servicebus.windows.net", target.as_str()).unwrap(),
+            );
+            for message in [
+                &malformed,
+                &request(REMOVE_RULE_OPERATION, false, []),
+                &request(ENUMERATE_RULES_OPERATION, false, []),
+            ] {
+                let response = process_request(
+                    message,
+                    MessageId::Ulong(337),
+                    &actor.namespace,
+                    &target,
+                    &broker,
+                    &management,
+                    Some(&authorization),
+                )
+                .await;
+                assert_eq!(response.status_code, 401);
+                assert!(!response.status_description.contains("secret"));
+            }
+            // Even a body the bounded decoder cannot read is not exposed to
+            // a client without Manage. It uses the original-byte path.
+            let response = process_encoded_request(
+                &malformed,
+                &[0xff],
+                MessageId::Ulong(337),
+                &actor.namespace,
+                &target,
+                &broker,
+                &management,
+                Some(&authorization),
+                ReplyRoute::Attached { limit: None },
+            )
+            .await;
+            assert_eq!(response.status_code, 401);
+        }
+        let manage = ManagementAuthorization::new(
+            permission_authorization(auth::PermissionSet::MANAGE),
+            ResourceScope::entity("tenant.servicebus.windows.net", target.as_str()).unwrap(),
+        );
+        let invalid = process_request(
+            &malformed,
+            MessageId::Ulong(337),
+            &actor.namespace,
+            &target,
+            &broker,
+            &management,
+            Some(&manage),
+        )
+        .await;
+        assert_eq!(invalid.status_description, "SQL action cannot be compiled");
+        no_effects(&actor, &before, observed);
+        assert_eq!(witness.captures.load(Ordering::SeqCst), 0);
+        assert!(witness.operations.lock().unwrap().is_empty());
+        let listen = ManagementAuthorization::new(
+            listen_authorization(),
+            ResourceScope::entity("tenant.servicebus.windows.net", target.as_str()).unwrap(),
+        );
+        assert_eq!(
+            process_request(
+                &peek_request(false),
+                MessageId::Ulong(338),
+                &actor.namespace,
+                &target,
+                &broker,
+                &management,
+                Some(&listen)
+            )
+            .await
+            .status_code,
+            204
+        );
+        drop(broker);
+        drop(witness);
+        let committed = actor.snapshot();
+        actor.reopen(&committed);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn valid_action_on_retained_stale_authority_has_no_clock_apply_wake_or_checkpoint_effect() {
+    for durable in [false, true] {
+        let mut actor = Actor::new(durable, false);
+        let target = prepare_subscription(&actor);
+        let witness = Witness::new(&actor);
+        let binding = capture(&actor, &target);
+        let broker = RequestBroker::with_sender(witness.clone(), Arc::new(Ok(binding)));
+        let management = ConnectionManagement::new();
+        let message = request(
+            ADD_RULE_OPERATION,
+            false,
+            [
+                ("rule-name", Value::String("action".into())),
+                (
+                    "rule-description",
+                    value_map([
+                        (
+                            "sql-filter",
+                            value_map([("expression", Value::String("1=1".into()))]),
+                        ),
+                        (
+                            "sql-rule-action",
+                            value_map([("expression", Value::String("REMOVE stale".into()))]),
+                        ),
+                    ]),
+                ),
+            ],
+        );
+        drift(&actor, &target);
+        let before = actor.snapshot();
+        let observed = counts(&actor);
+        let mut wake = Box::pin(
+            actor
+                .actual
+                .as_ref()
+                .unwrap()
+                .handle
+                .wait_until_deliverable(&actor.namespace, &target),
+        );
+        pending_once(wake.as_mut()).await;
+        not_found(&process(&actor, &target, &broker, &management, &message, None).await);
+        no_effects(&actor, &before, observed);
+        pending_once(wake.as_mut()).await;
+        drop(wake);
+        assert_eq!(witness.captures.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            &witness.operations.lock().unwrap()[0].1,
+            CommandKind::CreateRuleWithAction { .. }
+        ));
+        drop(broker);
+        drop(witness);
+        actor.reopen(&before);
+    }
 }
 
 fn no_effects(actor: &Actor, before: &StoreSnapshot, observed: (usize, usize, usize)) {
