@@ -40,7 +40,7 @@ const PRIVATE_DER: &str = concat!(
     "oFnGY0OFksX/ye0/XGpy2SFxYRwGU98HPYeBvAQQrVjdkzfy7BmXQQ==",
 );
 
-fn configuration() -> Value {
+pub(crate) fn configuration() -> Value {
     json!({
         "version": 1,
         "issuer": "https://issuer.example/",
@@ -54,15 +54,15 @@ fn policy() -> JwtPolicy {
     JwtPolicy::from_json(&configuration().to_string()).unwrap()
 }
 
-fn requested() -> ResourceScope {
+pub(crate) fn requested() -> ResourceScope {
     ResourceScope::parse("amqps://tenant.example/orders").unwrap()
 }
 
-fn header() -> Value {
+pub(crate) fn header() -> Value {
     json!({"alg": "RS256", "kid": "key-1", "typ": "switchyard+jwt"})
 }
 
-fn claims() -> Value {
+pub(crate) fn claims() -> Value {
     json!({"iss": "https://issuer.example/", "sub": "producer", "aud": "urn:switchyard:tenant", "iat": 100, "exp": 200})
 }
 
@@ -84,7 +84,7 @@ fn signed_raw(header: &str, claims: &str) -> String {
     format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature))
 }
 
-fn signed(header: &Value, claims: &Value) -> String {
+pub(crate) fn signed(header: &Value, claims: &Value) -> String {
     signed_raw(&header.to_string(), &claims.to_string())
 }
 
