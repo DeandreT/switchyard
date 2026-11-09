@@ -13,6 +13,9 @@ use std::{
 #[cfg(debug_assertions)]
 use std::sync::Arc;
 
+use admin_api::atom::https::{
+    Configuration as AtomConfiguration, HttpsListener, Retirement as AtomRetirement,
+};
 use clap::{Parser, ValueEnum};
 use cluster::{ClusterConfig, DeploymentMode};
 use protocol_amqp::{
@@ -25,7 +28,7 @@ use server::{
     AdminListenerService, AdminRetirement, AdminTlsConfig, Broker, BrokerHandle,
     DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SWEEP_INTERVAL, LocalProposer, NodeState,
     SHUTDOWN_EXPIRED_EXIT_CODE, ShutdownBudget, ShutdownExpired, ShutdownTrigger, StartupError,
-    StorageChoice, SystemClock, TimerThread, serve_transports, shut_down_with_admin,
+    StorageChoice, SystemClock, TimerThread, serve_all_transports, shut_down_all_transports,
     stop_timer_and_broker,
 };
 #[cfg(debug_assertions)]
@@ -135,6 +138,16 @@ struct Arguments {
     /// Offline JWT policy JSON with pinned public keys and local scope/rights bindings.
     #[arg(long, value_name = "PATH")]
     admin_jwt_policy_file: Option<PathBuf>,
+
+    /// Opt in to HTTPS/HTTP1 Atom transport. Routes remain unsupported; no CRUD.
+    #[arg(long)]
+    atom_listen: Option<SocketAddr>,
+    #[arg(long, value_name = "PATH")]
+    atom_tls_certificate: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    atom_tls_private_key: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    atom_jwt_policy_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -241,6 +254,53 @@ fn load_admin_config(arguments: &Arguments) -> Result<Option<AdminTlsConfig>, St
     AdminTlsConfig::new(tls, policy, root)
         .map(Some)
         .map_err(|error| StartupError::AdminConfiguration(error.to_owned()))
+}
+
+fn load_atom_config(arguments: &Arguments) -> Result<Option<AtomConfiguration>, StartupError> {
+    let (cert, key, policy) = match (
+        arguments.atom_listen,
+        arguments.atom_tls_certificate.as_deref(),
+        arguments.atom_tls_private_key.as_deref(),
+        arguments.atom_jwt_policy_file.as_deref(),
+    ) {
+        (None, None, None, None) => return Ok(None),
+        (Some(_), Some(cert), Some(key), Some(policy)) => (cert, key, policy),
+        _ => {
+            return Err(StartupError::AtomConfiguration(
+                "requires listen, certificate, private-key and policy-file options",
+            ));
+        }
+    };
+    let read = |path: &Path, limit: u64| -> Result<Vec<u8>, StartupError> {
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .and_then(|file| file.take(limit + 1).read_to_end(&mut bytes))
+            .map_err(|_| StartupError::AtomConfiguration("could not read credential file"))?;
+        if bytes.len() as u64 > limit {
+            return Err(StartupError::AtomConfiguration(
+                "credential file exceeds its bound",
+            ));
+        }
+        Ok(bytes)
+    };
+    let certificate = read(cert, 64 * 1024)?;
+    let private_key = read(key, 16 * 1024)?;
+    let json = read(policy, 64 * 1024)?;
+    let json = std::str::from_utf8(&json)
+        .map_err(|_| StartupError::AtomConfiguration("invalid policy file"))?;
+    let policy = auth::JwtPolicy::from_json(json)
+        .map_err(|_| StartupError::AtomConfiguration("invalid policy file"))?;
+    let namespace = namespace_from_hostname(&arguments.namespace)?;
+    let host = if arguments.namespace.contains('.') {
+        arguments.namespace.to_ascii_lowercase()
+    } else {
+        format!("{}.servicebus.windows.net", arguments.namespace)
+    };
+    let root = auth::ResourceScope::namespace(&host)
+        .map_err(|_| StartupError::AtomConfiguration("invalid namespace authority"))?;
+    AtomConfiguration::new(&certificate, &private_key, policy, namespace, root)
+        .map(Some)
+        .map_err(|_| StartupError::AtomConfiguration("invalid TLS identity or namespace authority"))
 }
 
 fn listen_address(
@@ -404,6 +464,7 @@ fn run() -> Result<(), StartupError> {
     let shared_access_authentication = load_amqp_authentication(&arguments, mode, tls.is_some())?;
     let listen = listen_address(arguments.listen, arguments.transport, tls.is_some());
     let admin_config = load_admin_config(&arguments)?;
+    let atom_config = load_atom_config(&arguments)?;
     let namespace = namespace_from_hostname(&arguments.namespace)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -445,17 +506,27 @@ fn run() -> Result<(), StartupError> {
                 detail: error.to_string(),
             })?;
         let address = listener.local_addr().unwrap_or(listen);
-        // Bind both sockets before starting either transport's serving tasks.
-        // A second-bind failure drops the first socket, with no detached service.
-        let mut admin = match (arguments.admin_listen, admin_config) {
+        // Bind all sockets before starting any transport's serving tasks.
+        // A later bind failure drops earlier sockets, with no detached service.
+        let admin_bound = match (arguments.admin_listen, admin_config) {
             (Some(address), Some(config)) => {
                 let socket = tokio::net::TcpListener::bind(address).await.map_err(|error| StartupError::Listen { address: address.to_string(), detail: error.to_string() })?;
-                let service = AdminListenerService::new(socket, config, handle.clone(), namespace.clone(), Duration::from_secs(arguments.admission_timeout_secs.get()));
-                info!(address = %service.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, "native administration TLS listener bound; authenticated RPC required for readiness");
-                Some(service)
+                Some((socket, config))
             },
             _ => None,
         };
+        let atom_bound = match (arguments.atom_listen, atom_config) {
+            (Some(address), Some(config)) => {
+                let socket = tokio::net::TcpListener::bind(address).await.map_err(|_| StartupError::AtomConfiguration("could not bind listener"))?;
+                Some((socket, config))
+            },
+            _ => None,
+        };
+        // Every configured socket is bound before any serving family starts.
+        let mut admin = admin_bound.map(|(socket, config)| AdminListenerService::new(socket, config, handle.clone(), namespace.clone(), Duration::from_secs(arguments.admission_timeout_secs.get())));
+        if let Some(service) = &admin { info!(address = %service.local_addr().map_err(|error| StartupError::Runtime(error.to_string()))?, "native administration TLS listener bound; authenticated RPC required for readiness"); }
+        let mut atom = atom_bound.map(|(socket, config)| HttpsListener::new(socket, config));
+        if atom.is_some() { info!("Atom HTTPS boundary bound; routes remain unsupported"); }
         info!(address = %address, namespace = %namespace, tls = tls.is_some(), transport = ?arguments.transport, max_connections = ?arguments.max_connections, admission_timeout_secs = arguments.admission_timeout_secs, shutdown_timeout_secs = arguments.shutdown_timeout_secs, "accepting AMQP connections");
         let amqp = AmqpListener::new(handle, namespace).with_admission_timeout(
             Duration::from_secs(arguments.admission_timeout_secs.get()),
@@ -482,22 +553,24 @@ fn run() -> Result<(), StartupError> {
             let trigger = trigger.clone();
             let retirement = service.retirement_handle();
             let admin_retirement = admin.as_ref().map(AdminListenerService::retirement_handle);
+            let atom_retirement = atom.as_ref().map(HttpsListener::retirement_handle);
             async move {
                 tokio::select! {
-                    () = forward_signals(signals, trigger, retirement, admin_retirement) => {},
+                    () = forward_signals(signals, trigger, retirement, admin_retirement, atom_retirement) => {},
                     _ = stopped => {},
                 }
             }
         });
 
-        // Both original owners stay here if select cancels the other accept
-        // borrower. Either terminal transport retires the other immediately.
-        serve_transports(&mut service, admin.as_mut(), &trigger).await;
+        // All original owners stay here if select cancels another accept
+        // borrower. Any terminal transport retires the others immediately.
+        serve_all_transports(&mut service, admin.as_mut(), atom.as_mut(), &trigger).await;
         let started = trigger.started().unwrap_or_else(Instant::now);
         let budget = ShutdownBudget::new(started, shutdown_timeout);
         service.retirement_handle().request();
         if let Some(admin) = admin.as_ref() { admin.retirement_handle().request(); }
-        let result = match shut_down_with_admin(&budget, &mut service, admin.as_mut(), &mut timer, &mut broker).await {
+        if let Some(atom) = atom.as_ref() { atom.retirement_handle().request(); }
+        let result = match shut_down_all_transports(&budget, &mut service, admin.as_mut(), atom.as_mut(), &mut timer, &mut broker).await {
             Ok(exit) => {
                 info!(
                     elapsed_millis =
@@ -510,7 +583,10 @@ fn run() -> Result<(), StartupError> {
                     }
                     _ => match admin.as_mut().and_then(AdminListenerService::take_failure) {
                         Some(error) => Err(StartupError::Runtime(error.to_string())),
-                        None => Ok(()),
+                        None => match atom.as_mut().and_then(HttpsListener::take_failure) {
+                            Some(_) => Err(StartupError::Runtime(String::from("Atom HTTPS transport failed"))),
+                            None => Ok(()),
+                        },
                     },
                 }
             }
@@ -631,6 +707,7 @@ async fn forward_signals(
     trigger: ShutdownTrigger,
     retirement: AmqpListenerRetirement,
     admin_retirement: Option<AdminRetirement>,
+    atom_retirement: Option<AtomRetirement>,
 ) {
     while let Some(signal) = signals.next().await {
         if trigger.request() {
@@ -638,6 +715,9 @@ async fn forward_signals(
             retirement.request();
             if let Some(admin) = admin_retirement.as_ref() {
                 admin.request();
+            }
+            if let Some(atom) = atom_retirement.as_ref() {
+                atom.request();
             }
         } else {
             info!(signal = %signal, "shutdown already in progress");

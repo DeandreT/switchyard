@@ -3,18 +3,18 @@
 //! accepted broker operation. No authorization decisions are cached here.
 
 use std::{
-    collections::HashMap,
     future::Future,
     io,
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context, Poll, ready},
+    task::Poll,
     time::Duration,
 };
 
 use admin_api::{
     rpc::{BackendErrorKind, EntityRpc},
+    transport::TaskFamily as Tasks,
     wire,
 };
 use auth::{JwtPolicy, ResourceScope};
@@ -25,10 +25,12 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use rustls::ServerConfig;
+#[cfg(test)]
+use tokio::sync::{Notify, OwnedSemaphorePermit};
 use tokio::{
     net::TcpListener,
-    sync::{Notify, OwnedSemaphorePermit, Semaphore, watch},
-    task::{Id, JoinError, JoinSet},
+    sync::{Semaphore, watch},
+    task::{JoinError, JoinSet},
 };
 use tokio_rustls::TlsAcceptor;
 use tonic::{Request, Response, Status};
@@ -111,90 +113,6 @@ async fn requested(mut signal: watch::Receiver<bool>) {
     let _ = signal.changed().await;
 }
 
-/// Hyper's stream executor also retains its original tasks. Joining just TCP
-/// connection tasks would not establish custody of cancelled HTTP/2 streams.
-#[derive(Default)]
-struct TaskSet {
-    tasks: Mutex<Originals>,
-    changed: Notify,
-}
-
-/// Capacity belongs to the retained original record, not the running future.
-/// A returned or panicked future remains charged until its original is joined.
-#[derive(Default)]
-struct Originals {
-    tasks: JoinSet<()>,
-    permits: HashMap<Id, OwnedSemaphorePermit>,
-}
-
-impl Originals {
-    fn is_empty(&self) -> bool {
-        self.tasks.is_empty() && self.permits.is_empty()
-    }
-
-    fn poll_join_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<(), JoinError>>> {
-        let Some(result) = ready!(self.tasks.poll_join_next_with_id(cx)) else {
-            assert!(
-                self.permits.is_empty(),
-                "no permit outlives its joined original"
-            );
-            return Poll::Ready(None);
-        };
-        let id = match &result {
-            Ok((id, ())) => *id,
-            Err(error) => error.id(),
-        };
-        // The ID comes from the actual join, including panic/cancellation exits.
-        // No unjoined handle is dropped to return capacity.
-        drop(self.permits.remove(&id));
-        Poll::Ready(Some(result.map(|(_, ())| ())))
-    }
-}
-
-#[derive(Clone, Default)]
-struct Tasks(Arc<TaskSet>);
-
-impl Tasks {
-    fn spawn(&self, work: impl Future<Output = ()> + Send + 'static) {
-        self.spawn_retained(work, None);
-    }
-
-    fn spawn_retained(
-        &self,
-        work: impl Future<Output = ()> + Send + 'static,
-        permit: Option<OwnedSemaphorePermit>,
-    ) {
-        {
-            let mut originals = self.0.tasks.lock().expect("admin tasks");
-            let id = originals.tasks.spawn(work).id();
-            if let Some(permit) = permit {
-                assert!(
-                    originals.permits.insert(id, permit).is_none(),
-                    "one permit per original"
-                );
-            }
-        }
-        self.0.changed.notify_one();
-    }
-
-    async fn join_next(&self) -> Option<Result<(), JoinError>> {
-        std::future::poll_fn(|cx| self.0.tasks.lock().expect("admin tasks").poll_join_next(cx))
-            .await
-    }
-
-    async fn next_live(&self) -> Result<(), JoinError> {
-        loop {
-            let changed = self.0.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if let Some(result) = self.join_next().await {
-                return result;
-            }
-            changed.await;
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReapKind {
     Rpc,
@@ -252,15 +170,6 @@ async fn reap_tasks(
         Poll::Pending
     })
     .await
-}
-
-impl<F> hyper::rt::Executor<F> for Tasks
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    fn execute(&self, future: F) {
-        self.spawn(future);
-    }
 }
 
 type Rpc = EntityRpc<BrokerHandle, fn(&SubmitError) -> BackendErrorKind>;
@@ -542,8 +451,7 @@ impl AdminListenerService {
             "admin listener drains before extraction"
         );
         assert!(
-            self.streams.0.tasks.lock().expect("admin tasks").is_empty()
-                && self.calls.0.tasks.lock().expect("admin tasks").is_empty(),
+            self.streams.is_empty() && self.calls.is_empty(),
             "admin stream and RPC originals drain before extraction"
         );
         self.failure.take()

@@ -32,8 +32,8 @@ pub use crate::{
     proposer::{DEFAULT_MAX_CLOCK_REGRESSION_MILLIS, LocalProposer, ProposeError},
     shutdown::{
         DEFAULT_SHUTDOWN_TIMEOUT, SHUTDOWN_EXPIRED_EXIT_CODE, ShutdownBudget, ShutdownExpired,
-        ShutdownStage, ShutdownTrigger, TimerThread, serve_transports, shut_down,
-        shut_down_with_admin, stop_timer_and_broker,
+        ShutdownStage, ShutdownTrigger, TimerThread, serve_all_transports, serve_transports,
+        shut_down, shut_down_all_transports, shut_down_with_admin, stop_timer_and_broker,
     },
     timer::{
         DEFAULT_SWEEP_INTERVAL, MAX_QUEUES_PER_SWEEP, MAX_ROUNDS_PER_INDEX, Shutdown, SweepReport,
@@ -127,6 +127,8 @@ pub enum StartupError {
     Runtime(String),
     #[error("native administration configuration is invalid: {0}")]
     AdminConfiguration(String),
+    #[error("Atom HTTPS configuration is invalid: {0}")]
+    AtomConfiguration(&'static str),
     #[error("offline AMQP JWT configuration is invalid: {0}")]
     JwtConfiguration(&'static str),
     #[error(transparent)]

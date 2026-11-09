@@ -2,9 +2,9 @@
 //!
 //! The stages run strictly in order, each only after the previous one ended:
 //!
-//! 1. Listener admission: both configured transports retire admission, including
-//!    new RPCs on existing HTTP/2 peers, before either protocol drain starts.
-//! 2. Protocol cleanup: both original connection/task families and accepted RPCs,
+//! 1. Listener admission: all configured transports retire admission, including
+//!    new requests on existing peers, before any protocol drain starts.
+//! 2. Protocol cleanup: all original connection/task families and accepted requests,
 //!    sessions, links and settlement work they own, are joined.
 //! 3. Timer: the sweep loop is told to stop and its thread is joined.
 //! 4. Broker: the owner thread stops after the requests queued ahead of it and
@@ -36,6 +36,7 @@ use tokio::time::{Instant, timeout_at};
 use tracing::{info, warn};
 
 use crate::{AdminListenerService, Broker, BrokerHandle, Shutdown, TimerWorker};
+use admin_api::atom::https::HttpsListener;
 
 /// The budget a process gives its whole shutdown unless configured.
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -211,18 +212,35 @@ pub async fn serve_transports<B: protocol_amqp::Broker>(
     mut admin: Option<&mut AdminListenerService>,
     trigger: &ShutdownTrigger,
 ) {
-    if let Some(admin) = admin.as_mut() {
-        tokio::select! {
-            () = listener.serve() => {},
-            () = admin.serve() => {},
+    serve_all_transports(listener, admin.take(), None, trigger).await;
+}
+
+/// Keeps the original owners of every configured transport through cancellation.
+pub async fn serve_all_transports<B: protocol_amqp::Broker>(
+    listener: &mut AmqpListenerService<B>,
+    mut admin: Option<&mut AdminListenerService>,
+    mut atom: Option<&mut HttpsListener>,
+    trigger: &ShutdownTrigger,
+) {
+    match (admin.as_mut(), atom.as_mut()) {
+        (Some(admin), Some(atom)) => {
+            tokio::select! { () = listener.serve() => {}, () = admin.serve() => {}, () = atom.serve() => {} }
         }
-    } else {
-        listener.serve().await;
+        (Some(admin), None) => {
+            tokio::select! { () = listener.serve() => {}, () = admin.serve() => {} }
+        }
+        (None, Some(atom)) => {
+            tokio::select! { () = listener.serve() => {}, () = atom.serve() => {} }
+        }
+        (None, None) => listener.serve().await,
     }
     trigger.request();
     listener.retirement_handle().request();
     if let Some(admin) = admin.as_ref() {
         admin.retirement_handle().request();
+    }
+    if let Some(atom) = atom.as_ref() {
+        atom.retirement_handle().request();
     }
 }
 
@@ -235,9 +253,25 @@ pub async fn shut_down_with_admin<B: protocol_amqp::Broker>(
     timer: &mut Option<TimerThread>,
     broker: &mut Option<Broker>,
 ) -> Result<Option<AmqpListenerExit>, ShutdownExpired> {
+    shut_down_all_transports(budget, listener, admin.take(), None, timer, broker).await
+}
+
+/// Retires ALL configured admissions before beginning any protocol cleanup.
+/// The same budget then covers every original family, timer and broker.
+pub async fn shut_down_all_transports<B: protocol_amqp::Broker>(
+    budget: &ShutdownBudget,
+    listener: &mut AmqpListenerService<B>,
+    mut admin: Option<&mut AdminListenerService>,
+    mut atom: Option<&mut HttpsListener>,
+    timer: &mut Option<TimerThread>,
+    broker: &mut Option<Broker>,
+) -> Result<Option<AmqpListenerExit>, ShutdownExpired> {
     listener.retirement_handle().request();
     if let Some(admin) = admin.as_ref() {
         admin.retirement_handle().request();
+    }
+    if let Some(atom) = atom.as_ref() {
+        atom.retirement_handle().request();
     }
     budget
         .stage(ShutdownStage::ListenerAdmission, async {
@@ -247,14 +281,24 @@ pub async fn shut_down_with_admin<B: protocol_amqp::Broker>(
             if let Some(admin) = admin.as_mut() {
                 admin.serve().await;
             }
+            if let Some(atom) = atom.as_mut() {
+                atom.serve().await;
+            }
         })
         .await?;
     let exit = budget
         .stage(ShutdownStage::ProtocolCleanup, async {
-            if let Some(admin) = admin.as_mut() {
-                tokio::join!(listener.finish(), admin.finish());
-            } else {
-                listener.finish().await;
+            match (admin.as_mut(), atom.as_mut()) {
+                (Some(admin), Some(atom)) => {
+                    tokio::join!(listener.finish(), admin.finish(), atom.finish());
+                }
+                (Some(admin), None) => {
+                    tokio::join!(listener.finish(), admin.finish());
+                }
+                (None, Some(atom)) => {
+                    tokio::join!(listener.finish(), atom.finish());
+                }
+                (None, None) => listener.finish().await,
             }
             listener.take_exit()
         })
