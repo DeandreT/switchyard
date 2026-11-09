@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use amqp::{Body, Message, MessageId};
 use domain::{
     CommandKind, CommandOutcome, CorrelationFilter, EntityPath, NamespaceName, RuleDefinition,
-    RuleFilter, RuleName, SqlRuleFilter,
+    RuleFilter, RuleName, SqlActionProgram, SqlRuleAction, SqlRuleFilter,
 };
 use serde_amqp::{Value, described::Described, descriptor::Descriptor, primitives::OrderedMap};
 
@@ -39,6 +39,7 @@ const TOP: &str = "top";
 
 const RULE_DESCRIPTION_CODE: u64 = 0x0000_0137_0000_0004;
 const EMPTY_RULE_ACTION_CODE: u64 = 0x0000_0137_0000_0005;
+const SQL_RULE_ACTION_CODE: u64 = 0x0000_0137_0000_0006;
 const SQL_FILTER_CODE: u64 = 0x0000_0013_7000_0006;
 const TRUE_FILTER_CODE: u64 = 0x0000_0013_7000_0007;
 const FALSE_FILTER_CODE: u64 = 0x0000_0013_7000_0008;
@@ -56,27 +57,28 @@ pub(super) async fn add<B: Broker>(
     entity: &EntityPath,
     broker: &B,
 ) -> ManagementResponse {
-    let (name, filter) = match add_request(&message.body) {
+    let (name, filter, action) = match add_request(&message.body) {
         Ok(request) => request,
         Err(description) => {
             return ManagementResponse::bad_request(message_id, tracking_id, description);
         }
     };
-    match super::submit_request(
-        broker,
-        namespace,
-        entity,
-        CommandKind::CreateRule { name, filter },
-    )
-    .await
-    {
+    let kind = match action {
+        Some(action) => CommandKind::CreateRuleWithAction {
+            name,
+            filter,
+            action,
+        },
+        None => CommandKind::CreateRule { name, filter },
+    };
+    match super::submit_request(broker, namespace, entity, kind).await {
         Ok(CommandOutcome::RuleCreated) => {
             ManagementResponse::accepted(message_id, tracking_id, Value::Null)
         }
-        Ok(other) => ManagementResponse::internal(
+        Ok(_) => ManagementResponse::internal(
             message_id,
             tracking_id,
-            format!("adding a rule produced an unexpected outcome: {other:?}"),
+            "adding a rule produced an unexpected outcome",
         ),
         Err(rejection) => ManagementResponse::from_rejection(message_id, tracking_id, &rejection),
     }
@@ -100,15 +102,16 @@ pub(super) async fn remove<B: Broker>(
         Ok(CommandOutcome::RuleDeleted) => {
             ManagementResponse::accepted(message_id, tracking_id, Value::Null)
         }
-        Ok(other) => ManagementResponse::internal(
+        Ok(_) => ManagementResponse::internal(
             message_id,
             tracking_id,
-            format!("removing a rule produced an unexpected outcome: {other:?}"),
+            "removing a rule produced an unexpected outcome",
         ),
         Err(rejection) => ManagementResponse::from_rejection(message_id, tracking_id, &rejection),
     }
 }
 
+#[cfg(test)]
 pub(super) async fn enumerate<B: Broker>(
     message: &Message,
     message_id: MessageId,
@@ -116,6 +119,28 @@ pub(super) async fn enumerate<B: Broker>(
     namespace: &NamespaceName,
     entity: &EntityPath,
     broker: &B,
+) -> ManagementResponse {
+    enumerate_bounded(
+        message,
+        message_id,
+        tracking_id,
+        namespace,
+        entity,
+        broker,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn enumerate_bounded<B: Broker>(
+    message: &Message,
+    message_id: MessageId,
+    tracking_id: Option<String>,
+    namespace: &NamespaceName,
+    entity: &EntityPath,
+    broker: &B,
+    reply_limit: Option<u64>,
 ) -> ManagementResponse {
     let (skip, max_rules) = match page_request(&message.body) {
         Ok(page) => page,
@@ -134,24 +159,19 @@ pub(super) async fn enumerate<B: Broker>(
         Ok(CommandOutcome::RulesListed { rules }) if rules.is_empty() => {
             ManagementResponse::no_content(message_id, tracking_id)
         }
-        Ok(CommandOutcome::RulesListed { rules }) => match rules_value(&rules) {
-            Ok(rules) => ManagementResponse::accepted(
-                message_id,
-                tracking_id,
-                map_body(RULES, Value::List(rules)),
-            ),
-            Err(description) => ManagementResponse::internal(message_id, tracking_id, description),
-        },
-        Ok(other) => ManagementResponse::internal(
+        Ok(CommandOutcome::RulesListed { rules }) => {
+            project_rules(&rules, message_id, tracking_id, reply_limit)
+        }
+        Ok(_) => ManagementResponse::internal(
             message_id,
             tracking_id,
-            format!("enumerating rules produced an unexpected outcome: {other:?}"),
+            "enumerating rules produced an unexpected outcome",
         ),
         Err(rejection) => ManagementResponse::from_rejection(message_id, tracking_id, &rejection),
     }
 }
 
-fn add_request(body: &Body) -> Result<(RuleName, RuleFilter), String> {
+fn add_request(body: &Body) -> Result<(RuleName, RuleFilter, Option<SqlRuleAction>), String> {
     let name = rule_name(body)?;
     let description = match map_value(body, RULE_DESCRIPTION) {
         Some(Value::Map(description)) => description,
@@ -172,7 +192,7 @@ fn add_request(body: &Body) -> Result<(RuleName, RuleFilter), String> {
             }
         }
     }
-    ensure_actionless(description)?;
+    let action = action_request(description)?;
 
     let filter = match (
         entry_value(description, SQL_FILTER),
@@ -192,7 +212,7 @@ fn add_request(body: &Body) -> Result<(RuleName, RuleFilter), String> {
         }
     };
     filter.validate().map_err(|error| error.to_string())?;
-    Ok((name, filter))
+    Ok((name, filter, action))
 }
 
 fn rule_name(body: &Body) -> Result<RuleName, String> {
@@ -270,15 +290,11 @@ fn correlation_properties(
             }
         };
         if !is_scalar(value) {
-            return Err(format!(
-                "correlation application property {name:?} must be an AMQP scalar"
-            ));
+            return Err("correlation application property must be an AMQP scalar".into());
         }
         let encoded = correlation_value(value).map_err(|error| error.to_string())?;
         if parsed.insert(name.clone(), encoded).is_some() {
-            return Err(format!(
-                "correlation application property {name:?} is repeated"
-            ));
+            return Err("correlation application property is repeated".into());
         }
     }
     Ok(parsed)
@@ -318,12 +334,39 @@ fn optional_string(map: &OrderedMap<Value, Value>, name: &str) -> Result<Option<
     }
 }
 
-fn ensure_actionless(description: &OrderedMap<Value, Value>) -> Result<(), String> {
+fn action_request(description: &OrderedMap<Value, Value>) -> Result<Option<SqlRuleAction>, String> {
     match entry_value(description, SQL_RULE_ACTION) {
-        None | Some(Value::Null) => Ok(()),
-        Some(Value::Map(action)) if action.is_empty() => Ok(()),
-        Some(value) if is_empty_action(value) => Ok(()),
-        Some(_) => Err(String::from("SQL rule actions are not supported")),
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Map(action)) if action.is_empty() => Ok(None),
+        Some(value) if is_empty_action(value) => Ok(None),
+        Some(Value::Map(action)) => {
+            let mut seen = std::collections::BTreeSet::new();
+            for (key, _) in action {
+                let key = match key {
+                    Value::String(key) => key.as_str(),
+                    Value::Symbol(key) => key.as_str(),
+                    _ => return Err("invalid SQL action setting".into()),
+                };
+                if ![EXPRESSION, COMPATIBILITY_LEVEL].contains(&key) || !seen.insert(key) {
+                    return Err("invalid SQL action setting".into());
+                }
+            }
+            match entry_value(action, COMPATIBILITY_LEVEL) {
+                None | Some(Value::Null) | Some(Value::Int(SQL_COMPATIBILITY_LEVEL)) => {}
+                _ => {
+                    return Err(
+                        "sql-rule-action.compatibility-level must be the AMQP int 20".into(),
+                    );
+                }
+            }
+            let Some(Value::String(source)) = entry_value(action, EXPRESSION) else {
+                return Err("sql-rule-action.expression must be an AMQP string".into());
+            };
+            // Compile borrowed text before retaining it, binding or submitting.
+            SqlActionProgram::compile(source).map_err(|_| "SQL action cannot be compiled")?;
+            Ok(Some(SqlRuleAction::new(source.as_str())))
+        }
+        Some(_) => Err(String::from("invalid SQL rule action shape")),
     }
 }
 
@@ -341,8 +384,8 @@ fn is_empty_action(value: &Value) -> bool {
 fn page_request(body: &Body) -> Result<(u32, u32), String> {
     let skip = nonnegative_int(body, SKIP)?;
     let top = nonnegative_int(body, TOP)?;
-    if top == 0 {
-        return Err(String::from("top must be a positive AMQP int"));
+    if top == 0 || top > domain::MAX_RULE_PAGE {
+        return Err(String::from("top must be an AMQP int between 1 and 100"));
     }
     Ok((skip, top))
 }
@@ -354,13 +397,143 @@ fn nonnegative_int(body: &Body, name: &str) -> Result<u32, String> {
     }
 }
 
-fn rules_value(rules: &[RuleDefinition]) -> Result<Vec<Value>, String> {
-    rules.iter().map(rule_value).collect()
+fn project_rules(
+    rules: &[RuleDefinition],
+    message_id: MessageId,
+    tracking_id: Option<String>,
+    reply_limit: Option<u64>,
+) -> ManagementResponse {
+    let maximum = reply_limit
+        .unwrap_or(u64::MAX)
+        .min(crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES as u64);
+    let too_large = || ManagementResponse {
+        correlation_id: message_id.clone(),
+        status_code: 403,
+        status_description: "rule page exceeds the bounded response size limit".into(),
+        error_condition: Some(crate::MESSAGE_SIZE_EXCEEDED),
+        tracking_id: tracking_id.clone(),
+        body: Value::Null,
+    };
+    // One page, not an unbounded projection followed by silent truncation. The
+    // fixed envelope is encoded once; extra container-width growth costs <= 16.
+    let empty = ManagementResponse::accepted(
+        message_id.clone(),
+        tracking_id.clone(),
+        map_body(RULES, Value::List(Vec::new())),
+    );
+    let Ok(encoded) = amqp::encode_message(&empty.into_message()) else {
+        return ManagementResponse::internal(
+            message_id,
+            tracking_id,
+            "rule response cannot be encoded",
+        );
+    };
+    let mut charged = encoded.len() as u64 + 16;
+    let mut entries = Vec::new();
+    if rules.len() > domain::MAX_RULE_PAGE as usize || charged > maximum {
+        return too_large();
+    }
+    for rule in rules {
+        // Bound an entry before cloning any retained source or property bytes.
+        // ListRules already validates catalog grammar; recheck source at this
+        // projection boundary rather than fabricating EmptyRuleAction on damage.
+        if let Some(action) = &rule.action
+            && action.compile().is_err()
+        {
+            return ManagementResponse::internal(
+                message_id,
+                tracking_id,
+                "stored SQL action is invalid",
+            );
+        }
+        let mut bound = 256usize;
+        let mut add = |size: usize| {
+            bound = bound.saturating_add(size);
+        };
+        add(rule.name.display_name().len());
+        if let Some(action) = &rule.action {
+            add(action.expression().len());
+        }
+        match &rule.filter {
+            RuleFilter::Sql(filter) => add(filter.expression().len()),
+            RuleFilter::Correlation(filter) => {
+                for value in [
+                    &filter.correlation_id,
+                    &filter.message_id,
+                    &filter.to,
+                    &filter.reply_to,
+                    &filter.subject,
+                    &filter.session_id,
+                    &filter.reply_to_session_id,
+                    &filter.content_type,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    add(value.len().saturating_add(5));
+                }
+                for (key, value) in &filter.application_properties {
+                    add(key
+                        .len()
+                        .saturating_add(value.as_bytes().len())
+                        .saturating_add(10));
+                }
+            }
+            _ => {}
+        }
+        if bound as u64 > maximum {
+            return too_large();
+        }
+        let entry = match rule_value(rule) {
+            Ok(entry) => entry,
+            Err(_) => {
+                return ManagementResponse::internal(
+                    message_id,
+                    tracking_id,
+                    "stored rule cannot be projected",
+                );
+            }
+        };
+        let Ok(size) = serde_amqp::serialized_size(&entry) else {
+            return ManagementResponse::internal(
+                message_id,
+                tracking_id,
+                "rule response cannot be encoded",
+            );
+        };
+        let Some(next) = charged.checked_add(size as u64) else {
+            return too_large();
+        };
+        if next > maximum {
+            return too_large();
+        }
+        charged = next;
+        entries.push(entry);
+    }
+    ManagementResponse::accepted(
+        message_id,
+        tracking_id,
+        map_body(RULES, Value::List(entries)),
+    )
 }
 
 fn rule_value(rule: &RuleDefinition) -> Result<Value, String> {
     let filter = filter_value(&rule.filter)?;
-    let action = described(EMPTY_RULE_ACTION_CODE, Value::List(Vec::new()));
+    let action = match &rule.action {
+        None => described(EMPTY_RULE_ACTION_CODE, Value::List(Vec::new())),
+        Some(action) => {
+            action
+                .compile()
+                .map_err(|_| "stored SQL action is invalid")?;
+            described(
+                SQL_RULE_ACTION_CODE,
+                Value::List(vec![
+                    Value::String(action.expression().to_owned()),
+                    Value::Int(SQL_COMPATIBILITY_LEVEL),
+                ]),
+            )
+        }
+    };
     let displayed_name = if rule.name.as_str() == domain::DEFAULT_RULE_NAME {
         "$Default"
     } else {
@@ -394,11 +567,22 @@ fn filter_value(filter: &RuleFilter) -> Result<Value, String> {
         RuleFilter::Correlation(filter) => {
             let mut properties = OrderedMap::new();
             for (name, encoded) in &filter.application_properties {
-                let value = serde_amqp::from_slice(encoded.as_bytes()).map_err(|error| {
-                    format!(
-                        "stored correlation application property {name:?} is invalid AMQP: {error}"
-                    )
-                })?;
+                // Correlation properties admitted over AMQP are scalars. Prove
+                // that bounded, nonrecursive shape before the serde decoder can
+                // encounter a forged retained container/count.
+                let scalar_limits = message_content::Limits {
+                    max_bytes: crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES,
+                    max_depth: 1,
+                    max_nodes: 1,
+                    max_work: crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES + 16,
+                };
+                message_content::decode_value(encoded.as_bytes(), scalar_limits)
+                    .map_err(|_| "stored correlation scalar is invalid")?;
+                let value = serde_amqp::from_slice(encoded.as_bytes())
+                    .map_err(|_| "stored correlation scalar is invalid")?;
+                if !is_scalar(&value) {
+                    return Err("stored correlation scalar is invalid".into());
+                }
                 properties.insert(Value::String(name.clone()), value);
             }
             Ok(described(
@@ -747,7 +931,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sql_actions_and_other_compatibility_levels_are_bad_requests_before_submission() {
+    async fn unsupported_actions_and_other_compatibility_levels_refuse_before_submission() {
         let broker = RecordingBroker::returning(Ok(CommandOutcome::RuleCreated));
         let (namespace, entity) = names();
         let other_level = add_message(
@@ -765,7 +949,7 @@ mod tests {
         );
         action_description.insert(
             Value::String(SQL_RULE_ACTION.into()),
-            map([(EXPRESSION, Value::String("SET copied = 1".into()))]),
+            map([(EXPRESSION, Value::String("SET copied = newid()".into()))]),
         );
         let action = Message {
             body: Body::Value(map([
@@ -777,7 +961,7 @@ mod tests {
 
         for (message, expected) in [
             (&other_level, "compatibility-level"),
-            (&action, "SQL rule actions are not supported"),
+            (&action, "SQL action cannot be compiled"),
         ] {
             let response = add(
                 message,
@@ -1067,6 +1251,17 @@ mod tests {
             ..CorrelationFilter::default()
         });
         assert!(filter_value(&malformed).is_err());
+        // A tiny forged retained array may advertise an enormous implicit
+        // element count. It must fail bounded scalar proof before serde sees it.
+        let forged = RuleFilter::Correlation(CorrelationFilter {
+            application_properties: BTreeMap::from([(
+                "forged".into(),
+                CorrelationValue::new(vec![0xf0, 0, 0, 0, 5, 0xff, 0xff, 0xff, 0xff, 0x41])
+                    .unwrap(),
+            )]),
+            ..CorrelationFilter::default()
+        });
+        assert!(filter_value(&forged).is_err());
     }
 
     #[tokio::test]
@@ -1138,5 +1333,242 @@ mod tests {
             ])
         );
         assert_eq!(filters[1].descriptor, Descriptor::Code(FALSE_FILTER_CODE));
+    }
+
+    fn with_action(action: Option<Value>) -> Message {
+        let mut message = add_message(
+            "Action",
+            SQL_FILTER,
+            map([(EXPRESSION, Value::String("1=1".into()))]),
+        );
+        let Body::Value(Value::Map(body)) = &mut message.body else {
+            unreachable!()
+        };
+        let Value::Map(description) = body
+            .get_mut(&Value::String(RULE_DESCRIPTION.into()))
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        description.swap_remove(&Value::String(SQL_RULE_ACTION.into()));
+        if let Some(action) = action {
+            description.insert(Value::String(SQL_RULE_ACTION.into()), action);
+        }
+        message
+    }
+
+    #[tokio::test]
+    async fn actions_compile_before_submission_and_preserve_exact_source_and_projection() {
+        let source = " SET user.flag = TRUE; REMOVE user.old; ";
+        for level in [None, Some(Value::Null), Some(Value::Int(20))] {
+            let mut action = OrderedMap::new();
+            action.insert(
+                Value::Symbol(EXPRESSION.into()),
+                Value::String(source.into()),
+            );
+            if let Some(level) = level {
+                action.insert(Value::String(COMPATIBILITY_LEVEL.into()), level);
+            }
+            let broker = RecordingBroker::returning(Ok(CommandOutcome::RuleCreated));
+            let (namespace, entity) = names();
+            let response = add(
+                &with_action(Some(Value::Map(action))),
+                MessageId::Ulong(1),
+                None,
+                &namespace,
+                &entity,
+                &broker,
+            )
+            .await;
+            assert_eq!(response.status_code, 200);
+            assert_eq!(
+                broker.commands(),
+                vec![CommandKind::CreateRuleWithAction {
+                    name: RuleName::new("Action").unwrap(),
+                    filter: RuleFilter::True,
+                    action: SqlRuleAction::new(source)
+                }]
+            );
+        }
+        let value = rule_value(&RuleDefinition {
+            name: RuleName::new("Action").unwrap(),
+            filter: RuleFilter::True,
+            created_at: Timestamp::from_millis(1),
+            action: Some(SqlRuleAction::new(source)),
+        })
+        .unwrap();
+        let Value::Map(entry) = value else { panic!() };
+        let Some(Value::Described(description)) = entry_value(&entry, RULE_DESCRIPTION) else {
+            panic!()
+        };
+        assert_eq!(
+            description.descriptor,
+            Descriptor::Code(RULE_DESCRIPTION_CODE)
+        );
+        let Value::List(fields) = &description.value else {
+            panic!()
+        };
+        assert_eq!(fields.len(), 4);
+        assert_eq!(
+            fields[1],
+            described(
+                SQL_RULE_ACTION_CODE,
+                Value::List(vec![Value::String(source.into()), Value::Int(20)])
+            )
+        );
+        assert_ne!(SQL_RULE_ACTION_CODE, SQL_FILTER_CODE);
+    }
+
+    #[test]
+    fn all_existing_actionless_forms_remain_actionless() {
+        for action in [
+            None,
+            Some(Value::Null),
+            Some(map([])),
+            Some(described(EMPTY_RULE_ACTION_CODE, Value::List(vec![]))),
+            Some(Value::Described(Box::new(Described {
+                descriptor: Descriptor::Name(EMPTY_RULE_ACTION_NAME.into()),
+                value: Value::List(vec![]),
+            }))),
+        ] {
+            assert_eq!(add_request(&with_action(action).body).unwrap().2, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn action_errors_are_fixed_and_do_not_submit_or_retain_uncompiled_source() {
+        let (namespace, entity) = names();
+        let broker = RecordingBroker::returning(Ok(CommandOutcome::RuleCreated));
+        for source in [
+            "",
+            "   ",
+            "SET secret = 'sensitive'; SET sys.Label = 'private'",
+            "SET x = NULL",
+            "SET x = @parameter",
+            "REMOVE x;".repeat(33).as_str(),
+            &format!("SET x = '{}'", "😀".repeat(512)),
+        ] {
+            let response = add(
+                &with_action(Some(map([(EXPRESSION, Value::String(source.into()))]))),
+                MessageId::Ulong(1),
+                None,
+                &namespace,
+                &entity,
+                &broker,
+            )
+            .await;
+            assert_eq!(response.status_code, 400);
+            assert_eq!(response.status_description, "SQL action cannot be compiled");
+        }
+        for action in [
+            map([(EXPRESSION, Value::Null)]),
+            map([
+                (EXPRESSION, Value::String("REMOVE x".into())),
+                ("parameters", map([])),
+            ]),
+            map([
+                (EXPRESSION, Value::String("REMOVE x".into())),
+                (COMPATIBILITY_LEVEL, Value::Long(20)),
+            ]),
+            map([
+                (EXPRESSION, Value::String("REMOVE x".into())),
+                (COMPATIBILITY_LEVEL, Value::Int(19)),
+            ]),
+            described(
+                SQL_RULE_ACTION_CODE,
+                Value::List(vec![Value::String("REMOVE x".into()), Value::Int(20)]),
+            ),
+            described(EMPTY_RULE_ACTION_CODE, Value::List(vec![Value::Null])),
+        ] {
+            assert_eq!(
+                add(
+                    &with_action(Some(action)),
+                    MessageId::Ulong(1),
+                    None,
+                    &namespace,
+                    &entity,
+                    &broker
+                )
+                .await
+                .status_code,
+                400
+            );
+        }
+        assert!(broker.commands().is_empty());
+        assert!(
+            add_request(
+                &with_action(Some(map([(
+                    EXPRESSION,
+                    Value::String("REMOVE x;".repeat(32))
+                )])))
+                .body
+            )
+            .is_ok()
+        );
+        let boundary = format!("SET x = '{}'", "😀".repeat(507)); // 1,024 UTF-16 units
+        assert_eq!(boundary.encode_utf16().count(), 1024);
+        assert!(
+            add_request(&with_action(Some(map([(EXPRESSION, Value::String(boundary))]))).body)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn enumeration_is_bounded_and_never_truncates_or_hides_corrupt_actions() {
+        for top in [0, 101, i32::MAX] {
+            assert!(
+                page_request(&Body::Value(map([
+                    (SKIP, Value::Int(0)),
+                    (TOP, Value::Int(top))
+                ])))
+                .is_err()
+            );
+        }
+        for (skip, top) in [
+            (Value::Int(-1), Value::Int(1)),
+            (Value::Int(0), Value::Long(20)),
+            (Value::Uint(0), Value::Int(1)),
+        ] {
+            assert!(page_request(&Body::Value(map([(SKIP, skip), (TOP, top)]))).is_err());
+        }
+        let rules = vec![
+            RuleDefinition {
+                name: RuleName::new("Action").unwrap(),
+                filter: RuleFilter::True,
+                created_at: Timestamp::from_millis(1),
+                action: Some(SqlRuleAction::new("REMOVE old"))
+            };
+            100
+        ];
+        let small = project_rules(&rules, MessageId::Ulong(1), None, Some(512));
+        assert_eq!(small.error_condition, Some(crate::MESSAGE_SIZE_EXCEEDED));
+        assert_eq!(small.body, Value::Null);
+        let full = project_rules(&rules, MessageId::Ulong(1), None, None);
+        assert_eq!(full.status_code, 200);
+        assert!(
+            amqp::encode_message(&full.into_message()).unwrap().len()
+                <= crate::SERVICE_BUS_STANDARD_MAX_MESSAGE_BYTES
+        );
+        let mut corrupt = rules[0].clone();
+        corrupt.action = Some(SqlRuleAction::new("SET sys.Label = 'do not echo'"));
+        let response = project_rules(&[corrupt], MessageId::Ulong(1), None, None);
+        assert_eq!(response.status_code, 500);
+        assert_eq!(response.status_description, "stored SQL action is invalid");
+        assert_eq!(response.body, Value::Null);
+        let mut large = rules[0].clone();
+        large.filter = RuleFilter::Correlation(CorrelationFilter {
+            application_properties: BTreeMap::from([(
+                "large".into(),
+                correlation_value(&Value::String("x".repeat(64 * 1024))).unwrap(),
+            )]),
+            ..CorrelationFilter::default()
+        });
+        let response = project_rules(&vec![large; 100], MessageId::Ulong(1), None, None);
+        assert_eq!(response.error_condition, Some(crate::MESSAGE_SIZE_EXCEEDED));
+        assert_eq!(
+            response.body,
+            Value::Null,
+            "never return a successful partial page"
+        );
     }
 }

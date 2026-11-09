@@ -3,8 +3,56 @@
 The domain's `SqlActionProgram` compiles and evaluates an ephemeral, transport-free
 action program. It returns a typed `SqlActionPatch` for one copy without changing
 the original message. The domain also persists exact `SqlRuleAction` source in
-action-bearing rules and routes isolated copies. AMQP rule management still
-refuses nonempty wire actions; domain-seeded copies render their removals.
+action-bearing rules and routes isolated copies. AMQP rule management accepts
+the bounded action subset below and renders each copy's typed changes/removals.
+
+## AMQP rule management
+
+`com.microsoft:add-rule`, `remove-rule` and `enumerate-rules` require **Manage**
+on the subscription. This operation check precedes body decoding and SQL
+compilation. Management Attach still admits Send or Listen; ordinary receive
+management still requires Listen, not Manage. Retained request-link authority
+and the original request/result custody apply unchanged.
+
+The supported add shape is the official SDK request map: `rule-name`, then a
+`rule-description` map containing exactly one supported filter and optional
+`sql-rule-action: { expression: <string> }`. An inner `rule-name`, if supplied,
+must match the outer name. SQL action `compatibility-level` may be absent/null
+or the AMQP **int 20**. String and symbol schema keys have the same case-exact
+identity. Unknown/nontext keys and repeated keys at body, description, filter
+and action scopes refuse, including byte-identical keys retained in the original
+delivery. Bounded `message_content::decode_content` validates those original
+bytes; normalized map replacement is not duplicate detection.
+
+Absent/null actions, empty maps and numeric/symbolic
+`com.microsoft:empty-rule-action:list` described empty lists remain actionless.
+Empty/whitespace SQL expressions refuse. Described SQL-action requests,
+parameters, preprocessing settings and other action features are not supported.
+The borrowed source compiles before it is copied or submitted; a compile error
+returns fixed `SQL action cannot be compiled` text, never the action source.
+
+Enumeration uses the rule-description described list
+`0x0000_0137_0000_0004` with `[filter, action, name, created-at]`. An action is
+either EmptyRuleAction (`0x0000_0137_0000_0005`, empty list), or SQL action
+(`0x0000_0137_0000_0006`, `[original expression string, int 20]`). The SQL
+**filter** descriptor is different: `0x0000_0013_7000_0006`. Both pinned official
+.NET SDKs use these request/response shapes; their public rule model exposes an
+EmptyRuleAction response as a null action. Stored action damage refuses a
+listing instead of projecting false actionlessness or a partial result.
+
+`skip` must be a nonnegative AMQP int; `top` must be an AMQP int from 1 through
+100. Projection charges bounded encoded work against the Standard message and
+known reply-link ceilings. An oversized page explicitly refuses with
+`amqp:link:message-size-exceeded`; it is not silently truncated and `top` is not
+clamped. A later-attached smaller reply link retains the existing late size
+refusal. A rule-page count is not evidence of service/network compatibility.
+These shapes and local copy behavior do not certify external Azure behavior
+or the full Azure SQL action language.
+
+Wire references: the [public request/response specification](https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-amqp-request-response#rule-operations)
+and the MIT-licensed SDK `AmqpRuleManager` and framing codecs at
+[7.21.0](https://github.com/Azure/azure-sdk-for-net/tree/Azure.Messaging.ServiceBus_7.21.0/sdk/servicebus/Azure.Messaging.ServiceBus/src/Amqp)
+and [7.20.2](https://github.com/Azure/azure-sdk-for-net/tree/Azure.Messaging.ServiceBus_7.20.2/sdk/servicebus/Azure.Messaging.ServiceBus/src/Amqp).
 
 ## Grammar and names
 
