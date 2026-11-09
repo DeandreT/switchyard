@@ -398,6 +398,13 @@ async fn stop_keeps_link_cleanup_when_a_local_detach_write_is_blocked() {
             .wait(|| probe.write_pending.load(Ordering::SeqCst))
             .await;
     }
+    let mut detached = Box::pin(sender.on_detach_owned());
+    assert!(
+        poll_fn(|cx| Poll::Ready(detached.as_mut().poll(cx)))
+            .await
+            .is_pending(),
+        "a blocked application Detach write must not publish retirement early"
+    );
     connection.stop();
     joined(&mut connection, &probe).await;
     assert!(matches!(

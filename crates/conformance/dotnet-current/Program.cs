@@ -6,6 +6,10 @@ return await SdkCustody.RunAsync(args, WorkflowAsync);
 
 static async Task<int> WorkflowAsync(string[] args)
 {
+if (args.Length == 6 && args[0] == "--sustained-send")
+{
+    return await SustainedFlowConformance.RunAsync(args[1], args[2], args[3], args[4], args[5]);
+}
 if (args.Length != 18)
 {
     Console.Error.WriteLine(

@@ -775,7 +775,7 @@ async fn stop_cancels_full_actual_incoming_attach_channel() {
 }
 
 #[tokio::test]
-async fn stop_joins_original_tasks_with_full_bounded_incoming_handoff() {
+async fn stop_joins_original_tasks_with_blocked_credit_refill_and_full_bounded_handoff() {
     let (mut connection, mut peer, probe) = opened().await;
     let original = task_ids(&connection);
     let mut session = pressure_session(&mut connection, &mut peer).await;
@@ -813,9 +813,13 @@ async fn stop_joins_original_tasks_with_full_bounded_incoming_handoff() {
         .expect("barrier Attach");
     assert_eq!(barrier.handle, 2);
     assert_eq!(receiver.deliveries.len(), 2048);
+    probe.block_write.store(true, Ordering::SeqCst);
     let first = receiver.recv().await.expect("first retained delivery");
     assert_eq!(first.id, 0);
     assert_eq!(receiver.deliveries.len(), 2047);
+    // This write can only be the capacity Flow caused by actual dequeue: the
+    // peer sent no Flow and the application issued no settlement or command.
+    probe.wait_write().await;
     pressure_joined(&mut connection, &probe, original).await;
     assert!(
         *receiver.detached.borrow(),

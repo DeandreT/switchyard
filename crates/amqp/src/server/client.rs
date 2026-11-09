@@ -548,6 +548,14 @@ fn receiver_message_limit(requested: Option<u64>) -> u64 {
 }
 
 enum ClientCommand {
+    // Exercise allocation wrap/reuse without creating 2^32 links. This only
+    // seeds the allocator; all protocol and retirement checks remain real.
+    #[cfg(test)]
+    SeedNextHandle {
+        channel: u16,
+        handle: u32,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
     Begin {
         reply: oneshot::Sender<Result<u16, EngineError>>,
     },
@@ -623,6 +631,20 @@ fn retire_pending_operations(
     }
 }
 
+fn retire_detaching_attaches(
+    sessions: &HashMap<u16, SessionState>,
+    attaches: &mut PendingAttaches,
+) {
+    for (_, pending) in attaches.extract_if(|(channel, _), pending| {
+        sessions
+            .get(channel)
+            .and_then(|s| s.links.get(&pending.handle))
+            .is_some_and(LinkState::is_detaching)
+    }) {
+        let _ = pending.reply.send(Err(EngineError::RemoteDetached));
+    }
+}
+
 async fn client_request<T>(
     commands: &mpsc::Sender<ClientCommand>,
     make: impl FnOnce(oneshot::Sender<Result<T, EngineError>>) -> ClientCommand,
@@ -638,24 +660,79 @@ async fn client_request<T>(
 async fn run_client<Io>(
     stream: Io,
     remote_max_frame_size: u32,
-    mut commands: mpsc::Receiver<ClientCommand>,
+    commands: mpsc::Receiver<ClientCommand>,
     closed: watch::Sender<bool>,
 ) -> Result<(), EngineError>
 where
     Io: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let (frames_tx, mut frames) = mpsc::channel(256);
-    tokio::spawn(async move {
-        loop {
-            let frame = read_frame(&mut reader).await;
-            let done = frame.is_err();
-            if frames_tx.send(frame).await.is_err() || done {
-                break;
+    let (frames_tx, frames) = mpsc::channel(256);
+    let (reader_stop, mut reader_stopped) = watch::channel(false);
+    let original_reader = tokio::spawn(async move {
+        let reading = async move {
+            loop {
+                let frame = read_frame(&mut reader).await;
+                let done = frame.is_err();
+                if frames_tx.send(frame).await.is_err() || done {
+                    break;
+                }
             }
+        };
+        // This task owns only read/decoding work. Actor termination may cancel
+        // either an idle/partial read or a full-frame-channel send, never a
+        // begun broker operation. Dropping the sole sender also requests stop.
+        tokio::select! {
+            biased;
+            () = wait_for_stop(&mut reader_stopped) => {},
+            () = reading => {},
         }
     });
+    #[cfg(test)]
+    let observation = CLIENT_READER_CUSTODY.try_with(Clone::clone).ok();
+    #[cfg(test)]
+    let reader_id = original_reader.id();
+    #[cfg(test)]
+    if let Some(observer) = &observation {
+        observer.send_replace(Some(ClientReaderObservation::Spawned(reader_id)));
+    }
 
+    // Keep the original JoinHandle outside the actor's fallible body: every
+    // ordinary or error return, including the retirement-budget refusal, joins
+    // that same reader before publishing connection closure.
+    let result = drive_client(&mut writer, remote_max_frame_size, commands, frames).await;
+    reader_stop.send_replace(true);
+    let joined = original_reader.await;
+    #[cfg(test)]
+    if let Some(observer) = &observation {
+        observer.send_replace(Some(ClientReaderObservation::Joined {
+            id: reader_id,
+            success: joined.is_ok(),
+        }));
+    }
+    drop(writer);
+    let _ = closed.send(true);
+    result.and(joined.map_err(|error| invalid_state(format!("client reader task failed: {error}"))))
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientReaderObservation {
+    Spawned(tokio::task::Id),
+    Joined { id: tokio::task::Id, success: bool },
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static CLIENT_READER_CUSTODY: watch::Sender<Option<ClientReaderObservation>>;
+}
+
+async fn drive_client<W: AsyncWrite + Unpin>(
+    mut writer: &mut W,
+    remote_max_frame_size: u32,
+    mut commands: mpsc::Receiver<ClientCommand>,
+    mut frames: mpsc::Receiver<Result<Frame, io::Error>>,
+) -> Result<(), EngineError> {
     let (unused_attach_tx, _) = mpsc::channel(1);
     let mut sessions = HashMap::<u16, SessionState>::new();
     let mut ending_sessions = HashSet::new();
@@ -695,14 +772,20 @@ where
                     }
                     Performative::Attach(attach) => {
                         let attach = *attach;
+                        if sessions.get(&channel).and_then(|session| session.links.get(&attach.handle)).is_some_and(LinkState::is_detaching) {
+                            continue;
+                        }
                         if let Some(pending) = pending_attaches.remove(&(channel, attach.name.clone())) {
                             if attach.role == Role::Sender {
+                                if let Some(LinkState::Receiving(link)) = sessions.get_mut(&channel).and_then(|session| session.links.get_mut(&pending.handle)) {
+                                    link.credit = engine::incoming::ReceivingCredit::new(attach.initial_delivery_count.unwrap_or(0));
+                                }
                                 write_amqp(
                                     &mut writer,
                                     channel,
                                     Performative::Flow(Flow {
                                         handle: Some(pending.handle),
-                                        delivery_count: Some(0),
+                                        delivery_count: Some(attach.initial_delivery_count.unwrap_or(0)),
                                         link_credit: Some(LINK_CREDIT),
                                         ..engine::incoming::session_flow(&sessions[&channel])
                                     }),
@@ -725,6 +808,7 @@ where
                             &mut sessions,
                             remote_max_frame_size,
                         ).await?;
+                        retire_detaching_attaches(&sessions, &mut pending_attaches);
                         Ok(false)
                     }
                     Performative::Transfer(transfer) => {
@@ -733,6 +817,7 @@ where
                             next_handles.remove(&channel);
                             detach_errors.retain(|(owner, _), _| *owner != channel);
                         }).await?;
+                        retire_detaching_attaches(&sessions, &mut pending_attaches);
                         Ok(false)
                     }
                     Performative::Disposition(disposition) => {
@@ -741,6 +826,10 @@ where
                     }
                     Performative::Detach(detach) => {
                         let locally_initiated = pending_detaches.remove(&(channel, detach.handle));
+                        let mut answer_needed = false;
+                        for (_, pending) in pending_attaches.extract_if(|(owner, _), pending| *owner == channel && pending.handle == detach.handle) {
+                            let _ = pending.reply.send(Err(EngineError::RemoteDetached));
+                        }
                         // Record the reason before stopping the link wakes its owner.
                         if let Some(slot) = detach_errors.remove(&(channel, detach.handle)) {
                             *slot.lock().expect("the detach error slot is not poisoned") =
@@ -749,11 +838,12 @@ where
                         if let Some(session) = sessions.get_mut(&channel)
                             && let Some(mut link) = session.links.remove(&detach.handle)
                         {
+                            answer_needed = !link.is_detaching();
                             stop_link(&mut link);
                         }
                         if let Some(reply) = locally_initiated {
                             let _ = reply.send(Ok(()));
-                        } else {
+                        } else if answer_needed {
                             write_amqp(
                                 &mut writer,
                                 channel,
@@ -802,6 +892,12 @@ where
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 let result = match command {
+                    #[cfg(test)]
+                    ClientCommand::SeedNextHandle { channel, handle, reply } => {
+                        *next_handles.get_mut(&channel).expect("seeded live session") = handle;
+                        let _ = reply.send(Ok(()));
+                        Ok(())
+                    }
                     ClientCommand::Begin { reply } => {
                         let channel = next_channel;
                         next_channel = next_channel.wrapping_add(1);
@@ -844,6 +940,10 @@ where
                             .ok_or_else(|| invalid_state("attach on an unknown session"))?;
                         let handle = *next_handle;
                         *next_handle = next_handle.wrapping_add(1);
+                        if sessions[&channel].links.contains_key(&handle) {
+                            let _ = reply.send(Err(invalid_state("link handle is still reserved")));
+                            continue;
+                        }
                         if let Some(slot) = request.detach_error.clone() {
                             detach_errors.insert((channel, handle), slot);
                         }
@@ -892,6 +992,7 @@ where
                                 let incarnation = next_link_incarnation();
                                 session.links.insert(handle, LinkState::Receiving(ReceivingLink {
                                     incarnation,
+                                    credit: engine::incoming::ReceivingCredit::new(0),
                                     max_message_size: receive_limit,
                                     deliveries: deliveries_tx,
                                     partial: None,
@@ -936,7 +1037,7 @@ where
                             let _ = reply.send(Err(EngineError::RemoteDetached));
                             continue;
                         };
-                        if link.incarnation() != incarnation {
+                        if link.incarnation() != incarnation || link.is_detaching() {
                             let _ = started.send(Err(EngineError::RemoteDetached));
                             let _ = reply.send(Err(EngineError::RemoteDetached));
                             continue;
@@ -1009,8 +1110,9 @@ where
                         let is_current = sessions
                             .get(&channel)
                             .and_then(|session| session.links.get(&handle))
-                            .is_some_and(|link| link.incarnation() == incarnation);
+                            .is_some_and(|link| link.incarnation() == incarnation && !link.is_detaching());
                         if is_current {
+                            engine::check_detach_capacity(&sessions)?;
                             pending_detaches.insert((channel, handle), reply);
                             write_amqp(
                                 &mut writer,
@@ -1021,7 +1123,9 @@ where
                                     error: None,
                                 }),
                                 Vec::new(),
-                            ).await
+                            ).await?;
+                            engine::begin_detach(channel, handle, &mut sessions)?;
+                            Ok(())
                         } else {
                             let _ = reply.send(Ok(()));
                             Ok(())
@@ -1086,7 +1190,6 @@ where
     if let Some(reply) = closing {
         let _ = reply.send(Err(EngineError::RemoteClosed));
     }
-    let _ = closed.send(true);
     Ok(())
 }
 
@@ -1097,6 +1200,130 @@ mod limit_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn client_receives_3072_on_one_link_with_peer_seeded_wrapping_refills() {
+        let (stream, mut peer) = tokio::io::duplex(64 * 1024);
+        let (commands, command_rx) = mpsc::channel(256);
+        let (closed_tx, closed) = watch::channel(false);
+        let driver = tokio::spawn(run_client(stream, 1024, command_rx, closed_tx));
+        let mut connection = ClientConnection { commands, closed };
+        let (finished, peer_finished) = oneshot::channel();
+        async fn control(peer: &mut tokio::io::DuplexStream) -> Performative {
+            let Frame::Amqp {
+                performative: Some(value),
+                ..
+            } = read_frame(peer).await.unwrap()
+            else {
+                panic!("AMQP control")
+            };
+            value
+        }
+        tokio::time::timeout(crate::test_deadline::WAIT, async {
+            tokio::join!(
+                async {
+                    let mut session = connection.begin().await.unwrap();
+                    let mut receiver = session
+                        .attach_receiver("sustained", "orders")
+                        .await
+                        .unwrap();
+                    for _ in 0..3072 {
+                        assert_eq!(
+                            receiver.recv().await.unwrap().message(),
+                            &Message::default()
+                        );
+                    }
+                    peer_finished.await.unwrap();
+                    connection.close().await.unwrap();
+                },
+                async {
+                    assert!(matches!(control(&mut peer).await, Performative::Begin(_)));
+                    write_amqp(
+                        &mut peer,
+                        0,
+                        Performative::Begin(Begin {
+                            remote_channel: Some(0),
+                            ..Begin::default()
+                        }),
+                        vec![],
+                    )
+                    .await
+                    .unwrap();
+                    let Performative::Attach(mut attach) = control(&mut peer).await else {
+                        panic!("receiver Attach")
+                    };
+                    let handle = attach.handle;
+                    let seed = u32::MAX - 1000;
+                    attach.role = Role::Sender;
+                    attach.initial_delivery_count = Some(seed);
+                    write_amqp(&mut peer, 0, Performative::Attach(attach), vec![])
+                        .await
+                        .unwrap();
+                    let Performative::Flow(flow) = control(&mut peer).await else {
+                        panic!("initial credit")
+                    };
+                    assert_eq!(flow.delivery_count, Some(seed));
+                    assert_eq!(flow.link_credit, Some(LINK_CREDIT));
+                    for batch in 0..3 {
+                        for id in batch * 1024..(batch + 1) * 1024 {
+                            write_amqp(
+                                &mut peer,
+                                0,
+                                Performative::Transfer(Transfer {
+                                    handle,
+                                    delivery_id: Some(id),
+                                    delivery_tag: Some(DeliveryTag::from(
+                                        id.to_be_bytes().to_vec(),
+                                    )),
+                                    message_format: Some(0),
+                                    settled: Some(true),
+                                    more: false,
+                                    rcv_settle_mode: None,
+                                    state: None,
+                                    resume: false,
+                                    aborted: false,
+                                    batchable: false,
+                                }),
+                                vec![],
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        loop {
+                            let Performative::Flow(flow) = control(&mut peer).await else {
+                                panic!("capacity Flow")
+                            };
+                            if flow.handle == Some(handle) {
+                                assert_eq!(
+                                    flow.delivery_count,
+                                    Some(seed.wrapping_add((batch + 1) * 1024))
+                                );
+                                assert_eq!(flow.link_credit, Some(LINK_CREDIT));
+                                break;
+                            }
+                        }
+                    }
+                    finished.send(()).unwrap();
+                    // Any final session-only refund is independent of link credit.
+                    loop {
+                        if matches!(control(&mut peer).await, Performative::Close(_)) {
+                            break;
+                        }
+                    }
+                    write_amqp(&mut peer, 0, Performative::Close(Close::default()), vec![])
+                        .await
+                        .unwrap();
+                }
+            );
+        })
+        .await
+        .expect("original sustained client receive deadline");
+        tokio::time::timeout(crate::test_deadline::WAIT, driver)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn client_replenishes_fragment_capacity_and_new_links_report_real_received_progress() {
@@ -1154,7 +1381,7 @@ mod tests {
                     };
                     let handle = attach.handle;
                     attach.role = Role::Sender;
-                    attach.initial_delivery_count = Some(0);
+                    attach.initial_delivery_count = Some(u32::MAX);
                     write_amqp(&mut peer, channel, Performative::Attach(attach), Vec::new())
                         .await
                         .unwrap();
@@ -1163,6 +1390,7 @@ mod tests {
                         panic!("initial credit")
                     };
                     assert_eq!(flow.next_incoming_id, Some(17));
+                    assert_eq!(flow.delivery_count, Some(u32::MAX));
                     for (index, byte) in payload.into_iter().enumerate() {
                         let first = index == 0;
                         write_amqp(

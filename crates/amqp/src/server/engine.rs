@@ -123,6 +123,9 @@ pub(super) struct PendingSession {
 pub(super) enum LinkState {
     Sending(SendingLink),
     Receiving(ReceivingLink),
+    /// Local Detach has been sent. Keep the handle reserved until its answer;
+    /// the retired endpoint's queues and partials no longer belong to the actor.
+    Detaching(u64),
 }
 
 impl LinkState {
@@ -130,8 +133,62 @@ impl LinkState {
         match self {
             Self::Sending(link) => link.drain.incarnation,
             Self::Receiving(link) => link.incarnation,
+            Self::Detaching(incarnation) => *incarnation,
         }
     }
+
+    pub(super) fn is_detaching(&self) -> bool {
+        matches!(self, Self::Detaching(_))
+    }
+}
+
+// A peer withholding answers cannot accumulate an unbounded retirement ledger.
+// This is connection-wide, not a fresh allowance on every new session.
+const MAX_DETACHING_LINKS: usize = 64;
+
+pub(super) fn check_detach_capacity(
+    sessions: &HashMap<u16, SessionState>,
+) -> Result<(), EngineError> {
+    if sessions
+        .values()
+        .flat_map(|s| s.links.values())
+        .filter(|l| l.is_detaching())
+        .count()
+        >= MAX_DETACHING_LINKS
+    {
+        return Err(invalid_state(
+            "native unacknowledged Detach limit exhausted",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn begin_detach(
+    channel: u16,
+    handle: u32,
+    sessions: &mut HashMap<u16, SessionState>,
+) -> Result<bool, EngineError> {
+    let Some(link) = sessions.get(&channel).and_then(|s| s.links.get(&handle)) else {
+        return Ok(false);
+    };
+    if link.is_detaching() {
+        return Ok(false);
+    }
+    check_detach_capacity(sessions)?;
+    let link = sessions
+        .get_mut(&channel)
+        .unwrap()
+        .links
+        .get_mut(&handle)
+        .unwrap();
+    let mut retired = std::mem::replace(link, LinkState::Detaching(link.incarnation()));
+    stop_link(&mut retired);
+    sessions
+        .get_mut(&channel)
+        .unwrap()
+        .pending_flows
+        .remove(&handle);
+    Ok(true)
 }
 
 pub(super) struct SendingLink {
@@ -200,6 +257,7 @@ pub(super) struct PendingConfirmation {
 
 pub(super) struct ReceivingLink {
     pub(super) incarnation: u64,
+    pub(super) credit: incoming::ReceivingCredit,
     pub(super) max_message_size: u64,
     pub(super) deliveries: incoming::DeliverySender,
     pub(super) partial: Option<PartialDelivery>,
@@ -378,6 +436,15 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
                 .get_mut(&channel)
                 .ok_or_else(|| invalid_state("attach on an unknown session"))?;
             let handle = attach.handle;
+            if session
+                .links
+                .get(&handle)
+                .is_some_and(LinkState::is_detaching)
+            {
+                // Crossed traffic cannot install a replacement before the old
+                // peer's acknowledgement has released the handle.
+                return Ok(FrameAction::Continue);
+            }
             if session.links.contains_key(&handle) || session.pending_attaches.contains_key(&handle)
             {
                 return Err(invalid_state("link handle is already attached"));
@@ -417,8 +484,9 @@ async fn handle_frame<W: AsyncWrite + Unpin>(
         Performative::Detach(detach) => {
             let answered = if let Some(session) = sessions.get_mut(&channel) {
                 if let Some(mut link) = session.links.remove(&detach.handle) {
+                    let answer_needed = !link.is_detaching();
                     stop_link(&mut link);
-                    true
+                    answer_needed
                 } else {
                     let removed = session.pending_attaches.remove(&detach.handle).is_some();
                     if removed {
@@ -603,6 +671,9 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                         handle,
                         LinkState::Receiving(ReceivingLink {
                             incarnation,
+                            credit: incoming::ReceivingCredit::new(
+                                attach.initial_delivery_count.unwrap_or(0),
+                            ),
                             max_message_size,
                             deliveries: deliveries_tx,
                             partial: None,
@@ -614,7 +685,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                         channel,
                         Performative::Flow(Flow {
                             handle: Some(handle),
-                            delivery_count: Some(0),
+                            delivery_count: Some(attach.initial_delivery_count.unwrap_or(0)),
                             link_credit: Some(LINK_CREDIT),
                             ..incoming::session_flow(session)
                         }),
@@ -694,7 +765,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 let _ = reply.send(Err(EngineError::RemoteDetached));
                 return Ok(CommandAction::Continue);
             };
-            if link.incarnation() != incarnation {
+            if link.incarnation() != incarnation || link.is_detaching() {
                 let _ = started.send(Err(EngineError::RemoteDetached));
                 let _ = reply.send(Err(EngineError::RemoteDetached));
                 return Ok(CommandAction::Continue);
@@ -762,7 +833,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             // A durable result can reach its confirmation after native Detach or
             // End. Its old owner is retired, not an active protocol fault; never
             // write that disposition into a replacement at the same wire handle.
-            if link.incarnation() != incarnation {
+            if link.incarnation() != incarnation || link.is_detaching() {
                 let _ = reply.send(Err(EngineError::RemoteDetached));
                 return Ok(CommandAction::Continue);
             }
@@ -809,6 +880,14 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                 let _ = reply.send(Err(EngineError::RemoteDetached));
                 return Ok(CommandAction::Continue);
             };
+            if session
+                .links
+                .get(&handle)
+                .is_some_and(LinkState::is_detaching)
+            {
+                let _ = reply.send(Err(EngineError::RemoteDetached));
+                return Ok(CommandAction::Continue);
+            }
             if !matches!(
                 session.links.get(&handle),
                 Some(LinkState::Receiving(link)) if link.incarnation == incarnation
@@ -842,8 +921,9 @@ async fn handle_command<W: AsyncWrite + Unpin>(
             let is_current = sessions
                 .get(&channel)
                 .and_then(|session| session.links.get(&handle))
-                .is_some_and(|link| link.incarnation() == incarnation);
+                .is_some_and(|link| link.incarnation() == incarnation && !link.is_detaching());
             if is_current {
+                check_detach_capacity(sessions)?;
                 write_amqp(
                     writer,
                     channel,
@@ -855,12 +935,10 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                     Vec::new(),
                 )
                 .await?;
-                if let Some(mut link) = sessions
-                    .get_mut(&channel)
-                    .and_then(|session| session.links.remove(&handle))
-                {
-                    stop_link(&mut link);
-                }
+                // Preserve the original native close's write-before-retirement
+                // ordering. In particular, a blocked write must not notify the
+                // pump's detach observer and suppress its retained outer fault.
+                begin_detach(channel, handle, sessions)?;
             }
             let _ = reply.send(Ok(()));
         }
@@ -1140,6 +1218,7 @@ fn settle_send(
 
 pub(super) fn stop_link(link: &mut LinkState) {
     match link {
+        LinkState::Detaching(_) => {}
         LinkState::Sending(link) => {
             let _ = link.detached.send(true);
             if let Some(sending) = link.transmitting.take() {

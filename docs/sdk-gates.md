@@ -4,9 +4,18 @@ The .NET TCP/WSS workflows are experimental Memory/Fjall data-plane gates.
 Selectors are fixed: `declared-current` is ServiceBus 7.21.0 / Core 1.62.0;
 `previous` is 7.20.2 / 1.60.0. Neither means latest. Exact ranges, locked graphs
 and selected runtime DLL approvals are checked in under `crates/conformance/pins`.
-Ordinary workspace tests ignore eight workflows and one restored-pin control.
+Ordinary workspace tests ignore these workflows and the opt-in controls.
 Selecting one requires
 Linux, .NET 10 and NuGet restore; missing prerequisites fail rather than skip.
+
+The separate `declared_current_memory_tcp_sustained_send` selector in
+`amqp_dotnet_current` sends 2,305 individual deliveries through one retained SDK
+sender with retries disabled. It uses the same pinned assets, loaded-assembly and
+original-child custody checks as the TCP workflows. After the original protocol
+and timer joins, native checks verify every ordered stored body and an empty
+queue. This is an additional focused gate, not a ninth matrix cell. Like the
+existing TCP fixture, its certificate callback bypasses validation only for the
+test endpoint; it neither changes machine trust nor certifies production TLS.
 
 The four exact batch checks accumulate arrival-order short batches: the
 [SDK receive contract](https://learn.microsoft.com/en-us/dotnet/api/azure.messaging.servicebus.servicebusreceiver.receivemessagesasync)

@@ -63,6 +63,8 @@ pub enum EngineError {
     MessageSizeExceeded { size: u64, maximum: u64 },
     #[error("native incoming message storage is full")]
     IncomingResourceLimit,
+    #[error("native incoming link credit is exhausted")]
+    IncomingCreditLimit,
 }
 
 /// The link error a sender reports when a delivery exceeds the receiving

@@ -8,6 +8,7 @@ mod confirmation;
 mod credit;
 mod incarnation;
 mod message_size;
+mod receiving_credit;
 mod session_incarnation;
 mod session_windows;
 
@@ -94,6 +95,7 @@ fn receiving_session(
     let (detached, _detached) = watch::channel(false);
     let link = ReceivingLink {
         incarnation: next_link_incarnation(),
+        credit: incoming::ReceivingCredit::new(0),
         max_message_size: u64::MAX,
         deliveries,
         partial: None,
