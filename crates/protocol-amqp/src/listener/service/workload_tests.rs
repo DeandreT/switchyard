@@ -28,6 +28,18 @@ use crate::{
 mod fixture;
 use fixture::*;
 
+// Shared only by the held-management-frontier integration tests. The proof is
+// still minted by a real handshake, and both original streams remain owned by
+// the caller until its original operation finishes.
+pub(crate) async fn management_peer() -> (
+    crate::workload::WorkloadPeer,
+    auth::workload::AdmittedWorkloadStream<tokio::net::TcpStream>,
+    tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+) {
+    let tls = TlsFixture::new(30);
+    fixture::peer(&tls, tls.endpoint(false, 1), &tls.manager).await
+}
+
 fn message(text: &str) -> Message {
     Message::builder()
         .body(Body::Data(vec![text.as_bytes().to_vec().into()]))

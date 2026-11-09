@@ -40,7 +40,7 @@ mod tcp_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(all(test, feature = "workload-tls"))]
-mod workload_tests;
+pub(crate) mod workload_tests;
 #[cfg(test)]
 mod wss_tests;
 
