@@ -225,6 +225,14 @@ core messages over real TCP with fixed identity/version checks and retained
 connection/dispatch ownership. It supplies no election driver, authenticated peer
 trust, quorum acknowledgement or server activation.
 
+The opt-in [persisted consensus driver](docs/consensus-driver.md) combines that
+transport with the pinned raft-rs RawNode and one exclusive profile-4 store.
+It persists each Ready before any associated message and separately persists
+LightReady commit changes. Elections, voting and replicated commit use the core's
+fixed-three rules. This library exposes only local proposal admission and
+diagnostic frontiers: actual application progress remains zero, no client
+outcomes or consistent reads exist, and production startup stays refused.
+
 ## Production Target: Not Implemented
 
 The intended release is a Rust-native Linux broker with quorum durability,

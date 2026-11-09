@@ -1,8 +1,9 @@
-//! Opt-in local consensus persistence, not a driver, election, network, quorum,
-//! application owner or production activation. Local commit state is accepted
-//! only from the future trusted Raft driver; this API does not prove a majority.
+//! Opt-in consensus persistence and a separate persisted RawNode driver. No
+//! application projection or production activation. The storage API alone
+//! accepts trusted local metadata; only the driver runs elections/replication.
 
 mod codec;
+pub mod driver;
 mod identity;
 mod store;
 

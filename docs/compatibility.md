@@ -642,6 +642,17 @@ raft-rs protobuf message per TCP connection. Fingerprint/voter checks are not
 authentication, and local write receipts are not peer durability/quorum acks.
 It does not activate server routing, elections or the production runtime.
 
+The separate opt-in [persisted driver](consensus-driver.md) runs the pinned
+raft-rs election/replication core over those real TCP connections and exclusive
+profile-4 stores. Ready and LightReady persistence precede their messages; an
+ambiguous write retires the original rather than retrying or acknowledging it.
+Local proposals undergo the existing bounded durable-envelope/version/namespace
+checks before core mutation. Admission and persisted-frontier observations are
+not client outcomes, application completion, consistent reads or peer trust.
+Actual applied progress remains zero; no domain profile-3 projection, server
+routing, consumers or production startup is enabled. Existing formats and
+snapshot/configuration/V11 refusal fences remain unchanged.
+
 Fjall stores use format 3. Ordinary opening never upgrades format 2; development
 startup refuses it before listening and names the offline
 `switchyardctl store upgrade --data-dir <path>` command. The upgrade preflights
