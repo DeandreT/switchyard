@@ -288,6 +288,51 @@ fn durable_roundtrip_controls_and_application_mapping() {
 }
 
 #[test]
+fn committed_sql_action_intent_keeps_v10_bytes_and_application_ordinal() {
+    let intent = DurableProposal::unbound(Command::new(
+        NamespaceName::new("tenant").unwrap(),
+        EntityPath::new("events/subscriptions/worker").unwrap(),
+        Timestamp::from_millis(1234),
+        CommandKind::CreateRuleWithAction {
+            name: domain::RuleName::new("copy").unwrap(),
+            filter: domain::RuleFilter::True,
+            action: domain::SqlRuleAction::new("SET copied = 1"),
+        },
+    ));
+    let bytes = intent.encode().unwrap();
+    assert_eq!(&bytes[4..8], &10_u32.to_be_bytes());
+    for durable in [false, true] {
+        let (backend, control, directory) = fixture(durable);
+        let mut store =
+            ConsensusStore::bootstrap(backend, identity(), 1, RetainedLogLimits::default())
+                .unwrap();
+        let mut entry = blank(2, 1);
+        entry.data = bytes.clone().into();
+        let entries = vec![blank(1, 1), entry];
+        store.persist(&entries, Some(&hs(1, 1, 2))).unwrap();
+        let before = rows(&control);
+        let store = store.reopen().unwrap();
+        assert_eq!(rows(&control), before);
+        assert_eq!(store.read_entries(1, 64).unwrap(), entries);
+        assert_eq!(store.application_ordinal(1).unwrap(), None);
+        assert_eq!(store.application_ordinal(2).unwrap(), Some(1));
+        assert_eq!(DurableProposal::decode(&entries[1].data).unwrap(), intent);
+        drop(store);
+        if let Some(directory) = directory {
+            let reopened = ConsensusStore::open(
+                ConsensusFjallStore::open(directory.path()).unwrap(),
+                identity(),
+                1,
+                RetainedLogLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(reopened.read_entries(1, 64).unwrap(), entries);
+            assert_eq!(reopened.application_ordinal(2).unwrap(), Some(1));
+        }
+    }
+}
+
+#[test]
 fn atomic_conflict_replacement_never_truncates_commit_or_matching_suffix() {
     for durable in [false, true] {
         let (backend, control, _directory) = fixture(durable);
