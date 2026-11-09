@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+workload = ["dep:rustls-pemfile", "dep:x509-parser"]
+workload-tls = ["workload"]
+
 [dependencies]
 base64.workspace = true
 hmac.workspace = true
@@ -15,6 +20,7 @@ hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 percent-encoding.workspace = true
 ring.workspace = true
 rustls.workspace = true
+rustls-pemfile = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -22,7 +28,13 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 url.workspace = true
+x509-parser = { workspace = true, optional = true }
 
 [dev-dependencies]
 rcgen.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+time = "0.3"
+
+[[test]]
+name = "workload_tls"
+required-features = ["workload-tls"]

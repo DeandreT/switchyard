@@ -64,6 +64,7 @@ tonic-prost-build = { version = "=0.14.9", default-features = false, features = 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2.5"
+x509-parser = { version = "=0.18.1", default-features = false }
 
 [profile.release]
 lto = "thin"

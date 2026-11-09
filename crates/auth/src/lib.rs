@@ -4,6 +4,8 @@ mod jwt;
 pub mod oidc;
 mod policy;
 mod sas;
+#[cfg(feature = "workload")]
+pub mod workload;
 
 use serde::{Deserialize, Serialize};
 
