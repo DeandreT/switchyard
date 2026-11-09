@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod consensus;
 mod journal;
 mod replay;
 mod snapshot;

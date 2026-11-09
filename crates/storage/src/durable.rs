@@ -28,8 +28,10 @@ pub const STORE_FORMAT_V2: u32 = 2;
 /// with #16's typed-content admission, so a format 3 store can hold content
 /// written after upgrade that capture then refuses.
 pub const STORE_FORMAT_V3: u32 = 3;
-/// The only layout this build reads and writes.
+/// The ordinary domain layout; consensus uses a separate, isolated opener.
 pub const ACTIVE_STORE_FORMAT: u32 = STORE_FORMAT_V3;
+/// Fresh-only consensus backend profile. Not a domain value/queue format.
+pub const CONSENSUS_STORE_FORMAT: u32 = 4;
 
 const RECORDS_KEYSPACE: &str = "records";
 const META_KEYSPACE: &str = "meta";
@@ -48,10 +50,17 @@ impl FjallStore {
     /// A directory has a single owner: opening one that another live handle
     /// already holds is refused rather than shared.
     pub fn open(directory: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let directory = directory.as_ref().to_path_buf();
+        Self::open_profile(directory.as_ref(), ACTIVE_STORE_FORMAT)
+    }
+
+    fn open_profile(directory: &Path, expected: u32) -> Result<Self, StorageError> {
+        let directory = directory.to_path_buf();
         let database = Database::builder(&directory)
             .open()
             .map_err(|error| StorageError::backend("open the store directory", &error))?;
+        if expected == CONSENSUS_STORE_FORMAT && !database.list_keyspace_names().is_empty() {
+            require_known_inventory(&database)?;
+        }
         let meta = database
             .keyspace(META_KEYSPACE, KeyspaceCreateOptions::default)
             .map_err(|error| StorageError::backend("open the metadata keyspace", &error))?;
@@ -63,7 +72,7 @@ impl FjallStore {
             .get(FORMAT_VERSION_KEY)
             .map_err(|error| StorageError::backend("read the store format version", &error))?
         {
-            Some(recorded) => require_readable_format(&recorded)?,
+            Some(recorded) => require_format(&recorded, expected)?,
             None => {
                 // A missing marker does not prove this is a fresh store.
                 let metadata_entry = meta.iter().next().map(read_entry).transpose()?;
@@ -77,22 +86,57 @@ impl FjallStore {
                 }
 
                 let mut batch = database.batch().durability(Some(PersistMode::SyncAll));
-                batch.insert(
-                    &meta,
-                    FORMAT_VERSION_KEY,
-                    ACTIVE_STORE_FORMAT.to_be_bytes().to_vec(),
-                );
+                batch.insert(&meta, FORMAT_VERSION_KEY, expected.to_be_bytes().to_vec());
                 batch.commit().map_err(|error| {
                     StorageError::backend("stamp the store format version", &error)
                 })?;
             }
         }
 
+        if expected == CONSENSUS_STORE_FORMAT {
+            inspect_native(&database, &meta, &records, |recorded| {
+                require_format(recorded, expected)?;
+                Ok(false)
+            })?;
+        }
         Ok(Self {
             database,
             records,
             meta,
             directory,
+        })
+    }
+
+    /// Only the non-Clone consensus wrapper can call this. Existing databases
+    /// are recovered without creating keyspaces or changing logical metadata.
+    pub(crate) fn open_consensus(directory: &Path) -> Result<Self, StorageError> {
+        let nonempty = match std::fs::read_dir(directory) {
+            Ok(mut entries) => entries
+                .next()
+                .transpose()
+                .map_err(|error| StorageError::backend("inspect the consensus directory", &error))?
+                .is_some(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(StorageError::backend(
+                    "inspect the consensus directory",
+                    &error,
+                ));
+            }
+        };
+        if !nonempty {
+            return Self::open_profile(directory, CONSENSUS_STORE_FORMAT);
+        }
+        let (database, meta, records) = recover_existing(directory)?;
+        inspect_native(&database, &meta, &records, |recorded| {
+            require_format(recorded, CONSENSUS_STORE_FORMAT)?;
+            Ok(false)
+        })?;
+        Ok(Self {
+            database,
+            meta,
+            records,
+            directory: directory.to_path_buf(),
         })
     }
 
@@ -312,6 +356,10 @@ impl StateStore for FjallStore {
 
 /// Rejects a store this build cannot read, rather than misreading it.
 fn require_readable_format(recorded: &[u8]) -> Result<(), StorageError> {
+    require_format(recorded, ACTIVE_STORE_FORMAT)
+}
+
+fn require_format(recorded: &[u8], expected: u32) -> Result<(), StorageError> {
     let bytes = <[u8; 4]>::try_from(recorded).map_err(|_| StorageError::CorruptMetadata {
         detail: format!(
             "format version record is {} bytes, expected 4",
@@ -319,11 +367,8 @@ fn require_readable_format(recorded: &[u8]) -> Result<(), StorageError> {
         ),
     })?;
     let found = u32::from_be_bytes(bytes);
-    if found != ACTIVE_STORE_FORMAT {
-        return Err(StorageError::UnsupportedStoreFormat {
-            found,
-            expected: ACTIVE_STORE_FORMAT,
-        });
+    if found != expected {
+        return Err(StorageError::UnsupportedStoreFormat { found, expected });
     }
     Ok(())
 }
