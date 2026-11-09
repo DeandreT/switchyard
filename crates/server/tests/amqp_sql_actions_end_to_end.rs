@@ -654,6 +654,40 @@ async fn exercise<P: StoreProvider>(provider: P) -> TestResult {
         healthy_before.close().await?;
     }
     eprintln!("sql-actions: healthy queue baseline before catalog corruption checked");
+
+    // First-mode accept writes a disposition; even link close does not prove
+    // that the broker's Complete has committed. Drain the entire original
+    // connection/listener and join the broker before freezing a store image.
+    // Otherwise delayed baseline settlement could cross the corruption
+    // snapshot frontier and look like mutation by a rejected rule operation.
+    drop(management);
+    drop(handle);
+    let baseline_image = finish_phase(wire, broker, raw).await?;
+    let raw = provider.open()?;
+    assert_eq!(
+        raw.snapshot()?,
+        baseline_image,
+        "baseline joined-owner reopen preserves the complete canonical image"
+    );
+    // These are positive completion witnesses, not exclusions from the whole
+    // image comparison: no baseline message or expiry row may remain persisted.
+    for prefix in [
+        keys::message_prefix(&namespace(), &entity("healthy")),
+        keys::expiry_prefix(&namespace(), &entity("healthy")),
+    ] {
+        assert!(
+            raw.scan_prefix(&prefix, 1)?.is_empty(),
+            "baseline Complete must be persisted before catalog corruption"
+        );
+    }
+    eprintln!("sql-actions: baseline Complete persisted after original-owner join and reopen");
+    let broker = Broker::spawn(LocalProposer::new(
+        StateMachine::new(raw.clone()),
+        clock.clone(),
+    ));
+    let handle = broker.handle();
+    let mut wire = Wire::start(handle.clone()).await?;
+    let mut management = Management::attach(&mut wire.session, &path("retain")).await?;
     raw.apply(WriteBatch::default().put(key.clone(), vec![3, 0xff]))?;
     let corrupt_snapshot = raw.snapshot()?;
     let response = management
