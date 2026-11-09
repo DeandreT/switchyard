@@ -104,8 +104,10 @@ The [OIDC library](docs/offline-jwt.md#bounded-discovery-library)
 supports explicit HTTPS discovery/key refresh with exact issuer/JWKS URL and public
 dial-IP pins, no DNS tasks or token-triggered fetch, and shared bounded freshness.
 It preserves the narrow local JWT profile; the server still uses offline policy
-files. Workload identity consumption, transactions and production activation
-remain separate work.
+files. The optional [workload TLS foundation](docs/workload-identity.md) verifies
+client certificates and provides endpoint-bound scoped authority with a fixed
+lease. AMQP/admin consumption and restart activation are not yet connected.
+Transactions and production activation also remain separate work.
 
 ### Message State
 

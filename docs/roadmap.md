@@ -21,6 +21,8 @@ Pre-alpha: only verified, merged `main` is complete.
   fences are available; lifecycle conservation and activation remain separate.
 - [x] Native TLS/h2 entity Create/Get/List, verified native CLI and bounded closed
   Atom HTTPS transport; offline server JWT CBS and a separate pinned OIDC library.
+- [x] Optional locally pinned workload policy and verified TLS proof foundation;
+  protocol/admin consumers and server activation remain separate.
 - [x] Incoming/outgoing session windows and consumption-based receiving-link refill.
 - [x] Isolated fixed-three-voter consensus persistence/bootstrap, without elections
   or quorum activation.
