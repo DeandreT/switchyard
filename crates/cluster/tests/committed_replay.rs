@@ -1143,7 +1143,7 @@ fn raw_ambiguity(durable: bool) -> TestResult {
     ambiguity(durable, true)
 }
 
-fn latest_marker_no_domain_reads(durable: bool) -> TestResult {
+fn latest_marker_only_compatibility_catalog_reads(durable: bool) -> TestResult {
     for conflict in [false, true] {
         let mut fixture = Fixture::new(durable)?;
         let original = create(10);
@@ -1156,10 +1156,36 @@ fn latest_marker_no_domain_reads(durable: bool) -> TestResult {
                 .put(keys::entity_metadata(&ns(), &queue()), vec![255]),
         );
         let before = fixture.snapshot();
-        fixture.control.read_fault.store(3, Ordering::SeqCst);
+        // Open now inspects raw profile versions for unsupported capacity
+        // ownership. It must still never read Clock or authority/state values.
         match fixture.open() {
             Ok(mut owner) => {
                 assert!(!conflict);
+                assert!(
+                    fixture
+                        .trace()
+                        .scans
+                        .iter()
+                        .any(|(prefix, _, _)| prefix == &[1])
+                );
+                assert!(
+                    fixture
+                        .trace()
+                        .gets
+                        .iter()
+                        .all(|key| key.first().is_none_or(|tag| *tag > 0x11))
+                );
+                assert!(
+                    fixture
+                        .trace()
+                        .scans
+                        .iter()
+                        .all(|(prefix, _, limit)| (prefix == F0
+                            || prefix == &key(F0, 2)
+                            || prefix == &[1])
+                            && *limit <= JOURNAL_VALIDATION_PAGE_ENTRIES)
+                );
+                fixture.control.read_fault.store(3, Ordering::SeqCst);
                 caught_up(&mut owner, &fixture, 1, 1);
                 drop(owner);
             }
@@ -1171,13 +1197,35 @@ fn latest_marker_no_domain_reads(durable: bool) -> TestResult {
                 );
             }
         }
-        assert_eq!(fixture.control.read_fault.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            fixture.control.read_fault.load(Ordering::SeqCst),
+            if conflict { 0 } else { 3 }
+        );
+        assert!(
+            fixture
+                .trace()
+                .gets
+                .iter()
+                .all(|key| key.first().is_none_or(|tag| *tag > 0x11))
+        );
+        assert!(
+            fixture
+                .trace()
+                .scans
+                .iter()
+                .all(|(prefix, _, limit)| (prefix == F0
+                    || prefix == &key(F0, 2)
+                    || prefix == &[1])
+                    && *limit <= JOURNAL_VALIDATION_PAGE_ENTRIES)
+        );
         assert_eq!(fixture.snapshot(), before);
         assert!(fixture.trace().batches.is_empty());
         fixture.reopen()?;
+        fixture.control.read_fault.store(0, Ordering::SeqCst);
         match fixture.open() {
             Ok(mut owner) => {
                 assert!(!conflict);
+                fixture.control.read_fault.store(3, Ordering::SeqCst);
                 caught_up(&mut owner, &fixture, 1, 1);
             }
             Err(error) => {
@@ -1188,7 +1236,10 @@ fn latest_marker_no_domain_reads(durable: bool) -> TestResult {
                 );
             }
         }
-        assert_eq!(fixture.control.read_fault.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            fixture.control.read_fault.load(Ordering::SeqCst),
+            if conflict { 0 } else { 3 }
+        );
         assert_eq!(fixture.snapshot(), before);
     }
     Ok(())
@@ -1269,7 +1320,7 @@ paired!(
     raw_ambiguity
 );
 paired!(
-    memory_latest_marker_is_outcome_free_and_domain_read_free,
-    fjall_latest_marker_is_outcome_free_and_domain_read_free,
-    latest_marker_no_domain_reads
+    memory_latest_marker_only_reads_compatibility_profile_versions,
+    fjall_latest_marker_only_reads_compatibility_profile_versions,
+    latest_marker_only_compatibility_catalog_reads
 );

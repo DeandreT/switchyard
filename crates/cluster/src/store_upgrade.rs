@@ -43,6 +43,8 @@ pub enum StoreUpgradeOutcome {
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum StoreUpgradeError {
     #[error(transparent)]
+    Capacity(#[from] domain::BrokerError),
+    #[error(transparent)]
     Storage(#[from] StoreFormatUpgradeError),
     #[error(transparent)]
     Content(#[from] LegacyContentError),
@@ -74,6 +76,7 @@ pub fn upgrade_store(
 
 /// Compatibility preflight of exactly the inspected image, without live reads.
 fn validate_upgrade_image(image: &Arc<SnapshotWithProvenance>) -> Result<(), StoreUpgradeError> {
+    domain::capacity_fence::check_recovery(&FrozenImage(Arc::clone(image)))?;
     let records = image.snapshot().entries();
     validate_legacy_content(records)?;
     let mut journal = false;
@@ -87,7 +90,30 @@ fn validate_upgrade_image(image: &Arc<SnapshotWithProvenance>) -> Result<(), Sto
     match (journal, indexed) {
         // Committed schemas, anchors and the latest checkpoint identity.
         (true, true) => drop(CommittedReplay::open(frozen)?),
-        (true, false) => drop(Journal::open(frozen)?),
+        (true, false) => {
+            let journal = Journal::open(frozen)?;
+            let mut cursor = journal.removed_through()?;
+            let committed = journal.committed_index()?;
+            while cursor < committed {
+                let entries = journal
+                    .read_committed(cursor + 1, crate::journal::JOURNAL_VALIDATION_PAGE_ENTRIES)?;
+                if entries.is_empty() {
+                    return Err(JournalError::Corrupt {
+                        detail: "committed upgrade page is empty",
+                    }
+                    .into());
+                }
+                for entry in entries {
+                    // The journal-only upgrade intentionally does not certify
+                    // ordinary proposal semantics, but cannot relabel new
+                    // capacity-owned intent as supported legacy content.
+                    if entry.payload().get(..8) == Some(b"SWDP\0\0\0\x0b") {
+                        return Err(domain::BrokerError::CapacityStateUnsupported.into());
+                    }
+                    cursor = entry.index();
+                }
+            }
+        }
         // The indexed owner without journal history; domain rows stay unadopted.
         (false, true) => drop(IndexedWriter::open(frozen)?),
         (false, false) => {}

@@ -10,6 +10,8 @@
 //! the injected store.
 
 mod admin_catalog;
+#[cfg(test)]
+mod capacity_fence_tests;
 mod catalog;
 mod deferred;
 mod duplicate;
@@ -128,6 +130,16 @@ impl<S: StateStore> StateMachine<S> {
     }
 
     pub(crate) fn prepare(
+        &self,
+        command: &Command,
+    ) -> Result<(CommandOutcome, WriteBatch), PreparationFailure> {
+        crate::capacity_fence::check_command(&self.store, &command.namespace, &command.entity)?;
+        self.prepare_unfenced(command)
+    }
+
+    // Shared unchanged handler dispatcher, kept below the capacity preflight.
+    // Tests exercise this boundary as a pre-ledger writer with the V1..V3 codecs.
+    fn prepare_unfenced(
         &self,
         command: &Command,
     ) -> Result<(CommandOutcome, WriteBatch), PreparationFailure> {

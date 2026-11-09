@@ -218,6 +218,127 @@ fn empty_and_populated_unindexed_stores_upgrade_without_adoption() {
 }
 
 #[test]
+fn unsupported_capacity_framing_refuses_capture_install_recovery_and_marker_upgrade() {
+    use domain::{
+        capacity_fence,
+        retained_accounting::{CapacityOwner, RetainedUsage, keys::usage, usage_codec},
+    };
+    for case in 0..5 {
+        let directory = TempDir::new().unwrap();
+        let rows = legacy(directory.path(), |store| {
+            let owner = CapacityOwner::new(ns(), orders(), 1).unwrap();
+            let config = QueueConfig {
+                capacity: domain::QueueCapacity::Finite {
+                    max_size_bytes: domain::QUEUE_CAPACITY_GRANULARITY_BYTES,
+                },
+                ..QueueConfig::default()
+            };
+            StateMachine::new(store.clone())
+                .apply(&command(1, CommandKind::CreateQueue { config }))
+                .unwrap();
+            let shadow = QueueConfig {
+                max_delivery_count: u32::MAX,
+                ..QueueConfig::default()
+            };
+            let mut batch = WriteBatch::default();
+            if case != 3 {
+                batch.push_put(
+                    keys::queue_config(&ns(), owner.parent()),
+                    capacity_fence::encode_profile(&owner, owner.parent(), &config).unwrap(),
+                );
+                if case != 0 {
+                    batch.push_put(
+                        keys::queue_config(&ns(), owner.shadow()),
+                        capacity_fence::encode_profile(&owner, owner.shadow(), &shadow).unwrap(),
+                    );
+                }
+            }
+            if case == 2 {
+                batch.push_put(usage(&owner), vec![0xff; 72]);
+            }
+            if case == 4 {
+                batch.push_put(
+                    usage(&owner),
+                    usage_codec::encode(&owner, RetainedUsage::new(1, 0, 0, 0).unwrap()).unwrap(),
+                );
+            }
+            if case == 3 {
+                batch.push_put(
+                    capacity_fence::data_key(&keys::message(
+                        &ns(),
+                        owner.shadow(),
+                        SequenceNumber::new(1),
+                    ))
+                    .unwrap(),
+                    vec![0xff],
+                );
+            }
+            store.apply(batch).unwrap();
+        });
+        assert_eq!(
+            upgrade_store(directory.path()),
+            Err(StoreUpgradeError::Capacity(
+                domain::BrokerError::CapacityStateUnsupported
+            ))
+        );
+        assert_refused_without_mutation(directory.path(), &rows);
+        stamp(directory.path(), STORE_FORMAT_V3);
+        let store = FjallStore::open(directory.path()).unwrap();
+        let before = store.snapshot().unwrap();
+        assert!(matches!(
+            SnapshotCapture::fjall(&store, caps().snapshot),
+            Err(SnapshotCaptureError::State(_))
+        ));
+        assert!(matches!(
+            SnapshotCapture::logical(&memory(&rows), caps().snapshot),
+            Err(SnapshotCaptureError::State(_))
+        ));
+        assert!(select_recovery(&store, caps().snapshot).is_err());
+        assert!(CommittedReplay::open(store.clone()).is_err());
+        assert!(IndexedWriter::open(store.clone()).is_err());
+        assert_eq!(store.snapshot().unwrap(), before);
+        let empty = SnapshotCapture::logical(&MemoryStore::default(), caps().snapshot).unwrap();
+        let mut install = SnapshotInstallOwner::new(store);
+        assert!(
+            install
+                .install(
+                    &empty,
+                    install_caps(),
+                    SnapshotInstallPolicy::AllowCrossBackend
+                )
+                .is_err()
+        );
+        assert!(!install.is_retired());
+        assert_eq!(install.snapshot().unwrap().snapshot(), &before);
+        drop(install);
+        assert_eq!(records(directory.path()), rows);
+    }
+}
+
+#[test]
+fn committed_capacity_v11_journal_only_upgrade_refuses_before_marker_write() {
+    let directory = TempDir::new().unwrap();
+    let rows = legacy(directory.path(), |store| {
+        let owner = domain::retained_accounting::CapacityOwner::new(ns(), orders(), 1).unwrap();
+        let original = DurableProposal::unbound(command(1, CommandKind::ExpireMessages));
+        let intent = domain::capacity_fence::CapacityIntent::capture(owner, original)
+            .unwrap()
+            .encode()
+            .unwrap();
+        let mut journal = Journal::open(store.clone()).unwrap();
+        journal.append(1, &intent).unwrap();
+        journal.commit(1).unwrap();
+    });
+    assert_eq!(
+        upgrade_store(directory.path()),
+        Err(StoreUpgradeError::Capacity(
+            domain::BrokerError::CapacityStateUnsupported
+        ))
+    );
+    assert_refused_without_mutation(directory.path(), &rows);
+}
+
+#[test]
 fn unsafe_legacy_content_refuses_before_any_marker_write() {
     for (envelope, error) in [
         (vec![0xff, b'S'], ContentError::InvalidConstructor),

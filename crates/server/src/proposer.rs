@@ -53,6 +53,7 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
         entity: &EntityPath,
         kind: CommandKind,
     ) -> Result<CommandOutcome, ProposeError> {
+        domain::capacity_fence::check_command(self.machine.store(), namespace, entity)?;
         let issued_at = self.stamp()?;
         let command = Command::new(namespace.clone(), entity.clone(), issued_at, kind);
         Ok(self.machine.apply(&command)?)
@@ -73,7 +74,17 @@ impl<S: StateStore, C: Clock> LocalProposer<S, C> {
         binding: &EntityBinding,
         kind: CommandKind,
     ) -> Result<CommandOutcome, ProposeError> {
+        domain::capacity_fence::check_bound_profile(
+            self.machine.store(),
+            binding.namespace(),
+            binding.target(),
+        )?;
         self.machine.validate_binding(binding)?;
+        domain::capacity_fence::check_command(
+            self.machine.store(),
+            binding.namespace(),
+            binding.target(),
+        )?;
         let issued_at = self.stamp()?;
         let command = Command::new(
             binding.namespace().clone(),

@@ -3,8 +3,9 @@
 `domain::retained_accounting` is an opt-in pure calculation library. Existing
 finite queue profiles remain metadata only: no command reads or writes a usage
 row, reserves capacity, or rejects a send based on retained bytes. Existing
-message V1/V2/V3, profile and proposal formats (including V7 finite intent and
-V9 proposals) are unchanged.
+message V1/V2/V3, legacy profile and proposal formats (including V7 finite intent
+and V9 proposals) are unchanged. Inert new-owner compatibility framing is
+specified in [capacity writer fences](capacity-writer-fences.md).
 
 ## Charge and ownership
 
@@ -80,27 +81,29 @@ check in the state machine.
 
 ## Capacity framing and follow-on integration
 
-Every reservation call explicitly chooses `CurrentUnframedEncoding` or
-`AdditionalMessageValueBytes(maximum)`. The latter adds a caller-specified maximum
+Every reservation call explicitly chooses `CurrentUnframedEncoding`,
+`IsolatedKeyspaceV1` or `AdditionalMessageValueBytes(maximum)`. The latter adds a caller-specified maximum
 capacity-owned message header/trailer length to every candidate, on both parent
 and shadow paths. There is one retained primary value per message. It must cover
 **all** additional framing bytes, not just a semantic owner identifier. The
 current-only choice proves only today's encoding and is not an activation gate.
 
-The writer/recovery fence work must define its actual capacity-owned framing,
-freeze/verify its allowance as part of the reservation model, and add canonical
-decoding/accounting for those framed inputs before using them. Framed bytes
-currently refuse canonical message decoding. Framing that grows keys, indexes,
-or separate charged rows needs an explicit model extension, not an implicit
-zero-byte allowance. No future message/proposal/profile version is allocated here.
+`IsolatedKeyspaceV1` requires tag `13` before every canonical message/index key.
+It adds exactly one byte to **each key** when measuring actual bytes and every
+automatic parent/shadow candidate. Values remain canonical V1–V3; there is no
+message-value framing overhead and V4 still refuses. Batch accounting also
+charges the real wrapped key lengths. Queue profile V4 and proposal V11 are
+separate, excluded compatibility framing, not live admission. Framing that grows
+values or separate charged rows still needs explicit coverage, not free bytes.
 
 The ordered integration is writer/recovery fences (#342), lifecycle conservation
 (#343), then finite creation/admission/resize (#344). Generation authority, legacy
 writer refusal (including profile-bypassing Complete and shadow writers), missing
 usage refusal, snapshot/reopen verification and atomic reservation updates belong
 to those integrations. The kernel does not adopt existing finite queues, stamp
-populated stores or reinterpret V7 intent. Do not persist its usage in a live
-store until the recovery and writer fences are in place.
+populated stores or reinterpret V7 intent. Current runtime/recovery explicitly
+refuse new-owner state; no live writer persists usage until lifecycle
+conservation and admission are implemented.
 
 ## Usage key and codec
 

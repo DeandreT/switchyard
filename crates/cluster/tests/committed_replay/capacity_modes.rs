@@ -143,3 +143,27 @@ fn v7_capacity_replay_matches_across_backends() -> TestResult {
     assert_eq!(memory, fjall);
     Ok(())
 }
+
+#[test]
+fn v11_capacity_intent_refuses_during_open_before_any_committed_prefix_is_applied() -> TestResult {
+    for durable in [false, true] {
+        let mut fixture = Fixture::new(durable)?;
+        let owner = domain::retained_accounting::CapacityOwner::new(ns(), queue(), 1)?;
+        let v11 = domain::capacity_fence::CapacityIntent::capture(owner, noop(20))?.encode()?;
+        fixture.log(&[create(10).encode()?, v11], 2);
+        let before = fixture.snapshot();
+        for _ in 0..2 {
+            assert!(matches!(
+                fixture.open(),
+                Err(ReplayError::Proposal {
+                    index: 2,
+                    source: DurableProposalError::UnsupportedVersion(11),
+                })
+            ));
+            assert_eq!(fixture.snapshot(), before);
+            assert!(fixture.trace().batches.is_empty());
+            fixture.reopen()?;
+        }
+    }
+    Ok(())
+}

@@ -14,6 +14,8 @@ use domain::{
 use serde::{Deserialize, Serialize};
 use storage::{Key, Mutation, StateStore, StorageError, StoreSnapshot, Value, WriteBatch};
 use testkit::StoreProvider;
+#[path = "support/capacity_trace.rs"]
+mod capacity_trace;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 enum TestKind {
@@ -40,6 +42,7 @@ fn head(kind: TestKind) -> Result<Value, domain::CodecError> {
 
 #[derive(Clone, Debug, Default)]
 struct Trace {
+    events: Vec<capacity_trace::Event>,
     gets: Vec<Key>,
     scans: Vec<(Key, Key, usize)>,
     batches: Vec<WriteBatch>,
@@ -69,6 +72,12 @@ impl<S: StateStore> StateStore for Observed<S> {
     fn get(&self, key: &[u8]) -> Result<Option<Value>, StorageError> {
         self.controls
             .lock()
+            .unwrap()
+            .trace
+            .events
+            .push(capacity_trace::Event::Get(key.to_vec()));
+        self.controls
+            .lock()
             .expect("controls lock")
             .trace
             .gets
@@ -77,6 +86,12 @@ impl<S: StateStore> StateStore for Observed<S> {
     }
 
     fn apply(&self, batch: WriteBatch) -> Result<(), StorageError> {
+        self.controls
+            .lock()
+            .unwrap()
+            .trace
+            .events
+            .push(capacity_trace::Event::Apply);
         let fail = {
             let mut controls = self.controls.lock().expect("controls lock");
             controls.trace.batches.push(batch.clone());
@@ -89,6 +104,12 @@ impl<S: StateStore> StateStore for Observed<S> {
     }
 
     fn snapshot(&self) -> Result<StoreSnapshot, StorageError> {
+        self.controls
+            .lock()
+            .unwrap()
+            .trace
+            .events
+            .push(capacity_trace::Event::Snapshot);
         self.controls.lock().expect("controls lock").trace.snapshots += 1;
         self.inner.snapshot()
     }
@@ -99,6 +120,16 @@ impl<S: StateStore> StateStore for Observed<S> {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Key, Value)>, StorageError> {
+        self.controls
+            .lock()
+            .unwrap()
+            .trace
+            .events
+            .push(capacity_trace::Event::Scan(
+                prefix.to_vec(),
+                start.to_vec(),
+                limit,
+            ));
         self.controls
             .lock()
             .expect("controls lock")
@@ -141,13 +172,23 @@ impl<P: StoreProvider> Fixture<P> {
     }
 
     fn trace(&self) -> Trace {
-        self.machine
+        let mut trace = self
+            .machine
             .store()
             .controls
             .lock()
             .expect("controls lock")
             .trace
-            .clone()
+            .clone();
+        let probes = capacity_trace::handler_trace(&mut trace.gets, &trace.scans, &trace.events);
+        trace.scans = trace
+            .scans
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| !probes.contains(index))
+            .map(|(_, scan)| scan)
+            .collect();
+        trace
     }
 
     fn at(
