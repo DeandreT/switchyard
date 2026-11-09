@@ -333,6 +333,45 @@ fn committed_sql_action_intent_keeps_v10_bytes_and_application_ordinal() {
 }
 
 #[test]
+fn capacity_intent_v11_cannot_enter_consensus_or_commit_a_preceding_blank() {
+    let owner = domain::retained_accounting::CapacityOwner::new(
+        NamespaceName::new("tenant").unwrap(),
+        EntityPath::new("orders").unwrap(),
+        1,
+    )
+    .unwrap();
+    let intent = domain::capacity_fence::CapacityIntent::capture(
+        owner,
+        DurableProposal::decode(&proposal_bytes()).unwrap(),
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+    for durable in [false, true] {
+        let (backend, control, _directory) = fixture(durable);
+        let mut store =
+            ConsensusStore::bootstrap(backend, identity(), 1, RetainedLogLimits::default())
+                .unwrap();
+        let before = rows(&control);
+        let writes = control.writes.lock().unwrap().len();
+        let mut entry = blank(2, 1);
+        entry.data = intent.clone().into();
+        assert!(matches!(
+            store.persist(&[blank(1, 1), entry], Some(&hs(1, 1, 2))),
+            Err(ConsensusError::Proposal(
+                domain::DurableProposalError::UnsupportedVersion(11)
+            ))
+        ));
+        assert_eq!(rows(&control), before);
+        assert_eq!(control.writes.lock().unwrap().len(), writes);
+        let store = store.reopen().unwrap();
+        assert_eq!(rows(&control), before);
+        assert_eq!(store.last_index().unwrap(), 0);
+        assert_eq!(store.hard_state().unwrap(), &HardState::default());
+    }
+}
+
+#[test]
 fn atomic_conflict_replacement_never_truncates_commit_or_matching_suffix() {
     for durable in [false, true] {
         let (backend, control, _directory) = fixture(durable);

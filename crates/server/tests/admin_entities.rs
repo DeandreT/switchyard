@@ -84,7 +84,7 @@ fn refused(error: BrokerError) -> AdminError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Operation {
     Get(Vec<u8>),
-    Scan(Vec<u8>, usize),
+    Scan(Vec<u8>, Vec<u8>, usize),
     Apply,
     Snapshot,
 }
@@ -175,7 +175,8 @@ impl<S: StateStore> StateStore for Observed<S> {
         start: &[u8],
         limit: usize,
     ) -> Result<Vec<(Key, Value)>, StorageError> {
-        self.control.record(Operation::Scan(prefix.to_vec(), limit));
+        self.control
+            .record(Operation::Scan(prefix.to_vec(), start.to_vec(), limit));
         self.store.scan_from(prefix, start, limit)
     }
 }
@@ -660,7 +661,7 @@ async fn profiles_and_errors<P: StoreProvider>(provider: P) {
         assert_eq!(event.thread, owner_thread);
         match event.operation {
             Operation::Get(key) => assert_ne!(key, keys::clock()),
-            Operation::Scan(_, limit) => assert!(limit <= MAX_ADMIN_CATALOG_SCAN + 1),
+            Operation::Scan(_, _, limit) => assert!(limit <= MAX_ADMIN_CATALOG_SCAN + 1),
             other => panic!("read used {other:?}"),
         }
     }
@@ -1068,7 +1069,7 @@ async fn pages_and_corruption<P: StoreProvider>(provider: P) {
             .all(|entity| entity.profile.kind() == EntityKind::Subscription)
     );
     let scans = control.events.lock().unwrap().clone();
-    assert!(scans.iter().any(|event| matches!(&event.operation, Operation::Scan(prefix, limit) if *limit == MAX_ADMIN_CATALOG_SCAN + 1 && *prefix == keys::namespace_queue_config_prefix(&ns("tenant")))));
+    assert!(scans.iter().any(|event| matches!(&event.operation, Operation::Scan(prefix, _, limit) if *limit == MAX_ADMIN_CATALOG_SCAN + 1 && *prefix == keys::namespace_queue_config_prefix(&ns("tenant")))));
     assert_eq!(raw.snapshot().unwrap(), before);
     for name in ["a", "b"] {
         service
@@ -1211,7 +1212,7 @@ async fn pages_and_corruption<P: StoreProvider>(provider: P) {
             .iter()
             .all(|event| match &event.operation {
                 Operation::Get(key) => *key != keys::clock(),
-                Operation::Scan(_, _) => true,
+                Operation::Scan(_, _, _) => true,
                 _ => false,
             })
     );
@@ -1233,6 +1234,33 @@ async fn pages_and_corruption<P: StoreProvider>(provider: P) {
     drop(store);
     drop(raw);
     assert_eq!(provider.open().unwrap().snapshot().unwrap(), before);
+}
+
+// The queued ordinary Create checks exactly its parent/shadow profiles and
+// usage, then each isolated endpoint prefix, before selecting persisted Clock.
+// Keep full operation/start-key witnesses rather than filtering these probes
+// from the owner FIFO trace or accepting arbitrary scans before the mutation.
+fn queued_create_capacity_preflight(
+    namespace: &NamespaceName,
+    parent: &EntityPath,
+) -> Vec<Operation> {
+    let owner =
+        domain::retained_accounting::CapacityOwner::new(namespace.clone(), parent.clone(), 1)
+            .unwrap();
+    let mut expected = vec![
+        Operation::Get(keys::queue_config(namespace, owner.parent())),
+        Operation::Get(keys::queue_config(namespace, owner.shadow())),
+        Operation::Get(domain::retained_accounting::keys::usage(&owner)),
+    ];
+    for endpoint in [owner.parent(), owner.shadow()] {
+        let scope = keys::queue_config(namespace, endpoint);
+        for tag in 0x02..=0x0D {
+            let mut prefix = vec![0x13, tag];
+            prefix.extend_from_slice(&scope[1..]);
+            expected.push(Operation::Scan(prefix.clone(), prefix, 1));
+        }
+    }
+    expected
 }
 
 async fn serialized_reads_and_cancel<P: StoreProvider>(provider: P) {
@@ -1316,18 +1344,30 @@ async fn serialized_reads_and_cancel<P: StoreProvider>(provider: P) {
                 |event| matches!(&event.operation, Operation::Get(key) if *key == keys::clock()),
             )
             .unwrap();
+        let before_clock = events[..stamp]
+            .iter()
+            .map(|event| event.operation.clone())
+            .collect::<Vec<_>>();
         assert_eq!(
-            events[..stamp]
-                .iter()
-                .map(|event| event.operation.clone())
-                .collect::<Vec<_>>(),
-            uninterrupted,
+            before_clock
+                .get(..uninterrupted.len())
+                .expect("the complete read must finish before queued Clock selection"),
+            uninterrupted.as_slice(),
             "the complete read, not merely its first probe, precedes the queued mutation"
         );
-        let last_read = events[..stamp].last().unwrap();
+        let expected_preflight = queued_create_capacity_preflight(
+            &ns("tenant"),
+            &path(if page { "after-list" } else { "after-get" }),
+        );
+        assert_eq!(
+            &before_clock[uninterrupted.len()..],
+            expected_preflight.as_slice(),
+            "only the queued Create's exact parent/shadow/usage reads and 24 one-row isolated probes may follow the complete read before Clock"
+        );
+        let last_read = events[..uninterrupted.len()].last().unwrap();
         assert!(matches!(
             last_read.operation,
-            Operation::Get(_) | Operation::Scan(_, _)
+            Operation::Get(_) | Operation::Scan(_, _, _)
         ));
         assert!(
             events[stamp..]
