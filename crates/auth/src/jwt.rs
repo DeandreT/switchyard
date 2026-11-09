@@ -55,6 +55,7 @@ struct PreparedPolicy {
     bindings: HashMap<String, Binding>,
 }
 
+#[derive(Clone)]
 struct Binding {
     scope: ResourceScope,
     permissions: PermissionSet,
@@ -197,34 +198,7 @@ impl JwtPolicy {
         {
             return Err(JwtError::InvalidConfiguration);
         }
-        let mut keys = HashMap::new();
-        for public in configuration.keys {
-            if !valid_kid(&public.kid)
-                || public.kty != "RSA"
-                || public.alg != "RS256"
-                || public.purpose != "sig"
-                || public.e != "AQAB"
-            {
-                return Err(JwtError::InvalidKey);
-            }
-            let modulus = decode_segment(&public.n, 512).map_err(|_| JwtError::InvalidKey)?;
-            if modulus.first().is_none_or(|byte| *byte == 0)
-                || modulus.last().is_none_or(|byte| byte & 1 == 0)
-            {
-                return Err(JwtError::InvalidKey);
-            }
-            let bits = modulus.len() * 8 - modulus[0].leading_zeros() as usize;
-            if !(2048..=4096).contains(&bits) {
-                return Err(JwtError::InvalidKey);
-            }
-            let prepared = PublicKeyComponents {
-                n: modulus,
-                e: vec![1, 0, 1],
-            };
-            if keys.insert(public.kid, prepared).is_some() {
-                return Err(JwtError::DuplicateIdentity);
-            }
-        }
+        let keys = prepare_keys(configuration.keys)?;
         let mut bindings = HashMap::new();
         for principal in configuration.bindings {
             if !valid_text(&principal.subject, MAX_SUBJECT_BYTES)
@@ -261,6 +235,43 @@ impl JwtPolicy {
             audience: configuration.audience,
             keys,
             bindings,
+        })))
+    }
+
+    pub(crate) fn issuer(&self) -> &str {
+        &self.0.issuer
+    }
+
+    // OIDC never exports this immutable snapshot. Empty sets intentionally revoke
+    // all keys for subsequent OIDC verification, without changing offline v1.
+    pub(crate) fn replace_jwks(&self, bytes: &[u8]) -> Result<Self, JwtError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Jwks {
+            keys: Vec<PublicKey>,
+        }
+        if bytes.len() > MAX_CONFIG_BYTES {
+            return Err(JwtError::TooLarge);
+        }
+        let value = bounded_json(bytes, MAX_CONFIG_NODES)?;
+        if !value.is_object()
+            || value
+                .get("keys")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(|keys| keys.iter().any(|key| !key.is_object()))
+        {
+            return Err(JwtError::InvalidConfiguration);
+        }
+        let jwks: Jwks =
+            serde_json::from_value(value).map_err(|_| JwtError::InvalidConfiguration)?;
+        if jwks.keys.len() > MAX_KEYS {
+            return Err(JwtError::TooLarge);
+        }
+        Ok(Self(Arc::new(PreparedPolicy {
+            issuer: self.0.issuer.clone(),
+            audience: self.0.audience.clone(),
+            keys: prepare_keys(jwks.keys)?,
+            bindings: self.0.bindings.clone(),
         })))
     }
 
@@ -376,6 +387,45 @@ impl Audience {
     }
 }
 
+fn prepare_keys(
+    public_keys: Vec<PublicKey>,
+) -> Result<HashMap<String, PublicKeyComponents<Vec<u8>>>, JwtError> {
+    let mut keys = HashMap::new();
+    for public in public_keys {
+        if !valid_kid(&public.kid)
+            || public.kty != "RSA"
+            || public.alg != "RS256"
+            || public.purpose != "sig"
+            || public.e != "AQAB"
+        {
+            return Err(JwtError::InvalidKey);
+        }
+        let modulus = decode_segment(&public.n, 512).map_err(|_| JwtError::InvalidKey)?;
+        if modulus.first().is_none_or(|byte| *byte == 0)
+            || modulus.last().is_none_or(|byte| byte & 1 == 0)
+        {
+            return Err(JwtError::InvalidKey);
+        }
+        let bits = modulus.len() * 8 - modulus[0].leading_zeros() as usize;
+        if !(2048..=4096).contains(&bits) {
+            return Err(JwtError::InvalidKey);
+        }
+        if keys
+            .insert(
+                public.kid,
+                PublicKeyComponents {
+                    n: modulus,
+                    e: vec![1, 0, 1],
+                },
+            )
+            .is_some()
+        {
+            return Err(JwtError::DuplicateIdentity);
+        }
+    }
+    Ok(keys)
+}
+
 fn valid_text(value: &str, maximum: usize) -> bool {
     !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
 }
@@ -407,7 +457,10 @@ fn scope_is_bounded(scope: &ResourceScope) -> bool {
     bytes <= MAX_RESOURCE_BYTES
 }
 
-fn bounded_json(bytes: &[u8], maximum_nodes: usize) -> Result<serde_json::Value, JwtError> {
+pub(crate) fn bounded_json(
+    bytes: &[u8],
+    maximum_nodes: usize,
+) -> Result<serde_json::Value, JwtError> {
     json::parse(bytes, MAX_DEPTH, maximum_nodes).map_err(|failure| match failure {
         json::Failure::Malformed => JwtError::MalformedJson,
         json::Failure::Duplicate => JwtError::DuplicateMember,
@@ -444,4 +497,4 @@ fn decode_segment(segment: &str, maximum_bytes: usize) -> Result<Vec<u8>, JwtErr
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

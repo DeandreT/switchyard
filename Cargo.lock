@@ -128,12 +128,19 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "hmac",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "percent-encoding",
+ "rcgen",
  "ring",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.19",
+ "tokio",
+ "tokio-rustls",
  "url",
 ]
 

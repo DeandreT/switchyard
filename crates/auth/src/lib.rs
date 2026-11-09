@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod jwt;
+pub mod oidc;
 mod policy;
 mod sas;
 

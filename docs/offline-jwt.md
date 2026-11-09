@@ -118,3 +118,125 @@ The AMQP policy is independent of native administration. JWT-only and combined
 SAS/JWT configurations are supported; incomplete SAS configuration still refuses.
 This adds no discovery, signing setup, generic Azure-token compatibility or
 production activation. The existing production quorum guard remains closed.
+
+## Bounded Discovery Library
+
+`auth::oidc::OidcVerifier` adds explicit discovery and signing-key rotation for
+the **same Switchyard token profile**, not generic Azure OAuth/OIDC access-token
+compatibility. This is a separate library API; it does not activate online
+verification in CBS, the server, administration or command execution. The
+production quorum guard remains closed. Issuer infrastructure, signing setup
+and production activation are separate deployment work.
+
+Construct a `JwtPolicy` from the version-1 local configuration above, then create
+two `PinnedEndpoint`s: the issuer with `/.well-known/openid-configuration`
+appended (after removing trailing `/`), and an exact approved JWKS URL on that
+issuer's origin (same HTTPS scheme, host and effective port). Supply both to
+`HttpsTransport::new` with 1-8 explicit DER root certificates (64 KiB total), then
+pass that transport, the local policy and `CachePolicy` to `OidcVerifier::new`.
+The policy supplies the exact issuer, audience and subject/scope/permission
+bindings. Its offline keys **do not bootstrap** the discovery cache.
+
+For example, inside a Tokio runtime with locally loaded `configuration` and
+`root_der` (DER certificate bytes):
+
+```rust
+use auth::oidc::{CachePolicy, HttpsTransport, OidcVerifier, PinnedEndpoint};
+use rustls::pki_types::CertificateDer;
+
+let local = auth::JwtPolicy::from_json(configuration)?;
+let discovery = PinnedEndpoint::new(
+    "https://issuer.example/.well-known/openid-configuration",
+    approved_discovery_ip,
+)?;
+let jwks = PinnedEndpoint::new("https://issuer.example/keys", approved_jwks_ip)?;
+let transport = HttpsTransport::new(discovery, jwks, vec![CertificateDer::from(root_der)])?;
+let verifier = OidcVerifier::new(local, transport, CachePolicy::default())?;
+verifier.refresh().await?; // Maintenance path, not called in response to a token.
+let grant = verifier.validate(token, &requested_scope, now_epoch_seconds)?;
+```
+
+The local policy's issuer must be exactly `https://issuer.example/` for this
+example; the approved IPs must pass the production public-address restrictions.
+
+Each endpoint also requires one operator-approved **public dial IP**. This API
+deliberately performs zero DNS queries: no system resolver, resolver callback,
+blocking DNS task or unbounded resolver cancellation exists. DNS answers cannot
+rebind the socket; callers must update local configuration when an approved IP
+changes. Host/SNI and certificate verification still use the pinned URL hostname,
+not that IP. Operators should provision approved IPs through their trusted local
+configuration process, not token claims, `peerHost` or discovery responses.
+Literal IP URLs must match their dial IP. Production rejects private, loopback,
+link-local, multicast, unspecified, reserved IPv4, mapped/compatible IPv6,
+transition-address and conservative special-purpose IPv6 ranges. The local TLS
+test fixture's exact IPv4 loopback exception exists only under `cfg(test)`, not
+as a production setting or feature.
+
+TLS validates the chain and hostname against only the explicit roots; it never
+uses machine trust, client certificates, credential callbacks, cookies, ambient
+credentials or proxy environment variables. Redirects are refused, not followed.
+There is no cross-origin JWKS option. Discovery must return the exact issuer
+string and exact configured JWKS URL. Unknown discovery metadata is bounded and
+ignored, never used to expand network authority. Discovery URLs and JWKS URLs
+are at most 2 KiB, HTTPS only, without credentials, query or fragment.
+
+Call `refresh().await` from an application-controlled maintenance path, then use
+`validate(token, requested_scope, now_epoch_seconds)` for new grants. Validation
+is synchronous and performs no I/O. Tokens, including unknown `kid`s and refused
+`jku`/`x5u` headers, never schedule refreshes. All clones share one cache and one
+refresh budget: one admitted refresh, no queued refreshes, at most two sequential
+HTTPS requests and one socket at a time. A second concurrent refresh returns
+`Busy`; an early refresh returns `Backoff`. Callers must retain/join any tasks
+they themselves spawn. The library creates no background workers, connection
+drivers, resolver jobs or retained-task list. Hyper's connection driver and
+exchange are polled in the original refresh future; cancellation drops both and
+closes the socket, rather than detaching cleanup. No library shutdown/drain task
+is needed.
+
+### Freshness, Failure And Removal
+
+The cache starts unavailable. Default maximum freshness is 300 seconds, successful
+refresh interval 60 seconds, failure backoff 10 seconds and whole-refresh deadline
+5 seconds. Local hard ranges are respectively 1-3600 seconds, 1 second through
+maximum freshness, 1-300 seconds and 10 milliseconds through 30 seconds. The one
+deadline covers dial, TLS, both HTTP responses, parsing and publication; it is not
+reset at each stage. Cancelled refreshes retain a conservative admission delay
+through their original deadline plus failure backoff. Successful completion uses
+the refresh interval; other completion uses failure backoff.
+
+Freshness and backoff use monotonic Tokio time, independently of caller-supplied
+JWT epoch time. Every verification, including calls through old verifier clones,
+checks freshness before and after bounded signature work under the cache lock.
+No immutable `JwtPolicy` snapshot is exposed by this API. At age **greater than
+or equal to** maximum freshness, new verification fails closed. An unavailable
+issuer, timeout, malformed document or invalid key retains the old set only until
+its original freshness deadline; failures never extend freshness. There is no
+stale-while-error or token-introspection fallback.
+Issuer HTTP cache headers cannot extend or override the locally configured age;
+there is no conditional-request/304 path that silently renews an old key set.
+
+A successful refresh atomically replaces the entire key set. Keys removed in that
+set cannot verify subsequent requests through any verifier clone; an empty valid
+`keys` array closes all keys. Partial/invalid sets never publish. JWKS accepts
+only the offline public-key fields/profile above and at most eight unique keys;
+private key fields, unsupported algorithms, extra JWK members and duplicate JSON
+names are refused. Providers emitting other standard JWK metadata need a separately
+designed profile, not implicit relaxation of the local verifier. Discovery and
+JWKS each have a 64 KiB body bound, JSON depth 8 and 2048 value nodes, checked
+before publication. HTTP uses maintained Hyper/rustls parsers, at most 32 headers
+and an 8 KiB read/header buffer. Only successful JSON responses without content
+encoding are accepted; chunked and lengthless bodies are counted incrementally,
+oversized declared bodies and trailers are refused. Cache growth is bounded to
+the local policy and one published set plus one bounded in-progress replacement.
+Errors and debug output contain static categories, not URLs, queries, tokens,
+claims, keys or underlying TLS/network diagnostics. The verifier emits no logs.
+
+Key removal and cache expiry prevent **new verification**, not revocation of an
+already returned `AccessGrant`. Existing consumers retain their grant until its
+stored token expiry or their explicit connection/grant cleanup. Refresh does not
+shorten those grants, persist revocations or notify consumers. Expiry still needs
+the consumers' existing interval checks; removal does not retroactively undo an
+operation already authorized. The legacy `JwtPolicy` API intentionally remains
+an immutable offline contract: callers retaining an independently loaded offline
+policy can still use its keys. Online consumers must use `OidcVerifier::validate`,
+not substitute an offline snapshot or fallback when discovery is unavailable.
