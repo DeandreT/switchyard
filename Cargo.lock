@@ -364,14 +364,17 @@ version = "0.1.0"
 dependencies = [
  "domain",
  "fjall",
+ "futures-util",
  "protobuf",
  "raft",
  "serde",
+ "serde_json",
  "sha2",
  "slog",
  "storage",
  "tempfile",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]

@@ -628,6 +628,11 @@ Legacy opening, native image/snapshot inspection and offline upgrade refuse
 profile 4; its wrappers do not implement legacy snapshot/install backend traits.
 There is no automatic adoption, profile migration or recovered-outcome promise.
 
+Opt-in [consensus peer transport](consensus-transport.md) carries one bounded
+raft-rs protobuf message per TCP connection. Fingerprint/voter checks are not
+authentication, and local write receipts are not peer durability/quorum acks.
+It does not activate server routing, elections or the production runtime.
+
 Fjall stores use format 3. Ordinary opening never upgrades format 2; development
 startup refuses it before listening and names the offline
 `switchyardctl store upgrade --data-dir <path>` command. The upgrade preflights

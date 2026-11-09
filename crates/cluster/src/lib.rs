@@ -5,6 +5,7 @@ mod journal;
 mod replay;
 mod snapshot;
 mod store_upgrade;
+pub mod transport;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

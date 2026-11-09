@@ -179,6 +179,11 @@ storage profile 4. Ordinary storage remains profile 3. This local foundation doe
 not run the core's election/transport driver or establish quorum; its exclusive
 backends cannot be used as unindexed domain writers or legacy snapshot targets.
 
+The separate opt-in [peer transport](docs/consensus-transport.md) carries bounded
+core messages over real TCP with fixed identity/version checks and retained
+connection/dispatch ownership. It supplies no election driver, authenticated peer
+trust, quorum acknowledgement or server activation.
+
 ## Production Target: Not Implemented
 
 The intended release is a Rust-native Linux broker with quorum durability,
