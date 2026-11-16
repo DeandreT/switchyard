@@ -23,7 +23,8 @@ Pre-alpha: only verified, merged `main` is complete.
   Atom HTTPS transport with ordinary subscription definition Get; offline server
   JWT CBS and a separate pinned OIDC library.
 - [x] Optional locally pinned workload policy, verified TLS proof foundation and
-  AMQP TCP/WSS library consumer; admin consumption and server activation remain separate.
+  AMQP TCP/WSS, native h2 and supported Atom HTTPS consumption, with independent
+  server policy-file opt-ins and restart-only trust/mapping activation.
 - [x] Incoming/outgoing session windows and consumption-based receiving-link refill.
 - [x] Isolated fixed-three-voter persistence/bootstrap, real peer transport,
   elections and majority-durable log replication. Application projection, client
@@ -99,7 +100,7 @@ PRs in dependency order ([workflow](../CONTRIBUTING.md)). Ready is not evidence.
 | Domain | #14, #16, #20, #21, #22 and #23 are complete. Finite admission remains #27; SQL actions include durable isolated copies and AMQP rule management. |
 | Admin | Authenticated TLS/h2 Create/Get/List, native CLI and Atom ordinary subscription definition Get are delivered. Other Atom CRUD/rule and collection/runtime profiles remain separate. |
 | Allocators | [#228](https://github.com/DeandreT/switchyard/issues/228), #238 ([PR258](https://github.com/DeandreT/switchyard/pull/258)), #239 ([PR264](https://github.com/DeandreT/switchyard/pull/264)) and #240 ([PR263](https://github.com/DeandreT/switchyard/pull/263)) and #232's allocation/graph composition verified. |
-| SDK/security | Offline JWT activation and declared current/previous Memory/Fjall data-plane gates are delivered. OIDC and AMQP workload identity are library-only; workload server/admin activation and identity administration remain pending. |
+| SDK/security | Offline JWT activation and declared current/previous Memory/Fjall data-plane gates are delivered. Workload identity has independent server AMQP/native/Atom opt-ins with restart-only activation. OIDC remains library-only; identity administration and production certification remain pending. |
 | Native Flow | Outgoing/incoming session conservation and receiver refill are delivered; sending-count wrap #368 and general Flow echo #77 remain pending. |
 
 Shared: #243 keys.rs (released by #229); machine.rs overlaps #240. #244 serializes broker

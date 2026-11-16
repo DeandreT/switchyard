@@ -33,6 +33,10 @@ type ClientCall = JoinHandle<Result<Response<wire::Entity>, Status>>;
 const WAIT: Duration = Duration::from_secs(120);
 const LIMIT: usize = 3;
 
+#[cfg(feature = "workload-tls")]
+#[path = "admin_workload_tests.rs"]
+mod workload_tests;
+
 fn configuration() -> TestResult<(AdminTlsConfig, String)> {
     let CertifiedKey { cert, key_pair } = generate_simple_self_signed(vec!["localhost".into()])?;
     let tls = protocol_amqp::tls_server_config(

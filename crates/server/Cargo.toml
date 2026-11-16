@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+workload-tls = ["auth/workload-tls", "protocol-amqp/workload-tls", "admin-api/workload-tls"]
+
 [[bin]]
 name = "switchyard"
 path = "src/main.rs"
@@ -44,6 +48,7 @@ serde_json.workspace = true
 serde_amqp.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+time = "0.3"
 testkit.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-rustls.workspace = true

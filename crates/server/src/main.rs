@@ -37,6 +37,9 @@ use tokio::time::Instant;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(feature = "workload-tls")]
+mod workload_startup;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "switchyard",
@@ -91,6 +94,11 @@ struct Arguments {
     #[arg(long, value_name = "PATH")]
     jwt_policy_file: Option<PathBuf>,
 
+    /// Immutable local client-certificate policy for AMQP TLS/WSS (restart to rotate).
+    #[cfg(feature = "workload-tls")]
+    #[arg(long, value_name = "PATH")]
+    amqp_workload_policy_file: Option<PathBuf>,
+
     /// Most live sockets the listener holds at once, counting TLS, WebSocket
     /// upgrade and AMQP handshakes as well as open connections. At the limit
     /// new peers wait in the OS backlog until a held connection ends.
@@ -139,7 +147,11 @@ struct Arguments {
     #[arg(long, value_name = "PATH")]
     admin_jwt_policy_file: Option<PathBuf>,
 
-    /// Opt in to HTTPS/HTTP1 Atom transport. Routes remain unsupported; no CRUD.
+    #[cfg(feature = "workload-tls")]
+    #[arg(long, value_name = "PATH")]
+    admin_workload_policy_file: Option<PathBuf>,
+
+    /// Opt in to HTTPS/HTTP1 Atom; ordinary subscription definition Get only.
     #[arg(long)]
     atom_listen: Option<SocketAddr>,
     #[arg(long, value_name = "PATH")]
@@ -148,6 +160,9 @@ struct Arguments {
     atom_tls_private_key: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     atom_jwt_policy_file: Option<PathBuf>,
+    #[cfg(feature = "workload-tls")]
+    #[arg(long, value_name = "PATH")]
+    atom_workload_policy_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -210,13 +225,26 @@ fn load_tls_config(
 }
 
 fn read_tls_file(path: &Path) -> Result<Vec<u8>, StartupError> {
-    fs::read(path).map_err(|error| StartupError::ReadTlsCredentials {
-        path: path.to_path_buf(),
-        detail: error.to_string(),
-    })
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .and_then(|file| file.take(64 * 1024 + 1).read_to_end(&mut bytes))
+        .map_err(|error| StartupError::ReadTlsCredentials {
+            path: path.to_path_buf(),
+            detail: error.to_string(),
+        })?;
+    if bytes.len() > 64 * 1024 {
+        return Err(StartupError::Runtime(
+            "TLS credential exceeds its bound".into(),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn load_admin_config(arguments: &Arguments) -> Result<Option<AdminTlsConfig>, StartupError> {
+    #[cfg(feature = "workload-tls")]
+    if arguments.admin_workload_policy_file.is_some() {
+        return workload_startup::admin(arguments).map(Some);
+    }
     let invalid = || {
         StartupError::AdminConfiguration(String::from(
             "requires explicit --admin-listen, --admin-tls-certificate, --admin-tls-private-key and --admin-jwt-policy-file",
@@ -257,6 +285,10 @@ fn load_admin_config(arguments: &Arguments) -> Result<Option<AdminTlsConfig>, St
 }
 
 fn load_atom_config(arguments: &Arguments) -> Result<Option<AtomConfiguration>, StartupError> {
+    #[cfg(feature = "workload-tls")]
+    if arguments.atom_workload_policy_file.is_some() {
+        return workload_startup::atom(arguments).map(Some);
+    }
     let (cert, key, policy) = match (
         arguments.atom_listen,
         arguments.atom_tls_certificate.as_deref(),
@@ -455,17 +487,48 @@ fn run() -> Result<(), StartupError> {
         voters: arguments.voters,
     };
     // Refuse an unsafe or malformed listener before opening a data directory.
+    #[cfg(not(feature = "workload-tls"))]
     let tls = load_tls_config(
         mode,
         arguments.tls_certificate.as_deref(),
         arguments.tls_private_key.as_deref(),
     )?;
-    validate_transport_security(arguments.transport, tls.is_some())?;
-    let shared_access_authentication = load_amqp_authentication(&arguments, mode, tls.is_some())?;
-    let listen = listen_address(arguments.listen, arguments.transport, tls.is_some());
+    #[cfg(feature = "workload-tls")]
+    let tls = if arguments.amqp_workload_policy_file.is_some() {
+        None
+    } else {
+        load_tls_config(
+            mode,
+            arguments.tls_certificate.as_deref(),
+            arguments.tls_private_key.as_deref(),
+        )?
+    };
+    #[cfg(not(feature = "workload-tls"))]
+    let secure = tls.is_some();
+    #[cfg(feature = "workload-tls")]
+    let secure = tls.is_some() || arguments.amqp_workload_policy_file.is_some();
+    validate_transport_security(arguments.transport, secure)?;
+    #[cfg(feature = "workload-tls")]
+    let authentication_mode = if arguments.amqp_workload_policy_file.is_some() {
+        DeploymentMode::Development
+    } else {
+        mode
+    };
+    #[cfg(not(feature = "workload-tls"))]
+    let authentication_mode = mode;
+    let shared_access_authentication =
+        load_amqp_authentication(&arguments, authentication_mode, secure)?;
+    let listen = listen_address(arguments.listen, arguments.transport, secure);
     let admin_config = load_admin_config(&arguments)?;
     let atom_config = load_atom_config(&arguments)?;
     let namespace = namespace_from_hostname(&arguments.namespace)?;
+    #[cfg(feature = "workload-tls")]
+    let (prepared_amqp, broker_slot) = workload_startup::amqp(
+        &arguments,
+        namespace.clone(),
+        tls,
+        shared_access_authentication,
+    )?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -484,6 +547,10 @@ fn run() -> Result<(), StartupError> {
         NodeState::Durable(machine) => Broker::spawn(LocalProposer::new(machine, SystemClock)),
     };
     let handle = broker.handle();
+    #[cfg(feature = "workload-tls")]
+    broker_slot
+        .set(handle.clone())
+        .map_err(|_| StartupError::Runtime("AMQP broker already installed".into()))?;
     let mut broker = Some(broker);
     let mut timer = Some(
         spawn_timer(
@@ -533,7 +600,9 @@ fn run() -> Result<(), StartupError> {
                 } else { admin_api::rpc::BackendErrorKind::Internal },
             ))));
         if atom.is_some() { info!("Atom HTTPS boundary bound; ordinary subscription definition Get only"); }
-        info!(address = %address, namespace = %namespace, tls = tls.is_some(), transport = ?arguments.transport, max_connections = ?arguments.max_connections, admission_timeout_secs = arguments.admission_timeout_secs, shutdown_timeout_secs = arguments.shutdown_timeout_secs, "accepting AMQP connections");
+        info!(address = %address, namespace = %namespace, tls = secure, transport = ?arguments.transport, max_connections = ?arguments.max_connections, admission_timeout_secs = arguments.admission_timeout_secs, shutdown_timeout_secs = arguments.shutdown_timeout_secs, "accepting AMQP connections");
+        #[cfg(not(feature = "workload-tls"))]
+        let mut service = {
         let amqp = AmqpListener::new(handle, namespace).with_admission_timeout(
             Duration::from_secs(arguments.admission_timeout_secs.get()),
         );
@@ -549,10 +618,13 @@ fn run() -> Result<(), StartupError> {
             Some(authentication) => amqp.with_shared_access_authentication(authentication),
             None => amqp,
         };
-        let mut service = match arguments.transport {
+        match arguments.transport {
             TransportArgument::AmqpTcp => amqp.into_tcp_service(listener),
             TransportArgument::AmqpWebSockets => amqp.into_wss_service(listener),
+        }
         };
+        #[cfg(feature = "workload-tls")]
+        let mut service = prepared_amqp.into_service(listener, arguments.transport);
         let trigger = ShutdownTrigger::default();
         let (stop_signals, stopped) = tokio::sync::oneshot::channel();
         let signal_task = tokio::spawn({

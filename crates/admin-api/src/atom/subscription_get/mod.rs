@@ -42,8 +42,14 @@ impl<B: EntityBackend, C: BackendErrorClassifier<B::Error>> SubscriptionGet<B, C
         let Address::Subscription { topic, name } = head.address() else {
             return Err(Failure::Internal);
         };
-        let definition = self
+        #[cfg(feature = "workload-tls")]
+        let service = self
             .service
+            .clone()
+            .with_connection(head.connection.clone());
+        #[cfg(not(feature = "workload-tls"))]
+        let service = &self.service;
+        let definition = service
             .get(GetEntityRequest {
                 namespace: head.namespace().to_string(),
                 address: EntityAddress::Subscription {
@@ -58,6 +64,8 @@ impl<B: EntityBackend, C: BackendErrorClassifier<B::Error>> SubscriptionGet<B, C
 
     fn failure(&self, error: ServiceError<B::Error>) -> Failure {
         match error {
+            #[cfg(feature = "workload-tls")]
+            ServiceError::AuthorizationExpired => Failure::Forbidden,
             ServiceError::Identifier(_)
             | ServiceError::InvalidEntityPath
             | ServiceError::AddressKindMismatch => Failure::Invalid,
