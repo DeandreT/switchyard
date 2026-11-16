@@ -1,6 +1,7 @@
 //! Opt-in persisted RawNode driver. No application projection, command outcomes,
 //! consistent reads, primary routing, production startup or authenticated peers.
 
+pub mod application;
 mod engine;
 mod input;
 mod node;
@@ -139,6 +140,7 @@ pub enum Failure {
     Core,
     Bounds,
     Panic,
+    Application,
 }
 
 /// Latest diagnostic metadata, NOT readiness, a linearizable read, a lease or
@@ -177,6 +179,8 @@ pub struct DriverStatus {
 
 #[derive(Debug, Error)]
 pub enum DriverError {
+    #[error(transparent)]
+    Application(#[from] application::ApplicationError),
     #[error("invalid bounded driver options")]
     Options,
     #[error(transparent)]

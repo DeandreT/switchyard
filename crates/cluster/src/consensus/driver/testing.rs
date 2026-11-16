@@ -140,6 +140,7 @@ impl Rule {
 }
 #[derive(Default)]
 struct State {
+    application_paused: bool,
     blocked: [u64; 3],
     hold: Option<Rule>,
     capture: Option<Rule>,
@@ -162,6 +163,14 @@ pub(super) enum Disposition {
     Lost,
 }
 impl NetworkControl {
+    /// A bounded pre-phase frontier. Never interrupts a begun backend call.
+    pub fn pause_application(&self, paused: bool) {
+        self.state.lock().expect("test links").application_paused = paused;
+        self.notify.notify_one();
+    }
+    pub(super) fn application_paused(&self) -> bool {
+        self.state.lock().expect("test links").application_paused
+    }
     pub fn observe_append(&self, from: u64, index: u64) {
         let mut state = self.state.lock().expect("test links");
         state.observe = Some((from, index));

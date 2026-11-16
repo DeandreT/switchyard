@@ -69,6 +69,13 @@ pub struct ConsensusDriver<B: ConsensusBackend> {
     dispatch_gate: super::testing::DispatchGate,
 }
 impl<B: ConsensusBackend> ConsensusDriver<B> {
+    fn application_ready(&self) -> bool {
+        #[cfg(feature = "consensus-driver-testkit")]
+        if self.controls.application_paused() {
+            return false;
+        }
+        self.engine.application_work()
+    }
     /// Validate all options and bind the fixed endpoint BEFORE invoking factory.
     /// `fresh` means explicit empty-store bootstrap, never history adoption.
     /// Factory is synchronous; cancellation cannot detach its begun native open.
@@ -78,6 +85,25 @@ impl<B: ConsensusBackend> ConsensusDriver<B> {
         options: DriverOptions,
         fresh: bool,
         factory: impl FnOnce() -> Result<B, storage::StorageError>,
+    ) -> Result<(Self, DriverHandle), DriverError> {
+        let expected = identity.clone();
+        let retained = options.retained;
+        Self::bind_with_store(identity, local, options, || {
+            let backend = factory()?;
+            let store = if fresh {
+                ConsensusStore::bootstrap(backend, expected, local, retained)?
+            } else {
+                ConsensusStore::open(backend, expected, local, retained)?
+            };
+            Ok((store, super::application::Policy::NoApplication))
+        })
+        .await
+    }
+    pub(super) async fn bind_with_store(
+        identity: ConsensusIdentity,
+        local: u64,
+        options: DriverOptions,
+        factory: impl FnOnce() -> Result<(ConsensusStore<B>, super::application::Policy), DriverError>,
     ) -> Result<(Self, DriverHandle), DriverError> {
         let codec = options.validate(&identity, local)?;
         let shared = Shared::new(identity.clone(), local, &options);
@@ -95,13 +121,8 @@ impl<B: ConsensusBackend> ConsensusDriver<B> {
         let (transport, sender) =
             PeerTransport::bind(identity.clone(), local, options.transport.clone(), handler)
                 .await?;
-        let backend = factory()?;
-        let store = if fresh {
-            ConsensusStore::bootstrap(backend, identity, local, options.retained)?
-        } else {
-            ConsensusStore::open(backend, identity, local, options.retained)?
-        };
-        let engine = Engine::new(store, options.clone(), codec)?;
+        let (store, policy) = factory()?;
+        let engine = Engine::new_with_policy(store, options.clone(), codec, policy)?;
         let timer = options.tick_interval.map(|d| {
             let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + d, d);
             timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -129,6 +150,10 @@ impl<B: ConsensusBackend> ConsensusDriver<B> {
     }
     pub fn status(&self) -> DriverStatus {
         self.handle.status()
+    }
+    #[cfg(feature = "consensus-driver-testkit")]
+    pub(super) fn observed_store(&self) -> &ConsensusStore<B> {
+        self.engine.core.store()
     }
     pub fn transport_status(&self) -> crate::transport::TransportStatus {
         self.transport.status()
@@ -238,6 +263,10 @@ impl<B: ConsensusBackend> ConsensusDriver<B> {
                 return self.finish().await;
             }
             self.flush();
+            if self.handle.shared.begin() && self.application_ready() {
+                self.engine.application_turn();
+                self.publish();
+            }
             if self.engine.status.retired {
                 continue;
             }
@@ -248,6 +277,7 @@ impl<B: ConsensusBackend> ConsensusDriver<B> {
                 Transport,
                 Receipt(usize, Result<(), crate::transport::TransportError>),
                 Control,
+                Application,
             }
             let wake = tokio::select! {
                 event=self.input.recv()=>Wake::Event(event),
@@ -255,6 +285,7 @@ impl<B: ConsensusBackend> ConsensusDriver<B> {
                 _=self.handle.shared.stop.notified()=>Wake::Stop,
                 _=self.transport.serve()=>Wake::Transport,
                 (index,result)=poll_sending(&mut self.sending)=>Wake::Receipt(index,result),
+                _=async {}, if self.application_ready()=>Wake::Application,
                 _=async {
                     #[cfg(feature="consensus-driver-testkit")]
                     self.controls.changed().await;
@@ -263,6 +294,7 @@ impl<B: ConsensusBackend> ConsensusDriver<B> {
                 }=>Wake::Control,
             };
             match wake {
+                Wake::Application => {}
                 Wake::Event(Some(event)) => {
                     if self.handle.shared.begin() {
                         self.engine.status.processing = true;
@@ -313,6 +345,7 @@ impl<B: ConsensusBackend> ConsensusDriver<B> {
         // Admission fence precedes EVERY drain. No deadline reset, abort or
         // timeout success: actual original transport joins determine completion.
         self.retire();
+        self.engine.application.stop();
         self.input.close();
         self.engine.status.retired = true;
         self.engine.status.accepting_proposals = false;
