@@ -9,6 +9,7 @@ mod credit;
 mod incarnation;
 mod message_size;
 mod receiving_credit;
+mod sending_credit;
 mod session_incarnation;
 mod session_windows;
 
@@ -41,6 +42,12 @@ fn test_link_credit() -> watch::Sender<bool> {
     watch::channel(false).0
 }
 
+fn sending_credit(initial: u32, credit: u32) -> SendingCredit {
+    SendingCredit::new(initial)
+        .update(Some(initial), Some(credit), 0)
+        .unwrap()
+}
+
 fn sending_session(
     channel: u16,
     handle: u32,
@@ -55,8 +62,7 @@ fn sending_session(
     let link = SendingLink {
         receiver_settle_mode,
         settle_mode: SenderSettleMode::Mixed,
-        delivery_count: 0,
-        credit_limit: 0,
+        progress: SendingCredit::new(0),
         queued: VecDeque::new(),
         unsettled: HashMap::from([(
             delivery_id,
@@ -180,8 +186,7 @@ fn queued_sending_session(
     let link = SendingLink {
         receiver_settle_mode: ReceiverSettleMode::First,
         settle_mode: SenderSettleMode::Unsettled,
-        delivery_count: 0,
-        credit_limit,
+        progress: sending_credit(0, u32::try_from(credit_limit).unwrap()),
         queued,
         unsettled: HashMap::new(),
         detached,
@@ -596,7 +601,7 @@ async fn link_credit_arriving_during_attach_is_applied_when_the_link_is_accepted
     let Some(LinkState::Sending(link)) = sessions[&channel].links.get(&handle) else {
         panic!("the remote receiver created a local sending link");
     };
-    assert_eq!(link.credit_limit, 50);
+    assert_eq!(link.progress.available(), 50);
 }
 
 #[tokio::test]
@@ -608,8 +613,7 @@ async fn drain_acknowledgement_is_generation_bound_and_returns_unused_credit() {
     let link = SendingLink {
         receiver_settle_mode: ReceiverSettleMode::First,
         settle_mode: SenderSettleMode::Unsettled,
-        delivery_count: 2,
-        credit_limit: 2,
+        progress: SendingCredit::new(2),
         queued: VecDeque::new(),
         unsettled: HashMap::new(),
         detached,
@@ -739,8 +743,8 @@ async fn drain_acknowledgement_is_generation_bound_and_returns_unused_credit() {
     let Some(LinkState::Sending(link)) = sessions[&channel].links.get(&handle) else {
         panic!("sending link remains attached");
     };
-    assert_eq!(link.delivery_count, 7);
-    assert_eq!(link.credit_limit, 7);
+    assert_eq!(link.progress.count(), 7);
+    assert_eq!(link.progress.available(), 0);
     assert!(link.drain.current.is_none());
 }
 
@@ -824,7 +828,7 @@ async fn a_drain_can_complete_after_queued_transfers_exhaust_credit() {
     let Some(LinkState::Sending(link)) = session.links.get(&handle) else {
         panic!("sending link remains attached");
     };
-    assert_eq!(link.delivery_count, 2);
+    assert_eq!(link.progress.count(), 2);
     assert_eq!(link.queued.len(), 1);
 }
 
@@ -1003,8 +1007,7 @@ async fn a_range_disposition_completes_only_matching_deliveries() {
     let link = SendingLink {
         receiver_settle_mode: ReceiverSettleMode::First,
         settle_mode: SenderSettleMode::Unsettled,
-        delivery_count: 4,
-        credit_limit: 4,
+        progress: SendingCredit::new(4),
         queued: VecDeque::new(),
         unsettled: HashMap::from([(9, before), (10, first), (11, middle), (12, last)]),
         detached,
@@ -1064,8 +1067,7 @@ async fn detach_fails_queued_and_unsettled_sends_and_releases_capacity() {
     let mut link = LinkState::Sending(SendingLink {
         receiver_settle_mode: ReceiverSettleMode::First,
         settle_mode: SenderSettleMode::Unsettled,
-        delivery_count: 1,
-        credit_limit: 1,
+        progress: SendingCredit::new(1),
         queued: VecDeque::from([queued]),
         unsettled: HashMap::from([(0, unsettled)]),
         detached,

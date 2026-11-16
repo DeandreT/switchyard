@@ -308,7 +308,11 @@ async fn a_detached_pending_attach_cannot_cross_handle_reuse() {
     let Some(LinkState::Sending(link)) = sessions[&channel].links.get(&handle) else {
         panic!("the current receiver creates a sending link");
     };
-    assert_eq!(link.credit_limit, 0, "stale Flow credit crossed link reuse");
+    assert_eq!(
+        link.progress.available(),
+        0,
+        "stale Flow credit crossed link reuse"
+    );
 }
 
 #[tokio::test]
