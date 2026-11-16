@@ -7,6 +7,10 @@ commit for one immutable three-voter namespace group. It does not project domain
 state, return client outcomes, supply primary routing or consumers, implement
 consistent reads, or enable production startup.
 
+The separate [committed application mode](consensus-application.md) reuses this
+private event owner through an explicit `ApplicationOwner`; the ordinary driver
+contract described here remains F2-only with actual applied zero.
+
 ## Construction And Authority
 
 `ConsensusDriver::bind` checks fixed identity, local voter, transport limits,

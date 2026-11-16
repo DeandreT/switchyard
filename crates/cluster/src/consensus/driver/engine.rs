@@ -16,6 +16,7 @@ use super::{
 use crate::{consensus::ConsensusStore, transport::FrameCodec};
 
 pub(super) struct Engine<B: ConsensusBackend> {
+    pub application: super::application::Policy,
     pub core: RawNode<ConsensusStore<B>>,
     pub ready: Option<Ready>,
     pub light: Option<LightReady>,
@@ -28,17 +29,34 @@ pub(super) struct Engine<B: ConsensusBackend> {
     codec: FrameCodec,
 }
 impl<B: ConsensusBackend> Engine<B> {
+    #[cfg(test)]
     pub fn new(
         store: ConsensusStore<B>,
         options: DriverOptions,
         codec: FrameCodec,
     ) -> Result<Self, DriverError> {
+        Self::new_with_policy(
+            store,
+            options,
+            codec,
+            super::application::Policy::NoApplication,
+        )
+    }
+    pub fn new_with_policy(
+        store: ConsensusStore<B>,
+        options: DriverOptions,
+        codec: FrameCodec,
+        application: super::application::Policy,
+    ) -> Result<Self, DriverError> {
+        let mut config = options.core_config(store.local_id());
+        config.applied = application.actual();
         let core = RawNode::new(
-            &options.core_config(store.local_id()),
+            &config,
             store,
             &slog::Logger::root(slog::Discard, slog::o!()),
         )?;
         let mut engine = Self {
+            application,
             core,
             ready: None,
             light: None,
@@ -63,7 +81,8 @@ impl<B: ConsensusBackend> Engine<B> {
         self.status.leader_id = self.core.raft.leader_id;
         self.status.accepting_proposals =
             self.core.raft.state == StateRole::Leader && !self.status.retired;
-        // Actual raft_log.applied is never advanced by the driver.
+        // Only the sealed application policy can establish actual apply. The
+        // ordinary NoApplication driver always leaves this at zero.
         self.status.applied = self.core.raft.raft_log.applied;
         Ok(())
     }
@@ -86,6 +105,7 @@ impl<B: ConsensusBackend> Engine<B> {
                     _ => unreachable!(),
                 };
                 self.status.failure = Some(match &error {
+                    DriverError::Application(_) => Failure::Application,
                     DriverError::Persistence(_) | DriverError::Backend(_) => Failure::Persistence,
                     DriverError::Panic => Failure::Panic,
                     DriverError::Bound(_) => Failure::Bounds,
@@ -94,6 +114,8 @@ impl<B: ConsensusBackend> Engine<B> {
                 self.status.storage_uncertain = self.core.store().is_retired();
                 self.status.retired = true;
                 self.status.accepting_proposals = false;
+                self.application.retire();
+                self.status.storage_uncertain |= self.application.uncertain();
                 self.error = Some(error);
                 Err(AdmissionError::Failed)
             }
@@ -104,6 +126,39 @@ impl<B: ConsensusBackend> Engine<B> {
         // The original caller's cancellation cannot interrupt an atomic apply.
         let _credit = event._credit;
         match event.op {
+            Operation::Application(original) => {
+                let result = self.guarded(|e| {
+                    if e.core.raft.state != StateRole::Leader || e.core.raft.term != original.term {
+                        original.finish(Err(super::application::ApplicationError::NotLeader));
+                        return Ok(());
+                    }
+                    if e.application.actual() < e.core.store().hard_state()?.commit {
+                        original.finish(Err(super::application::ApplicationError::Busy));
+                        return Ok(());
+                    }
+                    let before = e.core.raft.raft_log.last_index();
+                    match e
+                        .core
+                        .propose(original.context.clone(), original.data.clone())
+                    {
+                        Ok(()) => {}
+                        Err(raft::Error::ProposalDropped) => {
+                            original.finish(Err(super::application::ApplicationError::Busy));
+                            return Ok(());
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                    let index = e.core.raft.raft_log.last_index();
+                    if index != before + 1 {
+                        return Err(DriverError::Bound("application proposal index"));
+                    }
+                    e.application.track(original.clone(), index)?;
+                    e.persist_ready()
+                });
+                if result.is_err() {
+                    original.finish(Err(super::application::ApplicationError::Unknown));
+                }
+            }
             Operation::Propose {
                 data,
                 context,
@@ -218,7 +273,41 @@ impl<B: ConsensusBackend> Engine<B> {
             self.light = None;
             self.observe()?;
         }
+        self.application.fence(
+            self.core.raft.term,
+            self.core.raft.state == StateRole::Leader,
+        );
         self.observe()
+    }
+    pub fn application_work(&self) -> bool {
+        !self.status.retired && self.application.work(self.status.observed_commit)
+    }
+    pub fn application_turn(&mut self) {
+        let _ = self.guarded(|e| {
+            if e.ready.is_some() || e.light.is_some() || e.core.has_ready() {
+                return Err(DriverError::Bound("application before complete Ready pass"));
+            }
+            if let Some(proof) = e.application.turn(
+                e.core.store(),
+                e.core.raft.term,
+                e.core.raft.state == StateRole::Leader,
+            )? {
+                if proof.raft > e.core.store().hard_state()?.commit
+                    || proof.raft < e.core.raft.raft_log.applied
+                {
+                    return Err(DriverError::Bound(
+                        "actual-applied proof outside durable prefix",
+                    ));
+                }
+                e.core.advance_apply_to(proof.raft);
+                e.application.publish(
+                    proof,
+                    e.core.raft.term,
+                    e.core.raft.state == StateRole::Leader,
+                );
+            }
+            e.observe()
+        });
     }
     fn stage(&mut self, messages: Vec<Message>) -> Result<(), DriverError> {
         for message in messages {

@@ -137,6 +137,7 @@ impl Shared {
 }
 
 pub(super) enum Operation {
+    Application(Arc<super::application::Original>),
     Peer(Message, oneshot::Sender<Result<(), AdmissionError>>),
     Campaign(oneshot::Sender<Result<(), AdmissionError>>),
     Tick(oneshot::Sender<Result<(), AdmissionError>>),
@@ -154,6 +155,9 @@ pub(super) struct Event {
 impl Event {
     pub fn reject(self, error: AdmissionError) {
         match self.op {
+            Operation::Application(original) => {
+                original.finish(Err(super::application::ApplicationError::Unknown))
+            }
             Operation::Propose { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
@@ -170,6 +174,27 @@ pub struct DriverHandle {
     pub(super) queue: mpsc::Sender<Event>,
 }
 impl DriverHandle {
+    pub(super) fn application(
+        &self,
+        original: Arc<super::application::Original>,
+    ) -> Result<(), AdmissionError> {
+        let credit = self
+            .shared
+            .reserve(original.data.len() + original.context.len() + 256)?;
+        let _gate = self.shared.gate.lock().expect("driver admission fence");
+        if self.shared.retired.load(Ordering::Acquire) {
+            return Err(AdmissionError::Retired);
+        }
+        self.queue
+            .try_send(Event {
+                op: Operation::Application(original),
+                _credit: credit,
+            })
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => AdmissionError::Busy,
+                mpsc::error::TrySendError::Closed(_) => AdmissionError::Retired,
+            })
+    }
     pub fn status(&self) -> DriverStatus {
         self.shared.status()
     }
