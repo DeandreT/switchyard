@@ -13,6 +13,12 @@ use crate::{
 /// command rejects it exactly where the leader did.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum BrokerError {
+    #[error("capacity reservation model 1 does not support message version {version}")]
+    CapacityMessageUnsupported { version: u8 },
+    #[error("retained commitment {committed} exceeds the owner limit {limit}")]
+    RetainedCapacityExceeded { committed: u64, limit: u64 },
+    #[error("capacity test owner must be dropped and reopened after an ambiguous write")]
+    CapacityWriterUnusable,
     #[error("capacity-owned state requires unsupported lifecycle conservation")]
     CapacityStateUnsupported,
     #[error("capacity-owned state is corrupt or has incompatible ownership")]

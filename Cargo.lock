@@ -375,6 +375,7 @@ dependencies = [
  "slog",
  "storage",
  "tempfile",
+ "testkit",
  "thiserror 2.0.19",
  "tokio",
 ]

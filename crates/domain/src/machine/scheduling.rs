@@ -102,6 +102,8 @@ impl<S: StateStore> StateMachine<S> {
                 .ok_or(BrokerError::SequenceNumberExhausted)?;
             let active_sequence = SequenceNumber::new(counters.next_sequence);
             counters.next_sequence = next_sequence;
+            #[cfg(feature = "capacity-conservation-test-support")]
+            self.note_capacity_activation(placeholder_sequence, active_sequence)?;
 
             batch.push_delete(index_key);
             batch.push_delete(keys::message(namespace, entity, placeholder_sequence));

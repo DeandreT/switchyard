@@ -10,6 +10,8 @@
 mod admin;
 mod admin_listener;
 mod broker;
+#[cfg(feature = "capacity-conservation-test-support")]
+pub use broker::capacity_test_adapter::CapacityTestProposer;
 mod clock;
 mod proposer;
 mod shutdown;

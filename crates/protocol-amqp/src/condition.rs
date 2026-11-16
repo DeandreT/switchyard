@@ -77,6 +77,7 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         BrokerError::SubscriptionLimitExceeded { .. }
         | BrokerError::RuleLimitExceeded { .. }
         | BrokerError::SqlRuleLimitExceeded { .. }
+        | BrokerError::RetainedCapacityExceeded { .. }
         | BrokerError::SequenceNumberExhausted
         | BrokerError::LockTokenExhausted => RESOURCE_LIMIT_EXCEEDED,
 
@@ -102,6 +103,8 @@ pub fn condition_for(error: &BrokerError) -> &'static str {
         | BrokerError::CapacityStateUnsupported
         | BrokerError::CapacityStateCorrupt
         | BrokerError::CapacityUsageMissing
+        | BrokerError::CapacityMessageUnsupported { .. }
+        | BrokerError::CapacityWriterUnusable
         | BrokerError::DanglingSubscription { .. }
         | BrokerError::TopicTopologyCorrupt
         | BrokerError::EntityMetadataCorrupt
@@ -128,6 +131,24 @@ mod tests {
     use domain::{SequenceNumber, SessionId, Timestamp};
 
     use super::*;
+
+    #[test]
+    fn retained_test_policy_errors_are_not_healthy_quota_errors() {
+        assert_eq!(
+            condition_for(&BrokerError::RetainedCapacityExceeded {
+                committed: 2,
+                limit: 1
+            }),
+            RESOURCE_LIMIT_EXCEEDED
+        );
+        for error in [
+            BrokerError::CapacityMessageUnsupported { version: 4 },
+            BrokerError::CapacityWriterUnusable,
+        ] {
+            assert_eq!(condition_for(&error), INTERNAL_ERROR);
+            assert!(!is_retryable(&error));
+        }
+    }
 
     fn session() -> SessionId {
         SessionId::new("cart-1").expect("a valid session id")

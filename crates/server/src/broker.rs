@@ -33,6 +33,11 @@ use tracing::debug;
 
 use crate::{AdminError, Clock, LocalProposer, ProposeError};
 
+mod owner_adapter;
+use owner_adapter::{LocalAdapter, OwnerAdapter};
+#[cfg(feature = "capacity-conservation-test-support")]
+pub(crate) mod capacity_test_adapter;
+
 /// Commands that may be waiting ahead of a caller's own.
 ///
 /// Bounded, so a flood of clients cannot grow the queue without limit. A full
@@ -478,6 +483,19 @@ pub struct Broker {
 impl Broker {
     /// Starts the owner thread for `proposer`.
     pub fn spawn<S: StateStore, C: Clock>(proposer: LocalProposer<S, C>) -> Self {
+        Self::spawn_core(LocalAdapter(proposer))
+    }
+
+    /// Explicit nondefault-feature test path. Normal spawn always selects the
+    /// ordinary adapter, including in all-features builds of the shipped node.
+    #[cfg(feature = "capacity-conservation-test-support")]
+    pub fn spawn_capacity_test<S: StateStore, C: Clock>(
+        proposer: capacity_test_adapter::CapacityTestProposer<S, C>,
+    ) -> Self {
+        Self::spawn_core(proposer)
+    }
+
+    fn spawn_core(mut proposer: impl OwnerAdapter) -> Self {
         let (requests, incoming) = flume::bounded::<Request>(COMMAND_QUEUE_DEPTH);
         let watchers = Arc::new(Watchers::default());
         let watching = Arc::clone(&watchers);
@@ -493,24 +511,7 @@ impl Broker {
                         } => {
                             // Both queue/topic probes are inside this one owner
                             // turn; no queued mutation can run between them.
-                            let machine = proposer.machine();
-                            let entry = (|| match target {
-                                EntityTarget::Entity(path) => {
-                                    if let Some(queue) = machine.admin_queue(&namespace, &path)? {
-                                        Ok(Some(AdminCatalogEntry::Queue(queue)))
-                                    } else {
-                                        machine
-                                            .admin_topic(&namespace, &path)
-                                            .map(|topic| topic.map(AdminCatalogEntry::Topic))
-                                    }
-                                }
-                                EntityTarget::Subscription { topic, name, .. } => machine
-                                    .admin_subscription(&namespace, &topic, &name)
-                                    .map(|subscription| {
-                                        subscription.map(AdminCatalogEntry::Subscription)
-                                    }),
-                            })()
-                            .map_err(ServiceError::Catalog);
+                            let entry = proposer.admin_get(&namespace, target);
                             let _ = reply.send(entry);
                         }
                         Request::AdminList {
@@ -520,10 +521,7 @@ impl Broker {
                             limit,
                             reply,
                         } => {
-                            let page = proposer
-                                .machine()
-                                .admin_catalog_page(&namespace, kind, after.as_ref(), limit)
-                                .map_err(ServiceError::Catalog);
+                            let page = proposer.admin_list(&namespace, kind, after.as_ref(), limit);
                             let _ = reply.send(page);
                         }
                         Request::Bind {
@@ -567,32 +565,17 @@ impl Broker {
                             limit,
                             reply,
                         } => {
-                            let _ = reply.send(
-                                proposer
-                                    .machine()
-                                    .queues_after(after.as_ref(), limit)
-                                    .map_err(ProposeError::from),
-                            );
+                            let _ = reply.send(proposer.queues_after(after.as_ref(), limit));
                         }
                         Request::ListTopics {
                             after,
                             limit,
                             reply,
                         } => {
-                            let _ = reply.send(
-                                proposer
-                                    .machine()
-                                    .topics_after(after.as_ref(), limit)
-                                    .map_err(ProposeError::from),
-                            );
+                            let _ = reply.send(proposer.topics_after(after.as_ref(), limit));
                         }
                         Request::LastApplied { reply } => {
-                            let _ = reply.send(
-                                proposer
-                                    .machine()
-                                    .last_applied_time()
-                                    .map_err(ProposeError::from),
-                            );
+                            let _ = reply.send(proposer.last_applied_time());
                         }
                         Request::Stop => break,
                     }

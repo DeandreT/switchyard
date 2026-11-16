@@ -4,7 +4,9 @@ Finite ordinary queue operation is not activated. Historical queue V3 profiles
 and proposal V7 keep their exact metadata-only meaning and bytes. They do not
 acquire usage, reservations or enforcement on open, replay or upgrade. No runtime
 command emits the new framing, and there is no migration or raw-writer-safe
-administration API. Lifecycle conservation and admission remain separate work.
+administration API. The explicit nondefault
+[lifecycle conservation test facades](capacity-lifecycle-conservation.md) do not
+change these normal entry points or activate admission.
 
 ## Selected formats
 
@@ -30,7 +32,8 @@ administration API. Lifecycle conservation and admission remain separate work.
   namespace and parent, then one complete canonical historical proposal. Scope
   and any retained binding must agree with the capacity owner and generation.
   Nested V11 is refused. Ordinary proposal readers explicitly refuse V11, including
-  current replay: only the inert capacity-specific codec can inspect it. V7 is
+  normal replay. Explicit test-only typed replay retains the complete V11 owner
+  and outer proposal identity. V7 is
   never rewritten or reinterpreted. V10 belongs to durable SQL action intent.
 
 The codecs detect accidental corruption and cross-owner substitution, not hostile
@@ -43,7 +46,7 @@ shadow before Clock or handler preparation, including Complete, held locks,
 session-state writers and empty timer maintenance. New profiles require both
 canonical profiles, a live matching owner generation and valid usage. Missing
 usage refuses; malformed, stale or mismatched state refuses; valid new state also
-explicitly refuses until lifecycle conservation is implemented. Usage or isolated
+explicitly refuses through normal APIs even when test support is compiled. Usage or isolated
 rows without the new profile pair refuse, never rebuild or relabel a populated
 store. These errors are not checkpointed as successful deterministic commands.
 Unrelated queues remain usable through ordinary runtime application.
