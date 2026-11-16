@@ -1,3 +1,4 @@
+use super::sending_credit::DrainTarget;
 use super::*;
 
 pub(in crate::server) struct LinkDrain {
@@ -29,7 +30,7 @@ impl LinkDrain {
 #[derive(Clone, Copy)]
 pub(super) struct PendingDrain {
     pub(super) request: DrainRequest,
-    pub(super) credit_limit: u64,
+    pub(super) target: DrainTarget,
 }
 
 pub(super) fn reserve_credit(
@@ -125,7 +126,7 @@ pub(super) async fn release_credit<W: AsyncWrite + Unpin>(
     result
 }
 
-pub(super) async fn acknowledge_drain<W: AsyncWrite + Unpin>(
+pub(in crate::server) async fn acknowledge_drain<W: AsyncWrite + Unpin>(
     request: DrainRequest,
     reply: oneshot::Sender<Result<(), EngineError>>,
     sessions: &mut HashMap<u16, SessionState>,
@@ -135,8 +136,6 @@ pub(super) async fn acknowledge_drain<W: AsyncWrite + Unpin>(
         let _ = reply.send(Err(EngineError::RemoteDetached));
         return Ok(());
     };
-    let next_outgoing_id = session.outgoing.next_id();
-    let incoming_flow = incoming::session_flow(session);
     let Some(LinkState::Sending(link)) = session.links.get_mut(&request.handle) else {
         let _ = reply.send(Err(EngineError::RemoteDetached));
         return Ok(());
@@ -159,51 +158,18 @@ pub(super) async fn acknowledge_drain<W: AsyncWrite + Unpin>(
         let _ = reply.send(Err(invalid_state("cannot drain live credit reservations")));
         return Ok(());
     }
-    if !link.queued.is_empty() && u64::from(link.delivery_count) < pending.credit_limit {
+    if link.transmitting.is_some() {
+        let _ = reply.send(Err(invalid_state("cannot drain a transmitting delivery")));
+        return Ok(());
+    }
+    if !link.queued.is_empty() && link.progress.unused(pending.target) != 0 {
         let _ = reply.send(Err(invalid_state(
             "cannot return unused credit while deliveries are queued",
         )));
         return Ok(());
     }
 
-    let delivery_count = if pending.credit_limit > u64::from(link.delivery_count) {
-        pending.credit_limit as u32
-    } else {
-        link.delivery_count
-    };
-    let unused_credit = pending
-        .credit_limit
-        .saturating_sub(u64::from(link.delivery_count));
-    let result = write_amqp(
-        writer,
-        request.channel,
-        Performative::Flow(drained_flow(
-            request.handle,
-            delivery_count,
-            next_outgoing_id,
-            incoming_flow,
-        )),
-        Vec::new(),
-    )
-    .await;
-    if result.is_ok() {
-        link.delivery_count = delivery_count;
-        link.credit_limit = u64::from(delivery_count);
-        link.drain.current = None;
-        let _ = link.drain.notifications.send(None);
-        link.credit.send_if_modified(|ready| {
-            let changed = *ready;
-            *ready = false;
-            changed
-        });
-        trace!(
-            channel = request.channel,
-            handle = request.handle,
-            delivery_count,
-            unused_credit,
-            "unused link credit drained"
-        );
-    }
+    let result = write_drain(request.channel, request.handle, session, writer).await;
     let _ = reply.send(
         result
             .as_ref()
@@ -256,19 +222,46 @@ pub(in crate::server) async fn apply_flow<W: AsyncWrite + Unpin>(
             return Ok(());
         }
     };
-    if let Some(credit) = flow.link_credit {
-        link.credit_limit =
-            u64::from(flow.delivery_count.unwrap_or(link.delivery_count)) + u64::from(credit);
-        trace!(
-            channel,
-            handle,
-            delivery_count = link.delivery_count,
-            credit,
-            credit_limit = link.credit_limit,
-            queued = link.queued.len(),
-            "link credit updated"
-        );
-    }
+    let proposed = match link.progress.update(
+        flow.delivery_count,
+        flow.link_credit,
+        link.credit_reservations.len(),
+    ) {
+        Ok(proposed) => proposed,
+        Err(description) => {
+            // A bad link observation cannot manufacture permission or retire
+            // unrelated links. Retain the closing handle through its answer.
+            if begin_detach(channel, handle, sessions)? {
+                write_amqp(
+                    writer,
+                    channel,
+                    Performative::Detach(Detach {
+                        handle,
+                        closed: true,
+                        error: Some(Error::new(
+                            crate::AmqpError::InvalidField,
+                            description,
+                            None,
+                        )),
+                    }),
+                    Vec::new(),
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+    };
+    // A Flow replaces/cancels its drain generation in this same actor turn.
+    // No target in the old peer coordinate survives the rebase below.
+    link.progress = proposed;
+    trace!(
+        channel,
+        handle,
+        delivery_count = link.progress.count(),
+        credit = link.progress.available(),
+        queued = link.queued.len(),
+        "link credit updated"
+    );
     if flow.drain {
         let request = DrainRequest {
             channel,
@@ -279,14 +272,14 @@ pub(in crate::server) async fn apply_flow<W: AsyncWrite + Unpin>(
         link.drain.next_generation = link.drain.next_generation.wrapping_add(1);
         link.drain.current = Some(PendingDrain {
             request,
-            credit_limit: link.credit_limit,
+            target: link.progress.drain_target(),
         });
         let _ = link.drain.notifications.send(Some(request));
         trace!(
             channel,
             handle,
             generation = request.generation,
-            credit_limit = link.credit_limit,
+            credit = link.progress.available(),
             "remote requested link drain"
         );
     } else if link.drain.current.take().is_some() {
@@ -297,9 +290,7 @@ pub(in crate::server) async fn apply_flow<W: AsyncWrite + Unpin>(
 }
 
 pub(super) fn has_unreserved_credit(link: &SendingLink) -> bool {
-    link.queued.is_empty()
-        && u64::from(link.delivery_count).saturating_add(link.credit_reservations.len() as u64)
-            < link.credit_limit
+    link.queued.is_empty() && link.progress.can_reserve(link.credit_reservations.len())
 }
 
 pub(super) fn publish_credit(link: &SendingLink) {
@@ -317,55 +308,66 @@ pub(super) async fn complete_zero_credit_drain<W: AsyncWrite + Unpin>(
     session: &mut SessionState,
     writer: &mut W,
 ) -> Result<(), EngineError> {
-    let next_outgoing_id = session.outgoing.next_id();
-    let incoming_flow = incoming::session_flow(session);
     let Some(LinkState::Sending(link)) = session.links.get_mut(&handle) else {
         return Ok(());
     };
     let Some(pending) = link.drain.current else {
         return Ok(());
     };
-    if !link.credit_reservations.is_empty() || u64::from(link.delivery_count) < pending.credit_limit
+    if !link.credit_reservations.is_empty()
+        || link.transmitting.is_some()
+        || link.progress.unused(pending.target) != 0
     {
         return Ok(());
     }
-    let delivery_count = link.delivery_count;
-    write_amqp(
-        writer,
-        channel,
-        Performative::Flow(drained_flow(
-            handle,
-            delivery_count,
-            next_outgoing_id,
-            incoming_flow,
-        )),
-        Vec::new(),
-    )
-    .await?;
-    link.credit_limit = u64::from(delivery_count);
-    link.drain.current = None;
-    let _ = link.drain.notifications.send(None);
-    trace!(channel, handle, delivery_count, "zero link credit drained");
-    Ok(())
+    write_drain(channel, handle, session, writer).await
 }
 
-fn drained_flow(
+async fn write_drain<W: AsyncWrite + Unpin>(
+    channel: u16,
     handle: u32,
-    delivery_count: u32,
-    next_outgoing_id: u32,
-    incoming_flow: Flow,
-) -> Flow {
-    Flow {
-        next_incoming_id: incoming_flow.next_incoming_id,
-        incoming_window: incoming_flow.incoming_window,
-        next_outgoing_id,
-        outgoing_window: SESSION_WINDOW,
-        handle: Some(handle),
-        delivery_count: Some(delivery_count),
-        link_credit: Some(0),
-        available: None,
-        drain: true,
-        echo: false,
-        properties: None,
+    session: &mut SessionState,
+    writer: &mut W,
+) -> Result<(), EngineError> {
+    let session_flow = incoming::session_flow(session);
+    let Some(LinkState::Sending(link)) = session.links.get_mut(&handle) else {
+        return Ok(());
+    };
+    let Some(pending) = link.drain.current else {
+        return Ok(());
+    };
+    loop {
+        let step = link
+            .progress
+            .drain_step(pending.target)
+            .map_err(invalid_state)?;
+        write_amqp(
+            writer,
+            channel,
+            Performative::Flow(Flow {
+                handle: Some(handle),
+                delivery_count: Some(step.delivery_count),
+                link_credit: Some(step.remaining),
+                drain: true,
+                ..session_flow.clone()
+            }),
+            Vec::new(),
+        )
+        .await?;
+        // The original write must succeed before any count/frontier advances.
+        // A full uint takes at most three observable RFC-1982 increments.
+        link.progress = step.progress;
+        if step.remaining == 0 {
+            link.drain.current = None;
+            let _ = link.drain.notifications.send(None);
+            publish_credit(link);
+            trace!(
+                channel,
+                handle,
+                delivery_count = link.progress.count(),
+                "link credit drained"
+            );
+            return Ok(());
+        }
     }
 }

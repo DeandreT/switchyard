@@ -548,6 +548,11 @@ fn receiver_message_limit(requested: Option<u64>) -> u64 {
 }
 
 enum ClientCommand {
+    #[cfg(test)]
+    AcknowledgeDrain {
+        request: DrainRequest,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
     // Exercise allocation wrap/reuse without creating 2^32 links. This only
     // seeds the allocator; all protocol and retirement checks remain real.
     #[cfg(test)]
@@ -910,6 +915,10 @@ async fn drive_client<W: AsyncWrite + Unpin>(
                 let Some(command) = command else { break };
                 let result = match command {
                     #[cfg(test)]
+                    ClientCommand::AcknowledgeDrain { request, reply } => {
+                        engine::acknowledge_drain(request, reply, &mut sessions, &mut writer).await
+                    }
+                    #[cfg(test)]
                     ClientCommand::SeedNextHandle { channel, handle, reply } => {
                         *next_handles.get_mut(&channel).expect("seeded live session") = handle;
                         let _ = reply.send(Ok(()));
@@ -991,8 +1000,7 @@ async fn drive_client<W: AsyncWrite + Unpin>(
                                 session.links.insert(handle, LinkState::Sending(SendingLink {
                                     receiver_settle_mode: request.receiver_settle_mode,
                                     settle_mode: request.sender_settle_mode,
-                                    delivery_count: 0,
-                                    credit_limit: 0,
+                                    progress: SendingCredit::new(0),
                                     queued: VecDeque::new(),
                                     transmitting: None,
                                     unsettled: HashMap::new(),
@@ -1217,6 +1225,10 @@ mod limit_tests;
 #[cfg(test)]
 #[path = "client_reply_wait_tests.rs"]
 mod reply_wait_tests;
+
+#[cfg(test)]
+#[path = "client_sending_credit_tests.rs"]
+mod sending_credit_tests;
 
 #[cfg(test)]
 mod tests {

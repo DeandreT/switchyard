@@ -227,6 +227,41 @@ are additional storage.
 They make no hardware, throughput or latency claim. No persisted formats change; an
 older native implementation does not enforce these receive-storage bounds.
 
+### Native sending-link credit
+
+Sending credit is a full-uint integer budget, separate from the wrapping u32
+delivery count. One credit crossing MAX to zero permits one delivery, not a
+second delivery after wrap. Peer delivery counts must fit the bounded causal
+history actually published by successful first-Transfer or drain-Flow writes.
+This permits uniquely established progress beyond the RFC-1982 half range
+without guessing an epoch from arbitrary serial comparisons. An unresolvable
+observation detaches only that link with `amqp:invalid-field`, retaining its
+closing handle until the answer under the shared retirement bound below.
+
+An omitted receiver count refers to the initial Sender Attach position, never
+the current sender count. After confirmed peer progress leaves that initial
+position, omission is refused rather than reinterpreted as another wrap. Repeated
+snapshots and count-only Flow cannot replenish spent credit. A smaller grant can
+leave nonpositive credit; it never moves actual sender progress backward.
+
+Reservations retain their original admission across a later credit reduction.
+Release or drop removes that token once against the current grant, without
+advancing a count or fabricating a refund. Each actual delivery consumes one
+link slot; continuation frames consume only session-frame capacity. Settlement
+and the existing local send-capacity semaphore remain independent of link credit.
+
+Returning positive unused credit requires the application's explicit source-empty
+acknowledgement, no held reservation or partial transmission, and no usable queued
+delivery. Zero-credit drain also waits for the original final Transfer write.
+A full-uint unused drain publishes at most three standard Flow steps, each
+advancing at most 2,147,483,647 counts and committed only after its write succeeds.
+Intermediate states report remaining credit; the final zero-credit state completes
+drain. Control-only progress allocates no Transfer, session delivery ID, delivery
+tag, outcome or retention permit. General Flow echo and source-quiescence support
+remain separate work in [#77](https://github.com/DeandreT/switchyard/issues/77).
+The feature test client uses the same sending-credit helper; its public API does
+not expose an application source-empty drain acknowledgement.
+
 ### Native receiving-link credit
 
 Each receiving link initially grants 2,048 deliveries. Its delivery count starts

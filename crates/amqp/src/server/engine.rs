@@ -3,15 +3,16 @@ use tokio::io::AsyncWriteExt;
 
 pub(super) mod incoming;
 mod link_flow;
+mod sending_credit;
 mod session_flow;
 pub(super) use incoming::IncomingWindow;
 #[cfg(test)]
 use incoming::receive_transfer;
+pub(super) use sending_credit::SendingCredit;
 
+pub(super) use link_flow::acknowledge_drain;
 pub(super) use link_flow::{LinkDrain, apply_flow};
-use link_flow::{
-    acknowledge_drain, complete_zero_credit_drain, publish_credit, release_credit, reserve_credit,
-};
+use link_flow::{complete_zero_credit_drain, publish_credit, release_credit, reserve_credit};
 pub(super) use session_flow::OutgoingWindow;
 
 pub(super) enum Command {
@@ -194,8 +195,7 @@ pub(super) fn begin_detach(
 pub(super) struct SendingLink {
     pub(super) receiver_settle_mode: ReceiverSettleMode,
     pub(super) settle_mode: SenderSettleMode,
-    pub(super) delivery_count: u32,
-    pub(super) credit_limit: u64,
+    pub(super) progress: SendingCredit,
     pub(super) queued: VecDeque<QueuedSend>,
     pub(super) transmitting: Option<Box<TransmittingSend>>,
     pub(super) unsettled: HashMap<u32, UnsettledSend>,
@@ -702,8 +702,7 @@ async fn handle_command<W: AsyncWrite + Unpin>(
                         LinkState::Sending(SendingLink {
                             settle_mode: attach.snd_settle_mode,
                             receiver_settle_mode: attach.rcv_settle_mode,
-                            delivery_count: 0,
-                            credit_limit: 0,
+                            progress: SendingCredit::new(0),
                             queued: VecDeque::new(),
                             transmitting: None,
                             unsettled: HashMap::new(),
@@ -967,9 +966,7 @@ pub(super) async fn flush_sends<W: AsyncWrite + Unpin>(
                 .queued
                 .front()
                 .is_some_and(|queued| queued.reservation.is_some());
-            let committed = u64::from(link.delivery_count)
-                .saturating_add(link.credit_reservations.len() as u64);
-            if !front_is_reserved && committed >= link.credit_limit {
+            if !front_is_reserved && !link.progress.can_reserve(link.credit_reservations.len()) {
                 publish_credit(link);
                 complete_zero_credit_drain(channel, handle, session, writer).await?;
                 return Ok(());
@@ -985,7 +982,9 @@ pub(super) async fn flush_sends<W: AsyncWrite + Unpin>(
             if let Some(reservation) = queued.reservation {
                 let removed = reservation.incarnation == link.drain.incarnation
                     && link.credit_reservations.remove(&reservation.reservation_id);
-                debug_assert!(removed, "queued sends retain their credit reservation");
+                if !removed {
+                    return Err(invalid_state("queued send lost its credit reservation"));
+                }
             }
             let payload = encode_message(&queued.message)?;
             if let Some(maximum) = link.max_message_size
@@ -1000,9 +999,11 @@ pub(super) async fn flush_sends<W: AsyncWrite + Unpin>(
                     .send(Err(EngineError::MessageSizeExceeded { size, maximum }));
                 return detach_oversized(channel, handle, session, writer, size, maximum).await;
             }
+            link.progress
+                .start_delivery(link.credit_reservations.len())
+                .map_err(invalid_state)?;
             let delivery_id = session.next_delivery_id;
             session.next_delivery_id = session.next_delivery_id.wrapping_add(1);
-            link.delivery_count = link.delivery_count.wrapping_add(1);
             let settled = link.settle_mode == SenderSettleMode::Settled;
             let (settled_reply, settled_permit) = if settled {
                 (Some(queued.reply), Some(queued.permit))
@@ -1069,6 +1070,9 @@ pub(super) async fn flush_sends<W: AsyncWrite + Unpin>(
         )
         .await?;
         sending.writing = false;
+        if sending.first {
+            link.progress.first_transfer_written();
+        }
         session.outgoing.sent()?;
         sending.offset = end;
         sending.first = false;
