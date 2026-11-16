@@ -490,7 +490,7 @@ fn constructor_refuses_entity_scope_and_https_resource_scope() {
     assert!(matches!(
         EntityRpc::new(
             rpc.service,
-            rpc.policy,
+            rpc.policy.unwrap(),
             ResourceScope::entity("tenant.example", "orders").unwrap(),
             InternalBackendErrors
         ),

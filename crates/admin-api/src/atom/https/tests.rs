@@ -146,6 +146,9 @@ impl Body for CountBody {
 fn boundary(identity: &Identity, handler: Arc<dyn Handler>, limits: Limits) -> Boundary {
     let config = Arc::new(config(identity, limits));
     Boundary {
+        waiting: Arc::default(),
+        #[cfg(feature = "workload-tls")]
+        connection: None,
         config,
         handler,
         admission: Arc::new(Mutex::new(Admission {
@@ -392,7 +395,7 @@ async fn keyword_names_keep_entity_authorization_before_profiles_and_body_polls(
     let handler = Arc::new(Recording::default());
     let mut boundary = boundary(&identity, handler.clone(), Limits::default());
     Arc::get_mut(&mut boundary.config).unwrap().policy =
-        JwtPolicy::from_json(&keyword_policy().to_string())?;
+        Some(JwtPolicy::from_json(&keyword_policy().to_string())?);
     let wrong = fixture::sign(fixture::claims("entity"));
     for (index, path) in KEYWORD_PATHS.iter().enumerate() {
         let target = format!("/{path}?api-version=2024-05&enrich=False");
@@ -564,7 +567,7 @@ impl Node {
         let socket = TcpListener::bind("127.0.0.1:0").await?;
         let address = socket.local_addr()?;
         let mut config = config(&identity, limits);
-        config.policy = JwtPolicy::from_json(&policy.to_string())?;
+        config.policy = Some(JwtPolicy::from_json(&policy.to_string())?);
         let mut service = HttpsListener::with_handler(socket, config, handler);
         let retirement = service.retirement_handle();
         let (connections, requests) = service.permit_witnesses();

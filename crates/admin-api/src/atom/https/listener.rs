@@ -44,7 +44,7 @@ async fn requested(mut signal: watch::Receiver<bool>) {
 /// supplied "secure" bit, plaintext fallback or public incoming-stream hook.
 pub struct HttpsListener {
     socket: Option<TcpListener>,
-    boundary: Boundary,
+    pub(super) boundary: Boundary,
     retirement: Retirement,
     cleanup: watch::Sender<bool>,
     connections: TaskFamily,
@@ -60,8 +60,8 @@ impl HttpsListener {
         Self::with_handler(socket, config, Arc::new(ClosedRoutes))
     }
 
-    /// Explicit trusted Rust extension for future adapters or bounded test
-    /// callbacks. The shipped server never installs a handler through this API.
+    /// Trusted Rust extension used by the server's supported subscription Get
+    /// adapter and bounded tests. Callbacks run only after transport authorization.
     pub fn with_handler(
         socket: TcpListener,
         config: Configuration,
@@ -79,6 +79,10 @@ impl HttpsListener {
         Self {
             socket: Some(socket),
             boundary: Boundary {
+                #[cfg(test)]
+                waiting: Arc::default(),
+                #[cfg(feature = "workload-tls")]
+                connection: None,
                 config: Arc::new(config),
                 handler,
                 admission: admission.clone(),
@@ -190,8 +194,27 @@ async fn serve_connection(
     accepted_at: Instant,
 ) {
     let limits = boundary.config.limits;
+    #[cfg(feature = "workload-tls")]
+    let mut boundary = boundary;
     let deadline = accepted_at + limits.connection_timeout;
-    let acceptor = TlsAcceptor::from(boundary.config.tls.clone());
+    #[cfg(feature = "workload-tls")]
+    if let Some(endpoint) = boundary.config.workload.clone() {
+        let tls = tokio::select! {
+            biased;
+            () = requested(cleanup.clone()) => return,
+            result = endpoint.accept_before(socket, deadline.min(accepted_at + limits.handshake_timeout)) => match result { Ok(tls) => tls, Err(_) => return },
+        };
+        if tls.alpn_protocol().is_some_and(|alpn| alpn != b"http/1.1") {
+            return;
+        }
+        let Ok(connection) = crate::workload::Connection::from_admitted(endpoint, &tls) else {
+            return;
+        };
+        boundary.connection = Some(connection);
+        serve_http(tls, boundary, cleanup, deadline).await;
+        return;
+    }
+    let acceptor = TlsAcceptor::from(boundary.config.tls.clone().expect("prepared legacy TLS"));
     let tls = tokio::select! {
         biased;
         () = requested(cleanup.clone()) => return,
@@ -199,6 +222,27 @@ async fn serve_connection(
             deadline.min(accepted_at + limits.handshake_timeout), acceptor.accept(socket)
         ) => match result { Ok(Ok(tls)) => tls, _ => return },
     };
+    serve_http(tls, boundary, cleanup, deadline).await;
+}
+
+async fn serve_http<Io>(
+    tls: Io,
+    boundary: Boundary,
+    cleanup: watch::Receiver<bool>,
+    deadline: Instant,
+) where
+    Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let limits = boundary.config.limits;
+    let expiry = async {
+        #[cfg(feature = "workload-tls")]
+        if let Some(connection) = &boundary.connection {
+            return connection.expired().await;
+        }
+        std::future::pending::<()>().await;
+    };
+    tokio::pin!(expiry);
+    let request_boundary = boundary.clone();
     let mut builder = http1::Builder::new();
     builder
         .keep_alive(false)
@@ -207,7 +251,7 @@ async fn serve_connection(
         .timer(TokioTimer::new())
         .header_read_timeout(limits.header_timeout);
     let service = service_fn(move |request| {
-        let boundary = boundary.clone();
+        let boundary = request_boundary.clone();
         async move {
             let request_deadline =
                 deadline.min(Instant::now() + boundary.config.limits.request_timeout);
@@ -220,11 +264,12 @@ async fn serve_connection(
         tokio::pin!(connection);
         tokio::select! {
             biased;
+            () = &mut expiry => return,
             () = requested(cleanup) => {
                 connection.as_mut().graceful_shutdown();
                 // A network deadline closes only this socket driver. Begun backend
                 // originals remain in requests; finish must still join them.
-                let _ = tokio::time::timeout_at(deadline, connection).await;
+                tokio::select! { biased; () = &mut expiry => return, _ = tokio::time::timeout_at(deadline, connection) => {} }
             },
             _ = tokio::time::sleep_until(deadline) => {},
             _ = &mut connection => {},
@@ -232,7 +277,7 @@ async fn serve_connection(
     }
     // Parse/header errors also close TLS correctly. This is still the original
     // connection deadline, not a new drain or proof that callback work finished.
-    let _ = tokio::time::timeout_at(deadline, io.inner_mut().shutdown()).await;
+    tokio::select! { biased; () = &mut expiry => {}, _ = tokio::time::timeout_at(deadline, io.inner_mut().shutdown()) => {} }
 }
 
 /// Two-family rotating priority, using the same actual-join primitive as h2.

@@ -1,5 +1,5 @@
-//! Server-owned TLS/HTTP/1 boundary. Production routes remain closed: no XML,
-//! owner/generation reads, CRUD, rules or runtime materialization are activated.
+//! Server-owned TLS/HTTP/1 boundary. Only the installed ordinary subscription
+//! definition Get adapter is supported; no mutation/rule/runtime routes.
 mod listener;
 mod route;
 pub use listener::{HttpsListener, Retirement};
@@ -148,8 +148,10 @@ impl std::error::Error for ConfigurationError {}
 
 /// Prepared identity/policy only; never holds an opened durable backend.
 pub struct Configuration {
-    tls: Arc<ServerConfig>,
-    policy: JwtPolicy,
+    tls: Option<Arc<ServerConfig>>,
+    policy: Option<JwtPolicy>,
+    #[cfg(feature = "workload-tls")]
+    workload: Option<auth::workload::PreparedWorkloadTls>,
     namespace: NamespaceName,
     root: ResourceScope,
     limits: Limits,
@@ -203,8 +205,33 @@ impl Configuration {
                 .map_err(|_| ConfigurationError)?;
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Self {
-            tls: Arc::new(tls),
+            tls: Some(Arc::new(tls)),
+            policy: Some(policy),
+            #[cfg(feature = "workload-tls")]
+            workload: None,
+            namespace,
+            root,
+            limits: Limits::default(),
+        })
+    }
+    #[cfg(feature = "workload-tls")]
+    pub fn workload(
+        endpoint: auth::workload::PreparedWorkloadTls,
+        policy: Option<JwtPolicy>,
+        namespace: NamespaceName,
+        root: ResourceScope,
+    ) -> Result<Self, ConfigurationError> {
+        if root.path().next().is_some()
+            || root.host().split('.').next() != Some(namespace.as_str())
+            || endpoint.namespace() != &root
+            || (!endpoint.requires_client_certificate() && policy.is_none())
+        {
+            return Err(ConfigurationError);
+        }
+        Ok(Self {
+            tls: None,
             policy,
+            workload: Some(endpoint),
             namespace,
             root,
             limits: Limits::default(),
@@ -219,6 +246,8 @@ impl Configuration {
 
 /// Credential-free, canonical, authorized metadata. Construction is private.
 pub struct AuthorizedHead {
+    #[cfg(feature = "workload-tls")]
+    pub(super) connection: Option<crate::workload::Connection>,
     namespace: NamespaceName,
     address: Address,
     scope: ResourceScope,
@@ -323,54 +352,89 @@ struct Admission {
 }
 #[derive(Clone)]
 struct Boundary {
+    #[cfg(test)]
+    waiting: Arc<tokio::sync::Notify>,
+    #[cfg(feature = "workload-tls")]
+    connection: Option<crate::workload::Connection>,
     config: Arc<Configuration>,
     handler: Arc<dyn Handler>,
     admission: Arc<Mutex<Admission>>,
 }
 impl Boundary {
+    fn ensure_live(&self) -> Result<(), Refusal> {
+        #[cfg(feature = "workload-tls")]
+        if self
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.ensure_live().is_err())
+        {
+            return Err(Refusal::Unauthenticated);
+        }
+        Ok(())
+    }
     fn authorize(&self, parts: &hyper::http::request::Parts) -> Result<AuthorizedHead, Refusal> {
         if parts.version != Version::HTTP_11 {
             return Err(Refusal::Invalid);
         }
         let address = route::address(&parts.uri)?;
         let scope = address.scope(&self.config.root)?;
+        self.ensure_live()?;
         let mut auth = parts.headers.get_all(header::AUTHORIZATION).iter();
-        let value = auth
-            .next()
-            .ok_or(Refusal::Unauthenticated)?
-            .to_str()
-            .map_err(|_| Refusal::Unauthenticated)?;
-        if auth.next().is_some() {
+        if let Some(value) = auth.next() {
+            let value = value.to_str().map_err(|_| Refusal::Unauthenticated)?;
+            if auth.next().is_some() {
+                return Err(Refusal::Unauthenticated);
+            }
+            let (scheme, token) = value.split_once(' ').ok_or(Refusal::Unauthenticated)?;
+            if !scheme.eq_ignore_ascii_case("bearer")
+                || token.is_empty()
+                || token.bytes().any(|byte| byte.is_ascii_whitespace())
+            {
+                return Err(Refusal::Unauthenticated);
+            }
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| Refusal::Internal)?
+                .as_secs();
+            let grant = self
+                .config
+                .policy
+                .as_ref()
+                .ok_or(Refusal::Unauthenticated)?
+                .validate(token, &scope, now)
+                .map_err(|error| {
+                    if error == JwtError::ScopeMismatch {
+                        Refusal::Forbidden
+                    } else {
+                        Refusal::Unauthenticated
+                    }
+                })?;
+            if !grant.allows(&scope, Permission::Manage, now) {
+                return Err(Refusal::Forbidden);
+            }
+        } else {
+            #[cfg(feature = "workload-tls")]
+            {
+                self.connection
+                    .as_ref()
+                    .ok_or(Refusal::Unauthenticated)?
+                    .authorize(&scope)
+                    .map_err(|error| {
+                        if error == auth::workload::WorkloadError::IdentityDenied {
+                            Refusal::Unauthenticated
+                        } else {
+                            Refusal::Forbidden
+                        }
+                    })?;
+            }
+            #[cfg(not(feature = "workload-tls"))]
             return Err(Refusal::Unauthenticated);
-        }
-        let (scheme, token) = value.split_once(' ').ok_or(Refusal::Unauthenticated)?;
-        if !scheme.eq_ignore_ascii_case("bearer")
-            || token.is_empty()
-            || token.bytes().any(|byte| byte.is_ascii_whitespace())
-        {
-            return Err(Refusal::Unauthenticated);
-        }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| Refusal::Internal)?
-            .as_secs();
-        let grant = self
-            .config
-            .policy
-            .validate(token, &scope, now)
-            .map_err(|error| {
-                if error == JwtError::ScopeMismatch {
-                    Refusal::Forbidden
-                } else {
-                    Refusal::Unauthenticated
-                }
-            })?;
-        if !grant.allows(&scope, Permission::Manage, now) {
-            return Err(Refusal::Forbidden);
         }
         // Profile decisions (and every trusted handler callback) follow auth.
         let profile = route::profile(&parts.uri, &address)?;
         Ok(AuthorizedHead {
+            #[cfg(feature = "workload-tls")]
+            connection: self.connection.clone(),
             namespace: self.config.namespace.clone(),
             address,
             scope,
@@ -491,6 +555,7 @@ impl Boundary {
         if Instant::now() >= deadline {
             return Err(Refusal::Deadline);
         }
+        self.ensure_live()?;
         let reply = self
             .handler
             .handle(AuthorizedRequest { head, body: bytes })
@@ -506,11 +571,16 @@ impl Boundary {
         request: Request<hyper::body::Incoming>,
         deadline: Instant,
     ) -> Result<Response<Full<Bytes>>, Infallible> {
+        #[cfg(test)]
+        self.waiting.notify_one();
         let (send, receive) = oneshot::channel();
         {
             let admission = self.admission.lock().expect("Atom admission");
             if admission.retired {
                 return Ok(response(Err(Refusal::Retiring)));
+            }
+            if let Err(error) = self.ensure_live() {
+                return Ok(response(Err(error)));
             }
             let permit = match admission.permits.clone().try_acquire_owned() {
                 Ok(permit) => permit,
@@ -576,3 +646,5 @@ fn response(result: Result<Reply, Refusal>) -> Response<Full<Bytes>> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, feature = "workload-tls"))]
+mod workload_tests;

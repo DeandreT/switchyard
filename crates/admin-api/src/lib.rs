@@ -7,6 +7,8 @@ pub mod atom;
 pub mod rpc;
 mod service;
 pub mod transport;
+#[cfg(feature = "workload-tls")]
+pub mod workload;
 
 /// Generated v1 protobuf clients, servers and messages, separate from the typed API.
 pub mod wire {

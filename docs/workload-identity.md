@@ -1,4 +1,4 @@
-# Local workload identity foundation
+# Local workload identity
 
 The `auth` crate has two opt-in features:
 
@@ -7,9 +7,9 @@ The `auth` crate has two opt-in features:
   actual client stream and returns an opaque, endpoint-bound peer capability.
 
 Default features remain empty. Existing SAS and offline JWT APIs are unchanged.
-The protocol library can opt into the AMQP TCP/WSS consumer described below.
-There is no server CLI, native administration or Atom activation, certificate
-installation/provisioning, issuer fetching or production enablement. Other
+The optional server profile activates independent AMQP TCP/WSS, native admin h2
+and Atom HTTPS consumers described below. It does not provision certificates,
+fetch issuers, change global trust or enable production deployment. Other
 consumers must enforce credential selection, admission, retirement and custody.
 
 ## Policy format
@@ -252,9 +252,90 @@ a delivery buffered before expiry, but cannot thereby start a new post-cutoff
 settlement. This is a connection-authentication boundary, not a new entity-holder
 or storage/consensus contract.
 
-This is a library opt-in, not server-main/CLI, native administration or Atom
-activation. Restart orchestration, actual admin proof consumption and shared
-process shutdown integration remain separate.
+The library opt-in is also consumed by the nondefault server profile below.
+
+## Server opt-ins and startup
+
+Build the server with `server/workload-tls`. Defaults remain empty; merely
+compiling the feature does not opt a listener into certificate authentication.
+The three independent options are:
+
+- `--amqp-workload-policy-file PATH`, with `--tls-certificate` and
+  `--tls-private-key` (TCP or `--transport amqp-websockets`).
+- `--admin-workload-policy-file PATH`, with explicit `--admin-listen`,
+  `--admin-tls-certificate` and `--admin-tls-private-key`.
+- `--atom-workload-policy-file PATH`, with explicit `--atom-listen`,
+  `--atom-tls-certificate` and `--atom-tls-private-key`.
+
+Each file is an immutable, independently prepared snapshot of the format above.
+The namespace option selects the AMQPS resource root: a bare namespace uses
+`<namespace>.servicebus.windows.net`; a full hostname uses that canonical host.
+This resource authority is distinct from the TLS endpoint DNS name, JWT issuer
+and JWT audience. HTTP Host, identity headers and AMQP peer hostnames cannot
+select another resource authority or supply certificate proof.
+
+Required-certificate policies support explicit certificate-only operation: omit
+that listener's JWT/SAS options. Mixed mode retains the independent AMQP SAS/JWT,
+native `--admin-jwt-policy-file`, or Atom `--atom-jwt-policy-file` policy. Optional
+certificates require those actual alternative configurations; absence creates no
+certificate rights or artificial certificate deadline. A broken/partial credential
+tuple still refuses, and an invalid presented certificate never downgrades to JWT.
+Empty alternative mappings remain deny-all, not unrestricted authorization.
+
+All workload policy (256 KiB), server chain (64 KiB), key (32 KiB), namespace and
+transport tuple validation completes before durable open. Files are read with an
+extra byte to detect overflow, not silently truncated. JWT files retain their
+64 KiB bound. No secret key values are accepted on the command line. The actual
+opaque `WorkloadAmqpListener` is prepared before storage using a one-time backend
+slot, filled before serving; TLS/credentials are never extracted or replaced.
+Existing non-workload constructors and CLI behavior remain available. Production
+storage/quorum restrictions are unchanged even when this feature is compiled or
+the certificate profile is selected.
+
+## Native administration and Atom authorization
+
+Native `AdminTlsConfig::workload` explicitly accepts an optional JWT policy;
+certificate-only mode does not fabricate a JWT policy. Actual h2 ALPN is checked
+on the admitted stream. Atom `Configuration::workload` similarly consumes its
+actual HTTP/1.1 admitted stream. Their private connection contexts keep the
+endpoint and verified peer paired with that socket through protocol adaptation.
+A context from a different prepared endpoint refuses, even with identical policy
+bytes. No raw incoming-stream hook, caller-selected verifier, exported certificate
+or header is accepted as authentication.
+
+Native RPCs without a bearer require the certificate's **namespace-root Manage**
+mapping. Entity-scoped Manage is insufficient. Atom checks Manage at the canonical
+route resource, including the full topic/subscription path. With an explicit
+bearer, both transports select and freshly validate that credential instead;
+duplicate, malformed or invalid bearer values refuse and never fall back to an
+otherwise valid certificate. A valid bearer can select its existing local rights,
+but a presented certificate still supplies an outer, nonrenewable connection lease.
+An absent optional certificate instead requires a valid bearer on each admin call.
+
+Authentication remains before native conversion/backend calls and Atom
+profile/body/backend processing. Atom preserves its structured XML, canonical
+route positions and error/status contracts. Only ordinary subscription-definition
+Get is installed; there are no new CRUD, rule or runtime-materialization routes.
+
+Native RPC admission checks the connection lease **after** taking the existing
+listener-global admission mutex, before reserving capacity or spawning. Atom
+does the same at request admission and rechecks after bounded preparation. The
+typed service checks again inside its async methods immediately before invoking
+the real backend create/get/list method, with no intervening await. A prepared
+future or blocked admission frontier cannot start a new backend original after
+cutoff, even with a longer-lived bearer. Late refusal makes no backend clock,
+read, apply or notification call. A begun backend original is instead retained
+unchanged and finishes once, including after client cancellation or socket expiry.
+
+Each connection owner's select loop observes its own task-free expiry future and
+retires only that socket's IO and future admissions. It never requests global
+listener retirement or stops healthy peers. There are no detached watchers,
+aborts of accepted RPCs, early capacity refunds or new shutdown budgets. Native
+RPC permits remain held until actual original task join; rotating RPC/stream/
+connection reaping and Atom request/connection reaping retain their existing
+behavior. Process shutdown still retires all configured transports before cleanup
+and uses one shared deadline through original joins, timer and broker. Timeout,
+termination or owner drop alone is not a successful drain receipt.
 
 ## Restart-only trust rotation and local revocation
 
@@ -278,6 +359,15 @@ activation the old policy remains effective, subject to its existing leases.
 Do not describe a file edit or library object replacement alone as completed
 revocation, zero-downtime rotation or consumer drain. Policy changes do not undo
 already committed operations.
+
+For the server, stop the old process through its normal shared shutdown and
+verify successful completion before restarting with the candidate files. File
+edits alone affect neither existing connections nor new handshakes on a running
+listener. Replacement processes validate all inputs again before opening state;
+old connections, grants and endpoint capabilities are not transferred. An invalid
+candidate refuses startup rather than serving with a partially applied snapshot.
+Private fixture tests exercise this local behavior, not online revocation,
+hardware-backed identity or infrastructure/compliance certification.
 
 ## Dependency profile
 

@@ -44,8 +44,10 @@ const DEFAULT_MAX_IN_FLIGHT_RPCS: usize = 1_024;
 
 /// Prepared before the durable backend is opened. The only supported ALPN is h2.
 pub struct AdminTlsConfig {
-    tls: Arc<ServerConfig>,
-    policy: JwtPolicy,
+    tls: Option<Arc<ServerConfig>>,
+    policy: Option<JwtPolicy>,
+    #[cfg(feature = "workload-tls")]
+    workload: Option<auth::workload::PreparedWorkloadTls>,
     root: ResourceScope,
     max_in_flight_rpcs: usize,
 }
@@ -61,8 +63,32 @@ impl AdminTlsConfig {
         }
         tls.alpn_protocols = vec![b"h2".to_vec()];
         Ok(Self {
-            tls: Arc::new(tls),
+            tls: Some(Arc::new(tls)),
+            policy: Some(policy),
+            #[cfg(feature = "workload-tls")]
+            workload: None,
+            root,
+            max_in_flight_rpcs: DEFAULT_MAX_IN_FLIGHT_RPCS,
+        })
+    }
+
+    /// Explicit certificate-only or mixed profile, prepared before storage open.
+    #[cfg(feature = "workload-tls")]
+    pub fn workload(
+        endpoint: auth::workload::PreparedWorkloadTls,
+        policy: Option<JwtPolicy>,
+        root: ResourceScope,
+    ) -> Result<Self, &'static str> {
+        if root.path().next().is_some() || endpoint.namespace() != &root {
+            return Err("native administration requires the endpoint namespace root");
+        }
+        if !endpoint.requires_client_certificate() && policy.is_none() {
+            return Err("optional client certificates require alternative JWT credentials");
+        }
+        Ok(Self {
+            tls: None,
             policy,
+            workload: Some(endpoint),
             root,
             max_in_flight_rpcs: DEFAULT_MAX_IN_FLIGHT_RPCS,
         })
@@ -86,12 +112,82 @@ struct Admission {
     calls: Tasks,
     #[cfg(test)]
     admitted: Arc<Notify>,
+    // Persistent across task completion/reaping: an empty family is not proof
+    // that no RPC original was spawned.
+    #[cfg(test)]
+    admitted_count: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(all(test, feature = "workload-tls"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdmissionAttemptId(usize);
+
+#[cfg(all(test, feature = "workload-tls"))]
+#[derive(Clone, Copy, Debug)]
+struct AdmissionDecision {
+    attempt: AdmissionAttemptId,
+    retired: bool,
+    admitted_count: usize,
+}
+
+#[cfg(all(test, feature = "workload-tls"))]
+struct AdmissionTrace {
+    next_id: std::sync::atomic::AtomicUsize,
+    entered: watch::Sender<Option<AdmissionAttemptId>>,
+    decided: watch::Sender<Option<AdmissionDecision>>,
+}
+
+#[cfg(all(test, feature = "workload-tls"))]
+impl AdmissionTrace {
+    fn new() -> Self {
+        Self {
+            next_id: std::sync::atomic::AtomicUsize::new(0),
+            entered: watch::channel(None).0,
+            decided: watch::channel(None).0,
+        }
+    }
+
+    fn enter(&self) -> AdmissionAttemptId {
+        let attempt = AdmissionAttemptId(
+            self.next_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1,
+        );
+        self.entered.send_replace(Some(attempt));
+        attempt
+    }
+}
+
+// Declared AFTER acquiring the real admission guard, so this acknowledgement
+// runs on every critical-section exit (including refusal), BEFORE unlocking it.
+// It observes the existing decision; it implements no alternative admission.
+#[cfg(all(test, feature = "workload-tls"))]
+struct AdmissionDecisionAck<'a> {
+    trace: &'a AdmissionTrace,
+    attempt: AdmissionAttemptId,
+    admission: &'a Admission,
+}
+
+#[cfg(all(test, feature = "workload-tls"))]
+impl Drop for AdmissionDecisionAck<'_> {
+    fn drop(&mut self) {
+        self.trace.decided.send_replace(Some(AdmissionDecision {
+            attempt: self.attempt,
+            retired: self.admission.retired,
+            admitted_count: self
+                .admission
+                .admitted_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+        }));
+    }
 }
 
 #[derive(Clone)]
 pub struct AdminRetirement {
     admission: Arc<Mutex<Admission>>,
     signal: watch::Sender<bool>,
+    #[cfg(all(test, feature = "workload-tls"))]
+    admission_trace: Arc<AdmissionTrace>,
 }
 
 impl AdminRetirement {
@@ -178,6 +274,8 @@ type Rpc = EntityRpc<BrokerHandle, fn(&SubmitError) -> BackendErrorKind>;
 struct OwnedRpc {
     rpc: Arc<Rpc>,
     retirement: AdminRetirement,
+    #[cfg(feature = "workload-tls")]
+    connection: Option<admin_api::workload::Connection>,
 }
 
 impl OwnedRpc {
@@ -185,6 +283,8 @@ impl OwnedRpc {
         &self,
         work: impl Future<Output = Result<T, Status>> + Send + 'static,
     ) -> Result<T, Status> {
+        #[cfg(all(test, feature = "workload-tls"))]
+        let attempt = self.retirement.admission_trace.enter();
         let (send, receive) = tokio::sync::oneshot::channel();
         {
             let admission = self
@@ -192,8 +292,22 @@ impl OwnedRpc {
                 .admission
                 .lock()
                 .expect("admin admission lock");
+            #[cfg(all(test, feature = "workload-tls"))]
+            let _decision_ack = AdmissionDecisionAck {
+                trace: &self.retirement.admission_trace,
+                attempt,
+                admission: &admission,
+            };
             if admission.retired {
                 return Err(Status::unavailable("administration is retiring"));
+            }
+            #[cfg(feature = "workload-tls")]
+            if self
+                .connection
+                .as_ref()
+                .is_some_and(|connection| connection.ensure_live().is_err())
+            {
+                return Err(Status::unauthenticated("connection authorization expired"));
             }
             // No waiting task is spawned for an excess request. The same lock
             // linearizes the retiring gate, global capacity and original spawn.
@@ -210,7 +324,12 @@ impl OwnedRpc {
                 Some(permit),
             );
             #[cfg(test)]
-            admission.admitted.notify_one();
+            {
+                admission
+                    .admitted_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                admission.admitted.notify_one();
+            }
         }
         receive
             .await
@@ -284,7 +403,7 @@ fn classify(error: &SubmitError) -> BackendErrorKind {
 pub struct AdminListenerService {
     listener: Option<TcpListener>,
     config: AdminTlsConfig,
-    service: OwnedRpc,
+    backend: AdminService,
     retirement: AdminRetirement,
     // Separate from admission: even a local transport failure cannot begin
     // protocol cleanup before the coordinator retires BOTH admissions.
@@ -315,8 +434,12 @@ impl AdminListenerService {
                 calls: Tasks::default(),
                 #[cfg(test)]
                 admitted: Arc::default(),
+                #[cfg(test)]
+                admitted_count: std::sync::atomic::AtomicUsize::new(0),
             })),
             signal,
+            #[cfg(all(test, feature = "workload-tls"))]
+            admission_trace: Arc::new(AdmissionTrace::new()),
         };
         let calls = retirement
             .admission
@@ -324,20 +447,10 @@ impl AdminListenerService {
             .expect("admin admission lock")
             .calls
             .clone();
-        let rpc = EntityRpc::new(
-            AdminService::new(namespace, broker),
-            config.policy.clone(),
-            config.root.clone(),
-            classify as fn(&SubmitError) -> BackendErrorKind,
-        )
-        .expect("prepared namespace root");
         Self {
             listener: Some(listener),
             config,
-            service: OwnedRpc {
-                rpc: Arc::new(rpc),
-                retirement: retirement.clone(),
-            },
+            backend: AdminService::new(namespace, broker),
             retirement,
             cleanup,
             connections: JoinSet::new(),
@@ -380,13 +493,33 @@ impl AdminListenerService {
                         Ok(accepted) => accepted,
                         Err(error) => { self.failure = Some(error); self.retirement.request(); break; }
                     };
-                    let acceptor = TlsAcceptor::from(self.config.tls.clone());
+                    let tls_config = self.config.tls.clone();
+                    let policy = self.config.policy.clone();
+                    let root = self.config.root.clone();
+                    let backend = self.backend.clone();
+                    let retirement = self.retirement.clone();
+                    #[cfg(feature = "workload-tls")]
+                    let workload = self.config.workload.clone();
                     let cleanup = self.cleanup.subscribe();
                     let streams = self.streams.clone();
-                    let service = wire::entity_service_server::EntityServiceServer::new(self.service.clone());
                     let accepted_at = tokio::time::Instant::now();
                     let deadline = accepted_at.checked_add(self.admission_timeout).unwrap_or_else(|| accepted_at + Duration::from_secs(60 * 60 * 24 * 365));
                     self.connections.spawn(async move {
+                        #[cfg(feature = "workload-tls")]
+                        if let Some(endpoint) = workload {
+                            let tls = tokio::select! {
+                                biased;
+                                () = requested(cleanup.clone()) => return,
+                                result = endpoint.accept_before(socket, deadline) => match result { Ok(tls) => tls, Err(_) => return },
+                            };
+                            if tls.alpn_protocol() != Some(b"h2") { return; }
+                            let Ok(connection) = admin_api::workload::Connection::from_admitted(endpoint, &tls) else { return; };
+                            let rpc = EntityRpc::with_workload_connection(backend, policy, root, classify as fn(&SubmitError) -> BackendErrorKind, connection.clone()).expect("prepared namespace root");
+                            let service = OwnedRpc { rpc: Arc::new(rpc), retirement, connection: Some(connection) };
+                            serve_h2(tls, service, streams, cleanup).await;
+                            return;
+                        }
+                        let acceptor = TlsAcceptor::from(tls_config.expect("prepared legacy TLS"));
                         let tls = tokio::select! {
                             biased;
                             () = requested(cleanup.clone()) => return,
@@ -396,19 +529,9 @@ impl AdminListenerService {
                             },
                         };
                         if tls.get_ref().1.alpn_protocol() != Some(b"h2") { return; }
-                        let service = service.map_request(|request: hyper::Request<hyper::body::Incoming>| request.map(tonic::body::Body::new));
-                        let mut builder = http2::Builder::new(streams);
-                        builder.timer(TokioTimer::new());
-                        let connection = builder.serve_connection(TokioIo::new(tls), TowerToHyperService::new(service));
-                        tokio::pin!(connection);
-                        tokio::select! {
-                            biased;
-                            () = requested(cleanup) => {
-                                connection.as_mut().graceful_shutdown();
-                                let _ = connection.await;
-                            },
-                            _ = &mut connection => {},
-                        }
+                        let rpc = EntityRpc::new(backend, policy.expect("prepared legacy JWT"), root, classify as fn(&SubmitError) -> BackendErrorKind).expect("prepared namespace root");
+                        let service = OwnedRpc { rpc: Arc::new(rpc), retirement, #[cfg(feature = "workload-tls")] connection: None };
+                        serve_h2(tls, service, streams, cleanup).await;
                     });
                 },
             }
@@ -455,6 +578,40 @@ impl AdminListenerService {
             "admin stream and RPC originals drain before extraction"
         );
         self.failure.take()
+    }
+}
+
+async fn serve_h2<Io>(tls: Io, service: OwnedRpc, streams: Tasks, cleanup: watch::Receiver<bool>)
+where
+    Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    #[cfg(feature = "workload-tls")]
+    let context = service.connection.clone();
+    let expiry = async {
+        #[cfg(feature = "workload-tls")]
+        if let Some(context) = context {
+            return context.expired().await;
+        }
+        std::future::pending::<()>().await;
+    };
+    tokio::pin!(expiry);
+    let service = wire::entity_service_server::EntityServiceServer::new(service).map_request(
+        |request: hyper::Request<hyper::body::Incoming>| request.map(tonic::body::Body::new),
+    );
+    let mut builder = http2::Builder::new(streams);
+    builder.timer(TokioTimer::new());
+    let connection = builder.serve_connection(TokioIo::new(tls), TowerToHyperService::new(service));
+    tokio::pin!(connection);
+    tokio::select! {
+        biased;
+        // Dropping this socket driver does not drop retained RPC originals or
+        // refund their listener-global permits. Stream originals are also joined.
+        () = &mut expiry => {},
+        () = requested(cleanup) => {
+            connection.as_mut().graceful_shutdown();
+            tokio::select! { biased; () = &mut expiry => {}, _ = connection => {} }
+        },
+        _ = &mut connection => {},
     }
 }
 

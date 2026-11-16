@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+workload-tls = ["auth/workload-tls"]
+
 [dependencies]
 auth.workspace = true
 domain.workspace = true

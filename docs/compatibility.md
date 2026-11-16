@@ -142,8 +142,13 @@ With `protocol-amqp/workload-tls`, a fallible frozen listener consumes these on
 actual TCP/WSS, combines locally scoped rights with independent token grants,
 and fences all new broker work at the presented certificate's nonrenewable lease.
 Expiry retires only that connection and joins its originals without rolling back
-begun work. Server CLI/admin activation remains separate; default SAS/JWT/TLS
-configuration and trust behavior are unchanged.
+begun work. The optional `server/workload-tls` profile adds independent AMQP,
+native h2 and Atom HTTPS policy-file opt-ins, prepared before durable open.
+Native certificate authority still requires namespace-root Manage; supported
+Atom subscription Get uses canonical-resource Manage. Explicit invalid bearers
+never fall back to certificates. Rotation/revocation activates only after normal
+owner shutdown and restart. Default SAS/JWT/TLS configuration, production guards
+and trust behavior are unchanged; private fixtures are not production certification.
 
 ### Absolute link addresses
 

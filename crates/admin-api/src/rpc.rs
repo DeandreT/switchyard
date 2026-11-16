@@ -57,13 +57,15 @@ impl std::fmt::Display for NamespaceRootRequired {
 
 impl std::error::Error for NamespaceRootRequired {}
 
-/// Create/Get/List require a freshly verified namespace-root Manage JWT on every
-/// call. The configured amqps resource host is independent of the HTTPS endpoint
-/// and the deployment audience inside JwtPolicy. This is not a connection cache.
+/// Calls require namespace-root Manage from a freshly verified JWT or the
+/// explicitly installed actual workload connection. The AMQPS resource host is
+/// independent of endpoint DNS and JWT audience. Token decisions are not cached.
 #[derive(Clone)]
 pub struct EntityRpc<B, C = InternalBackendErrors> {
     service: EntityService<B>,
-    policy: JwtPolicy,
+    policy: Option<JwtPolicy>,
+    #[cfg(feature = "workload-tls")]
+    connection: Option<crate::workload::Connection>,
     namespace_root: ResourceScope,
     classifier: C,
     #[cfg(test)]
@@ -82,9 +84,35 @@ impl<B: EntityBackend, C: BackendErrorClassifier<B::Error>> EntityRpc<B, C> {
         }
         Ok(Self {
             service,
+            policy: Some(policy),
+            #[cfg(feature = "workload-tls")]
+            connection: None,
+            namespace_root,
+            classifier,
+            #[cfg(test)]
+            clock: None,
+        })
+    }
+
+    /// Installs the context derived from this connection's actual TLS admission.
+    /// No fabricated JWT policy is needed for certificate-only operation.
+    #[cfg(feature = "workload-tls")]
+    pub fn with_workload_connection(
+        service: EntityService<B>,
+        policy: Option<JwtPolicy>,
+        namespace_root: ResourceScope,
+        classifier: C,
+        connection: crate::workload::Connection,
+    ) -> Result<Self, NamespaceRootRequired> {
+        if namespace_root.path().next().is_some() {
+            return Err(NamespaceRootRequired);
+        }
+        Ok(Self {
+            service: service.with_connection(Some(connection.clone())),
             policy,
             namespace_root,
             classifier,
+            connection: Some(connection),
             #[cfg(test)]
             clock: None,
         })
@@ -101,8 +129,31 @@ impl<B: EntityBackend, C: BackendErrorClassifier<B::Error>> EntityRpc<B, C> {
     }
 
     fn authorize(&self, metadata: &MetadataMap) -> Result<(), Status> {
+        #[cfg(feature = "workload-tls")]
+        if self
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.ensure_live().is_err())
+        {
+            return Err(unauthenticated());
+        }
         let mut values = metadata.get_all("authorization").iter();
-        let value = values.next().ok_or_else(unauthenticated)?;
+        let value = match values.next() {
+            Some(value) => value,
+            None => {
+                #[cfg(feature = "workload-tls")]
+                if let Some(connection) = &self.connection {
+                    return connection.authorize(&self.namespace_root).map_err(|error| {
+                        if error == auth::workload::WorkloadError::IdentityDenied {
+                            unauthenticated()
+                        } else {
+                            denied()
+                        }
+                    });
+                }
+                return Err(unauthenticated());
+            }
+        };
         if values.next().is_some() {
             return Err(unauthenticated());
         }
@@ -117,6 +168,8 @@ impl<B: EntityBackend, C: BackendErrorClassifier<B::Error>> EntityRpc<B, C> {
         let now = self.now()?;
         let grant = self
             .policy
+            .as_ref()
+            .ok_or_else(unauthenticated)?
             .validate(token, &self.namespace_root, now)
             .map_err(|error| match error {
                 JwtError::ScopeMismatch => denied(),
@@ -141,6 +194,8 @@ impl<B: EntityBackend, C: BackendErrorClassifier<B::Error>> EntityRpc<B, C> {
 
     fn status(&self, error: ServiceError<B::Error>) -> Status {
         match error {
+            #[cfg(feature = "workload-tls")]
+            ServiceError::AuthorizationExpired => unauthenticated(),
             ServiceError::Identifier(_)
             | ServiceError::InvalidEntityPath
             | ServiceError::AddressKindMismatch => invalid(),

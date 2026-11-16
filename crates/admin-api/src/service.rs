@@ -1,4 +1,5 @@
-//! Local administration contract. No transport, authorization or runtime startup.
+//! Local administration contract; optional connection lease fencing is installed
+//! only by authenticated transports. No runtime startup or credential selection.
 
 use std::{error::Error, fmt, future::Future};
 
@@ -121,6 +122,8 @@ pub enum UnsupportedFeature {
 /// domain/storage/clock/stopped error, rather than its display string.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ServiceError<E> {
+    #[cfg(feature = "workload-tls")]
+    AuthorizationExpired,
     Identifier(IdentifierError),
     ForeignNamespace {
         expected: NamespaceName,
@@ -143,6 +146,8 @@ pub enum ServiceError<E> {
 impl<E: fmt::Display> fmt::Display for ServiceError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(feature = "workload-tls")]
+            Self::AuthorizationExpired => f.write_str("connection authorization expired"),
             Self::Identifier(error) => fmt::Display::fmt(error, f),
             Self::ForeignNamespace { expected, actual } => {
                 write!(
@@ -205,12 +210,36 @@ pub trait EntityBackend: Clone + Send + Sync {
 pub struct EntityService<B> {
     namespace: NamespaceName,
     backend: B,
+    #[cfg(feature = "workload-tls")]
+    connection: Option<crate::workload::Connection>,
 }
 
 impl<B: EntityBackend> EntityService<B> {
     /// The bound namespace is already canonical. This is scope, not authorization.
     pub fn new(namespace: NamespaceName, backend: B) -> Self {
-        Self { namespace, backend }
+        Self {
+            namespace,
+            backend,
+            #[cfg(feature = "workload-tls")]
+            connection: None,
+        }
+    }
+
+    #[cfg(feature = "workload-tls")]
+    pub(crate) fn with_connection(
+        mut self,
+        connection: Option<crate::workload::Connection>,
+    ) -> Self {
+        self.connection = connection;
+        self
+    }
+
+    #[cfg(feature = "workload-tls")]
+    fn admit(&self) -> Result<(), ServiceError<B::Error>> {
+        self.connection
+            .as_ref()
+            .map_or(Ok(()), |connection| connection.ensure_live())
+            .map_err(|_| ServiceError::AuthorizationExpired)
     }
 
     pub fn namespace(&self) -> &NamespaceName {
@@ -268,6 +297,8 @@ impl<B: EntityBackend> EntityService<B> {
         };
         // No existence preflight or early domain-config validation: duplicate,
         // clock and domain-refusal ordering remains the existing owner's policy.
+        #[cfg(feature = "workload-tls")]
+        self.admit()?;
         let actual = self
             .backend
             .create(self.namespace.clone(), entity, command)
@@ -291,6 +322,8 @@ impl<B: EntityBackend> EntityService<B> {
     ) -> Result<EntityDefinition, ServiceError<B::Error>> {
         self.check_namespace(request.namespace)?;
         let target = validate_address(request.address)?;
+        #[cfg(feature = "workload-tls")]
+        self.admit()?;
         let entry = self
             .backend
             .get(self.namespace.clone(), target.clone())
@@ -320,6 +353,8 @@ impl<B: EntityBackend> EntityService<B> {
                 .validate_scope(&self.namespace, request.kind)
                 .map_err(ServiceError::Catalog)?;
         }
+        #[cfg(feature = "workload-tls")]
+        self.admit()?;
         let page = self
             .backend
             .list(self.namespace.clone(), request.kind, after, request.limit)
