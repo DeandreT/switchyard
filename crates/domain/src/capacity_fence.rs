@@ -1,7 +1,8 @@
 //! Inert compatibility framing for ordinary retained-byte owners.
 //!
 //! These pure codecs do not create, migrate or admit a finite queue. Runtime and
-//! recovery deliberately refuse this state until lifecycle conservation exists.
+//! recovery deliberately refuse this state; explicit conservation test facades
+//! do not activate ordinary admission or generic recovery.
 //! All owner-local mutable data (including counters) uses an isolated keyspace:
 //! a pre-ledger writer must not discover even stale indexes through old prefixes.
 
@@ -202,7 +203,7 @@ fn check_selected<S: StateStore>(
     }
     let raw_usage = raw_usage.ok_or(BrokerError::CapacityUsageMissing)?;
     usage_codec::decode(&owner, &raw_usage).map_err(|_| BrokerError::CapacityStateCorrupt)?;
-    // No lifecycle writer exists yet, even for an empty owner with valid usage.
+    // No normal runtime writer is activated, even for an empty valid owner.
     Err(BrokerError::CapacityStateUnsupported)
 }
 

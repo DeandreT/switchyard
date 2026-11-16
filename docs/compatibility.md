@@ -518,7 +518,12 @@ cannot decode the profile pair or discover isolated owned rows, including throug
 Complete or config-free maintenance. No outer store-format bump is required.
 The isolated-key reservation measures one additional byte on every message/index
 key in every automatic parent/DLQ candidate; only message V1–V3 is proved, and V4
-continues to refuse. This does not enable finite admission or lifecycle writes.
+continues to refuse. This does not enable production finite admission or lifecycle
+writes. Explicit nondefault [conservation test facades](capacity-lifecycle-conservation.md)
+exercise the real shared lifecycle and unanchored indexed/replay cores over a sealed
+test genesis. They do not change normal constructors, recovery APIs or the shipped
+node, including in an all-features build. Snapshot/anchor/compaction/upgrade support
+is not implied by those test-only replay proofs.
 
 Topic membership records hold the filter-error setting: a subscription that discards
 filter-error copies stores a membership V2 (child path and setting), while every

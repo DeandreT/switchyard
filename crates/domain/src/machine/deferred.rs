@@ -26,6 +26,8 @@ impl<S: StateStore> StateMachine<S> {
         let config = self.load_config(command)?;
         let (mut record, locked_until, _) = self.held_lock(command, sequence, lock_token)?;
         rewrite.apply(&config, &mut record)?;
+        #[cfg(feature = "capacity-conservation-test-support")]
+        self.prove_capacity_rewrite(&command.entity, &record)?;
 
         let namespace = &command.namespace;
         let entity = &command.entity;

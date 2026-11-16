@@ -58,7 +58,8 @@ pub enum ReplayError {
 #[derive(Debug)]
 pub struct CommittedReplay<S> {
     journal: Journal<SharedStore<S>>,
-    writer: IndexedWriter<SharedStore<S>>,
+    writer: ReplayWriter<SharedStore<S>>,
+    mode: ReplayMode,
     applied: u64,
     committed: u64,
     last_appended: u64,
@@ -75,9 +76,29 @@ impl<S: StateStore> CommittedReplay<S> {
     /// length. StateStore materializes raw values before validation, and proposal
     /// DTO/container overhead is extra; this is not a hostile-allocation bound.
     pub fn open(store: S) -> Result<Self, ReplayError> {
+        Self::open_core(store, ReplayMode::Ordinary)
+    }
+
+    fn open_core(store: S, mode: ReplayMode) -> Result<Self, ReplayError> {
         let shared = SharedStore(Arc::new(store));
         let journal = Journal::open(shared.clone())?;
-        let writer = IndexedWriter::open(shared)?;
+        let writer = match &mode {
+            ReplayMode::Ordinary => ReplayWriter::Ordinary(IndexedWriter::open(shared)?),
+            #[cfg(feature = "capacity-conservation-test-support")]
+            ReplayMode::Conservation(genesis) => {
+                if journal.snapshot_anchor()?.is_some() {
+                    return Err(corrupt(
+                        "capacity test replay does not support anchored journals",
+                    ));
+                }
+                ReplayWriter::Conservation(
+                    domain::capacity_conservation::CapacityIndexedHarness::open(
+                        shared,
+                        genesis.clone(),
+                    )?,
+                )
+            }
+        };
         let applied = writer.applied_index()?;
         let committed = journal.committed_index()?;
         let last_appended = journal.last_appended_index()?;
@@ -91,7 +112,7 @@ impl<S: StateStore> CommittedReplay<S> {
                 "applied checkpoint regresses behind the snapshot anchor",
             ));
         }
-        let latest = validate_committed(&journal, applied, committed)?;
+        let latest = validate_committed(&journal, applied, committed, &mode)?;
         if applied != 0 {
             let proposal =
                 latest.ok_or_else(|| corrupt("the latest applied proposal is missing"))?;
@@ -100,6 +121,7 @@ impl<S: StateStore> CommittedReplay<S> {
         Ok(Self {
             journal,
             writer,
+            mode,
             applied,
             committed,
             last_appended,
@@ -159,7 +181,7 @@ impl<S: StateStore> CommittedReplay<S> {
         }
         let mut processed = 0;
         for entry in entries {
-            let proposal = decode_proposal(entry.index(), entry.payload())?;
+            let proposal = decode_proposal(entry.index(), entry.payload(), &self.mode)?;
             match self.writer.apply(entry.index(), &proposal)? {
                 IndexedApplyOutcome::Applied(_) | IndexedApplyOutcome::Refused(_) => {}
                 IndexedApplyOutcome::AlreadyApplied => {
@@ -194,14 +216,15 @@ fn validate_committed<S: StateStore>(
     journal: &Journal<S>,
     applied: u64,
     committed: u64,
-) -> Result<Option<DurableProposal>, ReplayError> {
+    mode: &ReplayMode,
+) -> Result<Option<ReplayOriginal>, ReplayError> {
     let mut validated = journal.removed_through()?;
     let mut latest = None;
     if let Some(anchor) = journal.snapshot_anchor()? {
         // Always decode the retained original, even after P advances beyond A.
         let original = anchor.original_proposal()?;
         if applied == anchor.applied_index() {
-            latest = Some(original);
+            latest = Some(ReplayOriginal::Ordinary(original));
         }
     }
     while validated < committed {
@@ -213,7 +236,7 @@ fn validate_committed<S: StateStore>(
             return Err(corrupt("a committed validation page is empty"));
         }
         for entry in entries {
-            let proposal = decode_proposal(entry.index(), entry.payload())?;
+            let proposal = decode_proposal(entry.index(), entry.payload(), mode)?;
             if entry.index() == applied {
                 latest = Some(proposal);
             }
@@ -223,8 +246,120 @@ fn validate_committed<S: StateStore>(
     Ok(latest)
 }
 
-fn decode_proposal(index: u64, bytes: &[u8]) -> Result<DurableProposal, ReplayError> {
-    DurableProposal::decode(bytes).map_err(|source| ReplayError::Proposal { index, source })
+fn decode_proposal(
+    index: u64,
+    bytes: &[u8],
+    mode: &ReplayMode,
+) -> Result<ReplayOriginal, ReplayError> {
+    match mode {
+        ReplayMode::Ordinary => DurableProposal::decode(bytes).map(ReplayOriginal::Ordinary),
+        #[cfg(feature = "capacity-conservation-test-support")]
+        ReplayMode::Conservation(_) => domain::capacity_conservation::TestOriginal::decode(bytes)
+            .map(ReplayOriginal::Conservation),
+    }
+    .map_err(|source| ReplayError::Proposal { index, source })
+}
+
+#[derive(Debug)]
+enum ReplayMode {
+    Ordinary,
+    #[cfg(feature = "capacity-conservation-test-support")]
+    Conservation(domain::capacity_conservation::TestGenesis),
+}
+
+enum ReplayOriginal {
+    Ordinary(DurableProposal),
+    #[cfg(feature = "capacity-conservation-test-support")]
+    Conservation(domain::capacity_conservation::TestOriginal),
+}
+
+#[derive(Debug)]
+enum ReplayWriter<S> {
+    Ordinary(IndexedWriter<S>),
+    #[cfg(feature = "capacity-conservation-test-support")]
+    Conservation(domain::capacity_conservation::CapacityIndexedHarness<S>),
+}
+
+impl<S: StateStore> ReplayWriter<S> {
+    fn applied_index(&self) -> Result<u64, IndexedApplyError> {
+        match self {
+            Self::Ordinary(writer) => writer.applied_index(),
+            #[cfg(feature = "capacity-conservation-test-support")]
+            Self::Conservation(writer) => writer.applied_index(),
+        }
+    }
+    fn latest_applied_digest(&self) -> Result<Option<[u8; 32]>, IndexedApplyError> {
+        match self {
+            Self::Ordinary(writer) => writer.latest_applied_digest(),
+            #[cfg(feature = "capacity-conservation-test-support")]
+            Self::Conservation(writer) => writer.latest_applied_digest(),
+        }
+    }
+    fn verify_latest_applied(&self, original: &ReplayOriginal) -> Result<(), IndexedApplyError> {
+        match (self, original) {
+            (Self::Ordinary(writer), ReplayOriginal::Ordinary(proposal)) => {
+                writer.verify_latest_applied(proposal)
+            }
+            #[cfg(feature = "capacity-conservation-test-support")]
+            (Self::Conservation(writer), ReplayOriginal::Conservation(proposal)) => {
+                writer.verify_latest_applied(proposal)
+            }
+            #[cfg(feature = "capacity-conservation-test-support")]
+            _ => Err(IndexedApplyError::Domain(
+                domain::BrokerError::CapacityStateUnsupported,
+            )),
+        }
+    }
+    fn apply(
+        &mut self,
+        index: u64,
+        original: &ReplayOriginal,
+    ) -> Result<IndexedApplyOutcome, IndexedApplyError> {
+        match (self, original) {
+            (Self::Ordinary(writer), ReplayOriginal::Ordinary(proposal)) => {
+                writer.apply(index, proposal)
+            }
+            #[cfg(feature = "capacity-conservation-test-support")]
+            (Self::Conservation(writer), ReplayOriginal::Conservation(proposal)) => {
+                writer.apply(index, proposal)
+            }
+            #[cfg(feature = "capacity-conservation-test-support")]
+            _ => Err(IndexedApplyError::Domain(
+                domain::BrokerError::CapacityStateUnsupported,
+            )),
+        }
+    }
+}
+
+/// Test-only unanchored replay over the same total-validation/advance core.
+/// Normal CommittedReplay::open always selects the ordinary refusal policy.
+#[cfg(feature = "capacity-conservation-test-support")]
+#[derive(Debug)]
+pub struct CapacityReplayHarness<S>(CommittedReplay<S>);
+
+#[cfg(feature = "capacity-conservation-test-support")]
+impl<S: StateStore> CapacityReplayHarness<S> {
+    pub fn open(
+        store: S,
+        genesis: domain::capacity_conservation::TestGenesis,
+    ) -> Result<Self, ReplayError> {
+        Ok(Self(CommittedReplay::open_core(
+            store,
+            ReplayMode::Conservation(genesis),
+        )?))
+    }
+    pub fn applied_index(&self) -> Result<u64, ReplayError> {
+        self.0.applied_index()
+    }
+    pub fn committed_index(&self) -> Result<u64, ReplayError> {
+        self.0.committed_index()
+    }
+    pub fn latest_applied_digest(&self) -> Result<Option<[u8; 32]>, ReplayError> {
+        self.0.latest_applied_digest()
+    }
+    pub fn replay_batch(&mut self, limit: usize) -> Result<ReplayProgress, ReplayError> {
+        self.0.replay_batch(limit)
+    }
 }
 
 fn corrupt(detail: &'static str) -> ReplayError {

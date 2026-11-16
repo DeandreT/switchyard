@@ -202,13 +202,14 @@ Callers must exclude all writers and keyspace creation, deletion and configurati
 changes; it is not authentication or a read-only directory opener.
 
 The pure [retained-byte kernel](docs/retained-byte-accounting.md) measures exact
-message/index KV lengths and prepaid automatic-growth reservations. It has no
-live conservation or admission integration. Historical finite V3/V7 metadata
-stays metadata-only. New generation-bound profile V4, isolated `0x13` retained keys
-and bounded capacity intent V11 are inert framing: ordinary writers, proposer
-timestamp selection, replay, snapshots and upgrades refuse unsupported ownership
-before effects. Message V4 accounting remains unsupported. See
-[capacity fences](docs/capacity-writer-fences.md).
+message/index KV lengths and prepaid automatic-growth reservations. An explicit
+nondefault [conservation test facade](docs/capacity-lifecycle-conservation.md) runs
+the shared lifecycle dispatcher, finalizer and unanchored indexed/replay core over
+validated generation-bound parent/DLQ images. It is not production admission.
+Historical finite V3/V7 metadata stays metadata-only. Normal writers, proposer
+timestamp selection, replay, snapshots and upgrades retain their
+[capacity fences](docs/capacity-writer-fences.md), even with test support compiled.
+Message V4 accounting remains numerically unsupported in reservation model 1.
 
 Production startup remains refused. These libraries do not activate runtime
 replay, quorum, full-state recovery, installation or compaction. Encryption and

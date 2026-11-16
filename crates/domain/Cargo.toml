@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+capacity-conservation-test-support = []
+
 [dependencies]
 message-content.workspace = true
 postcard.workspace = true
@@ -18,4 +21,3 @@ thiserror.workspace = true
 
 [dev-dependencies]
 testkit.workspace = true
-

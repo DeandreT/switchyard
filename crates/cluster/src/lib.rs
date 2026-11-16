@@ -14,6 +14,8 @@ pub use journal::{
     JOURNAL_ANCHORED_CONTAINER_VERSION, JOURNAL_FORMAT_VERSION, JOURNAL_VALIDATION_PAGE_ENTRIES,
     Journal, JournalEntry, JournalError, MAX_JOURNAL_PAYLOAD_BYTES, MAX_JOURNAL_READ_ENTRIES,
 };
+#[cfg(feature = "capacity-conservation-test-support")]
+pub use replay::CapacityReplayHarness;
 pub use replay::{CommittedReplay, ReplayError, ReplayProgress};
 pub use snapshot::{
     PreparedSnapshotAnchor, PreparedSnapshotCompaction, SNAPSHOT_ANCHOR_HASH_SCOPE,

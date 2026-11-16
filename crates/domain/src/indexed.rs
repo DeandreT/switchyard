@@ -87,17 +87,26 @@ impl<S: StateStore> IndexedWriter<S> {
     /// Only two fixed-size records are valid anywhere beneath the `0xF1` tag.
     /// StateStore still materializes raw values before checking their lengths.
     pub fn open(store: S) -> Result<Self, IndexedApplyError> {
+        Self::open_core(store, OpenPolicy::Ordinary)
+    }
+
+    fn open_core(store: S, policy: OpenPolicy) -> Result<Self, IndexedApplyError> {
         let entries = store.scan_prefix(&[0xF1], 3)?;
         if entries.len() > 2 {
             return Err(corrupt("unexpected ownership rows"));
         }
         let mut owner_version = VERSION;
         let checkpoint = if entries.is_empty() {
-            for tag in 0x00..=crate::capacity_fence::DATA_TAG {
-                if !store.scan_prefix(&[tag], 1)?.is_empty() {
-                    return Err(IndexedApplyError::PopulatedStore);
-                }
+            #[cfg(feature = "capacity-conservation-test-support")]
+            if let OpenPolicy::Conservation(genesis) = &policy {
+                genesis
+                    .validate(&store, true)
+                    .map_err(IndexedApplyError::Domain)?;
+            } else {
+                Self::require_empty(&store)?;
             }
+            #[cfg(not(feature = "capacity-conservation-test-support"))]
+            Self::require_empty(&store)?;
             None
         } else {
             if entries.len() != 2
@@ -108,7 +117,19 @@ impl<S: StateStore> IndexedWriter<S> {
             }
             owner_version = decode_owner(&entries[0].1)?;
             let checkpoint = decode_checkpoint(&entries[1].1)?;
-            crate::capacity_fence::check_recovery(&store).map_err(IndexedApplyError::Domain)?;
+            match &policy {
+                OpenPolicy::Ordinary => crate::capacity_fence::check_recovery(&store)
+                    .map_err(IndexedApplyError::Domain)?,
+                #[cfg(feature = "capacity-conservation-test-support")]
+                OpenPolicy::Conservation(genesis) => {
+                    if owner_version != VERSION {
+                        return Err(corrupt("capacity test replay does not support anchors"));
+                    }
+                    genesis
+                        .validate(&store, false)
+                        .map_err(IndexedApplyError::Domain)?;
+                }
+            }
             Some(checkpoint)
         };
         Ok(Self {
@@ -117,6 +138,15 @@ impl<S: StateStore> IndexedWriter<S> {
             owner_version,
             usable: true,
         })
+    }
+
+    fn require_empty(store: &S) -> Result<(), IndexedApplyError> {
+        for tag in 0x00..=crate::capacity_fence::DATA_TAG {
+            if !store.scan_prefix(&[tag], 1)?.is_empty() {
+                return Err(IndexedApplyError::PopulatedStore);
+            }
+        }
+        Ok(())
     }
 
     pub fn applied_index(&self) -> Result<u64, IndexedApplyError> {
@@ -192,10 +222,15 @@ impl<S: StateStore> IndexedWriter<S> {
         proposal: &DurableProposal,
     ) -> Result<(), IndexedApplyError> {
         self.require_usable()?;
+        self.verify_digest(Self::proposal_digest(proposal)?)
+    }
+
+    fn verify_digest(&self, digest: [u8; 32]) -> Result<(), IndexedApplyError> {
+        self.require_usable()?;
         let latest = self
             .checkpoint
             .ok_or_else(|| corrupt("there is no latest applied checkpoint"))?;
-        if Self::proposal_digest(proposal)? != latest.proposal_hash {
+        if digest != latest.proposal_hash {
             return Err(IndexedApplyError::ConflictingProposal {
                 index: latest.index,
             });
@@ -212,10 +247,33 @@ impl<S: StateStore> IndexedWriter<S> {
         proposal: &DurableProposal,
     ) -> Result<IndexedApplyOutcome, IndexedApplyError> {
         self.require_usable()?;
+        self.apply_core(
+            index,
+            Self::proposal_digest(proposal)?,
+            proposal.command(),
+            |machine| match proposal.authority() {
+                DurableProposalAuthority::Unbound => machine.prepare(proposal.command()),
+                DurableProposalAuthority::Bound(binding) => {
+                    machine.prepare_bound(proposal.command(), binding)
+                }
+            },
+        )
+    }
+
+    // Private shared commit/duplicate/refusal core, not a caller-injected writer.
+    fn apply_core(
+        &mut self,
+        index: u64,
+        proposal_hash: [u8; 32],
+        command: &crate::Command,
+        prepare: impl FnOnce(
+            &StateMachine<S>,
+        ) -> Result<(CommandOutcome, WriteBatch), PreparationFailure>,
+    ) -> Result<IndexedApplyOutcome, IndexedApplyError> {
+        self.require_usable()?;
         if index == 0 {
             return Err(IndexedApplyError::ZeroIndex);
         }
-        let proposal_hash = Self::proposal_digest(proposal)?;
         if let Some(latest) = self.checkpoint
             && index == latest.index
         {
@@ -236,13 +294,7 @@ impl<S: StateStore> IndexedWriter<S> {
             });
         }
 
-        let command = proposal.command();
-        let prepared = match proposal.authority() {
-            DurableProposalAuthority::Unbound => self.machine.prepare(command),
-            DurableProposalAuthority::Bound(binding) => {
-                self.machine.prepare_bound(command, binding)
-            }
-        };
+        let prepared = prepare(&self.machine);
         let (result, mut batch) = match prepared {
             Ok((outcome, batch)) => (IndexedApplyOutcome::Applied(outcome), batch),
             Err(error) if deterministic_refusal(&command.kind, &error) => (
@@ -279,6 +331,8 @@ impl<S: StateStore> IndexedWriter<S> {
 
 fn deterministic_refusal(kind: &CommandKind, failure: &PreparationFailure) -> bool {
     match failure {
+        #[cfg(feature = "capacity-conservation-test-support")]
+        PreparationFailure::HealthyRetainedCapacity { .. } => true,
         PreparationFailure::HealthyRuleCapacity => matches!(
             kind,
             CommandKind::CreateRule { .. } | CommandKind::CreateRuleWithAction { .. }
@@ -295,6 +349,73 @@ fn deterministic_refusal(kind: &CommandKind, failure: &PreparationFailure) -> bo
                 }
         ),
         PreparationFailure::Ordinary(error) => ordinary_deterministic_refusal(kind, error),
+    }
+}
+
+enum OpenPolicy {
+    Ordinary,
+    #[cfg(feature = "capacity-conservation-test-support")]
+    Conservation(crate::capacity_conservation::TestGenesis),
+}
+
+/// Explicit feature-only owner around the same indexed commit core. The sealed
+/// genesis is the only no-checkpoint exception; ordinary open remains closed.
+#[cfg(feature = "capacity-conservation-test-support")]
+#[derive(Debug)]
+pub struct CapacityIndexedHarness<S> {
+    inner: IndexedWriter<S>,
+    genesis: crate::capacity_conservation::TestGenesis,
+}
+
+#[cfg(feature = "capacity-conservation-test-support")]
+impl<S: StateStore> CapacityIndexedHarness<S> {
+    pub fn open(
+        store: S,
+        genesis: crate::capacity_conservation::TestGenesis,
+    ) -> Result<Self, IndexedApplyError> {
+        let inner = IndexedWriter::open_core(store, OpenPolicy::Conservation(genesis.clone()))?;
+        Ok(Self { inner, genesis })
+    }
+    pub fn applied_index(&self) -> Result<u64, IndexedApplyError> {
+        self.inner.applied_index()
+    }
+    pub fn latest_applied_digest(&self) -> Result<Option<[u8; 32]>, IndexedApplyError> {
+        self.inner.latest_applied_digest()
+    }
+    pub fn verify_latest_applied(
+        &self,
+        original: &crate::capacity_conservation::TestOriginal,
+    ) -> Result<(), IndexedApplyError> {
+        self.inner
+            .verify_digest(checksum(PROPOSAL_HASH_SCOPE, &original.encode()?))
+    }
+    pub fn apply(
+        &mut self,
+        index: u64,
+        original: &crate::capacity_conservation::TestOriginal,
+    ) -> Result<IndexedApplyOutcome, IndexedApplyError> {
+        use crate::capacity_conservation::TestOriginal;
+        let digest = checksum(PROPOSAL_HASH_SCOPE, &original.encode()?);
+        let owner = self.genesis.owner();
+        self.inner.apply_core(
+            index,
+            digest,
+            original.command(),
+            |machine| match original {
+                TestOriginal::Ordinary(proposal) => match proposal.authority() {
+                    DurableProposalAuthority::Unbound => machine.prepare(proposal.command()),
+                    DurableProposalAuthority::Bound(binding) => {
+                        machine.prepare_bound(proposal.command(), binding)
+                    }
+                },
+                TestOriginal::Owned(intent) => {
+                    if intent.owner() != owner {
+                        return Err(BrokerError::InvalidEntityBinding.into());
+                    }
+                    crate::machine::capacity::prepare(machine.store(), intent)
+                }
+            },
+        )
     }
 }
 

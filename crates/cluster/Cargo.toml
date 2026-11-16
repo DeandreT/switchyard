@@ -9,6 +9,7 @@ repository.workspace = true
 [features]
 # Local fault fixtures only; never enables server startup or peer trust.
 consensus-driver-testkit = []
+capacity-conservation-test-support = ["domain/capacity-conservation-test-support"]
 
 [dependencies]
 domain.workspace = true
@@ -22,6 +23,7 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+testkit.workspace = true
 fjall.workspace = true
 futures-util = { workspace = true, features = ["std", "async-await"] }
 serde_json.workspace = true

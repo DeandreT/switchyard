@@ -7,7 +7,7 @@ use crate::{
 
 const HEADER: usize = 12;
 
-/// Pure persistence shape. Current runtime/replay intentionally refuse V11;
+/// Pure persistence shape. Normal runtime/replay intentionally refuse V11;
 /// there is no conversion that discards the owner fence into executable intent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapacityIntent {

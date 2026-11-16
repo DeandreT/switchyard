@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "capacity-conservation-test-support")]
+pub mod capacity_conservation;
 pub mod capacity_fence;
 pub mod codec;
 pub mod keys;

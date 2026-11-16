@@ -10,6 +10,8 @@
 //! the injected store.
 
 mod admin_catalog;
+#[cfg(feature = "capacity-conservation-test-support")]
+pub(crate) mod capacity;
 #[cfg(test)]
 mod capacity_fence_tests;
 mod catalog;
@@ -72,11 +74,18 @@ const MAX_SESSION_SCAN: usize = 32;
 #[derive(Clone, Debug)]
 pub struct StateMachine<S> {
     store: S,
+    #[cfg(feature = "capacity-conservation-test-support")]
+    capacity: Option<capacity::TransitionContext>,
 }
 
 // Only the post-reader creation guards mint capacity origins; public callers erase them.
 #[derive(Debug)]
 pub(crate) enum PreparationFailure {
+    #[cfg(feature = "capacity-conservation-test-support")]
+    HealthyRetainedCapacity {
+        committed: u64,
+        limit: u64,
+    },
     Ordinary(BrokerError),
     HealthyRuleCapacity,
     HealthySqlRuleCapacity,
@@ -86,6 +95,10 @@ pub(crate) enum PreparationFailure {
 impl PreparationFailure {
     pub(crate) fn into_broker(self) -> BrokerError {
         match self {
+            #[cfg(feature = "capacity-conservation-test-support")]
+            Self::HealthyRetainedCapacity { committed, limit } => {
+                BrokerError::RetainedCapacityExceeded { committed, limit }
+            }
             Self::Ordinary(error) => error,
             Self::HealthyRuleCapacity => BrokerError::RuleLimitExceeded {
                 maximum: crate::MAX_SUBSCRIPTION_RULES,
@@ -106,9 +119,25 @@ impl From<BrokerError> for PreparationFailure {
     }
 }
 
+impl From<storage::StorageError> for PreparationFailure {
+    fn from(error: storage::StorageError) -> Self {
+        Self::Ordinary(error.into())
+    }
+}
+
+impl From<crate::CodecError> for PreparationFailure {
+    fn from(error: crate::CodecError) -> Self {
+        Self::Ordinary(error.into())
+    }
+}
+
 impl<S: StateStore> StateMachine<S> {
     pub fn new(store: S) -> Self {
-        Self { store }
+        Self {
+            store,
+            #[cfg(feature = "capacity-conservation-test-support")]
+            capacity: None,
+        }
     }
 
     pub fn store(&self) -> &S {
@@ -848,6 +877,9 @@ impl<S: StateStore> StateMachine<S> {
         let (mut record, locked_until, origin) = self.held_lock(command, sequence, lock_token)?;
         rewrite.apply(&config, &mut record)?;
 
+        #[cfg(feature = "capacity-conservation-test-support")]
+        self.prove_capacity_rewrite(&command.entity, &record)?;
+
         // Expiration is suspended while a receiver owns the lock. Once that
         // receiver gives it up, TTL takes precedence over redelivery.
         if record.is_expired_at(command.issued_at) {
@@ -892,6 +924,8 @@ impl<S: StateStore> StateMachine<S> {
         let config = self.load_config(command)?;
         let (mut record, _, _) = self.held_lock(command, sequence, lock_token)?;
         rewrite.apply(&config, &mut record)?;
+        #[cfg(feature = "capacity-conservation-test-support")]
+        self.prove_capacity_rewrite(&command.entity, &record)?;
         self.move_to_dead_letter(
             command,
             record,
@@ -1283,6 +1317,13 @@ impl<S: StateStore> StateMachine<S> {
             description,
             dead_lettered_at: command.issued_at,
         });
+        #[cfg(feature = "capacity-conservation-test-support")]
+        if matches!(
+            record.dead_letter.as_ref().map(|info| &info.reason),
+            Some(DeadLetterReason::Application(_))
+        ) {
+            self.prove_capacity_rewrite(&dead_letter_queue, &record)?;
+        }
         batch.push_put(
             keys::message(namespace, &dead_letter_queue, sequence),
             codec::message::encode(&record)?,

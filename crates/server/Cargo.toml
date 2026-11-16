@@ -9,6 +9,7 @@ repository.workspace = true
 [features]
 default = []
 workload-tls = ["auth/workload-tls", "protocol-amqp/workload-tls", "admin-api/workload-tls"]
+capacity-conservation-test-support = ["domain/capacity-conservation-test-support", "cluster/capacity-conservation-test-support"]
 
 [[bin]]
 name = "switchyard"
